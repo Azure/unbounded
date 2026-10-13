@@ -12,10 +12,12 @@ import (
 	"log/slog"
 
 	"github.com/opencontainers/go-digest"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 const (
-	diagnosticPageSize    = 16 << 20
+	diagnosticPageSize    = racersdk.PageSize
 	diagnosticPageRecords = 8
 )
 

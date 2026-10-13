@@ -163,7 +163,7 @@ func TestGantryIntegration(t *testing.T) {
 
 	t.Run("resume beyond first page", func(t *testing.T) {
 		p, metrics := newPull(t)
-		// Both the offset and returned suffix exceed 16 MiB; the offset is
+		// Both the offset and returned suffix exceed one page; the offset is
 		// deliberately unaligned to exercise virtual-layer random access.
 		offset := page + 7
 		require.Greater(t, layer.Size-offset, page)

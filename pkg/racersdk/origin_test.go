@@ -279,7 +279,7 @@ func TestOriginOperationsAndReuse(t *testing.T) {
 	conn := originDial(t, path)
 
 	reader := bufio.NewReader(conn)
-	for _, request := range []struct{ method, fields string }{{"HEAD", ""}, {"GET", "Range: bytes=16777216-33554431\r\nIf-Match: \"v\"\r\n"}, {"HEAD", "If-Match: \"v\"\r\n"}} {
+	for _, request := range []struct{ method, fields string }{{"HEAD", ""}, {"GET", "Range: bytes=4194304-8388607\r\nIf-Match: \"v\"\r\n"}, {"HEAD", "If-Match: \"v\"\r\n"}} {
 		if _, err := conn.Write(rawRequest(request.method, request.fields+"Authorization: secret\xff\r\n")); err != nil {
 			t.Fatal(err)
 		}
@@ -296,7 +296,7 @@ func TestOriginOperationsAndReuse(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if request.method == "GET" && (string(body) != "x" || response.StatusCode != 206 || response.Header.Get("Content-Range") != "bytes 16777216-16777216/16777217") {
+		if request.method == "GET" && (string(body) != "x" || response.StatusCode != 206 || response.Header.Get("Content-Range") != "bytes 4194304-4194304/4194305") {
 			t.Fatal("page response")
 		}
 
@@ -538,7 +538,7 @@ func TestOriginBodyContracts(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			body := &ownedReader{Reader: strings.NewReader("abc")}
 
-			method, fields := "GET", "Range: bytes=0-16777215\r\n"
+			method, fields := "GET", "Range: bytes=0-4194303\r\n"
 			if mode == "head-body" {
 				method, fields = "HEAD", ""
 			}
@@ -720,7 +720,7 @@ func TestOriginProbeCancellation(t *testing.T) {
 
 			defer func() { cancel(); <-done }()
 
-			response := originExchange(t, path, "GET", "Range: bytes=0-16777215\r\n")
+			response := originExchange(t, path, "GET", "Range: bytes=0-4194303\r\n")
 			require.Equal(t, tt.status, response.StatusCode)
 
 			got, err := io.ReadAll(response.Body)
@@ -887,16 +887,16 @@ func TestOriginSelectedRangeErrors(t *testing.T) {
 		status int
 	}{
 		{"Range: bytes=0-0\r\nIf-Match: \"v\"\r\n", 3, nil, 400},
-		{"Range: bytes=16777216-33554431\r\nIf-Match: \"v\"\r\n", 3, nil, 416},
-		{"Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\n", 3, ErrNotFound, 412},
-		{"Range: bytes=0-16777215\r\n", 0, ErrNotFound, 404},
-		{"Range: bytes=0-16777215\r\n", 0, ErrUnauthorized, 401},
-		{"Range: bytes=0-16777215\r\n", 0, ErrForbidden, 403},
-		{"Range: bytes=0-16777215\r\n", 0, ErrVersionMismatch, 412},
-		{"Range: bytes=0-16777215\r\n", 0, ErrInvalidRequest, 400},
-		{"Range: bytes=0-16777215\r\n", 0, ErrUnavailable, 503},
-		{"Range: bytes=0-16777215\r\n", 0, context.DeadlineExceeded, 503},
-		{"Range: bytes=0-16777215\r\n", 0, errors.New("backend"), 500},
+		{"Range: bytes=4194304-8388607\r\nIf-Match: \"v\"\r\n", 3, nil, 416},
+		{"Range: bytes=0-4194303\r\nIf-Match: \"v\"\r\n", 3, ErrNotFound, 412},
+		{"Range: bytes=0-4194303\r\n", 0, ErrNotFound, 404},
+		{"Range: bytes=0-4194303\r\n", 0, ErrUnauthorized, 401},
+		{"Range: bytes=0-4194303\r\n", 0, ErrForbidden, 403},
+		{"Range: bytes=0-4194303\r\n", 0, ErrVersionMismatch, 412},
+		{"Range: bytes=0-4194303\r\n", 0, ErrInvalidRequest, 400},
+		{"Range: bytes=0-4194303\r\n", 0, ErrUnavailable, 503},
+		{"Range: bytes=0-4194303\r\n", 0, context.DeadlineExceeded, 503},
+		{"Range: bytes=0-4194303\r\n", 0, errors.New("backend"), 500},
 	} {
 		t.Run(strconv.Itoa(tt.status)+"/"+fmt.Sprint(tt.err), func(t *testing.T) {
 			body := &ownedReader{Reader: strings.NewReader("")}
@@ -953,7 +953,7 @@ func TestOriginSlowDestination(t *testing.T) {
 	})
 
 	conn := originDial(t, path)
-	if _, err := conn.Write(rawRequest("GET", "Range: bytes=0-16777215\r\n")); err != nil {
+	if _, err := conn.Write(rawRequest("GET", "Range: bytes=0-4194303\r\n")); err != nil {
 		t.Fatal(err)
 	}
 	// No response reads: the finite kernel send buffer must apply backpressure.
@@ -1025,7 +1025,7 @@ func TestOriginClosePanicContained(t *testing.T) {
 	body := &panicCloser{}
 	path, cancel, done := startOrigin(t, nil, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), body, nil })
 
-	response := originExchange(t, path, "GET", "Range: bytes=0-16777215\r\n")
+	response := originExchange(t, path, "GET", "Range: bytes=0-4194303\r\n")
 	if response.StatusCode != 200 {
 		t.Fatal("empty success")
 	}

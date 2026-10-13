@@ -17,9 +17,9 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
-// PageSize is the unit in which Racer caches and transfers objects (16 MiB).
+// PageSize is the unit in which Racer caches and transfers objects (4 MiB).
 // Objects no larger than PageSize may be read with [ReadOptions.SmallObject].
-const PageSize = 16 << 20
+const PageSize = 4 << 20
 
 // The public constant must match the wire protocol.
 var _ [PageSize - wire.PageSize]struct{}

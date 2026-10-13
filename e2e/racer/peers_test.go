@@ -28,9 +28,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-const peerPageSize = 16 << 20
+const peerPageSize = racersdk.PageSize
 
 type peerNode struct {
 	name, uid, pod, ip string

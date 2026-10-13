@@ -59,7 +59,7 @@ func TestRawCanonicalHeaders(t *testing.T) {
 		{"head", rawResponse(200, metadata+"Content-Length: 1\r\n"), []string{"Content-Length", "Racer-Expires-At"}, parseHead, 0, ErrorProtocol},
 		{"origin", rawResponse(206, metadata+"Content-Length: 1\r\nContent-Range: bytes 0-0/1\r\nContent-Type: application/octet-stream\r\n"), []string{"Content-Length", "Racer-Expires-At", "Content-Range"}, parseOrigin, 0, ErrorProtocol},
 		{"subscription", rawResponse(200, metadata+fmt.Sprintf("Content-Length: %d\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nRacer-Object-Length: 1\r\nRacer-Range-Start: 0\r\nRacer-Range-End: 1\r\n", 1+2*FrameSize)), []string{"Content-Length", "Racer-Expires-At", "Racer-Object-Length", "Racer-Range-Start", "Racer-Range-End"}, parseSubscription, 0, ErrorProtocol},
-		{"request", rawRequest("GET", "Content-Length: 0\r\nRange: bytes=0-16777215\r\n"), []string{"Content-Length", "Range"}, parseRequest, 0, ErrorInvalidArgument},
+		{"request", rawRequest("GET", "Content-Length: 0\r\nRange: bytes=0-4194303\r\n"), []string{"Content-Length", "Range"}, parseRequest, 0, ErrorInvalidArgument},
 		{"head error", rawResponse(416, "Content-Length: 0\r\nContent-Range: bytes */1\r\n"), []string{"Content-Length", "Content-Range"}, parseHead, ErrorUnsatisfiableRange, ErrorProtocol},
 		{"origin error", rawResponse(416, "Content-Length: 0\r\nContent-Range: bytes */1\r\n"), []string{"Content-Length", "Content-Range"}, parseOrigin, ErrorUnsatisfiableRange, ErrorProtocol},
 		{"subscription error", rawResponse(416, "Content-Length: 0\r\nContent-Range: bytes */1\r\n"), []string{"Content-Length", "Content-Range"}, parseSubscription, ErrorUnsatisfiableRange, ErrorProtocol},

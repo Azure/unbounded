@@ -5,7 +5,7 @@ false). It compares each successful HTTP
 or direct-UDS blob stream against the deterministic catalog while retaining normal size/status
 classification. Only exact-size digest failures emit page evidence. Offsets are
 relative to the complete object, including tar metadata for OCI layers (raw blobs
-have no tar framing). Pages are 16 MiB; at
+have no tar framing). Pages follow the SDK page size (4 MiB in this experimental build); at
 most eight mismatching page hash pairs are retained. Comparison continues after
 the cap and reports the omitted count. No payload is retained or logged.
 

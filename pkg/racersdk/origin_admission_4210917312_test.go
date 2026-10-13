@@ -75,7 +75,7 @@ func TestOriginConfiguredAdmissionReservesMetadata(t *testing.T) {
 			defer func() { cancel(); <-done }()
 
 			for i := range limits.maxRequests {
-				response := originExchange(t, path, "GET", "Range: bytes=0-16777215\r\n")
+				response := originExchange(t, path, "GET", "Range: bytes=0-4194303\r\n")
 				require.Equal(t, http.StatusPartialContent, response.StatusCode, "content slot %d", i)
 			}
 
@@ -98,7 +98,7 @@ func TestOriginConfiguredAdmissionReservesMetadata(t *testing.T) {
 			for _, method := range []string{"GET", "HEAD"} {
 				fields := "Connection: close\r\n"
 				if method == "GET" {
-					fields += "Range: bytes=0-16777215\r\n"
+					fields += "Range: bytes=0-4194303\r\n"
 				}
 
 				response := originExchange(t, path, method, fields)

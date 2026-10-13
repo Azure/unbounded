@@ -41,6 +41,8 @@ func (r *diagnosticChunks) Read(p []byte) (int, error) {
 }
 
 func TestDiagnosticReader(t *testing.T) {
+	require.Equal(t, 4<<20, diagnosticPageSize)
+
 	data := make([]byte, diagnosticPageSize+1031)
 	for i := range data {
 		data[i] = byte(i * 31)
@@ -69,6 +71,9 @@ func TestDiagnosticReader(t *testing.T) {
 
 		require.Len(t, e.records, 1)
 		r := e.records[0]
+		require.Equal(t, int64(offset/(4<<20)), r.Index)
+		require.Equal(t, r.Index*(4<<20), r.Offset)
+		require.Equal(t, min(int64(4<<20), int64(len(data))-r.Offset), r.Length)
 		require.Equal(t, sha256.Sum256(actual[r.Offset:r.Offset+r.Length]), r.Actual)
 		require.Equal(t, sha256.Sum256(data[r.Offset:r.Offset+r.Length]), r.Expected)
 	}

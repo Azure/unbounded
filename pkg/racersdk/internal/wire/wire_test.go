@@ -82,10 +82,10 @@ func TestRequestWire(t *testing.T) {
 	}{
 		{"HEAD", "", OperationHead, true},
 		{"HEAD", "If-Match: \"\"\r\n", OperationHead, true},
-		{"GET", "Range: bytes=0-16777215\r\n", OperationBootstrap, true},
-		{"GET", "Range: bytes=16777216-33554431\r\nIf-Match: \"a,b\\c\"\r\n", OperationPinned, true},
+		{"GET", "Range: bytes=0-4194303\r\n", OperationBootstrap, true},
+		{"GET", "Range: bytes=4194304-8388607\r\nIf-Match: \"a,b\\c\"\r\n", OperationPinned, true},
 		{"GET", "Range: bytes=0-1\r\nIf-Match: \"v\"\r\n", OperationPinned, true},
-		{"GET", "Range: bytes=16777216-50331647\r\nIf-Match: \"v\"\r\n", OperationPinned, false},
+		{"GET", "Range: bytes=4194304-12582911\r\nIf-Match: \"v\"\r\n", OperationPinned, false},
 	} {
 		head := rawRequest(tt.method, tt.fields+"Racer-Metadata: opaque,\xff value\r\nAuthorization: Bearer secret\r\n")
 
@@ -110,8 +110,8 @@ func TestRequestWire(t *testing.T) {
 	}
 
 	for _, fields := range []string{
-		"", "Range: bytes=0-1\r\n", "Range: bytes=1-16777215\r\nIf-Match: \"v\"\r\n", "Range: bytes=0-16777216\r\nIf-Match: \"v\"\r\n", "Range: bytes=-1\r\nIf-Match: \"v\"\r\n", "Range: bytes=0-\r\nIf-Match: \"v\"\r\n",
-		"Range: bytes=0-16777215\r\nContent-Length: 1\r\n", "Range: bytes=0-16777215\r\nIf-Match: W/\"v\"\r\n",
+		"", "Range: bytes=0-1\r\n", "Range: bytes=1-4194303\r\nIf-Match: \"v\"\r\n", "Range: bytes=0-4194304\r\nIf-Match: \"v\"\r\n", "Range: bytes=-1\r\nIf-Match: \"v\"\r\n", "Range: bytes=0-\r\nIf-Match: \"v\"\r\n",
+		"Range: bytes=0-4194303\r\nContent-Length: 1\r\n", "Range: bytes=0-4194303\r\nIf-Match: W/\"v\"\r\n",
 	} {
 		_, err := ParseRequestHead(rawRequest("GET", fields), true)
 		assertKind(t, err, ErrorInvalidArgument)
@@ -219,8 +219,8 @@ func TestResponseWire(t *testing.T) {
 		{Request{Operation: OperationHead}, 200, "Content-Length: 9223372036854775807\r\n", math.MaxInt64, 0},
 		{bootstrap, 200, "Content-Length: 0\r\nContent-Type: application/octet-stream\r\n", 0, 0},
 		{bootstrap, 206, "Content-Length: 1\r\nContent-Range: bytes 0-0/1\r\nContent-Type: application/octet-stream\r\n", 1, 1},
-		{bootstrap, 206, "Content-Length: 16777216\r\nContent-Range: bytes 0-16777215/16777217\r\nContent-Type: application/octet-stream\r\n", PageSize + 1, int64(PageSize)},
-		{pinned, 206, "Content-Length: 1\r\nContent-Range: bytes 16777216-16777216/16777217\r\nContent-Type: application/octet-stream\r\n", PageSize + 1, 1},
+		{bootstrap, 206, "Content-Length: 4194304\r\nContent-Range: bytes 0-4194303/4194305\r\nContent-Type: application/octet-stream\r\n", PageSize + 1, int64(PageSize)},
+		{pinned, 206, "Content-Length: 1\r\nContent-Range: bytes 4194304-4194304/4194305\r\nContent-Type: application/octet-stream\r\n", PageSize + 1, 1},
 	} {
 		got, err := ParseResponseHead(rawResponse(tt.status, meta+tt.fields), tt.request, nil)
 		if err != nil || got.Metadata.Size != tt.size || got.Length != tt.length || got.Metadata.ETag != tag {
@@ -399,7 +399,7 @@ func TestSnapshotContentTypeMustMatchIncludingPresence(t *testing.T) {
 }
 
 func FuzzWireHead(f *testing.F) {
-	for _, head := range [][]byte{rawRequest("HEAD", ""), rawRequest("GET", "Range: bytes=0-16777215\r\nAuthorization: opaque\xff\r\n"), rawRequest("HEAD", "Content-Length: 0\r\nContent-Length: 0\r\n"), rawResponse(200, "Content-Length: 0\r\nETag: \"\"\r\nRacer-Expires-At: 0\r\nContent-Type: application/octet-stream\r\n"), rawResponse(416, "Content-Length: 0\r\nContent-Range: bytes */9223372036854775807\r\n")} {
+	for _, head := range [][]byte{rawRequest("HEAD", ""), rawRequest("GET", "Range: bytes=0-4194303\r\nAuthorization: opaque\xff\r\n"), rawRequest("HEAD", "Content-Length: 0\r\nContent-Length: 0\r\n"), rawResponse(200, "Content-Length: 0\r\nETag: \"\"\r\nRacer-Expires-At: 0\r\nContent-Type: application/octet-stream\r\n"), rawResponse(416, "Content-Length: 0\r\nContent-Range: bytes */9223372036854775807\r\n")} {
 		f.Add(head)
 	}
 
@@ -524,7 +524,7 @@ func TestWholePages(t *testing.T) {
 }
 
 func FuzzRange(f *testing.F) {
-	for _, s := range []string{"bytes=0-0", "bytes=-0", "bytes=16777216-", "bytes=0-9223372036854775807", "bytes=9223372036854775807-9223372036854775807"} {
+	for _, s := range []string{"bytes=0-0", "bytes=-0", "bytes=4194304-", "bytes=0-9223372036854775807", "bytes=9223372036854775807-9223372036854775807"} {
 		f.Add(s, uint64(math.MaxInt64))
 	}
 

@@ -165,13 +165,13 @@ func TestGetRanges(t *testing.T) {
 
 func TestGetPageCredits(t *testing.T) {
 	const (
-		first = PageSize - 1
-		end   = PageSize + 2
+		first = (4 << 20) - 1
+		end   = (4 << 20) + 2
 	)
 
 	c := rawServer(t, func(conn net.Conn, r *bufio.Reader, head []byte) {
 		if !strings.Contains(string(head), "Racer-Page-Credits: 2\r\n") ||
-			!strings.Contains(string(head), fmt.Sprintf("Racer-Byte-Credits: %d\r\n", 2*PageSize)) {
+			!strings.Contains(string(head), "Racer-Byte-Credits: 8388608\r\n") {
 			t.Errorf("subscription must grant two pages and 2*PageSize bytes: %q", head)
 			return
 		}

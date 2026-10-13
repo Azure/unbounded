@@ -81,7 +81,7 @@ func TestOriginExpiryOverflow(t *testing.T) {
 
 					defer func() { cancel(); <-done }()
 
-					method, fields := "GET", "Range: bytes=0-16777215\r\n"
+					method, fields := "GET", "Range: bytes=0-4194303\r\n"
 					if mode == "head" {
 						method, fields = "HEAD", ""
 					}

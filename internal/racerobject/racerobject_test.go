@@ -230,7 +230,7 @@ func TestOriginBridgeHeadBootstrapPinnedAndEmpty(t *testing.T) {
 					t.Error("GET changed absent version to an empty parameter")
 				}
 
-				if aws.ToString(in.IfMatch) != `"opaque-multipart-2"` || aws.ToString(in.VersionId) != version || aws.ToString(in.Key) != "a/../exact%2F +雪" || aws.ToString(in.Bucket) != "bucket" || aws.ToString(in.Range) != "bytes=16777216-16777218" {
+				if aws.ToString(in.IfMatch) != `"opaque-multipart-2"` || aws.ToString(in.VersionId) != version || aws.ToString(in.Key) != "a/../exact%2F +雪" || aws.ToString(in.Bucket) != "bucket" || aws.ToString(in.Range) != "bytes=4194304-4194306" {
 					t.Error("GET was not pinned to exact identity/range")
 				}
 

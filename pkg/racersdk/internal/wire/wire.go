@@ -26,7 +26,7 @@ const (
 	MaxFieldBytes           = 8192
 	ObjectPrefix            = "/v1/objects/"
 	ClientObjectPrefix      = "/v2/objects/"
-	PageSize                = 16 * 1024 * 1024
+	PageSize                = 4 * 1024 * 1024
 	FrameSize               = 21
 	CreditSize              = 12
 	PageFrame          byte = 1

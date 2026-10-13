@@ -47,7 +47,7 @@ func TestFormatRedacts(t *testing.T) {
 		}
 	}
 
-	if text := fmt.Sprint(o); !strings.Contains(text, `ETag: "\"v\""`) || !strings.Contains(text, "Offset: 16777216") {
+	if text := fmt.Sprint(o); !strings.Contains(text, `ETag: "\"v\""`) || !strings.Contains(text, "Offset: 4194304") {
 		t.Errorf("origin request = %s", text)
 	}
 }
