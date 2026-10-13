@@ -426,22 +426,32 @@ func s3HTTPError(code int) error {
 type SidecarConfig struct {
 	Namespace string
 	Buckets   []string
+	// API selects s3 (the default) or azure. Buckets names Azure containers.
+	API string
 }
 
 type sidecar struct {
 	client *racersdk.Client
 	scope  scope
+	api    string
 }
 
 // NewSidecar serves a read-only, trusted pod endpoint. The caller owns the client
-// and must bind the server to loopback. SigV4 headers are ignored, not verified or
-// forwarded. Presigned query parameters and unsupported S3 operations are rejected.
-// Only known auth/plumbing x-amz headers are accepted. Owner checks, SSE-C,
-// requester-pays, and checksum requests are unsupported and return NotImplemented.
+// and must bind the server to loopback. Authorization is ignored, not verified or
+// forwarded. Signed query parameters and unsupported operations are rejected.
+// Only known auth/plumbing provider headers and supported read headers are accepted.
 // Install this handler directly: a path-cleaning mux changes object identities.
 func NewSidecar(client *racersdk.Client, config SidecarConfig) (http.Handler, error) {
 	if client == nil {
 		return nil, errors.New("racer-object: missing sidecar client")
+	}
+
+	if config.API == "" {
+		config.API = "s3"
+	}
+
+	if config.API != "s3" && config.API != "azure" {
+		return nil, errors.New("racer-object: invalid sidecar API")
 	}
 
 	bound, err := newScope(config.Namespace, config.Buckets)
@@ -453,12 +463,20 @@ func NewSidecar(client *racersdk.Client, config SidecarConfig) (http.Handler, er
 		return nil, errors.New("racer-object: invalid sidecar bucket")
 	}
 
-	return &sidecar{client: client, scope: bound}, nil
+	return &sidecar{client: client, scope: bound, api: config.API}, nil
 }
 
 func (s *sidecar) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.api == "azure" {
+		w.Header().Set("x-ms-version", azureSidecarVersion)
+	}
+
 	if failure := s.serve(w, r); failure != 0 {
-		failure.write(w, r)
+		if s.api == "azure" {
+			writeAzureSidecarFailure(w, r, failure)
+		} else {
+			failure.write(w, r)
+		}
 	}
 }
 
@@ -496,12 +514,22 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 
 	if none.present && none.matches(m.ETag, true) {
 		w.Header().Set("ETag", m.ETag)
+
+		if s.api == "azure" {
+			writeAzureSidecarHeaders(w.Header(), version)
+		}
+
 		w.WriteHeader(http.StatusNotModified)
 
 		return 0
 	}
 
-	offset, length, partial, status := sidecarRange(r.Header, uint64(m.Size))
+	rangeHeaders := r.Header
+	if s.api == "azure" {
+		rangeHeaders = azureSidecarRangeHeaders(r)
+	}
+
+	offset, length, partial, status := sidecarRange(rangeHeaders, uint64(m.Size))
 	if status != 0 {
 		if status == http.StatusRequestedRangeNotSatisfiable {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", m.Size))
@@ -510,7 +538,7 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 		return sidecarFailure(status)
 	}
 
-	read := sidecarRead{m, version, offset, length, partial}
+	read := sidecarRead{metadata: m, version: version, offset: offset, length: length, partial: partial, api: s.api}
 	if r.Method == http.MethodHead {
 		read.writeHeaders(w)
 		return 0
@@ -557,9 +585,22 @@ func (read sidecarRead) writeBody(w http.ResponseWriter, v *racersdk.Object) sid
 }
 
 func (s *sidecar) request(r *http.Request) (racersdk.Request, string, sidecarFailure) {
+	if s.api == "azure" {
+		if !azureSidecarSupportedHeaders(r.Header) {
+			return racersdk.Request{}, "", http.StatusNotImplemented
+		}
+
+		return s.requestObject(r, azureSidecarQuery)
+	}
+
 	if !sidecarSupportedHeaders(r.Header) {
 		return racersdk.Request{}, "", http.StatusNotImplemented
 	}
+
+	return s.requestObject(r, sidecarVersion)
+}
+
+func (s *sidecar) requestObject(r *http.Request, parseQuery func(*http.Request) (string, sidecarFailure)) (racersdk.Request, string, sidecarFailure) {
 	// Split before decoding so an escaped slash is key data, not a bucket boundary.
 	// Decode each part exactly once; never clean dot segments or repeated slashes.
 	path, ok := strings.CutPrefix(r.URL.EscapedPath(), "/")
@@ -577,7 +618,7 @@ func (s *sidecar) request(r *http.Request) (racersdk.Request, string, sidecarFai
 		return racersdk.Request{}, "", http.StatusForbidden
 	}
 
-	version, failure := sidecarVersion(r)
+	version, failure := parseQuery(r)
 	if failure != 0 {
 		return racersdk.Request{}, "", failure
 	}
@@ -634,6 +675,7 @@ type sidecarRead struct {
 	version        string
 	offset, length uint64
 	partial        bool
+	api            string
 }
 
 func (read sidecarRead) writeHeaders(w http.ResponseWriter) {
@@ -649,7 +691,9 @@ func (read sidecarRead) writeHeaders(w http.ResponseWriter) {
 
 	h.Set("Content-Type", contentType)
 
-	if read.version != "" {
+	if read.api == "azure" {
+		writeAzureSidecarHeaders(h, read.version)
+	} else if read.version != "" {
 		h.Set("x-amz-version-id", read.version)
 	}
 
@@ -663,7 +707,7 @@ func (read sidecarRead) writeHeaders(w http.ResponseWriter) {
 	w.WriteHeader(status)
 }
 
-// sidecarFailure is an HTTP status with one fixed S3 code. Zero means success.
+// sidecarFailure is an HTTP status with a fixed code for each API. Zero means success.
 // Messages come only from StatusText, never from requests or upstream errors.
 type sidecarFailure int
 
@@ -682,8 +726,12 @@ var sidecarCodes = map[sidecarFailure]string{
 }
 
 func (f sidecarFailure) write(w http.ResponseWriter, r *http.Request) {
+	f.writeCode(w, r, sidecarCodes[f])
+}
+
+func (f sidecarFailure) writeCode(w http.ResponseWriter, r *http.Request, code string) {
 	// Both fields are fixed ASCII text without XML metacharacters.
-	body := "<Error><Code>" + sidecarCodes[f] + "</Code><Message>" + http.StatusText(int(f)) + "</Message></Error>"
+	body := "<Error><Code>" + code + "</Code><Message>" + http.StatusText(int(f)) + "</Message></Error>"
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
