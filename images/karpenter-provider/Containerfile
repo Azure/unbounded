@@ -13,4 +13,3 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} make unbounded-karpenter
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /src/bin/unbounded-karpenter-provider /unbounded-karpenter-provider
 ENTRYPOINT ["/unbounded-karpenter-provider"]
-
