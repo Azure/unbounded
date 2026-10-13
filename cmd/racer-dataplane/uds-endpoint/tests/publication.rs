@@ -74,19 +74,34 @@ fn prepare_reports_invalid_names_before_host_ownership_checks() {
 
 #[cfg(feature = "simulation")]
 #[test]
-fn simulation_default_validation_distinguishes_names_from_ownership() {
+fn simulation_layout_validation_distinguishes_names_from_ownership() {
     use uds_endpoint::simulation::BoundSocket as SimSocket;
     use uring_runtime::reactor::simulation::Simulation;
 
     let sim = Simulation::new();
     let directory = PathBuf::from("/sockets");
-    let next = Rc::new(SimSocket::bind(sim.clone(), directory.clone(), "pending-next").unwrap());
-    let old = Rc::new(SimSocket::bind(sim.clone(), directory.clone(), CANONICAL).unwrap());
+    let next =
+        Rc::new(SimSocket::bind(sim.clone(), directory.clone(), layout(), "pending-next").unwrap());
+    let old =
+        Rc::new(SimSocket::bind(sim.clone(), directory.clone(), layout(), "pending-old").unwrap());
+    let mut publication = Publication::default();
+    publication
+        .publish(
+            Replacement::prepare(old.clone(), None, "pending-old".into(), CANONICAL.into())
+                .unwrap(),
+        )
+        .unwrap();
+    publication.commit();
     for (temporary, canonical) in invalid_name_pairs() {
+        let reason = if canonical == CANONICAL {
+            uds_endpoint::Error::InvalidName
+        } else {
+            uds_endpoint::Error::InvalidLayout
+        };
         assert_error(
             &next.validate_names(&temporary, &canonical).unwrap_err(),
             io::ErrorKind::InvalidInput,
-            uds_endpoint::Error::InvalidName,
+            reason,
         );
     }
     next.validate_names("pending-next", CANONICAL).unwrap();
