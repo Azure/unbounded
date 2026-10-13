@@ -1,5 +1,6 @@
 pub use codec::*;
 pub use definitions::*;
+mod streaming;
 use std::time::Duration;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -571,6 +572,8 @@ mod codec {
         out
     }
 
+    // Private-record callers still need a Value. Wire DTOs use the schema-sized
+    // streaming pre-validator below instead of building this compatibility tree.
     pub fn strict_json(b: &[u8], limit: usize) -> Result<Value> {
         if b.len() > limit {
             return Err(Error::Overloaded);
@@ -592,8 +595,19 @@ mod codec {
         Ok(std::mem::take(&mut v.0))
     }
 
-    fn decode<T: serde::de::DeserializeOwned>(b: &[u8], limit: usize) -> Result<T> {
-        serde_json::from_value(strict_json(b, limit)?).map_err(|_| Error::InvalidRequest)
+    fn decode<T: serde::de::DeserializeOwned>(
+        b: &[u8],
+        limit: usize,
+        shape: streaming::Shape,
+    ) -> Result<T> {
+        if b.len() > limit {
+            return Err(Error::Overloaded);
+        }
+        // Keep escaped valid base64 in zeroizing storage, not serde's scratch.
+        let canonical = b.contains(&b'\\').then(|| canonicalize_json_strings(b));
+        let input = canonical.as_deref().map_or(b, Vec::as_slice);
+        streaming::validate(input, shape)?;
+        serde_json::from_slice(input).map_err(|_| Error::InvalidRequest)
     }
 
     fn encode<T: Serialize>(v: &T, limit: usize) -> Result<Vec<u8>> {
@@ -721,7 +735,7 @@ mod codec {
     }
 
     pub fn decode_enrollment_request(b: &[u8]) -> Result<EnrollmentRequest> {
-        let r: Request = decode(b, MAX_ENROLLMENT_BYTES)?;
+        let r: Request = decode(b, MAX_ENROLLMENT_BYTES, streaming::REQUEST)?;
         if r.shares == 0 {
             return Err(Error::InvalidRequest);
         }
@@ -783,7 +797,7 @@ mod codec {
     }
 
     pub fn decode_enrollment_response(b: &[u8]) -> Result<EnrollmentResponse> {
-        let r: Response = decode(b, MAX_ENROLLMENT_BYTES)?;
+        let r: Response = decode(b, MAX_ENROLLMENT_BYTES, streaming::RESPONSE)?;
         header(r.schema_version, &r.cluster)?;
         uuid(&r.node)?;
         uuid(&r.enrollment)?;
@@ -950,15 +964,7 @@ mod codec {
     }
 
     pub fn decode_publication(b: &[u8]) -> Result<Publication> {
-        let value = strict_json(b, MAX_PUBLICATION_BYTES)?;
-        if value
-            .get("members")
-            .and_then(Value::as_array)
-            .is_some_and(|a| a.len() > MAX_MEMBERS)
-        {
-            return Err(Error::Overloaded);
-        }
-        let p: PublicationDto = serde_json::from_value(value).map_err(|_| Error::InvalidRequest)?;
+        let p: PublicationDto = decode(b, MAX_PUBLICATION_BYTES, streaming::PUBLICATION)?;
         publication_from_dto(p)
     }
 
@@ -1151,7 +1157,7 @@ mod codec {
     }
 
     pub fn apply_delta(base: &Publication, bytes: &[u8]) -> Result<Publication> {
-        let d: DeltaDto = decode(bytes, 4 * 1024 * 1024)?;
+        let d: DeltaDto = decode(bytes, 4 * 1024 * 1024, streaming::DELTA)?;
         if d.delta_version != 1
             || d.cluster != base.cluster.0
             || counter(&d.base_sequence)? != base.sequence.0
@@ -1247,8 +1253,7 @@ mod codec {
     }
 
     pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
-        let scratch = JsonScratch(strict_json(b, MAX_BUNDLE_BYTES)?);
-        let r = Bundle::deserialize(&scratch.0).map_err(|_| Error::InvalidRequest)?;
+        let r: Bundle = decode(b, MAX_BUNDLE_BYTES, streaming::BUNDLE)?;
         header(r.schema_version, &r.cluster)?;
         let generation = BundleGeneration(counter(&r.generation)?);
         let roots = certificates(&r.peer_trust_roots)?;
@@ -1374,7 +1379,7 @@ mod codec {
         struct Failure {
             code: String,
         }
-        let f: Failure = decode(b, MAX_ENROLLMENT_BYTES)?;
+        let f: Failure = decode(b, MAX_ENROLLMENT_BYTES, streaming::FAILURE)?;
         let code = match f.code.as_str() {
             "invalid_request" => ProtocolFailure::InvalidRequest,
             "unauthenticated" => ProtocolFailure::Unauthenticated,
@@ -1864,6 +1869,41 @@ mod codec {
                         vector["name"]
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn shared_control_characters() {
+            let vectors: Value =
+                serde_json::from_slice(&fixture("control-characters.json")).unwrap();
+            for vector in vectors.as_array().unwrap() {
+                let text = vector["text"].as_str().unwrap();
+                let p = decode_publication(&fixture("publication.json")).unwrap();
+                let mut p = serde_json::to_value(dto(&p).unwrap()).unwrap();
+                p["members"][1]["rdma_nics"][0]["device"] = text.into();
+                let decoded = decode_publication(&serde_json::to_vec(&p).unwrap());
+                if vector["device_valid"] == true {
+                    let decoded = decoded.unwrap();
+                    assert_eq!(decoded.members[1].rails[0].device, text);
+                    let encoded = encode_publication(&decoded).unwrap();
+                    assert_eq!(
+                        decode_publication(&encoded).unwrap().members[1].rails[0].device,
+                        text
+                    );
+                } else {
+                    assert_eq!(decoded.err(), Some(Error::InvalidRequest));
+                }
+                let mut response =
+                    decode_enrollment_response(&fixture("bootstrap-response.json")).unwrap();
+                response.block_devices = Some(text.into());
+                let encoded = encode_enrollment_response(&response).unwrap();
+                assert_eq!(
+                    decode_enrollment_response(&encoded)
+                        .unwrap()
+                        .block_devices
+                        .as_deref(),
+                    Some(text)
+                );
             }
         }
 
@@ -2523,10 +2563,7 @@ mod codec {
                     r#"{{"cache":"cache","id":"id","purpose":"page","material":"secret"{suffix}}}"#
                 );
                 MATERIAL_DROPS.with(|drops| drops.set(0));
-                // Deserialize from Value exactly as decode_bundle does, preserving
-                // material-before-state ordering even with sorted JSON object keys.
-                let value: Value = serde_json::from_str(&json).unwrap();
-                assert!(Key::deserialize(&value).is_err());
+                assert!(serde_json::from_str::<Key>(&json).is_err());
                 assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 1);
             }
             MATERIAL_DROPS.with(|drops| drops.set(0));
@@ -2547,7 +2584,8 @@ mod codec {
                     decode_bundle(malformed.as_bytes()),
                     Err(Error::InvalidRequest)
                 ));
-                assert!(MATERIAL_DROPS.with(|drops| drops.get()) > 0);
+                // The pre-validator rejects malformed shape before secret DTOs.
+                assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 0);
             }
         }
 

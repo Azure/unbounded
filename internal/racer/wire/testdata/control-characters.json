@@ -1,0 +1,12 @@
+[
+  {"name":"nul","text":"a\u0000b","device_valid":false},
+  {"name":"newline","text":"a\nb","device_valid":false},
+  {"name":"carriage return","text":"a\rb","device_valid":false},
+  {"name":"tab","text":"a\tb","device_valid":true},
+  {"name":"backspace","text":"a\bb","device_valid":true},
+  {"name":"form feed","text":"a\fb","device_valid":true},
+  {"name":"unit separator","text":"a\u001fb","device_valid":true},
+  {"name":"delete","text":"a\u007fb","device_valid":true},
+  {"name":"quote and backslash","text":"a\"\\b","device_valid":true},
+  {"name":"line separators","text":"a\u2028\u2029b","device_valid":true}
+]

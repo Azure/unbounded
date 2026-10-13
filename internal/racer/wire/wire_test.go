@@ -134,6 +134,48 @@ func TestBootstrapBlockDevicesVectors(t *testing.T) {
 	}
 }
 
+func TestSharedControlCharacters(t *testing.T) {
+	var vectors []struct {
+		Name, Text  string
+		DeviceValid bool `json:"device_valid"`
+	}
+	require.NoError(t, json.Unmarshal(fixture(t, "control-characters.json"), &vectors))
+
+	for _, vector := range vectors {
+		t.Run(vector.Name, func(t *testing.T) {
+			p, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
+			require.NoError(t, err)
+
+			p.Members[1].RDMANICs[0].Device = vector.Text
+			raw, err := json.Marshal(p)
+			require.NoError(t, err)
+
+			decoded, err := DecodePublication(bytes.NewReader(raw))
+			if vector.DeviceValid {
+				require.NoError(t, err)
+				require.Equal(t, vector.Text, decoded.Members[1].RDMANICs[0].Device)
+				encoded, err := EncodePublication(decoded)
+				require.NoError(t, err)
+				again, err := DecodePublication(bytes.NewReader(encoded))
+				require.NoError(t, err)
+				require.Equal(t, decoded, again)
+			} else {
+				require.ErrorIs(t, err, InvalidRequest)
+			}
+
+			response, err := DecodeBootstrapResponse(bytes.NewReader(fixture(t, "bootstrap-response.json")))
+			require.NoError(t, err)
+
+			response.BlockDevices = vector.Text
+			encoded, err := EncodeBootstrap(response)
+			require.NoError(t, err)
+			got, err := DecodeBootstrapResponse(bytes.NewReader(encoded))
+			require.NoError(t, err)
+			require.Equal(t, vector.Text, got.BlockDevices)
+		})
+	}
+}
+
 func TestCanonicalHashSemantics(t *testing.T) {
 	v, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
 	require.NoError(t, err)
