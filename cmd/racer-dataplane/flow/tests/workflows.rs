@@ -539,10 +539,7 @@ mod quota_tests {
         ));
         assert!(matches!(
             &quotas.policy().rejected.lock().unwrap()[..],
-            [
-                Rejection::Keys { used: 1, limit: 1 },
-                Rejection::Keys { used: 1, limit: 1 }
-            ]
+            [Rejection::Keys { used: 1, limit: 1 }]
         ));
         shared.register(&Waker::from(wake.clone()));
         std::thread::spawn(move || drop(donor)).join().unwrap();
@@ -601,8 +598,8 @@ mod quota_tests {
             let rejected = quotas.policy().rejected.lock().unwrap();
             assert_eq!(
                 rejected.len(),
-                5,
-                "shared attempts once; local retries once"
+                3,
+                "each call attempts once without reclaimed backing"
             );
             for event in rejected.iter() {
                 assert!(matches!(
