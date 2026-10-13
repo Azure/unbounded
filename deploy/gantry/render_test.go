@@ -214,41 +214,6 @@ func TestRendersOptionalMetricsService(t *testing.T) {
 	}
 }
 
-func TestRendersConfiguredAgentUpdateStrategy(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		name string
-		args []string
-		want string
-	}{
-		{name: "default", want: "maxUnavailable: 50%"},
-		{
-			name: "override",
-			args: []string{"--set-string", "updateStrategy.rollingUpdate.maxUnavailable=10%"},
-			want: "maxUnavailable: 10%",
-		},
-		{
-			name: "count",
-			args: []string{"--set", "updateStrategy.rollingUpdate.maxUnavailable=3"},
-			want: "maxUnavailable: 3\n",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			raw, err := os.ReadFile(filepath.Join(renderChart(t, false, tc.args...), "daemonset.yaml"))
-			if err != nil {
-				t.Fatalf("read rendered agent DaemonSet: %v", err)
-			}
-
-			if !bytes.Contains(raw, []byte(tc.want)) {
-				t.Fatalf("rendered agent DaemonSet does not contain %q", tc.want)
-			}
-		})
-	}
-}
-
 func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
 	t.Parallel()
 
@@ -798,4 +763,39 @@ func sourceFile(t *testing.T) string {
 	}
 
 	return file
+}
+
+func TestRendersConfiguredAgentUpdateStrategy(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "default", want: "maxUnavailable: 50%"},
+		{
+			name: "override",
+			args: []string{"--set-string", "updateStrategy.rollingUpdate.maxUnavailable=10%"},
+			want: "maxUnavailable: 10%",
+		},
+		{
+			name: "count",
+			args: []string{"--set", "updateStrategy.rollingUpdate.maxUnavailable=3"},
+			want: "maxUnavailable: 3\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := os.ReadFile(filepath.Join(renderChart(t, false, tc.args...), "daemonset.yaml"))
+			if err != nil {
+				t.Fatalf("read rendered agent DaemonSet: %v", err)
+			}
+
+			if !bytes.Contains(raw, []byte(tc.want)) {
+				t.Fatalf("rendered agent DaemonSet does not contain %q", tc.want)
+			}
+		})
+	}
 }
