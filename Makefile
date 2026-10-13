@@ -90,6 +90,7 @@ REBOUND_CMD=./cmd/rebound
 REBOUND_IMAGE ?= $(CONTAINER_REGISTRY)/rebound:$(VERSION_TAG)
 REBOUND_REPLICAS ?= 2
 REBOUND_MAX_TTL ?= 1h
+REBOUND_MAX_NODES_PER_GRANT ?= 500
 REBOUND_EXCLUDED_NAMESPACES ?= kube-system,unbounded-system
 REBOUND_ADMIN_GROUPS ?= system:masters
 
@@ -1059,6 +1060,7 @@ rebound-manifests: ## Render rebound manifests into deploy/rebound/rendered
 		--set Image=$(REBOUND_IMAGE) \
 		--set Replicas=$(REBOUND_REPLICAS) \
 		--set MaxTTL=$(REBOUND_MAX_TTL) \
+		--set MaxNodesPerGrant=$(REBOUND_MAX_NODES_PER_GRANT) \
 		--set 'ExcludedNamespaces=$(REBOUND_EXCLUDED_NAMESPACES)' \
 		--set 'AdminGroups=$(REBOUND_ADMIN_GROUPS)'
 

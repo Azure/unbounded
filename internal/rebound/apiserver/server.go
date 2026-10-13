@@ -40,10 +40,11 @@ import (
 
 // Options holds serving and delegated security settings.
 type Options struct {
-	SecureServing  *genericoptions.SecureServingOptions
-	Authentication *genericoptions.DelegatingAuthenticationOptions
-	Authorization  *genericoptions.DelegatingAuthorizationOptions
-	MaxTTL         time.Duration
+	SecureServing    *genericoptions.SecureServingOptions
+	Authentication   *genericoptions.DelegatingAuthenticationOptions
+	Authorization    *genericoptions.DelegatingAuthorizationOptions
+	MaxTTL           time.Duration
+	MaxNodesPerGrant int
 }
 
 func NewOptions() *Options {
@@ -53,6 +54,7 @@ func NewOptions() *Options {
 	return &Options{
 		SecureServing: serving, Authentication: genericoptions.NewDelegatingAuthenticationOptions(),
 		Authorization: genericoptions.NewDelegatingAuthorizationOptions(), MaxTTL: time.Hour,
+		MaxNodesPerGrant: 500,
 	}
 }
 
@@ -61,6 +63,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	o.Authentication.AddFlags(fs)
 	o.Authorization.AddFlags(fs)
 	fs.DurationVar(&o.MaxTTL, "max-ttl", o.MaxTTL, "Maximum and default NodeGrant lifetime.")
+	fs.IntVar(&o.MaxNodesPerGrant, "max-nodes-per-grant", o.MaxNodesPerGrant, "Maximum number of nodes in one NodeGrant.")
 }
 
 // ServerConfig supplies the ledger client and an externally managed serving certificate.
@@ -90,6 +93,10 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 
 	if o.MaxTTL <= 0 {
 		return nil, errors.New("max-ttl must be positive")
+	}
+
+	if o.MaxNodesPerGrant <= 0 {
+		return nil, errors.New("max-nodes-per-grant must be positive")
 	}
 
 	if cfg.Clock == nil {
@@ -185,7 +192,7 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 
-	storage := newStorage(ledger.Store{Client: cfg.Client, Namespace: cfg.Namespace}, o.MaxTTL, cfg.Clock)
+	storage := newStorage(ledger.Store{Client: cfg.Client, Namespace: cfg.Namespace}, o.MaxTTL, o.MaxNodesPerGrant, cfg.Clock)
 	group := genericapiserver.NewDefaultAPIGroupInfo(rebound.GroupName, scheme, runtime.NewParameterCodec(scheme), codecs)
 
 	group.VersionedResourcesStorageMap[rebound.SchemeGroupVersion.Version] = map[string]rest.Storage{rebound.Resource: storage}

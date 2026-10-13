@@ -27,6 +27,7 @@ kubectl delete ngr train
 - **Atomic:** a grant gets all listed nodes or none. If any node is held by another
   grant, create fails with `409 Conflict` and names the busy nodes.
 - **TTL:** `spec.ttl` is optional. It defaults to `--max-ttl` (1h) and may not exceed it.
+- **Nodes:** a grant may name at most `--max-nodes-per-grant` nodes (500 by default).
 - **Immutable:** grants cannot be updated or renewed. Delete and create again, but
   note that deleting a grant deletes its pods (see below).
 - **Status:** the server sets `status.holder` (the user who created the grant) and
@@ -92,6 +93,7 @@ Set these Make variables to change the rendered manifests:
 | `REBOUND_IMAGE` | `Image` | `ghcr.io/azure/rebound:<version>` |
 | `REBOUND_REPLICAS` | `Replicas` | `2` |
 | `REBOUND_MAX_TTL` | `MaxTTL` | `1h` |
+| `REBOUND_MAX_NODES_PER_GRANT` | `MaxNodesPerGrant` | `500` |
 | `REBOUND_EXCLUDED_NAMESPACES` | `ExcludedNamespaces` | `kube-system,unbounded-system` |
 | `REBOUND_ADMIN_GROUPS` | `AdminGroups` | `system:masters` |
 
@@ -105,6 +107,7 @@ in `ExcludedNamespaces`. `AdminGroups` may change rebound node labels and taints
 |---|---|---|
 | `--namespace` | `unbounded-system` | Namespace of the ledger, serving Secret, and leader lease |
 | `--max-ttl` | `1h` | Default and maximum grant TTL |
+| `--max-nodes-per-grant` | `500` | Maximum nodes in one grant |
 | `--excluded-namespaces` | `kube-system,unbounded-system` | Namespaces whose pods are never deleted |
 | `--leader-elect` | `true` | Run controllers and certificate rotation on one replica |
 | `--secure-port` | `8443` | HTTPS port for the API |

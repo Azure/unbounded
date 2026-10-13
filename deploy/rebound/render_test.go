@@ -74,13 +74,14 @@ func TestRender(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name, namespace, image, ttl, excluded string
-		replicas                              int32
-		values                                map[string]string
+		name, namespace, image, ttl, maxNodes, excluded string
+		replicas                                        int32
+		values                                          map[string]string
 	}{
-		{"defaults", "unbounded-system", "ghcr.io/azure/rebound:latest", "1h", "kube-system,unbounded-system", 2, nil},
-		{"overrides", "grants", "example.test/rebound:test", "30m", "platform,grants", 3, map[string]string{
+		{"defaults", "unbounded-system", "ghcr.io/azure/rebound:latest", "1h", "500", "kube-system,unbounded-system", 2, nil},
+		{"overrides", "grants", "example.test/rebound:test", "30m", "25", "platform,grants", 3, map[string]string{
 			"Namespace": "grants", "Image": "example.test/rebound:test", "MaxTTL": "30m", "Replicas": "3",
+			"MaxNodesPerGrant":   "25",
 			"ExcludedNamespaces": "platform,grants", "AdminGroups": "operators,admins",
 		}},
 	} {
@@ -109,6 +110,7 @@ func TestRender(t *testing.T) {
 			require.Equal(t, tc.image, container.Image)
 			require.ElementsMatch(t, []string{
 				"--namespace=$(POD_NAMESPACE)", "--max-ttl=" + tc.ttl,
+				"--max-nodes-per-grant=" + tc.maxNodes,
 				"--secure-port=8443", "--metrics-bind-address=:8080", "--health-probe-bind-address=:8081", "--leader-elect=true",
 				"--excluded-namespaces=" + tc.excluded,
 			}, container.Args)

@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/pflag"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -28,6 +30,28 @@ import (
 
 	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
 )
+
+func TestMaxNodesPerGrantOption(t *testing.T) {
+	_, kube, _ := fixture(t)
+	certPEM, keyPEM, err := certutil.GenerateSelfSignedCertKey("rebound.system.svc", nil, nil)
+	require.NoError(t, err)
+	cert, err := dynamiccertificates.NewStaticCertKeyContent("test", certPEM, keyPEM)
+	require.NoError(t, err)
+
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			opts := NewOptions()
+			require.Equal(t, 500, opts.MaxNodesPerGrant)
+
+			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			opts.AddFlags(flags)
+			require.NoError(t, flags.Parse([]string{"--max-nodes-per-grant=" + value}))
+
+			_, err := opts.NewServer(ServerConfig{Client: kube, Namespace: "system", Cert: cert})
+			require.EqualError(t, err, "max-nodes-per-grant must be positive")
+		})
+	}
+}
 
 func TestServerLoopback(t *testing.T) {
 	for _, allowAnonymous := range []bool{false, true} {
@@ -228,6 +252,7 @@ func TestServer(t *testing.T) {
 
 	opts := NewOptions()
 	opts.SecureServing.Listener = listener
+	opts.MaxNodesPerGrant = 2
 
 	var denied atomic.Bool
 
@@ -247,6 +272,8 @@ func TestServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	require.Equal(t, 2, s.storage.maxNodesPerGrant)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)

@@ -61,7 +61,7 @@ func fixture(t *testing.T) (*storage, *fake.Clientset, context.Context) {
 
 		return false, nil, nil
 	})
-	s := newStorage(ledger.Store{Client: client, Namespace: "system"}, time.Hour, clocktesting.NewFakeClock(time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)))
+	s := newStorage(ledger.Store{Client: client, Namespace: "system"}, time.Hour, 500, clocktesting.NewFakeClock(time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)))
 	s.observe(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ledger.ConfigMapName, Namespace: "system", ResourceVersion: "1"}}, false)
 	t.Cleanup(s.Destroy)
 	ctx := request.WithUser(request.WithNamespace(t.Context(), "team"), &user.DefaultInfo{Name: "alice"})
@@ -248,7 +248,7 @@ func TestCreateTimesFromFinalAttempt(t *testing.T) {
 	start := c.Now()
 	lookups, updates := 0, 0
 
-	client.PrependReactor("get", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
+	client.PrependReactor("list", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
 		lookups++
 
 		c.Step(time.Minute)
@@ -866,7 +866,7 @@ func TestWatchFilterAndSlowConsumer(t *testing.T) {
 
 func TestStorageErrors(t *testing.T) {
 	s, client, ctx := fixture(t)
-	client.PrependReactor("get", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
+	client.PrependReactor("list", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewServiceUnavailable("node API unavailable")
 	})
 

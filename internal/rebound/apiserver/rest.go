@@ -37,18 +37,19 @@ import (
 )
 
 type storage struct {
-	store    ledger.Store
-	clock    clock.Clock
-	maxTTL   time.Duration
-	mu       sync.Mutex
-	history  []snapshot
-	watchers map[*grantWatch]struct{}
-	closed   bool
+	store            ledger.Store
+	clock            clock.Clock
+	maxTTL           time.Duration
+	maxNodesPerGrant int
+	mu               sync.Mutex
+	history          []snapshot
+	watchers         map[*grantWatch]struct{}
+	closed           bool
 }
 
-func newStorage(store ledger.Store, maxTTL time.Duration, c clock.Clock) *storage {
+func newStorage(store ledger.Store, maxTTL time.Duration, maxNodesPerGrant int, c clock.Clock) *storage {
 	return &storage{
-		store: store, maxTTL: maxTTL, clock: c,
+		store: store, maxTTL: maxTTL, maxNodesPerGrant: maxNodesPerGrant, clock: c,
 		history: []snapshot{{ledger: ledger.New(), rv: "0"}}, watchers: make(map[*grantWatch]struct{}),
 	}
 }
@@ -226,6 +227,10 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		errs = append(errs, field.Required(field.NewPath("spec", "nodes"), "at least one node is required"))
 	}
 
+	if len(g.Spec.Nodes) > s.maxNodesPerGrant {
+		errs = append(errs, field.TooMany(field.NewPath("spec", "nodes"), len(g.Spec.Nodes), s.maxNodesPerGrant))
+	}
+
 	if ttl <= 0 || ttl > s.maxTTL {
 		errs = append(errs, field.Invalid(field.NewPath("spec", "ttl"), ttl.String(), "must be positive and no greater than "+s.maxTTL.String()))
 	}
@@ -272,14 +277,21 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 
 		l.Reap(s.clock.Now(), nil)
 
+		nodes, err := s.store.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return &mutationError{err}
+		}
+
+		nodeNames := make(map[string]struct{}, len(nodes.Items))
+		for _, node := range nodes.Items {
+			nodeNames[node.Name] = struct{}{}
+		}
+
 		var nodeErrors field.ErrorList
 
 		for i, node := range record.Nodes {
-			_, err := s.store.Client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
+			if _, exists := nodeNames[node]; !exists {
 				nodeErrors = append(nodeErrors, field.Invalid(field.NewPath("spec", "nodes").Index(i), node, "node does not exist"))
-			} else if err != nil {
-				return &mutationError{err}
 			}
 		}
 

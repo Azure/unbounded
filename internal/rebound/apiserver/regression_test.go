@@ -204,6 +204,85 @@ func TestCreateChecksNamespaceOnRetry(t *testing.T) {
 	}
 }
 
+func TestCreateNodeLimit(t *testing.T) {
+	for _, limit := range []int{1, 500} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			s, client, ctx := fixture(t)
+			s.maxNodesPerGrant = limit
+
+			nodes := make([]string, limit+1)
+			for i := range nodes {
+				nodes[i] = fmt.Sprintf("node-%d", i)
+			}
+
+			client.ClearActions()
+
+			_, err := s.Create(ctx, grant("too-many", nodes...), nil, nil)
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			status, ok := err.(apierrors.APIStatus)
+			require.True(t, ok)
+			require.Equal(t, int32(422), status.Status().Code)
+			require.Len(t, status.Status().Details.Causes, 1)
+			require.Equal(t, metav1.CauseTypeTooMany, status.Status().Details.Causes[0].Type)
+			require.Equal(t, "spec.nodes", status.Status().Details.Causes[0].Field)
+			require.Empty(t, client.Actions(), "limit must be checked before namespace or ledger access")
+			require.Empty(t, cached(t, s).Data)
+		})
+	}
+}
+
+func TestCreateListsNodesOnce(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprint("missing=", missing), func(t *testing.T) {
+			s, client, ctx := fixture(t)
+			s.maxNodesPerGrant = 2
+
+			nodes := []string{"node-a", "node-b"}
+			if missing {
+				nodes = []string{"missing-a", "node-a", "missing-b"}
+				s.maxNodesPerGrant = len(nodes)
+			}
+
+			client.ClearActions()
+
+			_, err := s.Create(ctx, grant("first", nodes...), nil, nil)
+			if missing {
+				require.True(t, apierrors.IsInvalid(err), "%v", err)
+				status, ok := err.(apierrors.APIStatus)
+				require.True(t, ok)
+				require.Equal(t, int32(422), status.Status().Code)
+				causes := status.Status().Details.Causes
+				require.Len(t, causes, 2)
+
+				for i, index := range []int{0, 2} {
+					require.Equal(t, metav1.CauseTypeFieldValueInvalid, causes[i].Type)
+					require.Equal(t, fmt.Sprintf("spec.nodes[%d]", index), causes[i].Field)
+					require.Contains(t, causes[i].Message, nodes[index])
+					require.Contains(t, causes[i].Message, "node does not exist")
+				}
+			} else {
+				require.NoError(t, err, "a grant at the limit must succeed")
+			}
+
+			var nodeActions []string
+
+			for _, action := range client.Actions() {
+				if action.GetResource().Resource == "nodes" {
+					nodeActions = append(nodeActions, action.GetVerb())
+				}
+			}
+
+			require.Equal(t, []string{"list"}, nodeActions)
+
+			if missing {
+				require.Empty(t, cached(t, s).Data)
+			} else {
+				require.Len(t, ledger.Parse(cached(t, s).Data).Grants(), 1)
+			}
+		})
+	}
+}
+
 func TestCreateChecksNodesOnRetry(t *testing.T) {
 	s, client, ctx := fixture(t)
 	client.ClearActions()
@@ -232,7 +311,7 @@ func TestCreateChecksNodesOnRetry(t *testing.T) {
 		actions = append(actions, action.GetVerb()+" "+action.GetResource().Resource)
 	}
 
-	require.Equal(t, []string{"get configmaps", "get namespaces", "get nodes", "update configmaps", "get configmaps", "get namespaces", "get nodes"}, actions)
+	require.Equal(t, []string{"get configmaps", "get namespaces", "list nodes", "update configmaps", "get configmaps", "get namespaces", "list nodes"}, actions)
 	require.Empty(t, cached(t, s).Data)
 }
 
