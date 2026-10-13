@@ -998,6 +998,181 @@ mod coalesce_tests {
         check_flight_store_waker_drop_reentry(true);
     }
 
+    /// Detach retires the whole waiter without running callbacks in the transaction.
+    #[test]
+    fn flight_detach_drop_reentry() {
+        for phase in 0..5 {
+            for final_waiter in [false, true] {
+                let owner = Rc::new(RefCell::new(State::<
+                    u32,
+                    u32,
+                    Published<u32, u32>,
+                    CountingPolicy,
+                >::default()));
+                let due = Instant::now();
+                flight::update(&owner, |state, _| {
+                    for id in 1..=if final_waiter { 1 } else { 2 } {
+                        state.register(
+                            id,
+                            CountingPolicy {
+                                due,
+                                checks: Rc::new(Cell::new(0)),
+                                error: Rc::new(Cell::new(None)),
+                            },
+                            true,
+                            true,
+                        );
+                    }
+                    state.phase = match phase {
+                        0 => Phase::RetryPending,
+                        1 => Phase::Acquiring,
+                        2 => Phase::Draining(Outcome::Retry),
+                        3 => Phase::Complete(7),
+                        _ => Phase::Failed(8),
+                    };
+                    state.leader = matches!(phase, 1 | 2).then_some(1);
+                    state.waiters.get_mut(&1).unwrap().waker = Some(cohort_waker());
+                });
+                let called = Rc::new(Cell::new(0));
+                ON_COHORT_DROP.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new({
+                        let owner = owner.clone();
+                        let called = called.clone();
+                        move || {
+                            drop(flight::update(&owner, |state, _| {
+                                assert!(!state.waiters.contains_key(&1));
+                                assert!(!state.deadlines.contains_key(&(due, 1)));
+                                assert_eq!(state.waiters.len(), usize::from(!final_waiter));
+                                assert_eq!(state.deadlines.len(), usize::from(!final_waiter));
+                                assert_eq!(state.leader, matches!(phase, 1 | 2).then_some(1));
+                                assert!(match phase {
+                                    0 => matches!(state.phase, Phase::RetryPending),
+                                    1 => matches!(state.phase, Phase::Acquiring),
+                                    2 => matches!(state.phase, Phase::Draining(Outcome::Retry)),
+                                    3 => matches!(state.phase, Phase::Complete(7)),
+                                    _ => matches!(state.phase, Phase::Failed(8)),
+                                });
+                                state.detach(2)
+                            }));
+                            called.set(called.get() + 1);
+                        }
+                    }));
+                });
+                let retired = flight::update(&owner, |state, _| {
+                    assert!(state.detach(99).is_none());
+                    assert_eq!(state.waiters.len(), if final_waiter { 1 } else { 2 });
+                    assert_eq!(state.deadlines.len(), state.waiters.len());
+                    state.detach(1)
+                });
+                assert!(retired.as_ref().unwrap().waker.is_some());
+                assert_eq!(called.get(), 0);
+                drop(retired);
+                assert_eq!(called.get(), 1);
+                assert!(flight::update(&owner, |state, _| state.detach(1)).is_none());
+                assert!(owner.borrow().waiters.is_empty());
+                assert!(owner.borrow().deadlines.is_empty());
+                assert!(ON_COHORT_DROP.with(|slot| slot.borrow().is_none()));
+            }
+        }
+    }
+
+    /// A waiter without a waker still retains its policy until retirement.
+    #[test]
+    fn flight_detach_policy_drop_reentry_without_waker() {
+        struct Policy {
+            due: Instant,
+            on_drop: Option<Box<dyn FnOnce()>>,
+        }
+
+        impl WaiterPolicy for Policy {
+            type Error = u8;
+
+            fn check(&self) -> Option<u8> {
+                None
+            }
+
+            fn deadline(&self) -> Instant {
+                self.due
+            }
+        }
+
+        impl Drop for Policy {
+            fn drop(&mut self) {
+                self.on_drop.take().unwrap()();
+            }
+        }
+
+        let owner = Rc::new(RefCell::new(State::<u32, u32, u32, Policy>::default()));
+        let called = Rc::new(Cell::new(false));
+        let policy = Policy {
+            due: Instant::now(),
+            on_drop: Some(Box::new({
+                let owner = owner.clone();
+                let called = called.clone();
+                move || {
+                    flight::update(&owner, |state, _| {
+                        assert!(state.waiters.is_empty());
+                        assert!(state.deadlines.is_empty());
+                        assert!(state.detach(1).is_none());
+                    });
+                    called.set(true);
+                }
+            })),
+        };
+        let retired = flight::update(&owner, |state, _| {
+            state.register(1, policy, true, true);
+            state.detach(1)
+        });
+        assert!(retired.as_ref().unwrap().waker.is_none());
+        assert!(!called.get());
+        drop(retired);
+        assert!(called.get());
+    }
+
+    /// Shutdown wakes reenter after indexes clear, without bypassing settlement.
+    #[test]
+    fn flight_stop_wake_reentry_preserves_completion_fence() {
+        let owner = Rc::new(RefCell::new(State::<
+            u32,
+            u32,
+            Published<u32, u32>,
+            CountingPolicy,
+        >::default()));
+        let called = Rc::new(Cell::new(false));
+        let waker = on_wake({
+            let owner = owner.clone();
+            let called = called.clone();
+            move || {
+                flight::update(&owner, |state, wakes| {
+                    assert!(state.waiters.is_empty());
+                    assert!(state.deadlines.is_empty());
+                    assert!(state.detach(1).is_none());
+                    state.settle(false, 9, std::convert::identity, wakes);
+                    assert!(matches!(state.phase, Phase::Draining(Outcome::Failed(8))));
+                    state.settle(true, 9, std::convert::identity, wakes);
+                    assert!(matches!(state.phase, Phase::Failed(8)));
+                });
+                called.set(true);
+            }
+        });
+        flight::update(&owner, |state, wakes| {
+            state.register(
+                1,
+                CountingPolicy {
+                    due: Instant::now(),
+                    checks: Rc::new(Cell::new(0)),
+                    error: Rc::new(Cell::new(None)),
+                },
+                true,
+                true,
+            );
+            state.waiters.get_mut(&1).unwrap().waker = Some(waker);
+            state.stop(8, wakes);
+            assert!(!called.get());
+        });
+        assert!(called.get());
+    }
+
     /// Clone and replacement callbacks may poll, retry, or finish the same cohort.
     fn check_cohort_waker_event_reentry(on_clone: bool) {
         for action in 0..3 {

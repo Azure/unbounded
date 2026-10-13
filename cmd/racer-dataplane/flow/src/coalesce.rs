@@ -1170,10 +1170,13 @@ pub mod flight {
             }
 
             /// Remove a caller and its deadline without declaring operation completion.
-            pub fn detach(&mut self, id: u64) {
-                if let Some(waiter) = self.waiters.remove(&id) {
-                    self.deadlines.remove(&(waiter.deadline(), id));
-                }
+            /// Return the waiter from `update` and drop it outside the owner borrow;
+            /// both its policy and waker may run callbacks on drop.
+            #[must_use = "drop the detached waiter outside the owner borrow"]
+            pub fn detach(&mut self, id: u64) -> Option<Waiter<W>> {
+                let waiter = self.waiters.remove(&id)?;
+                self.deadlines.remove(&(waiter.deadline(), id));
+                Some(waiter)
             }
 
             /// Validate attachment and incarnation while allowing acquisition retries.
@@ -1479,7 +1482,7 @@ pub mod flight {
                     assert_eq!(core.validate_registration(1, true, &old, &identity), Ok(()));
                     assert_eq!(core.elect(2, &mut identity, 4), Ok(false));
                     if detach {
-                        core.detach(1);
+                        drop(core.detach(1));
                     } else {
                         error.set(Some(7));
                     }
@@ -1612,7 +1615,7 @@ pub mod flight {
                 let mut core = Core::default();
                 register(&mut core, 1, true, true);
                 register(&mut core, 2, true, true);
-                core.detach(1);
+                drop(core.detach(1));
                 assert_eq!(core.deadlines.len(), 1);
                 let mut identity = identity();
                 assert_eq!(core.elect(2, &mut identity, 3), Ok(true));
