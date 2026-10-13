@@ -523,6 +523,8 @@ impl<P: Policy> PipeLease<P> {
     /// Callers must not concurrently clear O_NONBLOCK through a duplicate FD.
     /// This native-only API requires an explicit OS descriptor borrow. Runtime
     /// descriptors, including simulation, use `try_splice_descriptor` instead.
+    /// A preexisting pending SIGPIPE returns EOPNOTSUPP without transferring bytes,
+    /// so callers can use their copy fallback without changing the pending signal.
     pub fn try_splice_to(&mut self, socket: BorrowedFd<'_>, count: usize) -> io::Result<usize> {
         #[cfg(feature = "simulation")]
         if self.resources.as_ref().unwrap().read.as_sim().is_some() {
@@ -549,6 +551,13 @@ impl<P: Policy> PipeLease<P> {
         // only across the syscall. Even a positive partial splice can generate
         // SIGPIPE, so the guard consumes new signals regardless of the result.
         let signal = SigpipeGuard::block()?;
+        // sigpending combines thread and process queues. A process-pending signal
+        // does not coalesce with splice's new thread signal. Do not splice when
+        // either queue is occupied: consuming could steal the caller's signal,
+        // while skipping consumption could leave a new signal behind.
+        if signal.was_pending {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
         // SAFETY: owned live FDs, null offsets for pipe/socket, no userspace page
         // pointers, and both ends are nonblocking. No vmsplice/GIFT is involved.
         let result = syscall_count(unsafe {
@@ -662,8 +671,8 @@ impl SigpipeGuard {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        // SAFETY: zero timeout never waits; only our thread's blocked SIGPIPE is
-        // consumed. Preserve a signal that was pending before entering the guard.
+        // SAFETY: zero timeout never waits; SIGPIPE is blocked on this thread.
+        // Neither pending queue held SIGPIPE when this guard was installed.
         while unsafe { libc::sigtimedwait(&self.set, std::ptr::null_mut(), &timeout) } < 0 {
             if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 break;
@@ -716,15 +725,19 @@ mod tests {
     fn sigpipe_guard_preserves_pending_signals_and_mask() {
         const CHILD: &str = "FLOW_PIPE_SIGPIPE_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            // The child and all its harness threads inherit this thread's mask.
+            // Restore it immediately after spawn; no parent disposition changes.
+            let mask = SigpipeGuard::block().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "pipe::tests::sigpipe_guard_preserves_pending_signals_and_mask",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
-                .status()
-                .unwrap();
+                .spawn();
+            drop(mask);
+            let status = child.unwrap().wait().unwrap();
             assert!(status.success(), "SIGPIPE child failed: {status}");
             return;
         }
@@ -779,6 +792,84 @@ mod tests {
         // Exercise an actual splice-generated EPIPE with SIGPIPE no longer ignored.
         splice_rejects_blocking_socket_and_handles_disconnect_without_losing_bytes();
         assert!(!sigpipe_pending());
+
+        for process_pending in [false, true] {
+            for thread_pending in [false, true] {
+                let outer = SigpipeGuard::block().unwrap();
+                // SAFETY: this isolated child's threads all block SIGPIPE.
+                unsafe {
+                    if process_pending {
+                        assert_eq!(libc::kill(libc::getpid(), libc::SIGPIPE), 0);
+                    }
+                    if thread_pending {
+                        assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE), 0);
+                    }
+                }
+                let before = current_signal_mask();
+                let pool = new_pool(admission(1));
+                let mut pipe = pool.acquire().unwrap();
+                pipe.try_write(b"abc").unwrap();
+                let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                socket.set_nonblocking(true).unwrap();
+                drop(peer);
+                let error = pipe.try_splice_to(socket.as_fd(), 3).unwrap_err();
+                if process_pending || thread_pending {
+                    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+                    assert!(splice_unsupported(&error));
+                } else {
+                    assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+                }
+                assert_eq!(pipe.buffered(), 3);
+                let mut bytes = [0; 3];
+                assert_eq!(pipe.try_read(&mut bytes).unwrap(), 3);
+                assert_eq!(&bytes, b"abc");
+                let after = current_signal_mask();
+                for signal in 1..=libc::SIGRTMAX() {
+                    // SAFETY: initialized sets and an in-range signal number.
+                    assert_eq!(unsafe { libc::sigismember(&before, signal) }, unsafe {
+                        libc::sigismember(&after, signal)
+                    });
+                }
+                // Another thread can consume only the shared process signal,
+                // proving we preserved its queue, not just the combined bit.
+                assert_eq!(
+                    std::thread::spawn(take_pending_sigpipe).join().unwrap(),
+                    process_pending.then_some(libc::SIGPIPE)
+                );
+                assert_eq!(
+                    take_pending_sigpipe(),
+                    thread_pending.then_some(libc::SIGPIPE)
+                );
+                assert_eq!(take_pending_sigpipe(), None);
+                assert!(!sigpipe_pending());
+                drop(outer);
+            }
+        }
+    }
+
+    /// Consume one blocked signal for queue-isolation assertions.
+    fn take_pending_sigpipe() -> Option<libc::c_int> {
+        // SAFETY: local initialized storage and a zero timeout; callers block SIGPIPE.
+        unsafe {
+            let mut set = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout);
+            if result == libc::SIGPIPE {
+                Some(result)
+            } else {
+                assert_eq!(result, -1);
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+                None
+            }
+        }
     }
 
     /// Read the current thread mask without changing it.
@@ -794,7 +885,7 @@ mod tests {
         }
     }
 
-    /// Read whether this thread currently has a pending SIGPIPE.
+    /// Read whether either the current thread or process has a pending SIGPIPE.
     fn sigpipe_pending() -> bool {
         // SAFETY: sigpending initializes the local set before it is queried.
         unsafe {
