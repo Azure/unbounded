@@ -7,6 +7,91 @@ use racer_object_wire::origin;
 use racer_object_wire::*;
 use std::time::{Duration, UNIX_EPOCH};
 
+fn decode_if_match_request(method: &str, value: &[u8]) -> MessageHead {
+    let mut raw = format!(
+        "{method} /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nIf-Match:",
+        CacheKey([0xab; 32]).to_hex()
+    )
+    .into_bytes();
+    raw.extend_from_slice(value);
+    raw.extend_from_slice(b"\r\n\r\n");
+    let (head, used) = http1::Codec::<()>::new(client::MAX_HEAD_BYTES)
+        .decode_head(&raw)
+        .unwrap()
+        .unwrap();
+    assert_eq!(used, raw.len());
+    head
+}
+
+#[test]
+fn client_if_match_accepts_http_ows_from_raw_codec() {
+    let parser = RequestParser::new(usize::MAX);
+    for method in ["HEAD", "POST"] {
+        for tag in ["\"v1\"", "\"\"", "\"a,b\\c\""] {
+            for (prefix, suffix) in [
+                ("", ""),
+                (" ", ""),
+                ("  ", ""),
+                ("\t", ""),
+                ("", " \t"),
+                (" \t ", "\t \t"),
+            ] {
+                let value = format!("{prefix}{tag}{suffix}");
+                let head = decode_if_match_request(method, value.as_bytes());
+                let parsed = parser.parse(&head).unwrap();
+                assert_eq!(parsed.kind.is_head(), method == "HEAD");
+                assert_eq!(parsed.kind.pin().unwrap().as_bytes(), tag.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn client_if_match_rejects_invalid_tags_despite_http_ows() {
+    let parser = RequestParser::new(usize::MAX);
+    for method in ["HEAD", "POST"] {
+        for value in [
+            b" \t ".as_slice(),
+            b" \t*\t ",
+            b" \tW/\"v1\"\t ",
+            b" \tv1\t ",
+            b" \t\"v1\t ",
+            b" \t\"a\", \"b\"\t ",
+            b" \t\"a b\"\t ",
+            b" \t\"a\tb\"\t ",
+            b" \t\"a\"b\"\t ",
+            b" \t\"\x80\"\t ",
+            b" \t\xa0\"v1\"\t ",
+            b" \t\"v1\"\xa0\t ",
+        ] {
+            let head = decode_if_match_request(method, value);
+            assert!(
+                matches!(parser.parse(&head), Err(Error::InvalidRequest)),
+                "{method} {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn client_if_match_ows_does_not_bypass_field_limit() {
+    let parser = RequestParser::new(usize::MAX);
+    for method in ["HEAD", "POST"] {
+        for length in [MAX_FIELD_BYTES, MAX_FIELD_BYTES + 1] {
+            let value = format!("\t\"v1\"{}", " ".repeat(length - 5));
+            let head = decode_if_match_request(method, value.as_bytes());
+            if length == MAX_FIELD_BYTES {
+                assert_eq!(
+                    parser.parse(&head).unwrap().kind.pin().unwrap().as_bytes(),
+                    b"\"v1\""
+                );
+            } else {
+                assert!(matches!(parser.parse(&head), Err(Error::HeaderTooLarge)));
+            }
+        }
+    }
+}
+
 #[test]
 fn head_retention_accepts_http_lists_and_quoted_delta_seconds() {
     let parser = RequestParser::new(usize::MAX);

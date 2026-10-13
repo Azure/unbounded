@@ -166,7 +166,7 @@ impl RequestParser {
                     if value.len() > MAX_FIELD_BYTES {
                         return Err(Error::HeaderTooLarge);
                     }
-                    pin = Some(StrongEtag::parse(value)?);
+                    pin = Some(StrongEtag::parse(trim_ows(value))?);
                 }
                 "range" => range = Some(ByteRange::parse(value)?),
                 "racer-page-credits" => page_credits = decimal(value, 1, 64)? as usize,
