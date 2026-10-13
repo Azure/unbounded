@@ -64,12 +64,13 @@ name. A filesystem-valid name can still exceed Linux's Unix socket address limit
   Restrictive owner permissions, including mode 000, are repaired to 0600 on the
   pinned inode before nonblocking exclusive `flock`. The lock is never unlinked.
   `validate` checks directory and lock identity and their permissions.
-- `BoundSocket::bind(Rc<EndpointOwner>, temporary)` derives both directory and
-  witness from the owner: callers cannot bind under an unrelated owner. It binds
-  the witness first, pins the socket, sets mode 0600, makes the listener nonblocking,
-  and hard-links the temporary name. `accept`, `AsFd`/`AsRawFd`, and
-  `identity` expose listener operations. `basename()` returns a read-only `String`
-  snapshot, not mutable publication bookkeeping.
+- [`BoundSocket::bind(Rc<EndpointOwner>, temporary)`](src/lib.rs) derives both
+  directory and witness from the owner: callers cannot bind under an unrelated
+  owner. It binds a nonblocking socket at the witness name, pins its inode, and
+  sets mode 0600 before calling `listen`, then hard-links the temporary name.
+  `accept`, `AsFd`/`AsRawFd`, and `identity` expose listener operations.
+  `basename()` returns a read-only `String` snapshot, not mutable publication
+  bookkeeping.
 - `set_mode(mode)` accepts only 000 through 0777 and changes the retained socket
   inode through procfs, never a replacement path. It validates the owner first.
   The caller chooses the final client-access policy before publication.
@@ -203,8 +204,10 @@ timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt -p uds-endpoint --
 ```
 
 The ignored `crash_state_driver` and `descriptor_limit_driver` tests are invoked
-by their parent integration tests with private fixture arguments; do not run them
-directly. The optional `test-util`
+by their parent integration tests with private fixture arguments. The ignored
+`admission_tests::permissive_umask_driver` is invoked by
+`admission_tests::permissions_precede_listen` in a subprocess with an isolated
+umask. Do not run these drivers directly. The optional `test-util`
 feature exposes only a cloned lock descriptor for lifecycle tests. It does not
 substitute a filesystem model for production syscalls. The separate `simulation`
 feature provides a simulated socket adapter; it does not replace the host tests.
