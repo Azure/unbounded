@@ -844,7 +844,7 @@ mod coalesce_tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     thread_local! {
         /// Callback invoked only by synchronous wakes on the current test worker.
@@ -1351,9 +1351,10 @@ mod coalesce_tests {
                     state.leader = Some(1);
                 });
                 let settle = |idle| {
+                    let now = Instant::now();
                     flight::update(&owner, |state, wakes| {
                         if refresh {
-                            state.refresh(idle, 9, 8, Instant::now, std::convert::identity, wakes)
+                            state.refresh(idle, 9, 8, now, std::convert::identity, wakes)
                         } else {
                             state.settle(idle, 9, std::convert::identity, wakes)
                         }
@@ -2135,7 +2136,7 @@ mod coalesce_tests {
         assert_eq!(state.elect(0, &mut identity, 2), Ok(true));
         error.set(Some(7));
         let mut wakes = Vec::new();
-        let _ = state.refresh(false, 9, 8, || now, std::convert::identity, &mut wakes);
+        let _ = state.refresh(false, 9, 8, now, std::convert::identity, &mut wakes);
         assert_eq!(checks.get(), 65);
         assert_eq!(state.deadlines.len(), 1);
         assert_eq!(state.waiters[&0].error, Some(7));
@@ -2144,12 +2145,97 @@ mod coalesce_tests {
         assert_eq!(state.elect(65, &mut identity, 2), Ok(false));
         assert_eq!(identity.generation, 1);
 
-        let _ = state.refresh(false, 9, 8, || now, std::convert::identity, &mut wakes);
+        let _ = state.refresh(false, 9, 8, now, std::convert::identity, &mut wakes);
         assert_eq!(checks.get(), 66);
         assert!(state.deadlines.is_empty());
         assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
         let _ = state.settle(true, 9, std::convert::identity, &mut wakes);
         assert!(matches!(state.phase, Phase::Failed(9)));
+    }
+
+    /// Clock callbacks run before borrowing; expiry uses one snapshot and a fixed budget.
+    #[test]
+    fn refresh_clock_reentry_uses_one_snapshot_and_bounded_expiry() {
+        /// Advance the clock during policy checks without changing fixed deadlines.
+        struct AdvancingPolicy {
+            due: Instant,
+            clock: Rc<Cell<Instant>>,
+            later: Instant,
+            checks: Rc<Cell<usize>>,
+        }
+
+        impl WaiterPolicy for AdvancingPolicy {
+            type Error = u8;
+
+            fn check(&self) -> Option<u8> {
+                self.checks.set(self.checks.get() + 1);
+                self.clock.set(self.later);
+                Some(7)
+            }
+
+            fn deadline(&self) -> Instant {
+                self.due
+            }
+        }
+
+        let owner =
+            RefCell::new(State::<u32, u32, Published<u32, u32>, AdvancingPolicy>::default());
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let clock = Rc::new(Cell::new(now));
+        let checks = Rc::new(Cell::new(0));
+        flight::update(&owner, |state, _| {
+            for id in 0..66 {
+                state.register(
+                    id,
+                    AdvancingPolicy {
+                        due: if id < 65 { now } else { later },
+                        clock: clock.clone(),
+                        later,
+                        checks: checks.clone(),
+                    },
+                    true,
+                    true,
+                );
+            }
+        });
+        let samples = Cell::new(0);
+        let sample = || {
+            flight::update(&owner, |state, _| assert_eq!(state.waiters.len(), 66));
+            samples.set(samples.get() + 1);
+            clock.get()
+        };
+        let snapshot = sample();
+        let refresh = |snapshot| {
+            let retired = flight::update(&owner, |state, wakes| {
+                state.refresh(false, 9, 8, snapshot, std::convert::identity, wakes)
+            });
+            assert!(retired.is_none());
+        };
+        refresh(snapshot);
+        assert_eq!(samples.get(), 1);
+        assert_eq!(checks.get(), 64);
+        assert_eq!(clock.get(), later);
+        assert_eq!(owner.borrow().deadlines.len(), 2);
+        assert!(owner.borrow().waiters[&64].error.is_none());
+
+        refresh(snapshot);
+        assert_eq!(checks.get(), 65);
+        assert_eq!(owner.borrow().deadlines.len(), 1);
+        assert!(owner.borrow().waiters[&65].error.is_none());
+        refresh(snapshot);
+        assert_eq!(checks.get(), 65);
+        assert_eq!(samples.get(), 1);
+
+        let snapshot = sample();
+        refresh(snapshot);
+        assert_eq!(samples.get(), 2);
+        assert_eq!(checks.get(), 66);
+        assert!(owner.borrow().deadlines.is_empty());
+        assert_eq!(owner.borrow().waiters[&65].error, Some(7));
+        refresh(snapshot);
+        assert_eq!(checks.get(), 66);
+        assert_eq!(samples.get(), 2);
     }
 
     /// Fixed-deadline policy with observable checks and externally injected failures.

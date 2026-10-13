@@ -1335,6 +1335,7 @@ pub mod flight {
             }
 
             /// Check the leader and up to 64 expired callers, then settle eligible outcomes.
+            /// Sample `now` before `update`; all deadline entries use that snapshot.
             /// Return the old partial from `update` and drop it outside the owner borrow.
             #[must_use = "drop the retired partial outside the owner borrow"]
             pub fn refresh(
@@ -1342,14 +1343,14 @@ pub mod flight {
                 idle: bool,
                 unavailable: W::Error,
                 canceled: W::Error,
-                now: impl Fn() -> Instant,
+                now: Instant,
                 split: fn(O) -> Published<C, P>,
                 wakes: &mut Vec<Waker>,
             ) -> Option<P> {
                 if let Some(id) = self.leader {
                     self.refresh_waiter(id, wakes);
                 }
-                self.refresh_expired(&now, wakes);
+                self.refresh_expired(now, wakes);
                 if matches!(self.phase, Phase::Acquiring) {
                     let leader = self.leader.and_then(|id| self.waiters.get(&id));
                     if leader.is_none_or(|waiter| waiter.error.is_some()) {
@@ -1404,12 +1405,12 @@ pub mod flight {
             }
 
             /// Consume at most 64 due deadline entries, independently of leader checks.
-            fn refresh_expired(&mut self, now: &impl Fn() -> Instant, wakes: &mut Vec<Waker>) {
+            fn refresh_expired(&mut self, now: Instant, wakes: &mut Vec<Waker>) {
                 for _ in 0..64 {
                     let Some((&(deadline, id), _)) = self.deadlines.first_key_value() else {
                         break;
                     };
-                    if deadline > now() {
+                    if deadline > now {
                         break;
                     }
                     self.deadlines.remove(&(deadline, id));
@@ -1502,7 +1503,7 @@ pub mod flight {
 
             /// Refresh with fixed unavailable and cancellation error values.
             fn refresh(core: &mut Core, idle: bool, wakes: &mut Vec<Waker>) {
-                let _ = core.refresh(idle, 9, 8, Instant::now, split, wakes);
+                let _ = core.refresh(idle, 9, 8, Instant::now(), split, wakes);
             }
 
             /// Leader cancellation or detach cannot bypass retained-operation drainage.
@@ -1631,11 +1632,11 @@ pub mod flight {
                     drop(retired);
                 }
                 let mut wakes = Vec::new();
-                let _ = core.refresh(true, 9, 8, || now, split, &mut wakes);
+                let _ = core.refresh(true, 9, 8, now, split, &mut wakes);
                 assert_eq!(core.deadlines.len(), 1);
                 assert_eq!(wakes.len(), 64);
                 assert!(core.waiters[&64].error.is_none());
-                let _ = core.refresh(true, 9, 8, || now, split, &mut wakes);
+                let _ = core.refresh(true, 9, 8, now, split, &mut wakes);
                 assert!(core.deadlines.is_empty());
                 assert_eq!(wakes.len(), 65);
                 core.notify(&mut wakes);
