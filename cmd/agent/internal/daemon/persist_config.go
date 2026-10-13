@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -39,10 +38,6 @@ func (p *persistAppliedConfig) Do(_ context.Context) error {
 	}
 
 	path := goalstates.AppliedConfigPath(p.machineName)
-	if err := ensureAppliedConfigDir(path); err != nil {
-		return fmt.Errorf("create applied config directory for %s: %w", path, err)
-	}
-
 	if err := writeFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write applied config to %s: %w", path, err)
 	}
@@ -61,10 +56,6 @@ func (p *persistAppliedConfig) Do(_ context.Context) error {
 	p.log.Info("applied config persisted", "path", path, "checksum_path", checksumPath)
 
 	return nil
-}
-
-func ensureAppliedConfigDir(path string) error {
-	return os.MkdirAll(filepath.Dir(path), 0o750)
 }
 
 type removeAppliedConfig struct {

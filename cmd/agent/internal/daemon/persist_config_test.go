@@ -11,14 +11,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestEnsureAppliedConfigDirCreatesMissingDirectory(t *testing.T) {
+func TestWriteFileCreatesMissingDirectory(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "etc", "unbounded", "agent", "kube1-applied-config.json")
-	require.NoError(t, ensureAppliedConfigDir(path))
+	require.NoError(t, writeFile(path, []byte("config"), 0o600))
 
-	info, err := os.Stat(filepath.Dir(path))
+	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.True(t, info.IsDir())
-	require.Equal(t, os.FileMode(0o750), info.Mode().Perm())
+	require.Equal(t, []byte("config"), data)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }
