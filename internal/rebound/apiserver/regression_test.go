@@ -15,6 +15,7 @@ import (
 	metainternal "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	clienttesting "k8s.io/client-go/testing"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -149,6 +150,60 @@ func TestDeleteExpired(t *testing.T) {
 	require.Equal(t, g.UID, l.Releases()[0].UID)
 }
 
+func TestCreateChecksNamespaceOnRetry(t *testing.T) {
+	for _, recreate := range []bool{true, false} {
+		t.Run(fmt.Sprint("recreate=", recreate), func(t *testing.T) {
+			s, client, ctx := fixture(t)
+			attempts := 0
+			namespaceGets := 0
+
+			client.PrependReactor("get", "namespaces", func(clienttesting.Action) (bool, runtime.Object, error) {
+				namespaceGets++
+				return false, nil, nil
+			})
+			client.PrependReactor("update", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+				attempts++
+				if attempts != 1 {
+					return false, nil, nil
+				}
+
+				resource := corev1.SchemeGroupVersion.WithResource("namespaces")
+				require.NoError(t, client.Tracker().Delete(resource, "", "team"))
+
+				if recreate {
+					require.NoError(t, client.Tracker().Create(resource, &corev1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "new-team-uid"},
+					}, ""))
+				}
+
+				return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), ledger.ConfigMapName, errors.New("retry"))
+			})
+
+			_, err := s.Create(ctx, grant("first", "node-a"), nil, nil)
+
+			require.Equal(t, 2, namespaceGets)
+
+			if recreate {
+				require.NoError(t, err)
+				require.Equal(t, 2, attempts)
+				stored, ok := ledger.Parse(cached(t, s).Data).Get(types.NamespacedName{Namespace: "team", Name: "first"})
+				require.True(t, ok)
+				require.Equal(t, types.UID("new-team-uid"), stored.NamespaceUID)
+			} else {
+				require.True(t, apierrors.IsInvalid(err), "%v", err)
+				status, ok := err.(apierrors.APIStatus)
+				require.True(t, ok)
+				require.Equal(t, int32(422), status.Status().Code)
+				require.Len(t, status.Status().Details.Causes, 1)
+				require.Equal(t, "metadata.namespace", status.Status().Details.Causes[0].Field)
+				require.Contains(t, status.Status().Details.Causes[0].Message, "namespace does not exist")
+				require.Equal(t, 1, attempts)
+				require.Empty(t, cached(t, s).Data)
+			}
+		})
+	}
+}
+
 func TestCreateChecksNodesOnRetry(t *testing.T) {
 	s, client, ctx := fixture(t)
 	client.ClearActions()
@@ -177,7 +232,7 @@ func TestCreateChecksNodesOnRetry(t *testing.T) {
 		actions = append(actions, action.GetVerb()+" "+action.GetResource().Resource)
 	}
 
-	require.Equal(t, []string{"get namespaces", "get configmaps", "get nodes", "update configmaps", "get configmaps", "get nodes"}, actions)
+	require.Equal(t, []string{"get configmaps", "get namespaces", "get nodes", "update configmaps", "get configmaps", "get namespaces", "get nodes"}, actions)
 	require.Empty(t, cached(t, s).Data)
 }
 
