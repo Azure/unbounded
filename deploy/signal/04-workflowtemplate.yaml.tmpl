@@ -127,6 +127,8 @@ spec:
                           - >-
                             mpirun --allow-run-as-root -np 1 --bind-to none
                             --map-by slot -mca plm_rsh_no_tree_spawn 1
+                            -mca plm_rsh_args
+                            "-o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/project-signal-known-hosts"
                             /bin/true
               Worker:
                 replicas: 1
@@ -139,7 +141,16 @@ spec:
                     containers:
                       - name: worker
                         image: "{{`{{workflow.parameters.runner-image}}`}}"
-                        command: ["/bin/bash", "-lc", "mkdir -p /run/sshd && ssh-keygen -A && exec /usr/sbin/sshd -D -e"]
+                        command:
+                          - /bin/bash
+                          - -lc
+                          - >-
+                            install -d -m 0700 /run/project-signal-ssh &&
+                            install -m 0600 /root/.ssh/authorized_keys /run/project-signal-ssh/authorized_keys &&
+                            mkdir -p /run/sshd &&
+                            ssh-keygen -A &&
+                            exec /usr/sbin/sshd -D -e
+                            -o AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys
                         resources:
                           limits:
                             nvidia.com/gpu: "1"

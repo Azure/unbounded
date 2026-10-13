@@ -33,12 +33,24 @@ func TestRunnerProvidesWorkflowDependencies(t *testing.T) {
 	assert.Contains(t, containerfile, "@sha256:")
 }
 
-func TestWorkflowGeneratesSSHHostKeysAtRuntime(t *testing.T) {
+func TestWorkflowConfiguresEphemeralMPIHostTrust(t *testing.T) {
 	t.Parallel()
 
 	content, err := os.ReadFile("04-workflowtemplate.yaml.tmpl")
 	require.NoError(t, err)
 
-	workerCommand := "mkdir -p /run/sshd && ssh-keygen -A && exec /usr/sbin/sshd -D -e"
-	assert.True(t, strings.Contains(string(content), workerCommand))
+	manifest := string(content)
+	for _, setting := range []string{
+		"StrictHostKeyChecking=accept-new",
+		"UserKnownHostsFile=/tmp/project-signal-known-hosts",
+		"install -d -m 0700 /run/project-signal-ssh",
+		"install -m 0600 /root/.ssh/authorized_keys /run/project-signal-ssh/authorized_keys",
+		"ssh-keygen -A",
+		"AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys",
+	} {
+		assert.True(t, strings.Contains(manifest, setting), "missing MPI SSH setting %q", setting)
+	}
+
+	assert.NotContains(t, manifest, "StrictHostKeyChecking=no")
+	assert.NotContains(t, manifest, "StrictModes=no")
 }
