@@ -102,6 +102,9 @@ under restrictive umask leaves evidence. Recovery runs while acquiring the lock:
    witness with a nonblocking connection through its pinned procfs path. Only
    `ECONNREFUSED` proves staleness; success or a busy connection means live, and
    permission errors or other syscall errors are not treated as stale.
+   Restore any changed mode after each probe, even for stale witnesses, before
+   probing another witness or removing names. A restore error stops recovery and
+   takes precedence over the probe result; otherwise preserve the probe error.
    A successful probe can enqueue a connection that immediately closes on the
    live listener; this is an unavoidable side effect of this liveness check.
 3. Revalidate the owner, remove the matching canonical name first, then temporary

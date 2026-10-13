@@ -452,10 +452,17 @@ impl EndpointOwner {
             // bind followed by chmod has a crash window. O_PATH pins the socket
             // even if umask disabled owner write. Repair only that validated inode
             // before probing it; EACCES is never classified as a dead listener.
-            if metadata.mode() & 0o200 == 0 {
-                chmod_pin(&pinned, (metadata.mode() & 0o777) | 0o200)?;
+            let mode = metadata.mode() & 0o7777;
+            if mode & 0o200 == 0 {
+                chmod_pin(&pinned, mode | 0o200)?;
             }
-            refused(&file_path(&pinned))?;
+            let probe = refused(&file_path(&pinned));
+            if mode & 0o200 == 0 {
+                // Restore even stale witnesses before advancing: a later probe or
+                // cleanup can fail. A restore error takes precedence over the probe.
+                chmod_pin(&pinned, mode)?;
+            }
+            probe?;
         }
         self.validate(&self.directory)?;
         if let Some(metadata) = canonical {

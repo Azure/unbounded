@@ -63,13 +63,83 @@ fn recovery_repairs_unwritable_witness_before_distinguishing_live_and_dead() {
             );
             assert!(witness.exists());
             assert!(root.0.join("socket").exists());
-            assert_ne!(fs::metadata(witness).unwrap().mode() & 0o200, 0);
+            assert_eq!(fs::metadata(witness).unwrap().mode() & 0o7777, 0);
+            assert_eq!(
+                fs::metadata(root.0.join("socket")).unwrap().mode() & 0o7777,
+                0
+            );
         } else {
             result.unwrap();
             assert!(!witness.exists());
             assert!(!root.0.join("socket").exists());
         }
         drop(listener);
+    }
+}
+
+#[test]
+fn recovery_restores_mode_on_probe_error() {
+    let root = Root::new();
+    let directory = root.directory();
+    let witness = root.0.join("witness-stage-a");
+    let _socket =
+        std::os::unix::net::UnixDatagram::bind(file_path(&directory).join("witness-stage-a"))
+            .unwrap();
+    fs::hard_link(&witness, root.0.join("socket")).unwrap();
+    fs::set_permissions(&witness, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let failure = EndpointOwner::acquire(&directory, layout()).unwrap_err();
+    assert_eq!(failure.raw_os_error(), Some(libc::EPROTOTYPE));
+    for name in ["witness-stage-a", "socket"] {
+        assert_eq!(fs::metadata(root.0.join(name)).unwrap().mode() & 0o7777, 0);
+    }
+}
+
+#[test]
+fn recovery_restores_mixed_witnesses_before_any_cleanup() {
+    for live_index in 0..2 {
+        let root = Root::new();
+        let directory = root.directory();
+        let names = ["stage-a", "stage-b"];
+        let modes = [0o040, 0o1400];
+        let mut live = None;
+        for (index, name) in names.iter().enumerate() {
+            let witness = format!("witness-{name}");
+            let listener = UnixListener::bind(file_path(&directory).join(&witness)).unwrap();
+            fs::hard_link(root.0.join(&witness), root.0.join(name)).unwrap();
+            fs::set_permissions(
+                root.0.join(&witness),
+                fs::Permissions::from_mode(modes[index]),
+            )
+            .unwrap();
+            if index == live_index {
+                fs::hard_link(root.0.join(&witness), root.0.join("socket")).unwrap();
+                live = Some(listener);
+            }
+        }
+
+        let failure = EndpointOwner::acquire(&directory, layout()).unwrap_err();
+        assert_eq!(
+            failure.get_ref().unwrap().downcast_ref::<Error>(),
+            Some(&Error::LiveSocket)
+        );
+        for (name, mode) in names.iter().zip(modes) {
+            for entry in [name.to_string(), format!("witness-{name}")] {
+                assert_eq!(
+                    fs::metadata(root.0.join(entry)).unwrap().mode() & 0o7777,
+                    mode
+                );
+            }
+        }
+        assert_eq!(
+            fs::metadata(root.0.join("socket")).unwrap().mode() & 0o7777,
+            modes[live_index]
+        );
+
+        drop(live);
+        EndpointOwner::acquire(&directory, layout()).unwrap();
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+        assert!(root.0.join("lock").exists());
     }
 }
 
