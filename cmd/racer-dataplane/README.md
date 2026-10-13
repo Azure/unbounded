@@ -76,8 +76,9 @@ from `racer-v2`, check its API needs and ownership contracts against this crate.
 Any missing compatibility API needs its own design and tests; this extraction
 does not promise to add every omitted API in a follow-up.
 
-Validate flow separately so workspace feature unification cannot enable simulation
-in its production gate:
+Use these commands for focused flow validation. The separate production run also
+checks the build with runtime simulation disabled, unlike workspace tests where
+other crates enable that runtime feature:
 
 ```sh
 timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-default-features -j 2 -- --test-threads=1
@@ -87,4 +88,6 @@ timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manife
 The flow production tests require Linux kernel pipes, Unix sockets, and splice.
 They exercise real I/O and fail rather than skipping unsupported operations.
 Simulation adds simulated and mixed-descriptor contracts without removing the
-real pipe tests. CI checks all targets and runs strict Clippy in each mode.
+real pipe tests: simulated pipes require an active `Simulation` scope, not just
+the feature. CI runs strict Clippy on all targets in each mode, the isolated
+production tests, and simulation tests through the workspace all-features run.
