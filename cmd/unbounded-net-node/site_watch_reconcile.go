@@ -362,9 +362,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		case updateCh <- struct{}{}:
 		default:
 		}
-
-		gatewayInformers.setEventHandler(requestUpdate)
 	}
+	gatewayInformers.setEventHandler(requestUpdate)
 
 	workers.Go(func() {
 		for {

@@ -8,14 +8,90 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
+
+func TestGatewayInformerLifecycleLateEventHandler(t *testing.T) {
+	client := newGatewayLifecycleClient()
+	lifecycle := newGatewayInformerLifecycle(client, 0)
+	t.Cleanup(lifecycle.close)
+
+	if _, _, err := lifecycle.prepare(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start the generation before installing the callback, reproducing the
+	// startup ordering that previously captured a permanent no-op.
+	events := make(chan struct{}, 1)
+
+	lifecycle.setEventHandler(func() {
+		_ = lifecycle.snapshot()
+
+		events <- struct{}{}
+	})
+
+	waitForEvent := func(resource, operation string) {
+		t.Helper()
+
+		select {
+		case <-events:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s %s did not request an immediate reconcile", resource, operation)
+		}
+	}
+	for _, resource := range []struct {
+		gvr  schema.GroupVersionResource
+		kind string
+	}{
+		{gatewayPoolGVR, "GatewayPool"},
+		{gatewayNodeGVR, "GatewayPoolNode"},
+		{gatewayPoolPeeringGVR, "GatewayPoolPeering"},
+	} {
+		api := client.Resource(resource.gvr)
+		object := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "net.unbounded-cloud.io/v1alpha1",
+			"kind":       resource.kind,
+			"metadata":   map[string]any{"name": "event-test", "resourceVersion": "1"},
+			"spec":       map[string]any{"nodeName": "node-a"},
+		}}
+
+		created, err := api.Create(t.Context(), object, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		waitForEvent(resource.kind, "add")
+		created.SetResourceVersion("2")
+
+		if err := unstructured.SetNestedField(created.Object, "node-b", "spec", "nodeName"); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := api.Update(t.Context(), created, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+
+		waitForEvent(resource.kind, "update")
+
+		if err := api.Delete(t.Context(), created.GetName(), metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+
+		waitForEvent(resource.kind, "delete")
+	}
+
+	if got := watchActionCount(client); got != 3 {
+		t.Fatalf("watch actions=%d, want unchanged generation with three watches", got)
+	}
+}
 
 func TestGatewayCachesRequired(t *testing.T) {
 	assignments := newTestInformer()

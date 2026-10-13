@@ -60,6 +60,16 @@ func (l *gatewayInformerLifecycle) setEventHandler(onEvent func()) {
 	l.onEvent = onEvent
 }
 
+func (l *gatewayInformerLifecycle) requestUpdate() {
+	l.mu.RLock()
+	onEvent := l.onEvent
+	l.mu.RUnlock()
+
+	if onEvent != nil {
+		onEvent()
+	}
+}
+
 func (l *gatewayInformerLifecycle) setRequired(required bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -149,7 +159,6 @@ func (l *gatewayInformerLifecycle) start(ctx context.Context) (gatewayInformerSn
 	l.lastErr = nil
 	l.generation++
 	generation := l.generation
-	onEvent := l.onEvent
 	l.mu.Unlock()
 
 	factory := newNodeDynamicInformerFactory(l.client, l.resync)
@@ -157,7 +166,7 @@ func (l *gatewayInformerLifecycle) start(ctx context.Context) (gatewayInformerSn
 	nodes := factory.ForResource(gatewayNodeGVR).Informer()
 	poolPeerings := factory.ForResource(gatewayPoolPeeringGVR).Informer()
 
-	cleanups, err := addGatewayInformerEventHandlers(pools, nodes, poolPeerings, onEvent)
+	cleanups, err := addGatewayInformerEventHandlers(pools, nodes, poolPeerings, l.requestUpdate)
 	if err != nil {
 		l.recordStartFailure(err)
 
