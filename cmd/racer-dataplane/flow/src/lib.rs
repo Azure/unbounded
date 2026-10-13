@@ -337,11 +337,17 @@ impl<P: Policy> Charge<P> {
     }
 
     /// Caller must retain at least the capacity of every live backing allocation.
+    /// A real reduction applies [`Policy::wakes`] after updating both counters.
+    /// Invalid requests and an unchanged amount do not notify the waiter.
     pub fn shrink(&mut self, amount: usize) -> Result<()> {
         if amount == 0 || amount > self.amount {
             return Err(Error::InvalidInput);
         }
+        let changed = amount != self.amount;
         self.release_to(amount);
+        if changed && P::wakes(self.class) {
+            self.totals.wake.wake();
+        }
         Ok(())
     }
 
@@ -2677,6 +2683,52 @@ mod quota_tests {
         assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
         assert!(quotas.policy.rejected.lock().unwrap().is_empty());
         assert!(ON_WAKE.with(|slot| slot.borrow().is_none()));
+    }
+
+    /// Shrink publishes aggregate and keyed headroom before a synchronous retry.
+    #[test]
+    fn shrink_wakes_after_both_counters_release() {
+        thread_local! {
+            static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        }
+
+        struct RetryWake;
+
+        impl std::task::Wake for RetryWake {
+            fn wake(self: Arc<Self>) {
+                let action = ON_WAKE.with(|slot| slot.borrow_mut().take());
+                if let Some(action) = action {
+                    action();
+                }
+            }
+        }
+
+        for class in [Resource::Other, Resource::Payload] {
+            let quotas = Rc::new(Quotas::new(TestPolicy::new(10, 1)));
+            let key = "key".to_owned();
+            let mut charge = quotas.reserve(Some(&key), class, 10).unwrap();
+            let nested = quotas.clone();
+            ON_WAKE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    assert_eq!(nested.used(class), 4);
+                    let refill = nested.reserve(Some(&key), class, 6).unwrap();
+                    assert_eq!(nested.used(class), 10);
+                    drop(refill);
+                }));
+            });
+            quotas
+                .shared()
+                .register(&std::task::Waker::from(Arc::new(RetryWake)));
+            charge.shrink(4).unwrap();
+            assert_eq!(quotas.used(class), 4);
+            assert_eq!(
+                ON_WAKE.with(|slot| slot.borrow().is_none()),
+                TestPolicy::wakes(class)
+            );
+            ON_WAKE.with(|slot| slot.borrow_mut().take());
+            drop(charge);
+            assert_eq!(quotas.used(class), 0);
+        }
     }
 
     /// Charges and shared handles retain exact accounting across threads.

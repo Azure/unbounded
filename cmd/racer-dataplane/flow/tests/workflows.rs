@@ -438,7 +438,7 @@ mod quota_tests {
             self.max_keys
         }
 
-        /// Only the waking class notifies admission waiters on drop.
+        /// Only the waking class notifies admission waiters on release.
         fn wakes(class: Resource) -> bool {
             class == Resource::Waking
         }
@@ -465,7 +465,7 @@ mod quota_tests {
         }
     }
 
-    /// Splitting is accounting-neutral; shrinking releases both budgets silently.
+    /// Splitting is accounting-neutral; shrinking wakes after releasing both budgets.
     #[test]
     fn keyed_split_shrink_and_cross_thread_drop_keep_exact_accounting() {
         /// Assert that local authority does not prevent transferable charges.
@@ -493,14 +493,24 @@ mod quota_tests {
             assert_eq!(charge.amount(), 60);
         }
         charge.shrink(60).unwrap();
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            0,
+            "no-op shrink must not wake"
+        );
         charge.shrink(20).unwrap();
         assert_eq!(shared.used(Resource::Waking), 60);
-        assert_eq!(wake.0.load(Ordering::SeqCst), 0, "shrink must not wake");
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            1,
+            "released capacity must wake"
+        );
         let refill = quotas.reserve(Some(&1), Resource::Waking, 40).unwrap();
         assert_eq!(shared.used(Resource::Waking), 100);
+        shared.register(&Waker::from(wake.clone()));
         std::thread::spawn(move || drop(split)).join().unwrap();
         assert_eq!(shared.used(Resource::Waking), 60);
-        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(wake.0.load(Ordering::SeqCst), 2);
         drop((refill, charge));
         assert_eq!(shared.used(Resource::Waking), 0);
         let next = quotas.reserve(Some(&2), Resource::Waking, 100).unwrap();
