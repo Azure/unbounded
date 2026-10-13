@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -87,6 +88,13 @@ func TestRequestTimeoutFlag(t *testing.T) {
 		{mode: "origin", value: "2m", wantErr: "--request-timeout must not exceed 1m in origin mode"},
 		{mode: "sidecar", value: "5m", want: 5 * time.Minute},
 		{mode: "sidecar", value: "10m", want: 10 * time.Minute},
+		{mode: "sidecar", value: "1ns", want: time.Nanosecond},
+		{mode: "sidecar", value: (time.Duration(math.MaxInt64) - sidecarWriteGrace - time.Nanosecond).String(), want: time.Duration(math.MaxInt64) - sidecarWriteGrace - time.Nanosecond},
+		{mode: "sidecar", value: (time.Duration(math.MaxInt64) - sidecarWriteGrace).String(), want: time.Duration(math.MaxInt64) - sidecarWriteGrace},
+		{mode: "sidecar", value: (time.Duration(math.MaxInt64) - sidecarWriteGrace + time.Nanosecond).String(), wantErr: "--request-timeout is too large to allow sidecar write grace"},
+		{mode: "sidecar", value: time.Duration(math.MaxInt64).String(), wantErr: "--request-timeout is too large to allow sidecar write grace"},
+		{mode: "sidecar", value: "0", wantErr: "--request-timeout must be positive"},
+		{mode: "sidecar", value: "-1ns", wantErr: "--request-timeout must be positive"},
 	} {
 		t.Run(tt.mode+"/"+tt.value, func(t *testing.T) {
 			o, err := parseOptions([]string{tt.mode, "--namespace=store", "--request-timeout=" + tt.value}, io.Discard)

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -170,8 +171,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		if err := validateEndpoint(o.endpoint); err != nil {
 			return o, err
 		}
-	} else if err := validateListen(o.listen); err != nil {
-		return o, err
+	} else {
+		if o.requestTimeout > math.MaxInt64-sidecarWriteGrace {
+			return o, errors.New("--request-timeout is too large to allow sidecar write grace")
+		}
+
+		if err := validateListen(o.listen); err != nil {
+			return o, err
+		}
 	}
 
 	return o, nil
