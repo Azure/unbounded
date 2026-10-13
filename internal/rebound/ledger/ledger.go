@@ -32,8 +32,8 @@ const (
 	// ConfigMapName is the name of the ledger ConfigMap.
 	ConfigMapName = "rebound-ledger"
 
-	// MaxSize bounds the encoded ledger. ConfigMaps are limited to 1 MiB;
-	// leave headroom for object metadata.
+	// MaxSize bounds the encoded ledger for writes that increase the grant count.
+	// Cleanup writes have extra headroom for release records.
 	MaxSize = 900 * 1024
 
 	// ReleaseRetention is how long a Release record is kept after it is written.

@@ -16,7 +16,10 @@ import (
 	"k8s.io/client-go/util/retry"
 )
 
-// ErrTooLarge is returned when a write would exceed MaxSize.
+// cleanupMaxSize leaves room for metadata below the ConfigMap's 1 MiB limit.
+const cleanupMaxSize = 1000 * 1024
+
+// ErrTooLarge is returned when a write would exceed its ledger size limit.
 var ErrTooLarge = errors.New("ledger is full")
 
 // Store reads and writes the ledger ConfigMap.
@@ -46,13 +49,20 @@ func (s *Store) Update(ctx context.Context, dryRun bool, mutate func(*Ledger) er
 		}
 
 		l := Parse(cm.Data)
+
+		grantCount := len(l.grants)
 		if err := mutate(l); err != nil {
 			return err
 		}
 
 		data := l.Encode()
-		// Allow writes that shrink an oversized ledger so deletes always work.
-		if Size(data) > MaxSize && Size(data) > Size(cm.Data) {
+		// Cleanup can grow release records, so reserve space beyond the grant limit.
+		limit := cleanupMaxSize
+		if len(l.grants) > grantCount {
+			limit = MaxSize
+		}
+
+		if Size(data) > limit {
 			return ErrTooLarge
 		}
 

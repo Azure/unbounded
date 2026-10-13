@@ -165,7 +165,7 @@ func TestStoreShrinksOversizedLedger(t *testing.T) {
 	client := fake.NewClientset(cm)
 	s := &Store{Client: client, Namespace: "system"}
 
-	// Growing an oversized ledger fails; shrinking it succeeds.
+	// Adding grants to an oversized ledger fails; removing them succeeds.
 	_, _, err := s.Update(t.Context(), false, func(l *Ledger) error { return l.Add(testGrant("second", "node-b")) })
 	require.ErrorIs(t, err, ErrTooLarge)
 	_, _, err = s.Update(t.Context(), false, func(l *Ledger) error {
@@ -173,4 +173,97 @@ func TestStoreShrinksOversizedLedger(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func paddedLedger(t *testing.T, size int) (*corev1.ConfigMap, *Grant) {
+	t.Helper()
+
+	l := New()
+	g := testGrant("g", "n")
+	g.Holder, g.Labels, g.Annotations = "", nil, nil
+	require.NoError(t, l.Add(g))
+
+	padding := testGrant("padding", "node-padding")
+	padding.ExpiresAt = g.ExpiresAt.Add(time.Hour)
+	padding.Holder = ""
+	require.NoError(t, l.Add(padding))
+	padding.Holder = strings.Repeat("x", size-Size(l.Encode()))
+	data := l.Encode()
+	require.Equal(t, size, Size(data))
+
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "system", ResourceVersion: "7"},
+		Data:       data,
+	}, g
+}
+
+func TestStoreCleanupSizeLimits(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		size    int
+		reap    bool
+		wantErr error
+	}{
+		{name: "delete above grant limit", size: MaxSize},
+		{name: "reap above grant limit", size: MaxSize, reap: true},
+		{name: "delete above hard limit", size: cleanupMaxSize, wantErr: ErrTooLarge},
+		{name: "reap above hard limit", size: cleanupMaxSize, reap: true, wantErr: ErrTooLarge},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before, g := paddedLedger(t, tt.size)
+			client := fake.NewClientset(before.DeepCopy())
+			s := &Store{Client: client, Namespace: "system"}
+			_, _, err := s.Update(t.Context(), false, func(l *Ledger) error {
+				if tt.reap {
+					removed, _ := l.Reap(g.ExpiresAt, nil)
+					require.Len(t, removed, 1)
+				} else {
+					require.True(t, l.Remove(g.Key(), g.ExpiresAt))
+				}
+
+				require.Greater(t, Size(l.Encode()), Size(before.Data))
+
+				return nil
+			})
+			require.ErrorIs(t, err, tt.wantErr)
+			after, err := s.Get(t.Context())
+			require.NoError(t, err)
+
+			if tt.wantErr != nil {
+				require.Empty(t, writeActions(client))
+				require.Equal(t, before.Data, after.Data)
+
+				return
+			}
+
+			require.Len(t, writeActions(client), 1)
+			require.Greater(t, Size(after.Data), MaxSize)
+			require.LessOrEqual(t, Size(after.Data), cleanupMaxSize)
+			stored := Parse(after.Data)
+			_, exists := stored.Get(g.Key())
+			require.False(t, exists)
+			require.Len(t, stored.Grants(), 1)
+			require.Len(t, stored.Releases(), 1)
+			require.Equal(t, g.UID, stored.Releases()[0].UID)
+		})
+	}
+}
+
+func TestStoreCreateExceedsGrantLimit(t *testing.T) {
+	before, _ := paddedLedger(t, MaxSize)
+	client := fake.NewClientset(before.DeepCopy())
+	s := &Store{Client: client, Namespace: "system"}
+	_, _, err := s.Update(t.Context(), false, func(l *Ledger) error {
+		err := l.Add(testGrant("new", "node-new"))
+		require.NoError(t, err)
+		require.Greater(t, Size(l.Encode()), MaxSize)
+		require.Less(t, Size(l.Encode()), cleanupMaxSize)
+
+		return nil
+	})
+	require.ErrorIs(t, err, ErrTooLarge)
+	require.Empty(t, writeActions(client))
+	after, err := s.Get(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, before.Data, after.Data)
 }
