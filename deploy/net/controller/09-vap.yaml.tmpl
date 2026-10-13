@@ -67,7 +67,8 @@ spec:
 #   - metadata.labels with the net.unbounded-cloud.io/ prefix
 #   - metadata.annotations with the net.unbounded-cloud.io/ prefix
 #   - spec.podCIDR and spec.podCIDRs (Kubernetes enforces immutability after initial set)
-# All other node fields (spec.taints, spec.unschedulable, status, etc.) must remain unchanged.
+#   - the node agent's exact gateway taint on its token-bound Node
+# All other node fields (spec.unschedulable, status, etc.) must remain unchanged.
 # The CEL expressions iterate over map keys dynamically rather than enumerating fields,
 # so new fields added to the Node spec in future Kubernetes versions are automatically protected.
 apiVersion: admissionregistration.k8s.io/v1
@@ -94,11 +95,28 @@ spec:
     # Status must be unchanged.
     - expression: "object.status == oldObject.status"
       message: "unbounded-net may not modify node status"
-    # Spec: only podCIDR and podCIDRs may change. All other spec fields are protected.
+    # Spec: only podCIDR and podCIDRs may change generally. The node agent may
+    # additionally add or remove its exact gateway taint.
     - expression: >-
-        object.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
-        oldObject.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in object.spec && oldObject.spec[k] == object.spec[k]))
-      message: "unbounded-net may only modify spec.podCIDR and spec.podCIDRs on nodes"
+        object.spec.all(k,
+          k in ['podCIDR', 'podCIDRs'] ||
+          (request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node' && k == 'taints') ||
+          (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
+        oldObject.spec.all(k,
+          k in ['podCIDR', 'podCIDRs'] ||
+          (request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node' && k == 'taints') ||
+          (k in object.spec && oldObject.spec[k] == object.spec[k]))
+      message: "unbounded-net may only modify pod CIDRs and the node agent's gateway taint"
+    - expression: >-
+        request.userInfo.username != 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node' ||
+        (request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('') == object.metadata.name &&
+          request.userInfo.extra[?'authentication.kubernetes.io/node-uid'][0].orValue('') == object.metadata.uid &&
+          object.spec.?taints.orValue([]).filter(t, t.key != 'net.unbounded-cloud.io/gateway-node') ==
+            oldObject.spec.?taints.orValue([]).filter(t, t.key != 'net.unbounded-cloud.io/gateway-node') &&
+          object.spec.?taints.orValue([]).filter(t, t.key == 'net.unbounded-cloud.io/gateway-node').size() <= 1 &&
+          object.spec.?taints.orValue([]).filter(t, t.key == 'net.unbounded-cloud.io/gateway-node').all(t,
+            t.value == 'true' && t.effect == 'NoSchedule'))
+      message: "unbounded-net-node may only add or remove its exact gateway taint on its own Node"
     - expression: >-
         request.userInfo.username != 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node' ||
         (((!has(object.metadata.annotations) || !('net.unbounded-cloud.io/wireguard-port' in object.metadata.annotations)) &&
@@ -195,4 +213,111 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   policyName: unbounded-net-public-ip-annotation-ownership
+  validationActions: ["Deny"]
+
+---
+# Restrict node-agent Pod updates to effective assignment acknowledgment by
+# the service account token bound to that exact Pod.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-net-effective-assignment-ownership
+  labels:
+    app.kubernetes.io/name: unbounded-net-node
+    app.kubernetes.io/component: node
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: "is-unbounded-net-node-sa"
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node'"
+  validations:
+    - expression: >-
+        request.userInfo.extra[?'authentication.kubernetes.io/pod-name'][0].orValue('') == object.metadata.name &&
+        request.userInfo.extra[?'authentication.kubernetes.io/pod-uid'][0].orValue('') == object.metadata.uid
+      message: "unbounded-net-node may only acknowledge assignment on its own bound Pod"
+    - expression: >-
+        object.spec == oldObject.spec &&
+        has(object.status) == has(oldObject.status) &&
+        (!has(object.status) || object.status == oldObject.status) &&
+        has(object.metadata.labels) == has(oldObject.metadata.labels) &&
+        (!has(object.metadata.labels) || object.metadata.labels == oldObject.metadata.labels) &&
+        has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences) &&
+        has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) &&
+        (!has(object.metadata.finalizers) || object.metadata.finalizers == oldObject.metadata.finalizers)
+      message: "unbounded-net-node may only modify effective assignment annotations on its own Pod"
+    - expression: >-
+        (!has(object.metadata.annotations) && !has(oldObject.metadata.annotations)) ||
+        (!has(oldObject.metadata.annotations) && object.metadata.annotations.all(k,
+          k in ['net.unbounded-cloud.io/effective-site', 'net.unbounded-cloud.io/effective-gateway-pool'])) ||
+        (!has(object.metadata.annotations) && oldObject.metadata.annotations.all(k,
+          k in ['net.unbounded-cloud.io/effective-site', 'net.unbounded-cloud.io/effective-gateway-pool'])) ||
+        (has(object.metadata.annotations) && has(oldObject.metadata.annotations) &&
+          object.metadata.annotations.all(k,
+            k in ['net.unbounded-cloud.io/effective-site', 'net.unbounded-cloud.io/effective-gateway-pool'] ||
+            (k in oldObject.metadata.annotations && object.metadata.annotations[k] == oldObject.metadata.annotations[k])) &&
+          oldObject.metadata.annotations.all(k,
+            k in ['net.unbounded-cloud.io/effective-site', 'net.unbounded-cloud.io/effective-gateway-pool'] ||
+            (k in object.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])))
+      message: "unbounded-net-node may only modify effective assignment annotations"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-net-effective-assignment-ownership
+  labels:
+    app.kubernetes.io/name: unbounded-net-node
+    app.kubernetes.io/component: node
+spec:
+  policyName: unbounded-net-effective-assignment-ownership
+  validationActions: ["Deny"]
+
+---
+# Restrict controller Pod deletion to the node-agent Pods owned by the
+# unbounded-net-node DaemonSet.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-net-node-pod-delete-restriction
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: "is-unbounded-net-controller-sa"
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-controller'"
+  validations:
+    - expression: >-
+        oldObject.metadata.namespace == '{{ default "unbounded-system" .Namespace }}' &&
+        oldObject.metadata.labels['app.kubernetes.io/name'] == 'unbounded-net-node' &&
+        oldObject.metadata.labels['app.kubernetes.io/component'] == 'node' &&
+        oldObject.metadata.ownerReferences.exists(owner,
+          owner.controller == true &&
+          owner.apiVersion == 'apps/v1' &&
+          owner.kind == 'DaemonSet' &&
+          owner.name == 'unbounded-net-node')
+      message: "unbounded-net controller may only delete DaemonSet-owned unbounded-net-node Pods"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-net-node-pod-delete-restriction
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  policyName: unbounded-net-node-pod-delete-restriction
   validationActions: ["Deny"]

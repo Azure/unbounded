@@ -5,14 +5,17 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/Azure/unbounded/internal/net/authn"
+	netcontroller "github.com/Azure/unbounded/internal/net/controller"
 )
 
 // These watches run on every serving replica, independently of leadership.
@@ -42,6 +45,12 @@ func newNodeAuthInformers(ctx context.Context, client kubernetes.Interface, name
 	// Instantiate both informers before starting their factories.
 	result.pods.Informer()
 	result.serviceAccounts.Informer()
+
+	if err := result.pods.Informer().AddIndexers(cache.Indexers{
+		netcontroller.NodeAgentPodNodeNameIndex: netcontroller.NodeAgentPodNodeNameIndexFunc,
+	}); err != nil {
+		panic(fmt.Sprintf("add node-agent Pod Node index: %v", err))
+	}
 
 	return result
 }

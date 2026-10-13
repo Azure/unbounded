@@ -93,6 +93,55 @@ func TestNodeFieldPolicyProtectsWireGuardPort(t *testing.T) {
 	}
 }
 
+func TestNodeFieldPolicyRestrictsGatewayTaint(t *testing.T) {
+	t.Parallel()
+
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-node-field-restriction")
+	specExpression := policyValidationExpression(t, policy, "unbounded-net may only modify pod CIDRs and the node agent's gateway taint")
+	taintExpression := policyValidationExpression(t, policy, "unbounded-net-node may only add or remove its exact gateway taint on its own Node")
+	request := func(nodeName string) map[string]any {
+		return map[string]any{"userInfo": map[string]any{
+			"username": nodeServiceAccountUsername,
+			"extra": map[string][]string{
+				nodeNameExtra: {nodeName},
+				nodeUIDExtra:  {"node-uid"},
+			},
+		}}
+	}
+
+	oldObject := nodeSpecAdmissionObject(nil)
+	exact := nodeSpecAdmissionObject([]map[string]any{{
+		"key":    "net.unbounded-cloud.io/gateway-node",
+		"value":  "true",
+		"effect": "NoSchedule",
+	}})
+
+	activation := map[string]any{"oldObject": oldObject, "object": exact, "request": request("node-a")}
+	if !evalCEL(t, specExpression, activation) || !evalCEL(t, taintExpression, activation) {
+		t.Fatal("exact own-Node gateway taint was denied")
+	}
+
+	wrong := nodeSpecAdmissionObject([]map[string]any{{
+		"key":    "net.unbounded-cloud.io/gateway-node",
+		"value":  "false",
+		"effect": "NoSchedule",
+	}})
+	if evalCEL(t, taintExpression, map[string]any{"oldObject": oldObject, "object": wrong, "request": request("node-a")}) {
+		t.Fatal("wrong gateway taint value was allowed")
+	}
+
+	otherOld := nodeSpecAdmissionObject([]map[string]any{{"key": "other", "effect": "NoSchedule"}})
+
+	otherChanged := nodeSpecAdmissionObject([]map[string]any{{"key": "changed", "effect": "NoSchedule"}})
+	if evalCEL(t, taintExpression, map[string]any{"oldObject": otherOld, "object": otherChanged, "request": request("node-a")}) {
+		t.Fatal("change to an unrelated taint was allowed")
+	}
+
+	if evalCEL(t, taintExpression, map[string]any{"oldObject": oldObject, "object": exact, "request": request("node-b")}) {
+		t.Fatal("cross-Node gateway taint was allowed")
+	}
+}
+
 func TestPublicIPAnnotationOwnershipPolicyScope(t *testing.T) {
 	t.Parallel()
 
@@ -365,6 +414,144 @@ func TestPublicIPAnnotationOwnershipPolicy(t *testing.T) {
 	}
 }
 
+func TestEffectiveAssignmentOwnershipPolicy(t *testing.T) {
+	t.Parallel()
+
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-effective-assignment-ownership")
+	ownPodExpression := policyValidationExpression(t, policy, "unbounded-net-node may only acknowledge assignment on its own bound Pod")
+	fieldExpression := policyValidationExpression(t, policy, "unbounded-net-node may only modify effective assignment annotations on its own Pod")
+	annotationExpression := policyValidationExpression(t, policy, "unbounded-net-node may only modify effective assignment annotations")
+
+	oldObject := podAdmissionObject("agent", "pod-uid", map[string]string{"existing": "keep"})
+	updated := podAdmissionObject("agent", "pod-uid", map[string]string{
+		"existing":                                      "keep",
+		"net.unbounded-cloud.io/effective-site":         "site-a",
+		"net.unbounded-cloud.io/effective-gateway-pool": "",
+	})
+	request := map[string]any{"userInfo": map[string]any{"extra": map[string][]string{
+		"authentication.kubernetes.io/pod-name": {"agent"},
+		"authentication.kubernetes.io/pod-uid":  {"pod-uid"},
+	}}}
+
+	if !evalCEL(t, ownPodExpression, map[string]any{"oldObject": oldObject, "object": updated, "request": request}) {
+		t.Fatal("own bound Pod was denied")
+	}
+
+	if !evalCEL(t, annotationExpression, map[string]any{"oldObject": oldObject, "object": updated, "request": request}) {
+		t.Fatal("effective assignment annotation update was denied")
+	}
+
+	if !evalCEL(t, fieldExpression, map[string]any{"oldObject": oldObject, "object": updated, "request": request}) {
+		t.Fatal("unchanged Pod fields were denied")
+	}
+
+	crossPodRequest := map[string]any{"userInfo": map[string]any{"extra": map[string][]string{
+		"authentication.kubernetes.io/pod-name": {"other"},
+		"authentication.kubernetes.io/pod-uid":  {"pod-uid"},
+	}}}
+	if evalCEL(t, ownPodExpression, map[string]any{"oldObject": oldObject, "object": updated, "request": crossPodRequest}) {
+		t.Fatal("cross-Pod acknowledgment was allowed")
+	}
+
+	changedUnowned := podAdmissionObject("agent", "pod-uid", map[string]string{
+		"existing":                                      "changed",
+		"net.unbounded-cloud.io/effective-site":         "site-a",
+		"net.unbounded-cloud.io/effective-gateway-pool": "",
+	})
+	if evalCEL(t, annotationExpression, map[string]any{"oldObject": oldObject, "object": changedUnowned, "request": request}) {
+		t.Fatal("unowned annotation change was allowed")
+	}
+}
+
+func TestEffectiveAssignmentPolicyOptionalPodFields(t *testing.T) {
+	t.Parallel()
+
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-effective-assignment-ownership")
+	expression := policyValidationExpression(t, policy, "unbounded-net-node may only modify effective assignment annotations on its own Pod")
+
+	for _, field := range []string{"labels", "ownerReferences", "finalizers", "status", "all"} {
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+
+			for _, change := range []string{"unchanged", "added", "removed"} {
+				t.Run(change, func(t *testing.T) {
+					t.Parallel()
+
+					oldObject := podAdmissionObject("agent", "pod-uid", map[string]string{"existing": "keep"})
+					updated := podAdmissionObject("agent", "pod-uid", map[string]string{
+						"existing":                                      "keep",
+						"net.unbounded-cloud.io/effective-site":         "site-a",
+						"net.unbounded-cloud.io/effective-gateway-pool": "",
+					})
+
+					fields := []string{field}
+					if field == "all" {
+						fields = []string{"labels", "ownerReferences", "finalizers", "status"}
+					}
+
+					for _, omitted := range fields {
+						oldFields := oldObject
+						newFields := updated
+
+						if omitted != "status" {
+							oldFields = oldObject["metadata"].(map[string]any)
+							newFields = updated["metadata"].(map[string]any)
+						}
+
+						if change != "removed" {
+							delete(oldFields, omitted)
+						}
+
+						if change != "added" {
+							delete(newFields, omitted)
+						}
+					}
+
+					allowed := evalCEL(t, expression, map[string]any{"oldObject": oldObject, "object": updated})
+					if allowed != (change == "unchanged") {
+						t.Fatalf("allowed = %v for %s optional field %s", allowed, change, field)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestNodePodDeleteRestrictionPolicy(t *testing.T) {
+	t.Parallel()
+
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-node-pod-delete-restriction")
+	expression := policyValidationExpression(t, policy, "unbounded-net controller may only delete DaemonSet-owned unbounded-net-node Pods")
+	request := map[string]any{"userInfo": map[string]any{}}
+
+	target := podAdmissionObject("agent", "pod-uid", nil)
+	target["metadata"].(map[string]any)["namespace"] = "unbounded-system"
+	target["metadata"].(map[string]any)["labels"] = map[string]string{
+		"app.kubernetes.io/name":      "unbounded-net-node",
+		"app.kubernetes.io/component": "node",
+	}
+	target["metadata"].(map[string]any)["ownerReferences"] = []map[string]any{{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"name":       "unbounded-net-node",
+		"controller": true,
+	}}
+
+	if !evalCEL(t, expression, map[string]any{"oldObject": target, "object": nil, "request": request}) {
+		t.Fatal("target node-agent Pod deletion was denied")
+	}
+
+	target["metadata"].(map[string]any)["ownerReferences"] = []map[string]any{{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"name":       "unbounded-net-node",
+		"controller": true,
+	}}
+	if evalCEL(t, expression, map[string]any{"oldObject": target, "object": nil, "request": request}) {
+		t.Fatal("non-DaemonSet Pod deletion was allowed")
+	}
+}
+
 func plannedNetObject(t *testing.T, kind, name string) *unstructured.Unstructured {
 	t.Helper()
 
@@ -452,6 +639,37 @@ func publicIPNodeAdmissionObject(name, uid string, annotations map[string]string
 	}
 
 	return map[string]any{"metadata": metadata}
+}
+
+func podAdmissionObject(name, uid string, annotations map[string]string) map[string]any {
+	metadata := map[string]any{
+		"name":            name,
+		"uid":             uid,
+		"labels":          map[string]string{},
+		"ownerReferences": []map[string]any{},
+		"finalizers":      []string{},
+	}
+	if annotations != nil {
+		metadata["annotations"] = annotations
+	}
+
+	return map[string]any{
+		"metadata": metadata,
+		"spec":     map[string]any{},
+		"status":   map[string]any{},
+	}
+}
+
+func nodeSpecAdmissionObject(taints []map[string]any) map[string]any {
+	if taints == nil {
+		taints = []map[string]any{}
+	}
+
+	return map[string]any{
+		"metadata": map[string]any{"name": "node-a", "uid": "node-uid"},
+		"spec":     map[string]any{"taints": taints},
+		"status":   map[string]any{},
+	}
 }
 
 func evalCEL(t *testing.T, expression string, activation map[string]any) bool {
