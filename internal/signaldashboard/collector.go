@@ -506,6 +506,11 @@ func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.Certificat
 			ReservationsReleased: run.Status.Cleanup.ReservationsReleased,
 			SnapshotDeleted:      run.Status.Cleanup.SnapshotDeleted,
 		},
+		Evidence: EvidenceStatus{
+			URI:      run.Status.Evidence.URI,
+			Digest:   run.Status.Evidence.Digest,
+			Retained: run.Status.Evidence.URI != "" && run.Status.Evidence.Digest != "",
+		},
 		Partial: len(snapshot.errors) > 0,
 		Errors:  snapshot.errors,
 	}

@@ -289,6 +289,14 @@ function renderRunDetail(detail) {
     });
   }
 
+  const evidence = byId("evidence-status");
+  clear(evidence);
+  evidence.append(
+    text("div", detail.evidence?.retained ? "Evidence retained" : "Evidence unavailable", "primary"),
+    text("p", `URI: ${detail.evidence?.uri || "not recorded"}`, "mono"),
+    text("p", `Digest: ${detail.evidence?.digest || "not recorded"}`, "mono"),
+  );
+
   const participants = byId("participant-list");
   clear(participants);
   detail.participants.forEach((participant) => {

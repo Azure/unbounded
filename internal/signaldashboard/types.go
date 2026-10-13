@@ -107,6 +107,7 @@ type RunDetail struct {
 	MPIJob        *MPIJobStatus       `json:"mpiJob,omitempty"`
 	Participants  []ParticipantStatus `json:"participants"`
 	Cleanup       CleanupStatus       `json:"cleanup"`
+	Evidence      EvidenceStatus      `json:"evidence"`
 	Partial       bool                `json:"partial"`
 	Errors        []APIError          `json:"errors,omitempty"`
 }
@@ -180,6 +181,12 @@ type ParticipantStatus struct {
 type CleanupStatus struct {
 	ReservationsReleased bool `json:"reservationsReleased"`
 	SnapshotDeleted      bool `json:"snapshotDeleted"`
+}
+
+type EvidenceStatus struct {
+	URI      string `json:"uri,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+	Retained bool   `json:"retained"`
 }
 
 type NodeList struct {

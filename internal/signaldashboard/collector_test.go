@@ -111,6 +111,9 @@ func TestCollectorCorrelatesWorkflowAndMPIJobByOwnership(t *testing.T) {
 	assert.Equal(t, "hardware-pass", detail.OutcomeType)
 	assert.Equal(t, []string{"a100-node-1"}, detail.NodeAliases)
 	assert.Len(t, detail.WorkflowNodes, 2)
+	assert.True(t, detail.Evidence.Retained)
+	assert.Equal(t, "kubernetes://project-signal/configmaps/run-example-evidence/evidence.json.gz", detail.Evidence.URI)
+	assert.Equal(t, "sha256:evidence", detail.Evidence.Digest)
 }
 
 func TestOutcomeTypeSeparatesHardwareAndInfrastructureFailures(t *testing.T) {
@@ -411,8 +414,12 @@ func fixtureReader() *fakeReader {
 			Reason:         "Healthy",
 			Workflow:       signalv1.WorkflowStatus{UID: string(workflowUID), Attempt: 1},
 			Cleanup:        signalv1.CleanupStatus{ReservationsReleased: true, SnapshotDeleted: true},
-			StartedAt:      &started,
-			FinishedAt:     &finished,
+			Evidence: signalv1.EvidenceStatus{
+				URI:    "kubernetes://project-signal/configmaps/run-example-evidence/evidence.json.gz",
+				Digest: "sha256:evidence",
+			},
+			StartedAt:  &started,
+			FinishedAt: &finished,
 		},
 	}
 
