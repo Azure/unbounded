@@ -75,7 +75,7 @@ pub enum Outcome {
     Neutral,
 }
 
-/// Admission observations emitted synchronously in state-transition order.
+/// Admission observations emitted synchronously after each state transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Aggregate, per-key, or record capacity rejected the attempt.
@@ -100,15 +100,18 @@ pub enum Event {
     LinkFailure,
 }
 
-/// Callbacks run synchronously under the admission lock and must not reenter it.
+/// Callbacks run outside the admission lock and may reenter admission.
+/// Values are transition snapshots and can arrive out of order across threads.
+/// Panics propagate from acquisition and observation after state is committed.
+/// Release notifications suppress panics so unwinding can still release capacity.
 pub trait Observer {
-    /// Record an admission or outcome event without reentering the owner.
+    /// Record an admission or outcome event.
     fn event(&self, event: Event);
 
-    /// Publish the current active count without reentering the owner.
+    /// Publish the active count captured by a transition.
     fn active(&self, active: usize);
 
-    /// Publish the current adaptive limit without reentering the owner.
+    /// Publish the adaptive limit captured by a transition.
     fn limit(&self, limit: usize);
 }
 
@@ -221,6 +224,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         let retired;
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
+            drop(state);
             self.observer.event(Event::Rejected);
             return Err(Error::Overloaded);
         }
@@ -237,6 +241,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                 })
                 .next();
             if retired.is_none() {
+                drop(state);
                 self.observer.event(Event::Rejected);
                 return Err(Error::Overloaded);
             }
@@ -256,10 +261,12 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         };
         if peer.generation.is_none() || peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now))
         {
+            drop(state);
             self.observer.event(Event::CircuitRejected);
             return Err(Error::Unavailable);
         }
         if peer.active >= peer.limit {
+            drop(state);
             self.observer.event(Event::Rejected);
             return Err(Error::Overloaded);
         }
@@ -271,17 +278,20 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             .generation
             .expect("admission rejects exhausted generations");
         state.active += 1;
-        self.observer.active(state.active);
-        self.observer.event(Event::Accepted);
-        if probe {
-            self.observer.event(Event::Probe);
-        }
-        Ok(Arc::new(Permit {
+        let active = state.active;
+        let permit = Arc::new(Permit {
             owner: self.clone(),
             key: owned,
             generation,
             probe,
-        }))
+        });
+        drop(state);
+        self.observer.active(active);
+        self.observer.event(Event::Accepted);
+        if probe {
+            self.observer.event(Event::Probe);
+        }
+        Ok(permit)
     }
 }
 
@@ -294,22 +304,30 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         };
         let config = self.owner.config;
         if outcome == Outcome::LocalPressure {
-            self.owner.observer.event(Event::LocalPressure);
-            if now.saturating_duration_since(state.updated) >= config.backoff {
+            let limit = if now.saturating_duration_since(state.updated) >= config.backoff {
                 state.limit = (state.limit / 2).max(1);
                 state.updated = now;
-                self.owner.observer.limit(state.limit);
+                Some(state.limit)
+            } else {
+                None
+            };
+            drop(state);
+            self.owner.observer.event(Event::LocalPressure);
+            if let Some(limit) = limit {
+                self.owner.observer.limit(limit);
             }
             return;
         }
-        if outcome == Outcome::Verified
+        let limit = if outcome == Outcome::Verified
             && state.limit < config.total
             && now.saturating_duration_since(state.updated) >= config.recovery
         {
             state.limit = state.limit.saturating_add(1).min(config.total);
             state.updated = now;
-            self.owner.observer.limit(state.limit);
-        }
+            Some(state.limit)
+        } else {
+            None
+        };
         let peer = state
             .peers
             .get_mut(&self.key)
@@ -320,29 +338,28 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
             Outcome::LocalPressure => Event::LocalPressure,
             Outcome::Neutral => return,
         };
-        self.owner.observer.event(event);
-        if peer.generation != Some(self.generation) {
-            return;
-        }
         match outcome {
+            _ if peer.generation != Some(self.generation) => {}
             Outcome::PeerFailure => {
                 peer.limit = (peer.limit / 2).max(1);
                 peer.generation = self.generation.checked_add(1);
                 peer.retry = Some(Deadline::after(now, config.backoff));
                 peer.updated = now;
             }
-            Outcome::Verified => {
-                if peer.retry.is_some() && !self.probe {
-                    return;
-                }
+            Outcome::Verified if peer.retry.is_none() || self.probe => {
                 peer.retry = None;
                 if now.saturating_duration_since(peer.updated) >= config.recovery {
                     peer.limit = peer.limit.saturating_add(1).min(config.per_key);
                     peer.updated = now;
                 }
             }
-            Outcome::LocalPressure | Outcome::Neutral => {}
+            Outcome::Verified | Outcome::LocalPressure | Outcome::Neutral => {}
         }
+        drop(state);
+        if let Some(limit) = limit {
+            self.owner.observer.limit(limit);
+        }
+        self.owner.observer.event(event);
     }
 }
 
@@ -350,9 +367,7 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
     /// Release final ownership and renew backoff for an unsuccessful probe.
     fn drop(&mut self) {
         let now = (self.owner.now)();
-        let Ok(mut state) = self.owner.state.lock() else {
-            return;
-        };
+        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
         let peer = state
             .peers
             .get_mut(&self.key)
@@ -371,7 +386,11 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
             }
         }
         state.active -= 1;
-        self.owner.observer.active(state.active);
+        let active = state.active;
+        drop(state);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.owner.observer.active(active);
+        }));
     }
 }
 
@@ -2231,6 +2250,146 @@ mod tests {
             backoff: Duration::from_millis(250),
             recovery: Duration::from_secs(1),
             retire_after: Duration::from_secs(60),
+        }
+    }
+
+    /// Every observer hook can inspect state and fail without stranding ownership.
+    #[test]
+    fn adaptive_observer_panics_preserve_cross_thread_accounting() {
+        use std::{
+            panic::{AssertUnwindSafe, catch_unwind},
+            sync::{
+                Weak,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+
+        #[derive(Default)]
+        struct Panics {
+            owner: OnceLock<Weak<Adaptive<u8, Self>>>,
+
+            mode: AtomicUsize,
+        }
+
+        impl Panics {
+            fn check(&self, mode: usize) {
+                if let Some(owner) = self.owner.get().and_then(Weak::upgrade) {
+                    assert!(
+                        owner.state.try_lock().is_ok(),
+                        "observer holds admission lock"
+                    );
+                    let _ = owner.available(&1);
+                }
+                assert_ne!(self.mode.load(Ordering::SeqCst), mode, "observer failed");
+            }
+        }
+
+        impl Observer for Panics {
+            fn event(&self, event: Event) {
+                self.check(match event {
+                    Event::Accepted => 1,
+                    Event::Probe => 2,
+                    Event::Rejected => 3,
+                    Event::CircuitRejected => 4,
+                    _ => 5,
+                });
+            }
+
+            fn active(&self, active: usize) {
+                self.check(if active == 0 { 6 } else { 7 });
+            }
+
+            fn limit(&self, _: usize) {
+                self.check(8);
+            }
+        }
+
+        for mode in [1, 2, 7] {
+            let owner = Adaptive::new(config(), Panics::default(), Instant::now).unwrap();
+            assert!(owner.observer.owner.set(Arc::downgrade(&owner)).is_ok());
+            if mode == 2 {
+                drop(owner.acquire(&1).unwrap());
+                owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
+                    Some(Deadline::At(Instant::now()));
+            }
+            owner.observer.mode.store(mode, Ordering::SeqCst);
+            assert!(catch_unwind(AssertUnwindSafe(|| owner.acquire(&1))).is_err());
+            let state = owner.state.lock().unwrap();
+            assert_eq!(state.active, 0);
+            assert_eq!(state.peers[&1].active, 0);
+            assert!(!state.peers[&1].probe);
+        }
+
+        for outcome in [
+            Outcome::PeerFailure,
+            Outcome::LocalPressure,
+            Outcome::Verified,
+        ] {
+            for mode in [5, 8] {
+                let owner = Adaptive::new(
+                    Config {
+                        backoff: Duration::ZERO,
+                        recovery: Duration::ZERO,
+                        ..config()
+                    },
+                    Panics::default(),
+                    Instant::now,
+                )
+                .unwrap();
+                assert!(owner.observer.owner.set(Arc::downgrade(&owner)).is_ok());
+                let permit = owner.acquire(&1).unwrap();
+                if outcome == Outcome::Verified {
+                    owner.state.lock().unwrap().limit = 2;
+                }
+                owner.observer.mode.store(mode, Ordering::SeqCst);
+                let result = catch_unwind(AssertUnwindSafe(|| permit.observe(outcome)));
+                assert_eq!(
+                    result.is_err(),
+                    mode == 5 || outcome != Outcome::PeerFailure
+                );
+                assert_eq!(owner.state.lock().unwrap().active, 1);
+                if outcome == Outcome::PeerFailure {
+                    assert!(owner.state.lock().unwrap().peers[&1].retry.is_some());
+                }
+                owner.observer.mode.store(6, Ordering::SeqCst);
+                std::thread::spawn(move || drop(permit)).join().unwrap();
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+                owner.observer.mode.store(0, Ordering::SeqCst);
+                let permit = owner.acquire(&2).unwrap();
+                let fence = permit.clone();
+                drop(permit);
+                assert_eq!(owner.state.lock().unwrap().active, 1);
+                std::thread::spawn(move || drop(fence)).join().unwrap();
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+            }
+        }
+
+        for mode in [3, 4] {
+            let owner = Adaptive::new(
+                Config {
+                    per_key: 1,
+                    ..config()
+                },
+                Panics::default(),
+                Instant::now,
+            )
+            .unwrap();
+            let held = owner.acquire(&1).unwrap();
+            if mode == 4 {
+                held.observe(Outcome::PeerFailure);
+            }
+            owner.observer.mode.store(mode, Ordering::SeqCst);
+            assert!(catch_unwind(AssertUnwindSafe(|| owner.acquire(&1))).is_err());
+            assert_eq!(owner.state.lock().unwrap().active, 1);
+            owner.observer.mode.store(6, Ordering::SeqCst);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    let _held = held;
+                    panic!("caller failed");
+                }))
+                .is_err()
+            );
+            assert_eq!(owner.state.lock().unwrap().active, 0);
         }
     }
 
