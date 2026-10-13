@@ -300,6 +300,8 @@ pub mod cluster {
             cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
             node: NodeId("00000000-0000-4000-8000-000000000002".into()),
             max_threads: 2,
+            io_workers: None,
+            crypto_helpers: None,
             allow_smt: false,
             opaque_relay: false,
             peer_tcp_nodelay: false,

@@ -246,11 +246,12 @@ impl Application {
         self.discovered_nics = crate::rdma::inventory();
         let mut plan = AffinityPlan::discover(&self.config)?;
         log_worker_plan("planned", &plan);
-        self.limits = size_workers_configured(
+        self.limits = size_workers_policy(
             &self.config.limits,
             &mut plan,
             self.config.enable_rdma,
             self.config.pprof_enabled,
+            self.config.io_workers.is_some(),
         )?;
         self.config.admission_history_per_worker(plan.pairs.len())?;
         log_worker_plan("final", &plan);
@@ -2480,9 +2481,11 @@ fn partition_limits_with_cause(
 fn log_worker_plan(stage: &str, plan: &AffinityPlan) {
     let groups = plan.crypto_groups();
     eprintln!(
-        "racer-dataplane: stage=worker-plan state={stage} io_workers={} crypto_workers={}",
+        "racer-dataplane: stage=worker-plan state={stage} io_workers={} crypto_workers={} total_threads={} max_threads={}",
         plan.pairs.len(),
-        groups.len()
+        groups.len(),
+        plan.pairs.len() + groups.len(),
+        plan.max_threads
     );
     for indices in groups {
         let crypto = &plan.pairs[indices[0]].crypto;
@@ -2506,11 +2509,22 @@ fn size_workers(node: &Limits, plan: &mut AffinityPlan, rdma: bool) -> Result<Li
     size_workers_configured(node, plan, rdma, false)
 }
 
+#[cfg(test)]
 fn size_workers_configured(
     node: &Limits,
     plan: &mut AffinityPlan,
     rdma: bool,
     profiling: bool,
+) -> Result<Limits> {
+    size_workers_policy(node, plan, rdma, profiling, false)
+}
+
+fn size_workers_policy(
+    node: &Limits,
+    plan: &mut AffinityPlan,
+    rdma: bool,
+    profiling: bool,
+    exact: bool,
 ) -> Result<Limits> {
     // Reduce shards to fund progress, then rebalance shared crypto execution.
     let mut count = plan.pairs.len();
@@ -2548,7 +2562,7 @@ fn size_workers_configured(
                 }
                 return Ok(limits);
             }
-            Err((dimension, _)) if count > 1 => {
+            Err((dimension, _)) if count > 1 && !exact => {
                 limiting_resource = Some(dimension);
                 count -= 1;
             }
@@ -2570,6 +2584,101 @@ mod lifecycle_policy_tests {
     //! Listener completion and control retry classification remain independent.
 
     use super::*;
+
+    #[test]
+    fn exact_sizing_rejects_unfunded_workers_without_reduction() {
+        let mut config = Config::from_lookup(|name| {
+            Ok(match name {
+                "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                "RACER_ENABLE_RDMA" => Some("false".into()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        config.io_workers = Some(20);
+        config.crypto_helpers = Some(20);
+        config.max_threads = 40;
+        let mut plan = AffinityPlan::from_topology(
+            &config,
+            uring_runtime::group::affinity::EffectiveTopology {
+                cpus: (0..72)
+                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: Some(0),
+                    })
+                    .collect(),
+                quota: None,
+                nics: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+        let mut limits = config.limits.clone();
+        limits.queue_entries = NonZeroUsize::new(1).unwrap();
+        assert!(size_workers_policy(&limits, &mut plan, false, false, true).is_err());
+        assert_eq!(plan.pairs.len(), 20);
+        assert_eq!(plan.crypto_groups().len(), 20);
+        for (index, pair) in plan.pairs.iter().enumerate() {
+            assert_eq!(pair.io.cpu, index);
+            assert_eq!(pair.crypto.cpu, 20 + index);
+        }
+    }
+
+    #[test]
+    fn exact_helper_counts_preserve_successful_per_io_budgets() {
+        let make = |helpers: usize| {
+            let config = Config::from_lookup(|name| {
+                Ok(match name {
+                    "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                    "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                    "RACER_ENABLE_RDMA" => Some("false".into()),
+                    "RACER_IO_WORKERS" => Some("20".into()),
+                    "RACER_CRYPTO_HELPERS" => Some(helpers.to_string()),
+                    "RACER_MAX_THREADS" => Some((20 + helpers).to_string()),
+                    "RACER_PLAINTEXT_BYTES" => Some("4294967296".into()),
+                    "RACER_CIPHERTEXT_BYTES" => Some("8589934592".into()),
+                    "RACER_DIRTY_BYTES" => Some("1073741824".into()),
+                    "RACER_REQUEST_CONTEXT_BYTES" => Some("268435456".into()),
+                    "RACER_QUEUE_ENTRIES" | "RACER_CLIENT_CONNECTIONS" | "RACER_PIPES" => {
+                        Some("1024".into())
+                    }
+                    "RACER_RELAY_TRANSFERS" => Some("64".into()),
+                    _ => None,
+                })
+            })
+            .unwrap();
+            let mut plan = AffinityPlan::from_topology(
+                &config,
+                uring_runtime::group::affinity::EffectiveTopology {
+                    cpus: (0..144)
+                        .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                            cpu,
+                            package: 0,
+                            core: cpu,
+                            numa_node: Some(cpu / 72),
+                        })
+                        .collect(),
+                    quota: None,
+                    nics: vec![],
+                },
+                &[],
+            )
+            .unwrap();
+            let limits = size_workers_policy(&config.limits, &mut plan, false, true, true).unwrap();
+            assert_eq!(plan.pairs.len(), 20);
+            assert_eq!(plan.crypto_groups().len(), helpers);
+            assert_eq!(limits.plaintext_bytes.get(), 4294967296 / 20);
+            assert_eq!(limits.ciphertext_bytes.get(), 8589934592 / 20);
+            (
+                format!("{limits:?}"),
+                config.admission_history_per_worker(20).unwrap(),
+            )
+        };
+        assert_eq!(make(10), make(20));
+    }
 
     #[test]
     fn profiling_worker_sizing_preserves_memory_and_ordinary_slots() {

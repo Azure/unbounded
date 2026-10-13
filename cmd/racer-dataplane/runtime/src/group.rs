@@ -1374,6 +1374,77 @@ pub mod affinity {
         Ok(pairs)
     }
 
+    /// Exact roles on the first preferred NUMA node, without fallback or sharing CPUs.
+    pub fn place_exact(
+        mut topology: EffectiveTopology,
+        max_threads: usize,
+        lanes: usize,
+        helpers: usize,
+        allow_smt: bool,
+    ) -> Result<Vec<Placement>> {
+        let total = lanes
+            .checked_add(helpers)
+            .ok_or(Error::InvalidConfiguration)?;
+        if lanes == 0 || helpers == 0 || helpers > lanes || total > max_threads {
+            return Err(Error::InvalidConfiguration);
+        }
+        if topology
+            .quota
+            .is_some_and(|q| u128::from(q.quota.get()) / u128::from(q.period.get()) < total as u128)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        topology.cpus.sort_by_key(|cpu| cpu.cpu);
+        if topology
+            .cpus
+            .windows(2)
+            .any(|pair| pair[0].cpu == pair[1].cpu)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        if !allow_smt {
+            let mut cores = HashSet::new();
+            topology
+                .cpus
+                .retain(|cpu| cores.insert((cpu.package, cpu.core)));
+        }
+        topology.nics.sort_by(|a, b| a.device.cmp(&b.device));
+        topology.nics.retain(|nic| nic.numa_node.is_some());
+        let mut nodes = BTreeMap::<_, Vec<_>>::new();
+        for cpu in topology.cpus {
+            nodes.entry(cpu.numa_node).or_default().push(cpu);
+        }
+        let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|(node, _)| {
+            (
+                !topology.nics.iter().any(|nic| nic.numa_node == *node),
+                *node,
+            )
+        });
+        let (node, local) = nodes
+            .into_iter()
+            .next()
+            .ok_or(Error::InvalidConfiguration)?;
+        if node.is_none() || local.len() < total {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut cores = HashSet::new();
+        let mut ordered = local
+            .into_iter()
+            .map(|cpu| (!cores.insert((cpu.package, cpu.core)), cpu))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(sibling, cpu)| (*sibling, cpu.cpu));
+        let local = ordered.into_iter().map(|(_, cpu)| cpu).collect::<Vec<_>>();
+        let nic = topology.nics.into_iter().find(|nic| nic.numa_node == node);
+        Ok((0..lanes)
+            .map(|index| Placement {
+                lane: local[index].clone(),
+                helper: local[lanes + index % helpers].clone(),
+                nic: nic.clone(),
+            })
+            .collect())
+    }
+
     /// Placement regressions independent of application worker IDs and rails.
     #[cfg(test)]
     mod placement_tests {

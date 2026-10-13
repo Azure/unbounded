@@ -72,6 +72,8 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | Setting | Default | Scope / constraint |
 |---------|---------|--------------------|
 | `RACER_MAX_THREADS` | Unset (automatic) | Total userspace I/O and crypto threads; explicit value at least 2 |
+| `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count; requires `RACER_CRYPTO_HELPERS` |
+| `RACER_CRYPTO_HELPERS` | Unset (automatic) | Exact helper count, from 1 through the exact I/O count; requires `RACER_IO_WORKERS` |
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
@@ -106,6 +108,18 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
+
+Exact sizing requires both count settings. Their sum must fit `RACER_MAX_THREADS`;
+the cap is never raised implicitly. The first NUMA node in the normal placement
+preference order must be known and have enough eligible CPUs for the whole split.
+Other host NUMA nodes are allowed, but exact placement does not span nodes or skip
+an undersized preferred node. Insufficient CPU quota or per-I/O resource budgets
+fails startup rather than reducing counts. For an isolated 20-I/O comparison, use
+10 helpers with cap 30 or 20 helpers with cap 40. Keep all resource budgets fixed.
+Omit both count settings to retain automatic sizing.
+Extra helpers change available crypto execution capacity, not I/O ownership or
+per-I/O budgets. They do not guarantee higher throughput; compare matched workloads
+before drawing a performance conclusion.
 
 Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
 Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets

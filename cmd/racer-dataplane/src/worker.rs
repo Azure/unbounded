@@ -105,9 +105,39 @@ impl AffinityPlan {
     /// preserves HTTP fallback. No extra control/diagnostic threads are created.
     pub fn from_topology(
         config: &Config,
-        topology: EffectiveTopology,
+        mut topology: EffectiveTopology,
         rails: &[RailMapping],
     ) -> Result<Self> {
+        if config.io_workers.is_some() || config.crypto_helpers.is_some() {
+            config.validate()?;
+        }
+        if let (Some(io), Some(helpers)) = (config.io_workers, config.crypto_helpers) {
+            topology.nics.retain(|nic| {
+                nic.numa_node.is_some()
+                    && (rails.is_empty()
+                        || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
+            });
+            let pairs = uring_runtime::group::affinity::place_exact(
+                topology,
+                config.max_threads,
+                io,
+                helpers,
+                config.allow_smt,
+            )?
+            .into_iter()
+            .enumerate()
+            .map(|(index, placement)| WorkerPair {
+                worker: WorkerId(index as u16),
+                io: placement.lane,
+                crypto: placement.helper,
+                nic: placement.nic,
+            })
+            .collect();
+            return Ok(Self {
+                pairs,
+                max_threads: config.max_threads,
+            });
+        }
         Self::place_with_policy(config.max_threads, topology, rails, config.allow_smt)
     }
     #[cfg(test)]
@@ -796,6 +826,32 @@ mod tests {
     use super::*;
     use racer_control_wire::CacheId;
 
+    #[test]
+    fn exact_twenty_endpoint_pairs_close_independently() {
+        let limits = crate::test_support::cluster::config(false).limits;
+        let resources = Resources::new(limits, (0..20).map(WorkerId).collect(), 42).unwrap();
+        let mut peers = resources
+            .ports
+            .iter()
+            .map(|ports| ports.lock().unwrap().1.take().unwrap())
+            .collect::<Vec<_>>();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for closed in 0..20 {
+            resources.abandon_lane(closed).unwrap();
+            for (index, peer) in peers.iter_mut().enumerate() {
+                let result = peer.poll_job(&mut cx);
+                if index <= closed {
+                    assert!(matches!(result, Poll::Ready(Ok(None))));
+                } else {
+                    assert!(
+                        result.is_pending(),
+                        "closing lane {closed} affected lane {index}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Validate before allocation and stop at the first failed endpoint pair.
     #[test]
     fn endpoint_allocator_preserves_order_generation_and_failure_boundary() {
@@ -1039,6 +1095,127 @@ mod tests {
                     }),
                     nics: vec![],
                 }
+            }
+
+            #[test]
+            fn thirty_thread_baseline_preserves_twenty_io_and_ten_crypto_assignments() {
+                let plan = AffinityPlan::place(30, topology(72, None), &[]).unwrap();
+                assert_eq!(plan.max_threads, 30);
+                assert_eq!(plan.pairs.len(), 20);
+                for (index, pair) in plan.pairs.iter().enumerate() {
+                    assert_eq!(pair.worker, WorkerId(index as u16));
+                    assert_eq!(pair.io.cpu, index);
+                    assert_eq!(pair.crypto.cpu, 20 + index % 10);
+                    assert_eq!(pair.io.numa_node, Some(0));
+                    assert_eq!(pair.crypto.numa_node, Some(0));
+                }
+                assert_eq!(
+                    plan.crypto_groups(),
+                    (0..10)
+                        .map(|index| vec![index, index + 10])
+                        .collect::<Vec<_>>()
+                );
+                let runtime = runtime_plan(&plan);
+                assert_eq!(runtime.lanes.len(), 20);
+                assert_eq!(runtime.helpers.len(), 10);
+                assert_eq!(runtime.max_threads, 30);
+            }
+
+            #[test]
+            fn exact_splits_preserve_io_on_a_two_numa_host() {
+                let mut hardware = topology(144, None);
+                for cpu in &mut hardware.cpus {
+                    cpu.numa_node = Some(cpu.cpu / 72);
+                }
+                for helpers in [10, 20] {
+                    let mut config = Config::from_lookup(|name| {
+                        Ok(match name {
+                            "RACER_CLUSTER_ID" => {
+                                Some("00000000-0000-4000-8000-000000000001".into())
+                            }
+                            "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                            "RACER_ENABLE_RDMA" => Some("false".into()),
+                            _ => None,
+                        })
+                    })
+                    .unwrap();
+                    config.io_workers = Some(20);
+                    config.crypto_helpers = Some(helpers);
+                    config.max_threads = 20 + helpers;
+                    let plan = AffinityPlan::from_topology(&config, hardware.clone(), &[]).unwrap();
+                    assert_eq!(plan.pairs.len(), 20);
+                    assert_eq!(plan.crypto_groups().len(), helpers);
+                    for (index, pair) in plan.pairs.iter().enumerate() {
+                        assert_eq!(pair.worker, WorkerId(index as u16));
+                        assert_eq!(pair.io.cpu, index);
+                        assert_eq!(pair.crypto.cpu, 20 + index % helpers);
+                    }
+                    let runtime = runtime_plan(&plan);
+                    let mut lanes = runtime
+                        .helpers
+                        .iter()
+                        .flat_map(|h| h.lanes.iter().copied())
+                        .collect::<Vec<_>>();
+                    lanes.sort_unstable();
+                    assert_eq!(lanes, (0..20).collect::<Vec<_>>());
+                }
+            }
+
+            #[test]
+            fn exact_placement_rejects_insufficient_or_unknown_local_capacity() {
+                use uring_runtime::group::affinity::place_exact;
+                assert!(place_exact(topology(72, None), 30, 20, 20, false).is_err());
+                assert!(place_exact(topology(39, None), 40, 20, 20, false).is_err());
+                assert!(place_exact(topology(72, Some((39, 1))), 40, 20, 20, false).is_err());
+                let mut unknown = topology(72, None);
+                for cpu in &mut unknown.cpus {
+                    cpu.numa_node = None;
+                }
+                assert!(place_exact(unknown, 40, 20, 20, false).is_err());
+                let mut split = topology(100, None);
+                for cpu in &mut split.cpus {
+                    cpu.numa_node = Some(usize::from(cpu.cpu >= 20));
+                }
+                assert!(place_exact(split, 40, 20, 20, false).is_err());
+                let mut duplicate = topology(72, None);
+                duplicate.cpus[1].cpu = 0;
+                assert!(place_exact(duplicate, 40, 20, 20, false).is_err());
+            }
+
+            #[test]
+            fn exact_smt_requires_opt_in_and_keeps_io_on_distinct_cores() {
+                use uring_runtime::group::affinity::place_exact;
+                let mut hardware = topology(8, None);
+                for cpu in &mut hardware.cpus {
+                    cpu.core = cpu.cpu % 4;
+                }
+                assert!(place_exact(hardware.clone(), 8, 4, 4, false).is_err());
+                let plan = place_exact(hardware, 8, 4, 4, true).unwrap();
+                for (index, pair) in plan.iter().enumerate() {
+                    assert_eq!(pair.lane.cpu, index);
+                    assert_eq!(pair.helper.cpu, index + 4);
+                }
+            }
+
+            #[test]
+            fn exact_nic_preference_selects_one_node_without_capacity_fallback() {
+                use uring_runtime::group::affinity::place_exact;
+                let mut hardware = topology(16, None);
+                for cpu in &mut hardware.cpus {
+                    cpu.numa_node = Some(cpu.cpu / 8);
+                }
+                hardware.nics.push(NicLocality {
+                    device: "nic1".into(),
+                    numa_node: Some(1),
+                });
+                let plan = place_exact(hardware.clone(), 8, 4, 4, false).unwrap();
+                for (index, pair) in plan.iter().enumerate() {
+                    assert_eq!(pair.lane.cpu, index + 8);
+                    assert_eq!(pair.helper.cpu, index + 12);
+                    assert_eq!(pair.nic.as_ref().unwrap().device, "nic1");
+                }
+                hardware.cpus.retain(|cpu| cpu.cpu < 12);
+                assert!(place_exact(hardware, 8, 4, 4, false).is_err());
             }
 
             #[test]

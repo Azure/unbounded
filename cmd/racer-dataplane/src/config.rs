@@ -80,6 +80,9 @@ pub struct Config {
     /// Total thread cap, minimum two; usize::MAX means no configured ceiling.
     /// Control and diagnostics run on I/O threads within this budget.
     pub max_threads: usize,
+    /// Paired exact counts; absent preserves automatic sizing and reduction.
+    pub io_workers: Option<usize>,
+    pub crypto_helpers: Option<usize>,
     /// Opt into logical-CPU sizing instead of one eligible CPU per physical core.
     pub allow_smt: bool,
     pub enable_rdma: bool,
@@ -196,6 +199,8 @@ impl Config {
             cluster: ClusterId(raw.cluster_id),
             node: NodeId(UNRESOLVED_NODE_ID.into()),
             max_threads: to_usize(raw.max_threads.unwrap_or(DEFAULT_MAX_THREADS as u64))?,
+            io_workers: raw.io_workers.map(to_usize).transpose()?,
+            crypto_helpers: raw.crypto_helpers.map(to_usize).transpose()?,
             allow_smt: raw.allow_smt.unwrap_or(false),
             enable_rdma,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
@@ -278,6 +283,18 @@ impl Config {
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
     /// discovered and checked when opening the slabs, not guessed from this config.
     pub fn validate(&self) -> Result<()> {
+        match (self.io_workers, self.crypto_helpers) {
+            (None, None) => {}
+            (Some(io), Some(helpers))
+                if io > 0
+                    && io <= usize::from(u16::MAX) + 1
+                    && helpers > 0
+                    && helpers <= io
+                    && io
+                        .checked_add(helpers)
+                        .is_some_and(|n| n <= self.max_threads) => {}
+            _ => return Err(Error::InvalidConfiguration),
+        }
         self.warm.validate()?;
         if let Some(pair) = &self.send_crc_pair {
             pair.validate()?;
@@ -464,6 +481,8 @@ const ENV_NAMES: &[&str] = &[
     "DEVICE_DIRECTORY",
     "ADMISSION_MODE",
     "MAX_THREADS",
+    "IO_WORKERS",
+    "CRYPTO_HELPERS",
     "WARM_MAX_TTL_SECS",
     "WARM_FILL_TIMEOUT_SECS",
     "WARM_MAX_JOBS",
@@ -535,6 +554,10 @@ struct RawConfig {
     send_crc_pair: Option<String>,
     #[serde(default, deserialize_with = "decimal")]
     max_threads: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    io_workers: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    crypto_helpers: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     warm_max_ttl_secs: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -833,6 +856,35 @@ mod tests {
                 Err(Error::InvalidConfiguration)
             );
         }
+    }
+
+    #[test]
+    fn exact_worker_counts_require_a_valid_pair_within_the_cap() {
+        let defaults = parse(&[]).unwrap();
+        assert_eq!((defaults.io_workers, defaults.crypto_helpers), (None, None));
+        for (io, helpers, cap, valid) in [
+            ("20", "10", "30", true),
+            ("20", "20", "40", true),
+            ("20", "20", "30", false),
+            ("0", "1", "40", false),
+            ("20", "0", "40", false),
+            ("10", "20", "40", false),
+            ("65537", "1", "99999", false),
+            ("-1", "1", "40", false),
+            ("18446744073709551615", "1", "40", false),
+        ] {
+            assert_eq!(
+                parse(&[
+                    ("RACER_IO_WORKERS", io),
+                    ("RACER_CRYPTO_HELPERS", helpers),
+                    ("RACER_MAX_THREADS", cap)
+                ])
+                .is_ok(),
+                valid
+            );
+        }
+        assert!(parse(&[("RACER_IO_WORKERS", "20")]).is_err());
+        assert!(parse(&[("RACER_CRYPTO_HELPERS", "20")]).is_err());
     }
 
     #[test]

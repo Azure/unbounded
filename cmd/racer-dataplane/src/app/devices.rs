@@ -487,6 +487,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_helper_counts_preserve_twenty_worker_device_ownership() {
+        let make = |helpers| {
+            let mut c = Config::from_lookup(|name| {
+                Ok(match name {
+                    "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                    "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                    "RACER_ENABLE_RDMA" => Some("false".into()),
+                    _ => None,
+                })
+            })
+            .unwrap();
+            c.io_workers = Some(20);
+            c.crypto_helpers = Some(helpers);
+            c.max_threads = 20 + helpers;
+            c.validate().unwrap();
+            plan(
+                (0..5)
+                    .map(|i| device(&format!("disk-{i}"), 100, c.segment_bytes))
+                    .collect(),
+                &c,
+                c.io_workers.unwrap(),
+            )
+            .unwrap()
+        };
+        let a = make(10);
+        let b = make(20);
+        assert_eq!(a.workers.len(), 20);
+        assert_eq!(b.workers.len(), 20);
+        assert_eq!(a.checkpoint_bytes, b.checkpoint_bytes);
+        for (a, b) in a.workers.iter().zip(&b.workers) {
+            assert_eq!(a.digest, b.digest);
+            assert_eq!(a.disk_groups, b.disk_groups);
+            assert_eq!(a.page_entries, b.page_entries);
+            assert_eq!(
+                a.placements.iter().map(|p| p.offset).collect::<Vec<_>>(),
+                b.placements.iter().map(|p| p.offset).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn disk_usage_shared_device_plan_exports_each_assigned_segment_once() {
         let c = config();
         let s = c.segment_bytes;
