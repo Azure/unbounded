@@ -1,7 +1,8 @@
 use http1::{Header, MessageHead, StartLine};
 use racer_control_wire::CacheId;
 use racer_object_wire::{
-    CacheKey, Error, ObjectId, ObjectVersion, PAGE_BYTES, PageId, PageNumber, StrongEtag, origin,
+    CacheKey, Error, ObjectId, ObjectVersion, PAGE_BYTES, PageId, PageNumber, StrongEtag,
+    VersionMetadata, origin,
 };
 
 fn object() -> ObjectId {
@@ -157,23 +158,31 @@ fn page_validation_still_requires_the_requested_version() {
             format!("bytes {PAGE_BYTES}-{PAGE_BYTES}/{}", PAGE_BYTES + 1),
         ),
     ]);
-    let (metadata, length) = origin::validate_page_head(&head, &page).unwrap();
+    let expected = VersionMetadata {
+        version: page.version.clone(),
+        length: PAGE_BYTES + 1,
+        content_type: None,
+    };
+    let (metadata, length) = origin::validate_page_head(&head, &page, &expected).unwrap();
     assert_eq!(metadata.version, page.version);
     assert_eq!(length, 1);
-    assert_eq!(origin::validate_page(&head, &page, 1), Ok(metadata));
+    assert_eq!(
+        origin::validate_page(&head, &page, &expected, 1),
+        Ok(metadata)
+    );
     for received in [0, 2] {
         assert_eq!(
-            origin::validate_page(&head, &page, received),
+            origin::validate_page(&head, &page, &expected, received),
             Err(Error::BadGateway)
         );
     }
     head.headers[1].value = b"\"v2\"".to_vec();
     assert_eq!(
-        origin::validate_page_head(&head, &page),
+        origin::validate_page_head(&head, &page, &expected),
         Err(Error::BadGateway)
     );
     assert_eq!(
-        origin::validate_page(&head, &page, 1),
+        origin::validate_page(&head, &page, &expected, 1),
         Err(Error::BadGateway)
     );
 }

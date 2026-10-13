@@ -2,7 +2,7 @@
 
 use crate::model::{
     ContentType, ExpiresAt, MAX_FIELD_BYTES, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES,
-    PageId, StrongEtag,
+    PageId, StrongEtag, VersionMetadata,
 };
 use crate::{Error, Result};
 use http1::{MessageHead, StartLine};
@@ -96,21 +96,26 @@ pub fn validate_metadata(
 }
 
 /// Require exact If-Match, Content-Range, whole-page length, and final-page bounds.
-/// Reject multipart, short/overlong bodies, and unexpected versions.
+/// Reject multipart, short/overlong bodies, and changed immutable metadata.
 pub fn validate_page(
     head: &MessageHead,
     page: &PageId,
+    expected: &VersionMetadata,
     received_bytes: usize,
 ) -> Result<ObjectMetadata> {
-    let (metadata, length) = validate_page_head(head, page)?;
+    let (metadata, length) = validate_page_head(head, page, expected)?;
     if received_bytes as u64 != length {
         return Err(Error::BadGateway);
     }
     Ok(metadata)
 }
 
-/// Validate before allocating or receiving any payload.
-pub fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetadata, u64)> {
+/// Validate immutable metadata before receiving payload; expiry may refresh.
+pub fn validate_page_head(
+    head: &MessageHead,
+    page: &PageId,
+    expected: &VersionMetadata,
+) -> Result<(ObjectMetadata, u64)> {
     let (status, length) = validate_response(head, true)?;
     if status != 206 || required(head, "Content-Type")? != b"application/octet-stream" {
         return Err(Error::BadGateway);
@@ -128,7 +133,7 @@ pub fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMe
         return Err(Error::BadGateway);
     }
     let metadata = metadata(head, &page.version.object, total)?;
-    if metadata.version != page.version {
+    if metadata.version != page.version || !expected.compatible(&metadata.immutable()) {
         return Err(Error::BadGateway);
     }
     Ok((metadata, length))

@@ -1,7 +1,8 @@
 use http1::{Codec, Header, MessageHead, StartLine};
 use racer_control_wire::CacheId;
 use racer_object_wire::{
-    CacheKey, Error, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag, origin,
+    CacheKey, ContentType, Error, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag,
+    VersionMetadata, origin,
 };
 
 fn object() -> ObjectId {
@@ -45,7 +46,10 @@ fn assert_content_type(mut head: MessageHead, expected: Option<&[u8]>) {
         version: metadata.version.clone(),
         number: PageNumber(0),
     };
-    assert_eq!(origin::validate_page(&head, &page, 1), Ok(metadata));
+    assert_eq!(
+        origin::validate_page(&head, &page, &metadata.immutable(), 1),
+        Ok(metadata)
+    );
 }
 
 #[test]
@@ -145,8 +149,13 @@ fn opaque_numeric_and_range_fields_still_reject_padding() {
                 },
                 number: PageNumber(0),
             };
+            let expected = VersionMetadata {
+                version: page.version.clone(),
+                length: 1,
+                content_type: Some(ContentType::parse(b"text/plain").unwrap()),
+            };
             assert_eq!(
-                origin::validate_page(&head, &page, 1),
+                origin::validate_page(&head, &page, &expected, 1),
                 Err(Error::BadGateway)
             );
         }
