@@ -74,19 +74,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type"
+        "rollingUpdate"
       ],
       "properties": {
-        "type": {
-          "type": "string",
-          "enum": [
-            "RollingUpdate",
-            "OnDelete"
-          ]
-        },
         "rollingUpdate": {
           "type": "object",
           "additionalProperties": false,
+          "required": [
+            "maxUnavailable"
+          ],
           "properties": {
             "maxUnavailable": {
               "anyOf": [
@@ -97,18 +93,6 @@
                 {
                   "type": "string",
                   "pattern": "^([1-9][0-9]?|100)%$"
-                }
-              ]
-            },
-            "maxSurge": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                {
-                  "type": "string",
-                  "pattern": "^([0-9]|[1-9][0-9]|100)%$"
                 }
               ]
             }

@@ -109,9 +109,10 @@ metricsService:
 
 ## Agent rollout
 
-`updateStrategy` is the agent DaemonSet's update strategy. The default
-`maxUnavailable: 50%` replaces half of the agents at once; lower it on large
-clusters to bound how many nodes lose their local mirror during a rollout:
+`updateStrategy.rollingUpdate.maxUnavailable` sets the agent DaemonSet's
+rolling-update step as a positive count or percentage. The default `50%`
+replaces half of the agents at once; lower it on large clusters to bound how
+many nodes lose their local mirror during a rollout:
 
 ```sh
 --set-string updateStrategy.rollingUpdate.maxUnavailable=10%

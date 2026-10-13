@@ -12,7 +12,9 @@ spec:
     matchLabels:
       app.kubernetes.io/name: gantry
   updateStrategy:
-    {{- toYaml .Values.updateStrategy | nindent 4 }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.updateStrategy.rollingUpdate.maxUnavailable }}
   template:
     metadata:
       labels:

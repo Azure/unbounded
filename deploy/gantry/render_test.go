@@ -228,6 +228,11 @@ func TestRendersConfiguredAgentUpdateStrategy(t *testing.T) {
 			args: []string{"--set-string", "updateStrategy.rollingUpdate.maxUnavailable=10%"},
 			want: "maxUnavailable: 10%",
 		},
+		{
+			name: "count",
+			args: []string{"--set", "updateStrategy.rollingUpdate.maxUnavailable=3"},
+			want: "maxUnavailable: 3\n",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

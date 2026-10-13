@@ -13,7 +13,6 @@ manager: helm
 # Rollout strategy for the agent DaemonSet. Lower maxUnavailable on large
 # clusters to bound how many nodes lose the local mirror at once.
 updateStrategy:
-  type: RollingUpdate
   rollingUpdate:
     maxUnavailable: 50%
 
