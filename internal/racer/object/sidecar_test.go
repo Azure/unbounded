@@ -98,6 +98,12 @@ func TestSidecarReads(t *testing.T) {
 		{"full", "GET", "", "0123456789", "", 200, 10},
 		{"head", "HEAD", "", "", "", 200, 10},
 		{"bounded", "GET", "bytes=2-5", "2345", "bytes 2-5/10", 206, 4},
+		{"uppercase unit", "GET", "BYTES=2-5", "2345", "bytes 2-5/10", 206, 4},
+		{"mixed case unit", "GET", "bYtEs=7-", "789", "bytes 7-9/10", 206, 3},
+		{"unknown unit", "GET", "items=0-1", "0123456789", "", 200, 10},
+		{"unknown unit value", "GET", "items=not-a-byte-range", "0123456789", "", 200, 10},
+		{"unknown unit beyond size", "GET", "items=999-", "0123456789", "", 200, 10},
+		{"unknown unit head", "HEAD", "items=0-1", "", "", 200, 10},
 		{"open", "GET", "bytes=7-", "789", "bytes 7-9/10", 206, 3},
 		{"suffix", "GET", "bytes=-3", "789", "bytes 7-9/10", 206, 3},
 		{"clamped", "GET", "bytes=8-999", "89", "bytes 8-9/10", 206, 2},
@@ -105,6 +111,7 @@ func TestSidecarReads(t *testing.T) {
 		{"one byte", "GET", "bytes=0-0", "0", "bytes 0-0/10", 206, 1},
 		{"head range", "HEAD", "bytes=2-5", "", "", 200, 4},
 		{"head suffix range", "HEAD", "bytes=-3", "", "", 200, 3},
+		{"head mixed case unit", "HEAD", "ByTeS=-3", "", "", 200, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := calls.Load()
@@ -298,13 +305,20 @@ func TestSidecarInvalidRanges(t *testing.T) {
 		status int
 	}{
 		{"bytes=4-", 416},
+		{"BYTES=4-", 416},
 		{"bytes=-0", 416},
 		{"bytes=999-1000", 416},
 		{"bytes=2-1", 400},
 		{"bytes=0-1,2-3", 400},
-		{"items=0-1", 400},
+		{"BYTES=0-1,2-3", 400},
+		{"bytes", 400},
+		{"=0-1", 400},
+		{"bytes =0-1", 400},
+		{"by tes=0-1", 400},
+		{"bytés=0-1", 400},
 		{"bytes=", 400},
 		{"bytes=-", 400},
+		{"ByTeS=-", 400},
 		{"bytes=+1-2", 400},
 		{"bytes=0-+1", 400},
 		{"bytes=0-1-2", 400},
@@ -603,6 +617,11 @@ func TestSidecarEmptyObject(t *testing.T) {
 		w = sidecarTestRequest(h, method, "/bucket/key", http.Header{"Range": {"bytes=0-"}})
 		if w.Code != 416 || w.Header().Get("Content-Range") != "bytes */0" {
 			t.Fatalf("empty range: %d", w.Code)
+		}
+
+		w = sidecarTestRequest(h, method, "/bucket/key", http.Header{"Range": {"items=0-"}})
+		if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") != "0" || w.Header().Get("Content-Range") != "" {
+			t.Fatalf("empty unknown range: %d %v %q", w.Code, w.Header(), w.Body.String())
 		}
 	}
 }

@@ -439,9 +439,19 @@ func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bo
 		return 0, 0, false, http.StatusBadRequest
 	}
 
-	s, ok := strings.CutPrefix(strings.Trim(values[0], " \t"), "bytes=")
-	if !ok {
+	unit, s, ok := strings.Cut(strings.Trim(values[0], " \t"), "=")
+	if !ok || unit == "" {
 		return 0, 0, false, http.StatusBadRequest
+	}
+
+	for _, c := range unit {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && !strings.ContainsRune("!#$%&'*+-.^_`|~", c) {
+			return 0, 0, false, http.StatusBadRequest
+		}
+	}
+
+	if !strings.EqualFold(unit, "bytes") {
+		return 0, size, false, 0
 	}
 
 	first, last, ok := strings.Cut(s, "-")
