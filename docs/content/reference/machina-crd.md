@@ -65,9 +65,9 @@ uses the `PXESpec` type; there is no top-level `spec.pxe` field.
 | `host.netboot.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
 | `host.netboot.targetDisk` | string | No | Installer-selected | Block device the installer writes the machine image to, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted, the initrd selects a disk automatically. |
 | `host.netboot.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
-| `host.netboot.redfish.url` | string | Yes | - | Redfish endpoint URL. |
+| `host.netboot.redfish.url` | string | Yes | - | Redfish endpoint URL, including any per-system path prefix (for example `https://manager:8080/7`). Omit `/redfish/v1`. |
 | `host.netboot.redfish.username` | string | Yes | - | Redfish username. |
-| `host.netboot.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
+| `host.netboot.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. Ignored when the endpoint exposes a single system selected by its URL. |
 | `host.netboot.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
 | `host.netboot.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
 | `host.netboot.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |

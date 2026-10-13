@@ -325,7 +325,8 @@ type DHCPLease struct {
 
 // RedfishSpec defines Redfish BMC connection details.
 type RedfishSpec struct {
-	// URL is the Redfish endpoint URL.
+	// URL is the Redfish endpoint URL. It may include a per-system path prefix,
+	// for example https://manager:8080/7. Do not include /redfish/v1.
 	// +kubebuilder:validation:Required
 	URL string `json:"url"`
 
@@ -334,6 +335,7 @@ type RedfishSpec struct {
 	Username string `json:"username"`
 
 	// DeviceID is the Redfish system device ID. Defaults to "1".
+	// It is ignored when the endpoint exposes a single system selected by its URL.
 	// +kubebuilder:default="1"
 	DeviceID string `json:"deviceID,omitempty"`
 

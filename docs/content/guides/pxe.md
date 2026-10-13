@@ -15,7 +15,7 @@ API group: `unbounded-cloud.io/v1alpha3`. CRD: **Machine** (`mach`), cluster-sco
 - A Kubernetes cluster with access to `kubectl`.
 - Bare-metal servers with UEFI PXE firmware and a BMC exposing a Redfish API.
 - Layer-2 network connectivity (or a DHCP relay agent) between metalman and the PXE NICs.
-- Network access from metalman to each BMC (HTTPS/443) and to the Kubernetes API (TCP/6443).
+- Network access from metalman to each BMC's HTTPS port (443 by default) and to the Kubernetes API (TCP/6443).
 - Network access from target machines to metalman (UDP/67, UDP/69, TCP/8880) and to the Kubernetes API (TCP/6443).
 - TPM 2.0 modules on target machines (required for secure attestation).
 
@@ -129,6 +129,17 @@ spec:
 ```
 
 Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
+
+For a rack manager that exposes each server through a separate URL, include the
+server's path prefix in `redfish.url`, such as `https://manager:8080/7` for slot 7.
+Do not append `/redfish/v1`. Metalman detects supported endpoints automatically;
+`deviceID` is ignored when the URL selects a single system. Use the rack manager's
+credentials with permission to change system boot settings and power.
+
+On these endpoints, Metalman can restore slot AC power before boot configuration
+or power-on, then wait up to ten minutes for the BMC without consuming operation
+attempts. Power-off does not cut slot AC power. Use `bootProtocol: PXE`; HTTP boot
+is not supported on these endpoints. Boot override persistence depends on firmware.
 
 ## Cloud-Init Customization
 
