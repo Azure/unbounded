@@ -65,7 +65,10 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /unbounded-agent/install-log", h.handleInstallLog)
 
 	if h.Media != nil {
-		mux.Handle("/bootmedia/", h.Media)
+		// Method-qualified patterns are required: a method-less pattern
+		// conflicts with "GET /" in net/http and panics at registration.
+		mux.Handle("GET /bootmedia/", h.Media)
+		mux.Handle("POST /bootmedia/", h.Media)
 	}
 
 	if h.Client != nil {

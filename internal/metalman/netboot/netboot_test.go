@@ -2108,6 +2108,72 @@ func TestHTTPServer_Start_Shutdown(t *testing.T) {
 	}
 }
 
+func TestHTTPServer_StartWithMediaRoutes(t *testing.T) {
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	port := freePort(t)
+
+	srv := &HTTPServer{
+		BindAddr: "127.0.0.1",
+		Port:     port,
+		FileResolver: FileResolver{
+			Cache:  NewOCICache(t.TempDir()),
+			Reader: fc,
+		},
+		Client: fc,
+		Media:  &MediaProvider{Client: fc},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- srv.Start(ctx)
+	}()
+
+	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
+	waitForHTTP(t, addr+"/healthz", 3*time.Second)
+
+	id := strings.Repeat("a", 32)
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodGet, "/bootmedia/" + id + "/grub.cfg", http.StatusNotFound},
+		{http.MethodPost, "/bootmedia/" + id + "/complete", http.StatusNotFound},
+		{http.MethodPut, "/bootmedia/" + id + "/complete", http.StatusMethodNotAllowed},
+	} {
+		req, err := http.NewRequestWithContext(t.Context(), tc.method, addr+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s %s: got %d, want %d", tc.method, tc.path, resp.StatusCode, tc.want)
+		}
+
+		if got := resp.Header.Get("Cache-Control"); tc.want == http.StatusNotFound && got != "no-store" {
+			t.Errorf("%s %s: request did not reach media handler (Cache-Control %q)", tc.method, tc.path, got)
+		}
+	}
+
+	cancel()
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("server returned error: %v", err)
+	}
+}
+
 func TestTFTPServer_ResolveFileByPath(t *testing.T) {
 	vmlinuzData := []byte("tftp-vmlinuz-data")
 
