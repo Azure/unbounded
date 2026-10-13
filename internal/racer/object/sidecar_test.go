@@ -460,7 +460,7 @@ func TestSidecarSDKFailures(t *testing.T) {
 		{racersdk.ErrUnauthorized, 403, "AccessDenied"},
 		{racersdk.ErrForbidden, 403, "AccessDenied"},
 		{racersdk.ErrNotFound, 404, "NoSuchKey"},
-		{racersdk.ErrVersionMismatch, 412, "PreconditionFailed"},
+		{racersdk.ErrVersionMismatch, 503, "ServiceUnavailable"},
 		{errInvalidS3Response, 502, "BadGateway"},
 		{racersdk.ErrUnavailable, 503, "ServiceUnavailable"},
 		{context.Canceled, 503, "ServiceUnavailable"},
@@ -494,22 +494,64 @@ func TestSidecarSDKFailures(t *testing.T) {
 }
 
 func TestSidecarPinnedVersionFailure(t *testing.T) {
-	m := sidecarTestMetadata(t, 4, `"old"`)
-	h, _ := sidecarTestHandler(t, func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		if r.Head {
-			return m, nil, nil
+	for _, size := range []int{0, 4} {
+		for _, tc := range []struct {
+			name, match, none string
+			status            int
+		}{
+			{"unconditional", "", "", 503},
+			{"matching tag", `"old"`, "", 503},
+			{"wildcard", "*", "", 503},
+			{"list accepts replacement", `"old", "new"`, "", 503},
+			{"list with weak replacement", `"old", W/"new"`, "", 503},
+			{"none allows selected", "", `"new"`, 503},
+			{"failed match", `"new"`, "", 412},
+			{"failed weak match", `W/"old"`, "", 412},
+			{"failed list", `"new", W/"old"`, "", 412},
+			{"failed match precedence", `"new"`, "*", 412},
+			{"none wildcard", "", "*", 304},
+			{"none list", "*", `"new", W/"old"`, 304},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", size, tc.name), func(t *testing.T) {
+				m := sidecarTestMetadata(t, size, `"old"`)
+
+				var calls atomic.Int32
+
+				h, _ := sidecarTestHandler(t, func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+					if calls.Add(1) == 1 {
+						return m, nil, nil
+					}
+
+					if r.ETag != m.ETag {
+						t.Error("missing Stat pin")
+					}
+
+					return racersdk.Metadata{}, nil, fmt.Errorf("private pin: %w", racersdk.ErrVersionMismatch)
+				})
+
+				headers := http.Header{}
+				if tc.match != "" {
+					headers.Set("If-Match", tc.match)
+				}
+
+				if tc.none != "" {
+					headers.Set("If-None-Match", tc.none)
+				}
+
+				w := sidecarTestRequest(h, "GET", "/bucket/key", headers)
+				if w.Code != tc.status {
+					t.Fatalf("status %d want %d: %s", w.Code, tc.status, w.Body.String())
+				}
+
+				if tc.status == 503 {
+					if calls.Load() < 2 || !strings.Contains(w.Body.String(), "<Code>ServiceUnavailable</Code>") || strings.Contains(w.Body.String(), "private") || w.Header().Get("ETag") != "" || w.Header().Get("Content-Range") != "" {
+						t.Fatalf("pin failure committed object or unsafe error: calls=%d headers=%v body=%q", calls.Load(), w.Header(), w.Body.String())
+					}
+				} else if calls.Load() != 1 {
+					t.Fatal("failed condition opened a stream")
+				}
+			})
 		}
-
-		if r.ETag != m.ETag {
-			t.Error("missing Stat pin")
-		}
-
-		return racersdk.Metadata{}, nil, racersdk.ErrVersionMismatch
-	})
-
-	w := sidecarTestRequest(h, "GET", "/bucket/key", nil)
-	if w.Code != 412 {
-		t.Fatalf("unavailable pin status %d", w.Code)
 	}
 }
 

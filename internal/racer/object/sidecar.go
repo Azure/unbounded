@@ -314,7 +314,8 @@ func sidecarSDKFailure(err error) sidecarFailure {
 	case errors.Is(err, racersdk.ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, racersdk.ErrVersionMismatch):
-		return http.StatusPreconditionFailed
+		// SDK pins select our representation, not the client's condition.
+		return http.StatusServiceUnavailable
 	case errors.Is(err, racersdk.ErrRangeNotSatisfiable):
 		return http.StatusRequestedRangeNotSatisfiable
 	case errors.Is(err, racersdk.ErrUnavailable), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, net.ErrClosed):
