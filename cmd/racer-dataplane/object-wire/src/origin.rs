@@ -116,7 +116,10 @@ pub fn validate_page_head(
     page: &PageId,
     expected: &VersionMetadata,
 ) -> Result<(ObjectMetadata, u64)> {
-    let (status, length) = validate_response(head, true)?;
+    let (status, length) = validate_response(head, true).map_err(|error| match error {
+        Error::UnsatisfiableRangeWithLength(total) if total != expected.length => Error::BadGateway,
+        other => other,
+    })?;
     if status != 206 || required(head, "Content-Type")? != b"application/octet-stream" {
         return Err(Error::BadGateway);
     }

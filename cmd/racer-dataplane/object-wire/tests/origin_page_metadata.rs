@@ -139,3 +139,100 @@ fn pages_reject_descriptors_for_other_objects_or_versions() {
         );
     }
 }
+
+fn assert_page_error(head: &MessageHead, expected: &VersionMetadata, error: Error) {
+    let page = PageId {
+        version: expected.version.clone(),
+        number: PageNumber(expected.length / PAGE_BYTES + 1),
+    };
+    assert_eq!(
+        origin::validate_page_head(head, &page, expected),
+        Err(error)
+    );
+    assert_eq!(origin::validate_page(head, &page, expected, 0), Err(error));
+}
+
+#[test]
+fn pages_require_unsatisfied_length_to_match_the_descriptor() {
+    for expected_length in [0, 42, i64::MAX as u64] {
+        let expected = descriptor(expected_length, None);
+        for reported_length in [0, 42, 99, i64::MAX as u64] {
+            let head = MessageHead {
+                start: StartLine::Response { status: 416 },
+                headers: vec![
+                    Header::new("Content-Length", b"0"),
+                    Header::new("Content-Range", format!("bytes */{reported_length}")),
+                ],
+            };
+            assert_page_error(
+                &head,
+                &expected,
+                if reported_length == expected_length {
+                    Error::UnsatisfiableRangeWithLength(expected_length)
+                } else {
+                    Error::BadGateway
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn matching_unsatisfied_length_does_not_bypass_error_framing() {
+    let expected = descriptor(42, None);
+    for headers in [
+        vec![Header::new("Content-Length", b"0")],
+        vec![Header::new("Content-Range", b"bytes */42")],
+        vec![
+            Header::new("Content-Length", b"1"),
+            Header::new("Content-Range", b"bytes */42"),
+        ],
+        vec![
+            Header::new("Content-Length", b"0"),
+            Header::new("Content-Range", b"bytes */42"),
+            Header::new("content-range", b"bytes */42"),
+        ],
+        vec![
+            Header::new("Content-Length", b"0"),
+            Header::new("Content-Range", b"bytes */42"),
+            Header::new("ETag", b"\"v1\""),
+        ],
+    ] {
+        let head = MessageHead {
+            start: StartLine::Response { status: 416 },
+            headers,
+        };
+        assert_page_error(&head, &expected, Error::BadGateway);
+    }
+    for range in [
+        "bytes */042",
+        "bytes */42 ",
+        "bytes 0-41/42",
+        "bytes */9223372036854775808",
+    ] {
+        let head = MessageHead {
+            start: StartLine::Response { status: 416 },
+            headers: vec![
+                Header::new("Content-Length", b"0"),
+                Header::new("Content-Range", range),
+            ],
+        };
+        assert_page_error(&head, &expected, Error::BadGateway);
+    }
+}
+
+#[test]
+fn page_error_statuses_other_than_416_keep_their_meanings() {
+    let expected = descriptor(42, None);
+    for (status, error) in [
+        (404, Error::BadGateway),
+        (412, Error::VersionUnavailable),
+        (503, Error::Unavailable),
+    ] {
+        let head = MessageHead {
+            start: StartLine::Response { status },
+            headers: vec![Header::new("Content-Length", b"0")],
+        };
+        assert_page_error(&head, &expected, error);
+    }
+}
