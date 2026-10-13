@@ -314,6 +314,19 @@ func TestReconcileMachineAvailabilityRequiresDomainAndImmutableIdentity(t *testi
 	).Reason)
 }
 
+func TestReconcileMachineAvailabilitySkipsLegacyMachine(t *testing.T) {
+	t.Parallel()
+
+	machine := &unboundedv1alpha3.Machine{}
+
+	reconcileMachineAvailability(machine)
+
+	require.Nil(t, apimeta.FindStatusCondition(
+		machine.Status.Conditions,
+		unboundedv1alpha3.MachineConditionAvailable,
+	))
+}
+
 // generateTestSSHKeyPEM creates a fresh RSA private key in PEM format for testing.
 // It uses generateTestRSAKey and marshalPrivateKeyPEM from ssh_integration_test.go.
 func generateTestSSHKeyPEM(t *testing.T) []byte {

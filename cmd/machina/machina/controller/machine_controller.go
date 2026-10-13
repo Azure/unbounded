@@ -1034,6 +1034,12 @@ func observeNodeAllocation(machine *unboundedv1alpha3.Machine, node *corev1.Node
 }
 
 func reconcileMachineAvailability(machine *unboundedv1alpha3.Machine) {
+	if machine.Status.Reservation == nil &&
+		machine.Labels[unboundedv1alpha3.MachineCapacityDomainLabelKey] == "" &&
+		apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionAvailable) == nil {
+		return
+	}
+
 	status := metav1.ConditionTrue
 	reason := "InventoryReady"
 	message := "Machine has immutable identity and is available for Karpenter reservation"
