@@ -103,7 +103,12 @@ fn hardening_rejects_non_directory_and_fchmod_failure() {
         .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
         .open(&root.0)
         .unwrap();
-    assert!(restrict_directory(&directory, 0o022).is_err());
+    assert_eq!(
+        restrict_directory(&directory, 0o022)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EBADF)
+    );
     assert_eq!(directory.metadata().unwrap().mode() & 0o777, 0o777);
 }
 
@@ -569,7 +574,13 @@ fn long_components_and_unix_socket_paths_fail_without_staging_leaks() {
     let owner = std::rc::Rc::new(EndpointOwner::acquire(&directory, long_layout).unwrap());
     // A legal filesystem component can still exceed sockaddr_un.sun_path.
     let too_long_for_socket = format!("stage-{}", "x".repeat(110));
-    assert!(BoundSocket::bind(owner.clone(), &too_long_for_socket).is_err());
+    let error = BoundSocket::bind(owner.clone(), &too_long_for_socket).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(semantic(&error), Some(&Error::InvalidName));
+    assert_eq!(
+        error.to_string(),
+        "invalid endpoint name or path: invalid syntax, conflicting names, or filesystem/Unix socket address length limit exceeded"
+    );
     let too_long_for_witness = format!("stage-{}", "x".repeat(249));
     assert_eq!(
         semantic(&BoundSocket::bind(owner, &too_long_for_witness).unwrap_err()),

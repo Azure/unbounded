@@ -254,6 +254,57 @@ impl Fixture {
 }
 
 #[test]
+fn generation_token_reuse_waits_for_witness_and_exchanged_cleanup_alias() {
+    for drop_previous_first in [false, true] {
+        let fixture = Fixture::new();
+        let old = fixture.initial();
+        let next = fixture.bind("pending-next");
+        let mut publication = Publication::default();
+        publication
+            .publish(
+                Replacement::prepare(
+                    next.clone(),
+                    Some(old.clone()),
+                    "pending-next".into(),
+                    CANONICAL.into(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        publication.commit();
+        drop(publication);
+
+        let remaining = if drop_previous_first {
+            drop(old);
+            assert!(!fixture.path("pending-next").exists());
+            assert!(fixture.path("owned-pending-next").exists());
+            next
+        } else {
+            drop(next);
+            assert!(old.owns("pending-next"));
+            assert!(!fixture.path("owned-pending-next").exists());
+            old
+        };
+        let error = BoundSocket::bind(fixture.owner.clone(), "pending-next").unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(if drop_previous_first {
+                libc::EADDRINUSE
+            } else {
+                libc::EEXIST
+            })
+        );
+        assert!(remaining.owns(&remaining.basename()));
+        drop(remaining);
+        assert!(!fixture.path("pending-next").exists());
+        assert!(!fixture.path("owned-pending-next").exists());
+        drop(fixture.bind("pending-next"));
+        assert!(!fixture.path("pending-next").exists());
+        assert!(!fixture.path("owned-pending-next").exists());
+    }
+}
+
+#[test]
 fn prepare_does_not_publish_and_drop_restores_exchanged_inode() {
     let fixture = Fixture::new();
     let old = fixture.initial();

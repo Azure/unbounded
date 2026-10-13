@@ -41,7 +41,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidName => "endpoint name must be one normal component of at most 255 bytes",
+            Self::InvalidName => {
+                "invalid endpoint name or path: invalid syntax, conflicting names, or filesystem/Unix socket address length limit exceeded"
+            }
             Self::InvalidLayout => {
                 "endpoint layout namespaces overlap or do not recognize the name"
             }
@@ -149,6 +151,9 @@ pub fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
 /// Remove requested permission bits from a pinned effective-user-owned directory.
 /// Non-permission bits in `remove` are ignored. Linux may additionally clear
 /// setgid when the caller is not a member of the inode's group; that is narrowing.
+/// Removing bits requires a descriptor usable with `fchmod`, such as one returned
+/// by `open_directory` or `child_directory`. An `O_PATH` descriptor works only
+/// when no permission change is needed; otherwise `fchmod` returns `EBADF`.
 ///
 /// # Errors
 /// Returns `UnsafeDirectory` for foreign ownership or non-directories,
@@ -577,6 +582,9 @@ impl BoundSocket {
     /// a crash before chmod or linking still leaves recoverable evidence.
     /// Pin and set mode 0600 before listening, so a permissive umask cannot admit
     /// clients through the witness before access is restricted.
+    /// Use a fresh temporary generation token while its witness or temporary
+    /// pathname remains, including after failed staging or an exchange that leaves
+    /// the previous generation at that temporary pathname.
     ///
     /// # Errors
     /// Returns name/layout/ownership validation errors or the underlying bind,
@@ -753,10 +761,18 @@ mod admission_tests {
         directory
             .set_permissions(fs::Permissions::from_mode(0o755))
             .unwrap();
+        assert_eq!(
+            BoundSocket::bind(owner.clone(), "pending-b")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EADDRINUSE)
+        );
         drop(owner);
-        EndpointOwner::acquire(&directory, layout).unwrap();
+        let owner = Rc::new(EndpointOwner::acquire(&directory, layout).unwrap());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         assert!(!anchor.join("owned-pending-b").exists());
+        drop(BoundSocket::bind(owner, "pending-b").unwrap());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
     }
 
     #[test]

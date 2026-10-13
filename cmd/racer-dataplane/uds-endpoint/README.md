@@ -1,9 +1,10 @@
 # uds-endpoint
 
-Private Linux filesystem-ownership helper for `racer-dataplane`. This unpublished
-crate depends only on `libc` in production. The optional `simulation` feature adds
-`uring-runtime` and its simulated filesystem. The crate does not choose an
-application model, protocol, or service-activation policy. It owns Unix stream
+Standalone Linux filesystem-ownership helper intended for the replacement
+`racer-dataplane`. It is a workspace member, not yet an application dependency.
+This unpublished crate depends only on `libc` in production. The optional
+`simulation` feature adds `uring-runtime` and its simulated filesystem. The crate
+does not choose an application model, protocol, or service-activation policy. It owns Unix stream
 socket names and a worker-local publication journal, not application readiness or
 admission.
 
@@ -50,6 +51,13 @@ Construction checks known overlaps. Because the temporary-name predicate is a
 function, bind and recovery also check each actual temporary and derived witness
 name. A filesystem-valid name can still exceed Linux's Unix socket address limit.
 
+Use a fresh temporary generation token for each bind attempt. Do not reuse it
+while either its derived witness or its temporary pathname remains. Failed
+staging can retain a witness until a later owner recovers it. After an exchange,
+the previous generation uses the next generation's temporary pathname for cleanup,
+while the next generation keeps its own witness. Dropping either generation alone
+may therefore leave the token unavailable, even if the temporary pathname is gone.
+
 - `open_directory(absolute_path, mode)` walks from `/`, opening every component
   without following symlinks and creating missing directories. Relative paths and
   explicit `.`/`..` components are rejected before creation. `child_directory`
@@ -57,6 +65,9 @@ name. A filesystem-valid name can still exceed Linux's Unix socket address limit
 - `restrict_directory(directory, remove)` only removes permission bits on an
   effective-user-owned directory; non-permission bits in `remove` are ignored.
   It verifies inode, UID, GID, and resulting mode. Linux can also clear setgid.
+  Actual permission changes require a descriptor usable with `fchmod`, such as
+  those returned by the directory helpers. An `O_PATH` descriptor succeeds only
+  for a no-op; a required change returns `EBADF`.
 - `EndpointOwner::acquire(directory, layout)` requires an effective-user-owned
   directory without group/world write access. There is no caller-selected lock
   mode. The persistent lock must be a single-link regular file owned by the
@@ -84,6 +95,13 @@ validation or a stat/unlink error on the cleanup name retains its witness for
 recovery. Explicit owner drop unlocks the persistent lock,
 including when an inherited or test-only cloned descriptor aliases it. Callers
 must not continue operating an inherited listener after its owner unlocks.
+
+Named metadata checks temporarily open an `O_PATH` descriptor. Descriptor
+exhaustion can therefore prevent validation and cleanup, leaving names and witnesses
+for recovery rather than risking an unverified unlink. Recovery uses a bounded
+number of descriptors, but still needs spare descriptors. Restore available
+descriptors and close the old listeners and owner before acquiring a new owner to
+recover retained names; do not blindly unlink witnesses or retry the same token.
 
 ## Crash and recovery ordering
 
