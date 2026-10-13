@@ -670,6 +670,11 @@ impl AsRawFd for BoundSocket {
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
+        if self.owner.validate(&self.owner.directory).is_err() {
+            // Unsafe directory access or lost lock identity invalidates cleanup.
+            // Retain both names so recovery can run after ownership is restored.
+            return;
+        }
         let Ok(metadata) = self.pinned.metadata() else {
             return;
         };
@@ -734,12 +739,16 @@ mod admission_tests {
             failure.get_ref().unwrap().downcast_ref::<Error>(),
             Some(&Error::UnsafeDirectory)
         );
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        assert!(anchor.join("owned-pending-b").exists());
+        assert!(!anchor.join("pending-b").exists());
         directory
             .set_permissions(fs::Permissions::from_mode(0o755))
             .unwrap();
         drop(owner);
         EndpointOwner::acquire(&directory, layout).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert!(!anchor.join("owned-pending-b").exists());
     }
 
     #[test]

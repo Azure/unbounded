@@ -58,9 +58,10 @@ name. A filesystem-valid name can still exceed Linux's Unix socket address limit
   Descriptor paths remain usable only while the descriptor is retained;
   `pin_socket` rejects non-sockets, foreign ownership, and identity changes.
 
-Final socket drop removes only matching inode names, retaining the owner until
-cleanup finishes. Cleanup is best effort. A stat/unlink error on the cleanup name
-retains its witness for recovery. Explicit owner drop unlocks the persistent lock,
+Final socket drop validates the owner before removing matching inode names,
+retaining the owner until cleanup finishes. Cleanup is best effort. Failed owner
+validation or a stat/unlink error on the cleanup name retains its witness for
+recovery. Explicit owner drop unlocks the persistent lock,
 including when an inherited or test-only cloned descriptor aliases it. Callers
 must not continue operating an inherited listener after its owner unlocks.
 

@@ -74,6 +74,90 @@ fn recovery_repairs_unwritable_witness_before_distinguishing_live_and_dead() {
 }
 
 #[test]
+fn drop_requires_safe_directory_permissions_before_cleanup() {
+    for mode in [0o700, 0o755, 0o770, 0o707, 0o777] {
+        for foreign in [false, true] {
+            let root = Root::new();
+            let directory = root.directory();
+            let owner = Rc::new(EndpointOwner::acquire(&directory, layout()).unwrap());
+            let bound = BoundSocket::bind(owner.clone(), "stage-a").unwrap();
+            let witness = root.0.join("witness-stage-a");
+            let basename = root.0.join("stage-a");
+            let identity = fs::metadata(&witness).unwrap();
+            if foreign {
+                fs::remove_file(&basename).unwrap();
+                fs::write(&basename, b"foreign").unwrap();
+            }
+            directory
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .unwrap();
+            drop(bound);
+            let unsafe_directory = mode & 0o022 != 0;
+            assert_eq!(witness.exists(), unsafe_directory, "mode {mode:o}");
+            assert_eq!(
+                basename.exists(),
+                unsafe_directory || foreign,
+                "mode {mode:o}"
+            );
+            if unsafe_directory {
+                assert!(same_inode(&fs::metadata(&witness).unwrap(), &identity));
+            }
+            if foreign {
+                assert_eq!(fs::read(&basename).unwrap(), b"foreign");
+            }
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+            drop(owner);
+            if foreign {
+                assert!(EndpointOwner::acquire(&directory, layout()).is_err());
+                assert_eq!(fs::read(&basename).unwrap(), b"foreign");
+                fs::remove_file(&basename).unwrap();
+            }
+            EndpointOwner::acquire(&directory, layout()).unwrap();
+            assert!(!witness.exists());
+            assert!(!basename.exists());
+        }
+    }
+}
+
+#[test]
+fn drop_preserves_names_when_owner_lock_validation_fails() {
+    for failure in ["mode", "replacement", "metadata"] {
+        let root = Root::new();
+        let directory = root.directory();
+        let owner = Rc::new(EndpointOwner::acquire(&directory, layout()).unwrap());
+        let bound = BoundSocket::bind(owner.clone(), "stage-a").unwrap();
+        let lock = root.0.join("lock");
+        match failure {
+            "mode" => fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap(),
+            "replacement" => {
+                fs::rename(&lock, root.0.join("old-lock")).unwrap();
+                fs::write(&lock, b"foreign").unwrap();
+                fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            _ => directory::FAIL_METADATA.with(|value| *value.borrow_mut() = Some("lock".into())),
+        }
+        assert!(owner.validate(&directory).is_err());
+        drop(bound);
+        directory::FAIL_METADATA.with(|value| *value.borrow_mut() = None);
+        for name in ["stage-a", "witness-stage-a"] {
+            assert!(root.0.join(name).exists(), "{failure}: {name}");
+        }
+        if failure == "replacement" {
+            assert_eq!(fs::read(&lock).unwrap(), b"foreign");
+            fs::remove_file(&lock).unwrap();
+            fs::rename(root.0.join("old-lock"), &lock).unwrap();
+        }
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(owner);
+        EndpointOwner::acquire(&directory, layout()).unwrap();
+        assert!(!root.0.join("stage-a").exists());
+        assert!(!root.0.join("witness-stage-a").exists());
+    }
+}
+
+#[test]
 fn drop_preserves_witness_on_basename_stat_failure() {
     let root = Root::new();
     let directory = root.directory();
