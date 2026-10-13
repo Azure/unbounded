@@ -225,7 +225,7 @@ impl<E: Endpoint> Replacement<E> {
 }
 
 /// A rollback journal. Publish only after all endpoints have been staged.
-/// Drop rolls back in reverse order; commit only disarms rollback, retaining
+/// Drop attempts rollback in reverse order; commit only disarms rollback, retaining
 /// owners so the caller can defer cleanup outside an infallible control commit.
 #[derive(Debug)]
 pub struct Publication<E: Endpoint> {
@@ -310,10 +310,14 @@ impl<E: Endpoint> Publication<E> {
     /// An absent canonical name can be restored from the owned previous staging
     /// name. New endpoints move back to their vacant temporary name even when
     /// external references keep their listeners alive.
-    /// This is idempotent even when a rollback rename fails.
-    pub fn rollback(&mut self) {
+    /// Returns true only when every published entry was restored. False means
+    /// owners must be retained while the caller handles incomplete restoration:
+    /// dropping a next owner may still unlink its canonical name.
+    /// Repeated calls return the same result without retrying failed entries.
+    /// After commit, returns false unless there were no published entries.
+    pub fn rollback(&mut self) -> bool {
         if self.completed {
-            return;
+            return self.replacements.iter().all(|entry| !entry.published);
         }
         // Disarm before invoking adapters: rollback is attempted only once even
         // if an adapter violates the no-panic contract during unwinding.
@@ -339,6 +343,7 @@ impl<E: Endpoint> Publication<E> {
                         if let Some(name) = replacement.restored_previous.take() {
                             previous.set_basename(name);
                         }
+                        replacement.published = false;
                     }
                 } else if next.absent(&replacement.canonical)
                     && previous.owns(&replacement.temporary)
@@ -352,6 +357,7 @@ impl<E: Endpoint> Publication<E> {
                     && let Some(name) = replacement.restored_previous.take()
                 {
                     previous.set_basename(name);
+                    replacement.published = false;
                 }
             } else if next.owns(&replacement.canonical)
                 && next.absent(&replacement.temporary)
@@ -365,13 +371,15 @@ impl<E: Endpoint> Publication<E> {
                 && let Some(name) = replacement.restored_next.take()
             {
                 next.set_basename(name);
+                replacement.published = false;
             }
         }
+        self.replacements.iter().all(|entry| !entry.published)
     }
 }
 
 impl<E: Endpoint> Drop for Publication<E> {
     fn drop(&mut self) {
-        self.rollback();
+        let _ = self.rollback();
     }
 }

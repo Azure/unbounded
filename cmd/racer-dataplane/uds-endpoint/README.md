@@ -113,8 +113,13 @@ are exchanged back; if canonical is absent, the old owned temporary can be moved
 back without replacement. New endpoints move from canonical back to their vacant
 temporary name even when an external `Rc` keeps the listener alive. Foreign names
 are never knowingly exchanged or overwritten. Failed guards or renames leave
-cleanup names unchanged. Rollback is best effort, has no error result, and does
-not promise full restoration after interference or filesystem failure.
+cleanup names unchanged. `rollback() -> bool` returns true only when every
+published entry was restored. False means restoration is incomplete: retain the
+owners while handling the failure, since dropping `next` may still unlink its
+canonical name. Repeated calls return the same result without retrying. After
+commit, rollback returns false unless no entries were published. Drop stays best
+effort and discards the result. Neither form promises full restoration after
+interference or filesystem failure.
 
 `commit(&mut self)` only disarms rollback: no filesystem calls, allocations, or
 owner drops. `previous()` exposes retained previous owners for deferred cleanup.

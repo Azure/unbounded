@@ -220,8 +220,8 @@ fn rollback_restores_missing_canonical_but_never_swaps_foreign_inodes() {
         if replaced != "missing" {
             fs::write(&path, b"foreign").unwrap();
         }
-        publication.rollback();
-        publication.rollback();
+        assert_eq!(publication.rollback(), replaced == "missing");
+        assert_eq!(publication.rollback(), replaced == "missing");
         if replaced == "missing" {
             assert!(old.owns(CANONICAL));
             assert_eq!(old.basename(), CANONICAL);
@@ -245,6 +245,7 @@ fn rollback_restores_missing_canonical_but_never_swaps_foreign_inodes() {
 struct Calls {
     log: RefCell<Vec<(usize, Rename)>>,
     fail_after: Cell<Option<usize>>,
+    fail_probe: Cell<Option<usize>>,
 }
 struct Observed {
     socket: Rc<BoundSocket>,
@@ -257,10 +258,22 @@ impl Endpoint for Observed {
         io::Error::other("not owned")
     }
     fn owns(&self, name: &str) -> bool {
-        self.socket.owns(name)
+        self.owns_checked(name).unwrap_or(false)
     }
     fn absent(&self, name: &str) -> bool {
-        self.socket.absent(name)
+        self.absent_checked(name).unwrap_or(false)
+    }
+    fn owns_checked(&self, name: &str) -> io::Result<bool> {
+        if self.calls.fail_probe.get() == Some(self.id) {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        self.socket.owns_checked(name)
+    }
+    fn absent_checked(&self, name: &str) -> io::Result<bool> {
+        if self.calls.fail_probe.get() == Some(self.id) {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        self.socket.absent_checked(name)
     }
     fn same_directory(&self, other: &Self) -> io::Result<bool> {
         self.socket.same_directory(&other.socket)
@@ -356,14 +369,112 @@ fn failed_rollback_is_not_retried_and_keeps_cleanup_names_matching_inodes() {
         )
         .unwrap();
     calls.fail_after.set(Some(0));
-    publication.rollback();
-    publication.rollback();
+    assert!(!publication.rollback());
+    assert!(!publication.rollback());
     drop(publication);
     assert_eq!(calls.log.borrow().len(), 2);
     assert!(old.owns("pending-next"));
     assert!(next.owns(CANONICAL));
     assert_eq!(old.basename(), "pending-next");
     assert_eq!(next.basename(), CANONICAL);
+}
+
+#[test]
+fn rollback_reports_partial_restoration_after_probe_or_rename_failure() {
+    for exchange in [false, true] {
+        for failure in ["next-stat", "previous-stat", "rename"] {
+            if !exchange && failure == "previous-stat" {
+                continue;
+            }
+            let fixtures = [Fixture::new(), Fixture::new(), Fixture::new()];
+            let old: Vec<_> = fixtures
+                .iter()
+                .map(|fixture| exchange.then(|| fixture.initial()))
+                .collect();
+            let next: Vec<_> = fixtures.iter().map(|f| f.bind("pending-next")).collect();
+            let calls = Rc::new(Calls::default());
+            let mut publication = Publication::default();
+            for id in 0..3 {
+                let previous = old[id].as_ref().map(|socket| {
+                    Rc::new(Observed {
+                        socket: socket.clone(),
+                        id: id + 10,
+                        calls: calls.clone(),
+                    })
+                });
+                let observed = Rc::new(Observed {
+                    socket: next[id].clone(),
+                    id,
+                    calls: calls.clone(),
+                });
+                publication
+                    .publish(
+                        Replacement::prepare(
+                            observed,
+                            previous,
+                            "pending-next".into(),
+                            CANONICAL.into(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            match failure {
+                "next-stat" => calls.fail_probe.set(Some(1)),
+                "previous-stat" => calls.fail_probe.set(Some(11)),
+                "rename" => calls.fail_after.set(Some(1)),
+                _ => unreachable!(),
+            }
+            assert!(!publication.rollback(), "{exchange}/{failure}");
+            calls.fail_probe.set(None);
+            calls.fail_after.set(None);
+            let attempted = calls.log.borrow().len();
+            assert!(!publication.rollback());
+            drop(publication);
+            assert_eq!(calls.log.borrow().len(), attempted);
+            let mode = if exchange {
+                Rename::Exchange
+            } else {
+                Rename::NoReplace
+            };
+            let mut expected = vec![(0, mode), (1, mode), (2, mode), (2, mode)];
+            if failure == "rename" {
+                expected.push((1, mode));
+            }
+            expected.push((0, mode));
+            assert_eq!(*calls.log.borrow(), expected);
+            for id in 0..3 {
+                let restored = id != 1;
+                let next_name = if restored { "pending-next" } else { CANONICAL };
+                assert!(next[id].owns(next_name));
+                assert_eq!(next[id].basename(), next_name);
+                if let Some(previous) = &old[id] {
+                    let old_name = if restored { CANONICAL } else { "pending-next" };
+                    assert!(previous.owns(old_name));
+                    assert_eq!(previous.basename(), old_name);
+                } else {
+                    assert_eq!(fixtures[id].path(CANONICAL).exists(), !restored);
+                }
+            }
+            // Retaining next preserves service after the transient error clears.
+            let _client = UnixStream::connect(fixtures[1].path(CANONICAL)).unwrap();
+            next[1].accept().unwrap();
+            drop(next);
+            assert!(!fixtures[1].path(CANONICAL).exists());
+            if let Some(previous) = &old[1] {
+                assert!(previous.owns("pending-next"));
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_rollback_reports_success_on_repeated_calls() {
+    let mut publication = Publication::<BoundSocket>::default();
+    assert!(publication.rollback());
+    assert!(publication.rollback());
+    publication.commit();
+    assert!(publication.rollback());
 }
 
 #[test]
@@ -398,7 +509,7 @@ fn commit_does_not_rename_or_drop_owners_and_allows_deferred_cleanup() {
     drop(old);
     let deferred: Vec<_> = publication.previous().cloned().collect();
     publication.commit();
-    publication.rollback();
+    assert!(!publication.rollback());
     assert!(weak.upgrade().is_some());
     assert_eq!(calls.log.borrow().len(), 1);
     drop(publication);
@@ -441,8 +552,8 @@ fn mixed_new_and_replacement_rollback_preserves_held_listeners() {
         .unwrap();
         assert_eq!(publication.publish(replacement).is_err(), id == 2);
     }
-    publication.rollback();
-    publication.rollback();
+    assert!(publication.rollback());
+    assert!(publication.rollback());
     drop(publication);
     assert_eq!(
         &*calls.log.borrow(),
@@ -478,7 +589,7 @@ fn completed_journals_reject_publish_after_commit_or_rollback() {
         if committed {
             publication.commit();
         } else {
-            publication.rollback();
+            assert!(publication.rollback());
         }
         let error = publication.publish(replacement).unwrap_err();
         assert_eq!(
@@ -572,8 +683,8 @@ fn guarded_new_endpoint_rollback_preserves_foreign_names_and_failed_rename() {
             }
             Guard::RenameFailure => calls.fail_after.set(Some(0)),
         }
-        publication.rollback();
-        publication.rollback();
+        assert!(!publication.rollback(), "{guard:?}");
+        assert!(!publication.rollback(), "{guard:?}");
         drop(publication);
         assert_eq!(next.basename(), CANONICAL, "{guard:?}");
         assert_eq!(
@@ -628,7 +739,7 @@ fn absent_canonical_restore_failure_is_guarded_and_not_retried() {
         .unwrap();
     fs::remove_file(fixture.path(CANONICAL)).unwrap();
     calls.fail_after.set(Some(0));
-    publication.rollback();
+    assert!(!publication.rollback());
     drop(publication);
     assert_eq!(
         &*calls.log.borrow(),
