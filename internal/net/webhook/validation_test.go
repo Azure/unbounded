@@ -897,3 +897,103 @@ func TestValidateIntraSiteCIDROverlap(t *testing.T) {
 		t.Fatalf("expected overlap error between nonMasqueradeCIDRs and localCidrs")
 	}
 }
+
+// TestCrossCloudSiteCIDRPlanning covers the IPAM constraint that governs
+// joining two clouds with one Site each over a private interconnect.
+//
+// Cross-cloud is where this bites hardest in practice, because each cloud hands
+// out a default private range independently: an Azure VNet and an AWS VPC both
+// commonly land on 10.0.0.0/16. The interconnect will carry that traffic
+// happily, so the failure surfaces here at admission rather than on the wire.
+func TestCrossCloudSiteCIDRPlanning(t *testing.T) {
+	// siteFor builds one cloud's Site with the given node and pod ranges.
+	siteFor := func(name, nodeCIDR, podCIDR string) unboundedv1alpha3.Site {
+		return unboundedv1alpha3.Site{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: unboundedv1alpha3.SiteSpec{
+				NodeCidrs: []string{nodeCIDR},
+				PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+					AssignmentEnabled: boolPtr(true),
+					CidrBlocks:        []string{podCIDR},
+				}},
+			},
+		}
+	}
+
+	t.Run("disjoint plan across both clouds is accepted", func(t *testing.T) {
+		sites := []unboundedv1alpha3.Site{
+			siteFor("azure-eastus", "10.10.0.0/16", "10.210.0.0/16"),
+			siteFor("aws-us-east-1", "10.20.0.0/16", "10.220.0.0/16"),
+		}
+
+		if err := validateNodeCIDRsNoOverlap(sites); err != nil {
+			t.Errorf("disjoint nodeCIDRs rejected: %v", err)
+		}
+
+		if err := validatePodCIDRsNoOverlap(sites); err != nil {
+			t.Errorf("disjoint podCIDRs rejected: %v", err)
+		}
+	})
+
+	t.Run("both clouds on their default range is rejected", func(t *testing.T) {
+		sites := []unboundedv1alpha3.Site{
+			siteFor("azure-eastus", "10.0.0.0/16", "10.210.0.0/16"),
+			siteFor("aws-us-east-1", "10.0.0.0/16", "10.220.0.0/16"),
+		}
+
+		if err := validateNodeCIDRsNoOverlap(sites); err == nil {
+			t.Error("identical nodeCIDRs in two clouds should be rejected")
+		}
+	})
+
+	t.Run("a containing supernet in the other cloud is rejected", func(t *testing.T) {
+		// Exact equality is the obvious case; containment is the one that slips
+		// through hand review, so assert it explicitly.
+		sites := []unboundedv1alpha3.Site{
+			siteFor("azure-eastus", "10.0.0.0/8", "10.210.0.0/16"),
+			siteFor("aws-us-east-1", "10.20.0.0/16", "10.220.0.0/16"),
+		}
+
+		if err := validateNodeCIDRsNoOverlap(sites); err == nil {
+			t.Error("a supernet spanning the peer cloud's nodeCIDR should be rejected")
+		}
+	})
+
+	t.Run("overlapping pod CIDRs are rejected even when node CIDRs are clean", func(t *testing.T) {
+		// Node ranges come from each cloud's fabric and get scrutinized; pod
+		// ranges are chosen by whoever wrote the Site and are easier to
+		// duplicate by copy-paste between the two manifests.
+		sites := []unboundedv1alpha3.Site{
+			siteFor("azure-eastus", "10.10.0.0/16", "10.210.0.0/16"),
+			siteFor("aws-us-east-1", "10.20.0.0/16", "10.210.0.0/16"),
+		}
+
+		if err := validateNodeCIDRsNoOverlap(sites); err != nil {
+			t.Errorf("nodeCIDRs are disjoint and should be accepted: %v", err)
+		}
+
+		if err := validatePodCIDRsNoOverlap(sites); err == nil {
+			t.Error("identical podCIDRs in two clouds should be rejected")
+		}
+	})
+
+	t.Run("a pod CIDR colliding with the peer cloud's node CIDR is not caught", func(t *testing.T) {
+		// Documents a real gap rather than asserting desired behavior: node and
+		// pod ranges are validated in separate passes (validation.go:537-552),
+		// so a pod CIDR carved out of the other cloud's node range is admitted
+		// and only fails later as unreachable routes. Worth knowing before
+		// planning cross-cloud IPAM.
+		sites := []unboundedv1alpha3.Site{
+			siteFor("azure-eastus", "10.10.0.0/16", "10.20.0.0/16"),
+			siteFor("aws-us-east-1", "10.20.0.0/16", "10.220.0.0/16"),
+		}
+
+		if err := validateNodeCIDRsNoOverlap(sites); err != nil {
+			t.Errorf("nodeCIDRs are disjoint: %v", err)
+		}
+
+		if err := validatePodCIDRsNoOverlap(sites); err != nil {
+			t.Errorf("podCIDRs are disjoint from each other: %v", err)
+		}
+	})
+}
