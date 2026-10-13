@@ -132,16 +132,19 @@ listener stay there; new connections to canonical reach the new listener. Alread
 accepted streams also remain independent. Callers must retain/drain or deliberately
 retire the old listener according to their service policy.
 
-`publication::Endpoint` is a low-level adapter contract. Successful rename and
-cleanup-name bookkeeping must not unwind after filesystem mutation; bookkeeping
-must not allocate or invoke user code. It is not an alternative public mechanism
-for arbitrary changes to a bound socket's cleanup name.
+`publication::Endpoint` is a public, trusted adapter contract for the journal and
+wrappers. Its `set_basename` hook assigns the supplied name without validation.
+The caller must supply a prevalidated name holding the socket after a successful
+rename. The update must be unconditional, with no I/O, allocation, panic, or user
+code: a probe failure after rename must not leave stale cleanup bookkeeping.
+Successful rename must also return without unwinding after filesystem mutation.
+The read-only `basename()` snapshot does not hide or restrict this adapter hook.
+Calling the hook with an arbitrary name can break cleanup; applications should
+use the publication journal to keep rename and bookkeeping together.
+
 The host adapter renames only its own socket inode between canonical or valid
 temporary names, never lock or witness names. The caller must still check the
-destination owner before an exchange. Cleanup-name adoption uses a no-follow inode
-probe and ignores missing, foreign, malformed, lock, and witness names. It does
-not call the layout predicate after a rename; use the publication journal to
-validate names and keep rename and cleanup bookkeeping together.
+destination owner before an exchange.
 
 ## Simulation limits
 

@@ -1,10 +1,10 @@
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uds_endpoint::publication::{Endpoint, Rename};
-use uds_endpoint::{BoundSocket, EndpointOwner, Layout, file_path, open_directory};
+use uds_endpoint::{BoundSocket, EndpointOwner, Layout, open_directory};
 
 const CANONICAL: &str = "endpoint.sock";
 const TEMPORARY: &str = "pending-next";
@@ -115,41 +115,25 @@ fn direct_rename_rejects_non_socket_namespaces_and_malformed_targets() {
 }
 
 #[test]
-fn basename_adoption_requires_socket_identity_without_following_symlinks() {
+fn basename_bookkeeping_cannot_fail_after_rename_when_path_is_unavailable() {
     let root = Root::new();
     let socket = root.socket();
-    fs::write(root.path("pending-foreign"), b"foreign").unwrap();
-    let directory = open_directory(&root.0, 0o700).unwrap();
-    let foreign_socket =
-        std::os::unix::net::UnixListener::bind(file_path(&directory).join("pending-socket"))
-            .unwrap();
-    symlink(TEMPORARY, root.path("pending-link")).unwrap();
-    for name in [
-        "",
-        ".",
-        "..",
-        "../escape",
-        "pending-\0bad",
-        "pending-missing",
-        "pending-foreign",
-        "pending-socket",
-        "pending-link",
-        LOCK,
-        WITNESS,
-        CANONICAL,
-        &"p".repeat(256),
-    ] {
-        socket.set_basename(name.into());
-        assert_eq!(socket.basename(), TEMPORARY, "{name:?}");
+    for (from, to) in [(TEMPORARY, CANONICAL), (CANONICAL, TEMPORARY)] {
+        let name = to.to_owned();
+        socket.rename(from, to, Rename::NoReplace).unwrap();
+        // Hide the completed rename's destination to force any later probe to
+        // fail, even as root. Bookkeeping must still record the completed rename.
+        fs::rename(root.path(to), root.path("unavailable")).unwrap();
+        assert!(!socket.owns(to));
+        socket.set_basename(name);
+        assert_eq!(socket.basename(), to);
+        fs::rename(root.path("unavailable"), root.path(to)).unwrap();
+        assert!(socket.owns(to));
     }
     drop(socket);
     assert!(!root.path(TEMPORARY).exists());
     assert!(!root.path(WITNESS).exists());
     assert!(root.path(LOCK).exists());
-    assert_eq!(fs::read(root.path("pending-foreign")).unwrap(), b"foreign");
-    assert!(root.path("pending-socket").exists());
-    assert!(fs::symlink_metadata(root.path("pending-link")).is_ok());
-    drop(foreign_socket);
 }
 
 #[test]

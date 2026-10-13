@@ -632,7 +632,8 @@ impl BoundSocket {
     pub fn identity(&self) -> (u64, u64) {
         (self.device, self.inode)
     }
-    /// Read-only snapshot; publication owns cleanup-name mutation.
+    /// Read-only snapshot. Publication updates cleanup bookkeeping through the
+    /// trusted `publication::Endpoint::set_basename` adapter hook.
     #[must_use]
     pub fn basename(&self) -> String {
         self.basename.borrow().clone()
