@@ -1,4 +1,48 @@
-# racer-object diagnostics
+# racer-object
+
+Read S3 objects and Azure block blobs through Racer. The origin holds upstream
+credentials; the sidecar serves trusted pod-local clients without authentication.
+See the [deployment guide](../../docs/content/guides/racer-object.md) for setup,
+request limits, and security requirements.
+
+## Azure Blob
+
+Use the current `--cache` flags for this draft:
+
+```sh
+racer-object origin --cache=racer-object --namespace=example-azure-store \
+  --provider=azure --account-url=https://ACCOUNT.blob.core.windows.net \
+  --azure-credential=default --bucket=example-container
+racer-object sidecar --cache=racer-object --namespace=example-azure-store \
+  --api=azure --bucket=example-container --listen=127.0.0.1:8080
+```
+
+Run these as separate processes with their Racer sockets mounted. `--bucket`
+means an Azure container. `DefaultAzureCredential` supports environment, workload
+identity, and managed identity credentials. Set `AZURE_CLIENT_ID` to select a
+user-assigned identity; there is no client ID flag. The identity must be attached
+or configured and have Storage Blob Data Reader access. Workload identity needs
+real pod labels, a service account, federation, and a projected token setup, not
+just environment variables. `--azure-credential=anonymous` is for public upstream
+blobs. SAS and shared key origin authentication are not supported.
+
+Use an anonymous local Azure SDK client with service URL
+`http://127.0.0.1:8080`, not an account URL or `/ACCOUNT` path. Requests use
+`GET` or `HEAD /container/blob`, with optional `versionid`. Only block blobs are
+supported, not snapshots or the special `$root`, `$web`, and `$logs` containers.
+`GET` supports one byte range; `x-ms-range` takes precedence over `Range`.
+`HEAD` ignores ranges. `If-Match` and `If-None-Match` are supported. Date, lease,
+CPK, and optional checksum requests are rejected. Responses omit `Last-Modified`
+and user metadata.
+
+The origin provider and sidecar API are independent. The default `--api=s3` also
+works with an Azure origin. Keep the same stable upstream namespace on origin and
+sidecar. Schema 1 cache keys are unchanged, so **change the namespace when changing
+account, provider, or endpoint**. Incoming authorization headers are ignored, not
+verified or forwarded. Keep the sidecar on trusted loopback; cache access is not
+per-client authorization.
+
+## Diagnostics
 
 Both `origin` and `sidecar` accept `--debug-listen`. Its default is empty,
 which disables the diagnostic listener. For local access, explicitly use

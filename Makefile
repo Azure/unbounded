@@ -389,10 +389,10 @@ help: ## Show this help
 	@echo "  racer-loadgen-test                Race-test loadgen and object helpers"
 	@echo "  racer-loadgen-manifest-test       Render and check base/direct loadgen manifests"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
-	@echo "  racer-object                     Test and build the S3 read adapter"
-	@echo "  racer-object-build               Build the S3 read adapter without tests"
-	@echo "  racer-object-test                Test the S3 read adapter and deployment examples"
-	@echo "  image-racer-object-local         Build the S3 read adapter image locally"
+	@echo "  racer-object                     Test and build the S3 and Azure Blob read adapter"
+	@echo "  racer-object-build               Build the S3 and Azure Blob read adapter without tests"
+	@echo "  racer-object-test                Test the S3 and Azure Blob read adapter and deployment examples"
+	@echo "  image-racer-object-local         Build the S3 and Azure Blob read adapter image locally"
 	@echo "  racer-test | racer-generate | racer-manifests  Test/generate/render Racer artifacts"
 	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
 	@echo "  racer-dataplane-test              Run Rust unit and helper integration tests (RACER_TEST_ARGS)"
@@ -629,16 +629,16 @@ image-racer-loadgen-local: ## Build the loadgen container image locally (single-
 	$(call trivy-maybe,$(RACER_LOADGEN_IMAGE))
 
 .PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
-racer-object: racer-object-test racer-object-build ## Test and build the S3 read adapter
+racer-object: racer-object-test racer-object-build ## Test and build the S3 and Azure Blob read adapter
 
-racer-object-build: ## Build the S3 read adapter without lint/test
+racer-object-build: ## Build the S3 and Azure Blob read adapter without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
 
-racer-object-test: ## Test the S3 read adapter and deployment examples
+racer-object-test: ## Test the S3 and Azure Blob read adapter and deployment examples
 	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racerobject/... ./deploy/racer-object/...
 
-image-racer-object-local: ## Build the S3 read adapter image locally (single-arch)
+image-racer-object-local: ## Build the S3 and Azure Blob read adapter image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION="$(VERSION)" --build-arg GIT_COMMIT="$(GIT_COMMIT)" \
 		--build-arg BUILD_TIME="$(BUILD_TIME)" \
