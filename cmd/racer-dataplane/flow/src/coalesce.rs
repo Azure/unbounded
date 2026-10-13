@@ -3,6 +3,14 @@
 //! Callers own execution, cancellation, admission policy, and result semantics.
 //! A cloned registration retains the same waiter and leadership until its final
 //! handle drops. Complete a cohort only after the real operation has finished.
+//!
+//! This small cohort API has no request budget or cancellation token. Before
+//! polling for leadership, the adapter must check its request's eligibility.
+//! The attempt driver must retain a clone of the elected registration until real
+//! work ends, even if the request cancels. Only that driver may call `retry` or
+//! `finish`; followers must not publish a terminal result. This is a caller-owned
+//! protocol, not a capability enforced by the registration type. Use `flight`
+//! when operation ownership and generation validation need separate state.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, hash_map::RandomState};
@@ -18,6 +26,8 @@ pub struct Limits {
     pub waiters_per_cohort: usize,
 
     /// Maximum leadership elections before broadcasting exhaustion.
+    /// Canceled requests do not refund elections. A retained driver prevents
+    /// re-election and exhaustion until its actual attempt ends.
     pub attempts_per_cohort: usize,
 }
 
@@ -37,6 +47,14 @@ pub enum Event<V> {
 
 /// Completed cohorts close admission immediately but continue charging live
 /// registrations. `S::default()` is called for each map, including new cohorts.
+/// ```compile_fail,E0277
+/// fn require_send<T: Send>() {}
+/// require_send::<flow_control::coalesce::Table<u32, u32>>();
+/// ```
+/// ```compile_fail,E0277
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<flow_control::coalesce::Table<u32, u32>>();
+/// ```
 pub struct Table<K, V, S = RandomState> {
     active: RefCell<HashMap<K, CohortOwner<V, S>, S>>,
 
@@ -143,11 +161,11 @@ impl<K: Clone + Eq + Hash, V, S: BuildHasher + Default> Table<K, V, S> {
 /// A worker-local handle to one waiter. Clones retain its leadership and charge;
 /// only dropping the last handle detaches it. Cloning never clones the key.
 /// Handles cannot move or be shared across workers:
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn require_send<T: Send>() {}
 /// require_send::<flow_control::coalesce::Registration<u32, u32>>();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn require_sync<T: Sync>() {}
 /// require_sync::<flow_control::coalesce::Registration<u32, u32>>();
 /// ```
@@ -196,6 +214,9 @@ impl<K: Eq + Hash, V, S: BuildHasher> Registration<K, V, S> {
 
     /// Broadcast a caller-owned value and close admission before waking readers.
     /// The operation owner must call this only after completion, not cancellation.
+    /// This method intentionally does not check leader identity: adapters may also
+    /// publish a cached or externally completed result before an election. They must
+    /// ensure a follower never uses it to cancel or replace the driver's real work.
     /// The first result is final; later calls leave it unchanged.
     pub fn finish(&self, result: V) {
         let wakers = {
@@ -349,6 +370,14 @@ pub mod shared {
     pub type Receiver<V> = Shared<LocalBoxFuture<'static, V>>;
 
     /// Ordered index retaining work until its completion owner explicitly finishes.
+    /// ```compile_fail,E0277
+    /// fn require_send<T: Send>() {}
+    /// require_send::<flow_control::coalesce::shared::Table<u32, u32>>();
+    /// ```
+    /// ```compile_fail,E0277
+    /// fn require_sync<T: Sync>() {}
+    /// require_sync::<flow_control::coalesce::shared::Table<u32, u32>>();
+    /// ```
     pub struct Table<K, V: Clone> {
         entries: RefCell<BTreeMap<K, Indexed<V>>>,
 
@@ -464,6 +493,14 @@ pub mod shared {
 
     /// Sole completion authority. Dropping it reports closure, not real completion,
     /// so its table entry remains occupied until explicit lost-owner recovery.
+    /// ```compile_fail,E0277
+    /// fn require_send<T: Send>() {}
+    /// require_send::<flow_control::coalesce::shared::Completion<u32, u32>>();
+    /// ```
+    /// ```compile_fail,E0277
+    /// fn require_sync<T: Sync>() {}
+    /// require_sync::<flow_control::coalesce::shared::Completion<u32, u32>>();
+    /// ```
     pub struct Completion<K, V: Clone> {
         table: Rc<Table<K, V>>,
 
@@ -878,16 +915,16 @@ pub mod flight {
 
     /// Owned membership with a synchronized, bounded sweep index.
     /// Direct map mutation is intentionally unavailable:
-    /// ```compile_fail
+    /// ```compile_fail,E0616
     /// let mut table = flow_control::coalesce::flight::Table::<u32, ()>::default();
     /// table.entries.clear();
     /// ```
     /// Even an empty table belongs to its worker:
-    /// ```compile_fail
+    /// ```compile_fail,E0277
     /// fn require_send<T: Send>() {}
     /// require_send::<flow_control::coalesce::flight::Table<u32, ()>>();
     /// ```
-    /// ```compile_fail
+    /// ```compile_fail,E0277
     /// fn require_sync<T: Sync>() {}
     /// require_sync::<flow_control::coalesce::flight::Table<u32, ()>>();
     /// ```
@@ -1120,6 +1157,14 @@ pub mod flight {
     /// Two-phase completion slots. Taking a resource leaves its slot occupied while
     /// its destructor runs outside the table borrow. Only explicit completion clears
     /// that slot; dropping an external completion token does not touch this owner.
+    /// ```compile_fail,E0277
+    /// fn require_send<T: Send>() {}
+    /// require_send::<flow_control::coalesce::flight::Operations<()>>();
+    /// ```
+    /// ```compile_fail,E0277
+    /// fn require_sync<T: Sync>() {}
+    /// require_sync::<flow_control::coalesce::flight::Operations<()>>();
+    /// ```
     pub struct Operations<R, S = RandomState> {
         slots: HashMap<u64, OperationSlot<R>, S>,
 
@@ -1337,6 +1382,30 @@ pub mod flight {
 
         /// Worker-local waiter index and transition state driven by an owning adapter.
         /// The adapter supplies actual operation idleness; cancellation is not idleness.
+        /// ```compile_fail,E0277
+        /// use flow_control::coalesce::flight::state::{State, WaiterPolicy};
+        /// use std::time::Instant;
+        /// struct Policy;
+        /// impl WaiterPolicy for Policy {
+        ///     type Error = ();
+        ///     fn check(&self, _: Instant) -> Option<()> { None }
+        ///     fn deadline(&self) -> Instant { Instant::now() }
+        /// }
+        /// fn require_send<T: Send>() {}
+        /// require_send::<State<(), (), (), Policy>>();
+        /// ```
+        /// ```compile_fail,E0277
+        /// use flow_control::coalesce::flight::state::{State, WaiterPolicy};
+        /// use std::time::Instant;
+        /// struct Policy;
+        /// impl WaiterPolicy for Policy {
+        ///     type Error = ();
+        ///     fn check(&self, _: Instant) -> Option<()> { None }
+        ///     fn deadline(&self) -> Instant { Instant::now() }
+        /// }
+        /// fn require_sync<T: Sync>() {}
+        /// require_sync::<State<(), (), (), Policy>>();
+        /// ```
         pub struct State<C, P, O, W: WaiterPolicy> {
             /// Current acquisition or settlement phase.
             pub phase: Phase<C, O, W::Error>,
@@ -3159,6 +3228,37 @@ mod tests {
         drop(follower);
         assert_eq!(table.registration_count(), 0);
         assert_eq!(table.active_count(), 0);
+    }
+
+    /// Retry and owner loss consume the same bounded election budget.
+    #[test]
+    fn canceled_request_keeps_driver_and_final_attempt_until_real_completion() {
+        for success in [false, true] {
+            let table = table(3, 1);
+            let request = table.join("key", 1).unwrap();
+            let follower = table.join("key", 1).unwrap();
+            assert_eq!(request.event(Waker::noop()), Poll::Ready(Event::Lead));
+            let driver = request.clone();
+            drop(request);
+            // Cancellation drops the request, not the clone held by actual work.
+            assert!(follower.event(Waker::noop()).is_pending());
+            assert_eq!(table.active_count(), 1);
+            assert_eq!(table.registration_count(), 2);
+            if success {
+                driver.finish(Ok(7));
+            } else {
+                // Only after work ends can its driver release election ownership.
+                driver.retry();
+            }
+            let expected = if success { Ok(7) } else { Err("exhausted") };
+            assert_eq!(
+                follower.event(Waker::noop()),
+                Poll::Ready(Event::Complete(expected))
+            );
+            drop((driver, follower));
+            assert_eq!(table.registration_count(), 0);
+            assert_eq!(table.active_count(), 0);
+        }
     }
 
     /// Retry and owner loss consume the same bounded election budget.
