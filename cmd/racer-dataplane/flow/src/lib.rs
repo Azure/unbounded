@@ -2845,6 +2845,142 @@ mod quota_tests {
         ));
     }
 
+    /// Compare seeded ownership transitions with an independent quota ledger.
+    #[test]
+    fn seeded_accounting_model_preserves_limits_and_ownership() {
+        const LIMIT: usize = 97;
+        const KEYS: usize = 4;
+        for seed in [1u64, 7, 31, 865, 0xdead_beef, u64::MAX] {
+            let quotas = Quotas::new(TestPolicy::new(LIMIT, KEYS));
+            let shared = quotas.shared();
+            let mut random = seed;
+            let mut owners: Vec<(Charge<TestPolicy>, Option<usize>, usize, Resource)> = Vec::new();
+            let mut stopped = false;
+            for step in 0..1200 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let bits = (random >> 32) as usize;
+                let mut totals = [0usize; 3];
+                let mut keyed = [[0usize; 3]; 6];
+                let mut active = [false; 6];
+                for (_, key, amount, class) in &owners {
+                    totals[class.index()] += amount;
+                    if let Some(key) = key {
+                        active[*key] = true;
+                        keyed[*key][class.index()] += amount;
+                    }
+                }
+                let count = active.iter().filter(|live| **live).count();
+                assert_eq!(
+                    quotas.active_keys.load(Ordering::Acquire),
+                    count,
+                    "seed {seed}, step {step}"
+                );
+                for class in [Resource::Payload, Resource::Other, Resource::Progress] {
+                    assert_eq!(quotas.used(class), totals[class.index()]);
+                    assert_eq!(shared.used(class), totals[class.index()]);
+                    assert!(totals[class.index()] <= LIMIT);
+                }
+                for (charge, key, amount, class) in &owners {
+                    assert_eq!(charge.amount(), *amount);
+                    assert_eq!(charge.class().index(), class.index());
+                    if let Some(key) = key {
+                        assert_eq!(charge.key(), Some(&key.to_string()));
+                        for class in [Resource::Payload, Resource::Other, Resource::Progress] {
+                            assert_eq!(
+                                charge.local.as_ref().unwrap().counter(class).used(),
+                                keyed[*key][class.index()]
+                            );
+                        }
+                    }
+                }
+                if step == 800 {
+                    quotas.stop();
+                    stopped = true;
+                }
+                let operation = if owners.len() > 64 { 5 } else { bits % 6 };
+                let amount = if bits.is_multiple_of(29) {
+                    usize::MAX
+                } else {
+                    (bits / 7) % 110
+                };
+                if operation < 3 {
+                    let completion = operation == 1;
+                    let key =
+                        (operation != 2 && !bits.is_multiple_of(5)).then_some((bits / 11) % 6);
+                    let class =
+                        [Resource::Payload, Resource::Other, Resource::Progress][(bits / 13) % 3];
+                    let expected = if stopped && !completion && !TestPolicy::allows_stopped(class) {
+                        Some(Error::Unavailable)
+                    } else if amount == 0 {
+                        Some(Error::InvalidInput)
+                    } else if key.is_some_and(|key| !active[key] && count == KEYS)
+                        || totals[class.index()]
+                            .checked_add(amount)
+                            .is_none_or(|next| next > LIMIT)
+                        || (!completion
+                            && key.is_some_and(|key| {
+                                let fair = LIMIT / (count + usize::from(!active[key]));
+                                keyed[key][class.index()]
+                                    .checked_add(amount)
+                                    .is_none_or(|next| next > fair)
+                            }))
+                    {
+                        Some(Error::Overloaded)
+                    } else {
+                        None
+                    };
+                    let identity = key.map(|key| key.to_string());
+                    let result = match operation {
+                        0 => quotas.reserve(identity.as_ref(), class, amount),
+                        1 => quotas.reserve_completion(identity.as_ref(), class, amount),
+                        _ => shared.reserve(class, amount),
+                    };
+                    assert_eq!(
+                        result.as_ref().err().copied(),
+                        expected,
+                        "seed {seed}, step {step}"
+                    );
+                    if let Ok(charge) = result {
+                        owners.push((charge, key, amount, class));
+                    }
+                } else if !owners.is_empty() {
+                    let index = (bits / 17) % owners.len();
+                    if operation == 5 {
+                        drop(owners.swap_remove(index));
+                    } else {
+                        let (charge, key, held, class) = &mut owners[index];
+                        if operation == 3 {
+                            let result = charge.split(amount);
+                            if amount != 0 && amount < *held {
+                                *held -= amount;
+                                let child = (result.unwrap(), *key, amount, *class);
+                                owners.push(child);
+                            } else {
+                                assert!(matches!(result, Err(Error::InvalidInput)));
+                            }
+                        } else if amount != 0 && amount <= *held {
+                            charge.shrink(amount).unwrap();
+                            *held = amount;
+                        } else {
+                            assert_eq!(charge.shrink(amount), Err(Error::InvalidInput));
+                        }
+                    }
+                }
+            }
+            drop(owners);
+            for class in [Resource::Payload, Resource::Other, Resource::Progress] {
+                assert_eq!(shared.used(class), 0);
+            }
+            assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+            let replacement = quotas
+                .reserve_completion(Some(&"new".to_owned()), Resource::Payload, LIMIT)
+                .unwrap();
+            drop(replacement);
+            assert_eq!(quotas.keys.borrow().len(), 1);
+            assert_eq!(shared.used(Resource::Payload), 0);
+        }
+    }
+
     /// Stop cannot miss an ordinary reservation still owned on another thread.
     #[test]
     fn stop_and_live_shared_admission_cannot_both_miss_publication() {
