@@ -86,8 +86,9 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 	if options.ResourceVersion == "" || options.ResourceVersion == "0" {
 		current := s.history[len(s.history)-1]
 		for _, g := range current.ledger.Grants() {
-			if !g.Expired(s.clock.Now()) {
-				initial = append(initial, watch.Event{Type: watch.Added, Object: grantObject(g, current.rv)})
+			obj := grantObject(g, current.rv)
+			if !g.Expired(s.clock.Now()) && match(obj) {
+				initial = append(initial, watch.Event{Type: watch.Added, Object: obj})
 			}
 		}
 	} else {
@@ -105,15 +106,13 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 		}
 
 		for i := index + 1; i < len(s.history); i++ {
-			initial = append(initial, diff(s.history[i-1], s.history[i])...)
+			initial = append(initial, diff(s.history[i-1], s.history[i]).matching(match)...)
 		}
 	}
 
 	w := &grantWatch{storage: s, result: make(chan watch.Event, len(initial)+128), done: make(chan struct{}), match: match}
 	for _, event := range initial {
-		if g, ok := event.Object.(*rebound.NodeGrant); ok && match(g) {
-			w.result <- event
-		}
+		w.result <- event
 	}
 
 	s.watchers[w] = struct{}{}
@@ -129,7 +128,31 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 	return w, nil
 }
 
-func diff(old, next snapshot) []watch.Event {
+type eventBatch struct {
+	events []watch.Event
+	rv     string
+}
+
+func (b eventBatch) matching(match func(*rebound.NodeGrant) bool) []watch.Event {
+	var events []watch.Event
+
+	for _, event := range b.events {
+		if g, ok := event.Object.(*rebound.NodeGrant); ok && match(g) {
+			events = append(events, watch.Event{Type: event.Type, Object: g.DeepCopy()})
+		}
+	}
+
+	// Only the last event this watcher receives advances past the batch.
+	if len(events) != 0 {
+		if g, ok := events[len(events)-1].Object.(*rebound.NodeGrant); ok {
+			g.ResourceVersion = b.rv
+		}
+	}
+
+	return events
+}
+
+func diff(old, next snapshot) eventBatch {
 	var events []watch.Event
 
 	for _, g := range old.ledger.Grants() {
@@ -146,14 +169,7 @@ func diff(old, next snapshot) []watch.Event {
 		}
 	}
 
-	// Only the final event advances the resume point past this batch.
-	if len(events) != 0 {
-		if g, ok := events[len(events)-1].Object.(*rebound.NodeGrant); ok {
-			g.ResourceVersion = next.rv
-		}
-	}
-
-	return events
+	return eventBatch{events: events, rv: next.rv}
 }
 
 func (s *storage) observe(obj interface{}, deleted bool) {
@@ -179,18 +195,16 @@ func (s *storage) observe(obj interface{}, deleted bool) {
 		return
 	}
 
-	for _, event := range diff(old, next) {
-		for w := range s.watchers {
-			g, ok := event.Object.(*rebound.NodeGrant)
-			if !ok || !w.match(g) {
-				continue
-			}
-
+	batch := diff(old, next)
+	for w := range s.watchers {
+	deliver:
+		for _, event := range batch.matching(w.match) {
 			select {
-			case w.result <- watch.Event{Type: event.Type, Object: g.DeepCopy()}:
+			case w.result <- event:
 			default:
 				// A slow client reconnects using its last RV, or relists if it fell behind.
 				w.stopLocked()
+				break deliver
 			}
 		}
 	}
