@@ -537,10 +537,11 @@ pub mod rest {
             epoch: [u8; 32],
             scope: &I::Scope,
         ) -> Option<Connection<I>> {
+            let identity = identity?;
+            scope.check().ok()?;
             let mut idle = self.idle.borrow_mut();
-            let connection = idle.take()?;
+            let mut connection = idle.take()?;
             if let Authentication::Authenticated(auth) = &connection.authentication
-                && let Some(identity) = identity
                 && auth.epoch == epoch
                 && auth.expires == identity.expires
                 && auth.owner.upgrade().is_some()
@@ -548,6 +549,7 @@ pub mod rest {
                 && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
                     < Duration::from_secs(20)
                 && connection.check(scope).is_ok()
+                && connection.idle_healthy()
             {
                 Some(connection)
             } else {
@@ -705,6 +707,25 @@ pub mod rest {
     }
 
     impl<I: Io + ?Sized> Connection<I> {
+        fn idle_healthy(&mut self) -> bool {
+            // Read only what is ready. Bound work even if the peer keeps sending tickets.
+            for _ in 0..16 {
+                let Ok(state) = self.tls.process_new_packets() else {
+                    return false;
+                };
+                if state.peer_has_closed() || state.plaintext_bytes_to_read() != 0 {
+                    return false;
+                }
+                match self.tls.read_tls(&mut self.socket.stream) {
+                    Ok(0) => return false,
+                    Ok(_) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+                    Err(_) => return false,
+                }
+            }
+            false
+        }
+
         pub fn request<'a>(
             mut self,
             request: Request<'a>,
@@ -1940,9 +1961,14 @@ pub mod rest {
             }
         }
 
-        fn request_at_yield(cancel: bool) {
-            use std::{net::TcpListener, task::Context};
-
+        fn connected_pair() -> (
+            Transport<CancelIo>,
+            Connection<CancelIo>,
+            TcpStream,
+            rustls::ServerConnection,
+            CancelScope,
+            testing::Directory,
+        ) {
             let (ca, ca_key) = testing::ca();
             let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
             let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
@@ -1964,7 +1990,7 @@ pub mod rest {
             let directory = testing::Directory::new();
             let trust = directory.0.join("ca.crt");
             std::fs::write(&trust, ca.pem()).unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             listener.set_nonblocking(true).unwrap();
             let server = std::thread::spawn(move || {
@@ -2002,7 +2028,7 @@ pub mod rest {
             while connection.tls.wants_write() {
                 futures::executor::block_on(connection.step(&scope)).unwrap();
             }
-            let (mut socket, mut tls) = server.join().unwrap();
+            let (socket, mut tls) = server.join().unwrap();
             socket.set_nonblocking(true).unwrap();
             assert_eq!(
                 socket.peek(&mut [0; 1]).unwrap_err().kind(),
@@ -2013,6 +2039,12 @@ pub mod rest {
                 std::io::ErrorKind::WouldBlock
             );
             socket.set_nonblocking(false).unwrap();
+            (transport, connection, socket, tls, scope, directory)
+        }
+
+        fn request_at_yield(cancel: bool) {
+            use std::task::Context;
+            let (_transport, connection, mut socket, mut tls, scope, _directory) = connected_pair();
             let mut request = connection.request(
                 testing::request(Method::Post, "/v1/bootstrap", Some("test-token"), 1024),
                 &scope,
@@ -2068,6 +2100,98 @@ pub mod rest {
         #[test]
         fn active_scope_after_tls_yield_sends_request() {
             request_at_yield(false);
+        }
+
+        #[test]
+        fn checkout_probes_idle_tls_before_reuse() {
+            for event in [
+                "healthy",
+                "key-update",
+                "close-notify",
+                "eof",
+                "plaintext",
+                "invalid-tls",
+            ] {
+                let (transport, mut connection, mut socket, mut tls, scope, _directory) =
+                    connected_pair();
+                let (ca, key) = testing::ca();
+                let identity = TestIdentity::new(&ca, &key);
+                let epoch = [1; 32];
+                connection.authentication = transport
+                    .authentication(
+                        Some(identity.borrowed()),
+                        epoch,
+                        Rc::downgrade(&transport.owner.borrow()),
+                    )
+                    .unwrap();
+                let fd = connection.socket.fd.clone();
+                *transport.idle.borrow_mut() = Some(connection);
+                match event {
+                    "healthy" | "eof" => (),
+                    "key-update" => tls.refresh_traffic_keys().unwrap(),
+                    "close-notify" => tls.send_close_notify(),
+                    "plaintext" => tls.writer().write_all(b"unsolicited response").unwrap(),
+                    "invalid-tls" => socket.write_all(b"not a TLS record").unwrap(),
+                    _ => unreachable!(),
+                }
+                while tls.wants_write() {
+                    tls.write_tls(&mut socket).unwrap();
+                }
+                if event == "eof" {
+                    socket.shutdown(std::net::Shutdown::Both).unwrap();
+                }
+                if event != "healthy" {
+                    futures::executor::block_on(transport.io().unwrap().ready(
+                        fd.clone(),
+                        true,
+                        false,
+                        None,
+                        &scope,
+                    ))
+                    .unwrap();
+                }
+                let checked = transport.checkout(Some(identity.borrowed()), epoch, &scope);
+                assert_eq!(
+                    checked.is_some(),
+                    matches!(event, "healthy" | "key-update"),
+                    "{event}"
+                );
+                if let Some(connection) = checked {
+                    assert!(Rc::ptr_eq(&connection.socket.fd, &fd));
+                }
+                assert!(transport.idle.borrow().is_none());
+            }
+        }
+
+        #[test]
+        fn bootstrap_and_canceled_checkout_preserve_healthy_idle_connection() {
+            let (transport, mut connection, _socket, _tls, scope, _directory) = connected_pair();
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            let epoch = [1; 32];
+            connection.authentication = transport
+                .authentication(
+                    Some(identity.borrowed()),
+                    epoch,
+                    Rc::downgrade(&transport.owner.borrow()),
+                )
+                .unwrap();
+            let fd = connection.socket.fd.clone();
+            *transport.idle.borrow_mut() = Some(connection);
+            assert!(transport.checkout(None, [0; 32], &scope).is_none());
+            assert!(transport.idle.borrow().is_some());
+            scope.cancelled.set(true);
+            assert!(
+                transport
+                    .checkout(Some(identity.borrowed()), epoch, &scope)
+                    .is_none()
+            );
+            assert!(transport.idle.borrow().is_some());
+            scope.cancelled.set(false);
+            let connection = transport
+                .checkout(Some(identity.borrowed()), epoch, &scope)
+                .unwrap();
+            assert!(Rc::ptr_eq(&connection.socket.fd, &fd));
         }
 
         fn authenticated(connection: &mut Connection<FixtureIo>) -> &mut Authenticated<FixtureIo> {
