@@ -1,7 +1,8 @@
 //! Controllable local origin server for protocol and application integration tests.
 //! Uses real HTTP bytes on a Unix socket; no application reactor or quotas are needed.
 
-use crate::model::{ObjectMetadata, PAGE_BYTES};
+use crate::model::{ByteRange, ObjectMetadata, PAGE_BYTES, StrongEtag};
+use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -239,6 +240,108 @@ impl Drop for AdapterOrigin {
     }
 }
 
+fn parse_request(request: &http1::MessageHead, state: &State) -> Result<Call> {
+    let http1::StartLine::Request { method, target } = &request.start else {
+        return Err(Error::InvalidRequest);
+    };
+    if target != &format!("/v1/objects/{}", state.metadata.version.object.key.to_hex())
+        || request.unique("Host")?.map(http1::trim_ows) != Some(b"racer".as_slice())
+        || request
+            .unique("Content-Length")?
+            .is_some_and(|value| value != b"0")
+    {
+        return Err(Error::InvalidRequest);
+    }
+    for name in [
+        "Content-Type",
+        "If-Match",
+        "Range",
+        "Racer-Metadata",
+        "Authorization",
+        "Racer-Object-Length",
+        "Racer-Range-Start",
+        "Racer-Range-End",
+        "Racer-Page-Credits",
+        "Racer-Byte-Credits",
+        "Racer-Ordered",
+    ] {
+        request.unique(name)?;
+    }
+    for name in [
+        "Content-Range",
+        "ETag",
+        "Racer-Expires-At",
+        "Racer-Content-Type",
+        "Transfer-Encoding",
+        "Content-Encoding",
+        "Trailer",
+        "Upgrade",
+        "Expect",
+        "If-None-Match",
+        "If-Modified-Since",
+        "If-Unmodified-Since",
+        "If-Range",
+    ] {
+        if request.unique(name)?.is_some() {
+            return Err(Error::InvalidRequest);
+        }
+    }
+    for name in ["Racer-Metadata", "Authorization"] {
+        if let Some(value) = request.unique(name)? {
+            crate::origin::opaque(value)?;
+        }
+    }
+    let pin = request
+        .unique("If-Match")?
+        .map(|value| StrongEtag::parse(http1::trim_ows(value)))
+        .transpose()?;
+    let range = request.unique("Range")?.map(ByteRange::parse).transpose()?;
+    let (kind, first) = match (method.as_str(), range) {
+        ("HEAD", None) => (RequestKind::Head, 0),
+        ("GET", Some(ByteRange::Closed { first, last })) => {
+            if first % PAGE_BYTES != 0 || last - first >= PAGE_BYTES {
+                return Err(Error::InvalidRange);
+            }
+            if pin.is_none() {
+                if first != 0 || last != PAGE_BYTES - 1 {
+                    return Err(Error::InvalidRange);
+                }
+                (RequestKind::InitialGet, first)
+            } else {
+                let nominal_last = first + PAGE_BYTES - 1;
+                if !state.missing
+                    && pin.as_ref() == Some(&state.metadata.version.etag)
+                    && first < state.metadata.length
+                    && last != nominal_last
+                    && last != state.metadata.length - 1
+                {
+                    return Err(Error::InvalidRange);
+                }
+                (RequestKind::PinnedGet, first)
+            }
+        }
+        ("HEAD" | "GET", _) => return Err(Error::InvalidRange),
+        _ => return Err(Error::MethodNotAllowed),
+    };
+    Ok(Call {
+        kind,
+        page: first / PAGE_BYTES,
+        if_match: pin.map(|etag| etag.as_bytes().to_vec()),
+    })
+}
+
+fn reject_request(stream: &mut UnixStream, error: Error) {
+    let (status, fields) = match error {
+        Error::MethodNotAllowed => (405, "Allow: HEAD, GET\r\n"),
+        Error::HeaderTooLarge => (431, ""),
+        _ => (400, ""),
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} Fixture\r\nConnection: close\r\n{fields}Content-Length: 0\r\n\r\n"
+    );
+}
+
 /// Serve one bounded request and close the connection after its response.
 fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
     stream
@@ -267,39 +370,28 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
             }
             Err(_) => return,
         }
-        assert!(request.len() <= 32768, "oversized adapter request");
+        if request.len() > 32768 {
+            reject_request(&mut stream, Error::HeaderTooLarge);
+            return;
+        }
     }
-    let request = Codec::new(32768).decode_head(&request).unwrap().unwrap().0;
-    let head =
-        matches!(&request.start, http1::StartLine::Request { method, .. } if method == "HEAD");
-    let if_match = request.unique("If-Match").unwrap().map(<[u8]>::to_vec);
-    let first = request
-        .unique("Range")
-        .unwrap()
-        .map(|range| {
-            std::str::from_utf8(range)
-                .unwrap()
-                .strip_prefix("bytes=")
-                .unwrap()
-                .split('-')
-                .next()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-        })
-        .unwrap_or(0);
-    let kind = if head {
-        RequestKind::Head
-    } else if if_match.is_some() {
-        RequestKind::PinnedGet
-    } else {
-        RequestKind::InitialGet
+    let call = Codec::new(32768)
+        .decode_head(&request)
+        .map_err(Error::from)
+        .and_then(|decoded| {
+            let (request, _) = decoded.ok_or(Error::InvalidRequest)?;
+            parse_request(&request, &state.lock().unwrap())
+        });
+    let call = match call {
+        Ok(call) => call,
+        Err(error) => {
+            reject_request(&mut stream, error);
+            return;
+        }
     };
-    let call = Call {
-        kind,
-        page: first / PAGE_BYTES,
-        if_match,
-    };
+    let kind = call.kind;
+    let head = kind == RequestKind::Head;
+    let first = call.page * PAGE_BYTES;
     let started = Instant::now();
     state.lock().unwrap().calls.push(call.clone());
     loop {
