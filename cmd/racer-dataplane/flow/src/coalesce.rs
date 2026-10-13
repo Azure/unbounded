@@ -1424,6 +1424,8 @@ pub mod flight {
 
             cursor: Cursor,
 
+            deadline_cursor: Option<(Instant, u64)>,
+
             /// State transitions belong to one worker even for thread-safe policy data.
             local: std::marker::PhantomData<std::rc::Rc<()>>,
         }
@@ -1438,6 +1440,7 @@ pub mod flight {
                     deadlines: BTreeMap::new(),
                     partial: None,
                     cursor: Cursor::default(),
+                    deadline_cursor: None,
                     local: std::marker::PhantomData,
                 }
             }
@@ -1697,15 +1700,25 @@ pub mod flight {
                 }
             }
 
-            /// Check at most 64 due entries once each, retaining any that defer failure.
+            /// Check at most 64 due entries once each, rotating past deferred failures.
             fn refresh_expired(&mut self, now: Instant, wakes: &mut Vec<Waker>) {
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+
+                let end = (now, u64::MAX);
+                let cursor = self.deadline_cursor.map(|cursor| cursor.min(end));
                 let due: Vec<_> = self
                     .deadlines
-                    .range(..=(now, u64::MAX))
+                    .range((cursor.map_or(Unbounded, Excluded), Included(end)))
+                    .chain(
+                        cursor
+                            .into_iter()
+                            .flat_map(|cursor| self.deadlines.range(..=cursor)),
+                    )
                     .take(64)
                     .map(|(&(deadline, id), _)| (deadline, id))
                     .collect();
                 for (deadline, id) in due {
+                    self.deadline_cursor = Some((deadline, id));
                     if self.waiters.contains_key(&id) {
                         self.refresh_waiter(id, now, wakes);
                     } else {

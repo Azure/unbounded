@@ -2196,6 +2196,72 @@ mod coalesce_tests {
         assert!(matches!(state.phase, Phase::Failed(9)));
     }
 
+    /// Deferred deadlines cannot starve later failures or exceed the refresh quantum.
+    #[test]
+    fn deferred_deadlines_rotate_past_full_quantum() {
+        let owner = RefCell::new(State::<u32, u32, Published<u32, u32>, CountingPolicy>::default());
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let checks = Rc::new(Cell::new(0));
+        let deferred = Rc::new(Cell::new(None));
+        let failed = Rc::new(Cell::new(Some(7)));
+        flight::update_at(&owner, now, |state, _| {
+            for id in 0..66 {
+                assert!(
+                    state
+                        .register(
+                            id,
+                            CountingPolicy {
+                                due: if id == 65 { later } else { now },
+                                checks: checks.clone(),
+                                error: if id < 64 {
+                                    deferred.clone()
+                                } else {
+                                    failed.clone()
+                                },
+                            },
+                            true,
+                            true
+                        )
+                        .is_ok()
+                );
+            }
+        });
+        let refresh = |now| {
+            flight::update_at(&owner, now, |state, txn| {
+                let retired = state.refresh(false, 9, 8, txn.now(), std::convert::identity, txn);
+                txn.retire(retired);
+            })
+        };
+        refresh(now);
+        assert_eq!(checks.get(), 64);
+        assert!(owner.borrow().waiters[&64].error.is_none());
+        refresh(now);
+        assert_eq!(checks.get(), 128);
+        assert_eq!(owner.borrow().waiters[&64].error, Some(7));
+        assert_eq!(owner.borrow().deadlines.len(), 65);
+        assert!(owner.borrow().waiters[&65].error.is_none());
+
+        deferred.set(Some(8));
+        refresh(now);
+        assert_eq!(checks.get(), 192);
+        assert_eq!(owner.borrow().deadlines.len(), 1);
+        assert!(
+            owner
+                .borrow()
+                .waiters
+                .values()
+                .take(64)
+                .all(|waiter| waiter.error == Some(8))
+        );
+        refresh(now);
+        assert_eq!(checks.get(), 192, "future deadlines are not visited");
+        refresh(later);
+        assert_eq!(checks.get(), 193);
+        assert_eq!(owner.borrow().waiters[&65].error, Some(7));
+        assert!(owner.borrow().deadlines.is_empty());
+    }
+
     /// Clock callbacks run before borrowing; expiry uses one snapshot and a fixed budget.
     #[test]
     fn refresh_clock_reentry_uses_one_snapshot_and_bounded_expiry() {
