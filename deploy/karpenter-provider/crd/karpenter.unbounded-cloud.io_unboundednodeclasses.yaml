@@ -87,7 +87,7 @@ spec:
                     type: boolean
                   requiredImage:
                     description: RequiredImage is an exact OCI image reference.
-                    pattern: ^.+@sha256:[a-f0-9]{64}$
+                    minLength: 1
                     type: string
                 required:
                 - requiredImage
@@ -113,8 +113,10 @@ spec:
                         required. GPU profiles must also declare nvidia.com/gpu.
                       type: object
                     capacityType:
-                      default: on-demand
-                      description: CapacityType is the Karpenter capacity type.
+                      default: reserved
+                      description: |-
+                        CapacityType is the Karpenter capacity type.
+                        Existing physical Machine inventory normally uses reserved.
                       type: string
                     gpu:
                       description: GPU defines exact accelerator and health requirements.

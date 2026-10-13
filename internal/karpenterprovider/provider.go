@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -116,7 +117,7 @@ func toInstanceType(
 
 	capacityType := spec.CapacityType
 	if capacityType == "" {
-		capacityType = karpenterv1.CapacityTypeOnDemand
+		capacityType = karpenterv1.CapacityTypeReserved
 	}
 
 	requirements := scheduling.NewRequirements(
@@ -135,13 +136,18 @@ func toInstanceType(
 		scheduling.NewRequirement(karpenterv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityType),
 	)
 
+	reservationCapacity := 0
+	if capacityType == karpenterv1.CapacityTypeReserved {
+		reservationCapacity = free
+	}
+
 	return &cloudprovider.InstanceType{
 		Name:         spec.Name,
 		Requirements: requirements,
 		Offerings: cloudprovider.Offerings{{
 			Requirements:        offeringRequirements,
 			Available:           free > 0,
-			ReservationCapacity: free,
+			ReservationCapacity: reservationCapacity,
 			Price:               0,
 		}},
 		Capacity: spec.Capacity.DeepCopy(),
@@ -152,6 +158,16 @@ func toInstanceType(
 func (p *Provider) Create(ctx context.Context, nodeClaim *karpenterv1.NodeClaim) (*karpenterv1.NodeClaim, error) {
 	if nodeClaim.UID == "" {
 		return nil, errors.New("NodeClaim UID is required")
+	}
+
+	if owned, err := p.findReservation(ctx, nodeClaim.Name, nodeClaim.UID); err != nil {
+		return nil, err
+	} else if owned != nil {
+		if err := p.configureOwnedMachine(ctx, owned, nodeClaim.UID); err != nil {
+			return nil, err
+		}
+
+		return p.finishCreate(ctx, nodeClaim, owned)
 	}
 
 	nodeClass, err := p.resolveNodeClass(ctx, nodeClaim.Spec.NodeClassRef)
@@ -178,12 +194,6 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpenterv1.NodeClaim)
 		return nil, err
 	}
 
-	if owned, err := p.findReservation(ctx, nodeClaim.Name, nodeClaim.UID); err != nil {
-		return nil, err
-	} else if owned != nil {
-		return p.finishCreate(ctx, nodeClaim, nodeClass, instanceSpec, owned)
-	}
-
 	machines, err := p.matchingMachines(ctx, nodeClass, instanceSpec)
 	if err != nil {
 		return nil, err
@@ -208,7 +218,11 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpenterv1.NodeClaim)
 		var reserved *machinav1alpha3.Machine
 
 		err = p.locker.WithLock(ctx, domain, func(lockCtx context.Context) error {
-			return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			if err := p.ensureUniqueProviderID(lockCtx, machine.Name, providerID); err != nil {
+				return err
+			}
+
+			if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 				var current machinav1alpha3.Machine
 				if err := p.client.Get(lockCtx, types.NamespacedName{Name: machine.Name}, &current); err != nil {
 					return err
@@ -226,8 +240,10 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpenterv1.NodeClaim)
 					NodeClassName:        nodeClass.Name,
 					NodeClassGeneration:  nodeClass.Generation,
 					InstanceType:         instanceSpec.Name,
+					ConfigurationName:    nodeClass.Spec.ConfigurationRef.Name,
 					ConfigurationVersion: configVersion.Spec.Version,
 					ImageID:              nodeClass.Spec.ImagePolicy.RequiredImage,
+					Launch:               launchSnapshot(nodeClaim, nodeClass, instanceSpec, &current),
 					ReservedAt:           metav1.Now(),
 				}
 				setReservedConditions(&current, nodeClaim.Name)
@@ -239,7 +255,15 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpenterv1.NodeClaim)
 				reserved = current.DeepCopy()
 
 				return nil
-			})
+			}); err != nil {
+				return err
+			}
+
+			if reserved == nil {
+				return nil
+			}
+
+			return p.configureReservedMachine(lockCtx, reserved.Name, nodeClaim.UID)
 		})
 		if err != nil {
 			if errors.Is(err, ErrDomainLocked) {
@@ -253,11 +277,7 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpenterv1.NodeClaim)
 			continue
 		}
 
-		if err := p.configureReservedMachine(ctx, reserved.Name, nodeClass, nodeClaim, providerID); err != nil {
-			return nil, err
-		}
-
-		return p.finishCreate(ctx, nodeClaim, nodeClass, instanceSpec, reserved)
+		return p.finishCreate(ctx, nodeClaim, reserved)
 	}
 
 	return nil, cloudprovider.NewInsufficientCapacityError(errors.New("no available Machine satisfies the NodeClass and NodeClaim requirements"))
@@ -266,11 +286,9 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpenterv1.NodeClaim)
 func (p *Provider) finishCreate(
 	ctx context.Context,
 	nodeClaim *karpenterv1.NodeClaim,
-	nodeClass *karpenterv1alpha1.UnboundedNodeClass,
-	instanceSpec *karpenterv1alpha1.InstanceType,
 	machine *machinav1alpha3.Machine,
 ) (*karpenterv1.NodeClaim, error) {
-	ready, reason := machineReady(machine, nodeClass, instanceSpec)
+	ready, reason := machineReady(machine)
 	if !ready {
 		if err := p.lifecycle.ProvisionWorker(ctx, machine); err != nil {
 			return nil, fmt.Errorf("provision reserved Machine %s: %w", machine.Name, err)
@@ -279,15 +297,13 @@ func (p *Provider) finishCreate(
 		return nil, fmt.Errorf("reserved Machine %s is not allocation ready: %s", machine.Name, reason)
 	}
 
-	return hydrateNodeClaim(nodeClaim, nodeClass, instanceSpec, machine), nil
+	return hydrateNodeClaim(nodeClaim, machine), nil
 }
 
 func (p *Provider) configureReservedMachine(
 	ctx context.Context,
 	machineName string,
-	nodeClass *karpenterv1alpha1.UnboundedNodeClass,
-	nodeClaim *karpenterv1.NodeClaim,
-	providerID string,
+	nodeClaimUID types.UID,
 ) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		var machine machinav1alpha3.Machine
@@ -295,27 +311,48 @@ func (p *Provider) configureReservedMachine(
 			return err
 		}
 
-		if machine.Status.Reservation == nil || machine.Status.Reservation.NodeClaimUID != nodeClaim.UID {
+		if machine.Status.Reservation == nil || machine.Status.Reservation.NodeClaimUID != nodeClaimUID {
 			return errors.New("machine reservation changed before configuration")
 		}
 
-		machine.Spec.ConfigurationRef = nodeClass.Spec.ConfigurationRef.DeepCopy()
+		reservation := machine.Status.Reservation
+		if reservation.Launch == nil {
+			return errors.New("machine reservation has no durable launch snapshot")
+		}
+
+		version := reservation.ConfigurationVersion
+
+		machine.Spec.ConfigurationRef = &machinav1alpha3.MachineConfigurationRef{
+			Name:    reservation.ConfigurationName,
+			Version: &version,
+		}
 		if machine.Spec.Kubernetes == nil {
 			machine.Spec.Kubernetes = &machinav1alpha3.KubernetesSpec{}
 		}
 
-		machine.Spec.Kubernetes.ProviderID = providerID
-		if machine.Spec.Kubernetes.NodeLabels == nil {
-			machine.Spec.Kubernetes.NodeLabels = map[string]string{}
-		}
-
-		maps.Copy(machine.Spec.Kubernetes.NodeLabels, nodeClass.Spec.Labels)
-
-		for key, value := range resolvedLabels(nodeClaim.Spec.Requirements) {
-			machine.Spec.Kubernetes.NodeLabels[key] = value
-		}
+		machine.Spec.Kubernetes.ProviderID = reservation.ProviderID
+		machine.Spec.Kubernetes.NodeLabels = maps.Clone(reservation.Launch.Labels)
+		machine.Spec.Kubernetes.RegisterWithTaints = registrationTaints(
+			reservation.Launch.Taints,
+			reservation.Launch.StartupTaints,
+		)
 
 		return p.client.Update(ctx, &machine)
+	})
+}
+
+func (p *Provider) configureOwnedMachine(
+	ctx context.Context,
+	machine *machinav1alpha3.Machine,
+	nodeClaimUID types.UID,
+) error {
+	reservation := machine.Status.Reservation
+	if reservation == nil || reservation.Domain == "" {
+		return errors.New("owned Machine has no durable reservation domain")
+	}
+
+	return p.locker.WithLock(ctx, reservation.Domain, func(lockCtx context.Context) error {
+		return p.configureReservedMachine(lockCtx, machine.Name, nodeClaimUID)
 	})
 }
 
@@ -356,17 +393,10 @@ func (p *Provider) List(ctx context.Context) ([]*karpenterv1.NodeClaim, error) {
 	return claims, nil
 }
 
-func (p *Provider) reconstruct(ctx context.Context, machine *machinav1alpha3.Machine) (*karpenterv1.NodeClaim, error) {
+func (p *Provider) reconstruct(_ context.Context, machine *machinav1alpha3.Machine) (*karpenterv1.NodeClaim, error) {
 	reservation := machine.Status.Reservation
-
-	var nodeClass karpenterv1alpha1.UnboundedNodeClass
-	if err := p.client.Get(ctx, types.NamespacedName{Name: reservation.NodeClassName}, &nodeClass); err != nil {
-		return nil, fmt.Errorf("get NodeClass %s: %w", reservation.NodeClassName, err)
-	}
-
-	instanceSpec := findInstanceType(&nodeClass, reservation.InstanceType)
-	if instanceSpec == nil {
-		return nil, fmt.Errorf("instance type %s no longer exists on NodeClass %s", reservation.InstanceType, nodeClass.Name)
+	if reservation.Launch == nil {
+		return nil, fmt.Errorf("machine %s reservation has no durable launch snapshot", machine.Name)
 	}
 
 	claim := &karpenterv1.NodeClaim{
@@ -375,12 +405,12 @@ func (p *Provider) reconstruct(ctx context.Context, machine *machinav1alpha3.Mac
 			NodeClassRef: &karpenterv1.NodeClassReference{
 				Group: karpenterv1alpha1.GroupVersion.Group,
 				Kind:  karpenterv1alpha1.KindUnboundedNodeClass,
-				Name:  nodeClass.Name,
+				Name:  reservation.NodeClassName,
 			},
 		},
 	}
 
-	return hydrateNodeClaim(claim, &nodeClass, instanceSpec, machine), nil
+	return hydrateNodeClaim(claim, machine), nil
 }
 
 func (p *Provider) Delete(ctx context.Context, nodeClaim *karpenterv1.NodeClaim) error {
@@ -605,11 +635,16 @@ func machineEligible(machine *machinav1alpha3.Machine) bool {
 		!apimeta.IsStatusConditionTrue(machine.Status.Conditions, machinav1alpha3.MachineConditionQuarantined)
 }
 
-func machineReady(
-	machine *machinav1alpha3.Machine,
-	nodeClass *karpenterv1alpha1.UnboundedNodeClass,
-	instanceSpec *karpenterv1alpha1.InstanceType,
-) (bool, string) {
+func machineReady(machine *machinav1alpha3.Machine) (bool, string) {
+	if machine.Status.Reservation == nil {
+		return false, "Machine reservation is missing"
+	}
+
+	if machine.Status.Reservation.Launch == nil {
+		return false, "Machine launch snapshot is missing"
+	}
+
+	launch := machine.Status.Reservation.Launch
 	if machine.Status.Allocation == nil || machine.Status.Allocation.Node == nil {
 		return false, "Node observation is missing"
 	}
@@ -623,15 +658,15 @@ func machineReady(
 		return false, "Node providerID does not match the Machine reservation"
 	}
 
-	if node.Image != nodeClass.Spec.ImagePolicy.RequiredImage {
+	if node.Image != machine.Status.Reservation.ImageID {
 		return false, "observed image does not match the required image"
 	}
 
-	if instanceSpec.GPU == nil {
+	if launch.GPU == nil {
 		return true, ""
 	}
 
-	if !nodeClass.Spec.ImagePolicy.RequireNVIDIA {
+	if !launch.RequireNVIDIA {
 		return false, "GPU capacity requires an NVIDIA-enabled image policy"
 	}
 
@@ -640,14 +675,14 @@ func machineReady(
 		return false, "GPU observation is missing"
 	}
 
-	if !strings.EqualFold(gpu.Vendor, instanceSpec.GPU.Vendor) ||
-		!strings.EqualFold(gpu.Model, instanceSpec.GPU.Model) ||
-		gpu.Count != instanceSpec.GPU.Count ||
-		gpu.HealthyCount != instanceSpec.GPU.Count {
+	if !strings.EqualFold(gpu.Vendor, launch.GPU.Vendor) ||
+		!strings.EqualFold(gpu.Model, launch.GPU.Model) ||
+		gpu.Count != launch.GPU.Count ||
+		gpu.HealthyCount != launch.GPU.Count {
 		return false, "GPU identity, total, or allocatable health does not match"
 	}
 
-	if instanceSpec.GPU.RequireFabric && !gpu.FabricHealthy {
+	if launch.GPU.RequireFabric && !gpu.FabricHealthy {
 		return false, "required GPU fabric is unhealthy"
 	}
 
@@ -656,8 +691,6 @@ func machineReady(
 
 func hydrateNodeClaim(
 	nodeClaim *karpenterv1.NodeClaim,
-	nodeClass *karpenterv1alpha1.UnboundedNodeClass,
-	instanceSpec *karpenterv1alpha1.InstanceType,
 	machine *machinav1alpha3.Machine,
 ) *karpenterv1.NodeClaim {
 	out := nodeClaim.DeepCopy()
@@ -665,24 +698,74 @@ func hydrateNodeClaim(
 		out.Labels = map[string]string{}
 	}
 
-	maps.Copy(out.Labels, nodeClass.Spec.Labels)
-	maps.Copy(out.Labels, resolvedLabels(out.Spec.Requirements))
-	out.Labels[corev1.LabelInstanceTypeStable] = instanceSpec.Name
-	out.Labels[corev1.LabelArchStable] = defaultString(instanceSpec.Architecture, "amd64")
-	out.Labels[corev1.LabelOSStable] = defaultString(instanceSpec.OperatingSystem, string(corev1.Linux))
-	out.Labels[corev1.LabelTopologyZone] = instanceSpec.Zone
-	out.Labels[karpenterv1.CapacityTypeLabelKey] = defaultString(instanceSpec.CapacityType, karpenterv1.CapacityTypeOnDemand)
-	out.Labels[corev1.LabelHostname] = machine.Name
-	out.Status.ProviderID = machine.Status.Reservation.ProviderID
-	out.Status.ImageID = nodeClass.Spec.ImagePolicy.RequiredImage
-	out.Status.Capacity = instanceSpec.Capacity.DeepCopy()
+	reservation := machine.Status.Reservation
+	maps.Copy(out.Labels, reservation.Launch.Labels)
+	out.Spec.Taints = slices.Clone(reservation.Launch.Taints)
+	out.Spec.StartupTaints = slices.Clone(reservation.Launch.StartupTaints)
+	out.Status.ProviderID = reservation.ProviderID
+	out.Status.ImageID = reservation.ImageID
+	out.Status.Capacity = reservation.Launch.Capacity.DeepCopy()
 
-	out.Status.Allocatable = instanceSpec.Capacity.DeepCopy()
+	out.Status.Allocatable = reservation.Launch.Capacity.DeepCopy()
 	if machine.Status.Allocation != nil && machine.Status.Allocation.Node != nil {
 		out.Status.NodeName = machine.Status.Allocation.Node.Name
+	} else {
+		out.Status.NodeName = reservation.Launch.NodeName
 	}
 
 	return out
+}
+
+func launchSnapshot(
+	nodeClaim *karpenterv1.NodeClaim,
+	nodeClass *karpenterv1alpha1.UnboundedNodeClass,
+	instanceSpec *karpenterv1alpha1.InstanceType,
+	machine *machinav1alpha3.Machine,
+) *machinav1alpha3.MachineLaunchSnapshot {
+	labels := maps.Clone(nodeClass.Spec.Labels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+
+	maps.Copy(labels, resolvedLabels(nodeClaim.Spec.Requirements))
+	labels[corev1.LabelInstanceTypeStable] = instanceSpec.Name
+	labels[corev1.LabelArchStable] = defaultString(instanceSpec.Architecture, "amd64")
+	labels[corev1.LabelOSStable] = defaultString(instanceSpec.OperatingSystem, string(corev1.Linux))
+	labels[corev1.LabelTopologyZone] = instanceSpec.Zone
+	labels[karpenterv1.CapacityTypeLabelKey] = defaultString(instanceSpec.CapacityType, karpenterv1.CapacityTypeReserved)
+	labels[corev1.LabelHostname] = stableNodeName(machine)
+
+	snapshot := machinav1alpha3.MachineLaunchSnapshot{
+		NodeName:        stableNodeName(machine),
+		Architecture:    labels[corev1.LabelArchStable],
+		OperatingSystem: labels[corev1.LabelOSStable],
+		Zone:            labels[corev1.LabelTopologyZone],
+		CapacityType:    labels[karpenterv1.CapacityTypeLabelKey],
+		Capacity:        instanceSpec.Capacity.DeepCopy(),
+		Labels:          labels,
+		Taints:          slices.Clone(nodeClaim.Spec.Taints),
+		StartupTaints:   slices.Clone(nodeClaim.Spec.StartupTaints),
+		RequireNVIDIA:   nodeClass.Spec.ImagePolicy.RequireNVIDIA,
+	}
+	if instanceSpec.GPU != nil {
+		snapshot.GPU = &machinav1alpha3.MachineLaunchGPU{
+			Vendor:        instanceSpec.GPU.Vendor,
+			Model:         instanceSpec.GPU.Model,
+			Count:         instanceSpec.GPU.Count,
+			RequireFabric: instanceSpec.GPU.RequireFabric,
+		}
+	}
+
+	return &snapshot
+}
+
+func stableNodeName(machine *machinav1alpha3.Machine) string {
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil &&
+		machine.Spec.Kubernetes.NodeRef.Name != "" {
+		return machine.Spec.Kubernetes.NodeRef.Name
+	}
+
+	return machine.Name
 }
 
 func resolvedLabels(requirements []karpenterv1.NodeSelectorRequirementWithMinValues) map[string]string {
@@ -695,6 +778,30 @@ func resolvedLabels(requirements []karpenterv1.NodeSelectorRequirementWithMinVal
 	}
 
 	return result
+}
+
+func registrationTaints(regular, startup []corev1.Taint) []string {
+	taints := make([]string, 0, len(regular)+len(startup))
+	seen := map[string]struct{}{}
+
+	for _, taint := range append(slices.Clone(regular), startup...) {
+		value := taint.Key
+		if taint.Value != "" {
+			value += "=" + taint.Value
+		}
+
+		value += ":" + string(taint.Effect)
+		if _, ok := seen[value]; ok {
+			continue
+		}
+
+		seen[value] = struct{}{}
+		taints = append(taints, value)
+	}
+
+	sort.Strings(taints)
+
+	return taints
 }
 
 func defaultString(value, fallback string) string {
@@ -768,14 +875,90 @@ func (p *Provider) findByProviderID(ctx context.Context, providerID string) (*ma
 		return nil, err
 	}
 
+	matches := make([]*machinav1alpha3.Machine, 0, 1)
+
 	for i := range machines.Items {
 		if machines.Items[i].Status.Reservation != nil &&
 			machines.Items[i].Status.Reservation.ProviderID == providerID {
-			return machines.Items[i].DeepCopy(), nil
+			matches = append(matches, machines.Items[i].DeepCopy())
 		}
 	}
 
-	return nil, nil
+	if len(matches) == 0 {
+		return nil, nil
+	}
+
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("provider ID %q is reserved by multiple Machines", providerID)
+	}
+
+	return matches[0], nil
+}
+
+func (p *Provider) ensureUniqueProviderID(ctx context.Context, machineName, providerID string) error {
+	var machines machinav1alpha3.MachineList
+	if err := p.client.List(ctx, &machines); err != nil {
+		return fmt.Errorf("list Machines for identity uniqueness: %w", err)
+	}
+
+	duplicates := []string{machineName}
+
+	for i := range machines.Items {
+		machine := &machines.Items[i]
+		if machine.Name == machineName {
+			continue
+		}
+
+		candidateID, err := StableProviderID(machine)
+		if err != nil {
+			continue
+		}
+
+		if candidateID == providerID {
+			duplicates = append(duplicates, machine.Name)
+		}
+	}
+
+	if len(duplicates) == 1 {
+		return nil
+	}
+
+	sort.Strings(duplicates)
+
+	message := fmt.Sprintf("immutable provider identity is duplicated by Machines %s", strings.Join(duplicates, ", "))
+	for _, duplicate := range duplicates {
+		if err := p.quarantineMachine(ctx, duplicate, "DuplicateProviderIdentity", message); err != nil {
+			return err
+		}
+	}
+
+	return errors.New(message)
+}
+
+func (p *Provider) quarantineMachine(ctx context.Context, machineName, reason, message string) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var machine machinav1alpha3.Machine
+		if err := p.client.Get(ctx, types.NamespacedName{Name: machineName}, &machine); err != nil {
+			return err
+		}
+
+		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:               machinav1alpha3.MachineConditionQuarantined,
+			Status:             metav1.ConditionTrue,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: machine.Generation,
+		})
+		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:               machinav1alpha3.MachineConditionAvailable,
+			Status:             metav1.ConditionFalse,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: machine.Generation,
+		})
+
+		return p.client.Status().Update(ctx, &machine)
+	})
 }
 
 func (p *Provider) setReleaseStage(
@@ -857,50 +1040,21 @@ func (p *Provider) clearReservation(ctx context.Context, machineName string, uid
 	})
 }
 
-func findInstanceType(
-	nodeClass *karpenterv1alpha1.UnboundedNodeClass,
-	name string,
-) *karpenterv1alpha1.InstanceType {
-	for i := range nodeClass.Spec.InstanceTypes {
-		if nodeClass.Spec.InstanceTypes[i].Name == name {
-			return &nodeClass.Spec.InstanceTypes[i]
-		}
-	}
-
-	return nil
-}
-
 // StableProviderID derives identity only from immutable host ownership fields.
 // DHCP addresses, SSH endpoints, and mutable Rack-SCM server IDs are excluded.
 func StableProviderID(machine *machinav1alpha3.Machine) (string, error) {
 	var identity string
 
 	switch {
+	case machine.Spec.Identity != nil:
+		serial := strings.ToLower(strings.TrimSpace(machine.Spec.Identity.SerialNumber))
+		mac := strings.ToLower(strings.TrimSpace(machine.Spec.Identity.MACAddress))
+		identity = strings.Join([]string{"physical", serial, mac}, ":")
 	case machine.Spec.Host != nil && machine.Spec.Host.Azure != nil:
 		identity = "azure:" + strings.ToLower(machine.Spec.Host.Azure.ResourceID)
 	case machine.Spec.Host != nil && machine.Spec.Host.External != nil && machine.Spec.Host.External.MachineRef != nil:
 		ref := machine.Spec.Host.External.MachineRef
 		identity = strings.Join([]string{"external", machine.Spec.Host.External.Provider, ref.APIGroup, ref.Kind, ref.Name}, ":")
-	case machine.Spec.Host != nil && machine.Spec.Host.External != nil && machine.Spec.Host.External.ProviderID != "":
-		identity = "external:" + machine.Spec.Host.External.Provider + ":" + machine.Spec.Host.External.ProviderID
-	case machine.Spec.ProviderID != "":
-		identity = "legacy:" + machine.Spec.Provider + ":" + machine.Spec.ProviderID
-	default:
-		netboot := machine.Spec.Netboot()
-		if netboot != nil {
-			macs := make([]string, 0, len(netboot.DHCPLeases))
-			for _, lease := range netboot.DHCPLeases {
-				if lease.MAC != "" {
-					macs = append(macs, strings.ToLower(lease.MAC))
-				}
-			}
-
-			sort.Strings(macs)
-
-			if len(macs) > 0 {
-				identity = "netboot-mac:" + strings.Join(macs, ",")
-			}
-		}
 	}
 
 	if identity == "" {

@@ -281,6 +281,39 @@ func TestObserveNodeAllocationDoesNotTrustMachineFabricLabel(t *testing.T) {
 	require.False(t, apimeta.IsStatusConditionTrue(machine.Status.Conditions, unboundedv1alpha3.MachineConditionAllocationReady))
 }
 
+func TestReconcileMachineAvailabilityRequiresDomainAndImmutableIdentity(t *testing.T) {
+	t.Parallel()
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+			unboundedv1alpha3.MachineCapacityDomainLabelKey: "hillsboro-gb200",
+		}},
+		Spec: unboundedv1alpha3.MachineSpec{
+			Identity: &unboundedv1alpha3.MachineIdentity{
+				SerialNumber: "P570550270005039",
+				MACAddress:   "d0:f4:05:5e:0c:e7",
+			},
+		},
+	}
+
+	reconcileMachineAvailability(machine)
+	require.True(t, apimeta.IsStatusConditionTrue(
+		machine.Status.Conditions,
+		unboundedv1alpha3.MachineConditionAvailable,
+	))
+
+	machine.Spec.Identity = nil
+	reconcileMachineAvailability(machine)
+	require.False(t, apimeta.IsStatusConditionTrue(
+		machine.Status.Conditions,
+		unboundedv1alpha3.MachineConditionAvailable,
+	))
+	require.Equal(t, "ImmutableIdentityMissing", findCondition(
+		machine.Status.Conditions,
+		unboundedv1alpha3.MachineConditionAvailable,
+	).Reason)
+}
+
 // generateTestSSHKeyPEM creates a fresh RSA private key in PEM format for testing.
 // It uses generateTestRSAKey and marshalPrivateKeyPEM from ssh_integration_test.go.
 func generateTestSSHKeyPEM(t *testing.T) []byte {

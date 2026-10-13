@@ -88,7 +88,7 @@ type UnboundedNodeClassSpec struct {
 type ImagePolicy struct {
 	// RequiredImage is an exact OCI image reference.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=`^.+@sha256:[a-f0-9]{64}$`
+	// +kubebuilder:validation:MinLength=1
 	RequiredImage string `json:"requiredImage"`
 
 	// RequireNVIDIA requires NVIDIA worker support. Dedicated GB200 capacity
@@ -123,7 +123,8 @@ type InstanceType struct {
 	Zone string `json:"zone"`
 
 	// CapacityType is the Karpenter capacity type.
-	// +kubebuilder:default=on-demand
+	// Existing physical Machine inventory normally uses reserved.
+	// +kubebuilder:default=reserved
 	CapacityType string `json:"capacityType,omitempty"`
 
 	// GPU defines exact accelerator and health requirements.

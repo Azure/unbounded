@@ -4,6 +4,7 @@
 package v1alpha3
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -144,7 +145,13 @@ const (
 // MachineSpec defines the desired state of a Machine.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))",message="host ownership cannot be combined with legacy pxe, provider, or providerID fields"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.identity) || (has(self.identity) && self.identity == oldSelf.identity)",message="physical identity is immutable once set"
 type MachineSpec struct {
+	// Identity contains immutable physical host identity. Mutable routes such as
+	// DHCP addresses and rack-management slot IDs do not belong here.
+	// +optional
+	Identity *MachineIdentity `json:"identity,omitempty"`
+
 	// SSH contains the SSH connection and credential details for the
 	// machine.
 	// +optional
@@ -212,6 +219,19 @@ type ProviderMachineReference struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
+}
+
+// +kubebuilder:validation:XValidation:rule="(has(self.serialNumber) && size(self.serialNumber) > 0) || (has(self.macAddress) && size(self.macAddress) > 0)",message="serialNumber or macAddress is required"
+type MachineIdentity struct {
+	// SerialNumber is the immutable manufacturer serial number.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	SerialNumber string `json:"serialNumber,omitempty"`
+
+	// MACAddress is an immutable physical host MAC address.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`
+	MACAddress string `json:"macAddress,omitempty"`
 }
 
 // HostSpec contains desired host settings and its mutually exclusive owner.
@@ -774,17 +794,43 @@ type MachineStatus struct {
 // MachineReservationStatus records exclusive Karpenter NodeClaim ownership and
 // restart-safe release progress.
 type MachineReservationStatus struct {
-	NodeClaimName        string                         `json:"nodeClaimName"`
-	NodeClaimUID         types.UID                      `json:"nodeClaimUID"`
-	ProviderID           string                         `json:"providerID"`
-	Domain               string                         `json:"domain"`
-	NodeClassName        string                         `json:"nodeClassName"`
-	NodeClassGeneration  int64                          `json:"nodeClassGeneration"`
-	InstanceType         string                         `json:"instanceType"`
-	ConfigurationVersion int32                          `json:"configurationVersion"`
-	ImageID              string                         `json:"imageID"`
-	ReservedAt           metav1.Time                    `json:"reservedAt"`
-	ReleaseStage         MachineReservationReleaseStage `json:"releaseStage,omitempty"`
+	NodeClaimName        string    `json:"nodeClaimName"`
+	NodeClaimUID         types.UID `json:"nodeClaimUID"`
+	ProviderID           string    `json:"providerID"`
+	Domain               string    `json:"domain"`
+	NodeClassName        string    `json:"nodeClassName"`
+	NodeClassGeneration  int64     `json:"nodeClassGeneration"`
+	InstanceType         string    `json:"instanceType"`
+	ConfigurationName    string    `json:"configurationName"`
+	ConfigurationVersion int32     `json:"configurationVersion"`
+	ImageID              string    `json:"imageID"`
+	// +optional
+	Launch       *MachineLaunchSnapshot         `json:"launch,omitempty"`
+	ReservedAt   metav1.Time                    `json:"reservedAt"`
+	ReleaseStage MachineReservationReleaseStage `json:"releaseStage,omitempty"`
+}
+
+// MachineLaunchSnapshot contains immutable provider launch data used to
+// reconstruct a NodeClaim after restarts or NodeClass changes.
+type MachineLaunchSnapshot struct {
+	NodeName        string              `json:"nodeName"`
+	Architecture    string              `json:"architecture"`
+	OperatingSystem string              `json:"operatingSystem"`
+	Zone            string              `json:"zone"`
+	CapacityType    string              `json:"capacityType"`
+	Capacity        corev1.ResourceList `json:"capacity"`
+	Labels          map[string]string   `json:"labels,omitempty"`
+	Taints          []corev1.Taint      `json:"taints,omitempty"`
+	StartupTaints   []corev1.Taint      `json:"startupTaints,omitempty"`
+	RequireNVIDIA   bool                `json:"requireNVIDIA,omitempty"`
+	GPU             *MachineLaunchGPU   `json:"gpu,omitempty"`
+}
+
+type MachineLaunchGPU struct {
+	Vendor        string `json:"vendor"`
+	Model         string `json:"model"`
+	Count         int32  `json:"count"`
+	RequireFabric bool   `json:"requireFabric,omitempty"`
 }
 
 // +kubebuilder:validation:Enum=RevokeCredentials;ResetWorker;DeleteNode;ReleaseReservation

@@ -967,7 +967,7 @@ func applyCRDs(t *testing.T, kubeconfig, repoRoot string) {
 	}
 
 	if err := run(context.Background(), "kubectl", "--kubeconfig", kubeconfig, "wait", "--for=condition=established", "--timeout=60s",
-		"crd/"+machinaSiteCRD, "crd/"+capacityClaimCRD, "crd/"+machineCRDName, "crd/"+siteNodeSliceCRD, "crd/"+gatewayPoolCRDName, "crd/"+legacySiteCRD); err != nil {
+		"crd/"+machinaSiteCRD, "crd/"+machineCRDName, "crd/"+siteNodeSliceCRD, "crd/"+gatewayPoolCRDName, "crd/"+legacySiteCRD); err != nil {
 		t.Fatalf("kubectl wait for CRDs: %v", err)
 	}
 }

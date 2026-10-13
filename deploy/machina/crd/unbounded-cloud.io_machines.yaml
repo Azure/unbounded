@@ -566,6 +566,25 @@ spec:
                   rule: '!has(oldSelf.azure) || has(self.azure)'
                 - message: external host ownership is immutable once set
                   rule: '!has(oldSelf.external) || has(self.external)'
+              identity:
+                description: |-
+                  Identity contains immutable physical host identity. Mutable routes such as
+                  DHCP addresses and rack-management slot IDs do not belong here.
+                properties:
+                  macAddress:
+                    description: MACAddress is an immutable physical host MAC address.
+                    pattern: ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$
+                    type: string
+                  serialNumber:
+                    description: SerialNumber is the immutable manufacturer serial
+                      number.
+                    minLength: 1
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: serialNumber or macAddress is required
+                  rule: (has(self.serialNumber) && size(self.serialNumber) > 0) ||
+                    (has(self.macAddress) && size(self.macAddress) > 0)
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.
                 properties:
@@ -900,6 +919,9 @@ spec:
               rule: '!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure)
                 && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider)
                 && !has(self.providerID))'
+            - message: physical identity is immutable once set
+              rule: '!has(oldSelf.identity) || (has(self.identity) && self.identity
+                == oldSelf.identity)'
           status:
             description: MachineStatus defines the observed state of a Machine.
             properties:
@@ -1056,6 +1078,8 @@ spec:
                   Reservation records the Karpenter NodeClaim that exclusively owns this
                   Machine.
                 properties:
+                  configurationName:
+                    type: string
                   configurationVersion:
                     format: int32
                     type: integer
@@ -1065,6 +1089,121 @@ spec:
                     type: string
                   instanceType:
                     type: string
+                  launch:
+                    description: |-
+                      MachineLaunchSnapshot contains immutable provider launch data used to
+                      reconstruct a NodeClaim after restarts or NodeClass changes.
+                    properties:
+                      architecture:
+                        type: string
+                      capacity:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                      capacityType:
+                        type: string
+                      gpu:
+                        properties:
+                          count:
+                            format: int32
+                            type: integer
+                          model:
+                            type: string
+                          requireFabric:
+                            type: boolean
+                          vendor:
+                            type: string
+                        required:
+                        - count
+                        - model
+                        - vendor
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      nodeName:
+                        type: string
+                      operatingSystem:
+                        type: string
+                      requireNVIDIA:
+                        type: boolean
+                      startupTaints:
+                        items:
+                          description: |-
+                            The node this Taint is attached to has the "effect" on
+                            any pod that does not tolerate the Taint.
+                          properties:
+                            effect:
+                              description: |-
+                                Required. The effect of the taint on pods
+                                that do not tolerate the taint.
+                                Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                              type: string
+                            key:
+                              description: Required. The taint key to be applied to
+                                a node.
+                              type: string
+                            timeAdded:
+                              description: TimeAdded represents the time at which
+                                the taint was added.
+                              format: date-time
+                              type: string
+                            value:
+                              description: The taint value corresponding to the taint
+                                key.
+                              type: string
+                          required:
+                          - effect
+                          - key
+                          type: object
+                        type: array
+                      taints:
+                        items:
+                          description: |-
+                            The node this Taint is attached to has the "effect" on
+                            any pod that does not tolerate the Taint.
+                          properties:
+                            effect:
+                              description: |-
+                                Required. The effect of the taint on pods
+                                that do not tolerate the taint.
+                                Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                              type: string
+                            key:
+                              description: Required. The taint key to be applied to
+                                a node.
+                              type: string
+                            timeAdded:
+                              description: TimeAdded represents the time at which
+                                the taint was added.
+                              format: date-time
+                              type: string
+                            value:
+                              description: The taint value corresponding to the taint
+                                key.
+                              type: string
+                          required:
+                          - effect
+                          - key
+                          type: object
+                        type: array
+                      zone:
+                        type: string
+                    required:
+                    - architecture
+                    - capacity
+                    - capacityType
+                    - nodeName
+                    - operatingSystem
+                    - zone
+                    type: object
                   nodeClaimName:
                     type: string
                   nodeClaimUID:
@@ -1091,6 +1230,7 @@ spec:
                     format: date-time
                     type: string
                 required:
+                - configurationName
                 - configurationVersion
                 - domain
                 - imageID

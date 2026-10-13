@@ -28,6 +28,7 @@ func TestMachineProviderOwnershipSchema(t *testing.T) {
 	assertSchemaValidations(t, specSchema, map[string]string{
 		"!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)":                                                                                   "provider is immutable once set",
 		"!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))": "host ownership cannot be combined with legacy pxe, provider, or providerID fields",
+		"!has(oldSelf.identity) || (has(self.identity) && self.identity == oldSelf.identity)":                                                                                   "physical identity is immutable once set",
 	})
 
 	hostSchema := specSchema.Properties["host"]

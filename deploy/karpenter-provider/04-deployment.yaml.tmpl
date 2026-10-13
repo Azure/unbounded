@@ -40,7 +40,7 @@ spec:
                 resourceFieldRef:
                   containerName: controller
                   resource: limits.memory
-                  divisor: "0"
+                  divisor: "1"
             - name: FEATURE_GATES
               value: "StaticCapacity=false,SpotToSpotConsolidation=false,NodeRepair=false,CapacityBuffer=false,PodDeletionCostManagement=false"
           ports:

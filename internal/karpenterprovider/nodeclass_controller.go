@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/awslabs/operatorpkg/status"
@@ -27,8 +26,6 @@ import (
 type NodeClassReconciler struct {
 	client.Client
 }
-
-var immutableImagePattern = regexp.MustCompile(`^.+@sha256:[a-f0-9]{64}$`)
 
 func (r *NodeClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var nodeClass karpenterv1alpha1.UnboundedNodeClass
@@ -59,8 +56,8 @@ func (r *NodeClassReconciler) validate(ctx context.Context, nodeClass *karpenter
 		return errors.New("domain is required for durable mutation serialization")
 	}
 
-	if !immutableImagePattern.MatchString(nodeClass.Spec.ImagePolicy.RequiredImage) {
-		return errors.New("imagePolicy.requiredImage must be an immutable sha256 OCI digest")
+	if strings.TrimSpace(nodeClass.Spec.ImagePolicy.RequiredImage) == "" {
+		return errors.New("imagePolicy.requiredImage is required")
 	}
 
 	version, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, &nodeClass.Spec.ConfigurationRef)
@@ -99,14 +96,17 @@ func (r *NodeClassReconciler) validate(ctx context.Context, nodeClass *karpenter
 			continue
 		}
 
+		if !nodeClass.Spec.ImagePolicy.RequireNVIDIA {
+			return fmt.Errorf("instance type %q GPU capacity requires an NVIDIA image policy", instanceType.Name)
+		}
+
 		gpuQuantity := instanceType.Capacity[corev1.ResourceName("nvidia.com/gpu")]
 		if gpuQuantity.Value() != int64(instanceType.GPU.Count) {
 			return fmt.Errorf("instance type %q GPU capacity must equal policy count", instanceType.Name)
 		}
 
 		if strings.EqualFold(instanceType.GPU.Model, "GB200") {
-			if !nodeClass.Spec.ImagePolicy.RequireNVIDIA ||
-				!strings.EqualFold(instanceType.GPU.Vendor, "NVIDIA") ||
+			if !strings.EqualFold(instanceType.GPU.Vendor, "NVIDIA") ||
 				instanceType.GPU.Count != 4 ||
 				!instanceType.GPU.RequireFabric {
 				return fmt.Errorf("instance type %q GB200 profile requires NVIDIA image policy, exactly 4 GPUs, and fabric health", instanceType.Name)

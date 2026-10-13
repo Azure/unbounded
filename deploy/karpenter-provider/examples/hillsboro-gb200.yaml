@@ -1,3 +1,103 @@
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineConfiguration
+metadata:
+  name: hillsboro-gb200
+spec:
+  template:
+    agent:
+      image: ghcr.io/azure/agent-ubuntu2404-nvidia:v20260619
+    kubernetes:
+      nodeLabels:
+        unbounded-cloud.io/site: hillsboro
+        unbounded-cloud.io/gpu-vendor: NVIDIA
+        unbounded-cloud.io/gpu-model: GB200
+  updateStrategy:
+    type: OnDelete
+---
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: gb2002159d2427
+  labels:
+    unbounded-cloud.io/site: hillsboro
+    unbounded-cloud.io/capacity-domain: hillsboro-gb200
+    unbounded-cloud.io/hardware-class: gb200
+    unbounded-cloud.io/allocation-enabled: "true"
+    unbounded-cloud.io/gpu-vendor: NVIDIA
+    unbounded-cloud.io/gpu-model: GB200
+spec:
+  identity:
+    serialNumber: P472450920001039
+    macAddress: d0:f4:05:5f:a4:27
+  host:
+    external:
+      provider: HillsboroInventory
+      providerID: serial://P472450920001039
+---
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: gb2002159d2426
+  labels:
+    unbounded-cloud.io/site: hillsboro
+    unbounded-cloud.io/capacity-domain: hillsboro-gb200
+    unbounded-cloud.io/hardware-class: gb200
+    unbounded-cloud.io/allocation-enabled: "true"
+    unbounded-cloud.io/gpu-vendor: NVIDIA
+    unbounded-cloud.io/gpu-model: GB200
+spec:
+  identity:
+    serialNumber: P570550270005039
+    macAddress: d0:f4:05:5e:0c:e7
+  host:
+    external:
+      provider: HillsboroInventory
+      providerID: serial://P570550270005039
+---
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: gb2002159d2425
+  labels:
+    unbounded-cloud.io/site: hillsboro
+    unbounded-cloud.io/capacity-domain: hillsboro-gb200
+    unbounded-cloud.io/hardware-class: gb200
+    unbounded-cloud.io/allocation-enabled: "false"
+    unbounded-cloud.io/gpu-vendor: NVIDIA
+    unbounded-cloud.io/gpu-model: GB200
+  annotations:
+    unbounded-cloud.io/allocation-blocked-reason: active-serial-owner
+spec:
+  identity:
+    serialNumber: P472450920013039
+    macAddress: d0:f4:05:5f:9c:d7
+  host:
+    external:
+      provider: HillsboroInventory
+      providerID: serial://P472450920013039
+---
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: gb2002159d2424
+  labels:
+    unbounded-cloud.io/site: hillsboro
+    unbounded-cloud.io/capacity-domain: hillsboro-gb200
+    unbounded-cloud.io/hardware-class: gb200
+    unbounded-cloud.io/allocation-enabled: "false"
+    unbounded-cloud.io/gpu-vendor: NVIDIA
+    unbounded-cloud.io/gpu-model: GB200
+  annotations:
+    unbounded-cloud.io/allocation-blocked-reason: active-serial-owner-and-sudo-unavailable
+spec:
+  identity:
+    serialNumber: P570550270027039
+    macAddress: d0:f4:05:5e:0b:37
+  host:
+    external:
+      provider: HillsboroInventory
+      providerID: serial://P570550270027039
+---
 apiVersion: karpenter.unbounded-cloud.io/v1alpha1
 kind: UnboundedNodeClass
 metadata:
@@ -5,6 +105,8 @@ metadata:
 spec:
   machineSelector:
     matchLabels:
+      unbounded-cloud.io/hardware-class: gb200
+      unbounded-cloud.io/allocation-enabled: "true"
       unbounded-cloud.io/gpu-vendor: NVIDIA
       unbounded-cloud.io/gpu-model: GB200
   site: hillsboro
@@ -12,14 +114,14 @@ spec:
   configurationRef:
     name: hillsboro-gb200
   imagePolicy:
-    requiredImage: ghcr.io/example/unbounded-worker-nvidia@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    requiredImage: ghcr.io/azure/agent-ubuntu2404-nvidia:v20260619
     requireNVIDIA: true
   instanceTypes:
     - name: hillsboro-gb200-4g
       architecture: arm64
       operatingSystem: linux
       zone: hillsboro
-      capacityType: on-demand
+      capacityType: reserved
       capacity:
         cpu: "80"
         memory: 512Gi
@@ -37,6 +139,9 @@ metadata:
   name: hillsboro-gb200
 spec:
   template:
+    metadata:
+      labels:
+        unbounded-cloud.io/site: hillsboro
     spec:
       nodeClassRef:
         group: karpenter.unbounded-cloud.io
@@ -51,7 +156,7 @@ spec:
           values: [arm64]
         - key: karpenter.sh/capacity-type
           operator: In
-          values: [on-demand]
+          values: [reserved]
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 5m

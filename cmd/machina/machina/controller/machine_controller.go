@@ -915,6 +915,8 @@ func clearNodeAllocation(machine *unboundedv1alpha3.Machine) {
 		unboundedv1alpha3.MachineConditionAllocationReady,
 	)
 	if machine.Status.Allocation == nil && allocationReady == nil {
+		reconcileMachineAvailability(machine)
+
 		return
 	}
 
@@ -931,16 +933,7 @@ func clearNodeAllocation(machine *unboundedv1alpha3.Machine) {
 		return
 	}
 
-	available := apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionAvailable)
-	if available != nil && available.Status == metav1.ConditionTrue && available.Reason == "Observed" {
-		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-			Type:               unboundedv1alpha3.MachineConditionAvailable,
-			Status:             metav1.ConditionFalse,
-			Reason:             "NodeObservationCleared",
-			Message:            "Node-derived availability was cleared with stale observations",
-			ObservedGeneration: machine.Generation,
-		})
-	}
+	reconcileMachineAvailability(machine)
 }
 
 func observeNodeAllocation(machine *unboundedv1alpha3.Machine, node *corev1.Node) {
@@ -1036,6 +1029,56 @@ func observeNodeAllocation(machine *unboundedv1alpha3.Machine, node *corev1.Node
 			ObservedGeneration: machine.Generation,
 		})
 	}
+
+	reconcileMachineAvailability(machine)
+}
+
+func reconcileMachineAvailability(machine *unboundedv1alpha3.Machine) {
+	status := metav1.ConditionTrue
+	reason := "InventoryReady"
+	message := "Machine has immutable identity and is available for Karpenter reservation"
+
+	switch {
+	case machine.Status.Reservation != nil:
+		status = metav1.ConditionFalse
+		reason = "Reserved"
+		message = fmt.Sprintf("Machine is reserved by Karpenter NodeClaim %s", machine.Status.Reservation.NodeClaimName)
+	case apimeta.IsStatusConditionTrue(machine.Status.Conditions, unboundedv1alpha3.MachineConditionQuarantined):
+		status = metav1.ConditionFalse
+		reason = "Quarantined"
+		message = "Machine is quarantined"
+	case machine.Labels[unboundedv1alpha3.MachineCapacityDomainLabelKey] == "":
+		status = metav1.ConditionFalse
+		reason = "CapacityDomainMissing"
+		message = "Machine has no capacity-domain label"
+	case !hasImmutableMachineIdentity(machine):
+		status = metav1.ConditionFalse
+		reason = "ImmutableIdentityMissing"
+		message = "Machine has no immutable physical identity or immutable provider reference"
+	}
+
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               unboundedv1alpha3.MachineConditionAvailable,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: machine.Generation,
+	})
+}
+
+func hasImmutableMachineIdentity(machine *unboundedv1alpha3.Machine) bool {
+	if machine.Spec.Identity != nil &&
+		(strings.TrimSpace(machine.Spec.Identity.SerialNumber) != "" ||
+			strings.TrimSpace(machine.Spec.Identity.MACAddress) != "") {
+		return true
+	}
+
+	if machine.Spec.Host == nil {
+		return false
+	}
+
+	return machine.Spec.Host.Azure != nil ||
+		(machine.Spec.Host.External != nil && machine.Spec.Host.External.MachineRef != nil)
 }
 
 func firstNonEmpty(values ...string) string {

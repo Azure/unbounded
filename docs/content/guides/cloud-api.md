@@ -52,6 +52,10 @@ the currently launched worker. NVIDIA requirements use an exact
 matching an image name that merely contains `nvidia` is not capability
 evidence.
 
+Pre-existing Machine inventory is advertised through Karpenter's standard
+`reserved` capacity type. Reservation capacity is the count of unreserved
+Machines matching the NodeClass and instance profile.
+
 The provider uses upstream Karpenter v1.15.0 controllers and requires the
 upstream NodePool and NodeClaim CRDs to be installed separately. The provider's
 southbound provision and release handlers currently fail closed until they are

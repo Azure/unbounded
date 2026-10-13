@@ -26,7 +26,10 @@ calling `operator.NewOperator`.
 
 The provider exposes every instance capacity declared by an
 `UnboundedNodeClass`, including types with no free offering. Availability and
-reservation capacity reflect unreserved matching Machine inventory.
+reserved-capacity counts reflect unreserved matching Machine inventory. The
+Hillsboro profile uses Karpenter's standard `reserved` capacity type because
+the provider allocates pre-existing physical hosts rather than buying new
+on-demand capacity.
 
 Create performs these steps:
 
@@ -34,8 +37,10 @@ Create performs these steps:
 2. Resolve the referenced `MachineConfiguration` version and exact worker
    image.
 3. Select a compatible instance type and list matching Machine inventory.
-4. Require `Available=True`, `AllocationReady=True`, no reservation, and
-   `Quarantined!=True`. Machine phase is never allocation authorization.
+4. Require `Available=True`, no reservation, and `Quarantined!=True`.
+   `Available` is derived from immutable identity, a capacity domain, and
+   reservation/quarantine state. Machine phase is never allocation
+   authorization.
 5. Derive `unbounded://<sha256>` from immutable host ownership fields.
 6. Acquire the per-domain Kubernetes Lease and reserve exactly one Machine
    with a conflict-safe status update keyed by NodeClaim UID.
@@ -47,23 +52,24 @@ Create performs these steps:
 
 Reservations are durable and contain NodeClaim name and UID, provider ID,
 domain, NodeClass generation, selected instance type, configuration version,
-image ID, reservation time, and release stage. Get and List reconstruct
-NodeClaims from this state after process restarts.
+image ID, resolved labels and taints, capacity, GPU policy, reservation time,
+and release stage. Get and List reconstruct NodeClaims from this immutable
+launch snapshot after process restarts or NodeClass changes.
 
 ## Identity
 
 Provider identity may derive from:
 
+- typed immutable physical serial and MAC identity;
 - Azure resource ID;
-- an external provider Machine reference;
-- an external or legacy provider ID;
-- sorted netboot MAC addresses when no richer immutable owner exists.
+- an immutable external provider Machine reference.
 
 DHCP addresses, SSH endpoints, Node InternalIP, and mutable Rack-SCM server IDs
-are observations or routes, never identity. Create fails closed if no immutable
-host identity is available. Kubelet receives the reservation provider ID
-through `--provider-id`, and the provider requires the resulting
-`Node.spec.providerID` to match exactly.
+are observations or routes, never identity. Mutable external provider IDs and
+netboot lease data are also excluded from provider identity. Create fails
+closed if no immutable host identity is available. Kubelet receives the
+reservation provider ID through `--provider-id`, and the provider requires the
+resulting `Node.spec.providerID` to match exactly.
 
 ## GB200 policy
 
@@ -109,8 +115,9 @@ does not copy the upstream NodePool or NodeClaim CRDs. Then install:
 - an UnboundedNodeClass and NodePool, such as
   `deploy/karpenter-provider/examples/hillsboro-gb200.yaml`.
 
-The example contains no credentials, DHCP identity, or Rack-SCM identity.
-Replace its image placeholder with an approved immutable digest.
+The example contains no credentials, DHCP identity, or Rack-SCM identity. It
+uses the approved Hillsboro NVIDIA worker image and marks gb200-3 and gb200-4
+allocation-disabled until their operator-session gates are cleared.
 
 ## Upgrade and rollback
 
