@@ -1408,6 +1408,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn native_slot_quota_includes_aligned_staging_and_registration() {
+            assert_eq!(crate::model::PAGE_BYTES, 4 * 1024 * 1024);
+            assert_eq!(MAX_CIPHERTEXT, 16 * 1024 * 1024 + 16);
             for (length, expected) in [
                 (1, 8192),
                 (4096, 8192),

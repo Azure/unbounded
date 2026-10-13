@@ -500,7 +500,7 @@ pub const PROFILE: &str = "racer-peer-v5";
 /// Maximum ordinary canonical field or head.
 pub const MAX_HEAD: usize = 64 * 1024;
 /// Maximum opaque payload admitted by this wire profile, including the AEAD tag.
-pub const MAX_BODY: usize = 16 * 1024 * 1024 + 16;
+pub const MAX_BODY: usize = 4 * 1024 * 1024 + 16;
 
 /// Reject noncanonical UUID spelling at the trust boundary.
 pub fn uuid(value: &str) -> Result<()> {

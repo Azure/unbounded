@@ -114,6 +114,39 @@ mod tests {
     }
 
     #[test]
+    fn four_mib_pages_shape_one_gib_and_reject_old_sixteen_mib_envelopes() {
+        assert_eq!(PAGE_BYTES, 4 * 1024 * 1024);
+        let descriptor = descriptor("v1", 1024 * 1024 * 1024);
+        let range = ByteRange::From(0).resolve(descriptor.length).unwrap();
+        assert_eq!(range.first_page(), PageNumber(0));
+        assert_eq!(range.last_page(), PageNumber(255));
+        let mut envelope = PageEnvelope {
+            page: PageId {
+                version: descriptor.version.clone(),
+                number: PageNumber(255),
+            },
+            key_id: KeyId([0; 16]),
+            nonce: Nonce([0; 24]),
+            plaintext_length: PAGE_BYTES as u32,
+            ciphertext_length: PAGE_BYTES as u32 + AEAD_TAG_BYTES,
+        };
+        assert_eq!(descriptor.validate_page(&envelope), Ok(()));
+        envelope.page.number = PageNumber(256);
+        assert_eq!(
+            descriptor.validate_page(&envelope),
+            Err(racer_object_wire::Error::CorruptRecord)
+        );
+        envelope.page.number = PageNumber(0);
+        envelope.plaintext_length = 16 * 1024 * 1024;
+        envelope.ciphertext_length = envelope.plaintext_length + AEAD_TAG_BYTES;
+        assert_eq!(envelope.validate(), Err(Error::CorruptRecord));
+        assert_eq!(
+            descriptor.validate_page(&envelope),
+            Err(racer_object_wire::Error::CorruptRecord)
+        );
+    }
+
+    #[test]
     fn envelope_enforces_nonempty_bounded_plaintext_and_exact_tag_length() {
         let mut envelope = PageEnvelope {
             page: PageId {

@@ -1399,7 +1399,7 @@ mod tests {
         for (name, value) in [
             ("RACER_SEGMENT_BYTES", "0"),
             ("RACER_SLAB_BYTES", "0"),
-            ("RACER_SEGMENT_BYTES", "16777216"),
+            ("RACER_SEGMENT_BYTES", "4194304"),
             ("RACER_SLAB_BYTES", "1073741825"),
             ("RACER_FREE_SEGMENT_RESERVE", "0"),
             ("RACER_FREE_SEGMENT_RESERVE", "16"),
@@ -1413,9 +1413,9 @@ mod tests {
     #[test]
     fn budgets_require_page_window_and_control_progress() {
         for (name, value) in [
-            ("RACER_PLAINTEXT_BYTES", "16777216"),
-            ("RACER_CIPHERTEXT_BYTES", "16777216"),
-            ("RACER_DIRTY_BYTES", "16777216"),
+            ("RACER_PLAINTEXT_BYTES", "4194304"),
+            ("RACER_CIPHERTEXT_BYTES", "4194304"),
+            ("RACER_DIRTY_BYTES", "4194304"),
             ("RACER_REQUEST_CONTEXT_BYTES", "32768"),
             ("RACER_QUEUE_ENTRIES", "1"),
             ("RACER_RETAINED_SNAPSHOTS", "1"),
@@ -1423,7 +1423,7 @@ mod tests {
             ("RACER_HEADER_BYTES", "1023"),
             ("RACER_FLIGHTS", "0"),
             ("RACER_PIPES", "65537"),
-            ("RACER_RANGE_WINDOW_PAGES", "16"),
+            ("RACER_RANGE_WINDOW_PAGES", "64"),
             ("RACER_PLAINTEXT_BYTES", "18446744073709551615"),
             ("RACER_CONNECTIONS_PER_NEIGHBOR", "129"),
         ] {
@@ -1439,7 +1439,7 @@ mod tests {
         assert!(
             parse(&[
                 ("RACER_ENABLE_RDMA", "true"),
-                ("RACER_REGISTERED_BYTES", "16777216")
+                ("RACER_REGISTERED_BYTES", "4194304")
             ])
             .is_err()
         );

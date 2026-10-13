@@ -2540,7 +2540,7 @@ pub(crate) mod tests {
                         f.scope.deadline.0 = Instant::now() + Duration::from_millis(40);
                     }
                     let (mut source, destination, writer, reader) =
-                        f.connections(16 * 1024 * 1024 + 16);
+                        f.connections(crate::model::PAGE_BYTES as usize + 16);
                     let metrics = crate::telemetry::Metrics::default();
                     let gate = crate::peer::receive::Gate::with_metrics(
                         crate::peer::receive::Config {
@@ -2557,7 +2557,8 @@ pub(crate) mod tests {
                     let producer = if writing {
                         let mut writer = held_writer.take().unwrap();
                         Some(std::thread::spawn(move || {
-                            let _ = writer.write_all(&vec![91; 16 * 1024 * 1024 + 16]);
+                            let _ =
+                                writer.write_all(&vec![91; crate::model::PAGE_BYTES as usize + 16]);
                         }))
                     } else {
                         None
@@ -2679,7 +2680,7 @@ pub(crate) mod tests {
         fn tcp_backpressure_recovers_and_wakes_queued_pipe_owner_without_losing_frame() {
             use std::os::fd::AsRawFd;
             let f = Fixture::new();
-            let length = 16 * 1024 * 1024 + 16;
+            let length = crate::model::PAGE_BYTES as usize + 16;
             let (source, destination, mut writer, mut reader) = f.connections(length);
             let size: libc::c_int = 64 * 1024;
             // SAFETY: live TCP descriptor and correctly sized option storage.

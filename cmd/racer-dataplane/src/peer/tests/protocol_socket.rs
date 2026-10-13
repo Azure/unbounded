@@ -396,7 +396,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         reactor,
         Codec::new(65536),
         admission.clone(),
-        16777232,
+        crate::model::PAGE_BYTES + 16,
     ));
     let calls = Rc::new(Cell::new(0));
     let server = server::PeerServer::for_test(

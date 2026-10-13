@@ -580,8 +580,8 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
 fn optional_persistence_headroom_preserves_one_page_and_half_budget() {
     use crate::read::fill::optional_headroom;
     let page = PAGE_BYTES as usize + 16;
-    assert!(optional_headroom(25 * 1024 * 1024, 0, page, page));
-    assert!(!optional_headroom(25 * 1024 * 1024, page, page, page));
+    assert!(optional_headroom(page + page / 2, 0, page, page));
+    assert!(!optional_headroom(page + page / 2, page, page, page));
     assert!(optional_headroom(page, 0, page, page));
     assert!(!optional_headroom(page - 1, 0, page, page));
     assert!(optional_headroom(19, 0, 19, page));
@@ -1079,12 +1079,14 @@ fn second_sight_completed_flight_and_current_ownership_promote_verified_copy() {
 fn network_plaintext_rechecks_pressure_cleared_after_rejection() {
     for (shrink, exhausted) in [(true, false), (false, false), (true, true), (false, true)] {
         let mut limits = crate::test_support::cluster::config(false).limits;
-        limits.plaintext_bytes = std::num::NonZeroUsize::new(858_993_459).unwrap();
+        let base_bytes = 50 * PAGE_BYTES as usize;
+        limits.plaintext_bytes =
+            std::num::NonZeroUsize::new(base_bytes + PAGE_BYTES as usize + 1024).unwrap();
         let f = fixture_with(3, Some(limits));
         let admission = &f.fill.dependencies.admission;
         let cache = &f.context.object.cache;
         let base = admission
-            .reserve(Some(cache), ResourceClass::Plaintext, 831_918_590)
+            .reserve(Some(cache), ResourceClass::Plaintext, base_bytes)
             .unwrap();
         let mut page = Some(
             admission
@@ -1110,7 +1112,10 @@ fn network_plaintext_rechecks_pressure_cleared_after_rejection() {
                     .map_err(Error::from);
                 if attempts == 1 + usize::from(exhausted) {
                     assert!(matches!(result, Err(Error::Overloaded)));
-                    assert_eq!(admission.used(ResourceClass::Plaintext), 848_695_806);
+                    assert_eq!(
+                        admission.used(ResourceClass::Plaintext),
+                        base_bytes + PAGE_BYTES as usize
+                    );
                     // Deterministically model a remote completion after the real
                     // admission rejection, before the caller checks reclamation.
                     if shrink {
@@ -1135,7 +1140,7 @@ fn network_plaintext_rechecks_pressure_cleared_after_rejection() {
         assert_eq!(result.as_ref().unwrap().amount(), PAGE_BYTES as usize);
         assert_eq!(
             admission.used(ResourceClass::Plaintext),
-            831_918_590 + PAGE_BYTES as usize + if shrink { 681 } else { 0 }
+            base_bytes + PAGE_BYTES as usize + if shrink { 681 } else { 0 }
         );
         drop((result, page, base));
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -1209,9 +1214,9 @@ fn network_plaintext_cleared_pressure_retry_is_bounded_and_reports_latest_failur
     let mut out = String::new();
     failures.write_protected(true, &mut out).unwrap();
     assert!(out.contains("total=1 retained=1"), "{out}");
-    assert!(out.contains("used: 33554432"), "{out}");
-    assert!(out.contains("cache_used: Some(33554432)"), "{out}");
-    assert!(!out.contains("16777217"), "{out}");
+    assert!(out.contains("used: 8388608"), "{out}");
+    assert!(out.contains("cache_used: Some(8388608)"), "{out}");
+    assert!(!out.contains("4194305"), "{out}");
 }
 
 #[test]
@@ -1305,7 +1310,9 @@ fn network_plaintext_impossible_capacity_still_terminates_without_scanning() {
 #[test]
 fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
     let mut limits = crate::test_support::cluster::config(false).limits;
-    limits.plaintext_bytes = std::num::NonZeroUsize::new(858_993_459).unwrap();
+    let pressure_bytes = 50 * PAGE_BYTES as usize;
+    limits.plaintext_bytes =
+        std::num::NonZeroUsize::new(pressure_bytes + PAGE_BYTES as usize + 1024 * 1024).unwrap();
     limits.metadata_entries = std::num::NonZeroUsize::new(819).unwrap();
     let f = fixture_with(3, Some(limits));
     let admission = &f.fill.dependencies.admission;
@@ -1378,25 +1385,30 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
         }
     }
     let pressure = admission
-        .reserve(None, ResourceClass::Plaintext, 828_901_886)
+        .reserve(None, ResourceClass::Plaintext, pressure_bytes)
         .unwrap();
-    assert_eq!(admission.used(ResourceClass::Plaintext), 846_203_390);
+    assert_eq!(
+        admission.used(ResourceClass::Plaintext),
+        pressure_bytes + PAGE_BYTES as usize + 512 * 1024
+    );
     let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&f.scope, &f.page));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(reserve.as_mut().poll(&mut cx).is_pending());
     assert!(reserve.as_mut().poll(&mut cx).is_pending());
     {
-        // Match the captured final failure exactly, then prove the capacity was
-        // available in an idle entry beyond the two visited batches.
-        assert_eq!(admission.used(ResourceClass::Plaintext), 845_679_102);
+        // The capacity is in an idle entry beyond the two visited batches.
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            pressure_bytes + PAGE_BYTES as usize
+        );
         assert_eq!(
             admission.limit(ResourceClass::Plaintext) - admission.used(ResourceClass::Plaintext),
-            13_314_357
+            1024 * 1024
         );
         for id in &tiny {
             assert!(cache.get(id).unwrap().is_none());
         }
-        assert_eq!(pressure.amount(), 828_901_886);
+        assert_eq!(pressure.amount(), pressure_bytes);
     }
     assert!(reserve.as_mut().poll(&mut cx).is_pending());
     let Poll::Ready(Ok(result)) = reserve.as_mut().poll(&mut cx) else {
@@ -1404,7 +1416,7 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
     };
     assert_eq!(result.amount(), PAGE_BYTES as usize);
     assert!(cache.get(large.as_ref().unwrap()).unwrap().is_none());
-    assert_eq!(pressure.amount(), 828_901_886);
+    assert_eq!(pressure.amount(), pressure_bytes);
     assert_eq!(f.origin.calls.get(), 0);
 }
 
@@ -1688,7 +1700,7 @@ fn final_fill_diagnostic_reports_exhaustion_not_recovered_or_optional_reserves()
     assert!(text.contains("worker=7"));
     assert!(text.contains("site=Some(NetworkPlaintext) page=Some(0)"));
     assert!(text.contains("class: Plaintext"));
-    assert!(text.contains("requested: 16777216"));
+    assert!(text.contains("requested: 4194304"));
     assert!(!text.contains("request=none"));
     drop(pressure);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
@@ -4318,8 +4330,10 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for disk in [true, false] {
-        for free in [13_109_248usize, 13_109_247, PAGE_BYTES as usize] {
-            let mut f = local_tail_fixture(63_440_896, disk);
+        let tail = PAGE_BYTES as usize / 2 + 1024;
+        let total = 3 * PAGE_BYTES + tail as u64;
+        for free in [tail, tail - 1, PAGE_BYTES as usize] {
+            let mut f = local_tail_fixture(total, disk);
             let admission = f.fill.dependencies.admission.clone();
             let pressure = admission
                 .reserve(
@@ -4334,7 +4348,7 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
                 &mut f.engine,
                 &f.crypto,
             );
-            if free == 13_109_247 {
+            if free == tail - 1 {
                 assert!(matches!(result, Err(Error::Overloaded)));
             } else {
                 let Some(crate::memory::AcquiredPage::Plaintext(page)) =
@@ -4342,12 +4356,12 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
                 else {
                     panic!("local plaintext required")
                 };
-                assert_eq!(page.plaintext.bytes().len(), 13_109_248);
+                assert_eq!(page.plaintext.bytes().len(), tail);
                 assert!(page.plaintext.bytes().iter().all(|&b| b == 3));
-                assert_eq!(page.metadata.length, 63_440_896);
+                assert_eq!(page.metadata.length, total);
                 assert_eq!(
                     admission.used(ResourceClass::Plaintext),
-                    pressure.amount() + 13_109_248
+                    pressure.amount() + tail
                 );
             }
             assert_eq!(f.origin.calls.get(), 0);
@@ -5049,7 +5063,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
-    limits.plaintext_bytes = std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap();
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(32 * PAGE_BYTES as usize).unwrap();
     limits.ciphertext_bytes = limits.plaintext_bytes;
     limits.metadata_entries = std::num::NonZeroUsize::new(64).unwrap();
     let mut f = fixture_with(PAGE_BYTES, Some(limits));
@@ -5209,7 +5223,10 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     );
     let mut diagnostics = String::new();
     failures.write(&mut diagnostics).unwrap();
-    assert!(diagnostics.contains("requested: 33554960"), "{diagnostics}");
+    assert!(
+        diagnostics.contains(&format!("requested: {}", 2 * PAGE_BYTES + 528)),
+        "{diagnostics}"
+    );
     drop((read, copy, busy));
     deps.memory.evict_idle(usize::MAX).unwrap();
     deps.writer.slabs().reclaim_idle();

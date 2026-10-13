@@ -1204,7 +1204,7 @@ mod fidelity {
 
     #[test]
     fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
-        assert_eq!((PLAIN, CIPHER), (16 * 1024 * 1024, 16 * 1024 * 1024 + 16));
+        assert_eq!((PLAIN, CIPHER), (4 * 1024 * 1024, 4 * 1024 * 1024 + 16));
         let model = admission(2);
         let real = admission(2);
         let cache = CacheId(crate::test_support::security::CACHE.into());

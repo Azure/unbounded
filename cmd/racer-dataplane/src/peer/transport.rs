@@ -2395,7 +2395,11 @@ mod tests {
         for (class, amount, requested) in [
             (ResourceClass::Plaintext, length, length),
             (ResourceClass::Ciphertext, length - 1, length),
-            (ResourceClass::Ciphertext, (16 << 20) + 17, (16 << 20) + 17),
+            (
+                ResourceClass::Ciphertext,
+                peer_wire::MAX_BODY + 1,
+                peer_wire::MAX_BODY + 1,
+            ),
         ] {
             let reservation = admission.reserve(None, class, amount).unwrap();
             assert!(WireBuffer::reserved(reservation, requested).is_err());
@@ -2404,7 +2408,7 @@ mod tests {
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         }
         assert!(matches!(
-            WireBuffer::new(&admission, (16 << 20) + 17),
+            WireBuffer::new(&admission, peer_wire::MAX_BODY + 1),
             Err(Error::InvalidRequest)
         ));
         assert!(matches!(
@@ -2450,7 +2454,11 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
         const ITERATIONS: usize = 128;
-        for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
+        for length in [
+            1 << 20,
+            crate::model::PAGE_BYTES as usize,
+            peer_wire::MAX_BODY,
+        ] {
             for reserved in [false, true] {
                 let admission = flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,

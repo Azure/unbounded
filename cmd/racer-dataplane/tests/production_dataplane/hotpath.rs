@@ -345,7 +345,7 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
     use std::io::BufRead;
     write!(
         client.get_mut(),
-        "POST /v2/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n"
+        "POST /v2/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 4194304\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-4194303\r\nConnection: close\r\n\r\n"
     )?;
     let mut head = String::new();
     loop {
@@ -949,7 +949,7 @@ fn memory_envelope_scales_with_workers_and_retains_headroom() {
     assert!(four > one);
     assert!(one_required >= 16 << 30);
     assert_eq!(four_required, four * 2);
-    assert_eq!(four, 12416 * MIB + 4 * 16);
+    assert_eq!(four, 11328 * MIB + 4 * (17 * P + 16));
     for workers in [5, 16, 128, 256] {
         let slab = slab_bytes(workers);
         assert!(device_bytes(workers, slab) >= slab * workers as u64 + 1024 * MIB);

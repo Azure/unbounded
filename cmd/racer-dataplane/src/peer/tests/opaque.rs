@@ -1154,7 +1154,7 @@ impl RelayFixture {
             .map(|i| (i % 251) as u8)
             .collect();
         let body = seal_fixture(&[8; 24], &plaintext);
-        assert_eq!(body.len(), 16 * 1024 * 1024 + 16);
+        assert_eq!(body.len(), crate::model::PAGE_BYTES as usize + 16);
         let metadata = ObjectMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -1482,7 +1482,7 @@ fn opaque_relay_benchmark() {
         let (wall, cpu) = exchange(materialized, false, 8, false, false);
         eprintln!(
             "materialized={materialized} bytes={} wall_ms={:.3} cpu_ms={:.3}",
-            8 * (16 * 1024 * 1024 + 16),
+            8 * (crate::model::PAGE_BYTES + 16),
             wall.as_secs_f64() * 1000.0,
             cpu.as_secs_f64() * 1000.0
         );

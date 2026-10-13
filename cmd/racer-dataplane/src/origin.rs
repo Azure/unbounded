@@ -126,7 +126,8 @@ impl OriginClient {
         scope.check()?;
         self.validate_reservation(&reservation, context)?;
         let mut head = request(context, "GET")?;
-        head.headers.push(Header::new("Range", b"bytes=0-16777215"));
+        head.headers
+            .push(Header::new("Range", format!("bytes=0-{}", PAGE_BYTES - 1)));
         let connection = self
             .pool
             .checkout_wait(endpoint, scope)

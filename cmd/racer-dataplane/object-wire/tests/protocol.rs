@@ -128,7 +128,7 @@ fn response_heads_and_frame_vectors_are_exact() {
     );
     assert_eq!(
         subscription.unique("Racer-Range-Start").unwrap(),
-        Some(b"16777215".as_slice())
+        Some(b"4194303".as_slice())
     );
     assert!(client::success_head(&metadata, Some(range)).is_err());
     assert!(client::subscription_head(&metadata, None).is_err());
@@ -227,7 +227,7 @@ fn portable_fixture_serves_pages_and_missing_pins() {
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let pin = if pinned { "If-Match: \"v1\"\r\n" } else { "" };
-        write!(stream, "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes=0-16777215\r\n{pin}\r\n", metadata.version.object.key.to_hex()).unwrap();
+        write!(stream, "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes=0-4194303\r\n{pin}\r\n", metadata.version.object.key.to_hex()).unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
         let (head, used) = http1::Codec::<()>::new(32768)

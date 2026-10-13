@@ -50,7 +50,7 @@ use std::time::UNIX_EPOCH;
 use uring_runtime::reactor::IoBuffer;
 
 const LIMIT: usize = 32768;
-const P: u64 = 16777216;
+const P: u64 = racer_dataplane::model::PAGE_BYTES;
 const MAX: u64 = 9223372036854775807;
 
 struct Rig {
@@ -263,12 +263,12 @@ fn raw_uds_all_singletons_reject_identical_case_insensitive_repeats() {
         ("Content-Range", "bytes 0-1/2"),
         ("ETag", "\"v\""),
         ("If-Match", "\"v\""),
-        ("Range", "bytes=0-16777215"),
+        ("Range", "bytes=0-4194303"),
         ("Racer-Expires-At", "0"),
         ("Racer-Metadata", "opaque"),
         ("Authorization", "opaque"),
         ("Racer-Page-Credits", "1"),
-        ("Racer-Byte-Credits", "16777216"),
+        ("Racer-Byte-Credits", "4194304"),
         ("Racer-Ordered", "1"),
     ] {
         let fields = format!(
@@ -548,11 +548,11 @@ fn raw_uds_origin_bootstrap_and_aligned_final_page() {
         number: PageNumber(1),
     };
     for (status, range, tag, length, valid) in [
-        (206, "bytes 16777216-16777218/16777219", "\"v\"", 3, true),
-        (200, "bytes 16777216-16777218/16777219", "\"v\"", 3, false),
-        (206, "bytes 16777217-16777218/16777219", "\"v\"", 2, false),
-        (206, "bytes 16777216-16777217/16777219", "\"v\"", 2, false),
-        (206, "bytes 16777216-16777218/16777219", "\"new\"", 3, false),
+        (206, "bytes 4194304-4194306/4194307", "\"v\"", 3, true),
+        (200, "bytes 4194304-4194306/4194307", "\"v\"", 3, false),
+        (206, "bytes 4194305-4194306/4194307", "\"v\"", 2, false),
+        (206, "bytes 4194304-4194305/4194307", "\"v\"", 2, false),
+        (206, "bytes 4194304-4194306/4194307", "\"new\"", 3, false),
     ] {
         let raw = format!("HTTP/1.1 {status} Result\r\nContent-Length: {length}\r\nContent-Type: application/octet-stream\r\nContent-Range: {range}\r\nETag: {tag}\r\nRacer-Expires-At: 0\r\n\r\n").into_bytes();
         let head = raw_response(raw, "GET").unwrap();
@@ -746,7 +746,7 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
                 } else if is_head {
                     b""
                 } else {
-                    b"Content-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n"
+                    b"Content-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 4194304\r\nRacer-Ordered: 1\r\n"
                 },
             ))
             .unwrap();
@@ -1273,14 +1273,14 @@ mod sdk {
             (
                 0,
                 "GET",
-                "Range: bytes=0-16777215\r\n",
+                "Range: bytes=0-4194303\r\n",
                 206,
                 Some(b"abc".as_slice()),
             ),
             (
                 1,
                 "GET",
-                "Range: bytes=0-16777215\r\n",
+                "Range: bytes=0-4194303\r\n",
                 200,
                 Some(b"".as_slice()),
             ),
@@ -1322,14 +1322,14 @@ mod sdk {
             (
                 0,
                 "GET",
-                "If-Match: \"v\"\r\nRange: bytes=0-16777216\r\n",
+                "If-Match: \"v\"\r\nRange: bytes=0-4194304\r\n",
                 400,
                 Some(b"".as_slice()),
             ),
             (
                 0,
                 "GET",
-                "If-Match: \"v\"\r\nRange: bytes=16777216-33554431\r\n",
+                "If-Match: \"v\"\r\nRange: bytes=4194304-8388607\r\n",
                 416,
                 Some(b"".as_slice()),
             ),
@@ -1346,8 +1346,8 @@ mod sdk {
             (5, "HEAD", "If-Match: \"v\"\r\n", 401, Some(b"".as_slice())),
             (6, "HEAD", "If-Match: \"v\"\r\n", 403, Some(b"".as_slice())),
             (7, "HEAD", "If-Match: \"v\"\r\n", 503, Some(b"".as_slice())),
-            (2, "GET", "Range: bytes=0-16777215\r\n", 206, None),
-            (3, "GET", "Range: bytes=0-16777215\r\n", 206, None),
+            (2, "GET", "Range: bytes=0-4194303\r\n", 206, None),
+            (3, "GET", "Range: bytes=0-4194303\r\n", 206, None),
         ] {
             let mut stream = UnixStream::connect(socket).unwrap();
             stream
@@ -1448,7 +1448,7 @@ fn raw_uds_fixed_body_is_not_scanned_for_heads_and_short_eof_is_failure() {
         let result: Result<Vec<u8>> = rig.drive(async {
             let scope = scope();
             let (head, _) = Codec::new(LIMIT)
-                .decode_head(&request("GET", b"Range: bytes=0-16777215\r\n"))
+                .decode_head(&request("GET", b"Range: bytes=0-4194303\r\n"))
                 .unwrap()
                 .unwrap();
             let sent = rig.io.send_head(rig.lease(local), head, &scope).await?;

@@ -147,7 +147,7 @@ pub struct PageId {
 // Overflow-checked single-range normalization and whole-page slice planning.
 
 /// Fixed logical page size; only the final page may be shorter.
-pub const PAGE_BYTES: u64 = 16 * 1024 * 1024;
+pub const PAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One canonical byte-range request, resolved against a version length later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1077,7 +1077,7 @@ fn zero_ttl_bootstrap_reclaims_idle_versions_and_new_objects_beyond_byte_budget(
         for call in rig.adapter.calls() {
             assert_eq!(call.method, "GET");
             assert_eq!(call.pin, None);
-            assert_eq!(call.range.as_deref(), Some("bytes=0-16777215"));
+            assert_eq!(call.range.as_deref(), Some("bytes=0-4194303"));
         }
         rig.memory.evict_idle(usize::MAX).unwrap();
         assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
@@ -1213,7 +1213,7 @@ fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
 #[test]
 fn full_page_writeback_reclaims_idle_ciphertext_at_default_worker_budget() {
     let rig = Rig::new(P, true, 4);
-    // Leave exactly the default four-worker shard's 64 MiB ciphertext budget.
+    // Leave four logical pages of ciphertext budget for the page-size experiment.
     // The fixture otherwise provides additional staging headroom that hides this
     // failure. This charge is unavailable to reclamation, like another live user.
     let _outside_worker_budget = rig
@@ -1221,7 +1221,7 @@ fn full_page_writeback_reclaims_idle_ciphertext_at_default_worker_budget() {
         .reserve(
             None,
             ResourceClass::Ciphertext,
-            rig.admission.limit(ResourceClass::Ciphertext) - 64 * 1024 * 1024,
+            rig.admission.limit(ResourceClass::Ciphertext) - 4 * P as usize,
         )
         .unwrap();
     for version in 1..=6 {
@@ -1248,7 +1248,7 @@ fn full_page_writeback_reclaims_idle_ciphertext_at_default_worker_budget() {
     rig.memory.evict_idle(usize::MAX).unwrap();
     rig.adapter.offline();
     check(
-        &rig.subscribe("If-Match: \"v6\"\r\nRange: bytes=0-16777215\r\n"),
+        &rig.subscribe("If-Match: \"v6\"\r\nRange: bytes=0-4194303\r\n"),
         6,
         0,
         P,
@@ -1269,7 +1269,7 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
         .reserve(
             None,
             ResourceClass::Ciphertext,
-            rig.admission.limit(ResourceClass::Ciphertext) - 64 * 1024 * 1024,
+            rig.admission.limit(ResourceClass::Ciphertext) - 4 * P as usize,
         )
         .unwrap();
     let mut held = Vec::new();
@@ -1556,7 +1556,7 @@ fn v2_empty_subscription_completes_without_pages_and_v1_get_is_rejected() {
     assert_eq!(rig.admission.used(ResourceClass::DirtyCiphertext), 0);
     let (local, mut remote) = UnixStream::pair().unwrap();
     remote
-        .write_all(request("GET", "Range: bytes=0-16777215\r\n").as_bytes())
+        .write_all(request("GET", "Range: bytes=0-4194303\r\n").as_bytes())
         .unwrap();
     assert_eq!(
         rig.drive(rig.serve(local, &scope())),
@@ -1604,7 +1604,7 @@ fn bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].method, "GET");
     assert_eq!(calls[0].pin, None);
-    assert_eq!(calls[0].range.as_deref(), Some("bytes=0-16777215"));
+    assert_eq!(calls[0].range.as_deref(), Some("bytes=0-4194303"));
     check(
         &rig.subscribe(&format!("If-Match: \"v1\"\r\nRange: bytes={P}-\r\n")),
         1,

@@ -257,6 +257,13 @@ fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
         assert_eq!(encode_signed(&decoded.original).unwrap(), encoded);
     }
     assert!(encode_envelope(&auth, true, MAX_BODY + 1).is_err());
+    assert_eq!(MAX_BODY, 4 * 1024 * 1024 + 16);
+    let old_body = 16 * 1024 * 1024 + 16;
+    assert!(encode_envelope(&auth, true, old_body).is_err());
+    let mut old = encode_envelope(&auth, true, MAX_BODY).unwrap();
+    old.headers.retain(|h| h.name != "content-length");
+    push(&mut old, "content-length", old_body);
+    assert!(decode_envelope(old, true).is_err());
     assert!(encode_envelope(&auth, false, 1).is_err());
     for (name, value) in [
         ("content-length", "00"),

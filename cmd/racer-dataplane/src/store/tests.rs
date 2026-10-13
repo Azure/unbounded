@@ -2835,6 +2835,54 @@ mod records {
     }
 
     #[test]
+    fn four_mib_record_roundtrip_rejects_old_sixteen_mib_geometry_with_valid_digest() {
+        let admission = admission();
+        let page = page(&admission, PAGE_BYTES as usize, 0, "cache", "v1");
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let length = alignment
+            .extent(0, logical_length(&page).unwrap())
+            .unwrap()
+            .length();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(&admission, alignment, length),
+        )
+        .unwrap();
+        assert_eq!(
+            parse(&encoded.buffer, encoded.header.extent)
+                .unwrap()
+                .header
+                .envelope
+                .plaintext_length,
+            4 * 1024 * 1024
+        );
+        let mut old = encoded.buffer.bytes().unwrap().to_vec();
+        let header = u32::from_le_bytes(old[12..16].try_into().unwrap()) as usize;
+        let old_plain = 16u32 * 1024 * 1024;
+        let old_cipher = old_plain + 16;
+        old[24..32].copy_from_slice(&u64::from(old_plain).to_le_bytes());
+        old[40..44].copy_from_slice(&old_plain.to_le_bytes());
+        old[44..48].copy_from_slice(&old_cipher.to_le_bytes());
+        let padded = alignment
+            .extent(0, header + old_cipher as usize)
+            .unwrap()
+            .length();
+        old.resize(padded, 0);
+        old[header..header + old_cipher as usize].fill(2);
+        let crc_offset = 128 + "cache".len() + "\"v1\"".len();
+        let checksum = racer_crypto::crc64(&old[header..header + old_cipher as usize]);
+        old[crc_offset..crc_offset + 8].copy_from_slice(&checksum.to_le_bytes());
+        let digest = Sha256::digest(&old[..header - 32]);
+        old[header - 32..header].copy_from_slice(&digest);
+        assert!(matches!(
+            parse_bytes(&old, Extent::new(0, padded).unwrap()),
+            Err(Error::CorruptRecord)
+        ));
+    }
+
+    #[test]
     fn frozen_v1_record_is_rejected() {
         let mut expected = unhex(GOLDEN_LOGICAL);
         expected.resize(512, 0);

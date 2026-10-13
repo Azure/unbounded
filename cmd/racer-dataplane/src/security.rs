@@ -3761,19 +3761,40 @@ mod tests {
                 .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
                 .collect();
             let mut encrypted = vec![0; length + 16];
-            racer_crypto::seal(
-                &[7; 32],
-                &descriptor.nonce.0,
-                &page_aad(&descriptor).unwrap(),
-                &raw,
-                &mut encrypted,
-            )
-            .unwrap();
+            let aad = if length > crate::model::PAGE_BYTES as usize {
+                assert_eq!(page_aad(&descriptor), Err(Error::CorruptRecord));
+                // Keep the frozen crypto vectors without accepting old page geometry.
+                let mut small = descriptor.clone();
+                small.plaintext_length = 1;
+                small.ciphertext_length = 17;
+                let mut aad = page_aad(&small).unwrap();
+                let end = aad.len();
+                aad[end - 8..end - 4].copy_from_slice(&descriptor.plaintext_length.to_be_bytes());
+                aad[end - 4..].copy_from_slice(&descriptor.ciphertext_length.to_be_bytes());
+                aad
+            } else {
+                page_aad(&descriptor).unwrap()
+            };
+            racer_crypto::seal(&[7; 32], &descriptor.nonce.0, &aad, &raw, &mut encrypted).unwrap();
             assert_eq!(
                 format!("{:x}", Sha256::digest(&encrypted)),
                 expected,
                 "length={length}"
             );
+            if length > crate::model::PAGE_BYTES as usize {
+                assert_eq!(descriptor.validate(), Err(Error::CorruptRecord));
+                assert!(
+                    pool.ciphertext(
+                        admission
+                            .reserve(Some(cache), ResourceClass::Ciphertext, length + 16)
+                            .unwrap(),
+                        descriptor.clone(),
+                        encrypted,
+                    )
+                    .is_err()
+                );
+                continue;
+            }
             // Exercise the engine with an installable current key ID, while
             // retaining the independent historical AAD known-answer assertion.
             descriptor.key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();

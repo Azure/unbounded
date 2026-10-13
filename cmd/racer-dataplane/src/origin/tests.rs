@@ -726,7 +726,7 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
             &receive(&mut stream),
             "GET",
             None,
-            Some(b"bytes=0-16777215"),
+            Some(b"bytes=0-4194303"),
             true,
         );
         stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nRacer-Content-Type: text/plain\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\na").unwrap();
@@ -738,7 +738,7 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
             &receive(&mut stream),
             "GET",
             Some(b"\"v\""),
-            Some(b"bytes=0-16777215"),
+            Some(b"bytes=0-4194303"),
             false,
         );
         stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nRacer-Content-Type: text/plain\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nab").unwrap();
@@ -1035,10 +1035,10 @@ fn real_uds_final_page_consumes_supplied_budget_without_second_charge() {
             &receive(&mut stream),
             "GET",
             Some(b"\"v\""),
-            Some(b"bytes=16777216-33554431"),
+            Some(b"bytes=4194304-8388607"),
             true,
         );
-        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 16777216-16777218/16777219\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nend").unwrap();
+        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 4194304-4194306/4194307\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nend").unwrap();
     });
     let (client, admission, reactor) = client();
     let context = context();
@@ -1408,7 +1408,7 @@ mod page_tests {
             &[
                 ("Content-Length", b"3"),
                 ("Content-Type", b"application/octet-stream"),
-                ("Content-Range", b"bytes 16777216-16777218/16777219"),
+                ("Content-Range", b"bytes 4194304-4194306/4194307"),
                 ("ETag", b"\"v\""),
                 ("Racer-Expires-At", b"0"),
             ],
@@ -1426,10 +1426,10 @@ mod page_tests {
         }
         for range in [
             "bytes 0-2/3",
-            "bytes 16777216-16777218/16777220",
-            "bytes */16777219",
-            "bytes 16777216-16777219/16777219",
-            "bytes 016777216-16777218/16777219",
+            "bytes 4194304-4194306/4194308",
+            "bytes */4194307",
+            "bytes 4194304-4194307/4194307",
+            "bytes 04194304-4194306/4194307",
         ] {
             let mut response = head();
             response.headers[2].value = range.as_bytes().to_vec();

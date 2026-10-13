@@ -56,7 +56,7 @@ mod acquisition {
         worker.origin.set_version(metadata.clone());
         worker.origin.set_body(vec![b'x'; metadata.length as usize]);
         let mut socket = fixture.connect();
-        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n")).unwrap();
+        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 4194304\r\nRacer-Ordered: 1\r\n")).unwrap();
         let mut raw = fixture.receive(&mut socket, false);
         let end = raw.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -79,10 +79,10 @@ mod acquisition {
             .unwrap()
             .to_ascii_lowercase();
         assert!(head.starts_with("http/1.1 200 "));
-        assert!(head.contains("content-length: 50331766\r\n"));
-        assert!(head.contains("racer-object-length: 50331661\r\n"));
+        assert!(head.contains("content-length: 12583030\r\n"));
+        assert!(head.contains("racer-object-length: 12582925\r\n"));
         assert!(head.contains("racer-range-start: 0\r\n"));
-        assert!(head.contains("racer-range-end: 50331661\r\n"));
+        assert!(head.contains("racer-range-end: 12582925\r\n"));
         assert!(!head.contains("content-range:"));
         assert_eq!(raw.len() - end, PAGE_BYTES as usize + 21);
         let mut frame = [0; 21];
@@ -1318,7 +1318,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
     for (late_failure, fields, expected_range, expected_length, expected_body) in [
         (
             false,
-            "Range: bytes=0-16777215\r\n",
+            "Range: bytes=0-4194303\r\n",
             "bytes 0-4/5",
             5,
             b"hello".as_slice(),
@@ -1346,8 +1346,8 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
         ),
         (
             true,
-            "If-Match: \"v1\"\r\nRange: bytes=16777214-16777216\r\n",
-            "bytes 16777214-16777216/16777217",
+            "If-Match: \"v1\"\r\nRange: bytes=4194302-4194304\r\n",
+            "bytes 4194302-4194304/4194305",
             3,
             b"xx".as_slice(),
         ),
@@ -1449,7 +1449,7 @@ fn subscription_retains_delivered_page_until_release_and_rejects_invalid_release
         socket
             .write_all(&request(
                 "POST",
-                "Range: bytes=16777214-16777216\r\nRacer-Page-Credits: 1\r\n",
+                "Range: bytes=4194302-4194304\r\nRacer-Page-Credits: 1\r\n",
             ))
             .unwrap();
         let mut output = fixture.receive(&mut socket, false);
@@ -1603,7 +1603,7 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     socket
         .write_all(&request(
             "POST",
-            "If-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n",
+            "If-Match: \"v1\"\r\nRange: bytes=0-4194303\r\nConnection: close\r\n",
         ))
         .unwrap();
     for _ in 0..16 {
@@ -3433,7 +3433,7 @@ mod parser_tests {
             ),
             (
                 "POST",
-                vec![("Range", b"bytes=0-16777215".as_slice())],
+                vec![("Range", b"bytes=0-4194303".as_slice())],
                 ReadKind::Subscription {
                     pin: None,
                     range: Some(ByteRange::Closed {
@@ -3462,7 +3462,7 @@ mod parser_tests {
             (
                 "POST",
                 vec![
-                    ("Range", b"bytes=16777216-".as_slice()),
+                    ("Range", b"bytes=4194304-".as_slice()),
                     ("If-Match", b"\"v\"".as_slice()),
                 ],
                 ReadKind::Subscription {
