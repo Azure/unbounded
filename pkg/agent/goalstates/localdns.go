@@ -21,15 +21,23 @@ import (
 )
 
 const (
-	CoreDNSVersion            = "1.12.3"
-	LocalDNSInterfaceName     = "localdns"
-	LocalDNSCorefilePath      = "/etc/unbounded/localdns/Corefile"
-	LocalDNSUpstreamsPath     = "/etc/unbounded/localdns/node-upstreams"
+	CoreDNSVersion        = "1.12.3"
+	LocalDNSInterfaceName = "localdns"
+
+	// The next three have no Go reader, and are kept anyway. Their values are
+	// a contract with code outside this module: the Corefile and upstreams
+	// paths are hardcoded in
+	// pkg/agent/phases/rootfs/assets/localdns-supervisor.sh, and the nftables
+	// rule comment is asserted by hack/agent/e2e-kind/e2e.py. "No caller" here
+	// means "no Go caller", which is not the same thing.
+	LocalDNSCorefilePath  = "/etc/unbounded/localdns/Corefile"
+	LocalDNSUpstreamsPath = "/etc/unbounded/localdns/node-upstreams"
+	LocalDNSRuleComment   = "unbounded-localdns: skip conntrack"
+
 	LocalDNSServiceUnit       = "localdns.service"
 	LocalDNSSliceUnit         = "localdns.slice"
 	LocalDNSReadinessPort     = 8181
 	LocalDNSMetricsPort       = 9253
-	LocalDNSRuleComment       = "unbounded-localdns: skip conntrack"
 	LocalDNSNFTTable          = "unbounded_localdns"
 	LocalDNSNetworkUnit       = "unbounded-localdns-network.service"
 	LocalDNSSupervisorPath    = "/usr/local/libexec/unbounded-localdns-supervisor"
