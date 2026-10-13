@@ -18,6 +18,8 @@ import (
 	"time"
 )
 
+const clockSkewAllowance = 5 * time.Minute
+
 func parseCertificate(data []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(data)
 	if block == nil || block.Type != "CERTIFICATE" {
@@ -74,7 +76,7 @@ func issue(now time.Time, lifetime time.Duration, names []string, ca *x509.Certi
 	template := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: "rebound"},
-		NotBefore:             now.UTC().Truncate(time.Second),
+		NotBefore:             now.Add(-clockSkewAllowance).UTC().Truncate(time.Second),
 		NotAfter:              now.Add(lifetime).UTC().Truncate(time.Second),
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
@@ -123,7 +125,9 @@ func validLeaf(cert, ca *x509.Certificate, names []string, now time.Time) bool {
 }
 
 func renewAt(cert *x509.Certificate) time.Time {
-	return cert.NotBefore.Add(cert.NotAfter.Sub(cert.NotBefore) * 2 / 3)
+	// Exclude the backdated validity window from the renewal lifetime.
+	issuedAt := cert.NotBefore.Add(clockSkewAllowance)
+	return issuedAt.Add(cert.NotAfter.Sub(issuedAt) * 2 / 3)
 }
 
 func earlier(a, b time.Time) time.Time {

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -136,6 +137,8 @@ func verify(t *testing.T, r *Rotator, s *corev1.Secret, count int) *x509.Certifi
 
 func TestIssueIdempotencyAndLeafRenewal(t *testing.T) {
 	r, clock := fixture()
+	issuedAt := clock.Now()
+
 	reconcile(t, r)
 	s := getSecret(t, r)
 
@@ -149,9 +152,15 @@ func TestIssueIdempotencyAndLeafRenewal(t *testing.T) {
 		t.Fatalf("invalid CA: %v", err)
 	}
 
-	if ca.NotAfter.Sub(ca.NotBefore) != 365*24*time.Hour || leaf.NotAfter.Sub(leaf.NotBefore) != 30*24*time.Hour {
+	if ca.NotAfter.Sub(issuedAt) != 365*24*time.Hour || leaf.NotAfter.Sub(issuedAt) != 30*24*time.Hour {
 		t.Fatal("wrong default lifetimes")
 	}
+
+	require.Equal(t, issuedAt.Add(-clockSkewAllowance), ca.NotBefore)
+	require.Equal(t, issuedAt.Add(-clockSkewAllowance), leaf.NotBefore)
+	require.Equal(t, issuedAt.Add(r.CALifetime*2/3), renewAt(ca))
+	require.Equal(t, issuedAt.Add(r.LeafLifetime*2/3), renewAt(leaf))
+	require.Equal(t, leaf.NotAfter.Format(time.RFC3339Nano), s.Annotations[leafExpiresAt])
 
 	client := r.Client.(*fake.Clientset)
 	agg := r.Aggregator.(*aggregatorfake.Clientset)
@@ -166,14 +175,14 @@ func TestIssueIdempotencyAndLeafRenewal(t *testing.T) {
 		}
 	}
 
-	clock.SetTime(renewAt(leaf).Add(-time.Second))
+	clock.SetTime(issuedAt.Add(r.LeafLifetime * 2 / 3).Add(-time.Second))
 	reconcile(t, r)
 
 	if !bytes.Equal(s.Data["tls.crt"], getSecret(t, r).Data["tls.crt"]) {
 		t.Fatal("renewed early")
 	}
 
-	clock.SetTime(renewAt(leaf))
+	clock.SetTime(issuedAt.Add(r.LeafLifetime * 2 / 3))
 	reconcile(t, r)
 	renewed := getSecret(t, r)
 	verify(t, r, renewed, 1)

@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	clocktesting "k8s.io/utils/clock/testing"
 )
 
 type listener struct{ calls atomic.Int64 }
@@ -230,6 +231,26 @@ func TestProviderCertificateValidity(t *testing.T) {
 	p.load(getSecret(t, r))
 	require.True(t, p.Ready())
 	require.NoError(t, p.Check(nil))
+}
+
+func TestProviderAcceptsFreshCertificateWithLaggingClock(t *testing.T) {
+	r, issuerClock := fixture()
+	reconcile(t, r)
+	secret := getSecret(t, r)
+
+	p := NewProvider(r.Client, "")
+	p.clock = clocktesting.NewFakeClock(issuerClock.Now().Add(-time.Minute))
+	p.load(secret)
+	require.True(t, p.Ready())
+	require.NoError(t, p.WaitReady(t.Context()))
+	cert, key := p.CurrentCertKeyContent()
+	require.Equal(t, secret.Data[corev1.TLSCertKey], cert)
+	require.Equal(t, secret.Data[corev1.TLSPrivateKeyKey], key)
+
+	r.Clock = clocktesting.NewFakeClock(p.clock.Now())
+	verify(t, r, secret, 1)
+	reconcile(t, r)
+	require.Equal(t, secret, getSecret(t, r))
 }
 
 func TestProviderRetainsValidPair(t *testing.T) {
