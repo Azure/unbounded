@@ -313,7 +313,11 @@ fn fixture_empty_bootstrap_and_head_remain_successful() {
             );
         } else {
             assert_eq!(
-                origin::validate_metadata(&head, &current.version.object),
+                origin::validate_metadata(
+                    &head,
+                    &current.version.object,
+                    pin.map(|_| &current.version.etag),
+                ),
                 Ok(current.clone())
             );
         }

@@ -77,14 +77,22 @@ pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(Obje
     Ok((metadata(head, object, total)?, length))
 }
 
-/// Validate an origin HEAD response without allocating an object body.
-pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<ObjectMetadata> {
-    let (status, length) = validate_response(head, false)?;
+/// Validate an origin HEAD response against its optional If-Match pin without a body.
+pub fn validate_metadata(
+    head: &MessageHead,
+    object: &ObjectId,
+    pin: Option<&StrongEtag>,
+) -> Result<ObjectMetadata> {
+    let (status, length) = validate_response(head, pin.is_some())?;
     if status != 200 {
         return Err(Error::BadGateway);
     }
     absent(head, &["Content-Range"])?;
-    metadata(head, object, length)
+    let metadata = metadata(head, object, length)?;
+    if pin.is_some_and(|expected| metadata.version.etag != *expected) {
+        return Err(Error::BadGateway);
+    }
+    Ok(metadata)
 }
 
 /// Require exact If-Match, Content-Range, whole-page length, and final-page bounds.

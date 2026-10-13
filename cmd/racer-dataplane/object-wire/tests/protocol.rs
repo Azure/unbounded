@@ -224,7 +224,7 @@ fn response_heads_and_frame_vectors_are_exact() {
     let metadata = metadata(PAGE_BYTES + 3);
     let head = client::success_head(&metadata, None).unwrap();
     assert_eq!(
-        origin::validate_metadata(&head, &metadata.version.object),
+        origin::validate_metadata(&head, &metadata.version.object, None),
         Ok(metadata.clone())
     );
     let range = ByteRange::From(PAGE_BYTES - 1)

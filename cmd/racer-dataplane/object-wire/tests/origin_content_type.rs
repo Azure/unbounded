@@ -29,7 +29,7 @@ fn response(content_type: Option<&[u8]>) -> MessageHead {
 
 fn assert_content_type(mut head: MessageHead, expected: Option<&[u8]>) {
     let object = object();
-    let metadata = origin::validate_metadata(&head, &object).unwrap();
+    let metadata = origin::validate_metadata(&head, &object, None).unwrap();
     assert_eq!(
         metadata.content_type.as_ref().map(|value| value.as_bytes()),
         expected
@@ -78,7 +78,7 @@ fn normalized_content_type_retains_its_size_limit() {
     assert_content_type(response(Some(padded.as_bytes())), Some(boundary.as_bytes()));
     let oversized = format!(" \ta/{}\t ", "b".repeat(255));
     assert_eq!(
-        origin::validate_metadata(&response(Some(oversized.as_bytes())), &object()),
+        origin::validate_metadata(&response(Some(oversized.as_bytes())), &object(), None),
         Err(Error::BadGateway)
     );
 }
@@ -102,7 +102,7 @@ fn normalization_does_not_accept_empty_malformed_or_duplicate_content_types() {
             Err(Error::BadGateway)
         );
         assert_eq!(
-            origin::validate_metadata(&head, &object()),
+            origin::validate_metadata(&head, &object(), None),
             Err(Error::BadGateway)
         );
     }
@@ -110,7 +110,7 @@ fn normalization_does_not_accept_empty_malformed_or_duplicate_content_types() {
     head.headers
         .push(Header::new("racer-content-type", b"text/plain"));
     assert_eq!(
-        origin::validate_metadata(&head, &object()),
+        origin::validate_metadata(&head, &object(), None),
         Err(Error::BadGateway)
     );
 }
