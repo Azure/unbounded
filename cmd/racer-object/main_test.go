@@ -506,11 +506,12 @@ func TestSidecarRequestCancellation(t *testing.T) {
 	for _, shutdown := range []bool{false, true} {
 		t.Run(map[bool]string{false: "timeout", true: "shutdown"}[shutdown], func(t *testing.T) {
 			entered := make(chan struct{})
-			released := make(chan struct{})
+			released := make(chan time.Time, 1)
 			handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 				close(entered)
 				<-r.Context().Done()
-				close(released)
+
+				released <- time.Now()
 			})
 
 			requestTimeout := 100 * time.Millisecond
@@ -518,7 +519,9 @@ func TestSidecarRequestCancellation(t *testing.T) {
 				requestTimeout = time.Minute
 			}
 
-			address, cancel, done := startTestSidecar(t, handler, requestTimeout)
+			const grace = 250 * time.Millisecond
+
+			address, cancel, done, listenerClosed := startTestSidecarWithGrace(t, handler, requestTimeout, grace)
 			requestDone := make(chan struct{})
 
 			go func() {
@@ -538,12 +541,18 @@ func TestSidecarRequestCancellation(t *testing.T) {
 				t.Fatal("request did not start")
 			}
 
+			shutdownStarted := time.Now()
+
 			if shutdown {
 				cancel()
+				waitSidecarBarrier(t, listenerClosed, "listener did not close")
 			}
 
 			select {
-			case <-released:
+			case canceledAt := <-released:
+				if shutdown && canceledAt.Sub(shutdownStarted) < grace {
+					t.Fatal("request canceled before shutdown grace expired")
+				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("request context not canceled")
 			}
@@ -588,13 +597,17 @@ func TestSidecarListenerErrors(t *testing.T) {
 
 type closeSignalReader struct {
 	*io.PipeReader
-	closed chan struct{}
-	once   sync.Once
+	closed   chan struct{}
+	closedAt time.Time
+	once     sync.Once
 }
 
 func (r *closeSignalReader) Close() error {
 	err := r.PipeReader.Close()
-	r.once.Do(func() { close(r.closed) })
+	r.once.Do(func() {
+		r.closedAt = time.Now()
+		close(r.closed)
+	})
 
 	return err
 }
@@ -624,7 +637,9 @@ func TestSidecarShutdownReleasesSDKStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	address, cancel, done := startTestSidecar(t, handler, time.Minute)
+	const grace = 250 * time.Millisecond
+
+	address, cancel, done, listenerClosed := startTestSidecarWithGrace(t, handler, time.Minute, grace)
 	requestDone := make(chan struct{})
 
 	go func() {
@@ -645,18 +660,25 @@ func TestSidecarShutdownReleasesSDKStream(t *testing.T) {
 		t.Fatal("SDK stream not opened")
 	}
 
+	shutdownStarted := time.Now()
+
 	cancel()
+	waitSidecarBarrier(t, listenerClosed, "listener did not close")
+
+	select {
+	case <-body.closed:
+		if body.closedAt.Sub(shutdownStarted) < grace {
+			t.Fatal("SDK stream released before shutdown grace expired")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("origin stream body not closed")
+	}
+
 	waitSidecar(t, done)
 
 	select {
 	case <-requestDone:
 	case <-time.After(6 * time.Second):
 		t.Fatal("stream request not released")
-	}
-
-	select {
-	case <-body.closed:
-	case <-time.After(3 * time.Second):
-		t.Fatal("origin stream body not closed")
 	}
 }

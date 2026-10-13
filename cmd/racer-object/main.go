@@ -423,7 +423,11 @@ func listenSidecar(ctx context.Context, address string) (net.Listener, error) {
 }
 
 func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handler, requestTimeout time.Duration) error {
-	lifetime, cancel := context.WithCancel(ctx)
+	return serveSidecarWithGrace(ctx, listener, handler, requestTimeout, 5*time.Second)
+}
+
+func serveSidecarWithGrace(ctx context.Context, listener net.Listener, handler http.Handler, requestTimeout, shutdownGrace time.Duration) error {
+	lifetime, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
 	server := &http.Server{
@@ -462,12 +466,11 @@ func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handl
 
 		return nil
 	case <-ctx.Done():
-		cancel()
-
-		shutdownCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, stop := context.WithTimeout(context.Background(), shutdownGrace)
 		defer stop()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
+			cancel()
 			closeResource(server)
 		}
 
