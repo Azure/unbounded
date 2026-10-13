@@ -579,6 +579,9 @@ mod identity_workflows {
     fn existing_key_and_customized_certificate_contract_are_preserved() {
         use racer_crypto::identity::test_util::{ca, issue_pending};
 
+        let clock = uring_runtime::environment::SimulationClock::new(112);
+        let _environment = clock.environment(0).enter();
+        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let (ca, ca_key) = ca();
         let cluster = ClusterId(CLUSTER.into());
         let node = NodeId(NODE.into());
