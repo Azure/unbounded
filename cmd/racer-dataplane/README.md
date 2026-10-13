@@ -56,7 +56,8 @@ runs strict Clippy for each allocator mode.
 
 The `flow-control` library provides policy-driven quotas, charged buffers, bounded
 kernel pipes, adaptive admission, and worker-local coalescing. Application policy
-and real operation completion remain the caller's responsibility. Its crate docs
+and real operation completion remain the caller's responsibility. Flow requires
+Rust 1.91 or newer (`BTreeMap::extract_if`); workspace CI uses Rust 1.96.0. Its crate docs
 describe ownership and admission contracts; generate them with:
 
 ```sh
