@@ -120,7 +120,9 @@ impl<P: Policy> Drop for PipeLease<P> {
         // Never recycle canceled/partially drained payloads: close those pipes.
         if let Some(resources) = self.resources.take()
             && resources.buffered == 0
-            && self.quotas.upgrade().is_some_and(|q| !q.is_stopped())
+            && self.quotas.upgrade().is_some_and(|q| {
+                !q.is_stopped() || P::allows_stopped(resources._reservation.class())
+            })
             && let Some(pool) = self.pool.upgrade()
         {
             pool.borrow_mut().push(resources);
@@ -165,9 +167,9 @@ impl<P: Policy> PipePool<P> {
         self.idle.borrow().len()
     }
 
-    /// Drain idle pipes on stop without releasing resources still owned by leases.
+    /// Drain idle pipes when stop forbids this class, leaving active leases owned.
     fn check_running(&self) -> Result<()> {
-        if self.quotas.is_stopped() {
+        if self.quotas.is_stopped() && !P::allows_stopped(self.pipe_class) {
             let idle = std::mem::take(&mut *self.idle.borrow_mut());
             // Charge destruction may reenter the pool; release the borrow first.
             drop(idle);
@@ -775,13 +777,15 @@ mod tests {
     enum ResourceClass {
         Pipe,
 
+        StopPipe,
+
         RequestContext,
 
         Plaintext,
     }
 
     impl crate::Class for ResourceClass {
-        const COUNT: usize = 3;
+        const COUNT: usize = 4;
 
         /// Select the fixture's stable per-class counter.
         fn index(self) -> usize {
@@ -812,7 +816,7 @@ mod tests {
                 }
             }
             match class {
-                ResourceClass::Pipe => self.pipes,
+                ResourceClass::Pipe | ResourceClass::StopPipe => self.pipes,
                 _ => self.context,
             }
         }
@@ -824,7 +828,12 @@ mod tests {
 
         /// Pipe release can notify an explicitly registered quota waiter.
         fn wakes(class: ResourceClass) -> bool {
-            matches!(class, ResourceClass::Pipe)
+            matches!(class, ResourceClass::Pipe | ResourceClass::StopPipe)
+        }
+
+        /// Only the explicitly opted-in pipe class may admit after stop.
+        fn allows_stopped(class: ResourceClass) -> bool {
+            matches!(class, ResourceClass::StopPipe)
         }
 
         /// Pipe counts do not authorize userspace page backing.
@@ -1571,6 +1580,50 @@ mod tests {
             replacement.try_read(&mut bytes).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    /// Stop opt-in applies to pipe reuse and creation, not to new waiter contexts.
+    #[test]
+    fn stopped_pool_honors_pipe_and_waiter_class_policy() {
+        let quotas = admission(2);
+        let pool = PipePool::new(
+            quotas.clone(),
+            ResourceClass::StopPipe,
+            ResourceClass::RequestContext,
+            8,
+        );
+        let first = pool.acquire().unwrap();
+        let second = pool.acquire().unwrap();
+        let mut admitted_wait = acquire_wait(&pool);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(admitted_wait.as_mut().poll(&mut cx).is_pending());
+        drop(first);
+        quotas.stop();
+        // Existing admitted waiter context may finish; its pipe class allows stop.
+        let Poll::Ready(Ok(first)) = admitted_wait.as_mut().poll(&mut cx) else {
+            panic!("allowed pipe class must remain available after stop");
+        };
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        let mut denied_wait = acquire_wait(&pool);
+        assert!(matches!(
+            denied_wait.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        drop(first);
+        assert_eq!(pool.idle_count(), 1);
+        let mut reused = pool.acquire().unwrap();
+        reused.try_write(b"discard").unwrap();
+        drop(reused);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(quotas.used(ResourceClass::StopPipe), 1);
+        let fresh = pool.acquire().unwrap();
+        assert_eq!(quotas.used(ResourceClass::StopPipe), 2);
+        drop((fresh, second));
+        assert_eq!(pool.idle_count(), 2);
+        drop((admitted_wait, denied_wait));
+        drop(pool);
+        assert_eq!(quotas.used(ResourceClass::StopPipe), 0);
     }
 
     /// Stop observation drains idle owners but leaves active work and waiters owned.
