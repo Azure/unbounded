@@ -778,7 +778,7 @@ func testCapacityClaim(name string) *unboundedv1alpha3.CapacityClaim {
 	}
 }
 
-func testMachine(name string, allocationReady bool, quarantined bool) *unboundedv1alpha3.Machine {
+func testMachine(name string, allocationReady, quarantined bool) *unboundedv1alpha3.Machine {
 	conditions := []metav1.Condition{
 		{Type: unboundedv1alpha3.MachineConditionAvailable, Status: metav1.ConditionTrue, Reason: "InventoryReady"},
 		{Type: unboundedv1alpha3.MachineConditionAllocationReady, Status: metav1.ConditionFalse, Reason: "Blocked"},
