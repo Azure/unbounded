@@ -584,15 +584,14 @@ impl<P: Policy> Quotas<P> {
         mode: AdmissionMode,
     ) -> Result<Charge<P>> {
         let result = self.reserve_inner(key, class, amount, mode);
-        if matches!(result, Err(Error::Overloaded)) {
-            self.reclaim_buffers_for(key, class);
+        if matches!(result, Err(Error::Overloaded)) && self.reclaim_buffers_for(key, class) {
             return self.reserve_inner(key, class, amount, mode);
         }
         result
     }
 
     /// Reclaim only when key records, fairness, or this class can benefit.
-    fn reclaim_buffers_for(&self, key: Option<&P::Key>, class: P::Class) {
+    fn reclaim_buffers_for(&self, key: Option<&P::Key>, class: P::Class) -> bool {
         let reclaimed = {
             let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             // Keyed admission can exhaust records or fair shares too. Unkeyed
@@ -607,7 +606,9 @@ impl<P: Policy> Quotas<P> {
                 Vec::new()
             }
         };
+        let progress = !reclaimed.is_empty();
         drop(reclaimed);
+        progress
     }
 
     /// Perform one admission attempt and report its rejection before retrying.
@@ -633,7 +634,7 @@ impl<P: Policy> Quotas<P> {
             let fair = self.fair_limit(class, 0);
             let used = local.counter(class).used();
             if used.checked_add(amount).is_none_or(|next| next > fair) {
-                self.rejected(class, amount, Some(used), Some(fair));
+                self.rejected(class, limit, amount, Some(used), Some(fair));
                 return Err(Error::Overloaded);
             }
         }
@@ -641,7 +642,7 @@ impl<P: Policy> Quotas<P> {
             .counter(class)
             .reserve(amount, limit)
             .map_err(|_| {
-                self.rejected(class, amount, None, None);
+                self.rejected(class, limit, amount, None, None);
                 Error::Overloaded
             })?;
         if let Some(local) = &local {
@@ -731,6 +732,7 @@ impl<P: Policy> Quotas<P> {
     fn rejected(
         &self,
         class: P::Class,
+        limit: usize,
         requested: usize,
         key_used: Option<usize>,
         key_limit: Option<usize>,
@@ -738,7 +740,7 @@ impl<P: Policy> Quotas<P> {
         self.policy.rejected(Rejection::Resource {
             class,
             used: self.used(class),
-            limit: self.limit(class),
+            limit,
             requested,
             key_used,
             key_limit,
@@ -1627,7 +1629,7 @@ mod quota_tests {
                             assert!(matches!(result, Err(Error::Overloaded)));
                             assert_eq!(quotas.used(Resource::Payload), 40);
                             let rejected = quotas.policy.rejected.borrow();
-                            assert_eq!(rejected.len(), 2);
+                            assert_eq!(rejected.len(), 1);
                             assert!(rejected.iter().all(|rejection| matches!(
                                 rejection,
                                 Rejection::Resource { key_used: Some(40), key_limit: Some(limit), .. }
@@ -1696,11 +1698,11 @@ mod quota_tests {
             let rejected = quotas.policy.rejected.lock().unwrap();
             assert_eq!(
                 rejected.len(),
-                7,
-                "local retries once; shared does not retry"
+                4,
+                "neither handle retries without reclaimed backing"
             );
             for (index, rejection) in rejected.iter().enumerate() {
-                let (key_used, key_limit) = if matches!(index, 3 | 4) {
+                let (key_used, key_limit) = if index == 2 {
                     (Some(6), Some(4))
                 } else {
                     (None, None)
@@ -1729,7 +1731,35 @@ mod quota_tests {
         assert_eq!(quotas.used(Resource::Payload), 4);
         drop(exact);
         assert_eq!(quotas.used(Resource::Payload), 0);
-        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 7);
+        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 4);
+    }
+
+    /// Rejection reports the sampled ceiling without calling policy again.
+    #[test]
+    fn rejection_keeps_enforced_limit_and_does_not_retry_without_progress() {
+        for keyed in [false, true] {
+            let quotas = Quotas::new(TestPolicy::new(100, 1));
+            let key = "key".to_owned();
+            quotas.policy.limit_samples.lock().unwrap().extend([3, 100]);
+            assert!(matches!(
+                quotas.reserve(keyed.then_some(&key), Resource::Payload, 4),
+                Err(Error::Overloaded)
+            ));
+            assert!(matches!(
+                quotas.policy.rejected.lock().unwrap().as_slice(),
+                [Rejection::Resource {
+                    limit: 3,
+                    requested: 4,
+                    ..
+                }]
+            ));
+            assert_eq!(quotas.used(Resource::Payload), 0);
+            assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+            assert_eq!(
+                quotas.policy.limit_samples.lock().unwrap().len(),
+                usize::from(!keyed)
+            );
+        }
     }
 
     /// Check nested admission at each key clone and preserve all owned counters.
@@ -1901,10 +1931,7 @@ mod quota_tests {
                 if action == "keys" && skip < 2 {
                     assert!(matches!(
                         quotas.policy.rejected.borrow().as_slice(),
-                        [
-                            Rejection::Keys { used: 2, limit: 2 },
-                            Rejection::Keys { used: 2, limit: 2 }
-                        ]
+                        [Rejection::Keys { used: 2, limit: 2 }]
                     ));
                 }
                 assert!(quotas.keys.borrow().len() <= 2);
@@ -2104,7 +2131,7 @@ mod quota_tests {
                             assert!(matches!(result.unwrap(), Err(Error::Overloaded)));
                             let expected = if action == "keys" { 2 } else { 0 };
                             assert!(matches!(quotas.policy.rejected.borrow().as_slice(),
-                                [Rejection::Keys { used, limit }, Rejection::Keys { .. }]
+                                [Rejection::Keys { used, limit }]
                                 if *used == expected && *limit == expected));
                         }
                         "stop" => assert!(matches!(result.unwrap(), Err(Error::Unavailable))),
@@ -2286,12 +2313,12 @@ mod quota_tests {
             Err(Error::Overloaded)
         ));
         assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
-        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 2);
+        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 1);
         let charge = quotas.reserve(None, Resource::Payload, 3 * size).unwrap();
         assert_eq!(quotas.retained_buffer_bytes(), 0);
-        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 3);
+        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 2);
         assert!(
-            matches!(quotas.policy.rejected.lock().unwrap()[2], Rejection::Resource { used, requested, .. } if used == 2 * size && requested == 3 * size)
+            matches!(quotas.policy.rejected.lock().unwrap()[1], Rejection::Resource { used, requested, .. } if used == 2 * size && requested == 3 * size)
         );
         let mut charge = charge;
         charge.recycle(vec![0xa7; 3 * size]);
@@ -2549,10 +2576,7 @@ mod quota_tests {
         assert!(quotas.policy.entered.get());
         assert!(matches!(
             &quotas.policy.rejected.borrow()[..],
-            [
-                Rejection::Keys { used: 1, limit: 1 },
-                Rejection::Keys { used: 1, limit: 1 }
-            ]
+            [Rejection::Keys { used: 1, limit: 1 }]
         ));
         assert_eq!(quotas.used(Resource::Payload), 1);
         assert_eq!(quotas.active_keys.load(Ordering::Acquire), 1);
