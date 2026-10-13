@@ -102,6 +102,13 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Record build provenance
+        id: provenance
+        run: |
+          git_commit=$(git rev-parse HEAD)
+          build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          printf 'git_commit=%s\nbuild_time=%s\n' "$git_commit" "$build_time" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/amd64,linux/arm64
@@ -140,3 +147,5 @@ jobs:
           build-args: |
             VERSION=${{ needs.resolve.outputs.tag }}
             CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}
+            GIT_COMMIT=${{ steps.provenance.outputs.git_commit }}
+            BUILD_TIME=${{ steps.provenance.outputs.build_time }}
