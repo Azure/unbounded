@@ -484,16 +484,19 @@ func s3Error(err error) error {
 		}
 	}
 
-	if errors.As(err, &status) {
+	// The AWS SDK wraps send failures in a synthetic response with status 0.
+	// Only a real HTTP status takes precedence over the transport cause.
+	if errors.As(err, &status) && status.HTTPStatusCode() != 0 {
 		return s3HTTPError(status.HTTPStatusCode())
 	}
 
 	var (
-		op  *net.OpError
-		dns *net.DNSError
+		connection interface{ ConnectionError() bool }
+		op         *net.OpError
+		dns        *net.DNSError
 	)
 
-	if errors.As(err, &op) || errors.As(err, &dns) {
+	if (errors.As(err, &connection) && connection.ConnectionError()) || errors.As(err, &op) || errors.As(err, &dns) {
 		return racersdk.ErrUnavailable
 	}
 
