@@ -132,7 +132,9 @@ struct State<K> {
 
     limit: usize,
 
-    updated: Instant,
+    pressure_updated: Instant,
+
+    recovery_updated: Instant,
 
     peers: BTreeMap<K, Peer>,
 }
@@ -178,6 +180,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             return Err(Error::InvalidInput);
         }
         observer.limit(config.total);
+        let started = now();
         Ok(Arc::new(Self {
             config,
             observer,
@@ -185,7 +188,8 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             state: Mutex::new(State {
                 active: 0,
                 limit: config.total,
-                updated: now(),
+                pressure_updated: started,
+                recovery_updated: started,
                 peers: BTreeMap::new(),
             }),
         }))
@@ -304,9 +308,9 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         };
         let config = self.owner.config;
         if outcome == Outcome::LocalPressure {
-            let limit = if now.saturating_duration_since(state.updated) >= config.backoff {
+            let limit = if now.saturating_duration_since(state.pressure_updated) >= config.backoff {
                 state.limit = (state.limit / 2).max(1);
-                state.updated = now;
+                state.pressure_updated = now;
                 Some(state.limit)
             } else {
                 None
@@ -320,10 +324,10 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         }
         let limit = if outcome == Outcome::Verified
             && state.limit < config.total
-            && now.saturating_duration_since(state.updated) >= config.recovery
+            && now.saturating_duration_since(state.recovery_updated) >= config.recovery
         {
             state.limit = state.limit.saturating_add(1).min(config.total);
-            state.updated = now;
+            state.recovery_updated = now;
             Some(state.limit)
         } else {
             None
@@ -2721,11 +2725,11 @@ mod tests {
         drop(probe);
         assert!(owner.available(&1));
         let work = owner.acquire(&2).unwrap();
-        owner.state.lock().unwrap().updated = Instant::now() - config().backoff;
+        owner.state.lock().unwrap().pressure_updated = Instant::now() - config().backoff;
         work.observe(Outcome::LocalPressure);
         assert_eq!(*owner.observer.limit.lock().unwrap(), 2);
         assert!(owner.available(&2));
-        owner.state.lock().unwrap().updated = Instant::now() - config().recovery;
+        owner.state.lock().unwrap().recovery_updated = Instant::now() - config().recovery;
         work.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), 3);
     }
@@ -2824,17 +2828,17 @@ mod tests {
             let owner = Adaptive::new(config, Counts::default(), now).unwrap();
             let work = owner.acquire(&1).unwrap();
             let updated = now() - config.backoff.max(config.recovery);
-            owner.state.lock().unwrap().updated = updated;
+            owner.state.lock().unwrap().pressure_updated = updated;
 
             for _ in 0..2 {
                 work.observe(Outcome::Verified);
                 let state = owner.state.lock().unwrap();
                 assert_eq!(state.limit, config.total);
-                assert_eq!(state.updated, updated);
+                assert_eq!(state.pressure_updated, updated);
             }
             work.observe(Outcome::LocalPressure);
             assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
-            assert_eq!(owner.state.lock().unwrap().updated, now());
+            assert_eq!(owner.state.lock().unwrap().pressure_updated, now());
             assert_eq!(owner.state.lock().unwrap().peers[&1].limit, config.per_key);
             assert!(owner.available(&1));
             assert_eq!(
@@ -2849,9 +2853,9 @@ mod tests {
         }
     }
 
-    /// Restoring the final slot still starts backoff and rate-limits pressure.
+    /// Restoring a slot leaves the independent pressure backoff unchanged.
     #[test]
-    fn recovery_restoring_slot_advances_pressure_backoff() {
+    fn recovery_restoring_slot_preserves_pressure_backoff() {
         fn now() -> Instant {
             static NOW: OnceLock<Instant> = OnceLock::new();
             *NOW.get_or_init(Instant::now)
@@ -2863,15 +2867,15 @@ mod tests {
         {
             let mut state = owner.state.lock().unwrap();
             state.limit = config.total - 1;
-            state.updated = now() - config.recovery;
+            state.recovery_updated = now() - config.recovery;
         }
         work.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
-        assert_eq!(owner.state.lock().unwrap().updated, now());
+        assert_eq!(owner.state.lock().unwrap().recovery_updated, now());
         work.observe(Outcome::LocalPressure);
         assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
 
-        owner.state.lock().unwrap().updated = now() - config.backoff;
+        owner.state.lock().unwrap().pressure_updated = now() - config.backoff;
         work.observe(Outcome::LocalPressure);
         assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
         work.observe(Outcome::LocalPressure);
@@ -2893,6 +2897,41 @@ mod tests {
 
         fn advance(duration: Duration) {
             CLOCK.set(now() + duration);
+        }
+
+        /// Frequent recoveries cannot postpone an independently due reduction.
+        #[test]
+        fn recovery_shorter_than_backoff_does_not_starve_pressure() {
+            let config = Config {
+                total: 32,
+                per_key: 32,
+                backoff: Duration::from_secs(10),
+                recovery: Duration::from_secs(1),
+                ..config()
+            };
+            let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+            let work = owner.acquire(&1).unwrap();
+            advance(config.backoff);
+            work.observe(Outcome::LocalPressure);
+            let reduced = now();
+            assert_eq!(owner.state.lock().unwrap().limit, 16);
+            for expected in 17..=25 {
+                advance(config.recovery);
+                work.observe(Outcome::Verified);
+                work.observe(Outcome::LocalPressure);
+                let state = owner.state.lock().unwrap();
+                assert_eq!(state.limit, expected);
+                assert_eq!(state.pressure_updated, reduced);
+            }
+            advance(config.recovery);
+            work.observe(Outcome::Verified);
+            work.observe(Outcome::LocalPressure);
+            assert_eq!(owner.state.lock().unwrap().limit, 13);
+            work.observe(Outcome::Verified);
+            assert_eq!(owner.state.lock().unwrap().limit, 13);
+            advance(config.recovery);
+            work.observe(Outcome::Verified);
+            assert_eq!(owner.state.lock().unwrap().limit, 14);
         }
 
         #[test]
