@@ -6,6 +6,7 @@ package netboot
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -141,6 +142,8 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id, action := parts[0], parts[1]
+	log := slog.With("handler", "bootmedia", "action", action, "remote", r.RemoteAddr)
+
 	if (action == "complete" && r.Method != http.MethodPost) || (action != "complete" && r.Method != http.MethodGet) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -148,13 +151,19 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	o, err := p.callbackOwner(r.Context(), id)
 	if err != nil {
+		log.Warn("rejecting boot media request without an owner", "err", err)
 		http.NotFound(w, r)
+
 		return
 	}
 
+	log = log.With("operation", o.op.Name, "machine", o.status().MachineUID)
+
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil || validateMediaLease(o.status().Netboot) != nil || ip != o.status().Netboot.DHCPLeases[0].IPv4 {
+		log.Warn("rejecting boot media request from an unexpected source")
 		http.NotFound(w, r)
+
 		return
 	}
 
@@ -162,6 +171,7 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "grub.cfg":
 		o, err = p.owner(r.Context(), id)
 		if err != nil {
+			log.Info("serving halt config because install is no longer authorized", "err", err)
 			// Explicit halt prevents an attached ISO from chainloading itself.
 			w.Header().Set("Content-Type", "text/plain")
 			w.Write([]byte("halt\n")) //nolint:errcheck // Best-effort HTTP response.
@@ -171,10 +181,13 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		data, err := p.installerConfig(o)
 		if err != nil {
+			log.Error("rendering boot media installer config", "err", err)
 			http.Error(w, "media config unavailable", http.StatusServiceUnavailable)
+
 			return
 		}
 
+		log.Info("serving boot media installer config")
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write(data) //nolint:errcheck // Best-effort HTTP response.
 	case "complete":
@@ -186,9 +199,13 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// A resource-version precondition avoids overwriting a concurrent
 			// controller cleanup or another target's status. The installer retries.
 			if err := p.Client.Status().Patch(r.Context(), o.op, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+				log.Warn("saving image-written status", "err", err)
 				http.Error(w, "cannot save image-written status", http.StatusServiceUnavailable)
+
 				return
 			}
+
+			log.Info("installer reported image written")
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -208,9 +225,13 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			o.op.Status.Targets[o.index].BootMedia = &status
 			if err := p.Client.Status().Patch(r.Context(), o.op, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+				log.Warn("saving reboot acknowledgment", "err", err)
 				http.Error(w, "cannot save reboot acknowledgment", http.StatusServiceUnavailable)
+
 				return
 			}
+
+			log.Info("installer allowed to reboot")
 		}
 
 		w.WriteHeader(http.StatusOK)

@@ -58,15 +58,29 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	defer cancel()
 	// Rack managers fetch the ISO using their own IP, not the host lease.
 	if t.Media != nil && (strings.HasPrefix(filename, "ub-") || strings.HasSuffix(filename, ".iso")) {
+		log := slog.With("proto", "tftp", "filename", filename)
+		if transfer, ok := rf.(tftp.OutgoingTransfer); ok {
+			log = log.With("ip", transfer.RemoteAddr().IP.String())
+		}
+
 		file, err := t.Media.OpenISO(ctx, filename)
 		if err != nil {
+			log.Warn("rejecting boot media transfer", "err", err)
 			return err
 		}
 		defer file.Close() //nolint:errcheck // Best-effort close after transfer.
 
-		_, err = rf.ReadFrom(file)
+		log.Info("serving boot media")
 
-		return err
+		n, err := rf.ReadFrom(file)
+		if err != nil {
+			log.Error("boot media transfer failed", "bytes", n, "err", err)
+			return err
+		}
+
+		log.Info("boot media transfer complete", "bytes", n)
+
+		return nil
 	}
 
 	ip := rf.(tftp.OutgoingTransfer).RemoteAddr().IP.String() //nolint:errcheck // Type is guaranteed by the tftp library.

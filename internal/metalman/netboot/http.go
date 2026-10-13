@@ -159,9 +159,13 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 			o, claimed, err := h.Media.artifactOwner(r.Context(), remote)
 			if claimed {
 				if err != nil || strings.HasSuffix(path, "grub.cfg") {
+					log.Warn("rejected boot media artifact request", "err", err)
 					http.NotFound(w, r)
+
 					return
 				}
+
+				log = log.With("handler", "bootmedia", "operation", o.op.Name)
 
 				ref := o.status().Netboot.NetbootImage
 				if path == "disk.img.gz" {
@@ -170,9 +174,13 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 				resolved, err := h.Media.Resolver.ResolveFileByPathForIP(r.Context(), path, o.machine, ref, remote)
 				if err != nil {
+					log.Warn("boot media artifact unavailable", "ref", ref, "err", err)
 					http.Error(w, "media artifact unavailable", http.StatusServiceUnavailable)
+
 					return
 				}
+
+				log.Info("serving boot media artifact", "ref", ref, "range", r.Header.Get("Range"))
 
 				if resolved.DiskPath != "" {
 					// GRUB's gzip arm64 kernel loader needs HTTP Range support.

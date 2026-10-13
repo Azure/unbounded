@@ -1228,6 +1228,41 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 	require.NotContains(t, body, "unbounded.disk=")
 }
 
+func TestGrubTemplate_SerialConsoleByArchitecture(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		arch    string
+		console bool
+	}{
+		{arch: "", console: true},
+		{arch: v1alpha3.PXEArchitectureAMD64, console: true},
+		// arm64 servers often use a PL011 UART, not ttyS0. Leave the
+		// choice to the firmware SPCR table.
+		{arch: v1alpha3.PXEArchitectureARM64, console: false},
+	} {
+		t.Run(tc.arch, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-console"},
+				Spec: v1alpha3.MachineSpec{
+					Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{Architecture: tc.arch}},
+				},
+			}
+
+			data := newTemplateData(node, ClusterInfo{ApiserverURL: "https://k8s.example.com"}, "http://10.0.1.1:8080", "", "10.0.1.21", true)
+			result, err := renderTemplate(string(grubTmpl), data)
+			require.NoError(t, err)
+
+			if tc.console {
+				require.Contains(t, string(result), "console=ttyS0,115200n8")
+			} else {
+				require.NotContains(t, string(result), "console=")
+			}
+		})
+	}
+}
+
 func TestInstallRequestedStopsAfterBootImageWritten(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-install", Namespace: "default"},

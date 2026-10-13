@@ -54,7 +54,9 @@ menuentry "Unbounded Metal Install" {
     {{- if .Machine.Spec.Netboot.TargetDisk }}
     unbounded.disk={{ .Machine.Spec.Netboot.TargetDisk }} \
     {{- end }}
+    {{- if ne (printf "%s" .Machine.Spec.Netboot.Architecture) "arm64" }}
     console=tty0 console=ttyS0,115200n8 \
+    {{- end }}
     ---
   initrd {{ .ArtifactRoot }}/initrd {{ .ArtifactRoot }}/init.cpio
 }
