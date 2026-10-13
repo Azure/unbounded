@@ -5,6 +5,7 @@ package net
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/cel-go/cel"
@@ -13,6 +14,150 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+func TestNodeFieldPolicyAssignmentOwnership(t *testing.T) {
+	t.Parallel()
+
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-node-field-restriction")
+
+	tests := []struct {
+		name        string
+		username    string
+		nodeName    string
+		nodeUID     string
+		key         string
+		annotation  bool
+		unbound     bool
+		wantAllowed bool
+	}{
+		{name: "own gateway label", key: "net.unbounded-cloud.io/gateway-pool"},
+		{name: "own legacy Site label", key: "net.unbounded-cloud.io/site"},
+		{name: "own canonical Site label", key: "unbounded-cloud.io/site"},
+		{name: "foreign gateway label", nodeName: "other", key: "net.unbounded-cloud.io/gateway-pool"},
+		{name: "foreign Site label", nodeName: "other", key: "unbounded-cloud.io/site"},
+		{name: "foreign public key", nodeName: "other", key: "net.unbounded-cloud.io/wg-pubkey", annotation: true},
+		{name: "wrong UID", nodeUID: "other-uid", key: "net.unbounded-cloud.io/wg-pubkey", annotation: true},
+		{name: "unbound token", unbound: true, key: "net.unbounded-cloud.io/wg-pubkey", annotation: true},
+		{name: "own public key", key: "net.unbounded-cloud.io/wg-pubkey", annotation: true, wantAllowed: true},
+		{name: "own MTU", key: "net.unbounded-cloud.io/tunnel-mtu", annotation: true, wantAllowed: true},
+		{name: "own discovered IP", key: discoveredPublicIPAnnotation, annotation: true, wantAllowed: true},
+		{name: "own discovery expiry", key: discoveredPublicIPExpiresAtAnnotation, annotation: true, wantAllowed: true},
+		{name: "own unknown annotation", key: "net.unbounded-cloud.io/arbitrary", annotation: true},
+		{name: "controller gateway label", username: controllerServiceAccountUsername, key: "net.unbounded-cloud.io/gateway-pool", wantAllowed: true},
+		{name: "controller Site label", username: controllerServiceAccountUsername, key: "unbounded-cloud.io/site", wantAllowed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			username := tt.username
+			if username == "" {
+				username = nodeServiceAccountUsername
+			}
+
+			name, uid := tt.nodeName, tt.nodeUID
+			if name == "" {
+				name = "node-a"
+			}
+
+			if uid == "" {
+				uid = "node-uid"
+			}
+
+			for _, operation := range []string{"add", "change", "remove"} {
+				t.Run(operation, func(t *testing.T) {
+					oldObject, object := nodeSpecAdmissionObject(nil), nodeSpecAdmissionObject(nil)
+
+					field := "labels"
+					if tt.annotation {
+						field = "annotations"
+					}
+
+					oldValues, values := map[string]string{}, map[string]string{}
+					if operation != "add" {
+						oldValues[tt.key] = "old"
+					}
+
+					if operation != "remove" {
+						values[tt.key] = "new"
+					}
+
+					oldObject["metadata"].(map[string]any)[field] = oldValues
+					object["metadata"].(map[string]any)[field] = values
+
+					activation := map[string]any{
+						"oldObject": oldObject, "object": object,
+						"request": map[string]any{"userInfo": map[string]any{
+							"username": username,
+							"extra":    map[string][]string{nodeNameExtra: {name}, nodeUIDExtra: {uid}},
+						}},
+					}
+					if tt.unbound {
+						activation["request"] = map[string]any{"userInfo": map[string]any{
+							"username": username,
+							"extra":    map[string][]string{},
+						}}
+					}
+
+					if got := policyAllows(t, policy, activation); got != tt.wantAllowed {
+						t.Fatalf("allowed=%v, want %v", got, tt.wantAllowed)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestNodeFieldPolicyPreservesControllerPodCIDRs(t *testing.T) {
+	t.Parallel()
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-node-field-restriction")
+	expression := policyValidationExpression(t, policy, "unbounded-net-node may not modify controller-owned pod CIDRs")
+
+	for _, field := range []string{"podCIDR", "podCIDRs"} {
+		for _, username := range []string{nodeServiceAccountUsername, controllerServiceAccountUsername} {
+			oldObject, object := nodeSpecAdmissionObject(nil), nodeSpecAdmissionObject(nil)
+
+			spec := object["spec"].(map[string]any)
+			if field == "podCIDR" {
+				spec[field] = "10.244.0.0/24"
+			} else {
+				spec[field] = []string{"10.244.0.0/24"}
+			}
+
+			allowed := evalCEL(t, expression, map[string]any{
+				"object": object, "oldObject": oldObject,
+				"request": map[string]any{"userInfo": map[string]any{"username": username}},
+			})
+			if allowed != (username == controllerServiceAccountUsername) {
+				t.Fatalf("%s mutation by %s allowed=%v", field, username, allowed)
+			}
+		}
+	}
+}
+
+func TestGatewayPoolNamePolicy(t *testing.T) {
+	t.Parallel()
+
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-gateway-pool-name")
+
+	rules, found, err := unstructured.NestedSlice(policy.Object, "spec", "matchConstraints", "resourceRules")
+	if err != nil || !found || len(rules) != 1 {
+		t.Fatalf("rules=%v err=%v", rules, err)
+	}
+
+	rule := rules[0].(map[string]any)
+	assertStringSliceField(t, rule, []string{"gatewaypools"}, "resources")
+	assertStringSliceField(t, rule, []string{"CREATE", "UPDATE"}, "operations")
+	assertStringSliceField(t, rule, []string{"net.unbounded-cloud.io"}, "apiGroups")
+
+	for _, name := range []string{"pool.raw", strings.Repeat("a", 63), strings.Repeat("a", 64)} {
+		got := policyAllows(t, policy, map[string]any{"object": map[string]any{"metadata": map[string]any{"name": name}}})
+		if got != (len(name) <= 63) {
+			t.Fatalf("name length=%d allowed=%v", len(name), got)
+		}
+	}
+
+	binding := plannedNetObject(t, "ValidatingAdmissionPolicyBinding", "unbounded-net-gateway-pool-name")
+	assertStringSliceField(t, binding.Object["spec"].(map[string]any), []string{"Deny"}, "validationActions")
+}
 
 const (
 	wireGuardPortAnnotation               = "net.unbounded-cloud.io/wireguard-port"
