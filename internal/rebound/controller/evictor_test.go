@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	clocktesting "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -82,6 +83,12 @@ func TestEvictorActiveGrant(t *testing.T) {
 
 	mirror := pod("other", "mirror", "a", testNow)
 	mirror.Annotations = map[string]string{corev1.MirrorPodAnnotationKey: "x"}
+	mirror.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: "a", UID: "node-a", Controller: ptr.To(true)}}
+	forged := pod("other", "forged", "a", testNow)
+	forged.Annotations = map[string]string{corev1.MirrorPodAnnotationKey: "x"}
+	wrongNode := forged.DeepCopy()
+	wrongNode.Name, wrongNode.UID = "wrong-node", "other/wrong-node"
+	wrongNode.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: "b", UID: "node-b", Controller: ptr.To(true)}}
 	done := pod("other", "done", "a", testNow)
 	done.Status.Phase = corev1.PodSucceeded
 	failed := pod("other", "failed", "a", testNow)
@@ -94,7 +101,7 @@ func TestEvictorActiveGrant(t *testing.T) {
 		pod("kube-system", "proxy", "a", testNow),
 		pod("system", "agent", "a", testNow),
 		pod("other", "elsewhere", "b", testNow),
-		mirror, done, failed,
+		mirror, forged, wrongNode, done, failed,
 	)
 
 	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})

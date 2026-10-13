@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -107,7 +108,7 @@ func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []
 		return false
 	}
 
-	if _, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
+	if isMirrorPod(pod) {
 		return false
 	}
 
@@ -158,4 +159,18 @@ func (r *evictor) mapLedger(_ context.Context, obj client.Object) []ctrl.Request
 	}
 
 	return requests
+}
+
+// isMirrorPod reports whether pod looks like a kubelet mirror pod: it has
+// the mirror annotation and its controller is the node it runs on. Users can
+// forge both, but kubelet never runs a mirror pod it did not create and
+// deletes such orphans, so a forged one holds no resources.
+func isMirrorPod(pod *corev1.Pod) bool {
+	if _, ok := pod.Annotations[corev1.MirrorPodAnnotationKey]; !ok {
+		return false
+	}
+
+	owner := metav1.GetControllerOf(pod)
+
+	return owner != nil && owner.Kind == "Node" && owner.APIVersion == "v1" && owner.Name == pod.Spec.NodeName
 }
