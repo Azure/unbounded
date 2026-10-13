@@ -3,7 +3,7 @@
 
 // Package ledger stores NodeGrants in a single ConfigMap.
 //
-// The ConfigMap holds two kinds of keys:
+// The ConfigMap holds three kinds of keys:
 //
 //   - "<node>" maps a granted node to "<namespace>/<grant>". The pod placement
 //     ValidatingAdmissionPolicy reads these keys through its paramRef.
@@ -13,6 +13,8 @@
 // Grant records are authoritative. Node keys are always derived from them
 // when the ledger is encoded, so a hand-edited or partially written node key
 // is repaired on the next write.
+// Releases separate the grant's end time from the record's retention deadline,
+// so a late reap does not extend the eviction window or skip pod cleanup.
 package ledger
 
 import (
@@ -34,8 +36,8 @@ const (
 	// leave headroom for object metadata.
 	MaxSize = 900 * 1024
 
-	// ReleaseRetention is how long a Release record is kept after its grant
-	// is removed. The evictor must act on it within this time.
+	// ReleaseRetention is how long a Release record is kept after it is written.
+	// The evictor must act on it within this time.
 	ReleaseRetention = 10 * time.Minute
 
 	grantKeyPrefix   = "_grant."
@@ -66,13 +68,15 @@ func (g *Grant) Expired(now time.Time) bool {
 }
 
 // Release records a removed grant. Pods in Namespace on Nodes that were
-// created while the grant was active are evicted.
+// created while the grant was active are evicted. ReleasedAt is the grant's
+// end time; DropAt is when the record can be removed.
 type Release struct {
 	UID        types.UID `json:"-"`
 	Namespace  string    `json:"namespace"`
 	Nodes      []string  `json:"nodes"`
 	CreatedAt  time.Time `json:"createdAt"`
 	ReleasedAt time.Time `json:"releasedAt"`
+	DropAt     time.Time `json:"dropAt"`
 }
 
 // ConflictError reports nodes that are already granted.
@@ -124,6 +128,11 @@ func Parse(data map[string]string) *Ledger {
 			r := &Release{}
 			if err := json.Unmarshal([]byte(v), r); err == nil && r.Namespace != "" && len(r.Nodes) > 0 {
 				r.UID = types.UID(uid)
+				if r.DropAt.IsZero() {
+					// Older records counted retention from the release time.
+					r.DropAt = r.ReleasedAt.Add(ReleaseRetention)
+				}
+
 				l.releases[r.UID] = r
 			}
 		}
@@ -276,6 +285,10 @@ func (l *Ledger) Releases() []*Release {
 // Remove deletes a grant and records a Release for it at now. It reports
 // whether the grant existed.
 func (l *Ledger) Remove(key types.NamespacedName, now time.Time) bool {
+	return l.remove(key, now, now)
+}
+
+func (l *Ledger) remove(key types.NamespacedName, releasedAt, now time.Time) bool {
 	g, ok := l.grants[key]
 	if !ok {
 		return false
@@ -284,7 +297,10 @@ func (l *Ledger) Remove(key types.NamespacedName, now time.Time) bool {
 	delete(l.grants, key)
 
 	if g.UID != "" {
-		l.releases[g.UID] = &Release{UID: g.UID, Namespace: g.Namespace, Nodes: g.Nodes, CreatedAt: g.CreatedAt, ReleasedAt: now}
+		l.releases[g.UID] = &Release{
+			UID: g.UID, Namespace: g.Namespace, Nodes: g.Nodes, CreatedAt: g.CreatedAt,
+			ReleasedAt: releasedAt, DropAt: now.Add(ReleaseRetention),
+		}
 	}
 
 	for _, n := range g.Nodes {
@@ -297,12 +313,18 @@ func (l *Ledger) Remove(key types.NamespacedName, now time.Time) bool {
 }
 
 // Reap removes grants that are expired at now or for which keep returns
-// false, and drops releases older than ReleaseRetention. It returns the
+// false, and drops releases at DropAt. Expired grants end at ExpiresAt;
+// other removals end at now. Release retention starts at now. It returns the
 // removed grants and the next time Reap has work to do (zero if never).
 func (l *Ledger) Reap(now time.Time, keep func(*Grant) bool) (removed []*Grant, next time.Time) {
 	for _, g := range l.Grants() {
 		if g.Expired(now) || (keep != nil && !keep(g)) {
-			l.Remove(g.Key(), now)
+			releasedAt := now
+			if g.Expired(now) {
+				releasedAt = g.ExpiresAt
+			}
+
+			l.remove(g.Key(), releasedAt, now)
 			removed = append(removed, g)
 
 			continue
@@ -314,11 +336,10 @@ func (l *Ledger) Reap(now time.Time, keep func(*Grant) bool) (removed []*Grant, 
 	}
 
 	for uid, r := range l.releases {
-		drop := r.ReleasedAt.Add(ReleaseRetention)
-		if !now.Before(drop) {
+		if !now.Before(r.DropAt) {
 			delete(l.releases, uid)
-		} else if next.IsZero() || drop.Before(next) {
-			next = drop
+		} else if next.IsZero() || r.DropAt.Before(next) {
+			next = r.DropAt
 		}
 	}
 

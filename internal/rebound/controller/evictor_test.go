@@ -141,6 +141,31 @@ func TestEvictorRelease(t *testing.T) {
 	require.ElementsMatch(t, []string{"tenant/before", "tenant/after", "other/unrelated", "tenant/elsewhere"}, remaining(t, c))
 }
 
+func TestEvictorLateExpiry(t *testing.T) {
+	g := grant("tenant", "g", "a", -time.Hour)
+	g.UID = "u1"
+	g.CreatedAt = g.ExpiresAt.Add(-time.Hour)
+
+	l := ledger.New()
+	require.NoError(t, l.Add(g))
+	removed, next := l.Reap(testNow, nil)
+	require.Equal(t, []*ledger.Grant{g}, removed)
+	require.Equal(t, testNow.Add(ledger.ReleaseRetention), next)
+
+	cm := configMap(t)
+	cm.Data = l.Encode()
+	r, c := newEvictor(t, cm, nil,
+		pod("tenant", "during", "a", g.CreatedAt.Add(time.Minute)),
+		pod("tenant", "at-expiry", "a", g.ExpiresAt),
+		pod("tenant", "after-expiry", "a", g.ExpiresAt.Add(time.Minute)),
+	)
+
+	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+	require.NoError(t, err)
+	require.Zero(t, result.RequeueAfter)
+	require.ElementsMatch(t, []string{"tenant/at-expiry", "tenant/after-expiry"}, remaining(t, c))
+}
+
 func TestEvictorExpiredGrantIsNotActive(t *testing.T) {
 	g := grant("tenant", "g", "a", 0)
 	r, c := newEvictor(t, configMap(t, g), nil, pod("other", "p", "a", testNow))

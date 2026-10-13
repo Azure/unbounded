@@ -105,7 +105,7 @@ func TestRemove(t *testing.T) {
 	require.Len(t, l.Grants(), 1)
 	require.Equal(t, []*Release{{
 		UID: "first", Namespace: "tenant", Nodes: []string{"node-a", "node-b"},
-		CreatedAt: g.CreatedAt, ReleasedAt: now,
+		CreatedAt: g.CreatedAt, ReleasedAt: now, DropAt: now.Add(ReleaseRetention),
 	}}, l.Releases())
 }
 
@@ -119,6 +119,8 @@ func TestReleaseRoundTrip(t *testing.T) {
 	require.Contains(t, data, "_release.first")
 	require.NotContains(t, data, "node-a")
 	require.Equal(t, data, Parse(data).Encode())
+	require.Equal(t, l.Releases(), Parse(data).Releases())
+	require.Equal(t, g.CreatedAt.Add(time.Minute+ReleaseRetention), Parse(data).Releases()[0].DropAt)
 
 	// Malformed release records are dropped.
 	data["_release.bad"] = "{"
@@ -136,6 +138,54 @@ func TestRemoveWithoutUIDRecordsNoRelease(t *testing.T) {
 	require.NoError(t, l.Add(g))
 	require.True(t, l.Remove(g.Key(), g.CreatedAt))
 	require.Empty(t, l.Releases())
+}
+
+func TestReleaseParseLegacyRetention(t *testing.T) {
+	for name, record := range map[string]string{
+		"missing": `{"namespace":"tenant","nodes":["node-a"],"releasedAt":"2026-10-13T13:00:00Z"}`,
+		"zero":    `{"namespace":"tenant","nodes":["node-a"],"releasedAt":"2026-10-13T13:00:00Z","dropAt":"0001-01-01T00:00:00Z"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := Parse(map[string]string{"_release.first": record})
+			require.Len(t, l.Releases(), 1)
+			r := l.Releases()[0]
+			require.Equal(t, r.ReleasedAt.Add(ReleaseRetention), r.DropAt)
+			_, next := l.Reap(r.ReleasedAt, nil)
+			require.Equal(t, r.DropAt, next)
+			_, next = l.Reap(r.DropAt, nil)
+			require.True(t, next.IsZero())
+			require.Empty(t, l.Releases())
+		})
+	}
+}
+
+func TestReapLateExpiry(t *testing.T) {
+	l := New()
+	g := testGrant("expired", "node-a")
+	require.NoError(t, l.Add(g))
+	now := g.ExpiresAt.Add(time.Hour)
+	dropAt := now.Add(ReleaseRetention)
+
+	removed, next := l.Reap(now, nil)
+	require.Equal(t, []*Grant{g}, removed)
+	require.Empty(t, l.Grants())
+	require.Equal(t, []*Release{{
+		UID: g.UID, Namespace: g.Namespace, Nodes: g.Nodes,
+		CreatedAt: g.CreatedAt, ReleasedAt: g.ExpiresAt, DropAt: dropAt,
+	}}, l.Releases())
+	require.Equal(t, dropAt, next)
+
+	// Persisting and reading the record must preserve its later drop deadline.
+	l = Parse(l.Encode())
+	removed, next = l.Reap(dropAt.Add(-time.Nanosecond), nil)
+	require.Empty(t, removed)
+	require.Len(t, l.Releases(), 1)
+	require.Equal(t, dropAt, next)
+
+	removed, next = l.Reap(dropAt, nil)
+	require.Empty(t, removed)
+	require.True(t, next.IsZero())
+	require.Empty(t, l.Encode())
 }
 
 func TestReap(t *testing.T) {
@@ -157,6 +207,13 @@ func TestReap(t *testing.T) {
 	require.Equal(t, now.Add(time.Minute), next)
 	require.Len(t, l.Grants(), 2)
 	require.Len(t, l.Releases(), 3)
+	require.Equal(t, now, l.Releases()[0].ReleasedAt)
+	require.Equal(t, now.Add(-time.Second), l.Releases()[1].ReleasedAt)
+	require.Equal(t, now, l.Releases()[2].ReleasedAt)
+
+	for _, r := range l.Releases() {
+		require.Equal(t, now.Add(ReleaseRetention), r.DropAt)
+	}
 
 	// Releases are kept for ReleaseRetention and drive the next reap.
 	removed, next = l.Reap(now.Add(time.Minute), nil)
