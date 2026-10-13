@@ -7,6 +7,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -825,77 +826,88 @@ func (gc *GatewayPoolController) reconcileNodeGatewayPoolAssignments(ctx context
 	}
 
 	now := time.Now()
+
+	var assignmentErrors []error
+
 	for _, node := range nodes {
-		desired, _ := gc.preferredGatewayPoolForNode(node, now)
-		if desired != "" {
-			if problems := validation.IsValidLabelValue(desired); len(problems) != 0 {
-				return fmt.Errorf("GatewayPool %q cannot be assigned to Node %q because its raw name is not a valid Kubernetes label value: %s", desired, node.Name, strings.Join(problems, "; "))
-			}
+		if err := gc.reconcileNodeGatewayPoolAssignment(ctx, node, now); err != nil {
+			assignmentErrors = append(assignmentErrors, err)
 		}
+	}
 
-		current := ""
-		if node.Labels != nil {
-			current = node.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]
+	return stderrors.Join(assignmentErrors...)
+}
+
+func (gc *GatewayPoolController) reconcileNodeGatewayPoolAssignment(ctx context.Context, node *corev1.Node, now time.Time) error {
+	desired, _ := gc.preferredGatewayPoolForNode(node, now)
+	if desired != "" {
+		if problems := validation.IsValidLabelValue(desired); len(problems) != 0 {
+			return fmt.Errorf("GatewayPool %q cannot be assigned to Node %q because its raw name is not a valid Kubernetes label value: %s", desired, node.Name, strings.Join(problems, "; "))
 		}
+	}
 
-		hasPort := node.Annotations != nil && node.Annotations[WireGuardPortAnnotation] != ""
-		if current == desired && (desired != "" || !hasPort) {
-			continue
-		}
+	current := ""
+	if node.Labels != nil {
+		current = node.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]
+	}
 
-		if node.UID == "" || node.ResourceVersion == "" {
-			return fmt.Errorf("cannot patch GatewayPool assignment on Node %q without cached UID and resourceVersion", node.Name)
-		}
+	hasPort := node.Annotations != nil && node.Annotations[WireGuardPortAnnotation] != ""
+	if current == desired && (desired != "" || !hasPort) {
+		return nil
+	}
 
-		patchOperations := []map[string]interface{}{
-			{"op": "test", "path": "/metadata/uid", "value": string(node.UID)},
-			{"op": "test", "path": "/metadata/resourceVersion", "value": node.ResourceVersion},
-		}
+	if node.UID == "" || node.ResourceVersion == "" {
+		return fmt.Errorf("cannot patch GatewayPool assignment on Node %q without cached UID and resourceVersion", node.Name)
+	}
 
-		if desired == "" {
-			if current != "" {
-				patchOperations = append(patchOperations, map[string]interface{}{
-					"op":   "remove",
-					"path": "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.GatewayPoolLabelKey),
-				})
-			}
+	patchOperations := []map[string]interface{}{
+		{"op": "test", "path": "/metadata/uid", "value": string(node.UID)},
+		{"op": "test", "path": "/metadata/resourceVersion", "value": node.ResourceVersion},
+	}
 
-			if hasPort {
-				patchOperations = append(patchOperations, map[string]interface{}{
-					"op":   "remove",
-					"path": "/metadata/annotations/" + escapeJSONPointer(WireGuardPortAnnotation),
-				})
-			}
-		} else if len(node.Labels) == 0 {
+	if desired == "" {
+		if current != "" {
 			patchOperations = append(patchOperations, map[string]interface{}{
-				"op":   "add",
-				"path": "/metadata/labels",
-				"value": map[string]string{
-					unboundednetv1alpha1.GatewayPoolLabelKey: desired,
-				},
-			})
-		} else {
-			patchOperations = append(patchOperations, map[string]interface{}{
-				"op":    "add",
-				"path":  "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.GatewayPoolLabelKey),
-				"value": desired,
+				"op":   "remove",
+				"path": "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.GatewayPoolLabelKey),
 			})
 		}
 
-		patch, err := json.Marshal(patchOperations)
-		if err != nil {
-			return fmt.Errorf("marshal GatewayPool assignment patch for Node %q: %w", node.Name, err)
+		if hasPort {
+			patchOperations = append(patchOperations, map[string]interface{}{
+				"op":   "remove",
+				"path": "/metadata/annotations/" + escapeJSONPointer(WireGuardPortAnnotation),
+			})
 		}
+	} else if len(node.Labels) == 0 {
+		patchOperations = append(patchOperations, map[string]interface{}{
+			"op":   "add",
+			"path": "/metadata/labels",
+			"value": map[string]string{
+				unboundednetv1alpha1.GatewayPoolLabelKey: desired,
+			},
+		})
+	} else {
+		patchOperations = append(patchOperations, map[string]interface{}{
+			"op":    "add",
+			"path":  "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.GatewayPoolLabelKey),
+			"value": desired,
+		})
+	}
 
-		if _, err := gc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
-			return fmt.Errorf(
-				"patch GatewayPool assignment on Node %q from cached UID %q and resourceVersion %q; retry after informer refresh: %w",
-				node.Name,
-				node.UID,
-				node.ResourceVersion,
-				err,
-			)
-		}
+	patch, err := json.Marshal(patchOperations)
+	if err != nil {
+		return fmt.Errorf("marshal GatewayPool assignment patch for Node %q: %w", node.Name, err)
+	}
+
+	if _, err := gc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf(
+			"patch GatewayPool assignment on Node %q from cached UID %q and resourceVersion %q; retry after informer refresh: %w",
+			node.Name,
+			node.UID,
+			node.ResourceVersion,
+			err,
+		)
 	}
 
 	return nil

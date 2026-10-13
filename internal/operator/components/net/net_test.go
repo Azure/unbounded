@@ -1471,6 +1471,8 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-gateway-pool-name
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-gateway-pool-name
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
@@ -1527,6 +1529,8 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-gateway-pool-name
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-gateway-pool-name
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
@@ -1598,6 +1602,8 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-gateway-pool-name
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-gateway-pool-name
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership

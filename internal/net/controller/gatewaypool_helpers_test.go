@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
@@ -29,6 +30,23 @@ import (
 type fakeInformer struct {
 	cache.SharedIndexInformer
 	store cache.Store
+}
+
+type orderedNodeLister struct {
+	corev1listers.NodeLister
+	nodes []*corev1.Node
+}
+
+func (l orderedNodeLister) List(selector labels.Selector) ([]*corev1.Node, error) {
+	var result []*corev1.Node
+
+	for _, node := range l.nodes {
+		if selector.Matches(labels.Set(node.Labels)) {
+			result = append(result, node)
+		}
+	}
+
+	return result, nil
 }
 
 func (f *fakeInformer) GetStore() cache.Store { return f.store }
@@ -1215,17 +1233,35 @@ func TestReconcileNodeGatewayPoolAssignments(t *testing.T) {
 				NodeSelector: map[string]string{"role": "gateway"},
 			},
 		}
-		client := kubefake.NewSimpleClientset(node)
+		validNode := makeGatewayNode("valid-gateway", map[string]string{"role": "valid-gateway"}, true, "pub-valid")
+		validNode.UID = "valid-uid"
+		validNode.ResourceVersion = "1"
+		validPool := &unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-pool"},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type:         gatewayPoolTypeExternal,
+				NodeSelector: map[string]string{"role": "valid-gateway"},
+			},
+		}
+		client := kubefake.NewSimpleClientset(node, validNode)
 
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 		if err := indexer.Add(node); err != nil {
 			t.Fatal(err)
 		}
 
+		if err := indexer.Add(validNode); err != nil {
+			t.Fatal(err)
+		}
+
 		controller := &GatewayPoolController{
 			clientset:           client,
 			nodeLister:          corev1listers.NewNodeLister(indexer),
-			gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &pool)},
+			gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &pool, validPool)},
+		}
+		controller.nodeLister = orderedNodeLister{
+			NodeLister: controller.nodeLister,
+			nodes:      []*corev1.Node{node, validNode},
 		}
 
 		err := controller.reconcileNodeGatewayPoolAssignments(t.Context())
@@ -1240,6 +1276,15 @@ func TestReconcileNodeGatewayPoolAssignments(t *testing.T) {
 
 		if _, ok := got.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]; ok {
 			t.Fatalf("invalid pool silently assigned: %#v", got.Labels)
+		}
+
+		gotValid, err := client.CoreV1().Nodes().Get(t.Context(), validNode.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if gotValid.Labels[unboundednetv1alpha1.GatewayPoolLabelKey] != validPool.Name {
+			t.Fatalf("valid assignment blocked by invalid pool: %#v", gotValid.Labels)
 		}
 	})
 
