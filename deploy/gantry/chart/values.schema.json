@@ -10,6 +10,7 @@
     "tolerations",
     "containerd",
     "nodeConfig",
+    "metricsService",
     "registryCredentials",
     "resources",
     "gantry"
@@ -140,6 +141,25 @@
         "reconcileIntervalSeconds": {
           "type": "integer",
           "minimum": 1
+        }
+      }
+    },
+    "metricsService": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "annotations"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       }
     },
