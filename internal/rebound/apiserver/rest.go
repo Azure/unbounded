@@ -59,11 +59,32 @@ func (*storage) GetSingularName() string          { return "nodegrant" }
 func (*storage) ShortNames() []string             { return []string{"ngr"} }
 func (*storage) DeleteReturnsDeletedObject() bool { return true }
 
-func (s *storage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
+func (s *storage) read(ctx context.Context, rv string) (snapshot, error) {
+	if rv == "" {
+		cm, err := s.store.Get(ctx)
+		if err != nil {
+			return snapshot{}, err
+		}
+
+		return snapshot{ledger: ledger.Parse(cm.Data), rv: cm.ResourceVersion}, nil
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current := s.history[len(s.history)-1]
+	return s.history[len(s.history)-1], nil
+}
+
+func (s *storage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	rv := ""
+	if options != nil {
+		rv = options.ResourceVersion
+	}
+
+	current, err := s.read(ctx, rv)
+	if err != nil {
+		return nil, err
+	}
 
 	g, ok := current.ledger.Get(types.NamespacedName{Namespace: request.NamespaceValue(ctx), Name: name})
 	if !ok || g.Expired(s.clock.Now()) {
@@ -79,10 +100,19 @@ func (s *storage) List(ctx context.Context, options *metainternal.ListOptions) (
 		return nil, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	rv := ""
+	if options != nil {
+		rv = options.ResourceVersion
+	}
 
-	current := s.history[len(s.history)-1]
+	current, err := s.read(ctx, rv)
+	if err != nil {
+		return nil, err
+	}
+
+	if options != nil && options.ResourceVersionMatch == metav1.ResourceVersionMatchExact && current.rv != rv {
+		return nil, apierrors.NewResourceExpired("requested resourceVersion is not available; relist")
+	}
 
 	result := &rebound.NodeGrantList{ListMeta: metav1.ListMeta{ResourceVersion: current.rv}, Items: []rebound.NodeGrant{}}
 	for _, g := range current.ledger.Grants() {
@@ -165,13 +195,6 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 			errs = append(errs, field.Invalid(path, node, strings.Join(problems, "; ")))
 		} else if seen[node] {
 			errs = append(errs, field.Duplicate(path, node))
-		} else {
-			_, err := s.store.Client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				errs = append(errs, field.Invalid(path, node, "node does not exist"))
-			} else if err != nil {
-				return nil, err
-			}
 		}
 
 		seen[node] = true
@@ -198,7 +221,26 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		}
 	}
 
-	_, rv, err := s.store.Update(ctx, options != nil && dryRun(options.DryRun), func(l *ledger.Ledger) error { return l.Add(record) })
+	_, rv, err := s.store.Update(ctx, options != nil && dryRun(options.DryRun), func(l *ledger.Ledger) error {
+		l.Reap(s.clock.Now(), nil)
+
+		var nodeErrors field.ErrorList
+
+		for i, node := range record.Nodes {
+			_, err := s.store.Client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				nodeErrors = append(nodeErrors, field.Invalid(field.NewPath("spec", "nodes").Index(i), node, "node does not exist"))
+			} else if err != nil {
+				return &mutationError{err}
+			}
+		}
+
+		if len(nodeErrors) != 0 {
+			return &mutationError{apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), g.Name, nodeErrors)}
+		}
+
+		return l.Add(record)
+	})
 	if err != nil {
 		return nil, storageError(g.Name, err)
 	}
@@ -258,7 +300,7 @@ func (s *storage) Delete(ctx context.Context, name string, validate rest.Validat
 
 	_, rv, err := s.store.Update(ctx, options != nil && dryRun(options.DryRun), func(l *ledger.Ledger) error {
 		g, ok := l.Get(types.NamespacedName{Namespace: request.NamespaceValue(ctx), Name: name})
-		if !ok || g.Expired(s.clock.Now()) {
+		if !ok {
 			return &mutationError{apierrors.NewNotFound(rebound.GroupResource(), name)}
 		}
 

@@ -22,6 +22,7 @@ import (
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	"k8s.io/apiserver/pkg/server/healthz"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -68,6 +69,8 @@ type ServerConfig struct {
 	Clock         clock.Clock
 	Authenticator authenticator.Request
 	Authorizer    authorizer.Authorizer
+	// ReadyzChecks are added to the server's /readyz endpoint.
+	ReadyzChecks []healthz.HealthChecker
 }
 
 type Server struct {
@@ -169,6 +172,8 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 	} else if err := o.Authorization.ApplyTo(&config.Authorization); err != nil {
 		return nil, err
 	}
+
+	config.AddReadyzChecks(cfg.ReadyzChecks...)
 
 	server, err := config.Complete(nil).New("rebound", genericapiserver.NewEmptyDelegate())
 	if err != nil {

@@ -135,14 +135,21 @@ func diff(old, next snapshot) []watch.Event {
 	for _, g := range old.ledger.Grants() {
 		n, ok := next.ledger.Get(g.Key())
 		if !ok || n.UID != g.UID {
-			events = append(events, watch.Event{Type: watch.Deleted, Object: grantObject(g, next.rv)})
+			events = append(events, watch.Event{Type: watch.Deleted, Object: grantObject(g, old.rv)})
 		}
 	}
 
 	for _, g := range next.ledger.Grants() {
 		o, ok := old.ledger.Get(g.Key())
 		if !ok || o.UID != g.UID {
-			events = append(events, watch.Event{Type: watch.Added, Object: grantObject(g, next.rv)})
+			events = append(events, watch.Event{Type: watch.Added, Object: grantObject(g, old.rv)})
+		}
+	}
+
+	// Only the final event advances the resume point past this batch.
+	if len(events) != 0 {
+		if g, ok := events[len(events)-1].Object.(*rebound.NodeGrant); ok {
+			g.ResourceVersion = next.rv
 		}
 	}
 

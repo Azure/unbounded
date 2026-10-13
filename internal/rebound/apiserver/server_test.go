@@ -194,24 +194,6 @@ func TestServer(t *testing.T) {
 		t.Fatalf("created: %s", data)
 	}
 
-	deadline = time.Now().Add(5 * time.Second)
-
-	for {
-		s.storage.mu.Lock()
-		rv := s.storage.history[len(s.storage.history)-1].rv
-		s.storage.mu.Unlock()
-
-		if rv == result.ResourceVersion {
-			break
-		}
-
-		if time.Now().After(deadline) {
-			t.Fatal("informer did not observe create")
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
-
 	data = requestHTTP(http.MethodGet, path+"/http-test", "application/json;as=Table;v=v1;g=meta.k8s.io", nil, http.StatusOK)
 
 	var table metav1.Table

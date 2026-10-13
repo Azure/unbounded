@@ -22,7 +22,8 @@ spec:
       expression: >-
         variables.isPod ?
           (has(object.spec) && has(object.spec.nodeName) ? object.spec.nodeName : '') :
-          (has(object.target) && has(object.target.kind) && object.target.kind == 'Node' &&
+          (has(object.target) &&
+           (!has(object.target.kind) || object.target.kind == '' || object.target.kind == 'Node') &&
            has(object.target.name) ? object.target.name : '')
     - name: ledger
       expression: "params != null && has(params.data) ? params.data : {}"

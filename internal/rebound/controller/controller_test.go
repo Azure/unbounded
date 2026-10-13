@@ -70,7 +70,7 @@ func TestReaper(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "live"}},
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "terminating", DeletionTimestamp: &metav1.Time{Time: testNow}, Finalizers: []string{"test"}}},
 	).Build()
-	r := &reaper{reader: reader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clocktesting.NewFakeClock(testNow)}
+	r := &reaper{reader: reader, apiReader: reader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clocktesting.NewFakeClock(testNow)}
 	result, err := r.Reconcile(t.Context(), ctrl.Request{})
 	require.NoError(t, err)
 	require.Equal(t, time.Minute+time.Second, result.RequeueAfter)
@@ -134,6 +134,68 @@ func TestReaperNamespaceErrorDoesNotWrite(t *testing.T) {
 
 	for _, action := range kube.Actions() {
 		require.Equal(t, "get", action.GetVerb())
+	}
+}
+
+func TestReaperConfirmsMissingNamespace(t *testing.T) {
+	sentinel := errors.New("namespace API failed")
+	for _, tt := range []struct {
+		name        string
+		namespace   *corev1.Namespace
+		readError   error
+		wantRemoved bool
+	}{
+		{name: "cache lags", namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}}},
+		{name: "missing", wantRemoved: true},
+		{name: "terminating", namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", DeletionTimestamp: &metav1.Time{Time: testNow}, Finalizers: []string{"test"}}}, wantRemoved: true},
+		{name: "API error", readError: sentinel},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := configMap(t, grant("tenant", "one", "a", time.Hour), grant("tenant", "two", "b", time.Hour))
+			kube := kubefake.NewClientset(cm)
+
+			builder := clientBuilder(t)
+			if tt.namespace != nil {
+				builder.WithObjects(tt.namespace)
+			}
+
+			reads := 0
+			apiReader := builder.WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					reads++
+
+					if tt.readError != nil {
+						return tt.readError
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				},
+			}).Build()
+			r := &reaper{reader: clientBuilder(t).Build(), apiReader: apiReader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clocktesting.NewFakeClock(testNow)}
+			result, err := r.Reconcile(t.Context(), ctrl.Request{})
+			require.ErrorIs(t, err, tt.readError)
+			require.Equal(t, 1, reads)
+
+			if !tt.wantRemoved {
+				for _, action := range kube.Actions() {
+					require.Equal(t, "get", action.GetVerb())
+				}
+			}
+
+			after, err := kube.CoreV1().ConfigMaps("system").Get(t.Context(), ledger.ConfigMapName, metav1.GetOptions{})
+			require.NoError(t, err)
+
+			if tt.wantRemoved {
+				require.Empty(t, after.Data)
+				require.Zero(t, result.RequeueAfter)
+			} else {
+				require.Equal(t, cm.Data, after.Data)
+
+				if tt.readError == nil {
+					require.Equal(t, time.Hour+time.Second, result.RequeueAfter)
+				}
+			}
+		})
 	}
 }
 
@@ -287,7 +349,7 @@ func TestMapLedgerAndPredicates(t *testing.T) {
 	).Build()
 	r := &nodeMirror{reader: c, namespace: "system"}
 	requests := r.mapLedger(t.Context(), cm)
-	require.Equal(t, []ctrl.Request{
+	require.ElementsMatch(t, []ctrl.Request{
 		{NamespacedName: types.NamespacedName{Name: "actual"}},
 		{NamespacedName: types.NamespacedName{Name: "both"}},
 		{NamespacedName: types.NamespacedName{Name: "desired"}},

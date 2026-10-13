@@ -468,7 +468,7 @@ func TestWatchReplacementSelectorsAndHistory(t *testing.T) {
 	cm.Data = l.Encode()
 	cm.ResourceVersion = "3"
 	s.observe(cm, false)
-	event(t, w, watch.Deleted, "first", "3")
+	event(t, w, watch.Deleted, "first", "2")
 	event(t, w, watch.Added, "first", "3")
 
 	for i := 4; i < 110; i++ {

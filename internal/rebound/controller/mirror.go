@@ -6,7 +6,6 @@ package controller
 import (
 	"context"
 	"reflect"
-	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -123,15 +122,8 @@ func (r *nodeMirror) mapLedger(ctx context.Context, obj client.Object) []ctrl.Re
 		}
 	}
 
-	sorted := make([]string, 0, len(names))
+	requests := make([]ctrl.Request, 0, len(names))
 	for name := range names {
-		sorted = append(sorted, name)
-	}
-
-	slices.Sort(sorted)
-
-	requests := make([]ctrl.Request, 0, len(sorted))
-	for _, name := range sorted {
 		requests = append(requests, ctrl.Request{NamespacedName: types.NamespacedName{Name: name}})
 	}
 

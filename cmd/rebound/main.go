@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	serverhealthz "k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	aggregator "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
@@ -171,6 +172,9 @@ func run(ctx context.Context, cfg config) error {
 			Client:    kube,
 			Namespace: cfg.namespace,
 			Cert:      provider,
+			ReadyzChecks: []serverhealthz.HealthChecker{
+				serverhealthz.NamedCheck("serving-cert", provider.Check),
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("create API server: %w", err)

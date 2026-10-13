@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net/http"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/clock"
 )
 
 var _ dynamiccertificates.CertKeyContentProvider = (*Provider)(nil)
@@ -29,6 +31,8 @@ type Provider struct {
 	cert, key []byte
 	listeners []dynamiccertificates.Listener
 	ready     chan struct{}
+	clock     clock.PassiveClock
+	leaf      *x509.Certificate
 }
 
 func NewProvider(client kubernetes.Interface, namespace string) *Provider {
@@ -39,6 +43,7 @@ func NewProvider(client kubernetes.Interface, namespace string) *Provider {
 	return &Provider{
 		informer: coreinformers.NewFilteredSecretInformer(client, namespace, 0, cache.Indexers{}, selectName(SecretName)),
 		ready:    make(chan struct{}),
+		clock:    clock.RealClock{},
 	}
 }
 
@@ -64,7 +69,19 @@ func (p *Provider) load(obj any) {
 	}
 
 	cert, key := secret.Data[corev1.TLSCertKey], secret.Data[corev1.TLSPrivateKeyKey]
-	if _, err := tls.X509KeyPair(cert, key); err != nil {
+
+	pair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		return
+	}
+
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return
+	}
+
+	now := p.clock.Now()
+	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
 		return
 	}
 
@@ -76,6 +93,7 @@ func (p *Provider) load(obj any) {
 
 	first := len(p.cert) == 0
 	p.cert, p.key = bytes.Clone(cert), bytes.Clone(key)
+	p.leaf = leaf
 
 	listeners := append([]dynamiccertificates.Listener(nil), p.listeners...)
 	if first {
@@ -107,26 +125,29 @@ func (p *Provider) NeedLeaderElection() bool { return false }
 func (p *Provider) HasSynced() bool { return p.informer.HasSynced() }
 
 func (p *Provider) Ready() bool {
-	select {
-	case <-p.ready:
-		return true
-	default:
-		return false
-	}
+	return p.Check(nil) == nil
 }
 
 func (p *Provider) WaitReady(ctx context.Context) error {
 	select {
 	case <-p.ready:
-		return nil
+		return p.Check(nil)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
 func (p *Provider) Check(_ *http.Request) error {
-	if !p.Ready() {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.leaf == nil {
 		return fmt.Errorf("serving certificate not loaded")
+	}
+
+	now := p.clock.Now()
+	if now.Before(p.leaf.NotBefore) || !now.Before(p.leaf.NotAfter) {
+		return fmt.Errorf("serving certificate is not valid now")
 	}
 
 	return nil

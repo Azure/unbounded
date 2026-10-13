@@ -62,7 +62,7 @@ func Setup(mgr ctrl.Manager, opts Options) error {
 		opts.Clock = clock.RealClock{}
 	}
 
-	reaper := &reaper{reader: mgr.GetCache(), store: opts.Store, clock: opts.Clock}
+	reaper := &reaper{reader: mgr.GetCache(), apiReader: mgr.GetAPIReader(), store: opts.Store, clock: opts.Clock}
 	filter := builder.WithPredicates(ledgerPredicate(opts.Namespace))
 
 	leader := runtimecontroller.Options{NeedLeaderElection: ptr.To(true)}

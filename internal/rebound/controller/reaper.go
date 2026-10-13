@@ -19,9 +19,10 @@ import (
 )
 
 type reaper struct {
-	reader client.Reader
-	store  *ledger.Store
-	clock  clock.Clock
+	reader    client.Reader
+	apiReader client.Reader
+	store     *ledger.Store
+	clock     clock.Clock
 }
 
 func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
@@ -46,6 +47,10 @@ func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, er
 			var ns corev1.Namespace
 
 			err := r.reader.Get(ctx, types.NamespacedName{Name: g.Namespace}, &ns)
+			if apierrors.IsNotFound(err) {
+				err = r.apiReader.Get(ctx, types.NamespacedName{Name: g.Namespace}, &ns)
+			}
+
 			if err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("get grant namespace %s: %w", g.Namespace, err)
 			}

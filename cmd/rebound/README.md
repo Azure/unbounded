@@ -75,4 +75,9 @@ Template values (set with `--set` on `render-manifests`):
 
 - The ledger must fit in one ConfigMap (about 900 KiB).
 - Watch history covers the last 100 ledger changes. Older resource versions get `410 Gone`.
+- Pod placement enforcement is eventual: the policy reads the ledger through the
+  API server's parameter cache. For a short time after a grant is created
+  (typically seconds), pods from other namespaces may still be placed on its nodes.
 - Pods already running on a node are not evicted when a grant is created.
+- The reaper enforces expiry shortly after `expiresAt`, so node restrictions may
+  linger briefly.

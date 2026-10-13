@@ -117,6 +117,42 @@ func TestPodPlacementCEL(t *testing.T) {
 	}
 }
 
+func TestBindingTargetKindCEL(t *testing.T) {
+	t.Parallel()
+
+	objects := renderObjects(t, nil)
+	policy := decodeObject[admissionv1.ValidatingAdmissionPolicy](t, objects, "ValidatingAdmissionPolicy/rebound-pod-placement")
+	ledger := map[string]any{"data": map[string]string{"node-a": "team-a/grant-a"}}
+
+	for _, resource := range []string{"pods", "bindings"} {
+		for _, target := range []struct {
+			name   string
+			fields map[string]any
+		}{
+			{"missing kind", map[string]any{"name": "node-a"}},
+			{"empty kind", map[string]any{"kind": "", "name": "node-a"}},
+			{"Node kind", map[string]any{"kind": "Node", "name": "node-a"}},
+		} {
+			for _, namespace := range []string{"team-a", "team-b"} {
+				t.Run(resource+"/"+target.name+"/"+namespace, func(t *testing.T) {
+					subresource := ""
+					if resource == "pods" {
+						subresource = "binding"
+					}
+
+					require.Equal(t, namespace == "team-a", policyAllows(t, policy, map[string]any{
+						"object": map[string]any{"metadata": map[string]any{}, "target": target.fields},
+						"params": ledger,
+						"request": map[string]any{
+							"namespace": namespace, "resource": map[string]any{"resource": resource}, "subResource": subresource,
+						},
+					}))
+				})
+			}
+		}
+	}
+}
+
 func nodeObject(labels map[string]string, taints ...map[string]any) map[string]any {
 	metadata := map[string]any{}
 	if labels != nil {
@@ -176,6 +212,40 @@ func TestNodeKeysCEL(t *testing.T) {
 				"object": tc.obj, "oldObject": tc.old, "request": map[string]any{"userInfo": userInfo},
 			}))
 		})
+	}
+}
+
+func TestNodeStatusKeysCEL(t *testing.T) {
+	t.Parallel()
+
+	objects := renderObjects(t, nil)
+	policy := decodeObject[admissionv1.ValidatingAdmissionPolicy](t, objects, "ValidatingAdmissionPolicy/rebound-node-keys")
+
+	for _, key := range []string{"rebound.unbounded-cloud.io/namespace", "rebound.unbounded-cloud.io/grant"} {
+		for _, tc := range []struct {
+			name        string
+			old, labels map[string]string
+			allowed     bool
+		}{
+			{"added", nil, map[string]string{key: "team-a"}, false},
+			{"removed", map[string]string{key: "team-a"}, nil, false},
+			{"changed", map[string]string{key: "team-a"}, map[string]string{key: "team-b"}, false},
+			{"unchanged", map[string]string{key: "team-a"}, map[string]string{key: "team-a"}, true},
+			{"unrelated", nil, map[string]string{"example.test/key": "value"}, true},
+		} {
+			t.Run(key+"/"+tc.name, func(t *testing.T) {
+				obj := nodeObject(tc.labels)
+				obj["status"] = map[string]any{"phase": "Running"}
+
+				require.Equal(t, tc.allowed, policyAllows(t, policy, map[string]any{
+					"object": obj, "oldObject": nodeObject(tc.old),
+					"request": map[string]any{
+						"resource": map[string]any{"resource": "nodes"}, "subResource": "status",
+						"userInfo": map[string]any{"username": "system:node:node-a", "groups": []string{"system:nodes"}},
+					},
+				}))
+			})
+		}
 	}
 }
 

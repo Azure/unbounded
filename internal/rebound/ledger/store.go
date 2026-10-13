@@ -40,7 +40,7 @@ func (s *Store) Update(ctx context.Context, dryRun bool, mutate func(*Ledger) er
 	)
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		cm, err := s.get(ctx)
+		cm, err := s.Get(ctx)
 		if err != nil {
 			return err
 		}
@@ -90,9 +90,9 @@ func (s *Store) Update(ctx context.Context, dryRun bool, mutate func(*Ledger) er
 	return out, rv, nil
 }
 
-// get returns the ledger ConfigMap, or an unsaved empty one if it does not
+// Get reads the ledger ConfigMap live, or returns an unsaved empty one if it does not
 // exist yet.
-func (s *Store) get(ctx context.Context) (*corev1.ConfigMap, error) {
+func (s *Store) Get(ctx context.Context) (*corev1.ConfigMap, error) {
 	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return &corev1.ConfigMap{

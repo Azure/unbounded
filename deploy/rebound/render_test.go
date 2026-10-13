@@ -153,7 +153,7 @@ func TestRender(t *testing.T) {
 					require.Equal(t, []string{"pods", "pods/binding", "bindings"}, policy.Spec.MatchConstraints.ResourceRules[0].Resources)
 				} else {
 					require.Nil(t, binding.Spec.ParamRef)
-					require.Equal(t, []string{"nodes"}, policy.Spec.MatchConstraints.ResourceRules[0].Resources)
+					require.Equal(t, []string{"nodes", "nodes/status"}, policy.Spec.MatchConstraints.ResourceRules[0].Resources)
 				}
 			}
 
@@ -168,15 +168,16 @@ func assertRBAC(t *testing.T, objects map[string]*unstructured.Unstructured, nam
 	role := decodeObject[rbacv1.Role](t, objects, "Role/rebound")
 	require.Equal(t, namespace, role.Namespace)
 	require.Equal(t, []rbacv1.PolicyRule{
-		{APIGroups: []string{""}, Resources: []string{"configmaps", "secrets"}, Verbs: []string{"get", "list", "watch", "create"}},
-		{APIGroups: []string{""}, Resources: []string{"configmaps"}, ResourceNames: []string{"rebound-ledger"}, Verbs: []string{"update", "patch"}},
-		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"rebound-serving"}, Verbs: []string{"update", "patch"}},
-		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch"}},
+		{APIGroups: []string{""}, Resources: []string{"configmaps", "secrets"}, Verbs: []string{"create"}},
+		{APIGroups: []string{""}, Resources: []string{"configmaps"}, ResourceNames: []string{"rebound-ledger"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"rebound-serving"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"create"}},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, ResourceNames: []string{"rebound"}, Verbs: []string{"get", "update"}},
 		{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
 	}, role.Rules)
 
 	for resource, name := range map[string]string{"configmaps": "rebound-ledger", "secrets": "rebound-serving"} {
-		for _, verb := range []string{"update", "patch"} {
+		for _, verb := range []string{"get", "list", "watch", "update", "patch"} {
 			found := false
 
 			for _, rule := range role.Rules {

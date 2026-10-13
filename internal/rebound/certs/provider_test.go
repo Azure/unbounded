@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
@@ -40,6 +41,7 @@ func eventually(t *testing.T, condition func() bool) {
 func TestProviderWatchReadinessAndHotSwap(t *testing.T) {
 	r, clock := fixture()
 	p := NewProvider(r.Client, "unbounded-system")
+	p.clock = clock
 	l := &listener{}
 	p.AddListener(l)
 
@@ -175,5 +177,85 @@ func TestWaitReadyCancellation(t *testing.T) {
 
 	if err := p.WaitReady(ctx); err != context.Canceled {
 		t.Fatalf("wanted canceled, got %v", err)
+	}
+}
+
+func TestProviderCertificateValidity(t *testing.T) {
+	r, clock := fixture()
+	reconcile(t, r)
+	secret := getSecret(t, r)
+	leaf, err := parseCertificate(secret.Data[corev1.TLSCertKey])
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name string
+		now  time.Time
+	}{
+		{name: "not yet valid", now: leaf.NotBefore.Add(-time.Second)},
+		{name: "expired", now: leaf.NotAfter},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clock.SetTime(tt.now)
+
+			p := NewProvider(r.Client, "")
+			p.clock = clock
+			l := &listener{}
+			p.AddListener(l)
+			p.load(secret)
+			require.False(t, p.Ready())
+			require.ErrorContains(t, p.Check(nil), "not loaded")
+			cert, key := p.CurrentCertKeyContent()
+			require.Empty(t, cert)
+			require.Empty(t, key)
+			require.Zero(t, l.calls.Load())
+		})
+	}
+
+	clock.SetTime(leaf.NotBefore)
+
+	p := NewProvider(r.Client, "")
+	p.clock = clock
+	p.load(secret)
+	require.NoError(t, p.Check(nil))
+	require.NoError(t, p.WaitReady(t.Context()))
+
+	clock.SetTime(leaf.NotAfter.Add(-time.Nanosecond))
+	require.True(t, p.Ready())
+	clock.SetTime(leaf.NotAfter)
+	require.False(t, p.Ready())
+	require.ErrorContains(t, p.Check(nil), "not valid now")
+	require.Error(t, p.WaitReady(t.Context()))
+
+	reconcile(t, r)
+	p.load(getSecret(t, r))
+	require.True(t, p.Ready())
+	require.NoError(t, p.Check(nil))
+}
+
+func TestProviderRetainsValidPair(t *testing.T) {
+	r, clock := fixture()
+	reconcile(t, r)
+	secret := getSecret(t, r)
+	p := NewProvider(r.Client, "")
+	p.clock = clock
+	l := &listener{}
+	p.AddListener(l)
+	p.load(secret)
+
+	ca, signer, err := loadCA(secret.Data["ca.crt"], secret.Data["ca.key"], clock.Now())
+	require.NoError(t, err)
+
+	for _, offset := range []time.Duration{-2 * time.Hour, time.Hour} {
+		cert, key, err := issue(clock.Now().Add(offset), time.Hour, r.dnsNames(), ca, signer)
+		require.NoError(t, err)
+
+		bad := secret.DeepCopy()
+		bad.Data[corev1.TLSCertKey], bad.Data[corev1.TLSPrivateKeyKey] = cert, key
+		p.load(bad)
+		currentCert, currentKey := p.CurrentCertKeyContent()
+		require.Equal(t, secret.Data[corev1.TLSCertKey], currentCert)
+		require.Equal(t, secret.Data[corev1.TLSPrivateKeyKey], currentKey)
+		require.EqualValues(t, 1, l.calls.Load())
+		require.NoError(t, p.Check(nil))
 	}
 }
