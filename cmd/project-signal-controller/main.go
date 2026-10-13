@@ -74,11 +74,6 @@ func run(ctx context.Context, cfg config) error {
 		return errors.New("namespace and script namespace are required")
 	}
 
-	evidence, err := projectsignal.NewKubernetesEvidenceStore(cfg.namespace)
-	if err != nil {
-		return err
-	}
-
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		return err
@@ -92,9 +87,12 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
+	watchedNamespaces := map[string]cache.Config{cfg.namespace: {}}
+	watchedNamespaces[cfg.scriptNamespace] = cache.Config{}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                        scheme,
-		Cache:                         cache.Options{DefaultNamespaces: map[string]cache.Config{cfg.namespace: {}}},
+		Cache:                         cache.Options{DefaultNamespaces: watchedNamespaces},
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddress},
 		HealthProbeBindAddress:        cfg.probeAddress,
 		LeaderElection:                cfg.leaderElect,
@@ -104,6 +102,11 @@ func run(ctx context.Context, cfg config) error {
 	})
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)
+	}
+
+	evidence, err := projectsignal.NewKubernetesEvidenceStore(mgr.GetClient(), cfg.namespace)
+	if err != nil {
+		return err
 	}
 
 	if _, err := mgr.GetRESTMapper().RESTMapping(schema.GroupKind{Group: "argoproj.io", Kind: "Workflow"}, "v1alpha1"); err != nil {

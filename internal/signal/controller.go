@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -350,7 +351,11 @@ func (r *AdmissionReconciler) reserveParticipants(ctx context.Context, participa
 		}
 
 		node.Annotations[ReservationLabel] = runName
-		if err := r.Patch(ctx, &node, client.MergeFrom(before)); err != nil {
+		if err := r.Patch(
+			ctx,
+			&node,
+			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
+		); err != nil {
 			return errors.Join(
 				fmt.Errorf("reserve participant %s: %w", participant.NodeName, err),
 				r.releaseParticipants(context.WithoutCancel(ctx), reserved, runName),
@@ -373,6 +378,10 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 				errs = append(errs, err)
 			}
 
+			continue
+		}
+
+		if participant.NodeUID != "" && node.UID != participant.NodeUID {
 			continue
 		}
 
@@ -504,7 +513,11 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 }
 
 func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.CertificationRun, attempt int32) (ctrl.Result, error) {
-	workflow := buildWorkflow(run, attempt)
+	workflow, err := buildWorkflow(run, attempt)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.Create(ctx, workflow); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, fmt.Errorf("create Workflow attempt %d: %w", attempt, err)
@@ -551,10 +564,21 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 	return ctrl.Result{}, nil
 }
 
-func buildWorkflow(run *signalv1.CertificationRun, attempt int32) *unstructured.Unstructured {
+func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured.Unstructured, error) {
 	participantNames := make([]string, 0, len(run.Spec.Participants))
 	for _, participant := range run.Spec.Participants {
 		participantNames = append(participantNames, participant.NodeName)
+	}
+
+	tolerations := append([]corev1.Toleration{{
+		Key:      "nvidia.com/gpu",
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}, run.Spec.Tolerations...)
+
+	tolerationsJSON, err := json.Marshal(tolerations)
+	if err != nil {
+		return nil, fmt.Errorf("encode Workflow tolerations: %w", err)
 	}
 
 	name := fmt.Sprintf("%s-a%d", run.Name, attempt)
@@ -594,6 +618,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) *unstructured.
 					map[string]any{"name": "backend-kind", "value": run.Spec.Backend.Kind},
 					map[string]any{"name": "queue", "value": run.Spec.Backend.Queue},
 					map[string]any{"name": "runner-image", "value": run.Spec.RunnerImage},
+					map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
 					map[string]any{"name": "expected-gpu-product-regex", "value": run.Spec.Parameters["expected-gpu-product-regex"]},
 					map[string]any{"name": "expected-gpu-count", "value": run.Spec.Parameters["expected-gpu-count"]},
 					map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
@@ -605,7 +630,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) *unstructured.
 		*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun")),
 	})
 
-	return workflow
+	return workflow, nil
 }
 
 func (r *RunReconciler) retryOrFinish(
@@ -716,15 +741,13 @@ func (r *RunReconciler) evidenceDocument(
 }
 
 func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
-	if run.Status.Workflow.Name != "" {
-		workflow := &unstructured.Unstructured{}
-		workflow.SetGroupVersionKind(workflowGVK)
-		workflow.SetNamespace(run.Namespace)
-		workflow.SetName(run.Status.Workflow.Name)
+	stopped, err := r.ensureWorkflowStopped(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
-		if err := r.Delete(ctx, workflow); err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
+	if !stopped {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	before := run.DeepCopy()
@@ -792,6 +815,15 @@ func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.Cer
 		return ctrl.Result{}, nil
 	}
 
+	stopped, err := r.ensureWorkflowStopped(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !stopped {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
 	if _, err := r.releaseRunReservations(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -817,6 +849,10 @@ func (r *RunReconciler) releaseRunReservations(ctx context.Context, run *signalv
 			return false, err
 		}
 
+		if participant.NodeUID != "" && node.UID != participant.NodeUID {
+			continue
+		}
+
 		if node.Annotations[ReservationLabel] != run.Name {
 			continue
 		}
@@ -838,6 +874,10 @@ func (r *RunReconciler) clearRequest(ctx context.Context, run *signalv1.Certific
 		return client.IgnoreNotFound(err)
 	}
 
+	if requestNodeUID := participantNodeUID(run, run.Spec.RequestNodeName); requestNodeUID != "" && node.UID != requestNodeUID {
+		return nil
+	}
+
 	if node.Labels[RequestLabel] != run.Spec.Profile.Name {
 		return nil
 	}
@@ -846,6 +886,42 @@ func (r *RunReconciler) clearRequest(ctx context.Context, run *signalv1.Certific
 	delete(node.Labels, RequestLabel)
 
 	return r.Patch(ctx, &node, client.MergeFrom(before))
+}
+
+func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1.CertificationRun) (bool, error) {
+	if run.Status.Workflow.Name == "" {
+		return true, nil
+	}
+
+	workflow := &unstructured.Unstructured{}
+	workflow.SetGroupVersionKind(workflowGVK)
+	workflow.SetNamespace(run.Namespace)
+	workflow.SetName(run.Status.Workflow.Name)
+
+	propagation := metav1.DeletePropagationForeground
+	if err := r.Delete(ctx, workflow, client.PropagationPolicy(propagation)); err != nil && !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("delete Workflow before releasing participants: %w", err)
+	}
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+
+		return false, fmt.Errorf("confirm Workflow deletion: %w", err)
+	}
+
+	return false, nil
+}
+
+func participantNodeUID(run *signalv1.CertificationRun, nodeName string) types.UID {
+	for _, participant := range run.Spec.Participants {
+		if participant.NodeName == nodeName {
+			return participant.NodeUID
+		}
+	}
+
+	return ""
 }
 
 func workflowParameter(workflow *unstructured.Unstructured, name string) string {

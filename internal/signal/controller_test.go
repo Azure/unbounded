@@ -227,13 +227,76 @@ func TestDeletingRunClearsReservationAndRequest(t *testing.T) {
 	}
 }
 
+func TestCancellationWaitsForWorkflowDeletionBeforeReleasingNode(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("canceling-run")
+	run.Spec.Cancel = true
+	run.Status.Phase = signalv1.RunPhaseRunning
+	run.Status.Workflow = signalv1.WorkflowStatus{Name: "canceling-run-a1", Attempt: 1}
+	node := readyNode(run.Spec.RequestNodeName, "A100")
+	node.Annotations = map[string]string{ReservationLabel: run.Name}
+	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Running", "", "")
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, node, workflow).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(
+				_ context.Context,
+				_ client.WithWatch,
+				_ client.Object,
+				_ ...client.DeleteOption,
+			) error {
+				return nil
+			},
+		}).
+		Build()
+	reconciler := &RunReconciler{Client: kube}
+
+	result, err := reconciler.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)},
+	)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Fatal("cancellation did not wait for Workflow deletion")
+	}
+
+	var gotRun signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &gotRun); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotRun.Status.Phase.Terminal() {
+		t.Fatalf("run became terminal before Workflow deletion: %#v", gotRun.Status)
+	}
+
+	var gotNode corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &gotNode); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotNode.Annotations[ReservationLabel] != run.Name {
+		t.Fatalf("reservation was released before Workflow deletion: %v", gotNode.Annotations)
+	}
+}
+
 func TestWorkflowPinsAttemptInputs(t *testing.T) {
 	t.Parallel()
 
 	run := testRun("run-1")
 	run.UID = types.UID("run-uid")
 
-	workflow := buildWorkflow(run, 2)
+	workflow, err := buildWorkflow(run, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if workflow.GetName() != "run-1-a2" {
 		t.Fatalf("workflow name = %q", workflow.GetName())
 	}
@@ -269,6 +332,10 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 	if values["script-configmap"] != run.Spec.Script.ConfigMapName || values["script-configmap"] == "scripts" {
 		t.Fatalf("workflow must mount the immutable snapshot, values = %#v", values)
 	}
+
+	if !strings.Contains(values["tolerations"], `"key":"nvidia.com/gpu"`) {
+		t.Fatalf("workflow tolerations = %q", values["tolerations"])
+	}
 }
 
 func TestStartAttemptRecoversExistingOwnedWorkflow(t *testing.T) {
@@ -276,7 +343,12 @@ func TestStartAttemptRecoversExistingOwnedWorkflow(t *testing.T) {
 
 	scheme := testScheme(t)
 	run := testRun("run-recovered")
-	workflow := buildWorkflow(run, 1)
+
+	workflow, err := buildWorkflow(run, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	workflow.SetUID("workflow-uid")
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).

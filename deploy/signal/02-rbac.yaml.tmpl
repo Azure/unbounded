@@ -81,6 +81,32 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
+  name: project-signal-script-reader
+  namespace: {{ default (default "project-signal" .Namespace) .ScriptNamespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: project-signal-script-reader
+  namespace: {{ default (default "project-signal" .Namespace) .ScriptNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: project-signal-script-reader
+subjects:
+  - kind: ServiceAccount
+    name: project-signal-controller
+    namespace: {{ default "project-signal" .Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
   name: project-signal-runner
   namespace: {{ default "project-signal" .Namespace }}
 rules:

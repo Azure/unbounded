@@ -229,6 +229,31 @@ spec:
             - script
             - workflow
             type: object
+            x-kubernetes-validations:
+            - message: profile is immutable
+              rule: self.profile == oldSelf.profile
+            - message: participants are immutable
+              rule: self.participants == oldSelf.participants
+            - message: script is immutable
+              rule: self.script == oldSelf.script
+            - message: workflow is immutable
+              rule: self.workflow == oldSelf.workflow
+            - message: backend is immutable
+              rule: self.backend == oldSelf.backend
+            - message: runnerImage is immutable
+              rule: self.runnerImage == oldSelf.runnerImage
+            - message: parameters are immutable
+              rule: self.parameters == oldSelf.parameters
+            - message: evidencePath is immutable
+              rule: self.evidencePath == oldSelf.evidencePath
+            - message: deadline is immutable
+              rule: self.deadline == oldSelf.deadline
+            - message: maxAttempts is immutable
+              rule: self.maxAttempts == oldSelf.maxAttempts
+            - message: tolerations are immutable
+              rule: self.tolerations == oldSelf.tolerations
+            - message: requestNodeName is immutable
+              rule: self.requestNodeName == oldSelf.requestNodeName
           status:
             properties:
               cleanup:

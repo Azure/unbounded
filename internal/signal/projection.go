@@ -164,6 +164,10 @@ func projectParticipants(
 				return client.IgnoreNotFound(err)
 			}
 
+			if participant.NodeUID != "" && node.UID != participant.NodeUID {
+				return nil
+			}
+
 			before := node.DeepCopy()
 			ensureProjectionMaps(&node)
 

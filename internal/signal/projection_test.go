@@ -129,6 +129,32 @@ func TestNodeProjectionDoesNotRegressAfterRestartOrOlderRetry(t *testing.T) {
 	}
 }
 
+func TestNodeProjectionDoesNotCertifyReplacementNode(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	replacement := readyNode("gpu-0", "A100")
+	replacement.UID = "replacement-uid"
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(replacement).Build()
+	run := testRun("run-pass")
+	run.Status.Phase = signalv1.RunPhaseSucceeded
+	run.Status.Verdict = "Pass"
+	run.Status.FinishedAt = ptrTime(metav1.Now())
+
+	if err := projectTerminal(context.Background(), kube, run); err != nil {
+		t.Fatal(err)
+	}
+
+	var got corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: replacement.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Labels[StateLabel] != "" || got.Labels[EligibilityLabel] != "" {
+		t.Fatalf("replacement Node was certified: labels=%v", got.Labels)
+	}
+}
+
 func TestProjectionValuesAreBoundedAndValid(t *testing.T) {
 	t.Parallel()
 

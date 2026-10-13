@@ -25,6 +25,9 @@ spec:
       - name: backend-kind
       - name: queue
       - name: runner-image
+      - name: tolerations
+        value: >-
+          [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
       - name: expected-gpu-product-regex
         value: "^$"
       - name: expected-gpu-count
@@ -56,10 +59,8 @@ spec:
     - name: node-health
       nodeSelector:
         kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
-      tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
+      podSpecPatch: >-
+        {"tolerations": {{`{{workflow.parameters.tolerations}}`}}}
       container:
         image: "{{`{{workflow.parameters.runner-image}}`}}"
         imagePullPolicy: IfNotPresent
@@ -134,10 +135,7 @@ spec:
                     restartPolicy: Never
                     nodeSelector:
                       kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
-                    tolerations:
-                      - key: nvidia.com/gpu
-                        operator: Exists
-                        effect: NoSchedule
+                    tolerations: {{`{{workflow.parameters.tolerations}}`}}
                     containers:
                       - name: worker
                         image: "{{`{{workflow.parameters.runner-image}}`}}"

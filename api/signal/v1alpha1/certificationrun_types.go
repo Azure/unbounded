@@ -46,6 +46,18 @@ type ScriptSnapshot struct {
 	Digest        string `json:"digest"`
 }
 
+// +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
+// +kubebuilder:validation:XValidation:rule="self.participants == oldSelf.participants",message="participants are immutable"
+// +kubebuilder:validation:XValidation:rule="self.script == oldSelf.script",message="script is immutable"
+// +kubebuilder:validation:XValidation:rule="self.workflow == oldSelf.workflow",message="workflow is immutable"
+// +kubebuilder:validation:XValidation:rule="self.backend == oldSelf.backend",message="backend is immutable"
+// +kubebuilder:validation:XValidation:rule="self.runnerImage == oldSelf.runnerImage",message="runnerImage is immutable"
+// +kubebuilder:validation:XValidation:rule="self.parameters == oldSelf.parameters",message="parameters are immutable"
+// +kubebuilder:validation:XValidation:rule="self.evidencePath == oldSelf.evidencePath",message="evidencePath is immutable"
+// +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
+// +kubebuilder:validation:XValidation:rule="self.maxAttempts == oldSelf.maxAttempts",message="maxAttempts is immutable"
+// +kubebuilder:validation:XValidation:rule="self.tolerations == oldSelf.tolerations",message="tolerations are immutable"
+// +kubebuilder:validation:XValidation:rule="self.requestNodeName == oldSelf.requestNodeName",message="requestNodeName is immutable"
 type CertificationRunSpec struct {
 	Profile      PinnedProfile     `json:"profile"`
 	Participants []Participant     `json:"participants"`
