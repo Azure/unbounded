@@ -5,11 +5,14 @@ package apiserver
 
 import (
 	"context"
+	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternal "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	"k8s.io/apimachinery/pkg/watch"
+	apistorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/client-go/tools/cache"
 
 	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
@@ -18,11 +21,14 @@ import (
 
 const historyLimit = 100
 
+var watchHistoryTimeout = 3 * time.Second
+
 type legacyWatchKey struct{}
 
 type snapshot struct {
-	ledger *ledger.Ledger
-	rv     string
+	ledger  *ledger.Ledger
+	rv      string
+	changed chan struct{}
 }
 
 type grantWatch struct {
@@ -54,7 +60,15 @@ func (s *storage) Destroy() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed {
+		return
+	}
+
 	s.closed = true
+	if changed := s.history[len(s.history)-1].changed; changed != nil {
+		close(changed)
+	}
+
 	for w := range s.watchers {
 		w.stopLocked()
 	}
@@ -92,17 +106,9 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 			}
 		}
 	} else {
-		index := -1
-
-		for i, snap := range s.history {
-			if snap.rv == options.ResourceVersion {
-				index = i
-				break
-			}
-		}
-
-		if index < 0 {
-			return nil, apierrors.NewResourceExpired("resourceVersion is not in ledger history; relist")
+		index, err := s.watchHistoryIndex(ctx, options.ResourceVersion)
+		if err != nil {
+			return nil, err
 		}
 
 		for i := index + 1; i < len(s.history); i++ {
@@ -126,6 +132,70 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 	}()
 
 	return w, nil
+}
+
+// watchHistoryIndex is called with s.mu held and returns with it held.
+func (s *storage) watchHistoryIndex(ctx context.Context, rv string) (int, error) {
+	requested, err := strconv.ParseUint(rv, 10, 64)
+	if err != nil {
+		return -1, apierrors.NewResourceExpired("resourceVersion is not in ledger history; relist")
+	}
+
+	timer := time.NewTimer(watchHistoryTimeout)
+	defer timer.Stop()
+
+	timedOut := false
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return -1, err
+		}
+
+		if s.closed {
+			return -1, apierrors.NewServiceUnavailable("storage is closed")
+		}
+
+		latest := &s.history[len(s.history)-1]
+
+		newest, err := strconv.ParseUint(latest.rv, 10, 64)
+		if err != nil {
+			return -1, apierrors.NewResourceExpired("ledger resourceVersion is invalid; relist")
+		}
+
+		if newest >= requested {
+			// History contains every informer observation. Revision gaps can include
+			// unrelated writes or coalesced updates; replay from the floor so the
+			// next observed transition is not skipped.
+			for i := len(s.history) - 1; i >= 0; i-- {
+				version, err := strconv.ParseUint(s.history[i].rv, 10, 64)
+				if err == nil && version <= requested {
+					return i, nil
+				}
+			}
+
+			return -1, apierrors.NewResourceExpired("resourceVersion is not in ledger history; relist")
+		}
+
+		if timedOut {
+			return -1, apistorage.NewTooLargeResourceVersionError(requested, newest, 1)
+		}
+
+		if latest.changed == nil {
+			latest.changed = make(chan struct{})
+		}
+
+		changed := latest.changed
+		s.mu.Unlock()
+
+		select {
+		case <-changed:
+		case <-ctx.Done():
+		case <-timer.C:
+			timedOut = true
+		}
+
+		s.mu.Lock()
+	}
 }
 
 type eventBatch struct {
@@ -190,6 +260,10 @@ func (s *storage) observe(obj interface{}, deleted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed {
+		return
+	}
+
 	old := s.history[len(s.history)-1]
 	if !deleted && old.rv == next.rv {
 		return
@@ -209,8 +283,17 @@ func (s *storage) observe(obj interface{}, deleted bool) {
 		}
 	}
 
+	// The empty RV 0 seed is not an observed state before the initial list.
+	if len(s.history) == 1 && old.rv == "0" {
+		s.history = nil
+	}
+
 	s.history = append(s.history, next)
 	if len(s.history) > historyLimit {
 		s.history = s.history[len(s.history)-historyLimit:]
+	}
+
+	if old.changed != nil {
+		close(old.changed)
 	}
 }
