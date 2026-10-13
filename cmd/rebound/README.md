@@ -41,7 +41,8 @@ kubectl delete ngr train
   resourceVersion, so two racing creates cannot both win.
 - The `rebound-pod-placement` ValidatingAdmissionPolicy reads the ledger as its
   param. It denies pods and bindings that target a granted node from any other
-  namespace. Namespaces in `ExcludedNamespaces` and mirror pods are always allowed.
+  namespace. Namespaces in `ExcludedNamespaces` and mirror pods created by the
+  node's own kubelet are always allowed.
 - The leader removes expired grants and grants whose namespace is gone. It also
   marks granted nodes with:
   - label `rebound.unbounded-cloud.io/namespace=<namespace>`

@@ -75,25 +75,29 @@ func TestPodPlacementCEL(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, namespace, node, resource, subresource string
+		user                                         string
 		mirror                                       bool
 		params                                       any
 		allowed                                      bool
 	}{
-		{"free node", "team-b", "free", "pods", "", false, ledger, true},
-		{"same namespace", "team-a", "node-a", "pods", "", false, ledger, true},
-		{"other namespace", "team-b", "node-a", "pods", "", false, ledger, false},
-		{"namespace prefix", "team", "node-a", "pods", "", false, ledger, false},
-		{"excluded system", "kube-system", "node-a", "pods", "", false, ledger, true},
-		{"excluded operator", "unbounded-system", "node-a", "pods", "", false, ledger, true},
-		{"mirror", "team-b", "node-a", "pods", "", true, ledger, true},
-		{"unscheduled", "team-b", "", "pods", "", false, ledger, true},
-		{"binding denied", "team-b", "node-a", "pods", "binding", false, ledger, false},
-		{"binding same namespace", "team-a", "node-a", "pods", "binding", false, ledger, true},
-		{"bindings denied", "team-b", "node-a", "bindings", "", false, ledger, false},
-		{"bindings same namespace", "team-a", "node-a", "bindings", "", false, ledger, true},
-		{"binding mirror annotation does not bypass", "team-b", "node-a", "pods", "binding", true, ledger, false},
-		{"missing params", "team-b", "node-a", "pods", "", false, nil, true},
-		{"missing data", "team-b", "node-a", "pods", "", false, map[string]any{}, true},
+		{"free node", "team-b", "free", "pods", "", "user", false, ledger, true},
+		{"same namespace", "team-a", "node-a", "pods", "", "user", false, ledger, true},
+		{"other namespace", "team-b", "node-a", "pods", "", "user", false, ledger, false},
+		{"namespace prefix", "team", "node-a", "pods", "", "user", false, ledger, false},
+		{"excluded system", "kube-system", "node-a", "pods", "", "user", false, ledger, true},
+		{"excluded operator", "unbounded-system", "node-a", "pods", "", "user", false, ledger, true},
+		{"mirror", "team-b", "node-a", "pods", "", "system:node:node-a", true, ledger, true},
+		{"mirror by user denied", "team-b", "node-a", "pods", "", "user", true, ledger, false},
+		{"mirror by other node denied", "team-b", "node-a", "pods", "", "system:node:other", true, ledger, false},
+		{"node without mirror denied", "team-b", "node-a", "pods", "", "system:node:node-a", false, ledger, false},
+		{"unscheduled", "team-b", "", "pods", "", "user", false, ledger, true},
+		{"binding denied", "team-b", "node-a", "pods", "binding", "user", false, ledger, false},
+		{"binding same namespace", "team-a", "node-a", "pods", "binding", "user", false, ledger, true},
+		{"bindings denied", "team-b", "node-a", "bindings", "", "user", false, ledger, false},
+		{"bindings same namespace", "team-a", "node-a", "bindings", "", "user", false, ledger, true},
+		{"binding mirror annotation does not bypass", "team-b", "node-a", "pods", "binding", "system:node:node-a", true, ledger, false},
+		{"missing params", "team-b", "node-a", "pods", "", "user", false, nil, true},
+		{"missing data", "team-b", "node-a", "pods", "", "user", false, map[string]any{}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			metadata := map[string]any{}
@@ -112,6 +116,7 @@ func TestPodPlacementCEL(t *testing.T) {
 			}
 
 			request := map[string]any{"namespace": tc.namespace, "resource": map[string]any{"resource": tc.resource}, "subResource": tc.subresource}
+			request["userInfo"] = map[string]any{"username": tc.user}
 			require.Equal(t, tc.allowed, policyAllows(t, policy, map[string]any{"object": obj, "params": tc.params, "request": request}))
 		})
 	}

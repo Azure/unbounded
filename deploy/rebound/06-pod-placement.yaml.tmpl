@@ -35,7 +35,8 @@ spec:
         variables.node == '' ||
         request.namespace in variables.excludedNamespaces ||
         (variables.isPod && has(object.metadata.annotations) &&
-         'kubernetes.io/config.mirror' in object.metadata.annotations) ||
+         'kubernetes.io/config.mirror' in object.metadata.annotations &&
+         request.userInfo.username == 'system:node:' + variables.node) ||
         !(variables.node in variables.ledger) ||
         variables.ledger[variables.node].startsWith(request.namespace + '/')
       messageExpression: >-
