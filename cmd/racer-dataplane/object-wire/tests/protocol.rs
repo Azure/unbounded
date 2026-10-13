@@ -7,6 +7,82 @@ use racer_object_wire::origin;
 use racer_object_wire::*;
 use std::time::{Duration, UNIX_EPOCH};
 
+fn decode_range_request(method: &str, value: &str) -> MessageHead {
+    let raw = format!(
+        "{method} /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: {value}\r\n\r\n",
+        CacheKey([0xab; 32]).to_hex()
+    );
+    let (head, used) = http1::Codec::<()>::new(client::MAX_HEAD_BYTES)
+        .decode_head(raw.as_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(used, raw.len());
+    head
+}
+
+#[test]
+fn client_range_accepts_closed_and_open_ranges_from_raw_codec() {
+    let parser = RequestParser::new(usize::MAX);
+    for (value, expected) in [
+        ("bytes=0-0", ByteRange::Closed { first: 0, last: 0 }),
+        ("bytes=1-9", ByteRange::Closed { first: 1, last: 9 }),
+        ("bytes=0-", ByteRange::From(0)),
+        ("bytes=1-", ByteRange::From(1)),
+        (
+            "bytes=0-9223372036854775807",
+            ByteRange::Closed {
+                first: 0,
+                last: MAX_WIRE_INTEGER,
+            },
+        ),
+        (
+            "bytes=9223372036854775807-",
+            ByteRange::From(MAX_WIRE_INTEGER),
+        ),
+    ] {
+        let head = decode_range_request("POST", value);
+        assert_eq!(
+            parser.parse(&head).unwrap().kind,
+            ReadKind::Subscription {
+                pin: None,
+                range: Some(expected),
+                page_credits: 2,
+                byte_credits: 2 * PAGE_BYTES,
+                ordered: false,
+            },
+            "{value}"
+        );
+        let head = decode_range_request("HEAD", value);
+        assert!(matches!(parser.parse(&head), Err(Error::InvalidRequest)));
+    }
+}
+
+#[test]
+fn client_range_rejects_suffix_and_malformed_ranges_from_raw_codec() {
+    let parser = RequestParser::new(usize::MAX);
+    for value in [
+        "bytes=-0",
+        "bytes=-1",
+        "bytes=-99",
+        "bytes=-9223372036854775807",
+        "bytes=-9223372036854775808",
+        "bytes=-",
+        "bytes=1-0",
+        "bytes=00-1",
+        "bytes=0-01",
+        "bytes=+1-",
+        "bytes=0-1,2-3",
+        "bytes=0-9223372036854775808",
+        "bytes=9223372036854775808-",
+    ] {
+        let head = decode_range_request("POST", value);
+        assert!(
+            matches!(parser.parse(&head), Err(Error::InvalidRange)),
+            "{value}"
+        );
+    }
+}
+
 fn decode_if_match_request(method: &str, value: &[u8]) -> MessageHead {
     let mut raw = format!(
         "{method} /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nIf-Match:",

@@ -168,7 +168,12 @@ impl RequestParser {
                     }
                     pin = Some(StrongEtag::parse(trim_ows(value))?);
                 }
-                "range" => range = Some(ByteRange::parse(value)?),
+                "range" => {
+                    range = Some(match ByteRange::parse(value)? {
+                        range @ (ByteRange::Closed { .. } | ByteRange::From(_)) => range,
+                        ByteRange::Suffix(_) => return Err(Error::InvalidRange),
+                    });
+                }
                 "racer-page-credits" => page_credits = decimal(value, 1, 64)? as usize,
                 "racer-byte-credits" => byte_credits = decimal(value, PAGE_BYTES, 64 * PAGE_BYTES)?,
                 "racer-ordered" => {
