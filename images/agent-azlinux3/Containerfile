@@ -10,7 +10,7 @@ FROM mcr.microsoft.com/azurelinux/base/core:3.0
 # minutes in nspawn. Keep firewall policy and network readiness owned by the
 # host bootstrap instead.
 RUN tdnf install -y \
-      systemd dbus curl ca-certificates \
+      systemd dbus curl ca-certificates rsyslog \
       iproute nftables iptables kmod systemd-udev procps-ng wireguard-tools bpftool \
     && rm -f \
       /usr/lib/systemd/system/iptables.service \
