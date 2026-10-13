@@ -118,7 +118,8 @@ func TestRender(t *testing.T) {
 			require.Equal(t, []corev1.Capability{"ALL"}, container.SecurityContext.Capabilities.Drop)
 			require.Equal(t, "/healthz", container.LivenessProbe.HTTPGet.Path)
 			require.Equal(t, "/readyz", container.ReadinessProbe.HTTPGet.Path)
-			require.Equal(t, intstr.FromString("health"), container.ReadinessProbe.HTTPGet.Port)
+			require.Equal(t, intstr.FromString("https"), container.ReadinessProbe.HTTPGet.Port)
+			require.Equal(t, corev1.URISchemeHTTPS, container.ReadinessProbe.HTTPGet.Scheme)
 			require.Contains(t, container.Ports, corev1.ContainerPort{Name: "health", ContainerPort: 8081})
 
 			service := decodeObject[corev1.Service](t, objects, "Service/rebound")

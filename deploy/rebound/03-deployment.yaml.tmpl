@@ -70,8 +70,11 @@ spec:
               path: /healthz
               port: health
             initialDelaySeconds: 10
+          # Ready only once the aggregated API server is serving with a
+          # loaded certificate and a synced ledger cache.
           readinessProbe:
             httpGet:
               path: /readyz
-              port: health
+              port: https
+              scheme: HTTPS
             initialDelaySeconds: 3
