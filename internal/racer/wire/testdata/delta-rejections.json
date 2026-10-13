@@ -1,0 +1,12 @@
+[
+  {"name":"changed membership without version advance","old":"\"membership_version\":\"2\"","new":"\"membership_version\":\"1\"","code":"conflict"},
+  {"name":"sequence replay","old":"\"sequence\":\"2\"","new":"\"sequence\":\"1\"","code":"conflict"},
+  {"name":"wrong base sequence","old":"\"base_sequence\":\"1\"","new":"\"base_sequence\":\"2\"","code":"conflict"},
+  {"name":"unsupported delta version","old":"\"delta_version\":1","new":"\"delta_version\":2","code":"conflict"},
+  {"name":"tampered site","old":"Site_1.west-2","new":"other-site","code":"conflict"},
+  {"name":"invalid site","old":"Site_1.west-2","new":"-invalid","code":"invalid_request"},
+  {"name":"unknown removal","old":"\"remove_members\":[]","new":"\"remove_members\":[\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\"]","code":"invalid_request"},
+  {"name":"remove and upsert","old":"\"remove_members\":[]","new":"\"remove_members\":[\"22222222-2222-4222-8222-222222222222\"]","code":"invalid_request"},
+  {"name":"escaped duplicate","old":"\"delta_version\":1","new":"\"delta_version\":1,\"delta_versi\\u006fn\":1","code":"invalid_request"},
+  {"name":"fractional version","old":"\"delta_version\":1","new":"\"delta_version\":1.0","code":"invalid_request"}
+]

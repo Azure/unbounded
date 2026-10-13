@@ -1343,6 +1343,87 @@ func TestDeltaValidationFailures(t *testing.T) {
 	require.Equal(t, Publication{}, got)
 }
 
+func TestSharedDeltaRejections(t *testing.T) {
+	var vectors []siteVector
+	require.NoError(t, json.Unmarshal(fixture(t, "site-vectors.json"), &vectors))
+	base, err := DecodePublication(strings.NewReader(vectors[0].Publication))
+	require.NoError(t, err)
+
+	var cases []struct {
+		Name, Old, New string
+		Code           ErrorCode
+	}
+	require.NoError(t, json.Unmarshal(fixture(t, "delta-rejections.json"), &cases))
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			raw := strings.Replace(vectors[1].Delta, tc.Old, tc.New, 1)
+			require.NotEqual(t, vectors[1].Delta, raw)
+			got, err := ApplyDelta(base, strings.NewReader(raw))
+			require.ErrorIs(t, err, tc.Code)
+			require.Equal(t, Publication{}, got)
+
+			unchanged, err := EncodePublication(base)
+			require.NoError(t, err)
+			require.Equal(t, vectors[0].Publication, string(unchanged))
+		})
+	}
+}
+
+func TestDeltaMembershipVersion(t *testing.T) {
+	base, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
+	require.NoError(t, err)
+
+	base.Sequence, base.MembershipVersion = 1, 2
+	original, err := EncodePublication(base)
+	require.NoError(t, err)
+
+	for _, change := range []string{"add", "remove", "shares", "endpoint", "rails", "site", "cache", "unchanged"} {
+		t.Run(change, func(t *testing.T) {
+			next := canonicalPublication(base)
+			next.Sequence++
+
+			switch change {
+			case "add":
+				added := next.Members[0]
+				added.Node = "77777777-7777-4777-8777-777777777777"
+				next.Members = append(next.Members, added)
+			case "remove":
+				next.Members = next.Members[:1]
+			case "shares":
+				next.Members[0].Shares = 9
+			case "endpoint":
+				next.Members[0].PeerEndpoint = "192.0.2.2:7443"
+			case "rails":
+				next.Members[1].RDMANICs = nil
+			case "site":
+				next.Members[0].Site = "site2"
+			case "cache":
+				next.Caches = nil
+			}
+
+			for _, version := range []MembershipVersion{1, 2, 3} {
+				next.MembershipVersion = version
+				raw, err := EncodeDelta(base, next)
+				require.NoError(t, err)
+
+				got, err := ApplyDelta(base, bytes.NewReader(raw))
+				if version < 2 || version == 2 && change != "cache" && change != "unchanged" {
+					require.ErrorIs(t, err, Conflict)
+					require.Equal(t, Publication{}, got)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, canonicalPublication(next), got)
+				}
+			}
+
+			unchanged, err := EncodePublication(base)
+			require.NoError(t, err)
+			require.Equal(t, original, unchanged)
+		})
+	}
+}
+
 func TestUnicodeEscapeValidation(t *testing.T) {
 	for _, tc := range []struct {
 		raw   string
