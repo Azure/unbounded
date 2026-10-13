@@ -1316,7 +1316,7 @@ mod codec {
         })
     }
 
-    pub fn encode_bundle(b: &KeyringBundle) -> Result<Vec<u8>> {
+    pub fn encode_bundle(b: &KeyringBundle) -> Result<zeroize::Zeroizing<Vec<u8>>> {
         let raw = Bundle {
             schema_version: b.schema_version,
             cluster: b.cluster.0.clone(),
@@ -1370,7 +1370,7 @@ mod codec {
         )));
         serde_json::to_writer(&mut encoded, &raw).map_err(|_| Error::Overloaded)?;
         decode_bundle(&encoded.0)?;
-        Ok(std::mem::take(&mut *encoded.0))
+        Ok(encoded.0)
     }
 
     pub fn decode_error(b: &[u8]) -> Result<ErrorResponse> {
@@ -2194,7 +2194,7 @@ mod codec {
                 "bootstrap-response.json" => {
                     encode_enrollment_response(&decode_enrollment_response(b)?)
                 }
-                "bundle.json" => encode_bundle(&decode_bundle(b)?),
+                "bundle.json" => encode_bundle(&decode_bundle(b)?).map(|b| b.to_vec()),
                 _ => panic!("unknown vector"),
             }
         }
@@ -2373,7 +2373,7 @@ mod codec {
                 key.material = [0xff; 32];
                 key.material[31] = 0xff - u8::try_from(i).unwrap();
             }
-            let original = String::from_utf8(encode_bundle(&bundle).unwrap()).unwrap();
+            let original = String::from_utf8(encode_bundle(&bundle).unwrap().to_vec()).unwrap();
             let materials: Vec<String> = bundle
                 .cache_keys
                 .iter()
@@ -2590,6 +2590,25 @@ mod codec {
         }
 
         #[test]
+        fn bundle_output_and_late_errors_keep_zeroizing_owners() {
+            let bundle = decode_bundle(BUNDLE.as_bytes()).unwrap();
+            let encoded: zeroize::Zeroizing<Vec<u8>> = encode_bundle(&bundle).unwrap();
+            assert_eq!(encoded.as_slice(), BUNDLE.trim().as_bytes());
+            assert_eq!(encoded.capacity(), MAX_BUNDLE_BYTES);
+            for malformed in [
+                BUNDLE.replacen("\"state\":\"prepared\"", "\"state\":\"future\"", 1),
+                BUNDLE.replacen("\"schema_version\":1", "\"schema_version\":2", 1),
+            ] {
+                MATERIAL_DROPS.with(|drops| drops.set(0));
+                assert!(decode_bundle(malformed.as_bytes()).is_err());
+                assert_eq!(
+                    MATERIAL_DROPS.with(|drops| drops.get()),
+                    bundle.cache_keys.len()
+                );
+            }
+        }
+
+        #[test]
         fn go_delta_vector_applies_exactly_and_rejects_tampering() {
             let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rdma_nics":[],"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rdma_nics":[],"site":""}],"caches":[]}"#).unwrap();
             let delta = include_str!(concat!(
@@ -2645,7 +2664,9 @@ mod codec {
             );
             assert_eq!(
                 BUNDLE.trim().as_bytes(),
-                encode_bundle(&decode_bundle(BUNDLE.as_bytes()).unwrap()).unwrap()
+                encode_bundle(&decode_bundle(BUNDLE.as_bytes()).unwrap())
+                    .unwrap()
+                    .as_slice()
             );
         }
 
