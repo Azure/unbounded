@@ -30,6 +30,14 @@ pub enum Error {
 
     CorruptRecord,
 
+    /// Stop enrollment and preserve identity.json. Restore a compatible backup,
+    /// or move it aside in the private directory before explicit re-enrollment.
+    UnreadableIdentityRecord,
+
+    /// Stop enrollment and preserve pending.json. Restore a compatible backup,
+    /// or move it aside in the private directory before preparing a new request.
+    UnreadablePendingRecord,
+
     InvalidConfiguration,
 
     Io,
@@ -232,7 +240,7 @@ impl<H: Host> Enrollment<H> {
         bytes: &[u8],
         response: &EnrollmentResponse,
     ) -> Result<(LocalSigningIdentity, Zeroizing<Vec<u8>>), Error> {
-        let pending = decode_pending(bytes)?;
+        let pending = usable_pending(bytes)?;
         self.request(
             &pending,
             Vec::new(),
@@ -244,6 +252,29 @@ impl<H: Host> Enrollment<H> {
             response: STANDARD.encode(wire::encode_enrollment_response(response)?),
         };
         Ok((identity, persisted.encode()?))
+    }
+
+    fn saved_identity(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(EnrollmentResponse, LocalSigningIdentity), Error> {
+        let persisted =
+            PersistedIdentity::decode(bytes).map_err(|_| Error::UnreadableIdentityRecord)?;
+        let response = persisted
+            .response()
+            .map_err(|_| Error::UnreadableIdentityRecord)?;
+        // Check local key integrity before trust or expiry can hide corruption.
+        let csr = STANDARD
+            .decode(&persisted.pending.csr)
+            .map_err(|_| Error::UnreadableIdentityRecord)?;
+        check_pending_key(&persisted.pending, &csr).map_err(|_| Error::UnreadableIdentityRecord)?;
+        let identity =
+            self.validate(&persisted.pending, &response)
+                .map_err(|error| match error {
+                    Error::CorruptRecord | Error::Wire(_) => Error::UnreadableIdentityRecord,
+                    other => other,
+                })?;
+        Ok((response, identity))
     }
 
     fn validate(
@@ -333,24 +364,12 @@ where
             .await
             {
                 Ok(bytes) => {
-                    let pending = decode_pending(&bytes)?;
+                    let pending = usable_pending(&bytes)?;
                     if pending.cluster == self.cluster.0 {
                         r.file_sync(dir.clone(), &scope).await?;
                         return self.request(&pending, nics, shares).map_err(Into::into);
                     }
-                    // Replace another cluster's request, but preserve corrupt records.
-                    let old_request = EnrollmentRequest {
-                        schema_version: wire::SCHEMA_VERSION,
-                        cluster: ClusterId(pending.cluster.clone()),
-                        enrollment: EnrollmentId(pending.enrollment.clone()),
-                        csr_der: STANDARD
-                            .decode(&pending.csr)
-                            .map_err(|_| Error::CorruptRecord)?,
-                        rdma_nics: Vec::new(),
-                        shares: wire::DEFAULT_SHARES,
-                    };
-                    wire::encode_enrollment_request(&old_request).map_err(Error::from)?;
-                    check_pending_key(&pending, &old_request.csr_der)?;
+                    // Replace another cluster's usable request, preserving corrupt records.
                 }
                 Err(e) if H::is_missing(e) => (),
                 Err(e) => return Err(e),
@@ -399,12 +418,10 @@ where
             .await
             {
                 Ok(bytes) => {
-                    let persisted = PersistedIdentity::decode(&bytes)?;
-                    let existing = persisted.response()?;
                     // Only a usable identity binds renewal to its existing node.
-                    // Match recovery: unusable identities do not block re-enrollment.
-                    match self.validate(&persisted.pending, &existing) {
-                        Ok(_)
+                    // Unreadable records require explicit repair, as on recovery.
+                    match self.saved_identity(&bytes) {
+                        Ok((existing, _))
                             if existing.cluster != response.cluster
                                 || existing.node != response.node =>
                         {
@@ -461,10 +478,8 @@ where
                 Err(e) if H::is_missing(e) => return Ok(None),
                 Err(e) => return Err(e),
             };
-            let persisted = PersistedIdentity::decode(&bytes)?;
-            let response = persisted.response()?;
-            match self.validate(&persisted.pending, &response) {
-                Ok(identity) => {
+            match self.saved_identity(&bytes) {
+                Ok((_, identity)) => {
                     r.file_sync(dir.clone(), &scope).await?;
                     match secure::read_at(
                         r,
@@ -598,6 +613,26 @@ fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
 fn decode_pending(bytes: &[u8]) -> Result<PendingIdentity, Error> {
     let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES)?);
     PendingIdentity::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
+}
+
+fn usable_pending(bytes: &[u8]) -> Result<PendingIdentity, Error> {
+    let check = || -> Result<PendingIdentity, Error> {
+        let pending = decode_pending(bytes)?;
+        let request = EnrollmentRequest {
+            schema_version: wire::SCHEMA_VERSION,
+            cluster: ClusterId(pending.cluster.clone()),
+            enrollment: EnrollmentId(pending.enrollment.clone()),
+            csr_der: STANDARD
+                .decode(&pending.csr)
+                .map_err(|_| Error::CorruptRecord)?,
+            rdma_nics: Vec::new(),
+            shares: wire::DEFAULT_SHARES,
+        };
+        wire::encode_enrollment_request(&request)?;
+        check_pending_key(&pending, &request.csr_der)?;
+        Ok(pending)
+    };
+    check().map_err(|_| Error::UnreadablePendingRecord)
 }
 
 fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>, Error> {
@@ -1105,6 +1140,7 @@ mod tests {
                 for case in [
                     "json",
                     "missing",
+                    "schema",
                     "cluster",
                     "enrollment",
                     "base64",
@@ -1124,6 +1160,9 @@ mod tests {
                     let encoded = match case {
                         "json" => Zeroizing::new(b"not JSON".to_vec()),
                         "missing" => Zeroizing::new(b"{}".to_vec()),
+                        "schema" => {
+                            Zeroizing::new(br#"{"schema_version":2,"pending":{}}"#.to_vec())
+                        }
                         _ => encode_private(&pending, wire::MAX_ENROLLMENT_BYTES).unwrap(),
                     };
                     sim.write_file(path, &encoded).unwrap();
@@ -1132,11 +1171,15 @@ mod tests {
                             &files,
                             e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)
                         )
-                        .is_err(),
+                        .is_err_and(|error| error == Error::UnreadablePendingRecord.into()),
                         "{cluster}: {case}"
                     );
                     assert_eq!(sim.read_file(path).unwrap(), *encoded, "{cluster}: {case}");
                 }
+                sim.rename(path, Path::new("/private/pending.json.unreadable"), 0)
+                    .unwrap();
+                let repaired = prepare(&files, &e, &scope);
+                assert_eq!(prepare(&files, &e, &scope).enrollment, repaired.enrollment);
             }
         }
 
@@ -1161,13 +1204,7 @@ mod tests {
                 if expired {
                     clock.set_wall_time(prior.expires_at() + Duration::from_secs(1));
                 }
-                for (bytes, expected) in [
-                    (
-                        b"not JSON".as_slice(),
-                        Error::Wire(wire::Error::InvalidRequest),
-                    ),
-                    (b"{}".as_slice(), Error::CorruptRecord),
-                ] {
+                for bytes in [b"not JSON".as_slice(), b"{}".as_slice()] {
                     sim.write_file(path, bytes).unwrap();
                     sim.chmod(path, 0o600).unwrap();
                     assert_eq!(
@@ -1176,7 +1213,7 @@ mod tests {
                     );
                     assert!(
                         matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)),
-                        Err(error) if error == expected.into())
+                        Err(error) if error == Error::UnreadablePendingRecord.into())
                     );
                     assert_eq!(sim.read_file(path).unwrap(), bytes);
                     assert_eq!(
@@ -1191,11 +1228,13 @@ mod tests {
         fn corrupt_saved_identity_is_not_treated_as_expired_authentication() {
             let sim = Simulation::new();
             let _environment = sim.enter();
+            let clock = uring_runtime::environment::SimulationClock::new(110);
+            let _time = clock.environment(0).enter();
             let (files, e, scope) = fixture();
             let (ca, key) = identity::test_util::ca();
             e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
             let first = prepare(&files, &e, &scope);
-            drive(
+            let accepted = drive(
                 &files,
                 e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
             )
@@ -1204,29 +1243,63 @@ mod tests {
             let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
             let path = Path::new("/private/identity.json");
             let committed = sim.read_file(path).unwrap();
-            for case in ["json", "response", "key"] {
+            for case in ["json", "missing", "response", "schema", "key", "key-der"] {
                 let mut persisted = PersistedIdentity::decode(&committed).unwrap();
                 match case {
                     "response" => persisted.response = "!".into(),
                     "key" => persisted.pending.private_key.0.push('!'),
+                    "key-der" => {
+                        persisted.pending.private_key.0 =
+                            Zeroizing::new(STANDARD.encode(b"not PKCS8"))
+                    }
+                    "schema" => {
+                        let mut response: serde_json::Value =
+                            serde_json::from_slice(&STANDARD.decode(&persisted.response).unwrap())
+                                .unwrap();
+                        response["schema_version"] = (wire::SCHEMA_VERSION + 1).into();
+                        persisted.response =
+                            STANDARD.encode(serde_json::to_vec(&response).unwrap());
+                    }
                     _ => (),
                 }
-                let bytes = if case == "json" {
-                    Zeroizing::new(b"{}".to_vec())
-                } else {
-                    persisted.encode().unwrap()
+                let bytes = match case {
+                    "json" => Zeroizing::new(b"not JSON".to_vec()),
+                    "missing" => Zeroizing::new(b"{}".to_vec()),
+                    _ => persisted.encode().unwrap(),
                 };
                 sim.write_file(path, &bytes).unwrap();
-                assert!(
-                    matches!(drive(&files, e.accept_response(response(&request, &ca, &key), &scope)),
-                    Err(error) if error == Error::CorruptRecord.into())
-                );
-                assert_eq!(sim.read_file(path).unwrap(), *bytes);
-                assert_eq!(
-                    sim.read_file(Path::new("/private/pending.json")).unwrap(),
-                    pending
-                );
+                let before_expiry = uring_runtime::environment::wall_now();
+                for expired in [false, true] {
+                    if expired {
+                        clock.set_wall_time(accepted.expires_at() + Duration::from_secs(1));
+                    }
+                    assert!(
+                        matches!(drive(&files, e.load_identity(&scope)),
+                        Err(error) if error == Error::UnreadableIdentityRecord.into()),
+                        "{case}: {expired}"
+                    );
+                    assert!(
+                        matches!(drive(&files, e.accept_response(response(&request, &ca, &key), &scope)),
+                    Err(error) if error == Error::UnreadableIdentityRecord.into())
+                    );
+                    assert_eq!(sim.read_file(path).unwrap(), *bytes);
+                    assert_eq!(
+                        sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                        pending
+                    );
+                }
+                clock.set_wall_time(before_expiry);
             }
+            // Explicit repair preserves the old bytes outside the active record name.
+            sim.rename(path, Path::new("/private/identity.json.unreadable"), 0)
+                .unwrap();
+            assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
+            drive(
+                &files,
+                e.accept_response(response(&request, &ca, &key), &scope),
+            )
+            .unwrap();
+            assert!(drive(&files, e.load_identity(&scope)).unwrap().is_some());
         }
 
         #[test]
@@ -1536,11 +1609,11 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)),
-                Err(error) if error == Error::CorruptRecord.into()
+                Err(error) if error == Error::UnreadablePendingRecord.into()
             ));
             assert!(matches!(
                 drive(&files, e.accept_response(response.clone(), &scope)),
-                Err(error) if error == Error::CorruptRecord.into()
+                Err(error) if error == Error::UnreadablePendingRecord.into()
             ));
             assert!(sim.metadata(Path::new("/private/identity.json")).is_err());
             assert_eq!(
@@ -1560,7 +1633,7 @@ mod tests {
             sim.chmod(Path::new("/private/identity.json"), 0o600)
                 .unwrap();
             assert!(
-                matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == Error::CorruptRecord.into())
+                matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == Error::UnreadableIdentityRecord.into())
             );
             assert_eq!(
                 sim.read_file(Path::new("/private/identity.json")).unwrap(),
@@ -1635,7 +1708,7 @@ mod tests {
         sim.write_file(Path::new("/private/pending.json"), b"{}")
             .unwrap();
         assert!(
-            matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)), Err(error) if error == Error::CorruptRecord.into())
+            matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)), Err(error) if error == Error::UnreadablePendingRecord.into())
         );
         for invalid in [b"".as_slice(), b"a b", b"\xff", b"token\r\nheader"] {
             assert!(matches!(token(invalid), Err(Error::Unauthorized)));
