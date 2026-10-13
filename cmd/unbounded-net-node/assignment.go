@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,131 @@ import (
 const assignmentRetryInterval = 2 * time.Second
 
 var errAssignmentChanged = errors.New("assignment changed after adoption")
+
+type startupAssignmentWatch struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+}
+
+func startStartupAssignmentWatch(ctx context.Context, clientset kubernetes.Interface, nodeName string, adopted nodeAssignment) (context.Context, *startupAssignmentWatch) {
+	runCtx, fail := context.WithCancelCause(ctx)
+	watchCtx, cancel := context.WithCancel(runCtx)
+
+	monitor := &startupAssignmentWatch{cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(monitor.done)
+		defer cancel()
+
+		err := watchAdoptedAssignment(watchCtx, clientset, nodeName, adopted)
+		if err != nil && watchCtx.Err() == nil {
+			klog.Errorf("Startup Node assignment watch failed: %v", err)
+			fail(err)
+		}
+	}()
+
+	return runCtx, monitor
+}
+
+func (m *startupAssignmentWatch) stop() {
+	m.once.Do(func() {
+		m.cancel()
+		<-m.done
+	})
+}
+
+func watchAdoptedAssignment(ctx context.Context, clientset kubernetes.Interface, nodeName string, adopted nodeAssignment) error {
+	for {
+		node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("%w: adopted Node %q no longer exists", errAssignmentChanged, nodeName)
+		}
+
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			klog.Warningf("Failed to get Node %s for startup assignment watch: %v", nodeName, err)
+
+			if err := waitForAssignmentRetry(ctx); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if err := validateAdoptedNodeAssignment(node, adopted); err != nil {
+			return err
+		}
+
+		timeout := int64(600)
+
+		watcher, err := clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
+			FieldSelector:   fields.OneTermEqualSelector("metadata.name", nodeName).String(),
+			ResourceVersion: node.ResourceVersion,
+			TimeoutSeconds:  &timeout,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			klog.Warningf("Failed to watch Node %s for startup assignment changes: %v", nodeName, err)
+
+			if err := waitForAssignmentRetry(ctx); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		err = observeAdoptedAssignment(ctx, watcher, nodeName, adopted)
+		watcher.Stop()
+
+		if err != nil {
+			return err
+		}
+
+		if err := waitForAssignmentRetry(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func observeAdoptedAssignment(ctx context.Context, watcher watch.Interface, nodeName string, adopted nodeAssignment) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				klog.V(4).Infof("Startup assignment watch for Node %s closed; revalidating before reconnect", nodeName)
+				return nil
+			}
+
+			switch event.Type {
+			case watch.Added, watch.Modified, watch.Deleted:
+				node, ok := event.Object.(*corev1.Node)
+				if !ok || node.Name != nodeName {
+					return fmt.Errorf("unexpected object %T in startup assignment watch for Node %q", event.Object, nodeName)
+				}
+
+				if event.Type == watch.Deleted {
+					return fmt.Errorf("%w: adopted Node %q was deleted", errAssignmentChanged, nodeName)
+				}
+
+				if err := validateAdoptedNodeAssignment(node, adopted); err != nil {
+					return err
+				}
+			case watch.Error:
+				klog.Warningf("Startup assignment watch for Node %s failed; revalidating before reconnect: %v", nodeName, apierrors.FromObject(event.Object))
+				return nil
+			case watch.Bookmark:
+			}
+		}
+	}
+}
 
 type nodeAssignment struct {
 	site        string
@@ -194,6 +320,10 @@ func acknowledgeEffectiveAssignment(
 	nodeName string,
 	adopted nodeAssignment,
 ) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+
 	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get Node %q before acknowledging assignment: %w", nodeName, err)
@@ -247,6 +377,10 @@ func acknowledgeEffectiveAssignment(
 	patch, err := json.Marshal(operations)
 	if err != nil {
 		return fmt.Errorf("marshal own Pod assignment acknowledgment: %w", err)
+	}
+
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
 	}
 
 	if _, err := clientset.CoreV1().Pods(namespace).Patch(ctx, podName, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {

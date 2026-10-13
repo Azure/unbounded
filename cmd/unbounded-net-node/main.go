@@ -700,7 +700,7 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 	return nil
 }
 
-func run(cfg *config) error {
+func run(cfg *config) (resultErr error) {
 	klog.Infof("unbounded-net-node version=%s commit=%s built=%s", version.Version, version.GitCommit, version.BuildTime)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -824,6 +824,14 @@ func run(cfg *config) error {
 	}
 
 	klog.Infof("Adopting effective Site %q and GatewayPool %q", adoptedAssignment.site, adoptedAssignment.gatewayPool)
+
+	ctx, startupWatch := startStartupAssignmentWatch(ctx, clientset, cfg.NodeName, adoptedAssignment)
+	defer startupWatch.stop()
+	defer func() {
+		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+			resultErr = cause
+		}
+	}()
 
 	// Detect and annotate the node's maximum tunnel MTU so the controller
 	// can validate that the configured MTU is compatible across all nodes.
@@ -972,5 +980,5 @@ func run(cfg *config) error {
 		return fmt.Errorf("POD_NAME, POD_NAMESPACE, and POD_UID are required for effective assignment acknowledgment")
 	}
 
-	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, adoptedAssignment, podNamespace, podName, podUID, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
+	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, adoptedAssignment, podNamespace, podName, podUID, startupWatch, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
 }
