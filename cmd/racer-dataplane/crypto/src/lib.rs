@@ -618,6 +618,17 @@ pub mod identity {
         entries: Vec<Entry>,
     }
 
+    impl PublishedBundle {
+        fn entry(&self, reference: &CacheKeyRef) -> Option<&Entry> {
+            self.entries
+                .binary_search_by(|entry| {
+                    reference_order(&entry.reference).cmp(&reference_order(reference))
+                })
+                .ok()
+                .map(|position| &self.entries[position])
+        }
+    }
+
     struct InstalledIdentity {
         identity: Arc<SigningIdentity>,
 
@@ -950,15 +961,11 @@ pub mod identity {
                         .generation()
                         .ok_or(Error::InvalidConfiguration)?;
                     // Removed IDs cannot reenter admission, even as prepared keys.
-                    if generation <= current.generation.0
-                        && !current.entries.iter().any(|e| e.reference == candidate.key)
-                    {
+                    let retained = current.entry(&candidate.key);
+                    if generation <= current.generation.0 && retained.is_none() {
                         return Err(Error::InvalidConfiguration);
                     }
-                    if let Some(old) = current
-                        .entries
-                        .iter()
-                        .find(|e| e.reference == candidate.key)
+                    if let Some(old) = retained
                         && *old.secret.0 != *candidate.material
                     {
                         return Err(Error::InvalidConfiguration);
@@ -978,12 +985,7 @@ pub mod identity {
                 .cache_keys
                 .iter()
                 .map(|candidate| {
-                    let retained = current.and_then(|current| {
-                        current
-                            .entries
-                            .iter()
-                            .find(|e| e.reference == candidate.key)
-                    });
+                    let retained = current.and_then(|current| current.entry(&candidate.key));
                     Entry {
                         reference: candidate.key.clone(),
                         state: candidate.state,
@@ -1103,13 +1105,7 @@ pub mod identity {
             if published.cluster != self.cluster {
                 return Err(Error::MissingKey);
             }
-            let position = published
-                .entries
-                .binary_search_by(|entry| {
-                    reference_order(&entry.reference).cmp(&reference_order(&reference))
-                })
-                .map_err(|_| Error::MissingKey)?;
-            let entry = &published.entries[position];
+            let entry = published.entry(&reference).ok_or(Error::MissingKey)?;
             Ok(KeyLease {
                 reference,
                 secret: entry.secret.clone(),
@@ -1963,6 +1959,8 @@ pub mod identity {
             }
 
             initial.generation = BundleGeneration(2);
+            // Direct callers may reorder retained references in a newer generation.
+            initial.cache_keys.reverse();
             keys.install_inner(&initial).unwrap();
             assert_eq!(keys.generation().unwrap(), Some(2));
             assert!(Arc::ptr_eq(&roots, &keys.peer_trust_roots().unwrap()));
