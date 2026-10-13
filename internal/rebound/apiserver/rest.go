@@ -42,7 +42,8 @@ type storage struct {
 	maxTTL           time.Duration
 	maxNodesPerGrant int
 	mu               sync.Mutex
-	history          []snapshot
+	current          snapshot
+	history          []eventBatch
 	watchers         map[*grantWatch]struct{}
 	closed           bool
 }
@@ -50,7 +51,8 @@ type storage struct {
 func newStorage(store ledger.Store, maxTTL time.Duration, maxNodesPerGrant int, c clock.Clock) *storage {
 	return &storage{
 		store: store, maxTTL: maxTTL, maxNodesPerGrant: maxNodesPerGrant, clock: c,
-		history: []snapshot{{ledger: ledger.New(), rv: "0"}}, watchers: make(map[*grantWatch]struct{}),
+		current: snapshot{ledger: ledger.New(), rv: "0"},
+		history: []eventBatch{{rv: "0"}}, watchers: make(map[*grantWatch]struct{}),
 	}
 }
 
@@ -74,7 +76,7 @@ func (s *storage) read(ctx context.Context, rv string, match metav1.ResourceVers
 		}
 
 		s.mu.Lock()
-		current := s.history[len(s.history)-1]
+		current := s.current
 		s.mu.Unlock()
 
 		if match == metav1.ResourceVersionMatchExact {

@@ -30,6 +30,8 @@ kubectl delete ngr train
 - **Nodes:** a grant may name at most `--max-nodes-per-grant` nodes (500 by default).
 - **Immutable:** grants cannot be updated or renewed. Delete and create again, but
   note that deleting a grant deletes its pods (see below).
+- **Metadata:** labels and annotations are stored. Create rejects `generateName`,
+  owner references, finalizers, deletion timestamps, and deletion grace periods.
 - **Status:** the server sets `status.holder` (the user who created the grant) and
   `status.expiresAt`.
 - **Access:** plain RBAC. The `view` role can read grants. `edit` and `admin` can

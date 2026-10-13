@@ -65,7 +65,7 @@ func (s *storage) Destroy() {
 	}
 
 	s.closed = true
-	if changed := s.history[len(s.history)-1].changed; changed != nil {
+	if changed := s.current.changed; changed != nil {
 		close(changed)
 	}
 
@@ -98,7 +98,7 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 	var initial []watch.Event
 
 	if options.ResourceVersion == "" || options.ResourceVersion == "0" {
-		current := s.history[len(s.history)-1]
+		current := s.current
 		for _, g := range current.ledger.Grants() {
 			obj := grantObject(g, current.rv)
 			if !g.Expired(s.clock.Now()) && match(obj) {
@@ -112,7 +112,7 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 		}
 
 		for i := index + 1; i < len(s.history); i++ {
-			initial = append(initial, diff(s.history[i-1], s.history[i]).matching(match)...)
+			initial = append(initial, s.history[i].matching(match)...)
 		}
 	}
 
@@ -155,7 +155,7 @@ func (s *storage) watchHistoryIndex(ctx context.Context, rv string) (int, error)
 			return -1, apierrors.NewServiceUnavailable("storage is closed")
 		}
 
-		latest := &s.history[len(s.history)-1]
+		latest := &s.current
 
 		newest, err := strconv.ParseUint(latest.rv, 10, 64)
 		if err != nil {
@@ -163,8 +163,8 @@ func (s *storage) watchHistoryIndex(ctx context.Context, rv string) (int, error)
 		}
 
 		if newest >= requested {
-			// Resume only from a snapshot the informer observed. If it skipped the
-			// requested revision, replaying from an older snapshot would resend
+			// Resume only from a revision the informer observed. If it skipped the
+			// requested revision, replaying from an older revision would resend
 			// changes the client already has, so the client must relist.
 			for i := len(s.history) - 1; i >= 0; i-- {
 				version, err := strconv.ParseUint(s.history[i].rv, 10, 64)
@@ -264,7 +264,7 @@ func (s *storage) observe(obj interface{}, deleted bool) {
 		return
 	}
 
-	old := s.history[len(s.history)-1]
+	old := s.current
 	if !deleted && old.rv == next.rv {
 		return
 	}
@@ -288,9 +288,12 @@ func (s *storage) observe(obj interface{}, deleted bool) {
 		s.history = nil
 	}
 
-	s.history = append(s.history, next)
-	if len(s.history) > historyLimit {
-		s.history = s.history[len(s.history)-historyLimit:]
+	s.current = next
+	if len(s.history) == historyLimit {
+		copy(s.history, s.history[1:])
+		s.history[len(s.history)-1] = batch
+	} else {
+		s.history = append(s.history, batch)
 	}
 
 	if old.changed != nil {
