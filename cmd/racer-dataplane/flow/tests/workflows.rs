@@ -518,7 +518,7 @@ mod quota_tests {
         assert!(quotas.policy().rejected.lock().unwrap().is_empty());
     }
 
-    /// Retaining backing transfers surplus admission but not the donor's key owner.
+    /// Exact retention leaves even an empty donor's key owned until final drop.
     #[test]
     fn recycler_transfers_surplus_and_empty_donor_still_owns_key_until_drop() {
         let size = 1 << 20;
@@ -526,17 +526,15 @@ mod quota_tests {
         let shared = quotas.shared();
         let wake = Arc::new(WakeCount::default());
         shared.register(&Waker::from(wake.clone()));
-        let mut donor = quotas
-            .reserve(Some(&1), Resource::Waking, 2 * size)
-            .unwrap();
+        let mut donor = quotas.reserve(Some(&1), Resource::Waking, size).unwrap();
         let mut bytes = donor.buffer(size).unwrap();
         bytes.fill(0xa7);
         bytes.truncate(1);
         donor.recycle(bytes);
         assert_eq!(donor.amount(), 0);
         assert_eq!(donor.key(), Some(&1));
-        assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
-        assert_eq!(shared.used(Resource::Waking), 2 * size);
+        assert_eq!(quotas.retained_buffer_bytes(), size);
+        assert_eq!(shared.used(Resource::Waking), size);
         assert_eq!(wake.0.load(Ordering::SeqCst), 0);
         assert_eq!(donor.shrink(1), Err(Error::InvalidInput));
         assert!(matches!(donor.split(1), Err(Error::InvalidInput)));
@@ -558,6 +556,34 @@ mod quota_tests {
         assert_eq!(shared.used(Resource::Waking), 0);
         assert_eq!(shared.used(Resource::Silent), 1);
         drop(next);
+        assert_eq!(shared.used(Resource::Silent), 0);
+    }
+
+    /// Surplus stays with the donor; shared pressure needs explicit local reclaim.
+    #[test]
+    fn recycler_retains_exact_capacity_and_shared_reclaim_is_explicit() {
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(3 * size, 1));
+        let shared = quotas.shared();
+        let mut donor = quotas
+            .reserve(Some(&1), Resource::Silent, 3 * size)
+            .unwrap();
+        donor.recycle(vec![0xa7; size]);
+        assert_eq!(donor.amount(), 2 * size);
+        assert_eq!(donor.key(), Some(&1));
+        assert_eq!(quotas.retained_buffer_bytes(), size);
+        assert_eq!(shared.used(Resource::Silent), 3 * size);
+        drop(donor);
+        assert_eq!(shared.used(Resource::Silent), size);
+        assert!(matches!(
+            shared.reserve(Resource::Silent, 3 * size),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(quotas.retained_buffer_bytes(), size);
+        quotas.reclaim_buffers();
+        let full = shared.reserve(Resource::Silent, 3 * size).unwrap();
+        let replacement = quotas.reserve(Some(&2), Resource::Waking, 1).unwrap();
+        drop((full, replacement));
         assert_eq!(shared.used(Resource::Silent), 0);
     }
 

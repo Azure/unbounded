@@ -8,7 +8,9 @@
 //!
 //! Recycling wipes the full allocation before retaining at most two buffers of
 //! at least 1 MiB. Pressure retries admission after applicable reclamation; stop
-//! releases retained buffers. Shared handles never retain the recycler.
+//! releases retained buffers. Idle buffers retain their exact capacity and key
+//! attribution. Shared handles never retain or reclaim the recycler; callers using
+//! only shared admission must arrange local reclamation to recover idle capacity.
 //!
 //! [`ChargedBuffer`] pairs fixed initialized backing with admission. Low-level
 //! raw buffer users must themselves retain sufficient charge for every allocation
@@ -221,6 +223,8 @@ impl<P: Policy> page_alloc::Charge for Charge<P> {
 
 /// An unkeyed admission and usage handle. It retains no recycler buffers.
 /// It is Send + Sync when the policy is Send + Sync.
+/// Idle buffers still count toward its limits. Only the local [`Quotas`] authority
+/// reclaims them, explicitly or under local admission pressure.
 pub struct SharedQuotas<P: Policy> {
     policy: P,
 
@@ -383,6 +387,8 @@ impl<P: Policy> Charge<P> {
 
     /// Wipe before every retention check. At most two >=1MiB buffers retain live
     /// charges; only the final exclusive payload owner may return an allocation.
+    /// Transfer exactly its capacity, retaining its key attribution. Any surplus
+    /// stays with this charge; even an empty donor owns its key until dropped.
     pub fn recycle(&mut self, mut bytes: Vec<u8>) {
         wipe_payload(&mut bytes);
         if self.stopped.load(Ordering::Acquire)
@@ -407,7 +413,7 @@ impl<P: Policy> Charge<P> {
         }
         // SAFETY: wipe_payload initialized the entire capacity above.
         unsafe { bytes.set_len(bytes.capacity()) };
-        let charge = self.transfer(self.amount, Weak::new(), key);
+        let charge = self.transfer(bytes.capacity(), Weak::new(), key);
         pool.push((bytes, charge));
     }
 
@@ -2457,11 +2463,11 @@ mod quota_tests {
             assert!(CLONE_HOOK.with(|slot| slot.borrow().is_none()));
             assert_eq!(quotas.is_stopped(), action == "stop");
             let retained = match action {
-                "retain" => 3 * size,
+                "retain" => 2 * size,
                 "fill" => 2 * size,
                 _ => 0,
             };
-            let owned = if action == "retain" { 0 } else { 2 * size };
+            let owned = if action == "retain" { size } else { 2 * size };
             assert_eq!(donor.amount(), owned);
             assert!(donor.key().is_some());
             assert_eq!(
