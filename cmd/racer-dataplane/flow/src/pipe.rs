@@ -238,7 +238,7 @@ impl<P: Policy> PipePool<P> {
                 .front()
                 .is_some_and(|entry| Rc::ptr_eq(entry, &waiting.entry))
             {
-                match self.acquire() {
+                match self.acquire_turn(Some(&waiting.entry)) {
                     Err(Error::Overloaded) => {}
                     result => return Poll::Ready(result.map_err(E::from)),
                 }
@@ -248,15 +248,38 @@ impl<P: Policy> PipePool<P> {
         .await
     }
 
-    /// Reserve before creating descriptors. Exhaustion never waits for a reader.
+    /// Reserve before creating descriptors. Exhaustion or queued predecessors
+    /// return Overloaded without waiting or bypassing the FIFO.
     pub fn acquire(&self) -> Result<PipeLease<P>> {
+        self.acquire_turn(None)
+    }
+
+    /// Admit only the queued head, or an immediate caller when no queue exists.
+    fn acquire_turn(&self, entry: Option<&Rc<RefCell<Option<Waker>>>>) -> Result<PipeLease<P>> {
         self.check_running()?;
+        self.check_turn(entry)?;
         if let Some(resources) = self.idle.borrow_mut().pop() {
             return Ok(self.lease(resources));
         }
         let reservation = self.quotas.reserve(None, self.pipe_class, 1)?;
         reservation.validate(self.pipe_class, 1)?;
+        // Policy callbacks during reservation can publish a queued predecessor.
+        if let Err(error) = self.check_turn(entry) {
+            drop(reservation);
+            wake_front(&self.waiting);
+            return Err(error);
+        }
         Ok(self.lease(PipeResources::new(reservation)?))
+    }
+
+    /// Recheck queue ownership after callbacks without holding a queue borrow.
+    fn check_turn(&self, entry: Option<&Rc<RefCell<Option<Waker>>>>) -> Result<()> {
+        let queue = self.waiting.borrow();
+        match (queue.front(), entry) {
+            (None, None) => Ok(()),
+            (Some(head), Some(entry)) if Rc::ptr_eq(head, entry) => Ok(()),
+            _ => Err(Error::Overloaded),
+        }
     }
 
     /// Attach local recycling and notification to uniquely owned resources.
@@ -1014,6 +1037,47 @@ mod tests {
         assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
         assert!(pool.waiting.borrow().is_empty());
         assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+    }
+
+    /// Multiple returns wake each queued successor before immediate callers enter.
+    #[test]
+    fn immediate_acquisition_cannot_bypass_fifo_after_multiple_returns() {
+        let pool = new_pool(admission(2));
+        let held = [pool.acquire().unwrap(), pool.acquire().unwrap()];
+        let first_count = Arc::new(WakeCounter::default());
+        let second_count = Arc::new(WakeCounter::default());
+        let first_waker = Waker::from(first_count.clone());
+        let second_waker = Waker::from(second_count.clone());
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut second_cx = Context::from_waker(&second_waker);
+        let mut first = acquire_wait(&pool);
+        let mut second = acquire_wait(&pool);
+        assert!(first.as_mut().poll(&mut first_cx).is_pending());
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+        drop(held);
+        assert_eq!(first_count.count(), 1);
+        assert_eq!(second_count.count(), 0);
+        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+        let Poll::Ready(Ok(first_lease)) = first.as_mut().poll(&mut first_cx) else {
+            panic!("head must acquire first returned pipe");
+        };
+        assert_eq!(second_count.count(), 1, "head completion forwards the wake");
+        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
+        let Poll::Ready(Ok(second_lease)) = second.as_mut().poll(&mut second_cx) else {
+            panic!("successor must acquire second returned pipe without another release");
+        };
+        assert!(pool.waiting.borrow().is_empty());
+        drop((first_lease, second_lease));
+        assert!(pool.acquire().is_ok());
+
+        let held = [pool.acquire().unwrap(), pool.acquire().unwrap()];
+        let mut canceled = acquire_wait(&pool);
+        assert!(canceled.as_mut().poll(&mut first_cx).is_pending());
+        drop(held);
+        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
+        drop(canceled);
+        assert!(pool.acquire().is_ok());
     }
 
     /// Distinguish application gate rejection from flow-control exhaustion.
