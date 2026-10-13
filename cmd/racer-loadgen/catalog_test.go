@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -186,9 +187,13 @@ func TestCatalogWorkerTraversalAndVerifiedBytes(t *testing.T) {
 			cancel()
 			<-done
 
+			mu.Lock()
+			observedRefs := slices.Clone(refs)
+			mu.Unlock()
+
 			for pass := range 2 {
 				seen := make(map[string]bool)
-				for _, ref := range refs[pass*5 : (pass+1)*5] {
+				for _, ref := range observedRefs[pass*5 : (pass+1)*5] {
 					seen[ref] = true
 				}
 
