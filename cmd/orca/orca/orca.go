@@ -19,6 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/orca/app"
 	"github.com/Azure/unbounded/internal/orca/config"
 )
@@ -40,42 +41,38 @@ func Run() {
 func newServeCmd() *cobra.Command {
 	var configPath string
 
+	logOpts := logger.Options{Format: logger.FormatJSON, AddSource: true}
+
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the Orca cache server",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return serve(cmd.Context(), configPath)
+			return serve(cmd.Context(), configPath, logOpts, cmd.Flags().Changed("log-level"))
 		},
 	}
 	cmd.Flags().StringVarP(&configPath, "config", "c", "/etc/orca/config.yaml",
 		"path to YAML config file")
+	logOpts.BindFlags(cmd.Flags())
 
 	return cmd
 }
 
-func serve(parent context.Context, configPath string) error {
+func serve(parent context.Context, configPath string, logOpts logger.Options, levelSet bool) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	level, err := resolveLogLevel(cfg.Logging.Level)
+	logOpts, err = resolveLogOptions(logOpts, levelSet, cfg.Logging.Level)
 	if err != nil {
 		return err
 	}
 
-	levelVar := new(slog.LevelVar)
-	levelVar.Set(level)
-
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level:     levelVar,
-		AddSource: true,
-	}))
-	slog.SetDefault(log)
+	log := logOpts.Setup(os.Stderr)
 
 	log.Info("orca starting",
 		"config_path", configPath,
-		"log_level", level.String(),
+		"log_level", logOpts.Level.String(),
 	)
 
 	log.Info("config loaded",
@@ -113,6 +110,23 @@ func serve(parent context.Context, configPath string) error {
 	log.Info("orca stopped")
 
 	return shutdownErr
+}
+
+// resolveLogOptions applies the level precedence to the parsed flags: the
+// --log-level flag when it was given, otherwise resolveLogLevel.
+func resolveLogOptions(flags logger.Options, levelSet bool, yamlLevel string) (logger.Options, error) {
+	if levelSet {
+		return flags, nil
+	}
+
+	level, err := resolveLogLevel(yamlLevel)
+	if err != nil {
+		return logger.Options{}, err
+	}
+
+	flags.Level = level
+
+	return flags, nil
 }
 
 // resolveLogLevel determines the effective slog.Level by consulting

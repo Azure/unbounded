@@ -64,3 +64,12 @@ func TestSafeNamePartFallsBackForSymbolOnlyScope(t *testing.T) {
 	require.Contains(t, part, "scope-")
 	require.LessOrEqual(t, len("machine-ops-controller-"+part), 63)
 }
+
+func TestLogFlags(t *testing.T) {
+	t.Parallel()
+
+	flags := newCommand().Flags()
+
+	require.Equal(t, "info", flags.Lookup("log-level").DefValue)
+	require.Equal(t, "text", flags.Lookup("log-format").DefValue)
+}

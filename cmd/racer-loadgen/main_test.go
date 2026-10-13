@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,8 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 func TestParseOptionsDefaults(t *testing.T) {
@@ -45,6 +48,7 @@ func TestParseOptionsDefaults(t *testing.T) {
 			Concurrency: 64, BlobConcurrency: 4, Timeout: 2 * time.Minute,
 			RetryDelay: time.Second, Verify: false,
 		},
+		logOpts: logger.Options{Level: logger.DefaultLevel, Format: logger.FormatText},
 	}, opts)
 }
 
@@ -58,6 +62,7 @@ func TestParseOptionsOverrides(t *testing.T) {
 		"--catalog-images=512", "--startup-timeout=4m",
 		"--profile=zipf", "--zipf-exponent=0.8",
 		"--metrics-shutdown-grace=45s",
+		"--log-level=debug", "--log-format=json",
 	}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, options{
@@ -71,6 +76,7 @@ func TestParseOptionsOverrides(t *testing.T) {
 			Concurrency: 0, BlobConcurrency: 3, Timeout: 9 * time.Second,
 			RetryDelay: 20 * time.Millisecond, Interval: 30 * time.Millisecond,
 		},
+		logOpts: logger.Options{Level: slog.LevelDebug, Format: logger.FormatJSON},
 	}, opts)
 }
 

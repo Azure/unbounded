@@ -29,3 +29,14 @@ Applications access a cache through its client socket at
 
 Deleting and recreating a `ClusterCache` creates a new cache identity, even if
 you reuse the name.
+
+## Logging
+
+The controller writes JSON logs to stderr. `--log-level` takes `debug`,
+`info` (default), `warn` or `error`; `info-1` enables logr `V(1)` messages
+without the rest of `debug`. `--log-format` takes `json` (default), `text` or
+`prettytext`. Error logs include a `stacktrace` field.
+
+The operator runs the controller with no arguments. To set either flag, append
+it to the `controller` container through the operator's component overrides
+with `extraArgs`.

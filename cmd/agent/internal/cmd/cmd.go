@@ -14,18 +14,14 @@ import (
 )
 
 func Run() {
-	cmdCtx := &CommandContext{
-		LogFormat: "text",
-	}
+	cmdCtx := newCommandContext()
 
 	root := &cobra.Command{
 		Use:   "agent",
 		Short: "Unbounded Kubernetes Node Agent",
 	}
 
-	root.PersistentFlags().BoolVar(&cmdCtx.Debug, "debug", false, "enable debug-level logging")
-	root.PersistentFlags().StringVar(&cmdCtx.LogFormat, "log-format", cmdCtx.LogFormat, "log format: text or json")
-	root.PersistentFlags().BoolVar(&cmdCtx.LogNoColor, "no-color", false, "disable color in log output")
+	bindLogFlags(root, cmdCtx)
 
 	root.AddCommand(
 		newCmdStart(cmdCtx),
@@ -35,7 +31,7 @@ func Run() {
 		newCmdVersion(),
 		newCmdNSpawnLifecycle(cmdCtx),
 		newCmdHostAgentUpgrade(cmdCtx),
-		newCmdRecordAgentUpgradeFailureSignal(),
+		newCmdRecordAgentUpgradeFailureSignal(cmdCtx),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -49,5 +45,21 @@ func Run() {
 
 		fmt.Printf("error: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// bindLogFlags registers the logging flags on root for every subcommand.
+//
+// --debug is the agent's original level flag. It stays, hidden, because the
+// install script (internal/provision/assets/unbounded-agent-install.sh) passes
+// it to whichever agent release it downloads.
+func bindLogFlags(root *cobra.Command, cmdCtx *CommandContext) {
+	flags := root.PersistentFlags()
+	cmdCtx.LogOpts.BindFlags(flags)
+	cmdCtx.LogOpts.BindDebugFlag(flags)
+	flags.BoolVar(&cmdCtx.LogOpts.NoColor, "no-color", false, "Disable color in prettytext log output")
+
+	if err := flags.MarkHidden("debug"); err != nil {
+		panic(fmt.Sprintf("hide --debug: %v", err))
 	}
 }

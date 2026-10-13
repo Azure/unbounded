@@ -33,18 +33,19 @@ func main() {
 }
 
 func newRootCommand() *cobra.Command {
-	var (
-		opts      artifacts.Options
-		debug     bool
-		logFormat string
-	)
+	var opts artifacts.Options
+
+	logOpts := logger.Options{
+		Format:    logger.FormatPrettyText,
+		AttrOrder: []string{"artifact", "source", "archive", "oci_ref", "digest", "staging_dir"},
+	}
 
 	cmd := &cobra.Command{
 		Use:          "agent-artifacts-builder",
 		Short:        "Build offline agent bootstrap artifact bundles",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			log := newLogger(debug, logFormat)
+			log := logOpts.Setup(os.Stderr)
 
 			if opts.ManifestPath == "" && opts.KubernetesVersion == "" {
 				return fmt.Errorf("one of --manifest or --kubernetes-version is required")
@@ -58,8 +59,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 
-	cmd.PersistentFlags().BoolVar(&debug, "debug", false, "enable debug-level logging")
-	cmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "log format: text or json")
+	logOpts.BindFlags(cmd.PersistentFlags())
 
 	flags := cmd.Flags()
 	flags.StringVar(&opts.OutputDir, "output-dir", "", "Directory where the offline artifact filesystem layout is written")
@@ -71,15 +71,15 @@ func newRootCommand() *cobra.Command {
 	flags.StringSliceVar(&opts.Architectures, "arch", nil, "Target architecture to include. Repeat or comma separate. Defaults to the host GOARCH")
 
 	cmd.AddCommand(
-		newBuildCommand(&debug, &logFormat),
+		newBuildCommand(&logOpts),
 		newResolvePublishInputsCommand(),
-		newValidateOCICommand(&debug, &logFormat),
+		newValidateOCICommand(&logOpts),
 	)
 
 	return cmd
 }
 
-func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
+func newBuildCommand(logOpts *logger.Options) *cobra.Command {
 	var (
 		outputDir          string
 		kubernetesVersions []string
@@ -117,7 +117,7 @@ func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
 				return fmt.Errorf("--legal-files-dir is required")
 			}
 
-			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, legalFilesDir, versions, images, publish)
+			return buildReleaseLayout(cmd.Context(), logOpts.Setup(os.Stderr), outputDir, legalFilesDir, versions, images, publish)
 		},
 	}
 
@@ -400,22 +400,7 @@ func prepareBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, 
 	return task, nil
 }
 
-func newLogger(debug bool, format string) *slog.Logger {
-	var lvl slog.LevelVar
-	if debug {
-		lvl.Set(slog.LevelDebug)
-	}
-
-	if strings.EqualFold(format, "json") {
-		return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: &lvl}))
-	}
-
-	return slog.New(logger.NewPrettyFieldHandler(&lvl, logger.PrettyFieldHandlerOptions{
-		AttrOrder: []string{"artifact", "source", "archive", "oci_ref", "digest", "staging_dir"},
-	}))
-}
-
-func newValidateOCICommand(debug *bool, logFormat *string) *cobra.Command {
+func newValidateOCICommand(logOpts *logger.Options) *cobra.Command {
 	var ociRef string
 
 	cmd := &cobra.Command{
@@ -427,7 +412,7 @@ func newValidateOCICommand(debug *bool, logFormat *string) *cobra.Command {
 				return fmt.Errorf("--oci-ref is required")
 			}
 
-			return artifacts.ValidateOCI(cmd.Context(), newLogger(*debug, *logFormat), ociRef)
+			return artifacts.ValidateOCI(cmd.Context(), logOpts.Setup(os.Stderr), ociRef)
 		},
 	}
 

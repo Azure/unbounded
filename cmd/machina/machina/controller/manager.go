@@ -18,7 +18,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -33,10 +32,9 @@ func init() {
 	utilruntime.Must(unboundedv1alpha3.AddToScheme(scheme))
 }
 
-// RunManager runs the controller manager.
+// RunManager runs the controller manager. The caller installs the logger first
+// (see NewCommand).
 func RunManager(ctx context.Context, cfg Config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
-
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Cache:                  machinaCacheOptions(),
@@ -66,7 +64,7 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("resolve cluster info: %w", err)
 	}
 
-	// Setup Machine controller — handles both reachability and provisioning.
+	// Set up the Machine controller, which handles both reachability and provisioning.
 	if err := setupMachineFieldIndexes(ctx, mgr.GetFieldIndexer()); err != nil {
 		return fmt.Errorf("setup Machine field indexes: %w", err)
 	}

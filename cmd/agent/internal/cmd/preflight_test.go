@@ -75,7 +75,7 @@ func preflightTestServer(t *testing.T) *httptest.Server {
 }
 
 func TestNewCmdPreflight(t *testing.T) {
-	cmd := newCmdPreflight(&CommandContext{LogFormat: "text"})
+	cmd := newCmdPreflight(&CommandContext{})
 
 	assert.Equal(t, "preflight", cmd.Use)
 	assert.NotNil(t, cmd.Flags().Lookup("config"))
@@ -93,7 +93,7 @@ func TestPreflightJSONOutput(t *testing.T) {
 	var out bytes.Buffer
 
 	h := &preflightHandler{
-		cmdCtx:                &CommandContext{LogFormat: "text"},
+		cmdCtx:                &CommandContext{},
 		configPath:            path,
 		ignorePreflightErrors: []string{"all"},
 		output:                "json",
@@ -120,7 +120,7 @@ func TestPreflightTextOutputError(t *testing.T) {
 	var out bytes.Buffer
 
 	h := &preflightHandler{
-		cmdCtx:     &CommandContext{LogFormat: "text"},
+		cmdCtx:     &CommandContext{},
 		configPath: path,
 		output:     "text",
 		writer:     &out,
@@ -144,7 +144,7 @@ func TestPreflightTextOutputIncludesOK(t *testing.T) {
 	var out bytes.Buffer
 
 	h := &preflightHandler{
-		cmdCtx:                &CommandContext{LogFormat: "text"},
+		cmdCtx:                &CommandContext{},
 		configPath:            path,
 		ignorePreflightErrors: []string{"all"},
 		output:                "text",

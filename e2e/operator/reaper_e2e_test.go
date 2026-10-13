@@ -33,6 +33,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -55,9 +56,9 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/logger"
 	netcontroller "github.com/Azure/unbounded/internal/net/controller"
 	"github.com/Azure/unbounded/internal/operator"
 )
@@ -131,7 +132,7 @@ func TestOperatorReaperMigration(t *testing.T) {
 	applyCRDs(t, kubeconfig, repoRoot)
 
 	cli := newClient(t, kubeconfig)
-	ctx := log.IntoContext(context.Background(), zap.New(zap.UseDevMode(true)))
+	ctx := log.IntoContext(context.Background(), logr.FromSlogHandler(logger.Options{Level: logger.DefaultLevel}.Handler(os.Stderr)))
 
 	stageNamespaces(ctx, t, cli)
 	stageLegacyWorkloads(ctx, t, cli)

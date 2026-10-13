@@ -4,10 +4,9 @@
 package main
 
 import (
-	"log/slog"
+	"fmt"
 	"os"
 
-	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,39 +15,47 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/playpen/runner"
 	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
-	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
+	if err := newCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newCommand() *cobra.Command {
+	var logOpts logger.Options
 
 	cfg := runner.DefaultConfig()
 	cfg.PodName = os.Getenv("POD_NAME")
-
 	cfg.PodNamespace = os.Getenv("POD_NAMESPACE")
-	if cfg.PodName != "" && cfg.PodNamespace != "" {
-		scheme := runtime.NewScheme()
-		utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-		utilruntime.Must(corev1.AddToScheme(scheme))
-
-		kubeClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
-		if err != nil {
-			slog.Error("create Kubernetes client", "error", err)
-			os.Exit(1)
-		}
-
-		cfg.KubernetesClient = kubeClient
-	}
 
 	root := &cobra.Command{
 		Use:   "playpen-runner",
 		Short: "Standalone VM runner and k3s control-plane helper for playpen tests",
+		// Runs before every subcommand too, so they all log the same way.
+		PersistentPreRun: func(*cobra.Command, []string) {
+			logOpts.Setup(os.Stderr)
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if cfg.PodName != "" && cfg.PodNamespace != "" {
+				kubeClient, err := newKubernetesClient()
+				if err != nil {
+					return fmt.Errorf("create Kubernetes client: %w", err)
+				}
+
+				cfg.KubernetesClient = kubeClient
+			}
+
 			return runner.Run(cmd.Context(), cfg)
 		},
 		Version: version.Version + " (commit: " + version.GitCommit + ")",
 	}
+
+	logOpts.BindFlags(root.PersistentFlags())
 
 	flags := root.Flags()
 	flags.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTPS Redfish and info listen address")
@@ -96,7 +103,18 @@ func main() {
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
-	if err := root.Execute(); err != nil {
-		os.Exit(1)
+	return root
+}
+
+func newKubernetesClient() (client.Client, error) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(corev1.AddToScheme(scheme))
+
+	restConfig, err := ctrl.GetConfig()
+	if err != nil {
+		return nil, err
 	}
+
+	return client.New(restConfig, client.Options{Scheme: scheme})
 }

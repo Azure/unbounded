@@ -18,6 +18,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/orca/chunk"
 )
 
@@ -520,24 +521,22 @@ func validateChunkingTiers(tiers []ChunkTier) error {
 	return nil
 }
 
-// ParseLogLevel maps an orca log-level string to slog.Level. Returns
-// an error for unknown values. Empty string is treated as the
-// configured default ("info"). Used both by config.validate at YAML
-// parse time and by the cmd/orca entrypoint to honor the
-// ORCA_LOG_LEVEL environment override.
+// ParseLogLevel maps an orca log-level string to slog.Level with
+// logger.ParseLevel, so it accepts debug, info, warn (or warning) and error,
+// with an optional offset. An empty string is the default level. Used both by
+// config.validate at YAML parse time and by the cmd/orca entrypoint to honor
+// the ORCA_LOG_LEVEL environment override.
 func ParseLogLevel(s string) (slog.Level, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "info":
-		return slog.LevelInfo, nil
-	case "debug":
-		return slog.LevelDebug, nil
-	case "warn", "warning":
-		return slog.LevelWarn, nil
-	case "error":
-		return slog.LevelError, nil
-	default:
-		return 0, fmt.Errorf("logging.level %q invalid; expected one of debug, info, warn, error", s)
+	if strings.TrimSpace(s) == "" {
+		return logger.DefaultLevel, nil
 	}
+
+	level, err := logger.ParseLevel(s)
+	if err != nil {
+		return 0, fmt.Errorf("logging.level: %w", err)
+	}
+
+	return level, nil
 }
 
 // TargetPerReplica returns the per-replica origin concurrency cap

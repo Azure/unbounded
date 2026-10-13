@@ -14,13 +14,14 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/cluster"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/cmd"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/site"
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 func Run() {
 	rootCfg := cmd.CommandContext{
 		CloudName:      "AzurePublicCloud",
 		SubscriptionID: "",
-		LogFormat:      "text",
+		LogOpts:        logger.Options{Format: logger.FormatPrettyText, AttrOrder: []string{"cluster", "stage", "step"}},
 		DataDir:        filepath.Join("~/.unbounded-forge"),
 	}
 
@@ -37,7 +38,7 @@ func Run() {
 
 	root.PersistentFlags().StringVarP(&rootCfg.CloudName, "cloud", "a", rootCfg.CloudName, "Azure cloud name")
 	root.PersistentFlags().StringVarP(&rootCfg.SubscriptionID, "subscription", "s", rootCfg.SubscriptionID, "Azure subscription ID")
-	root.PersistentFlags().StringVar(&rootCfg.LogFormat, "log-format", rootCfg.LogFormat, "log format")
+	rootCfg.LogOpts.BindFlags(root.PersistentFlags())
 
 	if err := root.Execute(); err != nil {
 		fmt.Printf("error: %v\n", err)

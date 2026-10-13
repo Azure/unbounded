@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 	"strconv"
 
@@ -13,19 +12,27 @@ import (
 	"github.com/spf13/cobra"
 
 	inventoryviewer "github.com/Azure/unbounded/internal/inventory/viewer"
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
+	if err := newCommand().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func newCommand() *cobra.Command {
 	config := inventoryviewer.Config{}
+	logOpts := logger.Options{Format: logger.FormatJSON}
 
 	rootCmd := &cobra.Command{
 		Use:     "inventory-viewer",
 		Short:   "Web interface for browsing inventory data",
 		Version: version.Version + " (commit: " + version.GitCommit + ")",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-			slog.SetDefault(logger)
+			logOpts.Setup(os.Stderr)
 
 			sslMode := pq.SSLMode(os.Getenv("POSTGRES_SSL_MODE"))
 			switch sslMode {
@@ -56,10 +63,8 @@ func main() {
 		},
 	}
 
+	logOpts.BindFlags(rootCmd.Flags())
 	rootCmd.Flags().StringVar(&config.Addr, "addr", ":8080", "Address for the HTTP server to listen on")
 
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	return rootCmd
 }

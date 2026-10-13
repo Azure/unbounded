@@ -26,13 +26,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/clusterinfo"
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
@@ -78,6 +78,7 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.imageRegistry, "image-registry", envStringDefault("UNBOUNDED_IMAGE_REGISTRY", "ghcr.io/azure"), "Full image-repository prefix (registry host plus org/namespace) for operator-managed component images (defaults to $UNBOUNDED_IMAGE_REGISTRY or ghcr.io/azure)")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
+	cfg.logOpts.BindFlags(cmd.Flags())
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
@@ -93,6 +94,7 @@ type config struct {
 	imageRegistry           string
 	apiServerEndpoint       string
 	reapLegacyResources     bool
+	logOpts                 logger.Options
 }
 
 func envStringDefault(name, fallback string) string {
@@ -142,7 +144,7 @@ func resolveAPIServerEndpoint(ctx context.Context, override string, clientset ku
 }
 
 func run(ctx context.Context, cfg config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	cfg.logOpts.Setup(os.Stderr)
 
 	scheme := runtimeScheme()
 

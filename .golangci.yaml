@@ -38,6 +38,7 @@ linters:
     - unused
 
     # Project policy.
+    - depguard
     - goheader
     - misspell
     - wsl_v5
@@ -77,6 +78,22 @@ linters:
   # settings for linters that never ran are what this file was full of.
 
   settings:
+    depguard:
+      rules:
+        # Go code logs through log/slog, set up by internal/logger (see Logging
+        # in AGENTS.md). These are the zap packages a controller-runtime binary
+        # reaches for by default. Deny entries match by import-path prefix, so
+        # go.uber.org/zap also covers zapcore. This checks our imports only:
+        # zap stays in go.mod as a dependency of go-libp2p-kad-dht.
+        logging:
+          list-mode: lax
+          deny:
+            - pkg: go.uber.org/zap
+              desc: log with log/slog, set up by internal/logger (see Logging in AGENTS.md)
+            - pkg: github.com/go-logr/zapr
+              desc: log with log/slog, set up by internal/logger (see Logging in AGENTS.md)
+            - pkg: sigs.k8s.io/controller-runtime/pkg/log/zap
+              desc: internal/logger routes controller-runtime through log/slog (see Logging in AGENTS.md)
     errcheck:
       # Treat type assertion as erroneous operation, though assertions should be avoided in general.
       check-type-assertions: true

@@ -6,6 +6,10 @@ package orca
 import (
 	"log/slog"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 // TestResolveLogLevel_PrecedenceAndDefault covers the resolution
@@ -55,4 +59,35 @@ func TestResolveLogLevel_PrecedenceAndDefault(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolveLogOptions_FlagWins covers the --log-level flag, which takes
+// precedence over ORCA_LOG_LEVEL and the YAML level.
+func TestResolveLogOptions_FlagWins(t *testing.T) {
+	t.Setenv("ORCA_LOG_LEVEL", "debug")
+
+	flags := logger.Options{Level: slog.LevelError, Format: logger.FormatJSON, AddSource: true}
+
+	got, err := resolveLogOptions(flags, true, "warn")
+	require.NoError(t, err)
+	require.Equal(t, flags, got)
+
+	got, err = resolveLogOptions(flags, false, "warn")
+	require.NoError(t, err)
+	require.Equal(t, slog.LevelDebug, got.Level, "without the flag, ORCA_LOG_LEVEL wins")
+
+	t.Setenv("ORCA_LOG_LEVEL", "")
+
+	got, err = resolveLogOptions(flags, false, "warn")
+	require.NoError(t, err)
+	require.Equal(t, slog.LevelWarn, got.Level, "then the YAML level")
+
+	_, err = resolveLogOptions(flags, false, "trace")
+	require.Error(t, err)
+}
+
+func TestServeLogFlagDefaults(t *testing.T) {
+	flags := newServeCmd().Flags()
+	require.Equal(t, "info", flags.Lookup("log-level").DefValue)
+	require.Equal(t, "json", flags.Lookup("log-format").DefValue)
 }

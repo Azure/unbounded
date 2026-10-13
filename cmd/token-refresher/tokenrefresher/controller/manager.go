@@ -19,7 +19,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -32,9 +31,9 @@ func init() {
 	utilruntime.Must(unboundedv1alpha3.AddToScheme(scheme))
 }
 
+// RunManager runs the controller manager. The caller installs the logger first
+// (see NewCommand).
 func RunManager(ctx context.Context, cfg Config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
-
 	restCfg := ctrl.GetConfigOrDie()
 
 	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{

@@ -17,7 +17,6 @@ import (
 
 // Config holds the configuration for the inventory inspector.
 type Config struct {
-	Debug  bool
 	DbConn pq.Config
 }
 
