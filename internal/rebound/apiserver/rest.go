@@ -223,6 +223,22 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		errs = append(errs, field.Forbidden(field.NewPath("metadata", "generateName"), "use an explicit name"))
 	}
 
+	if len(g.OwnerReferences) != 0 {
+		errs = append(errs, field.Forbidden(field.NewPath("metadata", "ownerReferences"), "not supported by NodeGrant"))
+	}
+
+	if len(g.Finalizers) != 0 {
+		errs = append(errs, field.Forbidden(field.NewPath("metadata", "finalizers"), "not supported by NodeGrant"))
+	}
+
+	if g.DeletionTimestamp != nil {
+		errs = append(errs, field.Forbidden(field.NewPath("metadata", "deletionTimestamp"), "not supported by NodeGrant"))
+	}
+
+	if g.DeletionGracePeriodSeconds != nil {
+		errs = append(errs, field.Forbidden(field.NewPath("metadata", "deletionGracePeriodSeconds"), "not supported by NodeGrant"))
+	}
+
 	if len(g.Spec.Nodes) == 0 {
 		errs = append(errs, field.Required(field.NewPath("spec", "nodes"), "at least one node is required"))
 	}
