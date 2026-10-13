@@ -268,6 +268,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/aws/smithy-go/blob/v1.28.2/LICENSE
+  - dependency: github.com/awslabs/operatorpkg
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/awslabs/operatorpkg/blob/5e8ed3699dea/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -572,6 +579,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/prometheus/common/blob/v0.70.1/LICENSE
+  - dependency: github.com/samber/lo
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2022-2025 Samuel Berthe
+    license:
+      - name: MIT License
+        link: https://github.com/samber/lo/blob/v1.53.0/LICENSE
   - dependency: github.com/spf13/cobra
     ecosystem: go
     copyright:
@@ -874,6 +888,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/controller-runtime/blob/v0.25.1/LICENSE
+  - dependency: sigs.k8s.io/karpenter
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes-sigs/karpenter/blob/v1.15.0/LICENSE
   - dependency: sigs.k8s.io/yaml
     ecosystem: go
     copyright:
