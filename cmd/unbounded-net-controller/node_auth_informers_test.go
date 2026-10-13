@@ -12,15 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -64,36 +61,12 @@ func waitNodeAuthCondition(t *testing.T, condition func() bool) {
 	}
 }
 
-// Initial cache sync can precede Watch. The fake tracker does not replay deletes
-// from that gap, so tests must wait for watch registration before mutating objects.
-func trackNodeAuthTestWatches(client *k8sfake.Clientset) func() bool {
-	var pods, serviceAccounts atomic.Bool
-
-	reactor := client.WatchReactionChain[0]
-	client.PrependWatchReactor("*", func(action k8stesting.Action) (bool, watch.Interface, error) {
-		handled, watcher, err := reactor.React(action)
-		if handled && err == nil && watcher != nil {
-			switch action.GetResource().Resource {
-			case "pods":
-				pods.Store(true)
-			case "serviceaccounts":
-				serviceAccounts.Store(true)
-			}
-		}
-
-		return handled, watcher, err
-	})
-
-	return func() bool { return pods.Load() && serviceAccounts.Load() }
-}
-
 func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuthInformers, context.CancelFunc) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
-	watched := trackNodeAuthTestWatches(client)
 	caches := newNodeAuthInformers(ctx, client, "unbounded-system", 0)
 	caches.start()
 	t.Cleanup(func() {
@@ -102,54 +75,8 @@ func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuth
 		caches.saFactory.Shutdown()
 	})
 	waitNodeAuthCondition(t, caches.ready)
-	waitNodeAuthCondition(t, watched)
 
 	return caches, cancel
-}
-
-func TestNodeAuthTestWatchesWaitForRegistration(t *testing.T) {
-	pod, sa, _ := nodeAuthObjects()
-	client := k8sfake.NewClientset(pod, sa)
-	watched := trackNodeAuthTestWatches(client)
-	release := make(chan struct{})
-
-	var once sync.Once
-
-	unblock := func() { once.Do(func() { close(release) }) }
-
-	client.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
-		<-release
-		return false, nil, nil
-	})
-
-	ctx, cancel := context.WithCancel(t.Context())
-	caches := newNodeAuthInformers(ctx, client, pod.Namespace, 0)
-
-	t.Cleanup(func() {
-		unblock()
-		cancel()
-		caches.podFactory.Shutdown()
-		caches.saFactory.Shutdown()
-	})
-	caches.start()
-	waitNodeAuthCondition(t, caches.pods.Informer().HasSynced)
-
-	if watched() {
-		t.Fatal("initial list completion must not imply watch registration")
-	}
-
-	unblock()
-	waitNodeAuthCondition(t, watched)
-	waitNodeAuthCondition(t, caches.ready)
-
-	if err := client.CoreV1().Pods(pod.Namespace).Delete(t.Context(), pod.Name, metav1.DeleteOptions{}); err != nil {
-		t.Fatal(err)
-	}
-
-	waitNodeAuthCondition(t, func() bool {
-		_, err := caches.pods.Lister().Pods(pod.Namespace).Get(pod.Name)
-		return err != nil
-	})
 }
 
 func assertNodeAuthProbes(t *testing.T, caches *nodeAuthInformers, client *k8sfake.Clientset, verifier serviceAccountTokenVerifier, ready bool) {
