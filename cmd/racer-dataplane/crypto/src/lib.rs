@@ -862,7 +862,8 @@ pub mod identity {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            root_store(&bundle.peer_trust_roots)?;
+            // Installation admits future and expired anchors; verification filters time.
+            build_root_store(&bundle.peer_trust_roots, None)?;
             let mut hash = Sha256::new();
             hash.update(b"racer/keyring/bundle/v1\0");
             hash.update((bundle.peer_trust_roots.len() as u64).to_be_bytes());
@@ -1278,6 +1279,13 @@ pub mod identity {
         roots: &[Vec<u8>],
         now: rustls::pki_types::UnixTime,
     ) -> Result<(RootCertStore, Vec<(u64, u64)>)> {
+        build_root_store(roots, Some(now))
+    }
+
+    fn build_root_store(
+        roots: &[Vec<u8>],
+        now: Option<rustls::pki_types::UnixTime>,
+    ) -> Result<(RootCertStore, Vec<(u64, u64)>)> {
         if roots.is_empty() || roots.len() > 32 {
             return Err(Error::Unauthorized);
         }
@@ -1293,14 +1301,17 @@ pub mod identity {
             }
             let start = cert.validity().not_before.timestamp();
             let end = cert.validity().not_after.timestamp();
-            let seconds = i64::try_from(now.as_secs()).map_err(|_| Error::Unauthorized)?;
-            if seconds < start || seconds >= end {
-                continue;
-            }
             store
                 .add(CertificateDer::from(root.clone()))
                 .map_err(|_| Error::Unauthorized)?;
-            bounds.push((start.max(0) as u64, end as u64));
+            if let Some(now) = now {
+                let seconds = i64::try_from(now.as_secs()).map_err(|_| Error::Unauthorized)?;
+                if seconds < start || seconds >= end {
+                    store.roots.pop();
+                    continue;
+                }
+            }
+            bounds.push((start.max(0) as u64, end.max(0) as u64));
         }
         if store.is_empty() {
             return Err(Error::Unauthorized);
@@ -1382,6 +1393,65 @@ pub mod identity {
     mod bundle_tests {
         use super::test_util::*;
         use super::*;
+
+        #[test]
+        fn installation_accepts_time_invalid_roots_but_verification_does_not() {
+            use std::time::Duration;
+
+            let clock = environment::SimulationClock::new(111);
+            let _environment = clock.environment(0).enter();
+            let now = environment::wall_now();
+            let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
+            let node = NodeId("22222222-2222-4222-8222-222222222222".into());
+            let (_, ca_key) = ca();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            params.not_before = (now + Duration::from_secs(60)).into();
+            params.not_after = (now + Duration::from_secs(120)).into();
+            let future = params.clone().self_signed(&ca_key).unwrap();
+            params.not_before = (now - Duration::from_secs(120)).into();
+            params.not_after = now.into();
+            let expired = params.self_signed(&ca_key).unwrap();
+            let (_, chain) = issue(&future, &ca_key, &cluster, &node, |_| {});
+
+            for roots in [
+                vec![future.der().to_vec()],
+                vec![expired.der().to_vec()],
+                vec![expired.der().to_vec(), future.der().to_vec()],
+            ] {
+                let keys = Rc::new(Keyring::new(cluster.clone(), node.clone(), Arc::default()));
+                let installer = BundleInstaller::new(keys.clone());
+                let mut bundle = racer_control_wire::KeyringBundle {
+                    schema_version: SCHEMA_VERSION,
+                    cluster: cluster.clone(),
+                    generation: BundleGeneration(1),
+                    peer_trust_roots: roots.clone(),
+                    cache_keys: vec![],
+                };
+                installer.install(bundle.clone()).unwrap();
+                installer.install(bundle.clone()).unwrap();
+                assert!(verify_chain(&roots, &chain, &cluster, &node).is_err());
+                clock.set_wall_time(now + Duration::from_secs(60));
+                assert_eq!(
+                    verify_chain(&roots, &chain, &cluster, &node).is_ok(),
+                    roots.contains(&future.der().to_vec())
+                );
+                clock.set_wall_time(now + Duration::from_secs(120));
+                assert!(verify_chain(&roots, &chain, &cluster, &node).is_err());
+                bundle.generation = BundleGeneration(2);
+                installer.install(bundle.clone()).unwrap();
+                bundle.generation = BundleGeneration(3);
+                for invalid in [vec![], vec![vec![0; 128]], chain.clone()] {
+                    bundle.peer_trust_roots = invalid;
+                    assert!(installer.install(bundle.clone()).is_err());
+                    assert!(keys.install(bundle.clone()).is_err());
+                    assert_eq!(keys.generation().unwrap(), Some(2));
+                    assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+                }
+                clock.set_wall_time(now);
+            }
+        }
 
         #[test]
         fn cached_delivery_revalidates_shared_keyring_epoch() {
