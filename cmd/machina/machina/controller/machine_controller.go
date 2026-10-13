@@ -10,11 +10,13 @@ import (
 	stderrs "errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -230,6 +232,15 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.Error(err, "Failed to get Machine")
 
 		return ctrl.Result{}, err
+	}
+
+	observationsChanged, err := r.refreshNodeAllocation(ctx, &machine)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if observationsChanged {
+		return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
 	}
 
 	// Machines without SSH configuration are not managed by this controller.
@@ -844,8 +855,11 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 
 	case unboundedv1alpha3.MachinePhaseReady:
 		if len(nodeList.Items) > 0 {
-			// Node still exists - stay Ready.
-			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
+			// Node still exists. Persist current mutable allocation
+			// observations without using the human-facing phase as an
+			// allocation signal.
+			return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseReady,
+				fmt.Sprintf("Node %s joined", node.Name))
 		}
 
 		// Node disappeared - transition back to Joining so we wait for
@@ -860,6 +874,177 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 		// Should not be called for other phases, but handle gracefully.
 		return ctrl.Result{}, nil
 	}
+}
+
+func (r *MachineReconciler) refreshNodeAllocation(
+	ctx context.Context,
+	machine *unboundedv1alpha3.Machine,
+) (bool, error) {
+	previous := machine.Status.DeepCopy()
+	nodeName := machine.Name
+
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil {
+		nodeName = machine.Spec.Kubernetes.NodeRef.Name
+	}
+
+	var node corev1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, fmt.Errorf("get Node allocation observation: %w", err)
+		}
+
+		clearNodeAllocation(machine)
+	} else {
+		observeNodeAllocation(machine, &node)
+	}
+
+	if equality.Semantic.DeepEqual(previous, &machine.Status) {
+		return false, nil
+	}
+
+	if err := r.Status().Update(ctx, machine); err != nil {
+		return false, fmt.Errorf("update Machine Node allocation observation: %w", err)
+	}
+
+	return true, nil
+}
+
+func clearNodeAllocation(machine *unboundedv1alpha3.Machine) {
+	allocationReady := apimeta.FindStatusCondition(
+		machine.Status.Conditions,
+		unboundedv1alpha3.MachineConditionAllocationReady,
+	)
+	if machine.Status.Allocation == nil && allocationReady == nil {
+		return
+	}
+
+	machine.Status.Allocation = nil
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               unboundedv1alpha3.MachineConditionAllocationReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             "NodeNotFound",
+		Message:            "Kubernetes Node was not found; allocation observations were cleared",
+		ObservedGeneration: machine.Generation,
+	})
+
+	if machine.Status.Reservation != nil {
+		return
+	}
+
+	available := apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionAvailable)
+	if available != nil && available.Status == metav1.ConditionTrue && available.Reason == "Observed" {
+		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:               unboundedv1alpha3.MachineConditionAvailable,
+			Status:             metav1.ConditionFalse,
+			Reason:             "NodeObservationCleared",
+			Message:            "Node-derived availability was cleared with stale observations",
+			ObservedGeneration: machine.Generation,
+		})
+	}
+}
+
+func observeNodeAllocation(machine *unboundedv1alpha3.Machine, node *corev1.Node) {
+	ready := false
+
+	for i := range node.Status.Conditions {
+		if node.Status.Conditions[i].Type == corev1.NodeReady {
+			ready = node.Status.Conditions[i].Status == corev1.ConditionTrue
+			break
+		}
+	}
+
+	internalIP := ""
+
+	for i := range node.Status.Addresses {
+		if node.Status.Addresses[i].Type == corev1.NodeInternalIP {
+			internalIP = node.Status.Addresses[i].Address
+			break
+		}
+	}
+
+	image := ""
+	if machine.Status.Agent != nil {
+		image = machine.Status.Agent.Image
+	}
+
+	machine.Status.Allocation = &unboundedv1alpha3.MachineAllocationStatus{
+		Node: &unboundedv1alpha3.MachineNodeObservation{
+			Name:       node.Name,
+			Ready:      ready,
+			InternalIP: internalIP,
+			Image:      image,
+		},
+	}
+
+	gpuVendor := firstNonEmpty(node.Labels[unboundedv1alpha3.MachineGPUVendorLabelKey], machine.Labels[unboundedv1alpha3.MachineGPUVendorLabelKey])
+	gpuModel := firstNonEmpty(node.Labels[unboundedv1alpha3.MachineGPUModelLabelKey], machine.Labels[unboundedv1alpha3.MachineGPUModelLabelKey])
+	gpuCapacity := node.Status.Capacity[corev1.ResourceName("nvidia.com/gpu")]
+	gpuHealthy := node.Status.Allocatable[corev1.ResourceName("nvidia.com/gpu")]
+
+	fabricHealthy, err := strconv.ParseBool(node.Labels[unboundedv1alpha3.MachineGPUFabricHealthyLabelKey])
+	if err != nil {
+		fabricHealthy = false
+	}
+
+	if gpuVendor != "" || gpuModel != "" || !gpuCapacity.IsZero() || !gpuHealthy.IsZero() {
+		machine.Status.Allocation.GPU = &unboundedv1alpha3.MachineGPUObservation{
+			Vendor:        gpuVendor,
+			Model:         gpuModel,
+			Count:         int32(gpuCapacity.Value()),
+			HealthyCount:  int32(gpuHealthy.Value()),
+			FabricHealthy: fabricHealthy,
+		}
+	}
+
+	allocationReady := ready && internalIP != "" && image != ""
+
+	if machine.Status.Allocation.GPU != nil {
+		gpu := machine.Status.Allocation.GPU
+
+		allocationReady = allocationReady && gpu.Vendor != "" && gpu.Model != "" &&
+			gpu.Count > 0 && gpu.HealthyCount == gpu.Count
+		if strings.EqualFold(gpu.Model, "GB200") {
+			allocationReady = allocationReady && gpu.Count == 4 && gpu.FabricHealthy
+		}
+	}
+
+	allocationStatus := metav1.ConditionFalse
+	allocationReason := "ObservationsIncomplete"
+	allocationMessage := "Node, image, or hardware health observations are incomplete"
+
+	if allocationReady {
+		allocationStatus = metav1.ConditionTrue
+		allocationReason = "Observed"
+		allocationMessage = "Node and hardware allocation observations are ready"
+	}
+
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               unboundedv1alpha3.MachineConditionAllocationReady,
+		Status:             allocationStatus,
+		Reason:             allocationReason,
+		Message:            allocationMessage,
+		ObservedGeneration: machine.Generation,
+	})
+
+	if machine.Status.Reservation == nil {
+		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:               unboundedv1alpha3.MachineConditionReserved,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Unreserved",
+			Message:            "Machine has no CapacityClaim reservation",
+			ObservedGeneration: machine.Generation,
+		})
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+
+	return ""
 }
 
 // wasProvisioned returns true if the machine has a Provisioned condition set to True.

@@ -6,6 +6,7 @@ package v1alpha3
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func init() {
@@ -22,6 +23,20 @@ const (
 	// Machine to a site and is also the canonical label the net controller
 	// applies to Nodes, superseding the deprecated net.unbounded-cloud.io/site.
 	MachineSiteLabelKey = "unbounded-cloud.io/site"
+
+	// MachineCapacityDomainLabelKey identifies the coordination domain used
+	// to serialize capacity reservation and release mutations.
+	MachineCapacityDomainLabelKey = "unbounded-cloud.io/capacity-domain"
+
+	// MachineGPUVendorLabelKey identifies the installed GPU vendor.
+	MachineGPUVendorLabelKey = "unbounded-cloud.io/gpu-vendor"
+
+	// MachineGPUModelLabelKey identifies the installed GPU model.
+	MachineGPUModelLabelKey = "unbounded-cloud.io/gpu-model"
+
+	// MachineGPUFabricHealthyLabelKey reports whether the GPU fabric health
+	// barrier passed.
+	MachineGPUFabricHealthyLabelKey = "unbounded-cloud.io/gpu-fabric-healthy"
 )
 
 // +kubebuilder:object:root=true
@@ -95,6 +110,23 @@ const (
 	// For OnDelete updates this remains True until the operator deletes
 	// the Node and the agent repaves with the desired version.
 	MachineConditionRepavePending = "RepavePending"
+
+	// MachineConditionAvailable indicates whether a Machine may be selected
+	// for a new CapacityClaim. A reservation always forces this condition
+	// false.
+	MachineConditionAvailable = "Available"
+
+	// MachineConditionReserved indicates whether a CapacityClaim owns the
+	// Machine reservation.
+	MachineConditionReserved = "Reserved"
+
+	// MachineConditionAllocationReady indicates that typed allocation
+	// observations are complete enough to evaluate a CapacityClaim.
+	MachineConditionAllocationReady = "AllocationReady"
+
+	// MachineConditionQuarantined prevents allocation regardless of Machine
+	// phase or other conditions.
+	MachineConditionQuarantined = "Quarantined"
 )
 
 // Annotation keys.
@@ -719,9 +751,56 @@ type MachineStatus struct {
 	// +optional
 	Configuration *MachineConfigurationRefStatus `json:"configuration,omitempty"`
 
+	// Reservation records the CapacityClaim that exclusively owns this
+	// Machine.
+	// +optional
+	Reservation *MachineReservationStatus `json:"reservation,omitempty"`
+
+	// Allocation contains typed, mutable observations used to determine
+	// whether reserved capacity is ready. It is not machine identity.
+	// +optional
+	Allocation *MachineAllocationStatus `json:"allocation,omitempty"`
+
 	// Conditions represent the latest available observations of the
 	// machine's state.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MachineReservationStatus records exclusive CapacityClaim ownership.
+type MachineReservationStatus struct {
+	ClaimName  string      `json:"claimName"`
+	ClaimUID   types.UID   `json:"claimUID"`
+	Domain     string      `json:"domain"`
+	ReservedAt metav1.Time `json:"reservedAt"`
+}
+
+// MachineAllocationStatus contains mutable node and accelerator observations.
+type MachineAllocationStatus struct {
+	// Node contains current Kubernetes Node observations.
+	// +optional
+	Node *MachineNodeObservation `json:"node,omitempty"`
+
+	// GPU contains current accelerator observations.
+	// +optional
+	GPU *MachineGPUObservation `json:"gpu,omitempty"`
+}
+
+// MachineNodeObservation contains mutable Kubernetes Node state. InternalIP is
+// deliberately observational and must not be used as Machine identity.
+type MachineNodeObservation struct {
+	Name       string `json:"name,omitempty"`
+	Ready      bool   `json:"ready,omitempty"`
+	InternalIP string `json:"internalIP,omitempty"`
+	Image      string `json:"image,omitempty"`
+}
+
+// MachineGPUObservation contains typed GPU and fabric health observations.
+type MachineGPUObservation struct {
+	Vendor        string `json:"vendor,omitempty"`
+	Model         string `json:"model,omitempty"`
+	Count         int32  `json:"count,omitempty"`
+	HealthyCount  int32  `json:"healthyCount,omitempty"`
+	FabricHealthy bool   `json:"fabricHealthy,omitempty"`
 }
 
 // MachineConfigurationRefStatus records which configuration version

@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -66,7 +67,7 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("resolve cluster info: %w", err)
 	}
 
-	// Setup Machine controller — handles both reachability and provisioning.
+	// Setup Machine controller. It handles both reachability and provisioning.
 	if err := setupMachineFieldIndexes(ctx, mgr.GetFieldIndexer()); err != nil {
 		return fmt.Errorf("setup Machine field indexes: %w", err)
 	}
@@ -96,6 +97,26 @@ func RunManager(ctx context.Context, cfg Config) error {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Machine configuration binding controller: %w", err)
+	}
+
+	holderIdentity, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("resolve CapacityClaim lease holder identity: %w", err)
+	}
+
+	holderIdentity = fmt.Sprintf("%s-%d", holderIdentity, os.Getpid())
+
+	if err := (&CapacityClaimReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Locker: &KubernetesDomainLocker{
+			Client:         mgr.GetClient(),
+			Namespace:      unbounded.SystemNamespace(),
+			HolderIdentity: holderIdentity,
+		},
+		Lifecycle: UnavailableCapacityLifecycle{},
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup CapacityClaim controller: %w", err)
 	}
 
 	daemonCSRApprover, err := NewDaemonCSRApprover(mgr.GetClient(), kubeClient)

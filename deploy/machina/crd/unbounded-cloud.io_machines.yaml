@@ -907,6 +907,40 @@ spec:
                       nspawn machine.
                     type: string
                 type: object
+              allocation:
+                description: |-
+                  Allocation contains typed, mutable observations used to determine
+                  whether reserved capacity is ready. It is not machine identity.
+                properties:
+                  gpu:
+                    description: GPU contains current accelerator observations.
+                    properties:
+                      count:
+                        format: int32
+                        type: integer
+                      fabricHealthy:
+                        type: boolean
+                      healthyCount:
+                        format: int32
+                        type: integer
+                      model:
+                        type: string
+                      vendor:
+                        type: string
+                    type: object
+                  node:
+                    description: Node contains current Kubernetes Node observations.
+                    properties:
+                      image:
+                        type: string
+                      internalIP:
+                        type: string
+                      name:
+                        type: string
+                      ready:
+                        type: boolean
+                    type: object
+                type: object
               conditions:
                 description: |-
                   Conditions represent the latest available observations of the
@@ -1009,6 +1043,30 @@ spec:
                       CertFingerprint is the TLS certificate fingerprint for the
                       Redfish endpoint, pinned on first connection.
                     type: string
+                type: object
+              reservation:
+                description: |-
+                  Reservation records the CapacityClaim that exclusively owns this
+                  Machine.
+                properties:
+                  claimName:
+                    type: string
+                  claimUID:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                  domain:
+                    type: string
+                  reservedAt:
+                    format: date-time
+                    type: string
+                required:
+                - claimName
+                - claimUID
+                - domain
+                - reservedAt
                 type: object
               ssh:
                 description: SSH holds observed SSH state.

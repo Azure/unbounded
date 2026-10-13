@@ -1,0 +1,418 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: capacityclaims.unbounded-cloud.io
+spec:
+  group: unbounded-cloud.io
+  names:
+    kind: CapacityClaim
+    listKind: CapacityClaimList
+    plural: capacityclaims
+    shortNames:
+    - cc
+    singular: capacityclaim
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.machine.name
+      name: Machine
+      type: string
+    - jsonPath: .spec.consumer.name
+      name: Consumer
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha3
+    schema:
+      openAPIV3Schema:
+        description: |-
+          CapacityClaim represents unsatisfied capacity that must bind exactly one
+          existing Machine.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              CapacityClaimSpec defines the capacity, placement, and configuration
+              requirements for a claim.
+            properties:
+              configurationRef:
+                description: |-
+                  ConfigurationRef selects the MachineConfiguration applied to the bound
+                  Machine.
+                properties:
+                  name:
+                    description: Name is the name of the MachineConfiguration.
+                    minLength: 1
+                    type: string
+                  version:
+                    description: |-
+                      Version is the specific MachineConfigurationVersion number to
+                      use. If omitted, the controller selects the latest locked
+                      (deployed) version and populates this field.
+                    format: int32
+                    type: integer
+                required:
+                - name
+                type: object
+              consumer:
+                description: Consumer identifies the workload or adapter requesting
+                  capacity.
+                properties:
+                  apiGroup:
+                    description: APIGroup is empty for core Kubernetes resources.
+                    type: string
+                  kind:
+                    description: Kind is the consumer resource kind.
+                    minLength: 1
+                    type: string
+                  name:
+                    description: Name is the consumer resource name.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace is empty for cluster-scoped consumers.
+                    type: string
+                  uid:
+                    description: UID prevents a recreated consumer from inheriting
+                      an old allocation.
+                    type: string
+                required:
+                - kind
+                - name
+                - uid
+                type: object
+              domainSelector:
+                description: |-
+                  DomainSelector restricts eligible Machines to allocation domains.
+                  A selected Machine must carry unbounded-cloud.io/capacity-domain.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              gpu:
+                description: GPU constrains accelerator capacity and health.
+                properties:
+                  count:
+                    description: Count is the exact required healthy GPU count.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  model:
+                    description: Model is the required GPU model, for example GB200.
+                    minLength: 1
+                    type: string
+                  requireFabric:
+                    description: RequireFabric requires the observed GPU fabric to
+                      be healthy.
+                    type: boolean
+                  vendor:
+                    description: Vendor is the required GPU vendor.
+                    enum:
+                    - NVIDIA
+                    type: string
+                required:
+                - count
+                - model
+                - vendor
+                type: object
+              imagePolicy:
+                description: ImagePolicy constrains the image selected by MachineConfiguration.
+                properties:
+                  requireNVIDIA:
+                    description: RequireNVIDIA requires an NVIDIA-enabled image.
+                    type: boolean
+                  requiredImage:
+                    description: |-
+                      RequiredImage requires an exact OCI image reference when set.
+                      It is the trust anchor for RequireNVIDIA because image-name substring
+                      matching is not a capability check.
+                    type: string
+                type: object
+              machineSelector:
+                description: MachineSelector selects hardware and capacity labels
+                  on Machines.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              releasePolicy:
+                default: DeleteNode
+                description: |-
+                  ReleasePolicy controls whether the Kubernetes Node is deleted during
+                  release. All other release barriers still apply.
+                enum:
+                - DeleteNode
+                - RetainNode
+                type: string
+              siteSelector:
+                description: SiteSelector further restricts eligible Machines by site
+                  labels.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+            required:
+            - configurationRef
+            - consumer
+            - machineSelector
+            type: object
+            x-kubernetes-validations:
+            - message: requireNVIDIA requires an exact requiredImage trust anchor
+              rule: '!has(self.imagePolicy) || !self.imagePolicy.requireNVIDIA ||
+                (has(self.imagePolicy.requiredImage) && size(self.imagePolicy.requiredImage)
+                > 0)'
+            - message: GB200 requires NVIDIA, exactly 4 GPUs, and an exact requiredImage
+              rule: '!has(self.gpu) || self.gpu.model != ''GB200'' || (self.gpu.vendor
+                == ''NVIDIA'' && self.gpu.count == 4 && self.imagePolicy.requireNVIDIA
+                && has(self.imagePolicy.requiredImage) && size(self.imagePolicy.requiredImage)
+                > 0)'
+          status:
+            description: CapacityClaimStatus defines the observed allocation state.
+            properties:
+              conditions:
+                description: Conditions are the authoritative allocation observations.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              machine:
+                description: Machine identifies the one Machine bound to this claim.
+                properties:
+                  name:
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
+              observedGeneration:
+                description: ObservedGeneration is the latest spec generation evaluated.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the human-readable claim phase.
+                enum:
+                - Pending
+                - Bound
+                - Provisioning
+                - Ready
+                - Releasing
+                - Failed
+                type: string
+              releaseStage:
+                description: ReleaseStage is the next or current release barrier.
+                enum:
+                - CordonDrain
+                - RevokeCredentials
+                - ResetWorker
+                - DeleteNode
+                - ReleaseReservation
+                - Complete
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

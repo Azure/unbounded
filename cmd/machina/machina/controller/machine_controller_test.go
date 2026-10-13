@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -142,6 +144,139 @@ func findCondition(conditions []metav1.Condition, condType string) *metav1.Condi
 	}
 
 	return nil
+}
+
+func TestReconcileRefreshesNodeObservationWithoutSSH(t *testing.T) {
+	t.Parallel()
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "external-machine",
+			Labels: map[string]string{
+				unboundedv1alpha3.MachineGPUVendorLabelKey: "NVIDIA",
+				unboundedv1alpha3.MachineGPUModelLabelKey:  "GB200",
+			},
+		},
+		Status: unboundedv1alpha3.MachineStatus{
+			Agent: &unboundedv1alpha3.AgentStatus{Image: testNVIDIAImage},
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: machine.Name,
+			Labels: map[string]string{
+				unboundedv1alpha3.MachineGPUFabricHealthyLabelKey: "true",
+			},
+		},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
+			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "192.0.2.10"}},
+			Capacity: corev1.ResourceList{
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("4"),
+			},
+			Allocatable: corev1.ResourceList{
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("4"),
+			},
+		},
+	}
+	scheme := newTestScheme(t)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&unboundedv1alpha3.Machine{}).
+		WithObjects(machine, node).
+		Build()
+	reconciler := &MachineReconciler{Client: fakeClient, Scheme: scheme}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: client.ObjectKey{Name: machine.Name},
+	})
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	var got unboundedv1alpha3.Machine
+	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &got))
+	require.NotNil(t, got.Status.Allocation)
+	require.Equal(t, "192.0.2.10", got.Status.Allocation.Node.InternalIP)
+	require.True(t, apimeta.IsStatusConditionTrue(got.Status.Conditions, unboundedv1alpha3.MachineConditionAllocationReady))
+}
+
+func TestReconcileClearsStaleNodeObservationWhenNodeDeleted(t *testing.T) {
+	t.Parallel()
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-machine"},
+		Status: unboundedv1alpha3.MachineStatus{
+			Allocation: &unboundedv1alpha3.MachineAllocationStatus{
+				Node: &unboundedv1alpha3.MachineNodeObservation{
+					Name: "external-machine", Ready: true, InternalIP: "192.0.2.10", Image: testNVIDIAImage,
+				},
+			},
+			Conditions: []metav1.Condition{
+				{
+					Type: unboundedv1alpha3.MachineConditionAllocationReady, Status: metav1.ConditionTrue,
+					Reason: "Observed",
+				},
+				{
+					Type: unboundedv1alpha3.MachineConditionAvailable, Status: metav1.ConditionTrue,
+					Reason: "Observed",
+				},
+			},
+		},
+	}
+	scheme := newTestScheme(t)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&unboundedv1alpha3.Machine{}).
+		WithObjects(machine).
+		Build()
+	reconciler := &MachineReconciler{Client: fakeClient, Scheme: scheme}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: client.ObjectKey{Name: machine.Name},
+	})
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	var got unboundedv1alpha3.Machine
+	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &got))
+	require.Nil(t, got.Status.Allocation)
+	require.False(t, apimeta.IsStatusConditionTrue(got.Status.Conditions, unboundedv1alpha3.MachineConditionAllocationReady))
+	require.False(t, apimeta.IsStatusConditionTrue(got.Status.Conditions, unboundedv1alpha3.MachineConditionAvailable))
+}
+
+func TestObserveNodeAllocationDoesNotTrustMachineFabricLabel(t *testing.T) {
+	t.Parallel()
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				unboundedv1alpha3.MachineGPUVendorLabelKey:        "NVIDIA",
+				unboundedv1alpha3.MachineGPUModelLabelKey:         "GB200",
+				unboundedv1alpha3.MachineGPUFabricHealthyLabelKey: "true",
+			},
+		},
+		Status: unboundedv1alpha3.MachineStatus{
+			Agent: &unboundedv1alpha3.AgentStatus{Image: testNVIDIAImage},
+		},
+	}
+	node := &corev1.Node{
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
+			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "192.0.2.10"}},
+			Capacity: corev1.ResourceList{
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("4"),
+			},
+			Allocatable: corev1.ResourceList{
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("4"),
+			},
+		},
+	}
+
+	observeNodeAllocation(machine, node)
+
+	require.NotNil(t, machine.Status.Allocation.GPU)
+	require.False(t, machine.Status.Allocation.GPU.FabricHealthy)
+	require.False(t, apimeta.IsStatusConditionTrue(machine.Status.Conditions, unboundedv1alpha3.MachineConditionAllocationReady))
 }
 
 // generateTestSSHKeyPEM creates a fresh RSA private key in PEM format for testing.
@@ -1270,6 +1405,10 @@ func TestReconcileNodeJoin_Joining_NodeFound(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	result, err = reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
@@ -1316,6 +1455,10 @@ func TestReconcileNodeJoin_Ready_NodeStillExists(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	result, err = reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
@@ -1395,6 +1538,10 @@ func TestReconcileNodeJoin_Joining_NodeReappears(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	result, err = reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 

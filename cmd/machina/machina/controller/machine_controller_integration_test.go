@@ -1007,14 +1007,19 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	}
 	require.NoError(t, fakeClient.Create(ctx, node))
 
-	// Reconcile 3: Joining + Node found -> Ready, nodeRef set.
+	// Reconcile 3: persist Node observations before SSH-specific work.
+	result, m = reconcileHelper(t, reconciler, "m1")
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	// Reconcile 4: Joining + Node found -> Ready, nodeRef set.
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.NotNil(t, m.Spec.Kubernetes.NodeRef)
 	require.Equal(t, "m1", m.Spec.Kubernetes.NodeRef.Name)
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
-	// Reconcile 4: Ready + Node still exists -> stays Ready.
+	// Reconcile 5: Ready + Node still exists -> stays Ready.
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
@@ -1022,7 +1027,12 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	// Delete the Node.
 	require.NoError(t, fakeClient.Delete(ctx, node))
 
-	// Reconcile 5: Ready + Node gone -> Joining (waiting for Node to rejoin).
+	// Reconcile 6: clear stale observations after Node deletion.
+	result, m = reconcileHelper(t, reconciler, "m1")
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	// Reconcile 7: Ready + Node gone -> Joining (waiting for Node to rejoin).
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
@@ -1035,7 +1045,12 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	}
 	require.NoError(t, fakeClient.Create(ctx, node))
 
-	// Reconcile 6: Joining + Node found -> Ready again.
+	// Reconcile 8: persist the recreated Node observations.
+	result, m = reconcileHelper(t, reconciler, "m1")
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	// Reconcile 9: Joining + Node found -> Ready again.
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.NotNil(t, m.Spec.Kubernetes.NodeRef)
@@ -1109,6 +1124,9 @@ func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
 		},
 	}
 	require.NoError(t, fakeClient.Create(ctx, node))
+
+	_, m = reconcileHelper(t, reconciler, "m1")
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 
 	_, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
