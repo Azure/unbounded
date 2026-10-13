@@ -37,6 +37,8 @@ func fixture(t *testing.T) (*storage, *fake.Clientset, context.Context) {
 	t.Helper()
 
 	client := fake.NewClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "team-uid"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "other", UID: "other-uid"}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ledger.ConfigMapName, Namespace: "system", ResourceVersion: "1"}},
 		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}},
 	)
@@ -113,6 +115,11 @@ func TestCreate(t *testing.T) {
 
 	before := cached(t, s).Data
 
+	stored, ok := ledger.Parse(before).Get(types.NamespacedName{Namespace: "team", Name: "first"})
+	if !ok || stored.NamespaceUID != "team-uid" {
+		t.Fatalf("namespace UID not stored: %+v", stored)
+	}
+
 	_, err := s.Create(ctx, grant("overlap", "node-a", "node-b"), nil, nil)
 	if !apierrors.IsConflict(err) || !strings.Contains(err.Error(), "node-a") {
 		t.Fatalf("expected node conflict, got %v", err)
@@ -134,6 +141,33 @@ func TestCreate(t *testing.T) {
 
 	if !reflect.DeepEqual(before, cached(t, s).Data) {
 		t.Fatal("validation changed ledger")
+	}
+}
+
+func TestCreateNamespaceErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantError func(error) bool
+	}{
+		{"missing", apierrors.NewNotFound(corev1.Resource("namespaces"), "team"), apierrors.IsInvalid},
+		{"unavailable", apierrors.NewServiceUnavailable("namespace API unavailable"), apierrors.IsServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, client, ctx := fixture(t)
+			client.PrependReactor("get", "namespaces", func(clienttesting.Action) (bool, runtime.Object, error) {
+				return true, nil, tc.err
+			})
+
+			_, err := s.Create(ctx, grant("test", "node-a"), nil, nil)
+			if !tc.wantError(err) {
+				t.Fatalf("unexpected namespace error: %v", err)
+			}
+
+			if len(cached(t, s).Data) != 0 {
+				t.Fatal("namespace failure changed ledger")
+			}
+		})
 	}
 }
 

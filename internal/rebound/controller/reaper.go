@@ -26,6 +26,11 @@ type reaper struct {
 }
 
 func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+	type namespaceKey struct {
+		name string
+		uid  types.UID
+	}
+
 	var (
 		removed []*ledger.Grant
 		next    time.Time
@@ -33,21 +38,22 @@ func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, er
 
 	_, _, err := r.store.Update(ctx, false, func(l *ledger.Ledger) error {
 		now := r.clock.Now()
-		keep := make(map[string]bool)
+		keep := make(map[namespaceKey]bool)
 
 		for _, g := range l.Grants() {
 			if g.Expired(now) {
 				continue
 			}
 
-			if _, checked := keep[g.Namespace]; checked {
+			key := namespaceKey{g.Namespace, g.NamespaceUID}
+			if _, checked := keep[key]; checked {
 				continue
 			}
 
 			var ns corev1.Namespace
 
 			err := r.reader.Get(ctx, types.NamespacedName{Name: g.Namespace}, &ns)
-			if apierrors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) || (err == nil && g.NamespaceUID != "" && ns.UID != g.NamespaceUID) {
 				err = r.apiReader.Get(ctx, types.NamespacedName{Name: g.Namespace}, &ns)
 			}
 
@@ -55,10 +61,10 @@ func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, er
 				return fmt.Errorf("get grant namespace %s: %w", g.Namespace, err)
 			}
 
-			keep[g.Namespace] = err == nil && ns.DeletionTimestamp.IsZero()
+			keep[key] = err == nil && ns.DeletionTimestamp.IsZero() && (g.NamespaceUID == "" || ns.UID == g.NamespaceUID)
 		}
 
-		removed, next = l.Reap(now, func(g *ledger.Grant) bool { return keep[g.Namespace] })
+		removed, next = l.Reap(now, func(g *ledger.Grant) bool { return keep[namespaceKey{g.Namespace, g.NamespaceUID}] })
 
 		return nil
 	})

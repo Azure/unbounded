@@ -23,6 +23,7 @@ func testGrant(name string, nodes ...string) *Grant {
 func TestRoundTrip(t *testing.T) {
 	l := New()
 	g := testGrant("first", "node-a", "node-b")
+	g.NamespaceUID = "tenant-uid"
 	require.NoError(t, l.Add(g))
 	data := l.Encode()
 	require.Equal(t, "tenant/first", data["node-a"])
@@ -35,6 +36,17 @@ func TestRoundTrip(t *testing.T) {
 	got, ok := parsed.Get(key)
 	require.True(t, ok)
 	require.Equal(t, g, got)
+}
+
+func TestLegacyNamespaceUID(t *testing.T) {
+	l := New()
+	g := testGrant("legacy", "node-a")
+	require.NoError(t, l.Add(g))
+	data := l.Encode()
+	require.NotContains(t, data[GrantKey(g.Key())], "namespaceUID")
+	parsed, ok := Parse(data).Get(g.Key())
+	require.True(t, ok)
+	require.Empty(t, parsed.NamespaceUID)
 }
 
 func TestParseRepairs(t *testing.T) {

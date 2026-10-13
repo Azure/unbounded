@@ -247,13 +247,23 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		return nil, apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), g.Name, errs)
 	}
 
+	namespace, err := s.store.Client.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), g.Name,
+			field.ErrorList{field.Invalid(field.NewPath("metadata", "namespace"), ns, "namespace does not exist")})
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
 	holder := ""
 	if user, exists := request.UserFrom(ctx); exists {
 		holder = user.GetName()
 	}
 
 	record := &ledger.Grant{
-		Namespace: ns, Name: g.Name, UID: uuid.NewUUID(), Nodes: slices.Clone(g.Spec.Nodes),
+		Namespace: ns, NamespaceUID: namespace.UID, Name: g.Name, UID: uuid.NewUUID(), Nodes: slices.Clone(g.Spec.Nodes),
 		Holder: holder, Labels: maps.Clone(g.Labels), Annotations: maps.Clone(g.Annotations),
 	}
 

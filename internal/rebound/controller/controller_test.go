@@ -199,6 +199,85 @@ func TestReaperConfirmsMissingNamespace(t *testing.T) {
 	}
 }
 
+func TestReaperNamespaceUID(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		grantUID    types.UID
+		cacheUID    types.UID
+		liveUID     types.UID
+		liveError   error
+		wantRemoved bool
+		wantReads   int
+	}{
+		{name: "match", grantUID: "original", cacheUID: "original"},
+		{name: "recreated", grantUID: "original", cacheUID: "replacement", liveUID: "replacement", wantRemoved: true, wantReads: 1},
+		{name: "stale mismatch", grantUID: "original", cacheUID: "stale", liveUID: "original", wantReads: 1},
+		{name: "cache missing live matches", grantUID: "original", liveUID: "original", wantReads: 1},
+		{name: "cache missing live differs", grantUID: "original", liveUID: "replacement", wantRemoved: true, wantReads: 1},
+		{name: "mismatch live missing", grantUID: "original", cacheUID: "replacement", wantRemoved: true, wantReads: 1},
+		{name: "mismatch live error", grantUID: "original", cacheUID: "replacement", liveError: errors.New("namespace API failed"), wantReads: 1},
+		{name: "legacy", cacheUID: "replacement"},
+		{name: "legacy cache missing", liveUID: "replacement", wantReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := grant("tenant", "one", "node", time.Hour)
+			g.NamespaceUID = tc.grantUID
+			cm := configMap(t, g)
+			kube := kubefake.NewClientset(cm)
+
+			cacheBuilder, liveBuilder := clientBuilder(t), clientBuilder(t)
+			if tc.cacheUID != "" {
+				cacheBuilder.WithObjects(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", UID: tc.cacheUID}})
+			}
+
+			if tc.liveUID != "" {
+				liveBuilder.WithObjects(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", UID: tc.liveUID}})
+			}
+
+			reads := 0
+			apiReader := liveBuilder.WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					reads++
+
+					if tc.liveError != nil {
+						return tc.liveError
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				},
+			}).Build()
+			r := &reaper{reader: cacheBuilder.Build(), apiReader: apiReader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clocktesting.NewFakeClock(testNow)}
+			_, err := r.Reconcile(t.Context(), ctrl.Request{})
+			require.ErrorIs(t, err, tc.liveError)
+			require.Equal(t, tc.wantReads, reads)
+			after, err := kube.CoreV1().ConfigMaps("system").Get(t.Context(), ledger.ConfigMapName, metav1.GetOptions{})
+			require.NoError(t, err)
+
+			if tc.wantRemoved {
+				require.Empty(t, after.Data)
+			} else {
+				require.Equal(t, cm.Data, after.Data)
+			}
+		})
+	}
+}
+
+func TestReaperMixedNamespaceUIDs(t *testing.T) {
+	old := grant("tenant", "old", "old-node", time.Hour)
+	old.NamespaceUID = "old"
+	current := grant("tenant", "current", "current-node", time.Hour)
+	current.NamespaceUID = "current"
+	legacy := grant("tenant", "legacy", "legacy-node", time.Hour)
+	kube := kubefake.NewClientset(configMap(t, old, current, legacy))
+	reader := clientBuilder(t, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", UID: "current"}}).Build()
+	r := &reaper{reader: reader, apiReader: reader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clocktesting.NewFakeClock(testNow)}
+	_, err := r.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err)
+	after, err := kube.CoreV1().ConfigMaps("system").Get(t.Context(), ledger.ConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, configMap(t, current, legacy).Data, after.Data)
+}
+
 func TestMirror(t *testing.T) {
 	unrelated := corev1.Taint{Key: "other", Value: "value", Effect: corev1.TaintEffectNoSchedule}
 

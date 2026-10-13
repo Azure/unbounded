@@ -46,15 +46,16 @@ const (
 
 // Grant is a stored NodeGrant.
 type Grant struct {
-	Namespace   string            `json:"-"`
-	Name        string            `json:"-"`
-	UID         types.UID         `json:"uid"`
-	Nodes       []string          `json:"nodes"`
-	Holder      string            `json:"holder"`
-	CreatedAt   time.Time         `json:"createdAt"`
-	ExpiresAt   time.Time         `json:"expiresAt"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
+	Namespace    string            `json:"-"`
+	NamespaceUID types.UID         `json:"namespaceUID,omitempty"`
+	Name         string            `json:"-"`
+	UID          types.UID         `json:"uid"`
+	Nodes        []string          `json:"nodes"`
+	Holder       string            `json:"holder"`
+	CreatedAt    time.Time         `json:"createdAt"`
+	ExpiresAt    time.Time         `json:"expiresAt"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	Annotations  map[string]string `json:"annotations,omitempty"`
 }
 
 // Key returns the namespace/name of the grant.

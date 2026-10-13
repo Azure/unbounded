@@ -177,7 +177,7 @@ func TestCreateChecksNodesOnRetry(t *testing.T) {
 		actions = append(actions, action.GetVerb()+" "+action.GetResource().Resource)
 	}
 
-	require.Equal(t, []string{"get configmaps", "get nodes", "update configmaps", "get configmaps", "get nodes"}, actions)
+	require.Equal(t, []string{"get namespaces", "get configmaps", "get nodes", "update configmaps", "get configmaps", "get nodes"}, actions)
 	require.Empty(t, cached(t, s).Data)
 }
 
