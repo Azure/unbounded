@@ -10,7 +10,7 @@ use std::{
     collections::VecDeque,
     future::poll_fn,
     io,
-    os::fd::{AsFd, AsRawFd, FromRawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
     rc::{Rc, Weak},
     task::{Poll, Waker},
 };
@@ -480,16 +480,22 @@ impl<P: Policy> PipeLease<P> {
                 _ => return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
             }
         }
-        self.try_splice_to(socket, count)
+        self.try_splice_to(socket.as_fd(), count)
     }
 
     /// Transfer copied kernel pipe bytes to a nonblocking stream socket. The
     /// caller retains both owners through this synchronous syscall. Unsupported
     /// splice errors leave the bytes in the pipe for an independent copy fallback.
     /// Callers must not concurrently clear O_NONBLOCK through a duplicate FD.
-    pub fn try_splice_to(&mut self, socket: &impl AsFd, count: usize) -> io::Result<usize> {
-        validate_socket(socket)?;
-        self.splice_to_fd(socket.as_fd().as_raw_fd(), count)
+    /// This native-only API requires an explicit OS descriptor borrow. Runtime
+    /// descriptors, including simulation, use `try_splice_descriptor` instead.
+    pub fn try_splice_to(&mut self, socket: BorrowedFd<'_>, count: usize) -> io::Result<usize> {
+        #[cfg(feature = "simulation")]
+        if self.resources.as_ref().unwrap().read.as_sim().is_some() {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        validate_socket(&socket)?;
+        self.splice_to_fd(socket.as_raw_fd(), count)
     }
 
     /// Drain to a stream socket. Like `try_splice_to`, this safe API validates
@@ -1506,6 +1512,14 @@ mod tests {
         let mut simulated_pipe = pool.acquire().unwrap();
         let (simulated_socket, _peer) = sim.socket_pair();
 
+        assert_eq!(
+            simulated_pipe
+                .try_splice_to(real_socket.as_fd(), 1)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+
         for (pipe, socket) in [
             (&mut real_pipe, &simulated_socket),
             (&mut simulated_pipe, &real_socket),
@@ -1903,9 +1917,9 @@ mod tests {
         let mut source = b"copied kernel pages".to_vec();
         assert_eq!(pipe.try_write(&source).unwrap(), source.len());
         source.fill(0);
-        assert_eq!(pipe.try_splice_to(&socket, 6).unwrap(), 6);
+        assert_eq!(pipe.try_splice_to(socket.as_fd(), 6).unwrap(), 6);
         assert_eq!(pipe.buffered(), 13);
-        assert_eq!(pipe.try_splice_to(&socket, usize::MAX).unwrap(), 13);
+        assert_eq!(pipe.try_splice_to(socket.as_fd(), usize::MAX).unwrap(), 13);
         assert_eq!(pipe.buffered(), 0);
         // Socket-owned kernel pages survive both pipe closure and quota reuse.
         drop(pipe);
@@ -1925,12 +1939,14 @@ mod tests {
         let mut pipe = pool.acquire().unwrap();
         pipe.try_write(b"abc").unwrap();
         let (socket, peer) = UnixStream::pair().unwrap();
-        assert_invalid_socket(pipe.try_splice_to(&socket, 3).unwrap_err());
+        assert_invalid_socket(pipe.try_splice_to(socket.as_fd(), 3).unwrap_err());
         assert_eq!(pipe.buffered(), 3);
         socket.set_nonblocking(true).unwrap();
         drop(peer);
         assert_eq!(
-            pipe.try_splice_to(&socket, 3).unwrap_err().raw_os_error(),
+            pipe.try_splice_to(socket.as_fd(), 3)
+                .unwrap_err()
+                .raw_os_error(),
             Some(libc::EPIPE)
         );
         assert_eq!(pipe.buffered(), 3);
@@ -1959,13 +1975,13 @@ mod tests {
             }
         }
         assert_eq!(
-            pipe.try_splice_to(&socket, 7).unwrap_err().kind(),
+            pipe.try_splice_to(socket.as_fd(), 7).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         assert_eq!(pipe.buffered(), 7);
         let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         datagram.set_nonblocking(true).unwrap();
-        assert_invalid_socket(pipe.try_splice_to(&datagram, 7).unwrap_err());
+        assert_invalid_socket(pipe.try_splice_to(datagram.as_fd(), 7).unwrap_err());
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/null")
@@ -1975,7 +1991,7 @@ mod tests {
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        assert_invalid_socket(pipe.try_splice_to(&file, 7).unwrap_err());
+        assert_invalid_socket(pipe.try_splice_to(file.as_fd(), 7).unwrap_err());
         let mut bytes = [0; 7];
         assert_eq!(pipe.try_read(&mut bytes).unwrap(), 7);
         assert_eq!(&bytes, b"pending");
