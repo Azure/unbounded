@@ -25,6 +25,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/metalman/attestation"
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
@@ -58,12 +59,15 @@ func ServePXECmd() *cobra.Command {
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
+		logOpts                        logger.Options
 	)
 
 	cmd := &cobra.Command{
 		Use:   "serve-pxe",
 		Short: "Run PXE servers and BMC control loop",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			logOpts.Setup(os.Stderr)
+
 			ctx := ctrl.SetupSignalHandler()
 			cfg := ctrl.GetConfigOrDie()
 
@@ -363,6 +367,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
+	logOpts.BindFlags(cmd.Flags())
 
 	return cmd
 }

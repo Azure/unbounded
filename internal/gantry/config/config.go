@@ -35,6 +35,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 // Recognized StorageMode values.
@@ -425,10 +427,11 @@ type Config struct {
 
 	// ---------- Logging ----------
 
-	// LogLevel is one of "debug", "info", "warn", "error".
+	// LogLevel is a level accepted by logger.ParseLevel: debug, info, warn or
+	// error, with an optional offset. Empty means logger.DefaultLevel.
 	LogLevel string `yaml:"log_level"`
 
-	// LogFormat is "json" (production) or "text" (development).
+	// LogFormat is json, text or prettytext. Empty means json.
 	LogFormat string `yaml:"log_format"`
 }
 
@@ -561,8 +564,8 @@ func NewDefault() *Config {
 			"auth", "not_found", "rate_limited",
 		},
 
-		LogLevel:  "info",
-		LogFormat: "json",
+		LogLevel:  strings.ToLower(logger.DefaultLevel.String()),
+		LogFormat: string(defaultLogFormat),
 	}
 }
 
@@ -879,8 +882,8 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.OriginFailureCooldownMultiplier, "origin-failure-cooldown-multiplier", c.OriginFailureCooldownMultiplier, "exponential multiplier between successive cooldowns")
 	fs.DurationVar(&c.OriginFailureHonorWindowCap, "origin-failure-honor-window-cap", c.OriginFailureHonorWindowCap, "requester-side honor window cap for transient cooldowns")
 
-	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level (debug/info/warn/error)")
-	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "log format (json/text)")
+	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug, info, warn or error, with an optional offset")
+	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "log format: json, text or prettytext")
 }
 
 // Load is the convenience composition of NewDefault -> LoadYAML(file) ->
@@ -1055,16 +1058,8 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	switch c.LogLevel {
-	case "debug", "info", "warn", "error":
-	default:
-		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
-	}
-
-	switch c.LogFormat {
-	case "json", "text":
-	default:
-		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
+	if _, err := c.LogOptions(); err != nil {
+		errs = append(errs, err)
 	}
 
 	if c.RacerEnabled {
@@ -1286,6 +1281,42 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// defaultLogFormat is the log format when log_format is empty.
+const defaultLogFormat = logger.FormatJSON
+
+// LogOptions returns the logging configuration for logger.Options.Setup. An
+// empty level or format means the default, as an unset environment variable
+// does.
+func (c *Config) LogOptions() (logger.Options, error) {
+	opts := logger.Options{Level: logger.DefaultLevel, Format: defaultLogFormat}
+
+	var errs []error
+
+	if strings.TrimSpace(c.LogLevel) != "" {
+		level, err := logger.ParseLevel(c.LogLevel)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("log_level: %w", err))
+		}
+
+		opts.Level = level
+	}
+
+	if strings.TrimSpace(c.LogFormat) != "" {
+		format, err := logger.ParseFormat(c.LogFormat)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("log_format: %w", err))
+		}
+
+		opts.Format = format
+	}
+
+	if len(errs) != 0 {
+		return logger.Options{}, errors.Join(errs...)
+	}
+
+	return opts, nil
 }
 
 // ResolveUpstream returns the UpstreamRegistry whose Name (or NSAlias)

@@ -14,98 +14,70 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"golang.org/x/term"
 )
 
-// consoleHandler is a slog.Handler implementation that writes log records
-// to stdout ensuring a deterministic ordering of selected attributes. The order
-// is defined at construction time via attrOrder. Only attributes whose keys are
-// present in attrOrder are rendered (and rendered exactly once) in the provided
-// order. Additional attributes (not listed in attrOrder) are ignored to keep
-// output stable and predictable.
+// consoleHandler is the prettytext slog.Handler. It writes one line per record:
 //
-// A line is formatted as:
+//	<timestamp> [<L>] [v1][v2]... <message> [key=value] ...
 //
-//	<LEVEL> <timestamp> [attr1] [attr2] ... [attrN] <message>
-//
-// Where:
-//   - <timestamp> is RFC3339 and logically associated with the key
-//     PreciseTimeStamp (not printed, per requirement to omit keys).
-//   - Only attribute VALUES (no key names) are printed, in the order supplied
-//     at construction time. Missing attributes are skipped silently.
-//   - The original log message text appears last.
+// <timestamp> is RFC3339 in UTC and <L> is the first letter of the level.
+// Values of attributes named in attrOrder come next, in that order and
+// without their keys. Every other attribute follows the message as
+// [key=value], in the order it was added: logger attributes first, then the
+// call's. A repeated key keeps its first position and shows the newest value.
+// Group attributes are not printed.
 type consoleHandler struct {
 	mu           *sync.Mutex  // protects writes + base state copies
 	attrOrder    []string     // desired attribute key order
 	baseAttrs    []slog.Attr  // attributes added via WithAttrs / With
-	groups       []string     // group stack (kept for interface parity)
-	w            io.Writer    // destination (defaults to os.Stderr)
-	level        slog.Leveler // optional level filter
+	w            io.Writer    // destination
+	level        slog.Leveler // level filter
 	enableColors bool
 	attrColors   map[string]color.Attribute
 }
 
-// PrettyFieldHandlerOptions configures the pretty console log handler.
-type PrettyFieldHandlerOptions struct {
-	Level      slog.Leveler
-	AttrOrder  []string
-	AttrColors map[string]color.Attribute
-}
-
-// NewPrettyFieldHandler creates a new slog.Handler which writes to stderr
-// and prints the provided ordered attribute keys after the log message.
-func NewPrettyFieldHandler(lvl slog.Leveler, opts PrettyFieldHandlerOptions) slog.Handler {
-	if lvl == nil {
-		// Default to Info level filtering if none provided.
-		lv := new(slog.LevelVar)
-		lv.Set(slog.LevelInfo)
-		lvl = lv
-	}
-
-	color.NoColor = false // force enable colors
-
-	if opts.AttrColors == nil {
-		opts.AttrColors = map[string]color.Attribute{}
-	}
-
-	// log levels have specific colors unless overridden in AttrColors
-	if _, ok := opts.AttrColors[slog.LevelDebug.String()]; !ok {
-		opts.AttrColors[slog.LevelDebug.String()] = color.FgHiBlack
-	}
-
-	if _, ok := opts.AttrColors[slog.LevelWarn.String()]; !ok {
-		opts.AttrColors[slog.LevelWarn.String()] = color.FgYellow
-	}
-
-	if _, ok := opts.AttrColors[slog.LevelInfo.String()]; !ok {
-		opts.AttrColors[slog.LevelInfo.String()] = color.FgGreen
-	}
-
-	if _, ok := opts.AttrColors[slog.LevelError.String()]; !ok {
-		opts.AttrColors[slog.LevelError.String()] = color.FgRed
-	}
-
-	// default color when nothing is defined
-	if _, ok := opts.AttrColors[""]; !ok {
-		opts.AttrColors[""] = color.FgHiBlue
-	}
-
+// newPrettyHandler returns the prettytext handler, writing records at or above
+// level to w. With colors set, it colors the output regardless of the color
+// package's process-wide setting.
+func newPrettyHandler(w io.Writer, level slog.Leveler, attrOrder []string, colors bool) slog.Handler {
 	return &consoleHandler{
 		mu:           &sync.Mutex{},
-		attrOrder:    opts.AttrOrder,
-		w:            os.Stderr,
-		level:        lvl,
-		enableColors: true,
-		attrColors:   opts.AttrColors,
+		attrOrder:    attrOrder,
+		w:            w,
+		level:        level,
+		enableColors: colors,
+		attrColors: map[string]color.Attribute{
+			slog.LevelDebug.String(): color.FgHiBlack,
+			slog.LevelInfo.String():  color.FgGreen,
+			slog.LevelWarn.String():  color.FgYellow,
+			slog.LevelError.String(): color.FgRed,
+			"":                       color.FgHiBlue, // everything else
+		},
 	}
+}
+
+// colorsFor reports whether prettytext output to w should be colored: w is a
+// terminal, NO_COLOR is unset or empty, and TERM is not dumb.
+func colorsFor(w io.Writer) bool {
+	f, ok := w.(*os.File)
+
+	return colorsAllowed(ok && term.IsTerminal(int(f.Fd())), os.Getenv)
+}
+
+func colorsAllowed(terminal bool, getenv func(string) string) bool {
+	return terminal && getenv("NO_COLOR") == "" && getenv("TERM") != "dumb"
 }
 
 // Enabled reports whether the handler handles records at the given level.
 func (h *consoleHandler) Enabled(_ context.Context, level slog.Level) bool {
-	if h.level == nil {
-		return true
-	}
-
 	return level >= h.level.Level()
+}
+
+// prettyAttr is one attribute to print, in first-added order.
+type prettyAttr struct {
+	key   string
+	value any
 }
 
 // Handle formats and writes the record honoring the attribute order.
@@ -114,24 +86,33 @@ func (h *consoleHandler) Handle(ctx context.Context, r slog.Record) error {
 		return nil
 	}
 
-	// Collect attribute values into a map for quick lookup. Latest wins.
-	attrMap := make(map[string]any, len(h.baseAttrs)+r.NumAttrs())
+	// Collect attributes in the order they were added. A repeated key keeps
+	// its first position and takes the newest value.
+	attrs := make([]prettyAttr, 0, len(h.baseAttrs)+r.NumAttrs())
+	index := make(map[string]int, cap(attrs))
 
-	// Base attributes first.
-	for _, a := range h.baseAttrs {
-		if a.Value.Kind() != slog.KindGroup { // ignore groups for simplicity
-			attrMap[a.Key] = a.Value.Any()
+	add := func(a slog.Attr) bool {
+		if a.Value.Kind() == slog.KindGroup { // ignore groups for simplicity
+			return true
 		}
-	}
 
-	// Record attributes override base ones.
-	r.Attrs(func(a slog.Attr) bool {
-		if a.Value.Kind() != slog.KindGroup {
-			attrMap[a.Key] = a.Value.Any()
+		if i, ok := index[a.Key]; ok {
+			attrs[i].value = a.Value.Any()
+
+			return true
 		}
+
+		index[a.Key] = len(attrs)
+		attrs = append(attrs, prettyAttr{key: a.Key, value: a.Value.Any()})
 
 		return true
-	})
+	}
+
+	for _, a := range h.baseAttrs {
+		add(a)
+	}
+
+	r.Attrs(add)
 
 	// Build the line.
 	var buf bytes.Buffer
@@ -152,8 +133,8 @@ func (h *consoleHandler) Handle(ctx context.Context, r slog.Record) error {
 
 	// Append ordered attribute VALUES only, each wrapped in square brackets.
 	for _, k := range h.attrOrder {
-		if v, ok := attrMap[k]; ok {
-			buf.WriteString(h.colorize(fmt.Sprintf("[%s]", v), h.getFieldColor(k)))
+		if i, ok := index[k]; ok {
+			buf.WriteString(h.colorize(fmt.Sprintf("[%s]", attrs[i].value), h.getFieldColor(k)))
 
 			// Mark this key as added to avoid duplication later.
 			attrAdded[k] = struct{}{}
@@ -165,10 +146,10 @@ func (h *consoleHandler) Handle(ctx context.Context, r slog.Record) error {
 		buf.WriteString(h.colorize(r.Message, h.getLevelColor(r.Level)))
 	}
 
-	// Append any additional attributes that were not in attrOrder, to ensure all attributes are printed.
-	for k, v := range attrMap {
-		if _, alreadyAdded := attrAdded[k]; !alreadyAdded {
-			buf.WriteString(h.colorize(fmt.Sprintf(" [%s=%v]", k, v), h.getFieldColor(k)))
+	// Append the attributes not in attrOrder, so every attribute is printed.
+	for _, a := range attrs {
+		if _, alreadyAdded := attrAdded[a.key]; !alreadyAdded {
+			buf.WriteString(h.colorize(fmt.Sprintf(" [%s=%v]", a.key, a.value), h.getFieldColor(a.key)))
 		}
 	}
 
@@ -189,7 +170,6 @@ func (h *consoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		mu:           h.mu, // share parent's mutex to synchronize all descendants
 		attrOrder:    append([]string{}, h.attrOrder...),
 		baseAttrs:    append(append([]slog.Attr{}, h.baseAttrs...), attrs...),
-		groups:       append([]string{}, h.groups...),
 		w:            h.w,
 		level:        h.level,
 		enableColors: h.enableColors, // preserve color setting when cloning
@@ -197,34 +177,21 @@ func (h *consoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
-// WithGroup returns a new handler with an additional group. Grouping is
-// preserved but not rendered (kept for interface compliance). Keys inside the
-// group still use their raw names for ordering purposes.
-func (h *consoleHandler) WithGroup(name string) slog.Handler {
-	if name == "" { // no-op
-		return h
-	}
-
-	nh := &consoleHandler{
-		mu:           h.mu, // share parent's mutex
-		attrOrder:    append([]string{}, h.attrOrder...),
-		baseAttrs:    append([]slog.Attr{}, h.baseAttrs...),
-		groups:       append(append([]string{}, h.groups...), name),
-		w:            h.w,
-		level:        h.level,
-		enableColors: h.enableColors, // preserve color setting when cloning
-		attrColors:   h.attrColors,
-	}
-
-	return nh
+// WithGroup returns h. Groups are not rendered, and keys inside a group keep
+// their own names for ordering.
+func (h *consoleHandler) WithGroup(string) slog.Handler {
+	return h
 }
 
 func (h *consoleHandler) colorize(v string, colorCode color.Attribute) string {
-	if h.enableColors {
-		v = color.New(colorCode).Sprint(v)
+	if !h.enableColors {
+		return v
 	}
 
-	return v
+	c := color.New(colorCode)
+	c.EnableColor() // the handler decided already; ignore color.NoColor
+
+	return c.Sprint(v)
 }
 
 func (h *consoleHandler) getFieldColor(field string) color.Attribute {
@@ -235,6 +202,11 @@ func (h *consoleHandler) getFieldColor(field string) color.Attribute {
 	return h.attrColors[""] // default color
 }
 
+// getLevelColor colors every level below info, such as logr V(1), as debug.
 func (h *consoleHandler) getLevelColor(level slog.Level) color.Attribute {
+	if level < slog.LevelInfo {
+		level = slog.LevelDebug
+	}
+
 	return h.getFieldColor(level.String())
 }

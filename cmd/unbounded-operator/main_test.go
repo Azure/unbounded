@@ -175,6 +175,18 @@ func TestImageRegistryConfiguration(t *testing.T) {
 	}
 }
 
+func TestLogFlags(t *testing.T) {
+	flags := newCommand(nil).Flags()
+
+	if got := flags.Lookup("log-level").DefValue; got != "info" {
+		t.Fatalf("--log-level default = %q, want info", got)
+	}
+
+	if got := flags.Lookup("log-format").DefValue; got != "text" {
+		t.Fatalf("--log-format default = %q, want text", got)
+	}
+}
+
 func TestResolveAPIServerEndpoint(t *testing.T) {
 	const clusterInfoKubeconfig = `apiVersion: v1
 clusters:

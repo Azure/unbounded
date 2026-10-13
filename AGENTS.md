@@ -79,6 +79,26 @@ unbounded-kube is organized into several directories:
   Exceptions are external contracts only, such as the GitHub Actions `cancelled()` expression and the
   `LICENCE` filename patterns in `hack/cmd/notice` that match upstream third-party files.
 
+## Logging
+
+These rules cover Go code.
+
+- Strongly prefer `log/slog`. Use another logger only when a framework requires one, and route it through slog
+  where the framework allows:
+  - controller-runtime code logs through the `logr.Logger` from `ctrl.LoggerFrom(ctx)`, which `internal/logger`
+    backs with the slog handler.
+  - The unbounded-net components (`cmd/unbounded-net-*`, `internal/net`) use klog with Kubernetes-style `-v`
+    verbosity that can change at runtime. Moving them to slog is separate work.
+- Every Go binary sets up logging through `internal/logger`: register `--log-level` and `--log-format` with
+  `logger.Options.BindFlags` (or `BindGoFlags` for the standard `flag` package), then call `Options.Setup`. It
+  installs the handler as the slog default and as controller-runtime's logger. Do not build handlers or call
+  `slog.SetDefault` anywhere else.
+- A binary may choose its default format (`text`, `json`, or `prettytext` for command-line tools) by setting
+  `Options.Format` before binding flags. The default level is always `logger.DefaultLevel` (info).
+- A level or format that also comes from an environment variable or config file is parsed with
+  `logger.ParseLevel` and `logger.ParseFormat`.
+- Log to stderr. Command-line tools write their results to stdout.
+
 ## Testing Standards
 
 - Add tests for new behavior. Cover success, failure, and edge cases.

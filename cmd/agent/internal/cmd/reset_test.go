@@ -13,7 +13,7 @@ import (
 func TestNewCmdReset_IsRegistered(t *testing.T) {
 	t.Parallel()
 
-	cmdCtx := &CommandContext{LogFormat: "text"}
+	cmdCtx := &CommandContext{}
 	cmd := newCmdReset(cmdCtx)
 
 	assert.Equal(t, "reset", cmd.Use)

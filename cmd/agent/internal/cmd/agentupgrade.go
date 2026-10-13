@@ -171,7 +171,7 @@ func writeHostAgentUpgradePlan(w io.Writer, plan agentbinary.ActivationPlan) err
 	return hostAgentUpgradePlanTemplate.Execute(w, plan)
 }
 
-func newCmdRecordAgentUpgradeFailureSignal() *cobra.Command {
+func newCmdRecordAgentUpgradeFailureSignal(cmdCtx *CommandContext) *cobra.Command {
 	var message string
 
 	cmd := &cobra.Command{
@@ -180,6 +180,8 @@ func newCmdRecordAgentUpgradeFailureSignal() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
+			cmdCtx.Setup()
+
 			return daemon.RecordAgentUpgradeFailureSignal(message)
 		},
 	}

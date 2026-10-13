@@ -13,7 +13,7 @@ import (
 )
 
 func TestNSpawnLifecycleCommandHasExplicitOperations(t *testing.T) {
-	cmd := newCmdNSpawnLifecycle(&CommandContext{LogFormat: "text"})
+	cmd := newCmdNSpawnLifecycle(&CommandContext{})
 	require.True(t, cmd.Hidden)
 	require.Len(t, cmd.Commands(), 3)
 	require.Equal(t, "post-start", cmd.Commands()[0].Name())

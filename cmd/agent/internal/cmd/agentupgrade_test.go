@@ -54,7 +54,7 @@ func TestHostAgentUpgradePreflight(t *testing.T) {
 	// until the migration has run, so preflight plans against where it will
 	// put things instead, and leaves the host root alone.
 	handler := &hostAgentUpgradeHandler{
-		cmdCtx:     &CommandContext{LogFormat: "text"},
+		cmdCtx:     &CommandContext{},
 		preflight:  true,
 		writer:     &output,
 		executable: func() (string, error) { return candidatePath, nil },
@@ -103,7 +103,7 @@ func TestHostAgentUpgradeTakesInstallationLockBeforeActivation(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, lock.Release()) })
 
 	handler := &hostAgentUpgradeHandler{
-		cmdCtx: &CommandContext{LogFormat: "text"}, installation: store,
+		cmdCtx: &CommandContext{}, installation: store,
 		executable:   func() (string, error) { return filepath.Join(dir, "candidate"), nil },
 		resolvedPath: func() (goalstates.AgentUpgradePaths, error) { return goalstates.AgentUpgradePaths{}, nil },
 		newService:   func(goalstates.AgentUpgradePaths) agentbinary.DaemonService { return preflightOnlyDaemonService{} },
@@ -136,7 +136,7 @@ func TestHostAgentUpgradeMigratesBeforeResolvingPaths(t *testing.T) {
 			var calls []string
 
 			handler := &hostAgentUpgradeHandler{
-				cmdCtx:     &CommandContext{LogFormat: "text"},
+				cmdCtx:     &CommandContext{},
 				executable: func() (string, error) { return filepath.Join(t.TempDir(), "candidate"), nil },
 				resolvedPath: func() (goalstates.AgentUpgradePaths, error) {
 					calls = append(calls, "resolve")
@@ -161,7 +161,7 @@ func TestRecordAgentUpgradeFailureSignalCommand(t *testing.T) {
 	t.Setenv(goalstates.EnvDaemonAgentUpgradeSignalPath, signalPath)
 	require.NoError(t, os.WriteFile(signalPath, []byte(`{"operationName":"op-1"}`+"\n"), 0o600))
 
-	cmd := newCmdRecordAgentUpgradeFailureSignal()
+	cmd := newCmdRecordAgentUpgradeFailureSignal(&CommandContext{})
 	cmd.SetArgs([]string{
 		"--message", "rolled back to last good",
 	})

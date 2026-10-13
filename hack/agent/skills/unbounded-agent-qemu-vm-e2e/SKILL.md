@@ -106,7 +106,7 @@ A successful node join should result in seeing the node registered in the target
 **Notes**:
 
 - Inside the VM, you have root permission.
-- The repo is mounted at `/agent` inside the VM — both the binary and config file are available without scp.
+- The repo is mounted at `/agent` inside the VM, so both the binary and config file are available without scp.
 - Prompt and confirm with user for the kubeconfig / target cluster to connect before running.
 - Refer to `internal/provision/assets/unbounded-agent-install.sh` for other options.
 - The node showing with `NotReady` state is fine as long as kubelet / containerd logs are looking correctly.
@@ -118,13 +118,13 @@ Join to an AKS cluster with debug log level:
 ```bash
 ./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh /path/to/kubeconfig
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@${VM_IP} \
-  "sudo UNBOUNDED_AGENT_CONFIG_FILE=/agent/unbounded-agent-config-dev.json /agent/bin/unbounded-agent start --debug"
+  "sudo UNBOUNDED_AGENT_CONFIG_FILE=/agent/unbounded-agent-config-dev.json /agent/bin/unbounded-agent start --log-level=debug"
 ```
 
 Capture logs to a file for later analysis (recommended):
 
 ```bash
-ssh ... "sudo ... /agent/bin/unbounded-agent start --debug" 2>&1 | tee .vm/agent-bootstrap.log
+ssh ... "sudo ... /agent/bin/unbounded-agent start --log-level=debug" 2>&1 | tee .vm/agent-bootstrap.log
 ```
 
 ### Analyze Bootstrap Logs

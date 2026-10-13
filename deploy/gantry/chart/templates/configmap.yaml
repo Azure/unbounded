@@ -79,6 +79,6 @@ data:
       - "not_found"
       - "rate_limited"
 
-    log_level: "debug"
+    log_level: "info"
     log_format: "json"
     {{- end }}

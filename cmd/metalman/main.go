@@ -4,20 +4,15 @@
 package main
 
 import (
-	"log/slog"
 	"os"
 
-	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
-	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/Azure/unbounded/internal/metalman/commands"
 	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
-	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
-
 	root := &cobra.Command{
 		Use:   "metalman",
 		Short: "Bare metal provisioning for Kubernetes",

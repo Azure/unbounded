@@ -18,7 +18,8 @@ These flags apply to all commands:
 |------|-------|---------|-------------|
 | `--cloud` | `-a` | `AzurePublicCloud` | Azure cloud name |
 | `--subscription` | `-s` | `<your-subscription-id>` | Azure subscription ID |
-| `--log-format` | | `text` | Log format (`text` or `json`) |
+| `--log-level` | | `info` | Minimum log level: `debug`, `info`, `warn` or `error` |
+| `--log-format` | | `prettytext` | Log format: `prettytext`, `text` or `json` |
 
 ## Create the Cluster
 

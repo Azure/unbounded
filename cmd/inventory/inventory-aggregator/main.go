@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 	"strconv"
 
@@ -13,24 +12,27 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/inventory/aggregator"
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
+	if err := newCommand().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func newCommand() *cobra.Command {
 	config := aggregator.Config{}
+	logOpts := logger.Options{Format: logger.FormatJSON}
 
 	rootCmd := &cobra.Command{
 		Use:     "inventory-aggregator",
 		Short:   "Aggregate and store node inventory data",
 		Version: version.Version + " (commit: " + version.GitCommit + ")",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			level := slog.LevelInfo
-			if config.Debug {
-				level = slog.LevelDebug
-			}
-
-			logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-			slog.SetDefault(logger)
+			logOpts.Setup(os.Stderr)
 
 			sslMode := pq.SSLMode(os.Getenv("POSTGRES_SSL_MODE"))
 			switch sslMode {
@@ -61,11 +63,8 @@ func main() {
 		},
 	}
 
-	rootCmd.Flags().BoolVar(&config.Debug, "debug", false, "Enable debug output")
+	logOpts.BindFlags(rootCmd.Flags())
 	rootCmd.Flags().StringVar(&config.GRPCAddr, "grpc-addr", ":50051", "Address for the gRPC server to listen on")
 
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	return rootCmd
 }

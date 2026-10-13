@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
@@ -40,6 +41,7 @@ type options struct {
 	catalogBlobs         int
 	blobBytes            int64
 	startupTimeout       time.Duration
+	logOpts              logger.Options
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -82,6 +84,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.BoolVar(&opts.pull.DiagnoseIntegrity, "diagnose-integrity", false, "Compare deterministic bytes and retain bounded page hashes on integrity failure (requires verify)")
 	f.DurationVar(&opts.startDelay, "start-delay", 10*time.Second, "Delay after origin readiness before starting workers")
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
+	opts.logOpts.BindGoFlags(f)
 
 	if err := f.Parse(args); err != nil {
 		return opts, err
@@ -158,6 +161,8 @@ func main() {
 	}
 
 	if err == nil {
+		opts.logOpts.Setup(os.Stderr)
+
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		err = run(ctx, opts)
 

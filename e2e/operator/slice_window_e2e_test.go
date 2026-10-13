@@ -17,9 +17,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,7 +30,8 @@ import (
 	utilwait "k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 const sliceWindowClusterName = "operator-slice-window-e2e"
@@ -60,7 +63,7 @@ func TestSiteControllerPreservesSlicesDuringMigrationWindow(t *testing.T) {
 	applyCRDs(t, kubeconfig, repoRoot)
 
 	cli := newClient(t, kubeconfig)
-	ctx := log.IntoContext(context.Background(), zap.New(zap.UseDevMode(true)))
+	ctx := log.IntoContext(context.Background(), logr.FromSlogHandler(logger.Options{Level: logger.DefaultLevel}.Handler(os.Stderr)))
 
 	// The restricted SiteController identity's ServiceAccount lives in targetNS.
 	mustCreate(ctx, t, cli, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: targetNS}})

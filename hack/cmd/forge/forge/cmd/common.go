@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/azsdk"
 	"github.com/Azure/unbounded/internal/logger"
@@ -19,8 +18,7 @@ type CommandContext struct {
 	DataDir        string
 	SubscriptionID string
 	Location       string
-	LogFormat      string
-	LogNoColor     bool
+	LogOpts        logger.Options
 	Logger         *slog.Logger
 }
 
@@ -30,18 +28,7 @@ func (cfg *CommandContext) Setup() error {
 		SubscriptionID: cfg.SubscriptionID,
 	}
 
-	logLevel := slog.LevelDebug
-
-	cfg.Logger = slog.New(logger.NewPrettyFieldHandler(nil, logger.PrettyFieldHandlerOptions{
-		Level:     logLevel,
-		AttrOrder: []string{"cluster", "stage", "step"},
-	}))
-
-	if strings.EqualFold(cfg.LogFormat, "json") {
-		cfg.Logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-			Level: logLevel,
-		}))
-	}
+	cfg.Logger = cfg.LogOpts.Setup(os.Stderr)
 
 	if err := cfg.AzureCli.Configure(); err != nil {
 		return fmt.Errorf("configure azure clients: %w", err)

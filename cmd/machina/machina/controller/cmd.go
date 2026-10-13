@@ -11,11 +11,16 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 // NewCommand creates a new controller command.
 func NewCommand() *cobra.Command {
-	var configPath string
+	var (
+		configPath string
+		logOpts    logger.Options
+	)
 
 	cmd := &cobra.Command{
 		Use:   "controller",
@@ -25,6 +30,8 @@ func NewCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
+
+			logOpts.Setup(os.Stderr)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -43,6 +50,7 @@ func NewCommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to the configuration file (required)")
+	logOpts.BindFlags(cmd.Flags())
 
 	if err := cmd.MarkFlagRequired("config"); err != nil {
 		panic(fmt.Sprintf("mark flag required: %v", err))

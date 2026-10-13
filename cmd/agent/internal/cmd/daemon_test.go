@@ -31,7 +31,7 @@ import (
 func TestDaemonCommandKeepsDeferredOutOfTheJournalAsAnError(t *testing.T) {
 	t.Parallel()
 
-	cmd := newCmdDaemon(&CommandContext{LogFormat: "text"})
+	cmd := newCmdDaemon(&CommandContext{})
 	require.True(t, cmd.SilenceUsage, "systemd passes fixed arguments; a runtime failure is never a usage problem")
 
 	// Run wraps the sentinel with context before it reaches here, which is how

@@ -43,7 +43,6 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/discovery"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
-	gantrylog "github.com/Azure/unbounded/internal/gantry/log"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
@@ -133,8 +132,13 @@ func runAgent(args []string) error {
 		return fmt.Errorf("config: %w", err)
 	}
 
-	logger := gantrylog.New(os.Stderr, c.LogLevel, c.LogFormat)
-	slog.SetDefault(logger)
+	// Validate has already checked the log settings; this only converts them.
+	logOpts, err := c.LogOptions()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+
+	logger := logOpts.Setup(os.Stderr)
 	logger.Info("gantry starting",
 		slog.String("version", version.Version),
 		slog.String("go", runtime.Version()),

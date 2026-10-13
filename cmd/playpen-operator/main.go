@@ -19,13 +19,25 @@ import (
 	apiregclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/Azure/unbounded/internal/logger"
 	"github.com/Azure/unbounded/internal/playpen/operator"
 	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
+	cmd := newCommand()
+	if err := cmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// newCommand builds the operator command. Logging options are passed apart
+// from operator.Config because internal/playpen/operator never reads them.
+func newCommand() *cobra.Command {
+	var logOpts logger.Options
+
 	cfg := operator.DefaultConfig()
 	cmd := &cobra.Command{
 		Use:   "playpen-operator",
@@ -34,7 +46,7 @@ func main() {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 
-			return run(ctx, cfg)
+			return run(ctx, cfg, logOpts)
 		},
 		Version: version.Version + " (commit: " + version.GitCommit + ")",
 	}
@@ -80,18 +92,16 @@ func main() {
 	flags.StringVar(&cfg.Runner.Redfish.Username, "runner-redfish-username", cfg.Runner.Redfish.Username, "Redfish username returned in allocs")
 	flags.StringVar(&cfg.Runner.Redfish.Password, "runner-redfish-password", cfg.Runner.Redfish.Password, "Redfish password returned in allocs")
 	flags.StringVar(&cfg.Runner.Redfish.DeviceID, "runner-redfish-device-id", cfg.Runner.Redfish.DeviceID, "Redfish device ID returned in allocs")
+	logOpts.BindFlags(flags)
 
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
-	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
+	return cmd
 }
 
-func run(ctx context.Context, cfg operator.Config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+func run(ctx context.Context, cfg operator.Config, logOpts logger.Options) error {
+	logOpts.Setup(os.Stderr)
 
 	scheme := runtimeScheme()
 	restConfig := ctrl.GetConfigOrDie()

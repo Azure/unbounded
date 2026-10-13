@@ -101,7 +101,8 @@ only occurs when the data has actually changed.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--debug` | `false` | Enable debug output |
+| `--log-level` | `info` | Minimum log level: `debug`, `info`, `warn` or `error` |
+| `--log-format` | `json` | Log format: `json`, `text` or `prettytext` |
 | `--grpc-addr` | `:50051` | gRPC listen address |
 
 ### Environment Variables (PostgreSQL)

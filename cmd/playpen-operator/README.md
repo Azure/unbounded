@@ -94,6 +94,9 @@ For local development against the current Kubernetes context:
 go run ./cmd/playpen-operator --listen-addr=:8443
 ```
 
+Logs go to stderr. `--log-level` takes `debug`, `info` (default), `warn` or
+`error`, and `--log-format` takes `text` (default), `json` or `prettytext`.
+
 For the in-cluster deployment, build the shared playpen image with
 `make image-playpen-local`, render manifests with `make playpen-manifests`, and
 apply the files under `deploy/playpen/rendered`.

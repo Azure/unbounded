@@ -17,7 +17,6 @@ import (
 
 // Config holds the configuration for the inventory collector service.
 type Config struct {
-	Debug    bool
 	DbConn   pq.Config
 	GRPCAddr string
 }
