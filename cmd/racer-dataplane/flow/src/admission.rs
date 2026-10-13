@@ -471,7 +471,16 @@ mod circuit {
                 // Complete application cloning before publishing exclusive ownership.
                 let indexed = key.clone();
                 let owned = key.clone();
-                self.probes.borrow_mut().insert(indexed);
+                // Clones may reenter admission. Recheck before moving either key
+                // into the set so rejected keys drop after the borrow is released.
+                let mut probes = self.probes.borrow_mut();
+                if probes.contains(key) {
+                    return Err(Error::Unavailable);
+                }
+                if probes.len() >= self.capacity {
+                    return Err(Error::Overloaded);
+                }
+                probes.insert(indexed);
                 Some(owned)
             } else {
                 None
@@ -591,13 +600,16 @@ mod circuit {
             panic::{AssertUnwindSafe, catch_unwind},
         };
 
-        type DropCallback = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+        type KeyCallback = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
-        #[derive(Clone)]
         struct ReentrantKey {
             id: u8,
 
-            on_drop: DropCallback,
+            on_drop: KeyCallback,
+
+            on_clone: KeyCallback,
+
+            clone_at: Rc<Cell<usize>>,
 
             panic_eq: Rc<Cell<bool>>,
         }
@@ -607,12 +619,34 @@ mod circuit {
                 Self {
                     id,
                     on_drop: Rc::new(RefCell::new(None)),
+                    on_clone: Rc::new(RefCell::new(None)),
+                    clone_at: Rc::new(Cell::new(0)),
                     panic_eq: Rc::new(Cell::new(false)),
                 }
             }
 
             fn on_drop(&self, callback: impl FnOnce() + 'static) {
                 *self.on_drop.borrow_mut() = Some(Box::new(callback));
+            }
+        }
+
+        impl Clone for ReentrantKey {
+            fn clone(&self) -> Self {
+                let remaining = self.clone_at.get().saturating_sub(1);
+                self.clone_at.set(remaining);
+                if remaining == 0 {
+                    let callback = self.on_clone.borrow_mut().take();
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                }
+                Self {
+                    id: self.id,
+                    on_drop: self.on_drop.clone(),
+                    on_clone: self.on_clone.clone(),
+                    clone_at: self.clone_at.clone(),
+                    panic_eq: self.panic_eq.clone(),
+                }
             }
         }
 
@@ -642,6 +676,82 @@ mod circuit {
                 let callback = self.on_drop.borrow_mut().take();
                 if let Some(callback) = callback {
                     callback();
+                }
+            }
+        }
+
+        #[test]
+        fn probe_clone_reentry_rechecks_ownership() {
+            check_probe_clone_reentry(true);
+        }
+
+        #[test]
+        fn probe_clone_reentry_rechecks_capacity() {
+            check_probe_clone_reentry(false);
+        }
+
+        fn check_probe_clone_reentry(same_key: bool) {
+            for clone_at in [1, 2] {
+                for capacity in [1, 2] {
+                    let now = Instant::now();
+                    let health = Rc::new(Circuits::new(capacity, Duration::ZERO));
+                    let key = ReentrantKey::new(7);
+                    health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                    let nested_key = Rc::new(RefCell::new(None));
+                    let saved = nested_key.clone();
+                    let owner = health.clone();
+                    let drops = Rc::new(Cell::new(0));
+                    let observed = drops.clone();
+                    let on_drop = key.on_drop.clone();
+                    key.clone_at.set(clone_at);
+                    *key.on_clone.borrow_mut() = Some(Box::new(move || {
+                        let outer = ReentrantKey::new(7);
+                        let nested = ReentrantKey::new(if same_key { 7 } else { 8 });
+                        if !same_key {
+                            owner.success(&outer);
+                            owner.failure(&nested, now, |_, _| Duration::ZERO).unwrap();
+                        }
+                        let mut probe = owner.acquire(&nested, now).unwrap();
+                        // Transfer the key to rebuild the guard after this callback returns.
+                        *saved.borrow_mut() = probe.key.take();
+                        drop(probe);
+                        if !same_key {
+                            owner.success(&nested);
+                            owner.failure(&outer, now, |_, _| Duration::ZERO).unwrap();
+                        }
+                        *on_drop.borrow_mut() = Some(Box::new(move || {
+                            // Rejected clones must drop after releasing the probes borrow.
+                            let _probes = owner.probes.borrow_mut();
+                            observed.set(observed.get() + 1);
+                        }));
+                    }));
+
+                    let result = health.acquire(&key, now);
+                    let nested = Probe {
+                        health: &health,
+                        key: nested_key.borrow_mut().take(),
+                    };
+                    assert!(nested.key.is_some());
+                    if same_key {
+                        assert!(matches!(result, Err(Error::Unavailable)));
+                    } else if capacity == 1 {
+                        assert!(matches!(result, Err(Error::Overloaded)));
+                    } else {
+                        assert!(result.is_ok());
+                        assert_eq!(health.probes.borrow().len(), 2);
+                    }
+                    drop(result);
+                    assert_eq!(drops.get(), 1);
+                    assert_eq!(health.probes.borrow().len(), 1);
+                    let lookup = ReentrantKey::new(if same_key { 7 } else { 8 });
+                    assert!(!health.available(&lookup, now));
+                    assert!(matches!(
+                        health.acquire(&lookup, now),
+                        Err(Error::Unavailable)
+                    ));
+                    drop(nested);
+                    assert!(health.probes.borrow().is_empty());
+                    assert!(health.acquire(&key, now).is_ok());
                 }
             }
         }
