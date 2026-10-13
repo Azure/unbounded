@@ -1473,10 +1473,16 @@ Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction
 Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
 Apply ClusterRoleBinding/unbounded-net-node
+Apply Role/unbounded-system/unbounded-net-node
+Apply RoleBinding/unbounded-system/unbounded-net-node
 Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
 `
 
@@ -1523,10 +1529,16 @@ Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction
 Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
 Apply ClusterRoleBinding/unbounded-net-node
+Apply Role/unbounded-system/unbounded-net-node
+Apply RoleBinding/unbounded-system/unbounded-net-node
 Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
 `
 
@@ -1573,6 +1585,8 @@ Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
 Apply ClusterRoleBinding/unbounded-net-node
+Apply Role/unbounded-system/unbounded-net-node
+Apply RoleBinding/unbounded-system/unbounded-net-node
 CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
 Apply Service/unbounded-system/unbounded-net-controller
 Apply Deployment/unbounded-system/unbounded-net-controller
@@ -1586,6 +1600,10 @@ Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction
 `
 
 	got, err := plan.ExecutionOrder()

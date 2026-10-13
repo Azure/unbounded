@@ -19,6 +19,18 @@ const (
 	// and read intentionally until then.
 	SiteLabelKey = "net.unbounded-cloud.io/site"
 
+	// GatewayPoolLabelKey identifies the single GatewayPool assignment adopted
+	// by the node agent. An absent label means the node is a worker.
+	GatewayPoolLabelKey = "net.unbounded-cloud.io/gateway-pool"
+
+	// EffectiveSiteAnnotation records the Site adopted by a node-agent Pod.
+	EffectiveSiteAnnotation = "net.unbounded-cloud.io/effective-site"
+
+	// EffectiveGatewayPoolAnnotation records the GatewayPool adopted by a
+	// node-agent Pod. A present empty value means the worker role; an absent
+	// key means acknowledgment is pending.
+	EffectiveGatewayPoolAnnotation = "net.unbounded-cloud.io/effective-gateway-pool"
+
 	// NodeDiscoveredPublicIPAnnotation contains the translated source IP
 	// discovered by the node agent. It does not prove that the WireGuard port is
 	// reachable through symmetric NAT or CGNAT.
