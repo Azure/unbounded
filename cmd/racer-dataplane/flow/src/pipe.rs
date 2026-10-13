@@ -387,6 +387,11 @@ impl<P: Policy> PipeLease<P> {
     /// to the caller; this method never waits or retains a borrowed buffer.
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
+        let count = bytes.len().min(pipe.capacity - pipe.buffered);
+        if count == 0 && !bytes.is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        }
+        let bytes = &bytes[..count];
         #[cfg(feature = "simulation")]
         if let Some(handle) = pipe.write.as_sim() {
             let written = handle.pipe_write(bytes)?;
@@ -395,13 +400,8 @@ impl<P: Policy> PipeLease<P> {
         }
         // SAFETY: the initialized slice stays live for this nonblocking syscall.
         // The read end is owned by this lease, so this cannot generate SIGPIPE.
-        let written = unsafe {
-            libc::write(
-                pipe.write.as_raw_fd(),
-                bytes.as_ptr().cast(),
-                bytes.len().min(pipe.capacity),
-            )
-        };
+        let written =
+            unsafe { libc::write(pipe.write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
         let written = syscall_count(written)?;
         pipe.buffered += written;
         Ok(written)
@@ -1625,6 +1625,56 @@ mod tests {
         assert_eq!(second.try_write(b"second").unwrap(), 6);
         assert_eq!(second.try_read(&mut out).unwrap(), 6);
         assert_eq!(&out[..6], b"second");
+    }
+
+    /// Oversized writes fill the free suffix, and drained pipes remain reusable.
+    fn assert_oversized_write_uses_remaining_capacity() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        let capacity = pool.acquire().unwrap().capacity();
+        for requested in [2, libc::PIPE_BUF, capacity + 1] {
+            assert_eq!(pool.idle_count(), 1);
+            let mut pipe = pool.acquire().unwrap();
+            assert_eq!(pool.idle_count(), 0);
+            assert_eq!(pipe.buffered(), 0);
+            assert_eq!(pipe.try_write(&[]).unwrap(), 0);
+            let prefix = vec![0x5a; capacity - 1];
+            assert_eq!(pipe.try_write(&prefix).unwrap(), prefix.len());
+            assert_eq!(pipe.buffered(), capacity - 1);
+            assert_eq!(pipe.try_write(&vec![0xa5; requested]).unwrap(), 1);
+            assert_eq!(pipe.buffered(), capacity);
+            assert_eq!(pipe.try_write(&[]).unwrap(), 0);
+            assert_eq!(
+                pipe.try_write(b"full").unwrap_err().raw_os_error(),
+                Some(libc::EAGAIN)
+            );
+            assert_eq!(pipe.buffered(), capacity);
+            let mut bytes = vec![0; capacity];
+            assert_eq!(pipe.try_read(&mut bytes).unwrap(), capacity);
+            assert_eq!(&bytes[..capacity - 1], prefix.as_slice());
+            assert_eq!(bytes[capacity - 1], 0xa5);
+            assert_eq!(pipe.buffered(), 0);
+            drop(pipe);
+            assert_eq!(pool.idle_count(), 1);
+            assert_eq!(quotas.used(ResourceClass::Pipe), 1);
+        }
+        drop(pool);
+        assert_eq!(quotas.used(ResourceClass::Pipe), 0);
+    }
+
+    /// Native small writes must not stall when their prefix fits the free suffix.
+    #[test]
+    fn native_oversized_write_uses_remaining_capacity() {
+        assert_oversized_write_uses_remaining_capacity();
+    }
+
+    /// Simulation uses the same bounded-prefix contract as native pipes.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn simulation_oversized_write_uses_remaining_capacity() {
+        let sim = uring_runtime::reactor::simulation::Simulation::new();
+        let _environment = sim.enter();
+        assert_oversized_write_uses_remaining_capacity();
     }
 
     /// Copied pages remain intact after source reuse, partial drain, and pipe reuse.
