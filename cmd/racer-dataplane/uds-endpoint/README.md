@@ -4,9 +4,9 @@ Standalone Linux filesystem-ownership helper intended for the replacement
 `racer-dataplane`. It is a workspace member, not yet an application dependency.
 This unpublished crate depends only on `libc` in production. The optional
 `simulation` feature adds `uring-runtime` and its simulated filesystem. The crate
-does not choose an application model, protocol, or service-activation policy. It owns Unix stream
-socket names and a worker-local publication journal, not application readiness or
-admission.
+does not choose an application model, protocol, or service-activation policy. It
+owns Unix stream socket names and a worker-local publication journal, not
+application readiness or admission.
 
 ## Platform and trust boundary
 
@@ -210,9 +210,13 @@ path walk and Unix address limits. Use host tests for those guarantees.
 ## Validation
 
 Run from `cmd/racer-dataplane`. No privileged test setup is needed. Integration
-fixtures use Cargo's `CARGO_TARGET_TMPDIR`; cleanup avoids a
-second panic during unwinding. Crash/umask cases run in isolated subprocesses,
-not through process-wide umask changes or fork inside parallel test workers.
+fixtures use Cargo's `CARGO_TARGET_TMPDIR`. Unit fixtures use `UDS_TEST_TMPDIR` if
+set, otherwise `CARGO_TARGET_DIR/tmp`, falling back to the workspace's `target/tmp`.
+Empty overrides are ignored; relative paths use the test process's working
+directory. Both unit fixtures share this selection, including the admission
+subprocess fixture. Cleanup avoids a second panic during unwinding. Crash/umask
+cases run in isolated subprocesses, not through process-wide umask changes or fork
+inside parallel test workers.
 
 ```sh
 timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked -p uds-endpoint --no-default-features -j 2

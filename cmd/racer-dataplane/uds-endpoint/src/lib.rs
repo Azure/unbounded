@@ -777,11 +777,7 @@ mod admission_tests {
 
     #[test]
     fn permissions_precede_listen() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("target/tmp")
-            .join(format!("admission-{}", std::process::id()));
+        let root = tests::fixture_root("admission");
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         let status = std::process::Command::new("timeout")

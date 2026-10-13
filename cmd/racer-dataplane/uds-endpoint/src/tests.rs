@@ -1,22 +1,73 @@
 use super::*;
 use publication::{Endpoint, Replacement};
+use std::ffi::OsStr;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Root(PathBuf);
 
-impl Root {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn fixture_base(explicit: Option<&OsStr>, target: Option<&OsStr>, cwd: &Path) -> PathBuf {
+    let base = if let Some(path) = explicit.filter(|path| !path.is_empty()) {
+        PathBuf::from(path)
+    } else if let Some(path) = target.filter(|path| !path.is_empty()) {
+        PathBuf::from(path).join("tmp")
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .join("target/tmp")
-            .join(format!(
-                "core-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+    };
+    cwd.join(base)
+}
+
+pub(super) fn fixture_root(prefix: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fixture_base(
+        std::env::var_os("UDS_TEST_TMPDIR").as_deref(),
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+        &std::env::current_dir().unwrap(),
+    )
+    .join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[test]
+fn fixture_root_selection_honors_overrides_without_changing_environment() {
+    let cwd = Path::new("/workspace/crate");
+    let fallback = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/tmp");
+    for (explicit, target, expected) in [
+        (None, None, fallback.clone()),
+        (Some(""), Some(""), fallback),
+        (
+            None,
+            Some("/workspace/build"),
+            PathBuf::from("/workspace/build/tmp"),
+        ),
+        (None, Some("build"), cwd.join("build/tmp")),
+        (Some("fixtures"), Some("build"), cwd.join("fixtures")),
+        (
+            Some("/workspace/fixtures"),
+            Some("build"),
+            PathBuf::from("/workspace/fixtures"),
+        ),
+        (Some(""), Some("build"), cwd.join("build/tmp")),
+    ] {
+        assert_eq!(
+            fixture_base(explicit.map(OsStr::new), target.map(OsStr::new), cwd),
+            expected
+        );
+    }
+}
+
+impl Root {
+    fn new() -> Self {
+        let path = fixture_root("core");
         fs::create_dir_all(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         Self(path)
@@ -39,6 +90,33 @@ fn layout() -> Layout {
     Layout::new("lock", "socket", "witness-", |s| s.starts_with("stage-")).unwrap()
 }
 
+fn stale(listener: UnixListener) {
+    // Prevent a concurrently spawned child from retaining a live listening alias.
+    assert_eq!(
+        // SAFETY: listener retains a valid socket descriptor throughout shutdown.
+        unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) },
+        0
+    );
+    drop(listener);
+}
+
+#[test]
+fn stale_shutdown_disables_inherited_listener_alias() {
+    let root = Root::new();
+    let directory = root.directory();
+    let witness = file_path(&directory).join("witness-stage-a");
+    let listener = UnixListener::bind(&witness).unwrap();
+    let inherited = listener.try_clone().unwrap();
+    stale(listener);
+    assert_eq!(
+        UnixStream::connect(&witness).unwrap_err().raw_os_error(),
+        Some(libc::ECONNREFUSED)
+    );
+    EndpointOwner::acquire(&directory, layout()).unwrap();
+    assert!(!witness.exists());
+    drop(inherited);
+}
+
 #[test]
 fn recovery_repairs_unwritable_witness_before_distinguishing_live_and_dead() {
     for live in [false, true] {
@@ -51,7 +129,7 @@ fn recovery_repairs_unwritable_witness_before_distinguishing_live_and_dead() {
         let listener = if live {
             Some(listener)
         } else {
-            drop(listener);
+            stale(listener);
             None
         };
         let result = EndpointOwner::acquire(&directory, layout());
@@ -115,6 +193,8 @@ fn recovery_restores_mixed_witnesses_before_any_cleanup() {
             if index == live_index {
                 fs::hard_link(root.0.join(&witness), root.0.join("socket")).unwrap();
                 live = Some(listener);
+            } else {
+                stale(listener);
             }
         }
 
@@ -136,7 +216,7 @@ fn recovery_restores_mixed_witnesses_before_any_cleanup() {
             modes[live_index]
         );
 
-        drop(live);
+        stale(live.unwrap());
         EndpointOwner::acquire(&directory, layout()).unwrap();
         assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
         assert!(root.0.join("lock").exists());
