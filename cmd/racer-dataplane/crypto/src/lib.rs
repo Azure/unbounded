@@ -124,10 +124,11 @@ pub fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(inner.as_slice());
     hash.update(msg);
-    let digest = hash.finalize();
+    // sha2 0.10 cannot wipe its private hash state; wipe our digest buffer.
+    let digest = Zeroizing::new(<[u8; 32]>::from(hash.finalize()));
     let mut hash = Sha256::new();
     hash.update(outer.as_slice());
-    hash.update(digest);
+    hash.update(digest.as_slice());
     hash.finalize().into()
 }
 
@@ -290,9 +291,10 @@ pub mod identity {
             mut bundle: racer_control_wire::KeyringBundle,
         ) -> std::result::Result<(BundleGeneration, Vec<Vec<u8>>), BundleError> {
             bundle.peer_trust_roots.sort();
+            // Avoid stable sort's heap scratch copies of inline secret material.
             bundle
                 .cache_keys
-                .sort_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
+                .sort_unstable_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
             let encoded = Zeroizing::new(
                 racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
             );

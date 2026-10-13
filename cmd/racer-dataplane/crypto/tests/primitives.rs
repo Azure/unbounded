@@ -1039,6 +1039,49 @@ mod identity_workflows {
     }
 
     #[test]
+    fn installer_canonicalizes_secret_records_and_rejects_duplicate_references() {
+        use racer_crypto::identity::BundleInstaller;
+
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = Rc::new(Keyring::new(
+            ClusterId(CLUSTER.into()),
+            NodeId(NODE.into()),
+            Arc::default(),
+        ));
+        let installer = BundleInstaller::new(keys.clone());
+        let mut bundle = bundle(1, roots);
+        for ordinal in 2..42 {
+            bundle.cache_keys.push(CacheEncryptionKey::new(
+                CacheKeyRef {
+                    cache: CacheId(CACHE.into()),
+                    id: KeyId::from_generation(1, ordinal).unwrap(),
+                    purpose: KeyPurpose::Page,
+                },
+                CacheKeyState::Prepared,
+                Zeroizing::new([ordinal as u8 + 32; 32]),
+            ));
+        }
+        let accepted = installer.install(bundle.clone()).unwrap();
+        bundle.cache_keys.reverse();
+        assert_eq!(installer.install(bundle.clone()).unwrap(), accepted);
+        bundle.cache_keys.rotate_left(17);
+        assert_eq!(installer.install(bundle.clone()).unwrap(), accepted);
+        for record in &bundle.cache_keys {
+            assert_eq!(
+                keys.lease(Some(&record.key.cache), record.key.id, record.key.purpose)
+                    .unwrap()
+                    .reference(),
+                &record.key
+            );
+        }
+        bundle.generation = BundleGeneration(2);
+        bundle.cache_keys.push(bundle.cache_keys[0].clone());
+        assert!(installer.install(bundle).is_err());
+        assert_eq!(installer.generation(), Some(BundleGeneration(1)));
+        assert_eq!(keys.generation().unwrap(), Some(1));
+    }
+
+    #[test]
     fn accepted_chain_validity_is_enforced_at_expiry_and_after_clock_rollback() {
         let clock = uring_runtime::environment::SimulationClock::new(97);
         let _environment = clock.environment(0).enter();
