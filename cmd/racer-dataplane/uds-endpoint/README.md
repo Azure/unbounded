@@ -19,7 +19,26 @@ Cooperating effective-UID owners must serialize directory mutation and respect
 the persistent lock. A hostile process with the same UID or root is outside the
 boundary: Linux has no compare-inode-and-unlink syscall. Inode checks prevent
 accidental deletion of already-replaced names, not adversarial races between a
-check and a mutation. Ancestor renames do not redirect retained directory handles.
+check and a mutation.
+
+Callers must secure the endpoint's parent and all ancestors against untrusted
+rename or replacement for as long as clients use its pathname. The directory walk
+rejects symlinks, but does not validate ancestor ownership or permissions.
+`EndpointOwner` validates the supplied directory and its lock, not the pathname
+leading to them. Ancestor renames do not redirect retained directory handles:
+publication, chmod, and cleanup still target the pinned directory and inodes.
+Clients resolving the original pathname can instead reach a replacement directory
+and socket. Pinned-inode safety does not guarantee client pathname integrity.
+
+Callers must also ensure that access and default ACLs grant only intended access,
+including on directories created by the walk. The crate does not inspect or remove
+ACLs. `restrict_directory` removes mode bits, not default ACLs. A socket can inherit
+named-user or named-group entries from its directory's default ACL. Mode 0600 masks
+those entries without deleting them; a later `set_mode(0o660)` can make their read
+and write permissions effective again. With an extended access ACL, the group mode
+bits describe the ACL mask, not just the owning group's permissions. Remove
+unwanted default ACLs before creating endpoints, or verify that all inherited
+entries fit the final client-access policy; checking mode bits alone is not enough.
 
 ## Layout and ownership API
 
