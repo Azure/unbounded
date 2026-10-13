@@ -143,6 +143,7 @@ func (c *Collector) Summary(snapshot collected) Summary {
 			if diagnosticRun(&snapshot.runs[i]) {
 				continue
 			}
+
 			if strings.EqualFold(snapshot.runs[i].Status.Verdict, "Pass") {
 				history.Passed++
 			} else {
@@ -169,6 +170,7 @@ func (c *Collector) Summary(snapshot collected) Summary {
 		}
 
 		nodeCounts[key]++
+
 		switch node.Labels[signal.EligibilityLabel] {
 		case "production":
 			currentNodes.Healthy++
@@ -408,6 +410,7 @@ func buildRunSummary(run *signalv1.CertificationRun, snapshot collected) RunSumm
 	finished := metaTime(run.Status.FinishedAt)
 	purpose, scope := runPurpose(run)
 	classification, superseded := runClassification(run, snapshot.runs)
+
 	timingLabel := "elapsed"
 	if run.Status.Phase.Terminal() {
 		timingLabel = "completed in"
@@ -466,6 +469,7 @@ func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.Certificat
 	plan, planIssues := declaredStagePlan(run)
 	events := []stageEvent{}
 	logError := ""
+
 	pod := workflowPod(workflow, snapshot.pods)
 	if pod != nil && c.PodLogs != nil {
 		content, err := c.PodLogs.ReadPodLog(ctx, c.Namespace, pod.Name, "main", maxStageLogLines, maxStageLogBytes)
@@ -475,11 +479,14 @@ func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.Certificat
 			events = parseStageEvents(content)
 		}
 	}
+
 	executionPlan, eventIssues, currentStage := reconcileStagePlan(plan, events, run.Status.Phase.Terminal(), snapshot.refreshed)
+
 	planIssues = append(planIssues, eventIssues...)
 	if logError != "" {
 		planIssues = append(planIssues, logError)
 	}
+
 	argoTask := argoTaskStatus(workflowNodes)
 
 	return RunDetail{
@@ -765,6 +772,7 @@ func latestRunByNode(runs []signalv1.CertificationRun) map[string]*signalv1.Cert
 		if !runs[i].Status.Phase.Terminal() || !certificationRun(&runs[i]) {
 			continue
 		}
+
 		for _, participant := range runs[i].Spec.Participants {
 			current := result[participant.NodeName]
 			if current == nil || current.CreationTimestamp.Before(&runs[i].CreationTimestamp) {

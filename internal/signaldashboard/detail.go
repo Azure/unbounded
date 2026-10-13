@@ -11,11 +11,11 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
-	"github.com/Azure/unbounded/internal/signal"
 )
 
 func latestOutcomes(snapshot collected) []LatestOutcome {
 	latest := map[string]*signalv1.CertificationRun{}
+
 	for i := range snapshot.runs {
 		run := &snapshot.runs[i]
 		if !run.Status.Phase.Terminal() || !certificationRun(run) {
@@ -41,10 +41,12 @@ func latestOutcomes(snapshot collected) []LatestOutcome {
 			At:        optionalTime(metaTime(run.Status.FinishedAt)),
 		})
 	}
+
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].NodeAlias == result[j].NodeAlias {
 			return result[i].Profile < result[j].Profile
 		}
+
 		return result[i].NodeAlias < result[j].NodeAlias
 	})
 
@@ -57,6 +59,7 @@ func workflowPod(workflow *unstructured.Unstructured, pods []corev1.Pod) *corev1
 	}
 
 	var fallback *corev1.Pod
+
 	for i := range pods {
 		if pods[i].Labels["workflows.argoproj.io/workflow"] != workflow.GetName() &&
 			!ownedByUID(&pods[i], workflow.GetUID()) {
@@ -72,6 +75,7 @@ func workflowPod(workflow *unstructured.Unstructured, pods []corev1.Pod) *corev1
 			if nodeName == "node-health" || strings.HasSuffix(nodeName, ".node-health") {
 				return &pods[i]
 			}
+
 			if fallback == nil {
 				fallback = &pods[i]
 			}
@@ -93,10 +97,12 @@ func scriptStatus(run *signalv1.CertificationRun, pod *corev1.Pod) ScriptStatus 
 	if pod == nil {
 		return status
 	}
+
 	for _, container := range pod.Spec.Containers {
 		if container.Name != "main" {
 			continue
 		}
+
 		status.Command = append(append([]string(nil), container.Command...), container.Args...)
 		for i, part := range status.Command {
 			if part == "--" && i+1 < len(status.Command) {
@@ -104,9 +110,11 @@ func scriptStatus(run *signalv1.CertificationRun, pod *corev1.Pod) ScriptStatus 
 				break
 			}
 		}
+
 		for i := range status.Command {
 			status.Command[i] = sanitizeDisplay(status.Command[i])
 		}
+
 		break
 	}
 
@@ -117,6 +125,7 @@ func sanitizeObjectName(name string) string {
 	if name == "" {
 		return ""
 	}
+
 	if strings.HasSuffix(name, "-scripts") {
 		return "run-snapshot-[redacted]-scripts"
 	}
@@ -154,12 +163,15 @@ func finalizationStages(run *signalv1.CertificationRun) []StageStatus {
 	if run.Status.Verdict != "" {
 		resultPhase = "Succeeded"
 	}
+
 	if run.Status.Evidence.URI != "" {
 		evidencePhase = "Succeeded"
 	}
+
 	if run.Status.Phase.Terminal() {
 		projectionPhase = "Succeeded"
 	}
+
 	if run.Status.Cleanup.ReservationsReleased && run.Status.Cleanup.SnapshotDeleted {
 		cleanupPhase = "Succeeded"
 	} else if run.Status.Phase.Terminal() {
@@ -193,8 +205,4 @@ func argoTaskStatus(nodes []WorkflowNode) StageStatus {
 	}
 
 	return StageStatus{ID: "node-health", Name: "node-health", Phase: "Pending", Source: "Argo Workflow"}
-}
-
-func nodeCurrentRun(node *corev1.Node) string {
-	return node.Annotations[signal.ReservationLabel]
 }

@@ -258,6 +258,7 @@ func TestViewFilterSeparatesCurrentHistoricalDiagnosticsAndSuperseded(t *testing
 	diagnostic.Spec.Purpose = signalv1.PurposeDiagnostic
 
 	snapshot := collected{runs: []signalv1.CertificationRun{active, old, passed, diagnostic}}
+
 	cases := map[string]string{
 		"Current":     "active",
 		"Historical":  "passed",

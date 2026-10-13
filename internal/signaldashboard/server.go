@@ -127,6 +127,7 @@ func filterRuns(snapshot collected, request *http.Request) collected {
 	profile := strings.ToLower(request.URL.Query().Get("profile"))
 
 	hardware := strings.ToLower(request.URL.Query().Get("hardware"))
+
 	view := strings.ToLower(request.URL.Query().Get("view"))
 	if phase == "" && verdict == "" && profile == "" && hardware == "" && view == "" {
 		return snapshot

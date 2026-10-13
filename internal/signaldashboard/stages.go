@@ -97,9 +97,11 @@ func reconcileStagePlan(
 		if plan[i].ExpectedDuration.Duration > 0 {
 			stages[i].ExpectedDuration = plan[i].ExpectedDuration.Duration.String()
 		}
+
 		if _, duplicate := index[plan[i].ID]; duplicate {
 			issues = append(issues, fmt.Sprintf("Duplicate declared stage ID %q.", plan[i].ID))
 		}
+
 		index[plan[i].ID] = i
 	}
 
@@ -118,10 +120,12 @@ func reconcileStagePlan(
 		if seenStatus[event.Name] == nil {
 			seenStatus[event.Name] = map[string]bool{}
 		}
+
 		if seenStatus[event.Name][status] {
 			issues = append(issues, fmt.Sprintf("Stage %q emitted duplicate %s events.", event.Name, status))
 			continue
 		}
+
 		seenStatus[event.Name][status] = true
 
 		at := time.UnixMilli(int64(event.AtEpoch * 1000)).UTC()
@@ -132,11 +136,13 @@ func reconcileStagePlan(
 			if i < highestStarted {
 				issues = append(issues, fmt.Sprintf("Stage %q started out of declared order.", event.Name))
 			}
+
 			for prior := 0; prior < i; prior++ {
 				if stages[prior].Required && stages[prior].Phase == "Pending" {
 					issues = append(issues, fmt.Sprintf("Stage %q started before required stage %q completed.", event.Name, stages[prior].ID))
 				}
 			}
+
 			highestStarted = max(highestStarted, i)
 			stage.Phase = status
 			stage.StartedAt = optionalTime(at)
@@ -144,11 +150,14 @@ func reconcileStagePlan(
 			if stage.StartedAt == nil {
 				stage.StartedAt = optionalTime(at)
 			}
+
 			stage.Phase = status
 			stage.FinishedAt = optionalTime(at)
+
 			if status == "Failed" {
 				failedAt = i
 			}
+
 			if status == "Skipped" && stage.Required && !stage.Conditional {
 				issues = append(issues, fmt.Sprintf("Required stage %q was skipped.", event.Name))
 			}
@@ -181,6 +190,7 @@ func reconcileStagePlan(
 	}
 
 	current := ""
+
 	for i := range stages {
 		stages[i].Duration = stageDuration(&stages[i], now)
 		if stages[i].Phase == "Running" {
@@ -212,10 +222,12 @@ func stageDuration(stage *StageStatus, now time.Time) string {
 	if stage.StartedAt == nil {
 		return ""
 	}
+
 	end := now
 	if stage.FinishedAt != nil {
 		end = *stage.FinishedAt
 	}
+
 	if end.Before(*stage.StartedAt) {
 		return ""
 	}

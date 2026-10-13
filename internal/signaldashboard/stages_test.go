@@ -131,6 +131,7 @@ func TestRunPurposeAndClassification(t *testing.T) {
 
 	explicit := old
 	explicit.Spec.Purpose = signalv1.PurposeTargetedVerification
+
 	assert.Equal(t, "Targeted verification", func() string { purpose, _ := runPurpose(&explicit); return purpose }())
 }
 
@@ -144,6 +145,7 @@ type fakePodLogs struct {
 func (f *fakePodLogs) ReadPodLog(_ context.Context, _, _, _ string, tailLines, limitBytes int64) ([]byte, error) {
 	f.tailLines = tailLines
 	f.limitBytes = limitBytes
+
 	return f.content, f.err
 }
 

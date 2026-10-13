@@ -22,7 +22,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/rand"
-	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -55,7 +55,7 @@ type AdmissionReconciler struct {
 	client.Client
 	Namespace       string
 	ScriptNamespace string
-	Recorder        record.EventRecorder
+	Recorder        recorder.EventRecorder
 	Now             func() time.Time
 }
 
@@ -66,7 +66,7 @@ type RunReconciler struct {
 	Now                func() time.Time
 	MaxConcurrentRuns  int
 	WorkflowAPIVersion string
-	Recorder           record.EventRecorder
+	Recorder           recorder.EventRecorder
 }
 
 func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -130,6 +130,7 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 	if err := r.Get(ctx, client.ObjectKey{Name: profileName}, &profile); err != nil {
 		return fmt.Errorf("get CertificationProfile %s: %w", profileName, err)
 	}
+
 	if err := validateStagePlan(profile.Spec.StagePlan); err != nil {
 		return fmt.Errorf("profile %s stage plan: %w", profile.Name, err)
 	}
@@ -230,7 +231,7 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 	releaseOnFailure = false
 
 	if r.Recorder != nil {
-		r.Recorder.Eventf(run, corev1.EventTypeNormal, "CertificationAdmitted",
+		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationAdmitted", "AdmitCertification",
 			"Created CertificationRun %s with immutable script digest %s", run.Name, scriptDigest)
 	}
 
@@ -543,7 +544,7 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 	}
 
 	if r.Recorder != nil {
-		r.Recorder.Eventf(run, corev1.EventTypeNormal, "WorkflowStarted",
+		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "WorkflowStarted", "StartWorkflow",
 			"Created Workflow %s for attempt %d", workflow.GetName(), attempt)
 	}
 
@@ -671,11 +672,11 @@ func (r *RunReconciler) finish(
 	}
 
 	if r.Recorder != nil {
-		r.Recorder.Eventf(run, corev1.EventTypeNormal, "CertificationFinished",
+		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationFinished", "FinishCertification",
 			"ExecutionState=%s Verdict=%s Reason=%s", executionState, verdict, reason)
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
 func (r *RunReconciler) evidenceDocument(
@@ -738,7 +739,7 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
 func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
@@ -779,7 +780,7 @@ func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.Certification
 	}
 
 	if r.Recorder != nil {
-		r.Recorder.Event(run, corev1.EventTypeNormal, "CertificationCleaned",
+		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationCleaned", "CleanCertification",
 			"Released participant reservations, cleared the request label, and deleted the script snapshot")
 	}
 
@@ -976,17 +977,21 @@ func removeString(values []string, remove string) []string {
 
 func validateStagePlan(plan []signalv1.CertificationStage) error {
 	seen := map[string]struct{}{}
+
 	for i := range plan {
 		stage := &plan[i]
 		if stage.ID == "" {
 			return fmt.Errorf("stage %d has an empty ID", i)
 		}
+
 		if stage.DisplayName == "" {
 			return fmt.Errorf("stage %q has an empty display name", stage.ID)
 		}
+
 		if _, ok := seen[stage.ID]; ok {
 			return fmt.Errorf("duplicate stage ID %q", stage.ID)
 		}
+
 		seen[stage.ID] = struct{}{}
 	}
 

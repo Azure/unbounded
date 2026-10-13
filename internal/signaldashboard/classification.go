@@ -51,6 +51,7 @@ func runClassification(run *signalv1.CertificationRun, runs []signalv1.Certifica
 	if !run.Status.Phase.Terminal() {
 		return "Current", false
 	}
+
 	if diagnosticRun(run) {
 		return "Diagnostics", false
 	}
@@ -80,6 +81,7 @@ func sameParticipants(left, right *signalv1.CertificationRun) bool {
 	for _, participant := range left.Spec.Participants {
 		names[participant.NodeName] = struct{}{}
 	}
+
 	for _, participant := range right.Spec.Participants {
 		if _, ok := names[participant.NodeName]; !ok {
 			return false

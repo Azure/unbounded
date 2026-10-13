@@ -114,7 +114,7 @@ func run(ctx context.Context, cfg config) error {
 		Client:          mgr.GetClient(),
 		Namespace:       cfg.namespace,
 		ScriptNamespace: cfg.scriptNamespace,
-		Recorder:        mgr.GetEventRecorderFor(controllerName),
+		Recorder:        mgr.GetEventRecorder(controllerName),
 	}
 	if err := admission.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("register admission reconciler: %w", err)
@@ -125,7 +125,7 @@ func run(ctx context.Context, cfg config) error {
 		Namespace:         cfg.namespace,
 		Evidence:          evidence,
 		MaxConcurrentRuns: cfg.maxConcurrentRuns,
-		Recorder:          mgr.GetEventRecorderFor(controllerName),
+		Recorder:          mgr.GetEventRecorder(controllerName),
 	}
 	if err := runs.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("register run reconciler: %w", err)

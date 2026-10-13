@@ -64,9 +64,11 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	if run.Spec.Script.Digest != digestString(payload) {
 		t.Fatalf("script digest = %q", run.Spec.Script.Digest)
 	}
+
 	if len(run.Spec.StagePlan) != 1 || run.Spec.StagePlan[0].ID != "workload" {
 		t.Fatalf("stage plan = %#v, want immutable profile plan", run.Spec.StagePlan)
 	}
+
 	if run.Spec.Purpose != signalv1.PurposeQuickCertification {
 		t.Fatalf("purpose = %q, want %q", run.Spec.Purpose, signalv1.PurposeQuickCertification)
 	}
@@ -325,6 +327,7 @@ func TestValidateStagePlanRejectsInvalidAndDuplicateStages(t *testing.T) {
 	if err := validateStagePlan([]signalv1.CertificationStage{{DisplayName: "Missing ID"}}); err == nil {
 		t.Fatal("expected empty stage ID to fail validation")
 	}
+
 	if err := validateStagePlan([]signalv1.CertificationStage{
 		{ID: "workload", DisplayName: "First"},
 		{ID: "workload", DisplayName: "Duplicate"},
