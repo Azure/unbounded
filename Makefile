@@ -656,9 +656,9 @@ license-check: ## Verify project-owned source license declarations
 		':(exclude)**/third_party/**' \
 		':(exclude)**/node_modules/**' \
 		':(exclude)**/target/**' | while IFS= read -r file; do \
-		case "$$file" in \
-			*.go) grep -qE '^// Code generated .* DO NOT EDIT\.$$' "$$file" && continue ;; \
-		esac; \
+		if grep -qE '^// Code generated .* DO NOT EDIT\.$$' "$$file"; then \
+			continue; \
+		fi; \
 		grep -qF 'SPDX-License-Identifier: Apache-2.0' "$$file" || printf '%s\n' "$$file"; \
 	done)"; \
 	if [ -n "$$missing" ]; then \
