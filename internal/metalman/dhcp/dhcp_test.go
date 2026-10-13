@@ -413,6 +413,128 @@ func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
 	}
 }
 
+func TestDHCPHandlerVirtualMediaSuppressesBootHints(t *testing.T) {
+	mac, err := net.ParseMAC("aa:bb:cc:dd:ee:f5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverIP := net.ParseIP("10.0.1.254").To4()
+	netbootImageRef := "ghcr.io/test/netboot@sha256:abcdef1234567890"
+	digest := "sha256:abcdef1234567890"
+	ociCache := netboot.NewOCICache(t.TempDir())
+	ociCache.SetDigest(netbootImageRef, digest)
+
+	diskDir := ociCache.DiskDir(digest)
+	if err := os.MkdirAll(diskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"),
+		[]byte("dhcpBootImageName: pxe-shimx64.efi\nhttpBootPath: http/shimx64.efi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, imageSource := range []string{"machine", "default"} {
+		t.Run(imageSource, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-virtual-media"},
+				Spec: v1alpha3.MachineSpec{
+					Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
+						BootProtocol: v1alpha3.PXEBootProtocolVirtualMedia,
+						DHCPLeases: []v1alpha3.DHCPLease{{
+							MAC: mac.String(), IPv4: "10.0.1.15", SubnetMask: "255.255.255.0",
+							Gateway: "10.0.1.1", DNS: []string{"1.1.1.1"},
+						}},
+					}},
+				},
+			}
+			if imageSource == "machine" {
+				node.Spec.Host.Netboot.NetbootImage = netbootImageRef
+			}
+
+			srv := &Server{
+				Interface: "eth0", Reader: newFakeReader(t, node), ServerIP: serverIP,
+				OCICache: ociCache, ServeURL: "http://10.0.1.254:8880/base/",
+				DefaultNetbootRef: netbootImageRef,
+			}
+
+			for _, class := range []string{"PXEClient:Arch:00007:UNDI:003016", "HTTPClient:Arch:00016:UNDI:003016"} {
+				t.Run(class, func(t *testing.T) {
+					for _, exchange := range []struct {
+						request dhcpv4.MessageType
+						reply   dhcpv4.MessageType
+					}{
+						{dhcpv4.MessageTypeDiscover, dhcpv4.MessageTypeOffer},
+						{dhcpv4.MessageTypeRequest, dhcpv4.MessageTypeAck},
+					} {
+						t.Run(exchange.request.String(), func(t *testing.T) {
+							request, err := dhcpv4.NewDiscovery(mac,
+								dhcpv4.WithOption(dhcpv4.OptClassIdentifier(class)),
+								dhcpv4.WithOption(dhcpv4.OptMessageType(exchange.request)))
+							if err != nil {
+								t.Fatal(err)
+							}
+
+							conn := &fakePacketConn{}
+							srv.handler(conn, &net.UDPAddr{IP: net.ParseIP("10.0.1.15"), Port: 68}, request)
+
+							if conn.written == nil {
+								t.Fatal("expected DHCP response for VirtualMedia")
+							}
+
+							resp, err := dhcpv4.FromBytes(conn.written)
+							if err != nil {
+								t.Fatal(err)
+							}
+
+							if resp.MessageType() != exchange.reply {
+								t.Errorf("expected %s, got %s", exchange.reply, resp.MessageType())
+							}
+
+							if !resp.YourIPAddr.Equal(net.ParseIP("10.0.1.15")) {
+								t.Errorf("expected YourIP 10.0.1.15, got %s", resp.YourIPAddr)
+							}
+
+							if !resp.ServerIdentifier().Equal(serverIP) {
+								t.Errorf("expected DHCP server identifier %s, got %s", serverIP, resp.ServerIdentifier())
+							}
+
+							if mask := resp.SubnetMask(); !net.IP(mask).Equal(net.ParseIP("255.255.255.0")) {
+								t.Errorf("expected subnet mask 255.255.255.0, got %s", net.IP(mask))
+							}
+
+							if routers := resp.Router(); len(routers) != 1 || !routers[0].Equal(net.ParseIP("10.0.1.1")) {
+								t.Errorf("expected gateway 10.0.1.1, got %v", routers)
+							}
+
+							if dns := resp.DNS(); len(dns) != 1 || !dns[0].Equal(net.ParseIP("1.1.1.1")) {
+								t.Errorf("expected DNS 1.1.1.1, got %v", dns)
+							}
+
+							if resp.GetOneOption(dhcpv4.OptionTFTPServerName) != nil {
+								t.Error("expected no TFTP server option for VirtualMedia")
+							}
+
+							if resp.GetOneOption(dhcpv4.OptionBootfileName) != nil {
+								t.Error("expected no bootfile option for VirtualMedia")
+							}
+
+							if resp.BootFileName != "" {
+								t.Errorf("expected empty BOOTP bootfile for VirtualMedia, got %q", resp.BootFileName)
+							}
+
+							if !resp.ServerIPAddr.IsUnspecified() {
+								t.Errorf("expected no next-server for VirtualMedia, got %s", resp.ServerIPAddr)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestDHCPHandlerUnknownMAC(t *testing.T) {
 	mac, _ := net.ParseMAC("ff:ff:ff:ff:ff:ff")
 	serverIP := net.ParseIP("10.0.1.254").To4()

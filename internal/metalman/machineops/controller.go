@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/bootmedia"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
@@ -71,15 +72,18 @@ type Reconciler struct {
 
 	Site                  string
 	PowerClients          PowerClientFactory
+	BootMedia             bootmedia.Provider
 	HTTPBootURL           func(*v1alpha3.Machine) (string, error)
 	MaxConcurrentMachines int
 	MaxAttempts           int32
 	PollInterval          time.Duration
 	PowerActionTimeout    time.Duration
+	MediaInstallTimeout   time.Duration
 	Now                   func() metav1.Time
 }
 
-// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete;update;patch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
@@ -120,8 +124,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	logger := slog.With("machineOperation", req.Name)
 
 	var op v1alpha3.MachineOperation
-	if err := r.Get(ctx, client.ObjectKey{Name: req.Name}, &op); err != nil {
+	if err := r.reader().Get(ctx, client.ObjectKey{Name: req.Name}, &op); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if handled, err := r.reconcileMediaCleanup(ctx, &op); handled || err != nil {
+		return ctrl.Result{RequeueAfter: r.pollInterval()}, err
+	}
+
+	if !op.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	if op.Status.IsTerminal() {
@@ -153,7 +165,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, nil
 		}
 
-		if err := r.Get(ctx, client.ObjectKey{Name: op.Name}, &op); err != nil {
+		if err := r.reader().Get(ctx, client.ObjectKey{Name: op.Name}, &op); err != nil {
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
 	}
@@ -358,6 +370,10 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		target.StartedAt = &now
 	}
 
+	if target.BootMedia != nil {
+		return r.advanceVirtualMedia(ctx, op, mediaMachine(target), target, now)
+	}
+
 	var machine v1alpha3.Machine
 	if err := r.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &machine); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -387,6 +403,10 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostReboot:
 		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
+		if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
+			return r.advanceVirtualMedia(ctx, op, &machine, target, now)
+		}
+
 		return r.advanceReplace(ctx, op, &machine, target, now)
 	default:
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)
@@ -840,6 +860,7 @@ func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, chan
 
 		for i, target := range latest.Status.Targets {
 			if updated, ok := byName[target.MachineRef]; ok {
+				mergeMediaCallbacks(&updated, target)
 				latest.Status.Targets[i] = updated
 			}
 		}
@@ -907,18 +928,18 @@ func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3
 	}
 
 	var list v1alpha3.MachineOperationList
-	if err := r.List(ctx, &list); err != nil {
+	if err := r.reader().List(ctx, &list); err != nil {
 		return "", fmt.Errorf("list MachineOperations: %w", err)
 	}
 
 	candidates := make([]v1alpha3.MachineOperation, 0, len(list.Items))
 
 	for _, candidate := range list.Items {
-		if candidate.Name == op.Name || candidate.Status.IsTerminal() || !isHostOperation(candidate.Spec.OperationKind) {
+		if candidate.Name == op.Name || (candidate.Status.IsTerminal() && !hasOutstandingMedia(&candidate)) || !isHostOperation(candidate.Spec.OperationKind) {
 			continue
 		}
 
-		if !operationBefore(&candidate, op) {
+		if !operationBefore(&candidate, op) && !hasOutstandingMedia(&candidate) {
 			continue
 		}
 
@@ -946,8 +967,12 @@ func (r *Reconciler) operationConflictKeys(ctx context.Context, op *v1alpha3.Mac
 
 	if len(op.Status.Targets) > 0 {
 		for _, target := range op.Status.Targets {
-			if isTerminalTarget(target) {
+			if isTerminalTarget(target) && !outstandingMedia(target) {
 				continue
+			}
+
+			if outstandingMedia(target) {
+				addMachineConflictKeys(keys, mediaMachine(target))
 			}
 
 			if err := r.addTargetConflictKeys(ctx, keys, target.MachineRef); err != nil {
@@ -1064,7 +1089,7 @@ func (r *Reconciler) reconcileTerminal(ctx context.Context, op *v1alpha3.Machine
 func (r *Reconciler) updateOperationStatus(ctx context.Context, name string, mutate func(*v1alpha3.MachineOperation)) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest v1alpha3.MachineOperation
-		if err := r.Get(ctx, client.ObjectKey{Name: name}, &latest); err != nil {
+		if err := r.reader().Get(ctx, client.ObjectKey{Name: name}, &latest); err != nil {
 			return err
 		}
 
