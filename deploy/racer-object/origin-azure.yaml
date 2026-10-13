@@ -42,7 +42,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - origin
-            - --cache=racer-object
+            - --volume=racer-object
             # Match the sidecar; change this when changing account or provider.
             - --namespace=example-azure-store
             # For Azure, --bucket is a container allowlist.

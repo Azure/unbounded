@@ -135,7 +135,7 @@ not a PVC or durable storage. Wait for the controller and dataplane to be ready
 using the Racer guide's checks before starting consumers. For an existing
 ClusterCache deployment, follow the [breaking-change upgrade steps]({{< relref "guides/racer" >}}#upgrade-from-clustercache).
 
-Choose **one** origin manifest for each cache: `origin.yaml` for S3 or
+Choose **one** origin manifest for each volume: `origin.yaml` for S3 or
 `origin-azure.yaml` for Azure Blob. They update the same DaemonSet; do not apply
 both. When switching providers, also change the namespace on origin and sidecar.
 

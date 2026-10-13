@@ -24,7 +24,7 @@ func TestAzureOriginExample(t *testing.T) {
 
 	origin := pod.Containers[0]
 	require.Equal(t, []string{
-		"origin", "--cache=racer-object", "--namespace=example-azure-store", "--bucket=example-container",
+		"origin", "--volume=racer-object", "--namespace=example-azure-store", "--bucket=example-container",
 		"--provider=azure", "--account-url=https://ACCOUNT.blob.core.windows.net", "--azure-credential=default",
 		"--metadata-ttl=30s", "--request-timeout=1m",
 	}, origin.Args)

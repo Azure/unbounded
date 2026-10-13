@@ -95,6 +95,24 @@ func TestProviderFlagConflicts(t *testing.T) {
 	}
 }
 
+func TestAzureVolumeOptions(t *testing.T) {
+	for _, args := range [][]string{
+		{"origin", "--namespace=store", "--provider=azure", "--account-url=https://account.blob.core.windows.net"},
+		{"sidecar", "--namespace=store", "--api=azure"},
+	} {
+		t.Run(args[0], func(t *testing.T) {
+			o, err := parseOptions(append(args, "--volume=azure-test"), io.Discard)
+			if err != nil || o.volume != "azure-test" {
+				t.Fatalf("Azure volume: %+v, %v", o, err)
+			}
+
+			if _, err := parseOptions(append(args, "--cache=azure-test"), io.Discard); err == nil {
+				t.Fatal("accepted legacy cache flag")
+			}
+		})
+	}
+}
+
 func TestAzureAccountURLValidation(t *testing.T) {
 	for _, value := range []string{
 		"https://account.blob.core.windows.net", "https://account/", "https://account:443",
@@ -283,7 +301,7 @@ func TestCreateOriginS3Selection(t *testing.T) {
 }
 
 func TestCreateSidecarAPISelection(t *testing.T) {
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "test"})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}

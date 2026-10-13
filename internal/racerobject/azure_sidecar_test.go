@@ -253,7 +253,7 @@ func assertAzureSidecarError(t *testing.T, w *httptest.ResponseRecorder, method 
 }
 
 func TestAzureSidecarExactIdentity(t *testing.T) {
-	for _, key := range []string{"a//b/../c", "/leading", "./relative", "a%2Fb", "a+b c", "雪/☃", "trailing/", "a?b#c", "a\x7fb"} {
+	for _, key := range []string{"a//b/../c", "/leading", "./relative", "a%2Fb", "a+b c", "雪/☃", "trailing/", "a?b#c"} {
 		t.Run(key, func(t *testing.T) {
 			want, err := NewRequest("test", "bucket", key, "version+/%")
 			if err != nil {
@@ -274,6 +274,18 @@ func TestAzureSidecarExactIdentity(t *testing.T) {
 				t.Fatalf("response = %d %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestAzureSidecarRejectsDELMetadata(t *testing.T) {
+	// Schema 1 JSON leaves DEL unescaped; the SDK rejects it in wire metadata.
+	h := azureSidecarTestHandler(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		t.Error("invalid metadata reached origin")
+		return racersdk.Metadata{}, nil, racersdk.ErrInvalidRequest
+	})
+	for _, method := range []string{"GET", "HEAD"} {
+		w := sidecarTestRequest(h, method, "/bucket/a%7Fb", nil)
+		assertAzureSidecarError(t, w, method, http.StatusBadRequest, "InvalidInput")
 	}
 }
 

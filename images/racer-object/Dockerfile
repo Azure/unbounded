@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.8-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.9-trixie AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

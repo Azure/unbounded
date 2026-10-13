@@ -7,13 +7,13 @@ request limits, and security requirements.
 
 ## Azure Blob
 
-Use the current `--cache` flags for this draft:
+Use the same `--volume` on the origin and sidecar:
 
 ```sh
-racer-object origin --cache=racer-object --namespace=example-azure-store \
+racer-object origin --volume=racer-object --namespace=example-azure-store \
   --provider=azure --account-url=https://ACCOUNT.blob.core.windows.net \
   --azure-credential=default --bucket=example-container
-racer-object sidecar --cache=racer-object --namespace=example-azure-store \
+racer-object sidecar --volume=racer-object --namespace=example-azure-store \
   --api=azure --bucket=example-container --listen=127.0.0.1:8080
 ```
 
