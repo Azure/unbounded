@@ -34,6 +34,8 @@ pub struct PipePool<P: Policy> {
     waiting: Waiters,
 
     idle: Rc<RefCell<Vec<PipeResources<P>>>>,
+
+    _stop_observer: Rc<dyn Fn()>,
 }
 
 /// Shared local queue whose head alone attempts scheduled admission.
@@ -141,13 +143,39 @@ impl<P: Policy> PipePool<P> {
         waiter_class: P::Class,
         waiter_limit: usize,
     ) -> Self {
+        let waiting = Waiters::default();
+        let idle = Rc::new(RefCell::new(Vec::<PipeResources<P>>::new()));
+        let stop_observer: Rc<dyn Fn()> = {
+            let waiting = waiting.clone();
+            let idle = idle.clone();
+            Rc::new(move || {
+                let retired = if P::allows_stopped(pipe_class) {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut *idle.borrow_mut())
+                };
+                // Consume all registrations before any destructor or wake can
+                // reenter. Keep futures and their context charges caller-owned.
+                let wakes: Vec<_> = waiting
+                    .borrow()
+                    .iter()
+                    .filter_map(|entry| entry.borrow_mut().take())
+                    .collect();
+                drop(retired);
+                for wake in wakes {
+                    wake.wake();
+                }
+            })
+        };
+        quotas.observe_stop(&stop_observer);
         Self {
             quotas,
             pipe_class,
             waiter_class,
             waiter_limit,
-            waiting: Rc::default(),
-            idle: Rc::default(),
+            waiting,
+            idle,
+            _stop_observer: stop_observer,
         }
     }
 
@@ -185,7 +213,8 @@ impl<P: Policy> PipePool<P> {
     /// only after queue capacity and its byte charge are secured, never on the
     /// immediate path. Its returned closure registers cancellation notification
     /// with each poll's waker and owns the registration until this wait ends.
-    /// The caller must arrange polls for deadlines, quota stop, or charges held
+    /// Local quota stop wakes all queued acquisitions after retiring forbidden
+    /// idle pipes. The caller must arrange polls for deadlines or charges held
     /// outside this pool; pipe returns and queue removal wake the FIFO head.
     /// No timer, polling loop, or self-wake is created here.
     pub async fn acquire_wait<E, Check, Subscribe, Register>(
@@ -234,6 +263,9 @@ impl<P: Policy> PipePool<P> {
             let wake = cx.waker().clone();
             let old = waiting.entry.borrow_mut().replace(wake);
             drop(old);
+            // Clone/drop callbacks may stop after the first check, including
+            // before this entry publishes its notification. Never miss that stop.
+            self.check_running()?;
             if self
                 .waiting
                 .borrow()
@@ -1599,6 +1631,7 @@ mod tests {
         assert!(admitted_wait.as_mut().poll(&mut cx).is_pending());
         drop(first);
         quotas.stop();
+        assert_eq!(pool.idle_count(), 1, "allowed idle pipes remain reusable");
         // Existing admitted waiter context may finish; its pipe class allows stop.
         let Poll::Ready(Ok(first)) = admitted_wait.as_mut().poll(&mut cx) else {
             panic!("allowed pipe class must remain available after stop");
@@ -1665,6 +1698,8 @@ mod tests {
             assert_eq!(pool.idle_count(), 2);
             assert_eq!(quotas.used(ResourceClass::Pipe), 3);
             quotas.stop();
+            assert_eq!(pool.idle_count(), 0, "stop must eagerly retire idle pipes");
+            assert_eq!(quotas.used(ResourceClass::Pipe), 1);
             match path {
                 0 => assert!(matches!(pool.acquire(), Err(Error::Unavailable))),
                 1 => assert!(matches!(
@@ -1724,7 +1759,6 @@ mod tests {
         let first = pool.acquire().unwrap();
         let second = pool.acquire().unwrap();
         drop((first, second));
-        quotas.stop();
         let called = Rc::new(std::cell::Cell::new(false));
         let callback_called = called.clone();
         let callback_pool = pool.clone();
@@ -1733,13 +1767,193 @@ mod tests {
             assert_eq!(event, "wake");
             assert_eq!(callback_pool.idle_count(), 0);
             assert!(matches!(callback_pool.acquire(), Err(Error::Unavailable)));
+            callback_pool.quotas().stop();
             callback_called.set(true);
         });
+        quotas.stop();
         assert!(matches!(pool.acquire(), Err(Error::Unavailable)));
         waker_callbacks::clear();
         assert!(called.get());
         assert_eq!(quotas.used(ResourceClass::Pipe), 0);
         assert_eq!(pool.idle_count(), 0);
+    }
+
+    /// Stop reaches every pool and queued entry without waiting for active leases.
+    #[test]
+    fn stop_wakes_all_pool_queues_after_idle_retirement() {
+        let quotas = admission(2);
+        let first_pool = new_pool(quotas.clone());
+        let second_pool = new_pool(quotas.clone());
+        let held = first_pool.acquire().unwrap();
+        let idle = second_pool.acquire().unwrap();
+        let counters: Vec<_> = (0..4).map(|_| Arc::new(WakeCounter::default())).collect();
+        let wakers: Vec<_> = counters.iter().cloned().map(Waker::from).collect();
+        let mut waits = [
+            acquire_wait(&first_pool),
+            acquire_wait(&first_pool),
+            acquire_wait(&second_pool),
+            acquire_wait(&second_pool),
+        ];
+        for (wait, waker) in waits.iter_mut().zip(&wakers) {
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(waker))
+                    .is_pending()
+            );
+        }
+        drop(idle);
+        // The follower stays queued even though the head can now reuse an idle pipe.
+        assert!(
+            waits[3]
+                .as_mut()
+                .poll(&mut Context::from_waker(&wakers[3]))
+                .is_pending()
+        );
+        let before: Vec<_> = counters.iter().map(|counter| counter.count()).collect();
+        quotas.stop();
+        assert_eq!(quotas.used(ResourceClass::Pipe), 1);
+        assert_eq!(second_pool.idle_count(), 0);
+        assert_eq!(counters[0].count(), before[0] + 1);
+        assert_eq!(counters[1].count(), before[1] + 1);
+        // The second pool head already has a return notification; its follower
+        // must be notified directly rather than depending on that head to poll.
+        assert_eq!(counters[3].count(), before[3] + 1);
+        assert_eq!(
+            quotas.used(ResourceClass::RequestContext),
+            4 * first_pool.waiter_bytes()
+        );
+        for (wait, waker) in waits.iter_mut().zip(&wakers) {
+            assert!(matches!(
+                wait.as_mut().poll(&mut Context::from_waker(waker)),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+        }
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        drop(held);
+        assert_eq!(quotas.used(ResourceClass::Pipe), 0);
+        quotas.stop();
+    }
+
+    /// Stop from a waker clone cannot leave a non-head acquisition asleep.
+    #[test]
+    fn stop_during_queue_waker_clone_is_observed_before_pending() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        let _held = pool.acquire().unwrap();
+        let mut first = acquire_wait(&pool);
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let mut second = acquire_wait(&pool);
+        let wake = waker_callbacks::waker();
+        waker_callbacks::on_callback(move |event| {
+            assert_eq!(event, "clone");
+            quotas.stop();
+        });
+        assert!(matches!(
+            second.as_mut().poll(&mut Context::from_waker(&wake)),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        waker_callbacks::clear();
+    }
+
+    /// Notifications see retired charges and can reenter without any pool borrow.
+    #[test]
+    fn stop_queue_wake_reenters_after_retirement() {
+        let quotas = admission(1);
+        let pool = Rc::new(new_pool(quotas.clone()));
+        let held = pool.acquire().unwrap();
+        let mut first = acquire_wait(&pool);
+        let mut second = acquire_wait(&pool);
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let wake = waker_callbacks::waker();
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        drop(held);
+        let called = Rc::new(std::cell::Cell::new(false));
+        let callback_called = called.clone();
+        let callback_pool = pool.clone();
+        waker_callbacks::on_callback(move |event| {
+            assert_eq!(event, "wake");
+            assert_eq!(callback_pool.idle_count(), 0);
+            assert_eq!(callback_pool.quotas().used(ResourceClass::Pipe), 0);
+            assert_eq!(callback_pool.waiting.borrow_mut().len(), 2);
+            assert!(matches!(callback_pool.acquire(), Err(Error::Unavailable)));
+            callback_pool.quotas().stop();
+            callback_called.set(true);
+        });
+        quotas.stop();
+        waker_callbacks::clear();
+        assert!(called.get());
+    }
+
+    /// An admitted waiter for an allowed class may stay pending and later succeed.
+    #[test]
+    fn stop_notification_preserves_allowed_queued_acquisition() {
+        let quotas = admission(1);
+        let pool = PipePool::new(
+            quotas.clone(),
+            ResourceClass::StopPipe,
+            ResourceClass::RequestContext,
+            8,
+        );
+        let held = pool.acquire().unwrap();
+        let mut wait = acquire_wait(&pool);
+        let counter = Arc::new(WakeCounter::default());
+        let wake = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&wake);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        quotas.stop();
+        assert_eq!(counter.count(), 1);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            quotas.used(ResourceClass::RequestContext),
+            pool.waiter_bytes()
+        );
+        drop(held);
+        assert_eq!(counter.count(), 2);
+        let Poll::Ready(Ok(lease)) = wait.as_mut().poll(&mut cx) else {
+            panic!("allowed waiter must still acquire after stop");
+        };
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        drop(lease);
+        assert_eq!(pool.idle_count(), 1);
+        quotas.stop();
+        assert_eq!(pool.idle_count(), 1);
+    }
+
+    /// The weak registry neither retains pools nor creates a quota ownership cycle.
+    #[test]
+    fn stop_observers_do_not_retain_dropped_pools() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        drop(pool.acquire().unwrap());
+        let idle = Rc::downgrade(&pool.idle);
+        let observer = Rc::downgrade(&pool._stop_observer);
+        drop(pool);
+        assert!(idle.upgrade().is_none());
+        assert!(observer.upgrade().is_none());
+        assert_eq!(quotas.used(ResourceClass::Pipe), 0);
+        let pool = new_pool(quotas.clone());
+        assert_eq!(quotas.stop_observers.borrow().len(), 1);
+        quotas.stop();
+        assert!(quotas.stop_observers.borrow().is_empty());
+        assert!(matches!(pool.acquire(), Err(Error::Unavailable)));
+        let weak = Rc::downgrade(&quotas);
+        drop((pool, quotas));
+        assert!(weak.upgrade().is_none());
     }
 
     /// A lease outliving its pool continues to hold capacity until drop.

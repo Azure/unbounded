@@ -245,6 +245,8 @@ pub struct Quotas<P: Policy> {
 
     buffers: Arc<Buffers<P>>,
 
+    stop_observers: RefCell<Vec<std::rc::Weak<dyn Fn()>>>,
+
     local: PhantomData<Rc<()>>,
 }
 
@@ -276,6 +278,8 @@ impl<P: Policy> page_alloc::Charge for Charge<P> {
 /// It is Send + Sync when the policy is Send + Sync.
 /// Idle buffers still count toward its limits. Only the local [`Quotas`] authority
 /// reclaims them, explicitly or under local admission pressure.
+/// Stop is published by [`Quotas::stop`] on its owning worker. Shared handles
+/// observe that atomic state but cannot invoke worker-local cleanup or stop.
 pub struct SharedQuotas<P: Policy> {
     policy: P,
 
@@ -519,6 +523,7 @@ impl<P: Policy> Quotas<P> {
             retired_keys: Arc::new(Mutex::new(VecDeque::new())),
             stopped: Arc::new(AtomicBool::new(false)),
             buffers: Arc::new(Mutex::new(Vec::new())),
+            stop_observers: RefCell::default(),
             local: PhantomData,
         }
     }
@@ -560,15 +565,35 @@ impl<P: Policy> Quotas<P> {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// Stop ordinary admission, reclaim idle backing, and wake the shared waiter.
+    /// Stop ordinary admission, reclaim idle backing, and notify local pipe queues
+    /// and the shared waiter. Pipe classes allowed after stop retain idle pipes.
+    /// Active leases and queued futures keep their charges until released/polled.
     /// A racing ordinary reservation either rolls back or is visible to a later
     /// [`Self::used`] read until released, even if its call returns after stop.
     /// Zero usage is not a drain fence for completion reservations or classes
     /// allowed after stop; callers must separately finish those producers.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        let observers = std::mem::take(&mut *self.stop_observers.borrow_mut());
         self.reclaim_buffers();
+        for observer in observers {
+            if let Some(observer) = observer.upgrade() {
+                observer();
+            }
+        }
         self.totals.wake.wake();
+    }
+
+    /// Register local cleanup without retaining its owner or crossing threads.
+    /// Hooks run once, outside the registry borrow, and must not panic.
+    fn observe_stop(&self, observer: &Rc<dyn Fn()>) {
+        if self.is_stopped() {
+            observer();
+        } else {
+            let mut observers = self.stop_observers.borrow_mut();
+            observers.retain(|observer| observer.strong_count() != 0);
+            observers.push(Rc::downgrade(observer));
+        }
     }
 
     /// A keyed fair-share deficit must be reclaimed from that key. Global
