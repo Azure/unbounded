@@ -140,12 +140,15 @@ func TestWatchWaitForHistory(t *testing.T) {
 
 			created(t, s, ctx, "b", "node-b")
 			got := waitingWatchResult(t, result)
-			require.NoError(t, got.err)
 
 			if !exact {
-				event(t, got.watch, watch.Added, "a", "1")
+				// The informer skipped RV 2, so replay would resend "a".
+				require.True(t, apierrors.IsResourceExpired(got.err), "%v", got.err)
+
+				return
 			}
 
+			require.NoError(t, got.err)
 			event(t, got.watch, watch.Added, "b", "3")
 			require.Empty(t, got.watch.ResultChan())
 		})
@@ -170,12 +173,16 @@ func TestWatchHistoryBounds(t *testing.T) {
 	}}
 	s.observe(cm, false)
 
-	for _, rv := range []string{"10", "15", "20"} {
+	for _, rv := range []string{"10", "20"} {
 		w, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: rv})
 		require.NoError(t, err)
 		require.Empty(t, w.ResultChan())
 		w.Stop()
 	}
+
+	// RV 15 falls between observed snapshots, so it cannot be resumed.
+	_, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "15"})
+	require.True(t, apierrors.IsResourceExpired(err), "%v", err)
 }
 
 func TestWatchBetweenSnapshots(t *testing.T) {
@@ -184,14 +191,10 @@ func TestWatchBetweenSnapshots(t *testing.T) {
 	require.NoError(t, err)
 	created(t, s, ctx, "b", "node-b")
 
-	w, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "2"})
-	require.NoError(t, err)
-
-	defer w.Stop()
-
-	event(t, w, watch.Added, "a", "1")
-	event(t, w, watch.Added, "b", "3")
-	require.Empty(t, w.ResultChan())
+	// The informer never observed RV 2. Replaying from RV 1 would resend "a",
+	// which a client that listed at RV 2 already has.
+	_, err = s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "2"})
+	require.True(t, apierrors.IsResourceExpired(err), "%v", err)
 }
 
 func TestWatchHistoryTimeout(t *testing.T) {

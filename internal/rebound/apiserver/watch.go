@@ -163,12 +163,12 @@ func (s *storage) watchHistoryIndex(ctx context.Context, rv string) (int, error)
 		}
 
 		if newest >= requested {
-			// History contains every informer observation. Revision gaps can include
-			// unrelated writes or coalesced updates; replay from the floor so the
-			// next observed transition is not skipped.
+			// Resume only from a snapshot the informer observed. If it skipped the
+			// requested revision, replaying from an older snapshot would resend
+			// changes the client already has, so the client must relist.
 			for i := len(s.history) - 1; i >= 0; i-- {
 				version, err := strconv.ParseUint(s.history[i].rv, 10, 64)
-				if err == nil && version <= requested {
+				if err == nil && version == requested {
 					return i, nil
 				}
 			}
