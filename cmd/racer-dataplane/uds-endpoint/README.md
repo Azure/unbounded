@@ -137,6 +137,26 @@ cleanup-name bookkeeping must not unwind after filesystem mutation; bookkeeping
 must not allocate or invoke user code. It is not an alternative public mechanism
 for arbitrary changes to a bound socket's cleanup name.
 
+## Simulation limits
+
+`simulation::BoundSocket::bind(sim, directory, layout, temporary)` uses the same
+`Layout` checks for temporary and derived witness names as the host adapter.
+Publication requires the configured canonical name. To create a canonical socket
+in a fixture, bind a temporary name and publish it. Completed publication returns
+`PublicationCompleted`; journal reservation failure reports `OutOfMemory`.
+
+The adapter tests inode-checked cleanup, retained directory identity, mode changes,
+and the shared publication journal. Bind returns with mode 0600. The runtime
+combines bind and listen, so this does not test the host's chmod-before-listen
+ordering. `set_mode` checks the current named inode; it does not retain a separate
+socket inode pin as the host does.
+
+There is no simulated `EndpointOwner`, flock, hard-link witness, or startup
+recovery. The adapter does not check directory/lock ownership or permissions,
+model UID/GID or ACL enforcement, or prove crash recovery. Directory creation and
+socket addresses follow the runtime model, not the host's descriptor-relative
+path walk and Unix address limits. Use host tests for those guarantees.
+
 ## Validation
 
 Run from `cmd/racer-dataplane`. No privileged test setup is needed. Integration
