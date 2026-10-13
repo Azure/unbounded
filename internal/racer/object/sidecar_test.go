@@ -1175,6 +1175,74 @@ func TestSidecarEmptyStreamClosedBeforeCompletion(t *testing.T) {
 	}
 }
 
+type sidecarDeadlineWriter struct {
+	*httptest.ResponseRecorder
+	deadline time.Time
+	changes  int
+	statuses []int
+}
+
+func (w *sidecarDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	w.changes++
+
+	return nil
+}
+
+func (w *sidecarDeadlineWriter) WriteHeader(status int) {
+	w.statuses = append(w.statuses, status)
+	w.ResponseRecorder.WriteHeader(status)
+}
+
+func TestSidecarEmptyStreamPreservesHTTPDeadline(t *testing.T) {
+	for _, outcome := range []string{"complete", "closed", "canceled"} {
+		t.Run(outcome, func(t *testing.T) {
+			_, client := sidecarTestHandler(t, sidecarTestOrigin(t, "", `"empty"`, nil))
+
+			request, err := NewRequest("test", "bucket", "key", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			m := sidecarTestMetadata(t, 0, `"empty"`)
+
+			v, err := client.Get(ctx, request, racersdk.ReadOptions{ETag: m.ETag})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer v.Close()
+
+			switch outcome {
+			case "closed":
+				if err := v.Close(); err != nil {
+					t.Fatal(err)
+				}
+			case "canceled":
+				cancel()
+			}
+
+			deadline := time.Now().Add(time.Minute)
+			w := &sidecarDeadlineWriter{ResponseRecorder: httptest.NewRecorder(), deadline: deadline}
+
+			failure := (sidecarRead{metadata: m}).writeBody(w, v)
+			if w.changes != 0 || !w.deadline.Equal(deadline) {
+				t.Fatalf("empty validation changed HTTP deadline: changes=%d deadline=%v", w.changes, w.deadline)
+			}
+
+			if outcome == "complete" {
+				if failure != 0 || len(w.statuses) != 1 || w.statuses[0] != 200 || w.Header().Get("Content-Length") != "0" || w.Header().Get("ETag") != m.ETag || w.Body.Len() != 0 {
+					t.Fatalf("empty success: failure=%d statuses=%v headers=%v body=%q", failure, w.statuses, w.Header(), w.Body.String())
+				}
+			} else if failure != 503 || len(w.statuses) != 0 || len(w.Header()) != 0 || w.Body.Len() != 0 {
+				t.Fatalf("empty failure committed response: failure=%d statuses=%v headers=%v body=%q", failure, w.statuses, w.Header(), w.Body.String())
+			}
+		})
+	}
+}
+
 func TestSidecarRangeClampsHugeNumbers(t *testing.T) {
 	const huge = "18446744073709551615"
 

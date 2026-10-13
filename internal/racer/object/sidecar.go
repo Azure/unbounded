@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -138,7 +139,7 @@ func (s *sidecar) stream(w http.ResponseWriter, r *http.Request, request racersd
 func (read sidecarRead) writeBody(w http.ResponseWriter, v *racersdk.Object) sidecarFailure {
 	// Empty success is not committed until the SDK has validated Complete.
 	if read.length == 0 {
-		if _, err := v.WriteTo(w); err != nil {
+		if _, err := v.WriteTo(io.Discard); err != nil {
 			return sidecarSDKFailure(err)
 		}
 	}
