@@ -24,7 +24,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/logging"
 	"golang.org/x/sys/unix"
 
@@ -311,12 +310,10 @@ func runOrigin(ctx context.Context, o options) error {
 		defer httpClient.CloseIdleConnections()
 	}
 
-	client := s3.NewFromConfig(cfg, func(s *s3.Options) {
-		s.UsePathStyle = o.pathStyle
-		if o.endpoint != "" {
-			s.BaseEndpoint = aws.String(o.endpoint)
-		}
-	})
+	client, err := newOriginS3Client(cfg, o)
+	if err != nil {
+		return err
+	}
 
 	origin, err := object.NewOrigin(client, object.OriginConfig{
 		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,
