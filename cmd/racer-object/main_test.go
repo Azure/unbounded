@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 
 	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/internal/version"
@@ -275,7 +276,7 @@ func TestAWSRegionAndCredentialChain(t *testing.T) {
 		t.Fatalf("explicit region: %v", err)
 	}
 
-	if cfg.HTTPClient.(*http.Client).Timeout != time.Second {
+	if cfg.HTTPClient.(*awshttp.BuildableClient).GetTimeout() != time.Second {
 		t.Fatal("upstream HTTP timeout missing")
 	}
 

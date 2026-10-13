@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/smithy-go/logging"
 	"golang.org/x/sys/unix"
@@ -267,18 +268,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 }
 
 func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
-	defaults, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return aws.Config{}, errors.New("could not configure origin HTTP transport")
-	}
-
-	transport := defaults.Clone()
-	// Keep room for the SDK's four separate metadata requests too.
-	transport.MaxIdleConnsPerHost = originMaxConcurrentRequests + 4
-	transport.MaxIdleConns = max(transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+	httpClient := awshttp.NewBuildableClient().WithTimeout(o.requestTimeout).
+		WithTransportOptions(func(transport *http.Transport) {
+			// Keep room for the SDK's four separate metadata requests too.
+			transport.MaxIdleConnsPerHost = originMaxConcurrentRequests + 4
+			transport.MaxIdleConns = max(transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+		})
 
 	load := []func(*config.LoadOptions) error{
-		config.WithHTTPClient(&http.Client{Transport: transport, Timeout: o.requestTimeout}),
+		config.WithHTTPClient(httpClient),
 		config.WithLogger(logging.NewStandardLogger(io.Discard)),
 		// S3-compatible backends may reject the SDK's default optional checksums.
 		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
@@ -306,14 +304,11 @@ func runOrigin(ctx context.Context, o options) error {
 		return err
 	}
 
-	if httpClient, ok := cfg.HTTPClient.(*http.Client); ok {
-		defer httpClient.CloseIdleConnections()
-	}
-
 	client, err := newOriginS3Client(cfg, o)
 	if err != nil {
 		return err
 	}
+	defer closeResource(client)
 
 	origin, err := object.NewOrigin(client, object.OriginConfig{
 		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,

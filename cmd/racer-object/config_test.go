@@ -122,3 +122,26 @@ func TestOriginEndpointOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestOriginServiceEndpointPrecedence(t *testing.T) {
+	isolateOriginAWSConfig(t)
+	t.Setenv("AWS_ENDPOINT_URL", "https://private-user:private-password@s3.example/private-path")
+	t.Setenv("AWS_ENDPOINT_URL_S3", "https://service.example")
+
+	o := options{region: "us-east-1", requestTimeout: time.Minute}
+
+	cfg, err := originAWSConfig(t.Context(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := newOriginS3Client(cfg, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeResource(client)
+
+	if got := aws.ToString(client.Options().BaseEndpoint); got != "https://service.example" {
+		t.Fatalf("endpoint = %q, want service environment override", got)
+	}
+}
