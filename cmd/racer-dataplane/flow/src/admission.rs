@@ -439,7 +439,8 @@ mod circuit {
         /// Release exclusivity without erasing the probe's timeout.
         fn drop(&mut self) {
             if let Some(key) = &self.key {
-                self.health.probes.borrow_mut().remove(key);
+                let removed = self.health.probes.borrow_mut().take(key);
+                drop(removed);
             }
         }
     }
@@ -480,7 +481,8 @@ mod circuit {
 
         /// Remove failure state without releasing any owned probe.
         pub fn success(&self, key: &K) {
-            self.states.borrow_mut().remove(key);
+            let removed = self.states.borrow_mut().remove_entry(key);
+            drop(removed);
         }
 
         /// Record a caller-classified failure using caller-selected retry jitter.
@@ -493,16 +495,22 @@ mod circuit {
             now: Instant,
             backoff: impl FnOnce(&K, u32) -> Duration,
         ) -> Result<()> {
+            // Keep unused keys outside the borrow, including on errors and unwind.
+            let indexed = key.clone();
             let mut states = self.states.borrow_mut();
             if !states.contains_key(key) && states.len() >= self.capacity {
                 return Err(Error::Overloaded);
             }
-            let state = states.entry(key.clone()).or_insert(Circuit {
-                failures: 0,
-                retry_at: Deadline::At(now),
-                probe_until: None,
-                pending_backoff: None,
-            });
+            let state = if let Some(state) = states.get_mut(key) {
+                state
+            } else {
+                states.entry(indexed).or_insert(Circuit {
+                    failures: 0,
+                    retry_at: Deadline::At(now),
+                    probe_until: None,
+                    pending_backoff: None,
+                })
+            };
             state.failures = state.failures.saturating_add(1);
             let failures = state.failures;
             let pending = Rc::new(());
@@ -554,7 +562,12 @@ mod circuit {
 
         /// Forget excluded failure records without releasing owned probes.
         pub fn retain(&self, keys: &[K]) {
-            self.states.borrow_mut().retain(|key, _| keys.contains(key));
+            // Declare removed keys first so even a comparison panic releases the borrow.
+            let mut removed = Vec::new();
+            let mut states = self.states.borrow_mut();
+            removed.extend(states.extract_if(.., |key, _| !keys.contains(key)));
+            drop(states);
+            drop(removed);
         }
 
         /// Count retained failure records, not active probes.
@@ -572,6 +585,196 @@ mod circuit {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::{
+            cell::Cell,
+            cmp::Ordering,
+            panic::{AssertUnwindSafe, catch_unwind},
+        };
+
+        type DropCallback = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+        #[derive(Clone)]
+        struct ReentrantKey {
+            id: u8,
+
+            on_drop: DropCallback,
+
+            panic_eq: Rc<Cell<bool>>,
+        }
+
+        impl ReentrantKey {
+            fn new(id: u8) -> Self {
+                Self {
+                    id,
+                    on_drop: Rc::new(RefCell::new(None)),
+                    panic_eq: Rc::new(Cell::new(false)),
+                }
+            }
+
+            fn on_drop(&self, callback: impl FnOnce() + 'static) {
+                *self.on_drop.borrow_mut() = Some(Box::new(callback));
+            }
+        }
+
+        impl PartialEq for ReentrantKey {
+            fn eq(&self, other: &Self) -> bool {
+                assert!(!other.panic_eq.get(), "key comparison failed");
+                self.id == other.id
+            }
+        }
+
+        impl Eq for ReentrantKey {}
+
+        impl PartialOrd for ReentrantKey {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for ReentrantKey {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.id.cmp(&other.id)
+            }
+        }
+
+        impl Drop for ReentrantKey {
+            fn drop(&mut self) {
+                let callback = self.on_drop.borrow_mut().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+        }
+
+        #[test]
+        fn probe_key_drop_reenters_after_release_on_success_error_and_unwind() {
+            for exit in [0, 1, 2] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::ZERO));
+                let key = ReentrantKey::new(7);
+                health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                let drops = Rc::new(Cell::new(0));
+                let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+                    let _probe = health.acquire(&key, now)?;
+                    let owner = health.clone();
+                    let lookup = key.clone();
+                    let observed = drops.clone();
+                    key.on_drop(move || {
+                        assert!(owner.available(&lookup, now));
+                        drop(owner.acquire(&lookup, now).unwrap());
+                        observed.set(observed.get() + 1);
+                    });
+                    match exit {
+                        0 => Ok(()),
+                        1 => Err(Error::Unavailable),
+                        _ => panic!("operation failed"),
+                    }
+                }));
+                match exit {
+                    0 => assert_eq!(result.unwrap(), Ok(())),
+                    1 => assert_eq!(result.unwrap(), Err(Error::Unavailable)),
+                    _ => assert!(result.is_err()),
+                }
+                assert_eq!(drops.get(), 1);
+                assert!(health.available(&key, now));
+            }
+        }
+
+        #[test]
+        fn removed_failure_keys_reenter_without_releasing_owned_probe() {
+            for retain in [false, true] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::ZERO));
+                let key = ReentrantKey::new(7);
+                health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                let probe = health.acquire(&key, now).unwrap();
+                let owner = health.clone();
+                let lookup = key.clone();
+                let drops = Rc::new(Cell::new(0));
+                let observed = drops.clone();
+                key.on_drop(move || {
+                    assert!(owner.is_empty());
+                    assert!(!owner.available(&lookup, now));
+                    owner.failure(&lookup, now, |_, _| Duration::ZERO).unwrap();
+                    observed.set(observed.get() + 1);
+                });
+                if retain {
+                    health.retain(&[]);
+                } else {
+                    health.success(&key);
+                }
+                assert_eq!(drops.get(), 1);
+                assert_eq!(health.len(), 1);
+                assert!(!health.available(&key, now));
+                drop(probe);
+                assert!(health.available(&key, now));
+            }
+        }
+
+        #[test]
+        fn retain_comparison_unwind_drops_extracted_keys_after_borrow() {
+            let now = Instant::now();
+            let health = Rc::new(Circuits::new(2, Duration::ZERO));
+            let first = ReentrantKey::new(1);
+            let second = ReentrantKey::new(2);
+            for key in [&first, &second] {
+                health.failure(key, now, |_, _| Duration::ZERO).unwrap();
+            }
+            let owner = health.clone();
+            let drops = Rc::new(Cell::new(0));
+            let observed = drops.clone();
+            first.on_drop(move || {
+                assert_eq!(owner.len(), 1);
+                owner.retain(&[]);
+                observed.set(observed.get() + 1);
+            });
+            second.panic_eq.set(true);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                health.retain(&[ReentrantKey::new(3)]);
+            }));
+            second.panic_eq.set(false);
+            assert!(result.is_err());
+            assert_eq!(drops.get(), 1);
+            assert!(health.is_empty());
+        }
+
+        #[test]
+        fn failure_unused_key_drop_reenters_on_update_error_and_unwind() {
+            for exit in [0, 1, 2] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::ZERO));
+                let existing = ReentrantKey::new(1);
+                health
+                    .failure(&existing, now, |_, _| Duration::ZERO)
+                    .unwrap();
+                let key = if exit == 1 {
+                    ReentrantKey::new(2)
+                } else {
+                    existing.clone()
+                };
+                let owner = health.clone();
+                let drops = Rc::new(Cell::new(0));
+                let observed = drops.clone();
+                key.on_drop(move || {
+                    assert_eq!(owner.len(), 1);
+                    owner.retain(&[]);
+                    observed.set(observed.get() + 1);
+                });
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    health.failure(&key, now, |_, _| {
+                        assert_ne!(exit, 2, "backoff failed");
+                        Duration::ZERO
+                    })
+                }));
+                match exit {
+                    0 => assert_eq!(result.unwrap(), Ok(())),
+                    1 => assert_eq!(result.unwrap(), Err(Error::Overloaded)),
+                    _ => assert!(result.is_err()),
+                }
+                assert_eq!(drops.get(), 1);
+                assert!(health.is_empty());
+            }
+        }
 
         /// Oversized retry delays stay closed to probes until explicit success.
         #[test]
