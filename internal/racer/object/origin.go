@@ -294,13 +294,113 @@ func (o *objectOrigin) headMetadata(head *s3.HeadObjectOutput, object Object) (r
 
 	metadata := racersdk.Metadata{
 		Size: *head.ContentLength, ETag: tag,
-		ExpiresAt: time.Now().Add(o.ttl).Truncate(time.Millisecond), ContentType: aws.ToString(head.ContentType),
+		ExpiresAt: time.Now().Add(o.ttl).Truncate(time.Millisecond), ContentType: normalizeS3ContentType(aws.ToString(head.ContentType)),
 	}
 
 	return metadata, nil
 }
 
 var errInvalidS3Response = errors.New("racer-object: invalid S3 response")
+
+// normalizeS3ContentType follows racersdk/internal/wire.ValidateContentType.
+// Unsupported values become absent metadata so the sidecar can use its fallback.
+func normalizeS3ContentType(value string) string {
+	if len(value) > 256 || strings.TrimSpace(value) != value {
+		return ""
+	}
+
+	for i := range len(value) {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return ""
+		}
+	}
+
+	rest := value
+	token := func() string {
+		i := 0
+		for i < len(rest) && (rest[i] >= 'a' && rest[i] <= 'z' || rest[i] >= 'A' && rest[i] <= 'Z' ||
+			rest[i] >= '0' && rest[i] <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(rest[i]))) {
+			i++
+		}
+
+		part := rest[:i]
+		rest = rest[i:]
+
+		return part
+	}
+
+	consume := func(b byte) bool {
+		if len(rest) == 0 || rest[0] != b {
+			return false
+		}
+
+		rest = rest[1:]
+
+		return true
+	}
+	if token() == "" || !consume('/') || token() == "" {
+		return ""
+	}
+
+	var parameters []string
+
+	for rest != "" {
+		rest = strings.TrimLeft(rest, " ")
+
+		if !consume(';') {
+			return ""
+		}
+
+		rest = strings.TrimLeft(rest, " ")
+
+		name := token()
+		if name == "" {
+			return ""
+		}
+
+		for _, old := range parameters {
+			if strings.EqualFold(old, name) {
+				return ""
+			}
+		}
+
+		parameters = append(parameters, name)
+		rest = strings.TrimLeft(rest, " ")
+
+		if !consume('=') {
+			return ""
+		}
+
+		rest = strings.TrimLeft(rest, " ")
+
+		if consume('"') {
+			for {
+				if rest == "" {
+					return ""
+				}
+
+				b := rest[0]
+				rest = rest[1:]
+
+				if b == '"' {
+					break
+				}
+
+				if b == '\\' {
+					if rest == "" {
+						return ""
+					}
+
+					rest = rest[1:]
+				}
+			}
+		} else if token() == "" {
+			return ""
+		}
+	}
+
+	return value
+}
 
 func validS3ETag(tag string) bool {
 	if len(tag) < 2 || len(tag) > 8<<10 || tag[0] != '"' || tag[len(tag)-1] != '"' {
@@ -338,9 +438,10 @@ func validateObjectPage(output *s3.GetObjectOutput, head *s3.HeadObjectOutput, m
 		return racersdk.ErrVersionMismatch
 	}
 
+	// Compare raw content types so normalization cannot hide a HEAD/GET mismatch.
 	if output.Body == nil || output.ContentLength == nil || *output.ContentLength != int64(last-first+1) ||
 		aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", first, last, metadata.Size) ||
-		aws.ToString(output.ContentType) != metadata.ContentType || aws.ToString(output.VersionId) != aws.ToString(head.VersionId) ||
+		aws.ToString(output.ContentType) != aws.ToString(head.ContentType) || aws.ToString(output.VersionId) != aws.ToString(head.VersionId) ||
 		!strings.EqualFold(aws.ToString(output.ContentEncoding), aws.ToString(head.ContentEncoding)) || aws.ToBool(output.DeleteMarker) {
 		return errInvalidS3Response
 	}

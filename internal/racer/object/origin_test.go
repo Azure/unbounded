@@ -491,7 +491,15 @@ func TestOriginInvalidHeadMetadata(t *testing.T) {
 				version = "requested"
 			}
 
-			_, err := client.Stat(t.Context(), objectRequest(t, version))
+			metadata, err := client.Stat(t.Context(), objectRequest(t, version))
+			if mode == "type" {
+				if err != nil || metadata.ContentType != "" || metadata.Size != 5 {
+					t.Fatalf("unsupported content type was not omitted: %+v, %v", metadata, err)
+				}
+
+				return
+			}
+
 			originAssertError(t, err, errInvalidS3Response)
 		})
 	}
@@ -855,6 +863,149 @@ func TestOriginAWSClientBridge(t *testing.T) {
 	got, err := originReadValue(t, client, objectRequest(t, "v+/="))
 	if err != nil || string(got) != "hello" || heads.Load() != 1 || gets.Load() != 1 {
 		t.Fatalf("AWS bridge = %q, %v, calls %d/%d", got, err, heads.Load(), gets.Load())
+	}
+}
+
+func TestNormalizeS3ContentType(t *testing.T) {
+	for _, value := range []string{
+		"", "text/plain", "application/a+b; charset=utf-8",
+		`text/plain ; a = ""; b="escaped\"quote"`, `text/plain;a="a b"`,
+		"application/" + strings.Repeat("x", 244),
+		"a/!#$%&'*+-.^_`|~", `text/plain;name*=utf-8''file`,
+	} {
+		if got := normalizeS3ContentType(value); got != value {
+			t.Fatalf("normalized supported type %q to %q", value, got)
+		}
+	}
+
+	for _, value := range []string{
+		"application/" + strings.Repeat("x", 245), " text/plain", "text/plain ",
+		"text/\x7f", "text/\xff", "text/\tplain", "text/plain\x00", "bad\r\nheader",
+		"text", "/plain", "text/", "text/plain extra", "text/plain;", "text/plain;=x",
+		"text/plain;a", "text/plain;a=", "text/plain;a=x;A=y", "text/plain;a=x;a=x",
+		`text/plain;a="`, `text/plain;a="x\`,
+	} {
+		if got := normalizeS3ContentType(value); got != "" {
+			t.Fatalf("unsupported type %q survived as %q", value, got)
+		}
+	}
+}
+
+func TestOriginAWSClientContentType(t *testing.T) {
+	boundary := "application/" + strings.Repeat("x", 244)
+	for _, tc := range []struct {
+		name, head, get, want string
+		mismatch              bool
+	}{
+		{"absent", "", "", "", false},
+		{"supported", "text/plain", "text/plain", "text/plain", false},
+		{"parameters", `text/plain ; a = ""; b="escaped\"quote"`, `text/plain ; a = ""; b="escaped\"quote"`, `text/plain ; a = ""; b="escaped\"quote"`, false},
+		{"quoted-space", `text/plain;a="a b"`, `text/plain;a="a b"`, `text/plain;a="a b"`, false},
+		{"suffix", "application/a+b; charset=utf-8", "application/a+b; charset=utf-8", "application/a+b; charset=utf-8", false},
+		{"boundary", boundary, boundary, boundary, false},
+		{"too-long", boundary + "x", boundary + "x", "", false},
+		{"non-ascii", `text/plain;name="café"`, `text/plain;name="café"`, "", false},
+		{"tab", "text/plain;\tcharset=utf-8", "text/plain;\tcharset=utf-8", "", false},
+		{"missing-slash", "text", "text", "", false},
+		{"missing-type", "/plain", "/plain", "", false},
+		{"missing-subtype", "text/", "text/", "", false},
+		{"extra-token", "text/plain extra", "text/plain extra", "", false},
+		{"trailing-semicolon", "text/plain;", "text/plain;", "", false},
+		{"missing-name", "text/plain;=x", "text/plain;=x", "", false},
+		{"missing-equals", "text/plain;a", "text/plain;a", "", false},
+		{"missing-value", "text/plain;a=", "text/plain;a=", "", false},
+		{"duplicate-parameter", "text/plain;a=x;A=x", "text/plain;a=x;A=x", "", false},
+		{"unclosed-quote", `text/plain;a="`, `text/plain;a="`, "", false},
+		{"unfinished-escape", `text/plain;a="x\`, `text/plain;a="x\`, "", false},
+		{"supported-mismatch", "text/plain", "application/test", "text/plain", true},
+		{"unsupported-mismatch", "text", "other", "", true},
+		{"unsupported-to-absent", "text", "", "", true},
+		{"absent-to-unsupported", "", "text", "", true},
+		{"supported-to-unsupported", "text/plain", "text", "text/plain", true},
+		{"unsupported-to-supported", "text", "text/plain", "", true},
+	} {
+		for _, operation := range []string{"HEAD", "bootstrap", "pinned"} {
+			t.Run(tc.name+"/"+operation, func(t *testing.T) {
+				var heads, gets atomic.Int32
+
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("ETag", `"opaque-multipart-2"`)
+					w.Header().Set("Content-Length", "5")
+					w.Header().Set("Content-Type", tc.head)
+
+					switch r.Method {
+					case http.MethodHead:
+						heads.Add(1)
+
+						if operation == "pinned" && r.Header.Get("If-Match") != `"opaque-multipart-2"` {
+							t.Error("pinned HEAD omitted If-Match")
+						}
+					case http.MethodGet:
+						gets.Add(1)
+
+						if r.Header.Get("Range") != "bytes=0-4" || r.Header.Get("If-Match") != `"opaque-multipart-2"` {
+							t.Error("GET missing range/pin")
+						}
+
+						w.Header().Set("Content-Type", tc.get)
+						w.Header().Set("Content-Range", "bytes 0-4/5")
+						w.WriteHeader(http.StatusPartialContent)
+
+						if _, err := io.WriteString(w, "hello"); err != nil {
+							t.Error(err)
+						}
+					default:
+						t.Error("unexpected S3 method")
+						w.WriteHeader(http.StatusMethodNotAllowed)
+					}
+				}))
+				t.Cleanup(server.Close)
+				client := originClient(t, testS3Client(t, server), OriginConfig{Namespace: "store"})
+
+				request := objectRequest(t, "")
+				if operation == "HEAD" {
+					metadata, err := client.Stat(t.Context(), request)
+					if err != nil || metadata.ContentType != tc.want || metadata.Size != 5 || heads.Load() != 1 || gets.Load() != 0 {
+						t.Fatalf("HEAD metadata = %+v, error = %v, calls = %d/%d", metadata, err, heads.Load(), gets.Load())
+					}
+
+					return
+				}
+
+				options := racersdk.ReadOptions{}
+				if operation == "pinned" {
+					options.ETag = `"opaque-multipart-2"`
+				}
+
+				value, err := client.Get(t.Context(), request, options)
+
+				var got []byte
+
+				if err == nil {
+					defer value.Close()
+
+					if value.Metadata().ContentType != tc.want {
+						t.Fatalf("GET content type = %q, want %q", value.Metadata().ContentType, tc.want)
+					}
+
+					got, err = io.ReadAll(value)
+				}
+
+				if tc.mismatch {
+					originAssertError(t, err, errInvalidS3Response)
+
+					if len(got) != 0 {
+						t.Fatalf("mismatched content type exposed bytes: %q", got)
+					}
+				} else if err != nil || string(got) != "hello" {
+					t.Fatalf("GET = %q, error = %v", got, err)
+				}
+
+				if gets.Load() != 1 || heads.Load() == 0 {
+					t.Fatalf("unexpected S3 calls = %d/%d", heads.Load(), gets.Load())
+				}
+			})
+		}
 	}
 }
 
