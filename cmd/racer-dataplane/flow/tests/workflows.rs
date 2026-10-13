@@ -1091,7 +1091,7 @@ mod coalesce_tests {
         impl WaiterPolicy for Policy {
             type Error = u8;
 
-            fn check(&self) -> Option<u8> {
+            fn check(&self, _: Instant) -> Option<u8> {
                 None
             }
 
@@ -1149,7 +1149,7 @@ mod coalesce_tests {
     impl WaiterPolicy for DropProbe {
         type Error = u8;
 
-        fn check(&self) -> Option<u8> {
+        fn check(&self, _: Instant) -> Option<u8> {
             None
         }
 
@@ -1899,7 +1899,7 @@ mod coalesce_tests {
 
     impl Entry for OwnedEntry {
         /// This fixture has no caller policy to refresh.
-        fn refresh(&mut self, _: &mut Vec<Waker>) {}
+        fn refresh(&mut self, _: &mut flight::Txn) {}
 
         /// Require explicit completion of every retained operation.
         fn quiescent(&self) -> bool {
@@ -1915,7 +1915,7 @@ mod coalesce_tests {
     }
 
     impl Entry for DroppableEntry {
-        fn refresh(&mut self, _: &mut Vec<Waker>) {}
+        fn refresh(&mut self, _: &mut flight::Txn) {}
 
         fn quiescent(&self) -> bool {
             self.quiescent
@@ -1997,10 +1997,10 @@ mod coalesce_tests {
             let dropped = dropped.clone();
             move || {
                 let table = table.upgrade().unwrap();
-                drop(flight::update(&table, |table, wakes| {
+                flight::update(&table, |table, wakes| {
                     assert!(table.is_empty());
                     let removed = table.sweep(1, wakes);
-                    assert!(removed.is_empty());
+                    assert_eq!(removed, 0);
                     assert_eq!(table.next_waiter_id(), Ok(1));
                     assert!(
                         table
@@ -2014,7 +2014,7 @@ mod coalesce_tests {
                             .is_ok()
                     );
                     removed
-                }));
+                });
                 dropped.set(dropped.get() + 1);
             }
         })));
@@ -2030,29 +2030,27 @@ mod coalesce_tests {
                 )
                 .is_ok()
         );
-        let removed = flight::update(&table, |table, wakes| {
+        flight::update(&table, |table, wakes| {
             assert!(table.remove_quiescent(&2).is_none());
             assert!(table.remove_quiescent(&1).is_none());
-            assert!(table.sweep(1, wakes).is_empty());
+            assert_eq!(table.sweep(1, wakes), 0);
             table.get_mut(&1).unwrap().quiescent = true;
-            assert!(table.sweep(0, wakes).is_empty());
+            assert_eq!(table.sweep(0, wakes), 0);
             assert_eq!(table.len(), 1);
             let removed = if sweep {
                 table.sweep(1, wakes)
             } else {
-                table.remove_quiescent(&1).into_iter().collect()
+                usize::from(wakes.remove_quiescent(table, &1))
             };
-            assert_eq!(removed.len(), 1);
+            assert_eq!(removed, 1);
             assert!(table.is_empty());
             assert!(table.remove_quiescent(&1).is_none());
             assert_eq!(dropped.get(), 0);
             removed
         });
-        assert_eq!(dropped.get(), 0);
-        drop(removed);
         assert_eq!(dropped.get(), 1);
         assert_eq!(table.borrow_mut().next_waiter_id(), Ok(2));
-        drop(flight::update(&table, |table, wakes| table.sweep(1, wakes)));
+        flight::update(&table, |table, wakes| table.sweep(1, wakes));
         assert_eq!(table.borrow().len(), 1, "replacement remains indexed");
         assert_eq!(dropped.get(), 1);
     }
@@ -2067,12 +2065,12 @@ mod coalesce_tests {
             let dropped = dropped.clone();
             move || {
                 let table = table.upgrade().unwrap();
-                drop(flight::update(&table, |table, wakes| {
+                flight::update(&table, |table, wakes| {
                     let removed = table.sweep(1, wakes);
                     assert_eq!(table.len(), 1);
                     assert!(table.remove_quiescent(&1).is_none());
                     removed
-                }));
+                });
                 dropped.set(true);
             }
         })));
@@ -2111,12 +2109,12 @@ mod coalesce_tests {
         drop(flight::update(&table, |table, _| {
             table.register_drain(waker)
         }));
-        drop(flight::update(&table, |table, wakes| {
+        flight::update(&table, |table, wakes| {
             let operations = &mut table.get_mut(&1).unwrap().0;
             operations.complete(id).unwrap();
             assert_eq!(operations.complete(id), Err(Stale));
             table.sweep(1, wakes)
-        }));
+        });
         assert!(notified.get());
     }
 
@@ -2179,10 +2177,10 @@ mod coalesce_tests {
         impl WaiterPolicy for AdvancingPolicy {
             type Error = u8;
 
-            fn check(&self) -> Option<u8> {
+            fn check(&self, now: Instant) -> Option<u8> {
                 self.checks.set(self.checks.get() + 1);
                 self.clock.set(self.later);
-                Some(7)
+                (now >= self.due).then_some(7)
             }
 
             fn deadline(&self) -> Instant {
@@ -2268,7 +2266,7 @@ mod coalesce_tests {
         type Error = u8;
 
         /// Count policy evaluation and return the current injected failure.
-        fn check(&self) -> Option<Self::Error> {
+        fn check(&self, _: Instant) -> Option<Self::Error> {
             self.checks.set(self.checks.get() + 1);
             self.error.get()
         }

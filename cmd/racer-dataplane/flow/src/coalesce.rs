@@ -703,27 +703,120 @@ pub mod flight {
     //!
     //! Entry hooks own result interpretation and policy. A sweep refreshes each
     //! selected entry once and removes it only when the hook reports quiescence.
-    //! Callers collect wakes while borrowed and dispatch them after releasing locks.
-    //! Clone incoming wakers before borrowing. Return retired wakers from `update`
-    //! and drop them after it returns, including unused copies of the same target.
-    //! Key callbacks and entry hooks run inside the caller's transaction and must
-    //! not reborrow its owner. Removed entries are returned for destruction outside.
+    //! Clone incoming wakers before borrowing. Hooks must stage removed values with
+    //! `Txn::retire`, not drop them or return them alongside queued notifications.
+    //! The transaction releases staged values before waking, including on unwind.
+    //! Low-level methods return owned values for inspection; stage those values before
+    //! queuing wakes. Key callbacks and hooks must not reborrow the owner. Callbacks
+    //! and destructors must not panic during transaction cleanup.
 
     use std::cell::RefCell;
     use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
     use std::hash::{BuildHasher, Hash};
     use std::rc::Rc;
     use std::task::Waker;
+    use std::time::Instant;
 
-    /// Run a synchronous owner transaction, then notify outside its mutable borrow.
-    pub fn update<T, R>(owner: &RefCell<T>, f: impl FnOnce(&mut T, &mut Vec<Waker>) -> R) -> R {
-        let mut wakes = Vec::new();
-        let result = {
+    /// Stage owned values and notifications while borrowing a worker-local owner.
+    /// Values passed to `retire` drop before wakes, after the owner borrow releases.
+    /// Raw state access still requires the adapter to stage every removed value.
+    pub struct Txn {
+        now: Instant,
+
+        retired: Vec<Box<dyn std::any::Any>>,
+
+        wakes: Vec<Waker>,
+    }
+
+    impl Txn {
+        /// Use one caller-sampled time for every hook in this transaction.
+        pub fn new(now: Instant) -> Self {
+            Self {
+                now,
+                retired: Vec::new(),
+                wakes: Vec::new(),
+            }
+        }
+
+        /// Read the fixed time without invoking an application clock callback.
+        pub fn now(&self) -> Instant {
+            self.now
+        }
+
+        /// Transfer an owned, worker-local value for destruction before notification.
+        pub fn retire<T: 'static>(&mut self, value: T) {
+            self.retired.push(Box::new(value));
+        }
+
+        /// Remove a quiescent entry and stage both index keys and its application state.
+        pub fn remove_quiescent<K: Eq + Hash + 'static, E: Entry + 'static, S: BuildHasher>(
+            &mut self,
+            table: &mut Table<K, E, S>,
+            key: &K,
+        ) -> bool {
+            if let Some(removed) = table.remove_quiescent(key) {
+                self.retire(removed);
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Sweep and stage all removed entries before any queued notification runs.
+        pub fn sweep<K: Clone + Eq + Hash + 'static, E: Entry + 'static, S: BuildHasher>(
+            &mut self,
+            table: &mut Table<K, E, S>,
+            budget: usize,
+        ) {
+            table.sweep(budget, self);
+        }
+
+        /// Store a precloned drain target and stage the previous target for release.
+        pub fn register_drain<K, E, S>(&mut self, table: &mut Table<K, E, S>, waker: Waker) {
+            self.retire(table.register_drain(waker));
+        }
+    }
+
+    impl std::ops::Deref for Txn {
+        type Target = Vec<Waker>;
+
+        /// Access notifications collected by low-level state transitions.
+        fn deref(&self) -> &Self::Target {
+            &self.wakes
+        }
+    }
+
+    impl std::ops::DerefMut for Txn {
+        /// Enqueue notifications without invoking callbacks under the owner borrow.
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.wakes
+        }
+    }
+
+    impl Drop for Txn {
+        /// The update scope releases its borrow before this guard runs, even on panic.
+        fn drop(&mut self) {
+            self.retired.clear();
+            super::wake_all(std::mem::take(&mut self.wakes));
+        }
+    }
+
+    /// Sample time before borrowing and release staged values before notifying.
+    pub fn update<T, R>(owner: &RefCell<T>, f: impl FnOnce(&mut T, &mut Txn) -> R) -> R {
+        update_at(owner, Instant::now(), f)
+    }
+
+    /// Run hooks with one supplied clock snapshot and cleanup on normal return or unwind.
+    pub fn update_at<T, R>(
+        owner: &RefCell<T>,
+        now: Instant,
+        f: impl FnOnce(&mut T, &mut Txn) -> R,
+    ) -> R {
+        let mut txn = Txn::new(now);
+        {
             let mut state = owner.borrow_mut();
-            f(&mut state, &mut wakes)
-        };
-        super::wake_all(wakes);
-        result
+            f(&mut state, &mut txn)
+        }
     }
 
     /// A monotonic identifier or acquisition budget has been exhausted.
@@ -777,7 +870,7 @@ pub mod flight {
     /// never merely cancellation requested by a caller or expiration of a deadline.
     pub trait Entry {
         /// Refresh bounded lifecycle work and enqueue notifications without waking.
-        fn refresh(&mut self, wakes: &mut Vec<Waker>);
+        fn refresh(&mut self, txn: &mut Txn);
 
         /// Report that neither waiters nor retained operations need this entry.
         fn quiescent(&self) -> bool;
@@ -826,6 +919,17 @@ pub mod flight {
         sweep_id: u64,
 
         entry: E,
+    }
+
+    /// Removed membership owns both keys so their destructors run with the entry.
+    #[must_use = "stage removed membership with Txn::retire before queuing notifications"]
+    pub struct Removed<K, E> {
+        _map_key: K,
+
+        _sweep_key: K,
+
+        /// Application state retained outside its former owner's borrow.
+        pub entry: E,
     }
 
     impl<K, E, S: Default> Default for Table<K, E, S> {
@@ -956,51 +1060,58 @@ pub mod flight {
         /// Used after explicit detach or completion as well as by background sweeps.
         /// Return the entry for destruction after releasing the owner borrow.
         #[must_use = "drop the removed entry outside the owner borrow"]
-        pub fn remove_quiescent(&mut self, key: &K) -> Option<E> {
+        pub fn remove_quiescent(&mut self, key: &K) -> Option<Removed<K, E>> {
             if !self.get(key).is_some_and(Entry::quiescent) {
                 return None;
             }
-            let entry = self.entries.remove(key).expect("quiescent entry");
-            self.sweep.remove(&entry.sweep_id);
-            Some(entry.entry)
+            let (map_key, entry) = self.entries.remove_entry(key).expect("quiescent entry");
+            let sweep_key = self
+                .sweep
+                .remove(&entry.sweep_id)
+                .expect("indexed sweep key");
+            Some(Removed {
+                _map_key: map_key,
+                _sweep_key: sweep_key,
+                entry: entry.entry,
+            })
         }
     }
 
     impl<K, E, S> Table<K, E, S> {
         /// Mark shutdown and visit each entry synchronously. The adapter must reject
         /// admission, choose settlement policy, and drive actual operation completions.
-        pub fn stop(
-            &mut self,
-            wakes: &mut Vec<Waker>,
-            mut stop: impl FnMut(&mut E, &mut Vec<Waker>),
-        ) {
+        pub fn stop(&mut self, txn: &mut Txn, mut stop: impl FnMut(&mut E, &mut Txn)) {
             self.stopping = true;
             for entry in self.entries.values_mut() {
-                stop(&mut entry.entry, wakes);
+                stop(&mut entry.entry, txn);
             }
         }
     }
 
-    impl<K: Clone + Eq + Hash, E: Entry, S: BuildHasher> Table<K, E, S> {
+    impl<K: Clone + Eq + Hash + 'static, E: Entry + 'static, S: BuildHasher> Table<K, E, S> {
         /// Refresh at most the budgeted entry count and remove quiescent entries.
-        /// Return removed entries from `update` and drop them outside its borrow.
-        #[must_use = "drop the removed entries outside the owner borrow"]
-        pub fn sweep(&mut self, budget: usize, wakes: &mut Vec<Waker>) -> Vec<E> {
-            let mut removed = Vec::new();
+        /// Stage keys and entries immediately, so a later hook panic cannot drop them
+        /// under the borrow. Return the number of removed entries.
+        pub fn sweep(&mut self, budget: usize, txn: &mut Txn) -> usize {
+            let mut removed = 0;
             for _ in 0..budget.min(self.sweep.len()) {
                 let Some((_, key)) = self.cursor.next(&self.sweep) else {
                     break;
                 };
                 let key = key.clone();
+                // Stage the temporary key before invoking application hooks.
+                let key = Rc::new(key);
+                txn.retire(key.clone());
                 if let Some(entry) = self.get_mut(&key) {
-                    entry.refresh(wakes);
+                    entry.refresh(txn);
                 }
                 if let Some(entry) = self.remove_quiescent(&key) {
-                    removed.push(entry);
+                    txn.retire(entry);
+                    removed += 1;
                 }
             }
             if self.entries.is_empty() {
-                self.notify_drain(wakes);
+                self.notify_drain(txn);
             }
             removed
         }
@@ -1123,7 +1234,9 @@ pub mod flight {
             type Error: Copy;
 
             /// Check cancellation, deadline, and any other request-owned policy.
-            fn check(&self) -> Option<Self::Error>;
+            /// Use this snapshot for deadline decisions. A due policy may defer failure;
+            /// its index remains live until a later check reports an error.
+            fn check(&self, now: Instant) -> Option<Self::Error>;
 
             /// Return the request's fixed deadline for bounded expiry indexing.
             fn deadline(&self) -> Instant;
@@ -1346,9 +1459,9 @@ pub mod flight {
             }
 
             /// Check one caller in round-robin order without scanning the waiter map.
-            pub fn sweep_waiter(&mut self, wakes: &mut Vec<Waker>) {
+            pub fn sweep_waiter(&mut self, now: Instant, wakes: &mut Vec<Waker>) {
                 if let Some((id, _)) = self.cursor.next(&self.waiters) {
-                    self.refresh_waiter(id, wakes);
+                    self.refresh_waiter(id, now, wakes);
                 }
             }
 
@@ -1459,7 +1572,7 @@ pub mod flight {
                 wakes: &mut Vec<Waker>,
             ) -> Option<P> {
                 if let Some(id) = self.leader {
-                    self.refresh_waiter(id, wakes);
+                    self.refresh_waiter(id, now, wakes);
                 }
                 self.refresh_expired(now, wakes);
                 if matches!(self.phase, Phase::Acquiring) {
@@ -1500,12 +1613,12 @@ pub mod flight {
             }
 
             /// Check one caller and enqueue its wake if its policy has failed.
-            fn refresh_waiter(&mut self, id: u64, wakes: &mut Vec<Waker>) {
+            fn refresh_waiter(&mut self, id: u64, now: Instant, wakes: &mut Vec<Waker>) {
                 let Some(waiter) = self.waiters.get_mut(&id) else {
                     return;
                 };
                 if waiter.error.is_none() {
-                    waiter.error = waiter.check();
+                    waiter.error = waiter.check(now);
                 }
                 if waiter.error.is_some() {
                     self.deadlines.remove(&(waiter.deadline(), id));
@@ -1515,17 +1628,20 @@ pub mod flight {
                 }
             }
 
-            /// Consume at most 64 due deadline entries, independently of leader checks.
+            /// Check at most 64 due entries once each, retaining any that defer failure.
             fn refresh_expired(&mut self, now: Instant, wakes: &mut Vec<Waker>) {
-                for _ in 0..64 {
-                    let Some((&(deadline, id), _)) = self.deadlines.first_key_value() else {
-                        break;
-                    };
-                    if deadline > now {
-                        break;
+                let due: Vec<_> = self
+                    .deadlines
+                    .range(..=(now, u64::MAX))
+                    .take(64)
+                    .map(|(&(deadline, id), _)| (deadline, id))
+                    .collect();
+                for (deadline, id) in due {
+                    if self.waiters.contains_key(&id) {
+                        self.refresh_waiter(id, now, wakes);
+                    } else {
+                        self.deadlines.remove(&(deadline, id));
                     }
-                    self.deadlines.remove(&(deadline, id));
-                    self.refresh_waiter(id, wakes);
                 }
             }
         }
@@ -1565,7 +1681,7 @@ pub mod flight {
                 type Error = u8;
 
                 /// Read the failure injected by the test.
-                fn check(&self) -> Option<u8> {
+                fn check(&self, _: Instant) -> Option<u8> {
                     self.error.get()
                 }
 
@@ -1786,6 +1902,64 @@ pub mod flight {
                 assert!(core.deadlines.is_empty());
             }
 
+            /// Due policies that defer failure remain indexed until a later check fails.
+            #[test]
+            fn deferred_deadline_failure_is_rechecked_with_shared_time() {
+                struct Deferred {
+                    due: Instant,
+
+                    fail_at: Instant,
+                }
+
+                impl WaiterPolicy for Deferred {
+                    type Error = u8;
+
+                    fn check(&self, now: Instant) -> Option<u8> {
+                        (now >= self.fail_at).then_some(7)
+                    }
+
+                    fn deadline(&self) -> Instant {
+                        self.due
+                    }
+                }
+
+                let now = Instant::now();
+                let later = now + Duration::from_secs(1);
+                let mut core = State::<(), (), (), Deferred>::default();
+                assert!(
+                    core.register(
+                        1,
+                        Deferred {
+                            due: now,
+                            fail_at: later
+                        },
+                        true,
+                        true
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    core.register(
+                        2,
+                        Deferred {
+                            due: now,
+                            fail_at: now
+                        },
+                        true,
+                        true
+                    )
+                    .is_ok()
+                );
+                let mut wakes = Vec::new();
+                core.refresh_expired(now, &mut wakes);
+                assert_eq!(core.waiters[&1].error, None);
+                assert_eq!(core.waiters[&2].error, Some(7));
+                assert_eq!(core.deadlines.len(), 1);
+                core.refresh_expired(later, &mut wakes);
+                assert_eq!(core.waiters[&1].error, Some(7));
+                assert!(core.deadlines.is_empty());
+            }
+
             /// Shutdown clears caller indexes but retains a pending completion outcome.
             #[test]
             fn detach_cleans_deadline_and_stop_preserves_pending_completion() {
@@ -1841,7 +2015,7 @@ pub mod flight {
 
         impl Entry for TestEntry {
             /// Count visits and detach callers when cancellation is observed.
-            fn refresh(&mut self, _: &mut Vec<Waker>) {
+            fn refresh(&mut self, _: &mut Txn) {
                 self.refreshed += 1;
                 if self.canceled {
                     self.waiters = 0;
@@ -1865,7 +2039,7 @@ pub mod flight {
 
             impl Entry for CallbackEntry {
                 /// This entry has no pending lifecycle work.
-                fn refresh(&mut self, _: &mut Vec<Waker>) {}
+                fn refresh(&mut self, _: &mut Txn) {}
 
                 /// Allow immediate removal.
                 fn quiescent(&self) -> bool {
@@ -1897,16 +2071,13 @@ pub mod flight {
                     })))
                 };
                 assert!(table.borrow_mut().insert(1, entry).is_ok());
-                let removed = update(&table, |table, wakes| {
+                update(&table, |table, txn| {
                     if sweep {
-                        table.sweep(1, wakes)
+                        txn.sweep(table, 1);
                     } else {
-                        table.remove_quiescent(&1).into_iter().collect()
+                        assert!(txn.remove_quiescent(table, &1));
                     }
                 });
-                assert!(!observed.get());
-                assert!(table.borrow().is_empty());
-                drop(removed);
                 assert!(observed.get());
                 assert_eq!(table.borrow().len(), 1);
                 drop(update(&table, |table, _| table.remove_quiescent(&1)));
@@ -1945,8 +2116,8 @@ pub mod flight {
             let entry = table.get_mut(&1).unwrap();
             assert!(entry.operations.insert(1, Resource(live.clone())).is_ok());
             entry.canceled = true;
-            let mut wakes = Vec::new();
-            drop(table.sweep(1, &mut wakes));
+            let mut wakes = Txn::new(Instant::now());
+            table.sweep(1, &mut wakes);
             assert_eq!(table.get(&1).unwrap().waiters, 0);
             assert_eq!(table.get(&2).unwrap().waiters, 1);
             assert_eq!(live.get(), 1, "cancellation is not completion");
@@ -2043,8 +2214,8 @@ pub mod flight {
             assert_eq!(table.sweep[&sweep_id], 1);
             drop(rejected);
             assert_eq!(rejected_live.get(), 0);
-            let removed = table.sweep(1, &mut Vec::new());
-            assert_eq!(removed.len(), usize::from(complete));
+            let removed = table.sweep(1, &mut Txn::new(Instant::now()));
+            assert_eq!(removed, usize::from(complete));
             if !complete {
                 let entry = table.get_mut(&1).unwrap();
                 assert_eq!(entry.refreshed, 1);
@@ -2097,7 +2268,7 @@ pub mod flight {
                 key: 1,
             });
             drop(token);
-            drop(update(&table, |table, wakes| table.sweep(100, wakes)));
+            update(&table, |table, wakes| table.sweep(100, wakes));
             assert_eq!(table.borrow().len(), 1);
             assert_eq!(live.get(), 1);
             let resources = table
@@ -2115,7 +2286,7 @@ pub mod flight {
                 .operations
                 .complete(1)
                 .unwrap();
-            drop(update(&table, |table, wakes| table.sweep(1, wakes)));
+            update(&table, |table, wakes| table.sweep(1, wakes));
             assert!(table.borrow().is_empty());
             assert_eq!(live.get(), 0);
         }
@@ -2168,27 +2339,27 @@ pub mod flight {
             for key in 1..=3 {
                 insert(&mut table, &owner, key);
             }
-            drop(table.sweep(0, &mut Vec::new()));
+            table.sweep(0, &mut Txn::new(Instant::now()));
             assert!(table.values().all(|entry| entry.refreshed == 0));
             for key in 1..=3 {
-                drop(table.sweep(1, &mut Vec::new()));
+                table.sweep(1, &mut Txn::new(Instant::now()));
                 assert_eq!(table.get(&key).unwrap().refreshed, 1);
             }
             table.get_mut(&2).unwrap().canceled = true;
-            drop(table.sweep(99, &mut Vec::new()));
+            table.sweep(99, &mut Txn::new(Instant::now()));
             assert!(!table.contains_key(&2));
             assert_eq!(table.sweep.len(), 2);
             assert!(table.values().all(|entry| entry.refreshed == 2));
             table.drain_waker = Some(Waker::noop().clone());
-            table.stop(&mut Vec::new(), |entry, _| {
+            table.stop(&mut Txn::new(Instant::now()), |entry, _| {
                 entry.canceled = true;
             });
-            let mut wakes = Vec::new();
-            drop(table.sweep(99, &mut wakes));
+            let mut wakes = Txn::new(Instant::now());
+            table.sweep(99, &mut wakes);
             assert!(table.is_empty());
             assert!(table.sweep.is_empty());
             assert_eq!(wakes.len(), 1);
-            drop(table.sweep(99, &mut wakes));
+            table.sweep(99, &mut wakes);
             assert_eq!(wakes.len(), 1, "drain wake is taken once");
         }
 
@@ -2235,13 +2406,13 @@ pub mod flight {
             assert_eq!(table.values().count(), 2);
             assert!(!table.sweep.contains_key(&original));
             assert!(table.sweep.contains_key(&replacement));
-            drop(table.sweep(2, &mut Vec::new()));
+            table.sweep(2, &mut Txn::new(Instant::now()));
             assert!(table.values().all(|entry| entry.refreshed == 1));
             table.get_mut(&1).unwrap().waiters = 0;
             assert!(table.remove_quiescent(&1).is_some());
             assert!(!table.contains_key(&1));
             assert_eq!(table.sweep.len(), table.len());
-            drop(table.sweep(1, &mut Vec::new()));
+            table.sweep(1, &mut Txn::new(Instant::now()));
             assert_eq!(table.get(&2).unwrap().refreshed, 2);
         }
 
@@ -2256,10 +2427,10 @@ pub mod flight {
             table.get_mut(&1).unwrap().waiters = 0;
             assert!(table.remove_quiescent(&1).is_some());
             assert_eq!(table.sweep.len(), 1);
-            drop(table.sweep(1, &mut Vec::new()));
+            table.sweep(1, &mut Txn::new(Instant::now()));
             assert_eq!(table.get(&2).unwrap().refreshed, 1);
             table.get_mut(&2).unwrap().waiters = 0;
-            drop(table.sweep(1, &mut Vec::new()));
+            table.sweep(1, &mut Txn::new(Instant::now()));
             assert!(table.is_empty());
             assert!(table.sweep.is_empty());
         }
@@ -2272,7 +2443,7 @@ pub mod flight {
             for key in 1..=3 {
                 insert(&mut table, &owner, key);
             }
-            table.stop(&mut Vec::new(), |entry, _| {
+            table.stop(&mut Txn::new(Instant::now()), |entry, _| {
                 entry.identity.incarnation = u64::MAX;
                 entry.canceled = true;
             });
@@ -2280,7 +2451,7 @@ pub mod flight {
             assert!(table.remove_quiescent(&2).is_some());
             insert(&mut table, &owner, 2);
             assert_eq!(table.sweep.len(), 3);
-            drop(table.sweep(3, &mut Vec::new()));
+            table.sweep(3, &mut Txn::new(Instant::now()));
             assert_eq!(table.len(), 1);
             assert_eq!(table.sweep.len(), 1);
             assert_eq!(table.get(&2).unwrap().refreshed, 1);
@@ -2312,10 +2483,10 @@ pub mod flight {
                 );
             }
             assert_eq!(table.sweep.len(), 3);
-            drop(table.sweep(0, &mut Vec::new()));
+            table.sweep(0, &mut Txn::new(Instant::now()));
             assert!(table.values().all(|entry| entry.refreshed == 0));
             for key in 1..=3 {
-                drop(table.sweep(1, &mut Vec::new()));
+                table.sweep(1, &mut Txn::new(Instant::now()));
                 assert_eq!(table.get(&key).unwrap().refreshed, 1);
                 assert_eq!(
                     table.values().map(|entry| entry.refreshed).sum::<usize>(),
@@ -2324,7 +2495,7 @@ pub mod flight {
             }
             table.get_mut(&2).unwrap().waiters = 0;
             assert!(table.remove_quiescent(&2).is_some());
-            drop(table.sweep(99, &mut Vec::new()));
+            table.sweep(99, &mut Txn::new(Instant::now()));
             assert_eq!(table.sweep.len(), 2);
             assert!(table.values().all(|entry| entry.refreshed == 2));
         }
@@ -2344,7 +2515,7 @@ pub mod flight {
                 (first.incarnation, second.incarnation, third.incarnation),
                 (1, 2, 3)
             );
-            drop(table.sweep(3, &mut Vec::new()));
+            table.sweep(3, &mut Txn::new(Instant::now()));
             assert!(table.values().all(|entry| entry.refreshed == 1));
             table.incarnation = Counter(u64::MAX);
             assert!(table.identity(owner).is_err());
@@ -2367,8 +2538,10 @@ pub mod flight {
                 4,
                 "insert does not require an incarnation allocation"
             );
-            table.stop(&mut Vec::new(), |entry, _| entry.canceled = true);
-            drop(table.sweep(4, &mut Vec::new()));
+            table.stop(&mut Txn::new(Instant::now()), |entry, _| {
+                entry.canceled = true
+            });
+            table.sweep(4, &mut Txn::new(Instant::now()));
             assert!(table.is_empty());
             assert!(table.sweep.is_empty());
         }
