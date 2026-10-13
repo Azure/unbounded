@@ -4,6 +4,7 @@
 use crate::directory::{Dir, component};
 use crate::{BoundSocket, Error, error, same_inode};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::rc::Rc;
 
@@ -25,7 +26,8 @@ impl Rename {
 
 /// Minimal inode owner used by the transaction. Implementations must retain their
 /// pinned directory and clean up only their own socket inode on final drop.
-/// `set_basename` changes only in-memory cleanup bookkeeping after a rename.
+/// `set_basename` changes only cleanup bookkeeping after a rename; it may probe
+/// the inode but must not mutate the filesystem.
 /// It must not panic, allocate, or invoke user code. The same applies to a
 /// successful return from `rename`: implementations must report success without
 /// unwinding after the filesystem mutation. These are low-level adapter methods,
@@ -150,11 +152,56 @@ impl Endpoint for BoundSocket {
         if from == to {
             return Err(error(Error::InvalidName));
         }
+        for name in [from, to] {
+            if name != self.owner.layout.canonical {
+                self.owner.layout.witness(name)?;
+            }
+        }
+        if !self.owns_checked(from)? {
+            return Err(Self::ownership_error());
+        }
         Dir(&self.owner.directory).rename(from, to, mode.flags())
     }
 
     fn set_basename(&self, basename: String) {
-        *self.basename.borrow_mut() = basename;
+        // Probe without allocating or calling the layout predicate after rename.
+        // Witnesses must remain separate from the movable cleanup name.
+        let bytes = basename.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 255
+            || bytes.contains(&0)
+            || bytes.contains(&b'/')
+            || basename == "."
+            || basename == ".."
+            || basename == self.owner.layout.lock
+            || basename.starts_with(self.owner.layout.witness_prefix)
+        {
+            return;
+        }
+        let mut name = [0_u8; 256];
+        name[..bytes.len()].copy_from_slice(bytes);
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: name is NUL-terminated, the directory descriptor is retained,
+        // and metadata is writable. AT_SYMLINK_NOFOLLOW rejects symlink aliases.
+        let result = unsafe {
+            libc::fstatat(
+                self.owner.directory.as_raw_fd(),
+                name.as_ptr().cast(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return;
+        }
+        // SAFETY: successful fstatat initialized metadata.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
+            && metadata.st_dev == self.device
+            && metadata.st_ino == self.inode
+        {
+            *self.basename.borrow_mut() = basename;
+        }
     }
 }
 
@@ -347,7 +394,7 @@ impl<E: Endpoint> Publication<E> {
                     }
                 } else if next.absent(&replacement.canonical)
                     && previous.owns(&replacement.temporary)
-                    && next
+                    && previous
                         .rename(
                             &replacement.temporary,
                             &replacement.canonical,

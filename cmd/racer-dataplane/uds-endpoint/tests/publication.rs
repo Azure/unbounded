@@ -743,7 +743,7 @@ fn absent_canonical_restore_failure_is_guarded_and_not_retried() {
     drop(publication);
     assert_eq!(
         &*calls.log.borrow(),
-        &[(1, Rename::Exchange), (1, Rename::NoReplace)]
+        &[(1, Rename::Exchange), (0, Rename::NoReplace)]
     );
     assert!(old.owns("pending-next"));
     assert_eq!(old.basename(), "pending-next");

@@ -136,6 +136,12 @@ retire the old listener according to their service policy.
 cleanup-name bookkeeping must not unwind after filesystem mutation; bookkeeping
 must not allocate or invoke user code. It is not an alternative public mechanism
 for arbitrary changes to a bound socket's cleanup name.
+The host adapter renames only its own socket inode between canonical or valid
+temporary names, never lock or witness names. The caller must still check the
+destination owner before an exchange. Cleanup-name adoption uses a no-follow inode
+probe and ignores missing, foreign, malformed, lock, and witness names. It does
+not call the layout predicate after a rename; use the publication journal to
+validate names and keep rename and cleanup bookkeeping together.
 
 ## Simulation limits
 
