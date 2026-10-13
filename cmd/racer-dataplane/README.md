@@ -63,6 +63,19 @@ describe ownership and admission contracts; generate them with:
 timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 doc --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-deps
 ```
 
+This extraction is a smaller API, not a drop-in replacement for the `racer-v2`
+branch. It does not include `reserve_detailed`, `ReserveError`,
+`observe_rejections`, `ChargedBytes`, `ChargedBuffer::unpooled`, or the `progress`,
+`fifo`, and `subscriptions` modules. `reserve` returns the coarse `Error` enum;
+`Policy::rejected` reports individual failed attempts, not a detailed return value
+for the whole reservation, which may retry after reclamation. Callers must not
+treat that hook as a correlated replacement for `ReserveError`.
+
+The placeholder executable does not yet use flow. Before importing a consumer
+from `racer-v2`, check its API needs and ownership contracts against this crate.
+Any missing compatibility API needs its own design and tests; this extraction
+does not promise to add every omitted API in a follow-up.
+
 Validate flow separately so workspace feature unification cannot enable simulation
 in its production gate:
 
