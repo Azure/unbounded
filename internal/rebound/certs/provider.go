@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
@@ -23,16 +24,21 @@ import (
 
 var _ dynamiccertificates.CertKeyContentProvider = (*Provider)(nil)
 
+// recheckInterval bounds how long a cached Secret rejected for its validity
+// window waits for the local clock to catch up when no Secret event arrives.
+const recheckInterval = 30 * time.Second
+
 // Provider retains the last valid key pair if the Secret is deleted or damaged.
 // It deliberately does not implement ControllerRunner: the manager owns its
 // informer lifecycle, not SecureServingInfo. Start it before calling WaitReady.
 type Provider struct {
 	informer  cache.SharedIndexInformer
+	reloadMu  sync.Mutex
 	mu        sync.RWMutex
 	cert, key []byte
 	listeners []dynamiccertificates.Listener
 	ready     chan struct{}
-	clock     clock.PassiveClock
+	clock     clock.WithTicker
 	leaf      *x509.Certificate
 	names     []string
 }
@@ -139,18 +145,49 @@ func (p *Provider) load(obj any) {
 	}
 }
 
+// reload loads the latest cached Secret. Events and the periodic recheck share
+// it, so a stale object never replaces a newer one.
+func (p *Provider) reload() {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	for _, obj := range p.informer.GetStore().List() {
+		p.load(obj)
+	}
+}
+
+// Start runs the informer and rechecks the cached Secret periodically, since
+// a certificate rejected as not yet valid can become valid without an event.
 func (p *Provider) Start(ctx context.Context) error {
 	_, err := p.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    p.load,
-		UpdateFunc: func(_, obj any) { p.load(obj) },
+		AddFunc:    func(any) { p.reload() },
+		UpdateFunc: func(_, _ any) { p.reload() },
 	})
 	if err != nil {
 		return err
 	}
 
-	p.informer.Run(ctx.Done())
+	done := make(chan struct{})
 
-	return nil
+	go func() {
+		defer close(done)
+
+		p.informer.Run(ctx.Done())
+	}()
+
+	ticker := p.clock.NewTicker(recheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			<-done
+
+			return nil
+		case <-ticker.C():
+			p.reload()
+		}
+	}
 }
 
 func (p *Provider) NeedLeaderElection() bool { return false }

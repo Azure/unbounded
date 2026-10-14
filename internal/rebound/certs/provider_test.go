@@ -253,6 +253,72 @@ func TestProviderAcceptsFreshCertificateWithLaggingClock(t *testing.T) {
 	require.Equal(t, secret, getSecret(t, r))
 }
 
+func TestProviderRechecksNotYetValidCertificate(t *testing.T) {
+	r, _ := fixture()
+	reconcile(t, r)
+	secret := getSecret(t, r)
+	leaf, err := parseCertificate(secret.Data[corev1.TLSCertKey])
+	require.NoError(t, err)
+
+	clock := clocktesting.NewFakeClock(leaf.NotBefore.Add(-time.Minute))
+	p := NewProvider(r.Client, "", "")
+	p.clock = clock
+	l := &listener{}
+	p.AddListener(l)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+
+	go func() { done <- p.Start(ctx) }()
+
+	t.Cleanup(func() {
+		cancel()
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Error("provider failed to stop")
+		}
+	})
+
+	ready := make(chan error, 1)
+
+	go func() { ready <- p.WaitReady(ctx) }()
+
+	eventually(t, p.HasSynced)
+	eventually(t, clock.HasWaiters)
+	require.False(t, p.Ready())
+	require.Zero(t, l.calls.Load())
+
+	select {
+	case err := <-ready:
+		t.Fatalf("WaitReady returned before the certificate was valid: %v", err)
+	default:
+	}
+
+	clock.SetTime(leaf.NotBefore)
+
+	select {
+	case err := <-ready:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitReady blocked after the clock caught up")
+	}
+
+	require.True(t, p.Ready())
+	eventually(t, func() bool { return l.calls.Load() == 1 })
+
+	cert, key := p.CurrentCertKeyContent()
+	require.Equal(t, secret.Data[corev1.TLSCertKey], cert)
+	require.Equal(t, secret.Data[corev1.TLSPrivateKeyKey], key)
+	require.Equal(t, secret.ResourceVersion, getSecret(t, r).ResourceVersion)
+
+	clock.SetTime(leaf.NotAfter)
+	require.False(t, p.Ready())
+	require.ErrorContains(t, p.Check(nil), "not valid now")
+}
+
 func TestProviderRetainsValidPair(t *testing.T) {
 	r, clock := fixture()
 	reconcile(t, r)
