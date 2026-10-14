@@ -16,8 +16,9 @@ spec:
         operations: [CREATE]
         resources: [pods, pods/binding, bindings]
   variables:
+    # The API server omits subResource when it is empty.
     - name: isPod
-      expression: "request.resource.resource == 'pods' && request.subResource == ''"
+      expression: "request.resource.resource == 'pods' && request.?subResource.orValue('') == ''"
     - name: node
       expression: >-
         variables.isPod ?

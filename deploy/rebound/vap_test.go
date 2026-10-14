@@ -66,6 +66,17 @@ func policyAllows(t *testing.T, policy admissionv1.ValidatingAdmissionPolicy, ac
 	return allowed
 }
 
+// podRequest builds an admission request the way the API server does: it
+// omits subResource when it is empty.
+func podRequest(namespace, resource, subresource string) map[string]any {
+	request := map[string]any{"namespace": namespace, "resource": map[string]any{"resource": resource}}
+	if subresource != "" {
+		request["subResource"] = subresource
+	}
+
+	return request
+}
+
 func TestPodPlacementCEL(t *testing.T) {
 	t.Parallel()
 
@@ -115,7 +126,7 @@ func TestPodPlacementCEL(t *testing.T) {
 				obj["target"] = map[string]any{"kind": "Node", "name": tc.node}
 			}
 
-			request := map[string]any{"namespace": tc.namespace, "resource": map[string]any{"resource": tc.resource}, "subResource": tc.subresource}
+			request := podRequest(tc.namespace, tc.resource, tc.subresource)
 			request["userInfo"] = map[string]any{"username": tc.user}
 			require.Equal(t, tc.allowed, policyAllows(t, policy, map[string]any{"object": obj, "params": tc.params, "request": request}))
 		})
@@ -148,9 +159,7 @@ func TestBindingTargetKindCEL(t *testing.T) {
 					require.Equal(t, namespace == "team-a", policyAllows(t, policy, map[string]any{
 						"object": map[string]any{"metadata": map[string]any{}, "target": target.fields},
 						"params": ledger,
-						"request": map[string]any{
-							"namespace": namespace, "resource": map[string]any{"resource": resource}, "subResource": subresource,
-						},
+						"request": podRequest(namespace, resource, subresource),
 					}))
 				})
 			}
@@ -264,7 +273,7 @@ func TestPolicyOverridesCEL(t *testing.T) {
 		require.Equal(t, namespace != "kube-system", policyAllows(t, placement, map[string]any{
 			"object":  map[string]any{"metadata": map[string]any{}, "spec": map[string]any{"nodeName": "node-a"}},
 			"params":  map[string]any{"data": map[string]string{"node-a": "team-a/grant-a"}},
-			"request": map[string]any{"namespace": namespace, "resource": map[string]any{"resource": "pods"}, "subResource": ""},
+			"request": podRequest(namespace, "pods", ""),
 		}))
 	}
 
