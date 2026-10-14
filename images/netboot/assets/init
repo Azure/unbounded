@@ -368,7 +368,31 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
     retry 20 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
     retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
 
-    if [ -n "$IP_PARAM" ]; then
+    if [ -n "$IP_PARAM" ] && [ ! -d /mnt/etc/netplan ] && [ -d /mnt/etc/systemd/network ]; then
+        # Images without netplan (for example Azure Linux) use
+        # systemd-networkd directly. The lower file name sorts before the
+        # image's default DHCP file, which is removed so that other NICs do
+        # not add competing default routes.
+        log "persisting static network configuration for systemd-networkd"
+        rm -f /mnt/etc/systemd/network/90-unbounded-dhcp.network
+        {
+            echo "[Match]"
+            echo "MACAddress=${BOOT_MAC}"
+            echo ""
+            echo "[Network]"
+            echo "DHCP=no"
+            echo "IPv6AcceptRA=no"
+            echo "Address=${CLIENT_IP}/${PREFIX}"
+            [ -z "$GW" ] || echo "Gateway=${GW}"
+            old_ifs=$IFS
+            IFS=,
+            for dns in $DNS_SERVERS; do
+                echo "DNS=${dns}"
+            done
+            IFS=$old_ifs
+        } > /mnt/etc/systemd/network/10-unbounded-metal.network
+        chmod 644 /mnt/etc/systemd/network/10-unbounded-metal.network
+    elif [ -n "$IP_PARAM" ]; then
         log "persisting static network configuration"
         mkdir -p /mnt/etc/netplan
         rm -f /mnt/etc/netplan/50-cloud-init.yaml

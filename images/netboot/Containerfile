@@ -1,6 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
+# The installer runs the Azure Linux kernel. Its module set includes drivers
+# that the Ubuntu generic kernel lacks, such as the Microsoft MANA NIC.
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS kernel
+
+ARG INSTALLER_KERNEL=kernel
+
+RUN tdnf install -y "${INSTALLER_KERNEL}" && \
+    tdnf clean all
+
 FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
@@ -9,7 +18,7 @@ RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if apt-get install -y --no-install-recommends \
-           ca-certificates cpio curl efibootmgr kmod linux-image-generic xz-utils; then \
+           ca-certificates cpio curl efibootmgr kmod xz-utils; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
@@ -18,9 +27,18 @@ RUN apt-get update && \
     done && $ok && \
     rm -rf /var/lib/apt/lists/*
 
+# Azure Linux ships xz-compressed modules. Decompress them so that any kmod
+# build in the Ubuntu initrd can load them, then rebuild the module index.
+COPY --from=kernel /usr/lib/modules /usr/lib/modules
+COPY --from=kernel /boot /tmp/kernel-boot
+RUN KVER=$(ls /lib/modules | head -1) && \
+    find "/lib/modules/${KVER}" -name '*.ko.xz' -exec xz -d {} + && \
+    depmod "${KVER}"
+
 RUN mkdir -p /artifacts && \
     KVER=$(ls /lib/modules | head -1) && \
-    cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
+    cp "/tmp/kernel-boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
+    chmod 644 /artifacts/vmlinuz && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
         NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
         curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \

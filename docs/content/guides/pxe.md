@@ -92,6 +92,25 @@ docker push ghcr.io/azure/netboot:v1
 
 Template context includes `.Machine`, `.ApiserverURL`, `.ServeURL`, `.KubernetesVersion`, and `.ClusterDNS`.
 
+### Machine images
+
+| Image | Contents |
+|---|---|
+| `images/host-ubuntu2404` | Ubuntu 24.04 cloud image. |
+| `images/host-azurelinux3` | Azure Linux 3.0 with the Azure Linux kernel, cloud-init, and systemd-networkd. Built for amd64 and arm64. |
+| `images/host-azurelinux3-nvidia` | The Azure Linux 3.0 image plus the HWE kernel and the NVIDIA open GPU driver. It loads the driver and enables persistence mode at boot. Fabric Manager and IMEX are not included. |
+
+The Azure Linux images boot with a fixed GRUB entry. A kernel package update
+does not change the boot entry, so update these machines by repaving them with
+a new image.
+
+The installer in the netboot image runs the Azure Linux kernel, so it has
+drivers for NICs such as Microsoft MANA. It still boots through the Ubuntu shim
+and GRUB. Running this installer with Secure Boot on is not supported yet.
+
+The installer writes the machine's static network settings as netplan when the
+image has `/etc/netplan`, and as a systemd-networkd file otherwise.
+
 See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Machine spec.
 
 ## Machine CRD
