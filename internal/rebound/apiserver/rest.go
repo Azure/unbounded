@@ -118,6 +118,13 @@ func (s *storage) read(ctx context.Context, rv string, match metav1.ResourceVers
 	return snapshot{ledger: ledger.Parse(cm.Data), rv: cm.ResourceVersion}, nil
 }
 
+// Get, List, and the initial events of Watch return exactly what the ledger
+// snapshot holds. They do not hide grants whose expiresAt has passed, because
+// the clock moving does not change the ledger RV or produce a watch event.
+// Filtering by the clock would let the same RV list different grants over
+// time, and a watching informer would disagree with a fresh list. An expired
+// grant stays visible until the reaper, or a create that reaps, removes it
+// from the ledger. That write gives it a new RV and a DELETED event.
 func (s *storage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	rv := ""
 	if options != nil {
@@ -130,7 +137,7 @@ func (s *storage) Get(ctx context.Context, name string, options *metav1.GetOptio
 	}
 
 	g, ok := current.ledger.Get(types.NamespacedName{Namespace: request.NamespaceValue(ctx), Name: name})
-	if !ok || g.Expired(s.clock.Now()) {
+	if !ok {
 		return nil, apierrors.NewNotFound(rebound.GroupResource(), name)
 	}
 
@@ -164,7 +171,7 @@ func (s *storage) List(ctx context.Context, options *metainternal.ListOptions) (
 	result := &rebound.NodeGrantList{ListMeta: metav1.ListMeta{ResourceVersion: current.rv}, Items: []rebound.NodeGrant{}}
 	for _, g := range current.ledger.Grants() {
 		obj := grantObject(g, current.rv)
-		if !g.Expired(s.clock.Now()) && match(obj) {
+		if match(obj) {
 			result.Items = append(result.Items, *obj)
 		}
 	}

@@ -115,14 +115,15 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 		// last one this watcher receives carries the snapshot RV. The others
 		// carry it with a leading zero. List and get parse that as the same
 		// snapshot, but it never equals a history RV, so a watch resumed from
-		// it gets 410 and the client relists.
+		// it gets 410 and the client relists. Expired grants are included,
+		// as in list, until a ledger write removes them.
 		current := s.current
 
 		var last *rebound.NodeGrant
 
 		for _, g := range current.ledger.Grants() {
 			obj := grantObject(g, "0"+current.rv)
-			if !g.Expired(s.clock.Now()) && match(obj) {
+			if match(obj) {
 				initial = append(initial, watch.Event{Type: watch.Added, Object: obj})
 				last = obj
 			}

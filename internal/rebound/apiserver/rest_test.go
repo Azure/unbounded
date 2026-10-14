@@ -609,8 +609,10 @@ func TestExpiredAndDeleteCollection(t *testing.T) {
 
 	c.Step(time.Hour)
 
+	// Reads do not filter by the clock, so the expired grant stays visible
+	// until a ledger write removes it.
 	_, err = s.Get(ctx, "second", nil)
-	if !apierrors.IsNotFound(err) {
+	if err != nil {
 		t.Fatalf("expired get: %v", err)
 	}
 
@@ -620,7 +622,7 @@ func TestExpiredAndDeleteCollection(t *testing.T) {
 	}
 
 	list, ok = obj.(*rebound.NodeGrantList)
-	if !ok || len(list.Items) != 0 {
+	if !ok || len(list.Items) != 1 || list.Items[0].Name != "second" {
 		t.Fatalf("expired list: %v", obj)
 	}
 

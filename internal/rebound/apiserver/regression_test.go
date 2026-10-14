@@ -131,8 +131,9 @@ func TestDeleteExpired(t *testing.T) {
 	require.True(t, ok)
 	c.Step(time.Hour)
 
+	// The expired grant is still in the ledger, so it is still readable.
 	_, err := s.Get(ctx, "first", nil)
-	require.True(t, apierrors.IsNotFound(err), "%v", err)
+	require.NoError(t, err)
 	_, _, err = s.Delete(ctx, "first", nil, &metav1.DeleteOptions{DryRun: []string{metav1.DryRunAll}})
 	require.NoError(t, err)
 	require.Len(t, ledger.Parse(cached(t, s).Data).Grants(), 1)
@@ -149,6 +150,91 @@ func TestDeleteExpired(t *testing.T) {
 	require.Empty(t, l.Grants())
 	require.Len(t, l.Releases(), 1)
 	require.Equal(t, g.UID, l.Releases()[0].UID)
+}
+
+// TestExpiredGrantVisibleUntilReaped checks that reads depend only on the
+// ledger snapshot. The clock passing expiresAt changes neither the RV nor the
+// watch stream, so it must not change what get, list, or a new watch return.
+func TestExpiredGrantVisibleUntilReaped(t *testing.T) {
+	s, _, ctx := fixture(t)
+	c, ok := s.clock.(*clocktesting.FakeClock)
+	require.True(t, ok)
+
+	short := grant("first", "node-a")
+	short.Spec.TTL = &metav1.Duration{Duration: time.Minute}
+	_, err := s.Create(ctx, short, nil, nil)
+	require.NoError(t, err)
+
+	rv := cached(t, s).ResourceVersion
+
+	listed, err := s.List(ctx, &metainternal.ListOptions{ResourceVersion: rv, ResourceVersionMatch: metav1.ResourceVersionMatchExact})
+	require.NoError(t, err)
+
+	before, ok := listed.(*rebound.NodeGrantList)
+	require.True(t, ok)
+	require.Equal(t, rv, before.ResourceVersion)
+	require.Len(t, before.Items, 1)
+
+	informer, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: rv})
+	require.NoError(t, err)
+	t.Cleanup(informer.Stop)
+
+	// Expire the grant by the clock alone. Nothing writes the ledger.
+	c.Step(2 * time.Minute)
+	require.True(t, before.Items[0].Status.ExpiresAt.Time.Before(c.Now()))
+
+	for _, getRV := range []string{"", "0", rv} {
+		obj, err := s.Get(ctx, "first", &metav1.GetOptions{ResourceVersion: getRV})
+		require.NoError(t, err, "RV %q", getRV)
+		require.Equal(t, &before.Items[0], obj, "RV %q", getRV)
+	}
+
+	for _, options := range []*metainternal.ListOptions{
+		nil,
+		{ResourceVersion: "0"},
+		{ResourceVersion: rv},
+		{ResourceVersion: rv, ResourceVersionMatch: metav1.ResourceVersionMatchExact},
+	} {
+		got, err := s.List(ctx, options)
+		require.NoError(t, err)
+		require.Equal(t, before, got, "options %+v", options)
+	}
+
+	prefill, err := s.Watch(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(prefill.Stop)
+	event(t, prefill, watch.Added, "first", rv)
+
+	// A past expiry renders as its timestamp in the table.
+	table, err := s.ConvertToTable(ctx, &before.Items[0], nil)
+	require.NoError(t, err)
+	require.Len(t, table.Rows, 1)
+	require.Equal(t, before.Items[0].Status.ExpiresAt.UTC().Format(time.RFC3339), table.Rows[0].Cells[3])
+
+	// The reaper's ledger write removes the grant and produces the event.
+	_, _, err = s.store.Update(ctx, false, func(l *ledger.Ledger) error {
+		removed, _ := l.Reap(c.Now(), nil)
+		require.Len(t, removed, 1)
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	reaped := cached(t, s).ResourceVersion
+	require.NotEqual(t, rv, reaped)
+	event(t, informer, watch.Deleted, "first", reaped)
+	event(t, prefill, watch.Deleted, "first", reaped)
+
+	_, err = s.Get(ctx, "first", nil)
+	require.True(t, apierrors.IsNotFound(err), "%v", err)
+
+	listed, err = s.List(ctx, &metainternal.ListOptions{ResourceVersion: "0"})
+	require.NoError(t, err)
+
+	after, ok := listed.(*rebound.NodeGrantList)
+	require.True(t, ok)
+	require.Equal(t, reaped, after.ResourceVersion)
+	require.Empty(t, after.Items)
 }
 
 func TestCreateChecksNamespaceOnRetry(t *testing.T) {
