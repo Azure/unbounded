@@ -430,6 +430,10 @@ func (c sidecarTags) matches(tag string, weak bool) bool {
 	return false
 }
 
+// sidecarRange selects the bytes to serve. Following RFC 9110 section 14.2 and
+// S3, a Range header that is repeated, malformed, multi-range, reversed, or in
+// an unknown unit is ignored and the full object is served. Only a valid single
+// byte range that the object cannot satisfy returns 416.
 func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bool, status int) {
 	values, present := h["Range"]
 	if !present {
@@ -437,17 +441,17 @@ func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bo
 	}
 
 	if len(values) != 1 {
-		return 0, 0, false, http.StatusBadRequest
+		return 0, size, false, 0
 	}
 
 	unit, s, ok := strings.Cut(strings.Trim(values[0], " \t"), "=")
 	if !ok || unit == "" {
-		return 0, 0, false, http.StatusBadRequest
+		return 0, size, false, 0
 	}
 
 	for _, c := range unit {
 		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && !strings.ContainsRune("!#$%&'*+-.^_`|~", c) {
-			return 0, 0, false, http.StatusBadRequest
+			return 0, size, false, 0
 		}
 	}
 
@@ -457,13 +461,13 @@ func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bo
 
 	first, last, ok := strings.Cut(s, "-")
 	if !ok || first == "" && last == "" {
-		return 0, 0, false, http.StatusBadRequest
+		return 0, size, false, 0
 	}
 
 	if first == "" {
 		suffix, valid := sidecarRangeNumber(last)
 		if !valid {
-			return 0, 0, false, http.StatusBadRequest
+			return 0, size, false, 0
 		}
 
 		if suffix == 0 || size == 0 {
@@ -477,14 +481,14 @@ func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bo
 
 	start, ok := sidecarRangeNumber(first)
 	if !ok {
-		return 0, 0, false, http.StatusBadRequest
+		return 0, size, false, 0
 	}
 
 	end := uint64(0)
 	if last != "" {
 		end, ok = sidecarRangeNumber(last)
 		if !ok || end < start {
-			return 0, 0, false, http.StatusBadRequest
+			return 0, size, false, 0
 		}
 	}
 

@@ -304,53 +304,87 @@ func TestSidecarInvalidRanges(t *testing.T) {
 		value  string
 		status int
 	}{
+		// Valid single byte ranges that the object cannot satisfy.
 		{"bytes=4-", 416},
 		{"BYTES=4-", 416},
+		{"bytes=4-4", 416},
 		{"bytes=-0", 416},
 		{"bytes=999-1000", 416},
-		{"bytes=2-1", 400},
-		{"bytes=0-1,2-3", 400},
-		{"BYTES=0-1,2-3", 400},
-		{"bytes", 400},
-		{"=0-1", 400},
-		{"bytes =0-1", 400},
-		{"by tes=0-1", 400},
-		{"bytés=0-1", 400},
-		{"bytes=", 400},
-		{"bytes=-", 400},
-		{"ByTeS=-", 400},
-		{"bytes=+1-2", 400},
-		{"bytes=0-+1", 400},
-		{"bytes=0-1-2", 400},
-		{"bytes= 0-1", 400},
-		{"bytes=18446744073709551616-", 400},
-		{"bytes=-bad", 400},
-		{"bytes=-18446744073709551616", 400},
-		{"", 400},
+		{"bytes=9223372036854775807-", 416},
+		// Valid ranges that are satisfiable stay partial.
+		{"Bytes=0-1", 206},
+		{"bytes=3-3", 206},
+		// Invalid or unsupported ranges are ignored per RFC 9110 and S3.
+		{"bytes=2-1", 200},
+		{"bytes=0-1,2-3", 200},
+		{"BYTES=0-1,2-3", 200},
+		{"bytes=0-1, 2-3", 200},
+		{"items=0-1", 200},
+		{"items=4-", 200},
+		{"bytes", 200},
+		{"=0-1", 200},
+		{"bytes =0-1", 200},
+		{"by tes=0-1", 200},
+		{"bytés=0-1", 200},
+		{"bytes=", 200},
+		{"bytes=-", 200},
+		{"ByTeS=-", 200},
+		{"bytes=+1-2", 200},
+		{"bytes=0-+1", 200},
+		{"bytes=0-1-2", 200},
+		{"bytes= 0-1", 200},
+		{"bytes=18446744073709551616-", 200},
+		{"bytes=-bad", 200},
+		{"bytes=-18446744073709551616", 200},
+		{"bytes=5-4", 200},
+		{"", 200},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
 			for _, method := range []string{"GET", "HEAD"} {
 				t.Run(method, func(t *testing.T) {
 					w := sidecarTestRequest(h, method, "/bucket/key", http.Header{"Range": {tc.value}})
-					if w.Code != tc.status {
-						t.Fatalf("status %d want %d", w.Code, tc.status)
+
+					want := tc.status
+					if method == "HEAD" && want == 206 {
+						want = 200
 					}
 
-					if tc.status == 416 && w.Header().Get("Content-Range") != "bytes */4" {
-						t.Fatal("missing unsatisfied range size")
+					if w.Code != want {
+						t.Fatalf("status %d want %d", w.Code, want)
+					}
+
+					switch tc.status {
+					case 416:
+						if w.Header().Get("Content-Range") != "bytes */4" {
+							t.Fatal("missing unsatisfied range size")
+						}
+					case 200:
+						if w.Header().Get("Content-Range") != "" || w.Header().Get("Content-Length") != "4" {
+							t.Fatalf("ignored range headers: %v", w.Header())
+						}
+
+						if method == "GET" && w.Body.String() != "data" {
+							t.Fatalf("ignored range body %q", w.Body.String())
+						}
 					}
 
 					if method == "HEAD" && w.Body.Len() != 0 {
-						t.Fatal("HEAD error body")
+						t.Fatal("HEAD body")
 					}
 				})
 			}
 		})
 	}
 
-	w := sidecarTestRequest(h, "GET", "/bucket/key", http.Header{"Range": {"bytes=0-1", "bytes=2-3"}})
-	if w.Code != 400 {
-		t.Fatal("multiple ranges accepted")
+	for _, method := range []string{"GET", "HEAD"} {
+		w := sidecarTestRequest(h, method, "/bucket/key", http.Header{"Range": {"bytes=0-1", "bytes=2-3"}})
+		if w.Code != 200 || w.Header().Get("Content-Range") != "" || w.Header().Get("Content-Length") != "4" {
+			t.Fatalf("%s multiple Range headers: %d %v", method, w.Code, w.Header())
+		}
+
+		if method == "GET" && w.Body.String() != "data" {
+			t.Fatalf("multiple Range headers body %q", w.Body.String())
+		}
 	}
 }
 
@@ -622,6 +656,13 @@ func TestSidecarEmptyObject(t *testing.T) {
 		w = sidecarTestRequest(h, method, "/bucket/key", http.Header{"Range": {"items=0-"}})
 		if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") != "0" || w.Header().Get("Content-Range") != "" {
 			t.Fatalf("empty unknown range: %d %v %q", w.Code, w.Header(), w.Body.String())
+		}
+
+		for _, value := range []string{"bytes=1-0", "bytes=0-1,2-3", "bytes=x-"} {
+			w = sidecarTestRequest(h, method, "/bucket/key", http.Header{"Range": {value}})
+			if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") != "0" || w.Header().Get("Content-Range") != "" {
+				t.Fatalf("empty invalid range %q: %d %v %q", value, w.Code, w.Header(), w.Body.String())
+			}
 		}
 	}
 }
@@ -1254,7 +1295,7 @@ func TestSidecarRangeClampsHugeNumbers(t *testing.T) {
 		{"bytes=2-" + huge, 2, 8, 0},
 		{"bytes=-" + huge, 0, 10, 0},
 		{"bytes=" + huge + "-", 0, 0, http.StatusRequestedRangeNotSatisfiable},
-		{"bytes=0-18446744073709551616", 0, 0, http.StatusBadRequest},
+		{"bytes=0-18446744073709551616", 0, 10, 0},
 	} {
 		h := http.Header{"Range": {tc.header}}
 

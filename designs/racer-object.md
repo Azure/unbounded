@@ -161,9 +161,13 @@ reach it.
 2. Check `If-Match` (strong compare, 412) and `If-None-Match` (weak compare,
    304).
 3. Parse the range. Open and suffix ranges are supported and clamped to the
-   size. The `bytes` unit is case-insensitive. Unknown range units are
-   ignored, so the full object is selected. Malformed byte ranges and
-   multiple ranges return 400. A range that starts past the end returns 416.
+   size. The `bytes` unit is case-insensitive. As RFC 9110 section 14.2
+   allows and S3 does, a `Range` that cannot be used is ignored and the full
+   object is served with 200. This covers unknown units, malformed values,
+   multi-range sets, a last position before the first, and repeated `Range`
+   headers. Only a valid single byte range that the object cannot satisfy
+   returns 416: one that starts at or past the end, a zero-length suffix, or
+   any byte range on an empty object.
 4. HEAD returns 200 with headers, even for a ranged HEAD. This matches S3.
 5. GET asks Racer for the range, pinned to the ETag from step 1. If the size
    or content type changed, it returns 502. An internal pin failure returns
