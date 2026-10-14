@@ -12,11 +12,99 @@ import (
 	"os"
 	"strings"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+// firstBootOwner authorizes the installed OS after handoff, even when the ISO
+// bytes are released or the operation is terminal. Final reports end this claim.
+func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOwner, bool, error) {
+	if p.Client == nil {
+		return nil, true, fmt.Errorf("media client unavailable")
+	}
+
+	var ops v1alpha3.MachineOperationList
+	if err := p.Client.List(ctx, &ops); err != nil {
+		return nil, true, err
+	}
+
+	var found *mediaOwner
+
+	for i := range ops.Items {
+		op := &ops.Items[i]
+		if op.Spec.OperationKind != v1alpha3.OperationHostReplace {
+			continue
+		}
+
+		for j := range op.Status.Targets {
+			target := &op.Status.Targets[j]
+
+			b := target.BootMedia
+			if b == nil || b.Netboot == nil || len(b.Netboot.DHCPLeases) == 0 || b.Netboot.DHCPLeases[0].IPv4 != ip || !b.ImageWritten || b.RebootRequestedAt == nil || b.Abandoned {
+				continue
+			}
+
+			cond := apimeta.FindStatusCondition(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+			if cond != nil && (cond.Status == metav1.ConditionTrue || (cond.Status == metav1.ConditionFalse && cond.Reason == "Failed")) {
+				continue
+			}
+
+			if found != nil {
+				return nil, true, fmt.Errorf("ambiguous media first-boot lease")
+			}
+
+			if b.MachineUID == "" || validateMediaLease(b.Netboot) != nil {
+				return nil, true, fmt.Errorf("invalid frozen media identity or lease")
+			}
+
+			var machine v1alpha3.Machine
+			if err := p.Client.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &machine); err != nil {
+				return nil, true, err
+			}
+
+			if machine.UID != b.MachineUID || !machine.DeletionTimestamp.IsZero() {
+				return nil, true, fmt.Errorf("media machine identity changed")
+			}
+
+			if machine.Spec.Host == nil {
+				machine.Spec.Host = &v1alpha3.HostSpec{}
+			}
+
+			machine.Spec.Host.Netboot = b.Netboot.DeepCopy()
+			found = &mediaOwner{machine: &machine, op: op, index: j}
+		}
+	}
+
+	return found, found != nil, nil
+}
+
+// Record against the authorized target, not a later operation for this Machine.
+func (p *MediaProvider) recordFirstBootCondition(ctx context.Context, o *mediaOwner, ev *cloudInitEvent) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current, claimed, err := p.firstBootOwner(ctx, o.status().Netboot.DHCPLeases[0].IPv4)
+		if err != nil {
+			return err
+		}
+
+		if !claimed || current.op.UID != o.op.UID || current.status().ID != o.status().ID {
+			return fmt.Errorf("media first-boot ownership changed")
+		}
+
+		cond := buildCloudInitCondition(ev, current.op.Generation)
+		if cond == nil {
+			return nil
+		}
+
+		base := current.op.DeepCopy()
+		apimeta.SetStatusCondition(&current.op.Status.Targets[current.index].Conditions, *cond)
+
+		return p.Client.Status().Patch(ctx, current.op, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
+}
 
 // artifactOwner claims the original lease before a mutable Machine IP lookup.
 // A revoked claim stays blocked rather than falling through to PXE serving.

@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -29,6 +31,184 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 )
+
+func firstBootFixture(t *testing.T) (*HTTPServer, *v1alpha3.Machine, *v1alpha3.MachineOperation) {
+	t.Helper()
+	p, m, op := mediaFixture(t, "amd64")
+	b := op.Status.Targets[0].BootMedia
+	now := metav1.Now()
+	b.ImageWritten, b.Cleaned, b.Released = true, true, true
+	b.RebootRequestedAt = &now
+	b.Netboot.CloudInit = &v1alpha3.CloudInitSpec{UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "frozen-user-data", Namespace: "default"}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "frozen-user-data", Namespace: "default"}, Data: map[string]string{"user-data": "#cloud-config\nhostname: frozen-host\n"}}
+	op.Status.Phase = v1alpha3.OperationPhaseFailed
+	m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.99"
+	m.Spec.Netboot().DHCPLeases[0].Gateway = "192.0.2.254"
+	m.Spec.Netboot().NetbootImage = "test/changed:latest"
+
+	op.Status.Targets = append(op.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: "other-host"})
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(op).WithObjects(m, op, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	p.Client, p.Resolver.Reader = fc, fc
+	p.Resolver.Cluster = &StaticClusterInfo{}
+
+	files := map[string][]byte{}
+	for _, name := range []string{"meta-data", "vendor-data", "network-config"} {
+		files["cloud-init/"+name+".tmpl"] = []byte(`{{ .Machine.Name }} {{ .BootLease.IPv4 }} {{ .BootLease.Gateway }}`)
+	}
+
+	require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("a", 64), files))
+
+	return &HTTPServer{Media: p, FileResolver: *p.Resolver, StatusRecorder: &recordingStatusRecorder{}}, m, op
+}
+
+func firstBootRequest(h *HTTPServer, path, ip, body string) *httptest.ResponseRecorder {
+	method := http.MethodGet
+	if body != "" {
+		method = http.MethodPost
+	}
+
+	r := httptest.NewRequest(method, path, strings.NewReader(body))
+	r.RemoteAddr = ip + ":4321"
+	w := httptest.NewRecorder()
+
+	switch path {
+	case "/cloudinit/log":
+		h.handleCloudInitLog(w, r)
+	case "/unbounded-agent/install-log":
+		h.handleInstallLog(w, r)
+	default:
+		h.handleFile(w, r)
+	}
+
+	return w
+}
+
+func TestMediaFirstBootFrozenLeaseAndReports(t *testing.T) {
+	for _, result := range []string{"SUCCESS", "FAIL"} {
+		t.Run(result, func(t *testing.T) {
+			h, m, op := firstBootFixture(t)
+			for _, name := range []string{"meta-data", "vendor-data", "network-config", "user-data"} {
+				w := firstBootRequest(h, "/cloud-init/"+name, "192.0.2.20", "")
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+				if name == "user-data" {
+					require.Equal(t, "#cloud-config\nhostname: frozen-host\n", w.Body.String())
+				} else {
+					require.Equal(t, "host 192.0.2.20 192.0.2.1", w.Body.String())
+				}
+			}
+			// First-boot access does not restore installer artifact access.
+			require.Equal(t, http.StatusNotFound, firstBootRequest(h, "/vmlinuz", "192.0.2.20", "").Code)
+
+			next := &v1alpha3.MachineOperation{ObjectMeta: metav1.ObjectMeta{Name: "successor", UID: "successor-uid"}, Spec: v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace, MachineRef: m.Name}}
+			require.NoError(t, h.Media.Client.Create(t.Context(), next))
+			require.Equal(t, http.StatusOK, firstBootRequest(h, "/unbounded-agent/install-log", "192.0.2.20", "install output").Code)
+
+			for _, body := range []string{`{"name":"init-local","event_type":"start"}`, `{"name":"modules-final","event_type":"finish","result":"` + result + `"}`} {
+				require.Equal(t, http.StatusOK, firstBootRequest(h, "/cloudinit/log", "192.0.2.20", body).Code)
+				require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+				require.NotNil(t, apimeta.FindStatusCondition(op.Status.Targets[0].Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
+			}
+
+			cond := apimeta.FindStatusCondition(op.Status.Targets[0].Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+			if result == "SUCCESS" {
+				require.Equal(t, metav1.ConditionTrue, cond.Status)
+			} else {
+				require.Equal(t, "Failed", cond.Reason)
+			}
+
+			require.Empty(t, op.Status.Targets[1].Conditions)
+			require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(next), next))
+			require.Empty(t, next.Status.Conditions)
+			require.Empty(t, h.StatusRecorder.(*recordingStatusRecorder).conditionEvents())
+			require.Equal(t, http.StatusNotFound, firstBootRequest(h, "/cloud-init/meta-data", "192.0.2.20", "").Code)
+			require.Equal(t, http.StatusOK, firstBootRequest(h, "/cloudinit/log", "192.0.2.20", `{"name":"init-local","event_type":"start"}`).Code)
+			require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+			require.Equal(t, *cond, *apimeta.FindStatusCondition(op.Status.Targets[0].Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
+		})
+	}
+}
+
+func TestMediaFirstBootAuthorization(t *testing.T) {
+	for _, scenario := range []string{"uid mismatch", "uid mismatch live lease", "abandoned", "not written", "no reboot", "ambiguous", "released successor"} {
+		t.Run(scenario, func(t *testing.T) {
+			h, m, op := firstBootFixture(t)
+
+			switch scenario {
+			case "uid mismatch", "uid mismatch live lease":
+				m.UID = "replacement-uid"
+				if scenario == "uid mismatch live lease" {
+					m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.20"
+				}
+
+				require.NoError(t, h.Media.Client.Update(t.Context(), m))
+			case "abandoned":
+				op.Status.Targets[0].BootMedia.Abandoned = true
+			case "not written":
+				op.Status.Targets[0].BootMedia.ImageWritten = false
+			case "no reboot":
+				op.Status.Targets[0].BootMedia.RebootRequestedAt = nil
+			case "ambiguous":
+				other := op.DeepCopy()
+				other.Name, other.UID, other.ResourceVersion = "duplicate", "duplicate-uid", ""
+				require.NoError(t, h.Media.Client.Create(t.Context(), other))
+			case "released successor":
+				apimeta.SetStatusCondition(&op.Status.Targets[0].Conditions, metav1.Condition{Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue, Reason: "Succeeded"})
+
+				m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.20"
+				m.Spec.Netboot().NetbootImage = op.Status.Targets[0].BootMedia.Netboot.NetbootImage
+				m.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolHTTP
+				require.NoError(t, h.Media.Client.Update(t.Context(), m))
+				next := &v1alpha3.MachineOperation{ObjectMeta: metav1.ObjectMeta{Name: "successor", UID: "successor-uid"}, Spec: v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace, MachineRef: m.Name}}
+				require.NoError(t, h.Media.Client.Create(t.Context(), next))
+			}
+
+			require.NoError(t, h.Media.Client.Status().Update(t.Context(), op))
+
+			w := firstBootRequest(h, "/cloud-init/network-config", "192.0.2.20", "")
+			if scenario == "released successor" {
+				require.Equal(t, http.StatusOK, w.Code)
+				require.Equal(t, "host 192.0.2.20 192.0.2.254", w.Body.String())
+			} else {
+				require.Equal(t, http.StatusNotFound, w.Code)
+			}
+
+			require.Equal(t, http.StatusOK, firstBootRequest(h, "/cloudinit/log", "192.0.2.20", `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`).Code)
+			require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+
+			if scenario == "released successor" {
+				require.Len(t, h.StatusRecorder.(*recordingStatusRecorder).conditionEvents(), 1)
+			} else {
+				require.Empty(t, op.Status.Targets[0].Conditions)
+				require.Empty(t, h.StatusRecorder.(*recordingStatusRecorder).conditionEvents())
+			}
+		})
+	}
+}
+
+func TestMediaFirstBootIgnoresForwardedLease(t *testing.T) {
+	h, _, _ := firstBootFixture(t)
+	r := httptest.NewRequest(http.MethodGet, "/cloud-init/meta-data", nil)
+	r.RemoteAddr = "192.0.2.30:4321"
+	r.Header.Set("X-Forwarded-For", "192.0.2.20")
+
+	w := httptest.NewRecorder()
+	h.handleFile(w, r)
+	require.Equal(t, http.StatusNotFound, w.Code)
+
+	r = httptest.NewRequest(http.MethodPost, "/cloudinit/log", strings.NewReader(`{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`))
+	r.RemoteAddr = "192.0.2.30:4321"
+	r.Header.Set("X-Forwarded-For", "192.0.2.20")
+
+	w = httptest.NewRecorder()
+	h.handleCloudInitLog(w, r)
+	require.Equal(t, http.StatusOK, w.Code)
+	o, claimed, err := h.Media.firstBootOwner(t.Context(), "192.0.2.20")
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Empty(t, o.op.Status.Targets[o.index].Conditions)
+}
 
 func TestMediaReleasedHistorySuccessorPrecedence(t *testing.T) {
 	for _, protocol := range []string{v1alpha3.PXEBootProtocolPXE, v1alpha3.PXEBootProtocolHTTP} {

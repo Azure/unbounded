@@ -195,7 +195,23 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	node, err := h.LookupNodeByIP(r.Context(), ip)
+	var (
+		node *v1alpha3.Machine
+		err  error
+	)
+
+	switch path {
+	case "cloud-init/meta-data", "cloud-init/user-data", "cloud-init/vendor-data", "cloud-init/network-config":
+		var owner *mediaOwner
+
+		node, owner, err = h.firstBootMachine(r)
+		if owner != nil {
+			ip = owner.status().Netboot.DHCPLeases[0].IPv4
+		}
+	default:
+		node, err = h.LookupNodeByIP(r.Context(), ip)
+	}
+
 	if err != nil {
 		log.Warn("no node for source IP", "err", err)
 		http.NotFound(w, r)
@@ -347,6 +363,26 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
 	}
 
+	if h.Media != nil {
+		_, owner, err := h.firstBootMachine(r)
+		if err != nil {
+			log.Warn("cloud-init report has no authorized Machine", "err", err)
+			w.WriteHeader(http.StatusOK)
+
+			return
+		}
+
+		if owner != nil {
+			if err := h.Media.recordFirstBootCondition(r.Context(), owner, &ev); err != nil {
+				log.Error("recording media cloud-init condition", "operation", owner.op.Name, "err", err)
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+			return
+		}
+	}
+
 	machineName := h.recordCloudInitCondition(r.Context(), log, ip, &ev)
 	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
@@ -364,8 +400,49 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Warn("unbounded-agent install log", "ip", ip, "body", strings.TrimSpace(string(body)))
+	log := slog.With("ip", ip)
+
+	if h.Media != nil {
+		node, owner, err := h.firstBootMachine(r)
+		if err != nil {
+			log.Warn("install log has no authorized Machine", "err", err)
+			w.WriteHeader(http.StatusOK)
+
+			return
+		}
+
+		log = log.With("node", node.Name)
+		if owner != nil {
+			log = log.With("operation", owner.op.Name)
+		}
+	}
+
+	log.Warn("unbounded-agent install log", "body", strings.TrimSpace(string(body)))
 	w.WriteHeader(http.StatusOK)
+}
+
+// Only the direct peer can claim a frozen lease. Keep the existing live-IP
+// lookup when no retained first-boot owner claims that peer.
+func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *mediaOwner, error) {
+	if h.Media != nil {
+		remote, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		o, claimed, err := h.Media.firstBootOwner(r.Context(), remote)
+		if claimed {
+			if err != nil {
+				return nil, nil, err
+			}
+
+			return o.machine, o, nil
+		}
+	}
+
+	node, err := h.LookupNodeByIP(r.Context(), clientIP(r))
+
+	return node, nil, err
 }
 
 // cloudInitLastStage is the final cloud-init stage. When this stage
