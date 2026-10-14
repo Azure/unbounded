@@ -342,13 +342,20 @@ func TestEvictorLedgerChangesDuringDelete(t *testing.T) {
 func TestEvictorDeleteChecksLedgerMetadata(t *testing.T) {
 	boom := errors.New("boom")
 
+	// The two reads around the pod list each read metadata, and only the
+	// first fetches the full ledger. Each delete then checks metadata.
 	for name, tc := range map[string]struct {
-		metaErr error
+		// failFrom is the first metadata read that fails, or 0 for none.
+		failFrom int
+		// meta and full are the metadata and full ledger reads.
+		meta, full int
 		// want is the number of pods left after the reconcile.
 		want int
 	}{
-		"unchanged ledger": {},
-		"metadata error":   {metaErr: boom, want: 5},
+		"unchanged ledger": {meta: 2 + 5, full: 1},
+		// The first failed check stops the sweep.
+		"metadata error on delete check": {failFrom: 3, meta: 3, full: 1, want: 5},
+		"metadata error on first read":   {failFrom: 1, meta: 1, want: 5},
 	} {
 		t.Run(name, func(t *testing.T) {
 			full, meta := 0, 0
@@ -361,8 +368,8 @@ func TestEvictorDeleteChecksLedgerMetadata(t *testing.T) {
 
 					meta++
 
-					if tc.metaErr != nil {
-						return tc.metaErr
+					if tc.failFrom != 0 && meta >= tc.failFrom {
+						return boom
 					}
 				}
 
@@ -377,18 +384,160 @@ func TestEvictorDeleteChecksLedgerMetadata(t *testing.T) {
 			r, c := newEvictor(t, configMap(t, grant("tenant", "g", "a", time.Hour)), funcs, pods...)
 
 			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
-			if tc.metaErr != nil {
-				require.ErrorIs(t, err, tc.metaErr)
-				// The first failed check stops the sweep.
-				require.Equal(t, 1, meta)
+			if tc.failFrom != 0 {
+				require.ErrorIs(t, err, boom)
 			} else {
 				require.NoError(t, err)
-				require.Equal(t, len(pods), meta)
 			}
 
-			// Only the reads around the pod list fetch the full ledger.
-			require.Equal(t, 2, full)
+			require.Equal(t, tc.meta, meta)
+			require.Equal(t, tc.full, full)
 			require.Len(t, remaining(t, c), tc.want)
+		})
+	}
+}
+
+func TestEvictorReusesCachedLedger(t *testing.T) {
+	old := grant("tenant-a", "g", "a", time.Hour)
+	old.UID = "a"
+	handoff := grant("tenant-b", "g", "a", time.Hour)
+	handoff.UID = "b"
+
+	full, meta := 0, 0
+	funcs := &interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		switch obj.(type) {
+		case *corev1.ConfigMap:
+			full++
+		case *metav1.PartialObjectMetadata:
+			meta++
+		}
+
+		return c.Get(ctx, key, obj, opts...)
+	}}
+
+	r, c := newEvictor(t, configMap(t, old), funcs, pod("tenant-a", "p", "a", testNow))
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}}
+
+	// The read after the pod list reuses the ledger fetched before it.
+	result, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, sweepInterval, result.RequeueAfter)
+	require.Equal(t, 1, full)
+	require.Equal(t, 2, meta)
+
+	// Sweeps of an unchanged ledger read only its metadata.
+	for range 3 {
+		_, err = r.Reconcile(t.Context(), req)
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, 1, full)
+	require.Equal(t, 2+3*2, meta)
+	require.Equal(t, []string{"tenant-a/p"}, remaining(t, c))
+
+	// A changed ledger is fetched in full again.
+	var cm corev1.ConfigMap
+	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm))
+	cm.Data = configMap(t, handoff).Data
+	require.NoError(t, c.Update(t.Context(), &cm))
+
+	full, meta = 0, 0
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, 1, full)
+	// Two reads around the pod list and one before deleting tenant-a's pod.
+	require.Equal(t, 3, meta)
+	require.Empty(t, remaining(t, c))
+}
+
+func TestEvictorLedgerChangesBetweenReads(t *testing.T) {
+	old := grant("tenant-a", "g", "a", time.Hour)
+	old.UID = "a"
+	handoff := grant("tenant-b", "g", "a", time.Hour)
+	handoff.UID = "b"
+	boom := errors.New("boom")
+
+	for name, tc := range map[string]struct {
+		// between runs after the first metadata read, before the full read.
+		between func(ctx context.Context, c client.WithWatch) error
+		fullErr error
+		lists   int
+		want    []string
+	}{
+		"ledger updated": {
+			between: func(ctx context.Context, c client.WithWatch) error {
+				var cm corev1.ConfigMap
+				if err := c.Get(ctx, types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm); err != nil {
+					return err
+				}
+
+				cm.Data = configMap(t, handoff).Data
+
+				return c.Update(ctx, &cm)
+			},
+			// The records carry the version of the full read, so the read
+			// after the pod list matches it and one list is enough.
+			lists: 1,
+			want:  []string{"tenant-b/p"},
+		},
+		"ledger deleted": {
+			between: func(ctx context.Context, c client.WithWatch) error {
+				return c.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "system", Name: ledger.ConfigMapName}})
+			},
+			want: []string{"tenant-a/p", "tenant-b/p"},
+		},
+		"full read error": {
+			fullErr: boom,
+			want:    []string{"tenant-a/p", "tenant-b/p"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			full, meta, lists := 0, 0, 0
+			funcs := &interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					switch obj.(type) {
+					case *corev1.ConfigMap:
+						full++
+
+						if tc.fullErr != nil {
+							return tc.fullErr
+						}
+					case *metav1.PartialObjectMetadata:
+						meta++
+
+						if err := c.Get(ctx, key, obj, opts...); err != nil || meta > 1 || tc.between == nil {
+							return err
+						}
+
+						return tc.between(ctx, c)
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				},
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*corev1.PodList); ok {
+						lists++
+					}
+
+					return c.List(ctx, list, opts...)
+				},
+			}
+
+			r, c := newEvictor(t, configMap(t, old), funcs,
+				pod("tenant-a", "p", "a", testNow),
+				pod("tenant-b", "p", "a", testNow),
+			)
+
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+			if tc.fullErr != nil {
+				require.ErrorIs(t, err, tc.fullErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, 1, full)
+			require.Equal(t, tc.lists, lists)
+			require.ElementsMatch(t, tc.want, remaining(t, c))
 		})
 	}
 }

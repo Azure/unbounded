@@ -189,19 +189,32 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 
 // ledgerRecords reads the ledger live and returns its resourceVersion, the
 // node's unexpired grant, and the node's release records. A missing ledger
-// has version "" and no records.
+// has version "" and no records. It reads the ledger's metadata first and
+// fetches the full ledger only when its version is not cached.
 func (r *evictor) ledgerRecords(ctx context.Context, node string) (string, *ledger.Grant, []*ledger.Release, error) {
-	var cm corev1.ConfigMap
-	if err := r.apiReader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, &cm); err != nil {
-		return "", nil, nil, client.IgnoreNotFound(err)
+	version, err := r.liveLedgerVersion(ctx)
+	if err != nil || version == "" {
+		return "", nil, nil, err
 	}
 
-	g, releases := r.nodeRecords(&cm, node)
+	g, releases, ok := r.cachedRecords(version, node)
+	if !ok {
+		var cm corev1.ConfigMap
+		if err := r.apiReader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, &cm); err != nil {
+			return "", nil, nil, client.IgnoreNotFound(err)
+		}
+
+		// The ledger can change after the metadata read. Return the version
+		// of the records.
+		version = cm.ResourceVersion
+		g, releases = r.nodeRecords(&cm, node)
+	}
+
 	if g != nil && g.Expired(r.clock.Now()) {
 		g = nil
 	}
 
-	return cm.ResourceVersion, g, releases, nil
+	return version, g, releases, nil
 }
 
 // liveLedgerVersion reads only the ledger's metadata live and returns its
@@ -235,6 +248,27 @@ func (r *evictor) nodeRecords(cm *corev1.ConfigMap, node string) (*ledger.Grant,
 		r.ledgerVersion = cm.ResourceVersion
 	}
 
+	return r.lookupLocked(node)
+}
+
+// cachedRecords returns read-only records from the index if it holds
+// version, and false otherwise.
+func (r *evictor) cachedRecords(version, node string) (*ledger.Grant, []*ledger.Release, bool) {
+	r.ledgerMu.Lock()
+	defer r.ledgerMu.Unlock()
+
+	if r.cachedLedger == nil || r.ledgerVersion != version {
+		return nil, nil, false
+	}
+
+	g, releases := r.lookupLocked(node)
+
+	return g, releases, true
+}
+
+// lookupLocked returns the node's records from the index. The caller must
+// hold ledgerMu.
+func (r *evictor) lookupLocked(node string) (*ledger.Grant, []*ledger.Release) {
 	key, _ := r.cachedLedger.NodeGrant(node)
 	g, _ := r.cachedLedger.Get(key)
 
