@@ -5,6 +5,7 @@ package redfish
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -305,36 +306,39 @@ func TestVirtualMediaRecovery(t *testing.T) {
 }
 
 func TestVirtualMediaCleanupUnavailable(t *testing.T) {
-	for _, failUnmount := range []bool{false, true} {
-		t.Run("unmount="+map[bool]string{true: "true", false: "false"}[failUnmount], func(t *testing.T) {
-			var paths []string
+	// 202 Accepted means the task may still be running, so it is not success.
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusAccepted} {
+		for _, failUnmount := range []bool{false, true} {
+			t.Run(fmt.Sprintf("status=%d/unmount=%t", status, failUnmount), func(t *testing.T) {
+				var paths []string
 
-			srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
-				paths = append(paths, r.URL.Path)
-				switch r.URL.Path {
-				case "/7" + rackSystemPath:
-					if !failUnmount {
-						w.WriteHeader(http.StatusServiceUnavailable)
+				srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+					paths = append(paths, r.URL.Path)
+					switch r.URL.Path {
+					case "/7" + rackSystemPath:
+						if !failUnmount {
+							w.WriteHeader(status)
+						}
+					case "/7" + remoteDrivePath + "Unmount":
+						w.WriteHeader(status)
+					default:
+						t.Errorf("unexpected request %s", r.URL.Path)
 					}
-				case "/7" + remoteDrivePath + "Unmount":
-					w.WriteHeader(http.StatusServiceUnavailable)
-				default:
-					t.Errorf("unexpected request %s", r.URL.Path)
+				})
+				c := dialRack(t, srv, "7")
+
+				err := c.CleanupVirtualMedia(t.Context(), testMedia)
+				require.Error(t, err)
+
+				want := []string{"/7" + rackSystemPath}
+				if failUnmount {
+					want = append(want, "/7"+remoteDrivePath+"Unmount")
 				}
+
+				require.Equal(t, want, paths)
+				require.NotContains(t, paths, rackTftpPath+"Delete")
 			})
-			c := dialRack(t, srv, "7")
-
-			err := c.CleanupVirtualMedia(t.Context(), testMedia)
-			require.Error(t, err)
-
-			want := []string{"/7" + rackSystemPath}
-			if failUnmount {
-				want = append(want, "/7"+remoteDrivePath+"Unmount")
-			}
-
-			require.Equal(t, want, paths)
-			require.NotContains(t, paths, rackTftpPath+"Delete")
-		})
+		}
 	}
 }
 

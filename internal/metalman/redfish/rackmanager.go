@@ -153,13 +153,15 @@ func slotPowerOnTarget(actions map[string]struct {
 }
 
 // rackRequest rejects malformed successful responses before recovery can hide them.
+// It also rejects 202 Accepted: the task may still be running, and callers
+// such as cleanup must not report success before the work is done.
 func rackRequest(ctx context.Context, session *bmcSession, method, path string, body any) ([]byte, error) {
 	data, status, err := session.do(ctx, method, path, body)
 	if err != nil {
 		return nil, err
 	}
 
-	if !isSuccessStatus(status) || (method == http.MethodGet && status != http.StatusOK) {
+	if !isSuccessStatus(status) || status == http.StatusAccepted || (method == http.MethodGet && status != http.StatusOK) {
 		return nil, redfishResponseError(method, path, status, data, checkCompletion(data))
 	}
 
