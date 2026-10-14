@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternal "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -327,6 +328,76 @@ func TestCreateChecksNodesOnRetry(t *testing.T) {
 
 	require.Equal(t, []string{"get configmaps", "get namespaces", "list nodes", "update configmaps", "get configmaps", "get namespaces", "list nodes"}, actions)
 	require.Empty(t, cached(t, s).Data)
+}
+
+func received(t *testing.T, w watch.Interface, typ watch.EventType, name string) *rebound.NodeGrant {
+	t.Helper()
+
+	select {
+	case e, ok := <-w.ResultChan():
+		require.True(t, ok, "watch closed")
+		g, ok := e.Object.(*rebound.NodeGrant)
+		require.True(t, ok)
+		require.Equal(t, typ, e.Type)
+		require.Equal(t, name, g.Name)
+
+		return g
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch event timed out")
+		return nil
+	}
+}
+
+func TestWatchResumeWithinInitialEvents(t *testing.T) {
+	s, _, ctx := fixture(t)
+	created(t, s, ctx, "first", "node-a")
+	created(t, s, ctx, "second", "node-b")
+
+	w, err := s.Watch(ctx, nil)
+	require.NoError(t, err)
+
+	defer w.Stop()
+
+	partial := received(t, w, watch.Added, "first").ResourceVersion
+	require.NotEqual(t, "3", partial, "a partial snapshot must not advertise the snapshot RV")
+	require.NotEqual(t, "0", partial)
+	require.NotEmpty(t, partial)
+	event(t, w, watch.Added, "second", "3")
+	w.Stop()
+
+	// The client stopped after the first initial event, so it must relist.
+	_, err = s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: partial})
+	require.True(t, apierrors.IsResourceExpired(err), "%v", err)
+
+	listed, err := s.List(ctx, &metainternal.ListOptions{ResourceVersion: partial})
+	require.NoError(t, err)
+
+	list, ok := listed.(*rebound.NodeGrantList)
+	require.True(t, ok)
+	require.Equal(t, "3", list.ResourceVersion)
+	require.Len(t, list.Items, 2)
+
+	// The last event this watcher receives carries the snapshot RV, even
+	// when the selector skips later grants.
+	filtered, err := s.Watch(ctx, &metainternal.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", "first")})
+	require.NoError(t, err)
+
+	defer filtered.Stop()
+
+	event(t, filtered, watch.Added, "first", "3")
+	require.Empty(t, filtered.ResultChan())
+
+	resumed, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "3"})
+	require.NoError(t, err)
+
+	defer resumed.Stop()
+
+	require.Empty(t, resumed.ResultChan())
+
+	_, _, err = s.Delete(ctx, "first", nil, nil)
+	require.NoError(t, err)
+	cached(t, s)
+	event(t, resumed, watch.Deleted, "first", "4")
 }
 
 func TestWatchResumeWithinDeletionBatch(t *testing.T) {

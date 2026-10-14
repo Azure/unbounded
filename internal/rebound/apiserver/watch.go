@@ -111,12 +111,25 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 		// An explicit sendInitialEvents=false starts at the current state
 		// without replaying it.
 	default:
+		// No prefix of the initial events is a resumable state, so only the
+		// last one this watcher receives carries the snapshot RV. The others
+		// carry it with a leading zero. List and get parse that as the same
+		// snapshot, but it never equals a history RV, so a watch resumed from
+		// it gets 410 and the client relists.
 		current := s.current
+
+		var last *rebound.NodeGrant
+
 		for _, g := range current.ledger.Grants() {
-			obj := grantObject(g, current.rv)
+			obj := grantObject(g, "0"+current.rv)
 			if !g.Expired(s.clock.Now()) && match(obj) {
 				initial = append(initial, watch.Event{Type: watch.Added, Object: obj})
+				last = obj
 			}
+		}
+
+		if last != nil {
+			last.ResourceVersion = current.rv
 		}
 	}
 
@@ -169,10 +182,11 @@ func (s *storage) watchHistoryIndex(ctx context.Context, rv string) (int, error)
 		if newest >= requested {
 			// Resume only from a revision the informer observed. If it skipped the
 			// requested revision, replaying from an older revision would resend
-			// changes the client already has, so the client must relist.
+			// changes the client already has, so the client must relist. The
+			// match is on the exact string so the zero-prefixed RVs of partial
+			// initial events never resume.
 			for i := len(s.history) - 1; i >= 0; i-- {
-				version, err := strconv.ParseUint(s.history[i].rv, 10, 64)
-				if err == nil && version == requested {
+				if s.history[i].rv == rv {
 					return i, nil
 				}
 			}
