@@ -41,12 +41,13 @@ func init() {
 // to detect updated images pushed under the same tag.
 const imageResyncInterval = 5 * time.Minute
 
-// OCIReconciler watches Machine CRs and pulls their referenced OCI images.
+// OCIReconciler watches Machines and retained operation media for OCI images.
 // Work items are deduplicated by image reference, architecture, and pull secret
 // so machines sharing the same pull identity only trigger one download.
 type OCIReconciler struct {
 	Client                      client.Client
 	Cache                       *OCICache
+	Site                        string
 	DefaultNetbootRef           string
 	DefaultNetbootPullSecretRef *v1alpha3.NamespacedSecretReference
 }
@@ -61,6 +62,7 @@ func (r *OCIReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("oci-image").
 		Watches(&v1alpha3.Machine{}, handler.EnqueueRequestsFromMapFunc(r.mapMachineToImage)).
+		Watches(&v1alpha3.MachineOperation{}, handler.EnqueueRequestsFromMapFunc(r.mapOperationToImage)).
 		Complete(r)
 }
 
@@ -99,6 +101,34 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		})
 	}
 
+	return imageReconcileRequests(refs)
+}
+
+func (r *OCIReconciler) mapOperationToImage(_ context.Context, obj client.Object) []reconcile.Request {
+	op, ok := obj.(*v1alpha3.MachineOperation)
+	if !ok || op.Spec.OperationKind != v1alpha3.OperationHostReplace {
+		return nil
+	}
+
+	var refs []imagePullRequest
+
+	for _, target := range op.Status.Targets {
+		media := target.BootMedia
+		if media == nil || media.Netboot == nil || media.Site != r.Site || mediaArtifactsReleased(op, target) {
+			continue
+		}
+
+		spec := media.Netboot
+		refs = append(refs,
+			imagePullRequest{ImageRef: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef},
+			imagePullRequest{ImageRef: spec.NetbootImage, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.NetbootPullSecretRef},
+		)
+	}
+
+	return imageReconcileRequests(refs)
+}
+
+func imageReconcileRequests(refs []imagePullRequest) []reconcile.Request {
 	reqs := make([]reconcile.Request, 0, len(refs))
 
 	seen := make(map[string]struct{}, len(refs))

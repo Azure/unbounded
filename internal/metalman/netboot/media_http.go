@@ -44,7 +44,7 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 
 			claimed = true
 
-			if target.BootMedia.Released && target.BootMedia.Cleaned && (op.Status.IsTerminal() || target.Phase == v1alpha3.OperationPhaseComplete || target.Phase == v1alpha3.OperationPhaseFailed) {
+			if mediaArtifactsReleased(&op, target) {
 				continue
 			}
 
@@ -70,6 +70,11 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 	}
 
 	return nil, claimed, fmt.Errorf("no active media artifact authorization")
+}
+
+func mediaArtifactsReleased(op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus) bool {
+	return target.BootMedia != nil && target.BootMedia.Released && target.BootMedia.Cleaned &&
+		(op.Status.IsTerminal() || target.Phase == v1alpha3.OperationPhaseComplete || target.Phase == v1alpha3.OperationPhaseFailed)
 }
 
 // Released history yields only to an explicit live PXE/HTTP install. Changing

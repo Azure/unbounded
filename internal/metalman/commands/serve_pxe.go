@@ -207,6 +207,7 @@ func ServePXECmd() *cobra.Command {
 			if err := (&netboot.OCIReconciler{
 				Client:                      mgr.GetClient(),
 				Cache:                       ociCache,
+				Site:                        site,
 				DefaultNetbootRef:           defaultNetbootImage,
 				DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
 			}).SetupWithManager(mgr); err != nil {
