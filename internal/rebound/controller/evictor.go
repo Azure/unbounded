@@ -26,6 +26,10 @@ import (
 // a pod creation that started during a grant finishes after its release.
 const sweepInterval = 15 * time.Second
 
+// maxListAttempts bounds how often a reconcile lists pods while the ledger
+// keeps changing before it gives up and retries with backoff.
+const maxListAttempts = 3
+
 // evictor deletes pods that a grant does not allow on its nodes:
 //
 //   - While a grant is active, pods from other namespaces.
@@ -53,27 +57,44 @@ type evictor struct {
 }
 
 func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var cm corev1.ConfigMap
-	if err := r.apiReader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, &cm); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
 	node := req.Name
-	g, releases := r.nodeRecords(&cm, node)
 
-	var active *ledger.Grant
-
-	if g != nil && !g.Expired(r.clock.Now()) {
-		active = g
-	}
-
-	if active == nil && len(releases) == 0 {
-		return ctrl.Result{}, nil
+	version, active, releases, err := r.ledgerRecords(ctx, node)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	var pods corev1.PodList
-	if err := r.apiReader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node}); err != nil {
-		return ctrl.Result{}, err
+
+	// The ledger can change while pods are listed. For example, the node can
+	// move to another namespace whose new pods are in the list. Only judge
+	// pods against a ledger version that did not change during the list.
+	for attempt := 1; ; attempt++ {
+		if active == nil && len(releases) == 0 {
+			return ctrl.Result{}, nil
+		}
+
+		if err := r.apiReader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node}); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		after, afterActive, afterReleases, err := r.ledgerRecords(ctx, node)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Use the records from the second read so expiry is checked again.
+		active, releases = afterActive, afterReleases
+
+		if after == version {
+			break
+		}
+
+		if attempt == maxListAttempts {
+			return ctrl.Result{}, fmt.Errorf("ledger changed while listing pods on node %s", node)
+		}
+
+		version = after
 	}
 
 	var errs []error
@@ -142,6 +163,23 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// ledgerRecords reads the ledger live and returns its resourceVersion, the
+// node's unexpired grant, and the node's release records. A missing ledger
+// has version "" and no records.
+func (r *evictor) ledgerRecords(ctx context.Context, node string) (string, *ledger.Grant, []*ledger.Release, error) {
+	var cm corev1.ConfigMap
+	if err := r.apiReader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, &cm); err != nil {
+		return "", nil, nil, client.IgnoreNotFound(err)
+	}
+
+	g, releases := r.nodeRecords(&cm, node)
+	if g != nil && g.Expired(r.clock.Now()) {
+		g = nil
+	}
+
+	return cm.ResourceVersion, g, releases, nil
 }
 
 // nodeRecords returns read-only records from an index rebuilt once per ledger version.

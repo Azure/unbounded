@@ -142,6 +142,111 @@ func TestEvictorReadsLiveLedger(t *testing.T) {
 	require.Equal(t, []string{"tenant-b/p"}, remaining(t, c))
 }
 
+func TestEvictorLedgerChangesDuringPodList(t *testing.T) {
+	old := grant("tenant-a", "g", "n1", time.Hour)
+	old.UID = "a"
+	handoff := grant("tenant-b", "g", "n1", time.Hour)
+	handoff.UID = "b"
+
+	// update replaces the ledger with one holding grants, as another writer would.
+	update := func(ctx context.Context, c client.WithWatch, grants ...*ledger.Grant) error {
+		var cm corev1.ConfigMap
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm); err != nil {
+			return err
+		}
+
+		cm.Data = configMap(t, grants...).Data
+
+		return c.Update(ctx, &cm)
+	}
+
+	tests := []struct {
+		name string
+		// during runs inside each pod list, after the list returns.
+		during  func(ctx context.Context, c client.WithWatch, lists int) error
+		lists   int
+		wantErr bool
+		want    []string
+	}{
+		{
+			name: "handoff during first list",
+			during: func(ctx context.Context, c client.WithWatch, lists int) error {
+				if lists > 1 {
+					return nil
+				}
+
+				// tenant-a releases the node, tenant-b takes it and creates a pod.
+				if err := update(ctx, c, handoff); err != nil {
+					return err
+				}
+
+				return c.Create(ctx, pod("tenant-b", "new", "n1", testNow))
+			},
+			lists: 2,
+			// The listed tenant-b pod was not judged against tenant-a's grant.
+			// The second list sees both pods under tenant-b's grant.
+			want: []string{"tenant-b/new", "tenant-b/p"},
+		},
+		{
+			name: "ledger keeps changing",
+			during: func(ctx context.Context, c client.WithWatch, lists int) error {
+				if lists%2 == 1 {
+					return update(ctx, c, handoff)
+				}
+
+				return update(ctx, c, old)
+			},
+			lists:   maxListAttempts,
+			wantErr: true,
+			want:    []string{"tenant-a/p", "tenant-b/p"},
+		},
+		{
+			name: "ledger deleted during list",
+			during: func(ctx context.Context, c client.WithWatch, _ int) error {
+				return c.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "system", Name: ledger.ConfigMapName}})
+			},
+			lists: 1,
+			want:  []string{"tenant-a/p", "tenant-b/p"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lists, reconciled := 0, false
+			funcs := &interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if err := c.List(ctx, list, opts...); err != nil {
+					return err
+				}
+
+				if _, ok := list.(*corev1.PodList); !ok || reconciled {
+					return nil
+				}
+
+				lists++
+
+				return tt.during(ctx, c, lists)
+			}}
+
+			r, c := newEvictor(t, configMap(t, old), funcs,
+				pod("tenant-a", "p", "n1", testNow),
+				pod("tenant-b", "p", "n1", testNow),
+			)
+
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}})
+			reconciled = true
+
+			if tt.wantErr {
+				require.ErrorContains(t, err, "ledger changed while listing pods")
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tt.lists, lists)
+			require.ElementsMatch(t, tt.want, remaining(t, c))
+		})
+	}
+}
+
 func TestEvictorRelease(t *testing.T) {
 	g := grant("tenant", "g", "a", time.Hour)
 	g.UID = "u1"
