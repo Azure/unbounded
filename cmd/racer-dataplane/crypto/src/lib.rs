@@ -295,9 +295,7 @@ pub mod identity {
             bundle
                 .cache_keys
                 .sort_unstable_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
-            let encoded = Zeroizing::new(
-                racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
-            );
+            let encoded = racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?;
             let hash: [u8; 32] = Sha256::digest(&*encoded).into();
             let mut state = self.state.borrow_mut();
             if let Some(old) = state.accepted.as_ref()
