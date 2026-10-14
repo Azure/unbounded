@@ -338,6 +338,17 @@ func TestSidecarInvalidRanges(t *testing.T) {
 		{"bytes=-bad", 200},
 		{"bytes=-18446744073709551616", 200},
 		{"bytes=5-4", 200},
+		// Reversed ranges stay ignored even when both bounds clamp to MaxInt64.
+		{"bytes=9223372036854775808-9223372036854775807", 200},
+		{"bytes=18446744073709551615-9223372036854775808", 200},
+		{"bytes=0009223372036854775808-9223372036854775807", 200},
+		{"bytes=18446744073709551615-018446744073709551614", 200},
+		// Non-reversed huge ranges still clamp and stay unsatisfiable.
+		{"bytes=9223372036854775807-9223372036854775808", 416},
+		{"bytes=9223372036854775808-9223372036854775808", 416},
+		{"bytes=09223372036854775808-18446744073709551615", 416},
+		{"bytes=00004-0004", 416},
+		{"bytes=002-0003", 206},
 		{"", 200},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
@@ -1524,4 +1535,24 @@ func sidecarCountingHandler(t *testing.T, client *sidecarCountingClient) http.Ha
 	}
 
 	return &sidecar{client: client, scope: bound}
+}
+
+func TestSidecarDecimalLess(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"9223372036854775807", "9223372036854775808", true},
+		{"9223372036854775808", "9223372036854775807", false},
+		{"0009223372036854775808", "9223372036854775808", false},
+		{"9", "10", true},
+		{"010", "9", false},
+		{"0", "000", false},
+		{"", "0", false},
+		{"1", "2", true},
+	} {
+		if got := sidecarDecimalLess(tc.a, tc.b); got != tc.want {
+			t.Fatalf("%q < %q = %v", tc.a, tc.b, got)
+		}
+	}
 }

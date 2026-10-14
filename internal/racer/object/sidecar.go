@@ -594,7 +594,8 @@ func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bo
 	end := uint64(0)
 	if last != "" {
 		end, ok = sidecarRangeNumber(last)
-		if !ok || end < start {
+		// Compare the digits, since clamping can make reversed bounds equal.
+		if !ok || sidecarDecimalLess(last, first) {
 			return 0, size, false, 0
 		}
 	}
@@ -632,4 +633,17 @@ func sidecarRangeNumber(s string) (uint64, bool) {
 	}
 
 	return uint64(n), true
+}
+
+// sidecarDecimalLess reports whether decimal digit string a is less than b,
+// ignoring leading zeros.
+func sidecarDecimalLess(a, b string) bool {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+
+	if len(a) != len(b) {
+		return len(a) < len(b)
+	}
+
+	return a < b
 }
