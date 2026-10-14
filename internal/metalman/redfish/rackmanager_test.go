@@ -618,6 +618,8 @@ func TestRackManagerPowerFallback(t *testing.T) {
 		{"bladeMissingPower", 200, `{}`, "", "", false},
 		{"bladeInvalidPower", 200, `{"PowerState":"--"}`, "", "", false},
 		{"bladeOn", 200, `{"PowerState":"On"}`, "", PowerOn, false},
+		{"bladePoweringOn", 200, `{"PowerState":"PoweringOn"}`, "", "PoweringOn", false},
+		{"bladePoweringOff", 200, `{"PowerState":"PoweringOff"}`, "", "PoweringOff", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var fallback atomic.Int64

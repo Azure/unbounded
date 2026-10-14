@@ -60,6 +60,10 @@ type PowerState string
 const (
 	PowerOn  PowerState = "On"
 	PowerOff PowerState = "Off"
+
+	// Redfish transition states reported while power is changing.
+	powerTurningOn  PowerState = "PoweringOn"
+	powerTurningOff PowerState = "PoweringOff"
 )
 
 // ResetType represents a Redfish ComputerSystem.Reset action type.

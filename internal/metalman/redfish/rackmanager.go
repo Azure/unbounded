@@ -229,7 +229,10 @@ func (c *Client) rackPowerState(ctx context.Context) (PowerState, error) {
 			return "", fmt.Errorf("parsing blade power state: %w", err)
 		}
 
-		if result.PowerState != PowerOn && result.PowerState != PowerOff {
+		switch result.PowerState {
+		case PowerOn, PowerOff, powerTurningOn, powerTurningOff:
+			// Transition states are valid; callers poll until they settle.
+		default:
 			return "", fmt.Errorf("invalid blade power state %q", result.PowerState)
 		}
 
