@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -2378,5 +2380,116 @@ func waitForSlicesDirty(t *testing.T, ctx context.Context, sc *SiteController) {
 	})
 	if err != nil {
 		t.Fatalf("SiteNodeSlice event did not mark slices dirty: %v", err)
+	}
+}
+
+func sliceWorkSites(t *testing.T, sc *SiteController) []string {
+	t.Helper()
+
+	work, ok := sc.takeSliceWork()
+	if !ok || work.all {
+		t.Fatalf("slice work = %#v, available = %v, want targeted Sites", work, ok)
+	}
+
+	sites := make([]string, 0, len(work.sites))
+	for site := range work.sites {
+		sites = append(sites, site)
+	}
+
+	sort.Strings(sites)
+
+	return sites
+}
+
+func newIPMatchedSliceTestController() *SiteController {
+	return &SiteController{
+		workqueue: workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		sitesCache: []unboundedv1alpha3.Site{
+			{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}}},
+		},
+		pendingPodCIDRs: make(map[string]*pendingPodCIDRAssignment),
+	}
+}
+
+func sliceTestNode(ip string, labels map[string]string) *corev1.Node {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", UID: "node-uid", Labels: labels}}
+	if ip != "" {
+		node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ip}}
+	}
+
+	return node
+}
+
+func TestNodeUpdateDirtiesIPMatchedSites(t *testing.T) {
+	t.Parallel()
+
+	sc := newIPMatchedSliceTestController()
+	defer sc.workqueue.ShutDown()
+
+	sc.handleNodeUpdate(sliceTestNode("10.1.0.5", nil), sliceTestNode("10.2.0.5", nil))
+
+	if got, want := sliceWorkSites(t, sc), []string{"site-a", "site-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirty Sites = %v, want %v", got, want)
+	}
+}
+
+func TestNodeUpdateLosingAddressDirtiesPreviousSite(t *testing.T) {
+	t.Parallel()
+
+	sc := newIPMatchedSliceTestController()
+	defer sc.workqueue.ShutDown()
+
+	sc.handleNodeUpdate(sliceTestNode("10.1.0.5", nil), sliceTestNode("", nil))
+
+	if got, want := sliceWorkSites(t, sc), []string{"site-a"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirty Sites = %v, want %v", got, want)
+	}
+}
+
+func TestNodeDeleteDirtiesIPMatchedAndLabeledSites(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		obj  interface{}
+	}{
+		{name: "delete", obj: sliceTestNode("10.1.0.5", map[string]string{canonicalSiteLabelKey: "site-b"})},
+		{name: "tombstone", obj: cache.DeletedFinalStateUnknown{Key: "node-1", Obj: sliceTestNode("10.1.0.5", map[string]string{canonicalSiteLabelKey: "site-b"})}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sc := newIPMatchedSliceTestController()
+			defer sc.workqueue.ShutDown()
+
+			sc.handleNodeDelete(tt.obj)
+
+			if got, want := sliceWorkSites(t, sc), []string{"site-a", "site-b"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("dirty Sites = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestSliceSiteNameChangeDirtiesBothSites(t *testing.T) {
+	t.Parallel()
+
+	slice := func(siteName string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": unboundednetv1alpha1.GroupVersion.String(),
+			"kind":       "SiteNodeSlice",
+			"metadata":   map[string]interface{}{"name": "site-a-0"},
+			"siteName":   siteName,
+		}}
+	}
+
+	sc := &SiteController{}
+	sc.handleSliceUpdate(slice("site-a"), slice("site-b"))
+
+	if got, want := sliceWorkSites(t, sc), []string{"site-a", "site-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirty Sites = %v, want %v", got, want)
 	}
 }
