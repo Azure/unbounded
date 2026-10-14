@@ -381,19 +381,23 @@ func resolveNVIDIAIMEXQualification(path string) (*NVIDIAIMEXQualification, erro
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize NVIDIA host qualification %s: %w", path, err)
 	}
+
 	if !bytes.Equal(data, canonical) {
 		return nil, fmt.Errorf(
 			"NVIDIA host qualification %s is not RFC 8785 canonical JSON",
 			path,
 		)
 	}
+
 	if err := validateRequiredNVIDIAQualificationFields(canonical); err != nil {
 		return nil, fmt.Errorf("decode NVIDIA host qualification %s: %w", path, err)
 	}
 
 	var qualification NVIDIAIMEXQualification
+
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
+
 	if err := decoder.Decode(&qualification); err != nil {
 		return nil, fmt.Errorf("decode NVIDIA host qualification %s: %w", path, err)
 	}
@@ -404,6 +408,7 @@ func resolveNVIDIAIMEXQualification(path string) (*NVIDIAIMEXQualification, erro
 
 	digest := fmt.Sprintf("%x", sha256.Sum256(canonical))
 	sidecarPath := path + ".sha256"
+
 	sidecar, err := os.ReadFile(sidecarPath)
 	if err != nil {
 		return nil, fmt.Errorf("read NVIDIA host qualification digest sidecar %s: %w", sidecarPath, err)
@@ -427,16 +432,20 @@ func canonicalQualificationJSON(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if _, ok := value.(map[string]any); !ok {
 		return nil, fmt.Errorf("qualification must be a JSON object")
 	}
+
 	if err := ensureJSONEOF(decoder); err != nil {
 		return nil, err
 	}
 
 	var canonical bytes.Buffer
+
 	encoder := json.NewEncoder(&canonical)
 	encoder.SetEscapeHTML(false)
+
 	if err := encoder.Encode(value); err != nil {
 		return nil, err
 	}
@@ -453,6 +462,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err := json.Unmarshal(data, &root); err != nil {
 		return fmt.Errorf("decode qualification object: %w", err)
 	}
+
 	if err := requireJSONFields(root, "qualification", []string{
 		"schemaVersion", "profile", "profileVersion", "contractVersion", "image",
 		"architecture", "distro", "driver", "fabricManager", "nscq", "imex",
@@ -466,6 +476,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(image, "image", []string{"id", "version", "digest"}); err != nil {
 		return err
 	}
@@ -474,6 +485,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(distro, "distro", []string{"name", "version", "kernel", "kernelDevel"}); err != nil {
 		return err
 	}
@@ -482,6 +494,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(driver, "driver", []string{"branch", "version", "userspaceVersion", "package"}); err != nil {
 		return err
 	}
@@ -491,6 +504,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 		if err != nil {
 			return err
 		}
+
 		if err := requireJSONFields(value, name, []string{"package", "version"}); err != nil {
 			return err
 		}
@@ -500,19 +514,24 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(imex, "imex", []string{"package", "version", "expectedPaths", "service", "lifecycleOwner"}); err != nil {
 		return err
 	}
+
 	if err := requireJSONArray(imex, "expectedPaths", "imex.expectedPaths"); err != nil {
 		return err
 	}
+
 	service, err := requiredJSONObject(imex, "service", "imex.service")
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(service, "imex.service", []string{"name", "enabled", "masked"}); err != nil {
 		return err
 	}
+
 	if err := requireJSONNonNull(service, "enabled", "imex.service.enabled"); err != nil {
 		return err
 	}
@@ -521,6 +540,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(toolkit, "toolkit", []string{"version", "minimumVersion", "ready"}); err != nil {
 		return err
 	}
@@ -529,11 +549,13 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(containerRuntime, "containerRuntime", []string{
 		"name", "version", "minimumVersion", "cdiEnabled", "cdiSpecDirectories",
 	}); err != nil {
 		return err
 	}
+
 	if err := requireJSONArray(containerRuntime, "cdiSpecDirectories", "containerRuntime.cdiSpecDirectories"); err != nil {
 		return err
 	}
@@ -542,11 +564,13 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(prerequisites, "prerequisites", []string{
 		"requiredFiles", "requiredServices", "requiredDevices", "requiredKernelModules",
 	}); err != nil {
 		return err
 	}
+
 	for _, field := range []string{"requiredFiles", "requiredServices", "requiredDevices", "requiredKernelModules"} {
 		if err := requireJSONArray(prerequisites, field, "prerequisites."+field); err != nil {
 			return err
@@ -557,30 +581,37 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(acceptance, "acceptance", []string{
 		"contractVersion", "resultVersion", "status", "qualifiedAt", "evidence", "failClosedReasons",
 	}); err != nil {
 		return err
 	}
+
 	if err := requireJSONArray(acceptance, "failClosedReasons", "acceptance.failClosedReasons"); err != nil {
 		return err
 	}
+
 	evidence, err := requiredJSONObject(acceptance, "evidence", "acceptance.evidence")
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(evidence, "acceptance.evidence", []string{
 		"gpuCount", "fourGpuDetected", "localNvlink", "multiNodeNvlinkClaimed",
 	}); err != nil {
 		return err
 	}
+
 	if err := requireJSONNonNull(evidence, "multiNodeNvlinkClaimed", "acceptance.evidence.multiNodeNvlinkClaimed"); err != nil {
 		return err
 	}
+
 	localNVLink, err := requiredJSONObject(evidence, "localNvlink", "acceptance.evidence.localNvlink")
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(localNVLink, "acceptance.evidence.localNvlink", []string{"checked", "healthy", "evidence"}); err != nil {
 		return err
 	}
@@ -589,11 +620,13 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if err := requireJSONFields(integrity, "integrity", []string{
 		"artifactPath", "canonicalization", "encoding", "trailingNewline", "digestAlgorithm", "digestSidecar",
 	}); err != nil {
 		return err
 	}
+
 	if err := requireJSONNonNull(integrity, "trailingNewline", "integrity.trailingNewline"); err != nil {
 		return err
 	}
@@ -602,6 +635,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	if err != nil {
 		return err
 	}
+
 	return requireJSONFields(authenticity, "authenticity", []string{"status", "requiredBeforeRelease", "attestation"})
 }
 
@@ -627,11 +661,13 @@ func requireJSONFields(object map[string]json.RawMessage, path string, fields []
 			return fmt.Errorf("required field %q is missing", path+"."+field)
 		}
 	}
+
 	for field := range object {
 		if _, ok := allowed[field]; !ok {
 			return fmt.Errorf("unknown field %q in %s", field, path)
 		}
 	}
+
 	return nil
 }
 
@@ -654,6 +690,7 @@ func requireJSONNonNull(parent map[string]json.RawMessage, key string, path stri
 	if !ok {
 		return fmt.Errorf("required field %q is missing", path)
 	}
+
 	if bytes.Equal(raw, []byte("null")) {
 		return fmt.Errorf("required field %q must not be null", path)
 	}
@@ -679,6 +716,7 @@ func parseCanonicalJSONValue(decoder *json.Decoder) (any, error) {
 			if err != nil {
 				return nil, fmt.Errorf("qualification integer %q: %w", text, err)
 			}
+
 			const maxExactJSONInteger = int64(1<<53 - 1)
 			if value > maxExactJSONInteger || value < -maxExactJSONInteger {
 				return nil, fmt.Errorf("qualification integer %q exceeds the exact JSON range", text)
@@ -693,15 +731,18 @@ func parseCanonicalJSONValue(decoder *json.Decoder) (any, error) {
 	switch delimiter {
 	case '{':
 		object := make(map[string]any)
+
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
 				return nil, err
 			}
+
 			key, ok := keyToken.(string)
 			if !ok {
 				return nil, fmt.Errorf("qualification field name must be a string")
 			}
+
 			if _, exists := object[key]; exists {
 				return nil, fmt.Errorf("duplicate qualification field %q", key)
 			}
@@ -710,6 +751,7 @@ func parseCanonicalJSONValue(decoder *json.Decoder) (any, error) {
 			if err != nil {
 				return nil, err
 			}
+
 			object[key] = value
 		}
 
@@ -717,6 +759,7 @@ func parseCanonicalJSONValue(decoder *json.Decoder) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		if end != json.Delim('}') {
 			return nil, fmt.Errorf("qualification JSON object is not closed")
 		}
@@ -724,11 +767,13 @@ func parseCanonicalJSONValue(decoder *json.Decoder) (any, error) {
 		return object, nil
 	case '[':
 		array := make([]any, 0)
+
 		for decoder.More() {
 			value, err := parseCanonicalJSONValue(decoder)
 			if err != nil {
 				return nil, err
 			}
+
 			array = append(array, value)
 		}
 
@@ -736,6 +781,7 @@ func parseCanonicalJSONValue(decoder *json.Decoder) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		if end != json.Delim(']') {
 			return nil, fmt.Errorf("qualification JSON array is not closed")
 		}
@@ -815,19 +861,23 @@ func nvidiaLocalNVLinkStatusHealthy(out []byte) bool {
 
 	currentGPU := -1
 	linkCounts := make(map[int]int, expectedGPUCount)
+
 	for _, line := range strings.Split(strings.ToLower(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "gpu ") {
 			indexText, _, ok := strings.Cut(strings.TrimPrefix(line, "gpu "), ":")
+
 			index, err := strconv.Atoi(strings.TrimSpace(indexText))
 			if !ok || err != nil || index < 0 || index >= expectedGPUCount {
 				currentGPU = -1
 				continue
 			}
+
 			currentGPU = index
 			if _, ok := linkCounts[index]; !ok {
 				linkCounts[index] = 0
 			}
+
 			continue
 		}
 
@@ -835,6 +885,7 @@ func nvidiaLocalNVLinkStatusHealthy(out []byte) bool {
 			if strings.Contains(line, "inactive") {
 				return false
 			}
+
 			linkCounts[currentGPU]++
 		}
 	}
@@ -842,6 +893,7 @@ func nvidiaLocalNVLinkStatusHealthy(out []byte) bool {
 	if len(linkCounts) != expectedGPUCount {
 		return false
 	}
+
 	for gpu := range expectedGPUCount {
 		if linkCounts[gpu] == 0 {
 			return false
@@ -1102,6 +1154,7 @@ func validateNVIDIAQualificationContract(
 		"/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2", "/dev/nvidia3",
 		"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-caps",
 	}
+
 	requiredKernelModules := []string{"nvidia", "nvidia_drm", "nvidia_modeset", "nvidia_uvm", "mana", "mana_ib", "gdma"}
 	if !validUniqueNonemptyStrings(qualification.Prerequisites.RequiredFiles, false) ||
 		!validUniqueNonemptyStrings(qualification.Prerequisites.RequiredServices, false) ||
@@ -1113,6 +1166,7 @@ func validateNVIDIAQualificationContract(
 		!containsAllStrings(qualification.Prerequisites.RequiredKernelModules, requiredKernelModules) {
 		return fmt.Errorf("NVIDIA IMEX DRA qualification is missing required prerequisite evidence")
 	}
+
 	for _, device := range qualification.Prerequisites.RequiredDevices {
 		if !slices.Contains(nvidia.GPUDevicePaths, device) {
 			return fmt.Errorf("NVIDIA IMEX DRA qualification requires missing device %s", device)
@@ -1182,9 +1236,11 @@ func validUniqueNonemptyStrings(values []string, requireOne bool) bool {
 		if value == "" {
 			return false
 		}
+
 		if _, ok := seen[value]; ok {
 			return false
 		}
+
 		seen[value] = struct{}{}
 	}
 
@@ -1194,12 +1250,14 @@ func validUniqueNonemptyStrings(values []string, requireOne bool) bool {
 func versionAtLeast(version, minimum string) bool {
 	parse := func(value string) ([]int, bool) {
 		parts := strings.Split(value, ".")
+
 		parsed := make([]int, len(parts))
 		for index, part := range parts {
 			number, err := strconv.Atoi(part)
 			if err != nil {
 				return nil, false
 			}
+
 			parsed[index] = number
 		}
 
@@ -1210,6 +1268,7 @@ func versionAtLeast(version, minimum string) bool {
 	if !ok {
 		return false
 	}
+
 	required, ok := parse(minimum)
 	if !ok {
 		return false
@@ -1221,9 +1280,11 @@ func versionAtLeast(version, minimum string) bool {
 		if index < len(current) {
 			currentPart = current[index]
 		}
+
 		if index < len(required) {
 			requiredPart = required[index]
 		}
+
 		if currentPart != requiredPart {
 			return currentPart > requiredPart
 		}

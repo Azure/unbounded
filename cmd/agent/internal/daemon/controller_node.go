@@ -145,6 +145,7 @@ func syncNVIDIAIMEXNodeMetadata(
 	if node.Labels == nil {
 		node.Labels = map[string]string{}
 	}
+
 	if node.Annotations == nil {
 		node.Annotations = map[string]string{}
 	}
@@ -166,6 +167,7 @@ func syncNVIDIAIMEXNodeMetadata(
 		_, modePresent := node.Labels[provision.NVIDIAIMEXModeLabelKey]
 		_, profilePresent := node.Labels[provision.NVIDIAHostProfileLabelKey]
 		_, versionPresent := node.Labels[provision.NVIDIAHostProfileVersionLabelKey]
+
 		_, digestPresent := node.Annotations[provision.NVIDIAHostProfileDigestAnnotationKey]
 		if !modePresent && !profilePresent && !versionPresent && !digestPresent {
 			return nil

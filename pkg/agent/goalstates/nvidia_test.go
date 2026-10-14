@@ -217,6 +217,7 @@ func TestResolveNVIDIAIMEXQualificationRejectsUnknownFields(t *testing.T) {
 	qualification := validTestNVIDIAQualification()
 	encoded, err := json.Marshal(qualification)
 	require.NoError(t, err)
+
 	var document map[string]any
 	require.NoError(t, json.Unmarshal(encoded, &document))
 	document["unexpected"] = true
@@ -238,11 +239,13 @@ func TestResolveNVIDIAIMEXQualificationRejectsMissingRequiredFalseField(t *testi
 	qualification := validTestNVIDIAQualification()
 	encoded, err := json.Marshal(qualification)
 	require.NoError(t, err)
+
 	var document map[string]any
 	require.NoError(t, json.Unmarshal(encoded, &document))
 	imex := document["imex"].(map[string]any)
 	service := imex["service"].(map[string]any)
 	delete(service, "enabled")
+
 	encoded, err = json.Marshal(document)
 	require.NoError(t, err)
 	canonical, err := canonicalQualificationJSON(encoded)
@@ -261,6 +264,7 @@ func TestResolveNVIDIAIMEXQualificationRejectsUnknownNestedField(t *testing.T) {
 	qualification := validTestNVIDIAQualification()
 	encoded, err := json.Marshal(qualification)
 	require.NoError(t, err)
+
 	var document map[string]any
 	require.NoError(t, json.Unmarshal(encoded, &document))
 	imex := document["imex"].(map[string]any)
@@ -284,6 +288,7 @@ func TestResolveNVIDIAIMEXQualificationRejectsNullArray(t *testing.T) {
 	qualification := validTestNVIDIAQualification()
 	encoded, err := json.Marshal(qualification)
 	require.NoError(t, err)
+
 	var document map[string]any
 	require.NoError(t, json.Unmarshal(encoded, &document))
 	acceptance := document["acceptance"].(map[string]any)

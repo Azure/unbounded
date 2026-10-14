@@ -347,11 +347,13 @@ func (a *AgentConfig) validateNVIDIA() error {
 		} else if !validDNSLabelValue(imex.HostProfile) {
 			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfile must be a lowercase DNS label of at most 63 characters"))
 		}
+
 		if strings.TrimSpace(imex.HostProfileVersion) == "" {
 			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileVersion is required"))
 		} else if NormalizeNVIDIAProfileVersionLabel(imex.HostProfileVersion) == "" {
 			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileVersion must normalize to a lowercase DNS label of at most 63 characters"))
 		}
+
 		if !validSHA256Digest(imex.HostProfileDigest) {
 			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileDigest must be sha256:<64 lowercase hexadecimal characters>"))
 		}
@@ -412,11 +414,13 @@ func isASCIILowerAlphaNumeric(char rune) bool {
 // MachineConfiguration and the qualification evidence.
 func NormalizeNVIDIAProfileVersionLabel(version string) string {
 	var normalized strings.Builder
+
 	previousHyphen := false
 
 	for _, char := range strings.ToLower(strings.TrimSpace(version)) {
 		if isASCIILowerAlphaNumeric(char) {
 			normalized.WriteRune(char)
+
 			previousHyphen = false
 
 			continue
@@ -424,6 +428,7 @@ func NormalizeNVIDIAProfileVersionLabel(version string) string {
 
 		if normalized.Len() > 0 && !previousHyphen {
 			normalized.WriteByte('-')
+
 			previousHyphen = true
 		}
 	}
