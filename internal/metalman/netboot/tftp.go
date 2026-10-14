@@ -87,6 +87,13 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	filename = strings.TrimPrefix(filename, "/")
 	log := slog.With("proto", "tftp", "filename", filename, "ip", ip)
 
+	if t.Media != nil {
+		if _, claimed, err := t.Media.artifactOwner(ctx, ip); claimed {
+			log.Warn("rejecting boot media artifact transfer", "err", err)
+			return fmt.Errorf("source IP is claimed by boot media; artifacts require HTTP")
+		}
+	}
+
 	node, err := t.LookupNodeByIP(ctx, ip)
 	if err != nil {
 		log.Warn("no node for source IP", "err", err)
