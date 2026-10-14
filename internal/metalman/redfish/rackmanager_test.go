@@ -188,6 +188,15 @@ func TestRackManagerDetection(t *testing.T) {
 					return
 				}
 
+				if r.URL.Path == tc.path+"/redfish/v1/Systems/normal" {
+					assert.Contains(t, []string{"unauthorized", "forbidden", "unavailable", "malformed", "failure"}, tc.name)
+					assert.Equal(t, http.MethodGet, r.Method)
+
+					_, _ = w.Write([]byte(`{"PowerState":"On"}`))
+
+					return
+				}
+
 				assert.Equal(t, tc.path+"/redfish/v1/SessionService/Sessions", r.URL.Path)
 				sessions.Add(1)
 				w.WriteHeader(http.StatusNotImplemented)
@@ -262,8 +271,9 @@ func TestRackManagerDetectionPreservesTransport(t *testing.T) {
 	defer original.CloseIdleConnections()
 
 	blade := &bmcSession{httpClient: original, baseURL: srv.URL + "/7", user: "admin", pass: "secret"}
-	rack, err := detectRackManager(t.Context(), blade)
+	rack, inconclusive, err := detectRackManager(t.Context(), blade)
 	require.NoError(t, err)
+	require.False(t, inconclusive)
 	require.NotNil(t, rack)
 	require.NotSame(t, original, blade.httpClient)
 	require.Equal(t, 30*time.Second, original.Timeout)
@@ -310,13 +320,18 @@ func TestRackManagerHardwareUnavailableRecovery(t *testing.T) {
 
 func TestRackManagerDetectionFallsBackToWorkingPrefixedBMC(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
+		name     string
+		status   int
+		body     string
+		deviceID string
 	}{
-		{"unauthorized", http.StatusUnauthorized, "root requires other credentials"},
-		{"unavailable", http.StatusServiceUnavailable, "root unavailable"},
-		{"html", http.StatusOK, "<html>Management proxy</html>"},
+		{"unauthorized", http.StatusUnauthorized, "root requires other credentials", ""},
+		{"unavailable", http.StatusServiceUnavailable, "root unavailable", ""},
+		{"html", http.StatusOK, "<html>Management proxy</html>", ""},
+		{"unauthorizedWithDeviceID", http.StatusUnauthorized, "root requires other credentials", "normal"},
+		{"forbiddenWithDeviceID", http.StatusForbidden, "root requires other credentials", "normal"},
+		{"unavailableWithDeviceID", http.StatusServiceUnavailable, "root unavailable", "normal"},
+		{"htmlWithDeviceID", http.StatusOK, "<html>Management proxy</html>", "normal"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
@@ -358,7 +373,7 @@ func TestRackManagerDetectionFallsBackToWorkingPrefixedBMC(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			c, err := Dial(t.Context(), srv.URL+"/proxy", tlsServerFingerprint(srv), "admin", "secret", "")
+			c, err := Dial(t.Context(), srv.URL+"/proxy", tlsServerFingerprint(srv), "admin", "secret", tc.deviceID)
 			require.NoError(t, err)
 
 			defer c.Close()
@@ -371,6 +386,95 @@ func TestRackManagerDetectionFallsBackToWorkingPrefixedBMC(t *testing.T) {
 			require.NoError(t, c.Reset(t.Context(), ResetForceRestart))
 			require.Equal(t, int64(1), probes.Load())
 			require.Equal(t, int64(1), resets.Load())
+		})
+	}
+}
+
+func TestRackManagerDetectionRetriesAfterInvalidFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"missing", http.StatusNotFound, ""},
+		{"unavailable", http.StatusServiceUnavailable, ""},
+		{"html", http.StatusOK, "<html>Management proxy</html>"},
+		{"null", http.StatusOK, "null"},
+		{"error", http.StatusOK, `{"error":{"code":"GeneralError"}}`},
+		{"completionFailure", http.StatusOK, completionBody("Failure", "BMC unavailable", false)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				recovered atomic.Bool
+				probes    atomic.Int64
+				systems   atomic.Int64
+				closed    atomic.Int64
+			)
+
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case rackManagerPath:
+					probes.Add(1)
+
+					if !recovered.Load() {
+						w.WriteHeader(http.StatusServiceUnavailable)
+
+						return
+					}
+
+					_, _ = w.Write([]byte(rackIdentity))
+				case "/28/redfish/v1/SessionService/Sessions":
+					assert.Equal(t, http.MethodPost, r.Method)
+					w.Header().Set("X-Auth-Token", testToken)
+					w.Header().Set("Location", "/redfish/v1/SessionService/Sessions/test")
+					w.WriteHeader(http.StatusCreated)
+				case "/28/redfish/v1/Systems/1":
+					assert.Equal(t, http.MethodGet, r.Method)
+					assert.Equal(t, testToken, r.Header.Get("X-Auth-Token"))
+					systems.Add(1)
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.body))
+				case "/28/redfish/v1/SessionService/Sessions/test":
+					assert.Equal(t, http.MethodDelete, r.Method)
+					assert.Equal(t, testToken, r.Header.Get("X-Auth-Token"))
+					closed.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			url := srv.URL + "/28"
+			fingerprint := tlsServerFingerprint(srv)
+			c, err := Dial(t.Context(), url, fingerprint, "admin", "secret", "1")
+			require.ErrorContains(t, err, "validating standard BMC after inconclusive rack detection")
+			require.Nil(t, c)
+
+			pool := NewPool()
+			defer pool.Close()
+
+			c, err = pool.Get(t.Context(), url, fingerprint, "admin", "secret", "1")
+			require.ErrorContains(t, err, "validating standard BMC after inconclusive rack detection")
+			require.Nil(t, c)
+			require.Empty(t, pool.clients)
+			require.Equal(t, int64(2), systems.Load())
+			require.Equal(t, int64(2), closed.Load())
+
+			recovered.Store(true)
+
+			c, err = pool.Get(t.Context(), url, fingerprint, "admin", "secret", "1")
+			require.NoError(t, err)
+			require.NotNil(t, c.rack)
+			require.Equal(t, "28", c.deviceID)
+			require.True(t, c.SupportsVirtualMedia())
+
+			cached, err := pool.Get(t.Context(), url, fingerprint, "admin", "secret", "1")
+			require.NoError(t, err)
+			require.Same(t, c, cached)
+			require.Equal(t, int64(3), probes.Load())
+			require.Equal(t, int64(2), systems.Load())
 		})
 	}
 }
@@ -422,11 +526,14 @@ func TestRackManagerDetectionProbeTimeoutFallsBack(t *testing.T) {
 	defer httpClient.CloseIdleConnections()
 
 	session := &bmcSession{httpClient: httpClient, baseURL: srv.URL + "/proxy", user: "admin", pass: "secret"}
-	rack, err := detectRackManager(t.Context(), session)
+	rack, inconclusive, err := detectRackManager(t.Context(), session)
 	require.NoError(t, err)
+	require.True(t, inconclusive)
 	require.Nil(t, rack)
 	require.NoError(t, t.Context().Err())
 	require.Equal(t, int64(1), probes.Load())
+
+	require.NoError(t, validateFallbackSystem(t.Context(), session, "normal"))
 
 	c := &Client{session: session, deviceID: "normal"}
 	state, err := c.PowerState(t.Context())

@@ -145,7 +145,7 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 		pass:       pass,
 	}
 
-	rack, err := detectRackManager(ctx, s)
+	rack, inconclusive, err := detectRackManager(ctx, s)
 	if err != nil {
 		httpClient.CloseIdleConnections()
 		return nil, err
@@ -167,6 +167,16 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 	if err != nil {
 		s.close()
 		return nil, err
+	}
+
+	// Do not cache an unverified standard BMC after a transient rack probe failure.
+	if inconclusive {
+		if err := validateFallbackSystem(ctx, s, id); err != nil {
+			s.close()
+			httpClient.CloseIdleConnections()
+
+			return nil, fmt.Errorf("validating standard BMC after inconclusive rack detection: %w", err)
+		}
 	}
 
 	slog.InfoContext(ctx, "Redfish dialed BMC", "url", url, "device", id)
@@ -815,6 +825,30 @@ func newHTTPClient(certSHA256 string) *http.Client {
 			},
 		},
 	}
+}
+
+func validateFallbackSystem(ctx context.Context, s *bmcSession, deviceID string) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s", deviceID)
+
+	data, status, err := s.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+
+	if status != http.StatusOK {
+		return redfishResponseError(http.MethodGet, path, status, data, nil)
+	}
+
+	var system map[string]json.RawMessage
+	if err := json.Unmarshal(data, &system); err != nil {
+		return fmt.Errorf("parsing fallback system: %w", err)
+	}
+
+	if system == nil || system["error"] != nil {
+		return fmt.Errorf("invalid fallback system response from %s", path)
+	}
+
+	return nil
 }
 
 // resolveDeviceID returns the given deviceID if non-empty, or discovers it

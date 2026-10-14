@@ -54,14 +54,15 @@ const (
 	recoveryClearOverride
 )
 
-func detectRackManager(ctx context.Context, blade *bmcSession) (*rackManager, error) {
+// detectRackManager reports whether an inconclusive probe needs fallback validation.
+func detectRackManager(ctx context.Context, blade *bmcSession) (rack *rackManager, inconclusive bool, err error) {
 	u, err := url.Parse(blade.baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parsing BMC URL: %w", err)
+		return nil, false, fmt.Errorf("parsing BMC URL: %w", err)
 	}
 
 	if strings.Trim(u.Path, "/") == "" {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	rootURL := *u
@@ -72,12 +73,20 @@ func detectRackManager(ctx context.Context, blade *bmcSession) (*rackManager, er
 	root := &bmcSession{httpClient: blade.httpClient, baseURL: rootURL.String(), user: blade.user, pass: blade.pass}
 
 	data, status, err := root.do(ctx, http.MethodGet, rackManagerPath, nil)
-	if err != nil && (ctx.Err() != nil || errors.Is(err, errTLSCertPin)) {
-		return nil, fmt.Errorf("detecting rack manager: %w", err)
+	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, errTLSCertPin) {
+			return nil, false, fmt.Errorf("detecting rack manager: %w", err)
+		}
+
+		return nil, true, nil
+	}
+
+	if status == http.StatusNotFound || status == http.StatusNotImplemented {
+		return nil, false, nil
 	}
 
 	if status != http.StatusOK {
-		return nil, nil
+		return nil, true, nil
 	}
 
 	var manager struct {
@@ -90,27 +99,23 @@ func detectRackManager(ctx context.Context, blade *bmcSession) (*rackManager, er
 		} `json:"Actions"`
 	}
 	if err := json.Unmarshal(data, &manager); err != nil {
-		return nil, nil
+		return nil, true, nil
 	}
 
 	if manager.ID != "RackManager" || manager.ODataID != rackManagerPath {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	powerOnTarget := slotPowerOnTarget(manager.Actions.Oem)
 	if powerOnTarget == "" {
-		return nil, nil
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("detecting rack manager: %w", err)
+		return nil, false, nil
 	}
 
 	slot := strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), "/")
 
 	n, err := strconv.Atoi(slot)
 	if err != nil || n < 1 || strconv.Itoa(n) != slot || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("rack manager URL path must be a slot number such as /7, got %q", u.EscapedPath())
+		return nil, false, fmt.Errorf("rack manager URL path must be a slot number such as /7, got %q", u.EscapedPath())
 	}
 
 	// Synchronous TFTP transfers and remote-drive mounts can exceed 30 seconds.
@@ -120,7 +125,7 @@ func detectRackManager(ctx context.Context, blade *bmcSession) (*rackManager, er
 	blade.httpClient = &httpClient
 	root.httpClient = &httpClient
 
-	return &rackManager{root: root, slot: slot, powerOnTarget: powerOnTarget, now: time.Now}, nil
+	return &rackManager{root: root, slot: slot, powerOnTarget: powerOnTarget, now: time.Now}, false, nil
 }
 
 // slotPowerOnTarget finds the vendor action that powers on one slot. Its key
