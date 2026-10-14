@@ -359,7 +359,7 @@ where
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
             let r = self.host.reactor();
             let dir = secure::directory(r, &self.identity_directory, true, true, &scope).await?;
-            match secure::read_at(
+            let pending = match secure::read_at(
                 r,
                 &dir,
                 "pending.json",
@@ -369,39 +369,41 @@ where
             )
             .await
             {
-                Ok(bytes) => {
-                    let pending = usable_pending(&bytes)?;
-                    if pending.cluster == self.cluster.0 {
-                        let committed = match secure::read_at(
-                            r,
-                            &dir,
-                            "identity.json",
-                            wire::MAX_ENROLLMENT_BYTES * 3,
-                            true,
-                            &scope,
-                        )
-                        .await
-                        {
-                            Ok(bytes) => {
-                                let saved = PersistedIdentity::decode(&bytes)
-                                    .and_then(|saved| saved.checked_response())
-                                    .map_err(|_| Error::UnreadableIdentityRecord)?;
-                                saved.cluster.0 == pending.cluster
-                                    && saved.enrollment.0 == pending.enrollment
-                            }
-                            Err(e) if H::is_missing(e) => false,
-                            Err(e) => return Err(e),
-                        };
-                        if !committed {
-                            r.file_sync(dir.clone(), &scope).await?;
-                            return self.request(&pending, nics, shares).map_err(Into::into);
-                        }
-                    }
-                    // Replace committed or foreign requests, preserving corrupt records.
-                }
-                Err(e) if H::is_missing(e) => (),
+                Ok(bytes) => Some(usable_pending(&bytes)?),
+                Err(e) if H::is_missing(e) => None,
                 Err(e) => return Err(e),
+            };
+            // Always check the saved identity so an unreadable record stops
+            // enrollment before a request is issued, whatever pending holds.
+            let committed = match secure::read_at(
+                r,
+                &dir,
+                "identity.json",
+                wire::MAX_ENROLLMENT_BYTES * 3,
+                true,
+                &scope,
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    let saved = PersistedIdentity::decode(&bytes)
+                        .and_then(|saved| saved.checked_response())
+                        .map_err(|_| Error::UnreadableIdentityRecord)?;
+                    Some((saved.cluster, saved.enrollment))
+                }
+                Err(e) if H::is_missing(e) => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(pending) = pending
+                && pending.cluster == self.cluster.0
+                && !committed.as_ref().is_some_and(|(cluster, enrollment)| {
+                    cluster.0 == pending.cluster && enrollment.0 == pending.enrollment
+                })
+            {
+                r.file_sync(dir.clone(), &scope).await?;
+                return self.request(&pending, nics, shares).map_err(Into::into);
             }
+            // Replace committed or foreign requests, preserving corrupt records.
             let pending = self.generate()?;
             let encoded = encode_private(&pending, wire::MAX_ENROLLMENT_BYTES)?;
             secure::atomic_write(r, &dir, "pending.json", &encoded, &scope).await?;
@@ -1610,6 +1612,73 @@ mod tests {
                 assert_eq!(sim.read_file(identity_path).unwrap(), *corrupt);
                 assert_eq!(sim.read_file(pending_path).unwrap(), pending);
             }
+        }
+    }
+
+    #[test]
+    fn prepare_rejects_unreadable_identity_without_same_cluster_pending() {
+        for state in ["absent", "other-cluster"] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let (files, e, scope) = fixture();
+            let (ca, key) = identity::test_util::ca();
+            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+            let first = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            drive(
+                &files,
+                e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+            )
+            .unwrap();
+            let identity_path = Path::new("/private/identity.json");
+            let pending_path = Path::new("/private/pending.json");
+            let committed = sim.read_file(identity_path).unwrap();
+            let pending = if state == "other-cluster" {
+                let mut other = e.generate().unwrap();
+                other.cluster = "44444444-4444-4444-8444-444444444444".into();
+                let bytes = encode_private(&other, wire::MAX_ENROLLMENT_BYTES).unwrap();
+                sim.write_file(pending_path, &bytes).unwrap();
+                sim.chmod(pending_path, 0o600).unwrap();
+                Some(bytes.to_vec())
+            } else {
+                None
+            };
+            let mut schema = PersistedIdentity::decode(&committed).unwrap();
+            let mut response: serde_json::Value =
+                serde_json::from_slice(&STANDARD.decode(&schema.response).unwrap()).unwrap();
+            response["schema_version"] = (wire::SCHEMA_VERSION + 1).into();
+            schema.response = STANDARD.encode(serde_json::to_vec(&response).unwrap());
+            for corrupt in [
+                Zeroizing::new(b"not JSON".to_vec()),
+                Zeroizing::new(b"{}".to_vec()),
+                schema.encode().unwrap(),
+            ] {
+                sim.write_file(identity_path, &corrupt).unwrap();
+                sim.chmod(identity_path, 0o600).unwrap();
+                assert!(
+                    drive(
+                        &files,
+                        e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)
+                    )
+                    .is_err_and(|error| error == Error::UnreadableIdentityRecord.into()),
+                    "{state}"
+                );
+                assert_eq!(sim.read_file(identity_path).unwrap(), *corrupt);
+                assert_eq!(sim.read_file(pending_path).ok(), pending, "{state}");
+            }
+            // A readable identity, valid or not, still allows a new request.
+            sim.write_file(identity_path, &committed).unwrap();
+            sim.chmod(identity_path, 0o600).unwrap();
+            let renewed = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            assert_eq!(renewed.cluster.0, CLUSTER);
+            assert_ne!(renewed.enrollment, first.enrollment);
         }
     }
 
