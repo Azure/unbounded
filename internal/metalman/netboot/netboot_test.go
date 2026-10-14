@@ -1390,7 +1390,7 @@ func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 		"install_log=/var/log/unbounded-agent-install.log",
 		"trap report_unbounded_failure ERR",
 		"last 120 lines of ${install_log}",
-		"systemctl list-units --failed --plain --no-legend",
+		"systemctl list-units --all --state=failed,auto-restart --plain --no-legend",
 		`journalctl -b --no-pager -n 40 -u "$unit"`,
 		`curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "http://10.0.1.1:8080/unbounded-agent/install-log"`,
 		`bash /usr/local/bin/unbounded-agent-install.sh 2>&1 | tee "$install_log"`,

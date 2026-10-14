@@ -68,7 +68,8 @@ runcmd:
           echo "could not read ${install_log}: file does not exist"
         fi
         # Unit logs often explain failures that the agent only reports as an exit status.
-        for unit in $(systemctl list-units --failed --plain --no-legend 2>/dev/null | cut -d' ' -f1); do
+        # Units that restart on failure sit in auto-restart rather than failed.
+        for unit in $(systemctl list-units --all --state=failed,auto-restart --plain --no-legend 2>/dev/null | cut -d' ' -f1); do
           echo
           echo "last 40 journal lines of failed unit ${unit}:"
           journalctl -b --no-pager -n 40 -u "$unit" 2>&1
