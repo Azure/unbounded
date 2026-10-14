@@ -44,12 +44,7 @@ func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOw
 			target := &op.Status.Targets[j]
 
 			b := target.BootMedia
-			if !mediaInSite(b, p.Site) || b.Netboot == nil || len(b.Netboot.DHCPLeases) == 0 || b.Netboot.DHCPLeases[0].IPv4 != ip || !b.ImageWritten || b.RebootRequestedAt == nil || b.Abandoned {
-				continue
-			}
-
-			cond := apimeta.FindStatusCondition(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
-			if cond != nil && (cond.Status == metav1.ConditionTrue || (cond.Status == metav1.ConditionFalse && cond.Reason == "Failed")) {
+			if !mediaInSite(b, p.Site) || !mediaFirstBootPending(*target) || b.Netboot.DHCPLeases[0].IPv4 != ip {
 				continue
 			}
 
@@ -80,6 +75,19 @@ func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOw
 	}
 
 	return found, found != nil, nil
+}
+
+// mediaFirstBootPending keeps frozen templates available until a final report
+// or abandonment ends first-boot authorization, even after artifact release.
+func mediaFirstBootPending(target v1alpha3.MachineOperationTargetStatus) bool {
+	b := target.BootMedia
+	if b == nil || b.Netboot == nil || len(b.Netboot.DHCPLeases) == 0 || !b.ImageWritten || b.RebootRequestedAt == nil || b.Abandoned {
+		return false
+	}
+
+	cond := apimeta.FindStatusCondition(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+
+	return cond == nil || (cond.Status != metav1.ConditionTrue && (cond.Status != metav1.ConditionFalse || cond.Reason != "Failed"))
 }
 
 // Retained media claims block live-IP fallback even after the Machine's IP or

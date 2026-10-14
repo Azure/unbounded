@@ -114,15 +114,20 @@ func (r *OCIReconciler) mapOperationToImage(_ context.Context, obj client.Object
 
 	for _, target := range op.Status.Targets {
 		media := target.BootMedia
-		if !mediaInSite(media, r.Site) || media.Netboot == nil || mediaArtifactsReleased(op, target) {
+		if !mediaInSite(media, r.Site) || media.Netboot == nil {
 			continue
 		}
 
 		spec := media.Netboot
-		refs = append(refs,
-			imagePullRequest{ImageRef: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef},
-			imagePullRequest{ImageRef: spec.NetbootImage, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.NetbootPullSecretRef},
-		)
+
+		artifactsNeeded := !mediaArtifactsReleased(op, target)
+		if artifactsNeeded {
+			refs = append(refs, imagePullRequest{ImageRef: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef})
+		}
+
+		if artifactsNeeded || mediaFirstBootPending(target) {
+			refs = append(refs, imagePullRequest{ImageRef: spec.NetbootImage, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.NetbootPullSecretRef})
+		}
 	}
 
 	return imageReconcileRequests(refs)

@@ -103,8 +103,34 @@ func TestOCIReconcilerMapOperationToImage(t *testing.T) {
 }
 
 func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
-	for _, missingSecret := range []bool{false, true} {
-		t.Run(fmt.Sprintf("missing-secret=%t", missingSecret), func(t *testing.T) {
+	tests := []struct {
+		name          string
+		missingSecret bool
+		released      bool
+		edit          func(*v1alpha3.MachineOperationTargetStatus)
+		wantDisk      bool
+		wantBoot      bool
+	}{
+		{name: "missing-secret=false", wantDisk: true, wantBoot: true},
+		{name: "missing-secret=true", missingSecret: true, wantDisk: true, wantBoot: true},
+		{name: "released first boot pending", released: true, wantBoot: true},
+		{name: "released first boot running", released: true, wantBoot: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) {
+			target.Conditions = []metav1.Condition{{Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionFalse, Reason: "Running"}}
+		}},
+		{name: "released first boot succeeded", released: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) {
+			target.Conditions = []metav1.Condition{{Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
+		}},
+		{name: "released first boot failed", released: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) {
+			target.Conditions = []metav1.Condition{{Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionFalse, Reason: "Failed"}}
+		}},
+		{name: "released abandoned", released: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) { target.BootMedia.Abandoned = true }},
+		{name: "released image not written", released: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) { target.BootMedia.ImageWritten = false }},
+		{name: "released reboot not requested", released: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) { target.BootMedia.RebootRequestedAt = nil }},
+		{name: "released no lease", released: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) { target.BootMedia.Netboot.DHCPLeases = nil }},
+		{name: "released other site", released: true, edit: func(target *v1alpha3.MachineOperationTargetStatus) { target.BootMedia.Site = "rack-b" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
 			diskStore, diskDigest := pushTestImage(t, []byte("frozen disk"))
 			bootStore, bootDigest := pushTestImage(t, []byte("frozen netboot"))
@@ -158,18 +184,35 @@ func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
 				Image: host + "/disk@" + diskDigest, NetbootImage: host + "/netboot@" + bootDigest,
 				Architecture:  v1alpha3.PXEArchitectureARM64,
 				PullSecretRef: secretRef(secret.Namespace, secret.Name), NetbootPullSecretRef: secretRef(secret.Namespace, secret.Name),
+				DHCPLeases: []v1alpha3.DHCPLease{{IPv4: "192.0.2.10", MAC: "02:00:00:00:00:01", Gateway: "192.0.2.1", SubnetMask: "255.255.255.0"}},
 			}
 			machine := &v1alpha3.Machine{
-				ObjectMeta: metav1.ObjectMeta{Name: "node"},
+				ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "node-uid", Labels: map[string]string{"unbounded-cloud.io/site": "rack-a"}},
 				Spec:       v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: spec.DeepCopy()}},
 			}
 			op := &v1alpha3.MachineOperation{
 				ObjectMeta: metav1.ObjectMeta{Name: "install"},
 				Spec:       v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace},
 				Status: v1alpha3.MachineOperationStatus{Targets: []v1alpha3.MachineOperationTargetStatus{{
-					MachineRef: machine.Name, BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Netboot: spec.DeepCopy()},
+					MachineRef: machine.Name, BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Netboot: spec.DeepCopy(), Site: "rack-a", MachineUID: machine.UID},
 				}}},
 			}
+
+			if tt.released {
+				now := metav1.Now()
+				target := &op.Status.Targets[0]
+				target.Phase = v1alpha3.OperationPhaseFailed
+				target.BootMedia.Released = true
+				target.BootMedia.Cleaned = true
+				target.BootMedia.ImageWritten = true
+				target.BootMedia.RebootRequestedAt = &now
+			}
+
+			if tt.edit != nil {
+				tt.edit(&op.Status.Targets[0])
+			}
+
+			frozenSpec := op.Status.Targets[0].BootMedia.Netboot.DeepCopy()
 			scheme := runtime.NewScheme()
 			require.NoError(t, corev1.AddToScheme(scheme))
 			require.NoError(t, v1alpha3.AddToScheme(scheme))
@@ -184,7 +227,11 @@ func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
 				require.NoError(t, os.WriteFile(filepath.Join(dir, "disk.img"), []byte(image.payload), 0o600))
 			}
 
-			r := &OCIReconciler{Client: c, Cache: cache}
+			cloudInitDir := filepath.Join(cache.DiskDirForArchitecture(bootDigest, "arm64"), "cloud-init")
+			require.NoError(t, os.MkdirAll(cloudInitDir, 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(cloudInitDir, "vendor-data.tmpl"), []byte("frozen cloud-init {{ .Machine.Name }}"), 0o600))
+
+			r := &OCIReconciler{Client: c, Cache: cache, Site: "rack-a"}
 			for _, req := range r.mapMachineToImage(ctx, machine) {
 				result, err := r.Reconcile(ctx, req)
 				require.NoError(t, err)
@@ -198,7 +245,7 @@ func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
 			}
 			require.NoError(t, c.Update(ctx, machine))
 			// Restart loses mappings, but not the files on disk.
-			r = &OCIReconciler{Client: c, Cache: NewOCICache(cache.CacheDir)}
+			r = &OCIReconciler{Client: c, Cache: NewOCICache(cache.CacheDir), Site: "rack-a"}
 
 			var machines v1alpha3.MachineList
 			require.NoError(t, c.List(ctx, &machines))
@@ -214,7 +261,7 @@ func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
 			_, err := r.Cache.MetadataForRefArchitecture(spec.NetbootImage, "arm64")
 			require.ErrorIs(t, err, ErrNotYetDownloaded)
 
-			if missingSecret {
+			if tt.missingSecret {
 				require.NoError(t, c.Delete(ctx, secret))
 			}
 
@@ -222,20 +269,28 @@ func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
 			require.NoError(t, c.List(ctx, &ops))
 			require.Len(t, ops.Items, 1)
 			reqs := r.mapOperationToImage(ctx, &ops.Items[0])
-			require.Len(t, reqs, 2)
+			wantRequests := 0
+
+			for _, wanted := range []bool{tt.wantDisk, tt.wantBoot} {
+				if wanted {
+					wantRequests++
+				}
+			}
+
+			require.Len(t, reqs, wantRequests)
 
 			for _, req := range reqs {
 				result, err := r.Reconcile(ctx, req)
 				require.NoError(t, err)
 
-				if missingSecret {
+				if tt.missingSecret {
 					require.Equal(t, 30*time.Second, result.RequeueAfter)
 				} else {
 					require.Equal(t, imageResyncInterval, result.RequeueAfter)
 				}
 			}
 
-			if missingSecret {
+			if tt.missingSecret {
 				require.Empty(t, r.Cache.DigestForArchitecture(spec.Image, "arm64"))
 				require.Empty(t, r.Cache.DigestForArchitecture(spec.NetbootImage, "arm64"))
 
@@ -250,6 +305,11 @@ func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
 			}
 
 			for ref, payload := range map[string]string{spec.Image: "frozen disk", spec.NetbootImage: "frozen netboot"} {
+				if (ref == spec.Image && !tt.wantDisk) || (ref == spec.NetbootImage && !tt.wantBoot) {
+					require.Empty(t, r.Cache.DigestForArchitecture(ref, "arm64"))
+					continue
+				}
+
 				_, err := r.Cache.MetadataForRefArchitecture(ref, "arm64")
 				require.NoError(t, err)
 				path, tmpl, err := r.Cache.ResolvePathForArchitecture(ref, "arm64", "disk.img")
@@ -262,8 +322,24 @@ func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {
 				require.Empty(t, r.Cache.DigestForArchitecture(ref, "amd64"))
 			}
 
+			if tt.released {
+				provider := &MediaProvider{Client: c, Site: "rack-a"}
+				owner, claimed, err := provider.firstBootOwner(ctx, spec.DHCPLeases[0].IPv4)
+				require.NoError(t, err)
+				require.Equal(t, tt.wantBoot, claimed)
+
+				if tt.wantBoot {
+					require.Equal(t, spec, owner.machine.Spec.Netboot())
+
+					resolver := &FileResolver{Cache: r.Cache, Reader: c, Cluster: &StaticClusterInfo{}}
+					resolved, err := resolver.ResolveFileByPathForIP(ctx, "cloud-init/vendor-data", owner.machine, spec.NetbootImage, spec.DHCPLeases[0].IPv4)
+					require.NoError(t, err)
+					require.Equal(t, "frozen cloud-init node", string(resolved.Data))
+				}
+			}
+
 			require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(op), op))
-			require.Equal(t, spec, op.Status.Targets[0].BootMedia.Netboot)
+			require.Equal(t, frozenSpec, op.Status.Targets[0].BootMedia.Netboot)
 		})
 	}
 }
