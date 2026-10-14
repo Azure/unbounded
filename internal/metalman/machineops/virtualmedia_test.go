@@ -178,7 +178,7 @@ func TestVirtualMediaDurableLifecycleAndRestart(t *testing.T) {
 	current = mediaStep(t, r, op.Name)
 	require.True(t, current.Status.Targets[0].BootMedia.Released)
 	mediaStep(t, r, op.Name)
-	q := &StatusQueue{Client: r.Client}
+	q := &StatusQueue{Client: r.Client, Site: r.Site}
 	require.NoError(t, q.flushOperationCondition(t.Context(), m.Name, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", "done"))
 	require.NoError(t, r.Create(t.Context(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: m.Name}}))
 	mediaStep(t, r, op.Name)
@@ -645,7 +645,7 @@ func TestVirtualMediaCleanupFailureDoesNotBlockOtherTargets(t *testing.T) {
 			require.Equal(t, []string{action, action, action, action}, d.calls)
 			require.Equal(t, []string{"cleanup", "delete", "release"}, healthyDriver.calls)
 
-			q := &StatusQueue{Client: r.Client}
+			q := &StatusQueue{Client: r.Client, Site: r.Site}
 			require.NoError(t, q.flushOperationCondition(t.Context(), second.Name, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", "booted"))
 			require.NoError(t, r.Create(t.Context(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: second.Name}}))
 			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
@@ -692,7 +692,7 @@ func TestVirtualMediaCloudInitIsTargetScoped(t *testing.T) {
 		BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: "second", ImageWritten: true, Cleaned: true},
 	})
 	require.NoError(t, r.Status().Update(t.Context(), current))
-	q := &StatusQueue{Client: r.Client}
+	q := &StatusQueue{Client: r.Client, Site: r.Site}
 	require.NoError(t, q.flushOperationCondition(t.Context(), m.Name, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", "done"))
 	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), current))
 	require.True(t, apimeta.IsStatusConditionTrue(current.Status.Targets[0].Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
@@ -905,7 +905,7 @@ func TestVirtualMediaRealProviderCallbackAndPartialCleanup(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, current.Status.Targets[0].Stage)
 	require.Equal(t, http.StatusOK, request(http.MethodGet, "ready"))
 
-	q := &StatusQueue{Client: r.Client}
+	q := &StatusQueue{Client: r.Client, Site: r.Site}
 	require.NoError(t, q.flushOperationCondition(t.Context(), m.Name, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", "done"))
 	require.NoError(t, r.Create(t.Context(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: m.Name}}))
 	mediaStep(t, r, op.Name)
@@ -1026,7 +1026,7 @@ func TestVirtualMediaDeletingLostReadyResponseRetainsCallback(t *testing.T) {
 			newer.Spec.MachineRef = m.Name
 			newer.CreationTimestamp = metav1.NewTime(fixedNow().Add(time.Hour))
 			require.NoError(t, r.Create(t.Context(), newer))
-			q := &StatusQueue{Client: r.Client}
+			q := &StatusQueue{Client: r.Client, Site: r.Site}
 			require.NoError(t, q.flushOperationCondition(t.Context(), m.Name, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", "booted"))
 			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), current))
 			require.True(t, apimeta.IsStatusConditionTrue(current.Status.Targets[0].Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
@@ -1056,7 +1056,7 @@ func TestVirtualMediaKnownSuccessAfterCleanupDelay(t *testing.T) {
 	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.Error(t, err)
 
-	q := &StatusQueue{Client: r.Client}
+	q := &StatusQueue{Client: r.Client, Site: r.Site}
 	require.NoError(t, q.flushOperationCondition(t.Context(), m.Name, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", "booted"))
 	require.NoError(t, r.Create(t.Context(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: m.Name}}))
 	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(20 * time.Minute)) }

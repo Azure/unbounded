@@ -217,7 +217,7 @@ func ServePXECmd() *cobra.Command {
 			redfishPool := redfish.NewPool()
 			defer redfishPool.Close()
 
-			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient(), Site: site}
 
 			resolver := netboot.FileResolver{
 				Cache:             ociCache,

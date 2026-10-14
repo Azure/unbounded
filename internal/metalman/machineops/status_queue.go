@@ -32,6 +32,7 @@ const (
 // sends that completion signal once.
 type StatusQueue struct {
 	Client   client.Client
+	Site     string
 	Now      func() metav1.Time
 	Log      *slog.Logger
 	Capacity int
@@ -228,6 +229,9 @@ func (q *StatusQueue) activeOperationForMachine(ctx context.Context, machineName
 	candidates := make([]*v1alpha3.MachineOperation, 0, len(list.Items))
 	for i := range list.Items {
 		op := &list.Items[i]
+		if operationHasForeignMediaForMachine(op, machineName, q.Site) {
+			continue
+		}
 
 		retained := operationRetainsMediaForMachine(op, machineName)
 		if op.Spec.OperationKind != v1alpha3.OperationHostReplace || (!retained && (op.Status.IsTerminal() || !operationTargetsMachine(op, machineName))) {
@@ -251,6 +255,16 @@ func (q *StatusQueue) activeOperationForMachine(ctx context.Context, machineName
 	})
 
 	return candidates[0], true, nil
+}
+
+func operationHasForeignMediaForMachine(op *v1alpha3.MachineOperation, machineName, site string) bool {
+	for _, target := range op.Status.Targets {
+		if target.MachineRef == machineName && target.BootMedia != nil && target.BootMedia.Site != site {
+			return true
+		}
+	}
+
+	return false
 }
 
 func operationRetainsMediaForMachine(op *v1alpha3.MachineOperation, machineName string) bool {
