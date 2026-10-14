@@ -955,14 +955,14 @@ func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3
 			continue
 		}
 
-		if !operationBefore(&candidate, op) && !hasOutstandingMedia(&candidate) {
+		if !conflictingOperationBefore(&candidate, op) {
 			continue
 		}
 
 		candidates = append(candidates, candidate)
 	}
 
-	sort.Slice(candidates, func(i, j int) bool { return operationBefore(&candidates[i], &candidates[j]) })
+	sort.Slice(candidates, func(i, j int) bool { return conflictingOperationBefore(&candidates[i], &candidates[j]) })
 
 	for _, candidate := range candidates {
 		candidateKeys, err := r.operationConflictKeys(ctx, &candidate)
@@ -1073,6 +1073,15 @@ func conflictSetsOverlap(a, b map[string]struct{}) bool {
 
 func normalizeRedfishURL(raw string) string {
 	return strings.TrimRight(raw, "/")
+}
+
+func conflictingOperationBefore(a, b *v1alpha3.MachineOperation) bool {
+	aRetainsMedia, bRetainsMedia := hasOutstandingMedia(a), hasOutstandingMedia(b)
+	if aRetainsMedia != bRetainsMedia {
+		return aRetainsMedia
+	}
+
+	return operationBefore(a, b)
 }
 
 func operationBefore(a, b *v1alpha3.MachineOperation) bool {

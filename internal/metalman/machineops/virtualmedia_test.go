@@ -266,6 +266,115 @@ func TestVirtualMediaTerminalConflictAndCallbackMerge(t *testing.T) {
 	require.Contains(t, keys, "machine:media-machine")
 }
 
+func TestConflictingOperationsMediaPriority(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		olderMedia    bool
+		newerMedia    bool
+		released      bool
+		sameTimestamp bool
+		winner        int
+	}{
+		{name: "newer media owner", newerMedia: true, winner: 1},
+		{name: "newer released media with unconfirmed boot", newerMedia: true, released: true, winner: 1},
+		{name: "older media owner", olderMedia: true},
+		{name: "both retain media", olderMedia: true, newerMedia: true},
+		{name: "neither retains media"},
+		{name: "media priority before name", newerMedia: true, sameTimestamp: true, winner: 1},
+		{name: "both retain media name tie-break", olderMedia: true, newerMedia: true, sameTimestamp: true},
+		{name: "neither retains media name tie-break", sameTimestamp: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			machine := testBareMetalMachine("machine", "rack-a")
+
+			ops := []*v1alpha3.MachineOperation{
+				testOperation("op-z", v1alpha3.OperationHostReplace),
+				testOperation("op-a", v1alpha3.OperationHostReplace),
+			}
+			if tc.sameTimestamp {
+				ops[0].Name, ops[1].Name = "op-a", "op-z"
+			} else {
+				ops[0].CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+			}
+
+			for i, retainsMedia := range []bool{tc.olderMedia, tc.newerMedia} {
+				ops[i].Spec.MachineRef = machine.Name
+				ops[i].Status.Phase = v1alpha3.OperationPhaseInProgress
+
+				ops[i].Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+					MachineRef: machine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+				}}
+				if retainsMedia {
+					ops[i].Status.Targets[0].BootMedia = &v1alpha3.MachineOperationBootMediaStatus{
+						Netboot: machine.Spec.Netboot().DeepCopy(), Released: tc.released, ImageWritten: tc.released,
+					}
+				}
+			}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, ops[0], ops[1]).Build()
+
+			r := testReconciler(c, nil, "rack-a")
+			for i, op := range ops {
+				blocker, err := r.olderConflictingOperation(t.Context(), op)
+				require.NoError(t, err)
+
+				if i == tc.winner {
+					require.Empty(t, blocker, "winning operation must not wait")
+				} else {
+					require.Equal(t, ops[tc.winner].Name, blocker, "only the losing operation must wait")
+				}
+			}
+		})
+	}
+}
+
+func TestVirtualMediaConflictAfterRedfishURLChangeAllowsInstallTimeout(t *testing.T) {
+	r, d, machine, op := mediaFixture(t)
+
+	var current *v1alpha3.MachineOperation
+	for range 10 {
+		current = mediaStep(t, r, op.Name)
+	}
+
+	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+
+	otherMachine := testBareMetalMachine("other-machine", "rack-a")
+	otherMachine.Spec.Netboot().Redfish.URL = "https://other-bmc.example.com"
+	older := testOperation("older-op", v1alpha3.OperationHostPowerOff)
+	older.CreationTimestamp = metav1.NewTime(op.CreationTimestamp.Add(-time.Minute))
+	older.Spec.MachineRef = otherMachine.Name
+	older.Status.Phase = v1alpha3.OperationPhaseInProgress
+	older.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: otherMachine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+	}}
+	require.NoError(t, r.Create(t.Context(), otherMachine))
+	require.NoError(t, r.Create(t.Context(), older))
+
+	for _, candidate := range []*v1alpha3.MachineOperation{older, current} {
+		blocker, err := r.olderConflictingOperation(t.Context(), candidate)
+		require.NoError(t, err)
+		require.Empty(t, blocker)
+	}
+
+	otherMachine.Spec.Netboot().Redfish.URL = machine.Spec.Netboot().Redfish.URL + "/"
+	require.NoError(t, r.Update(t.Context(), otherMachine))
+
+	callsBefore := slices.Clone(d.calls)
+	waiting := mediaStep(t, r, older.Name)
+	require.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
+	require.Contains(t, waiting.Status.Message, op.Name)
+	require.Equal(t, older.Status.Targets, waiting.Status.Targets)
+	require.Equal(t, callsBefore, d.calls)
+
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(r.mediaInstallTimeout())) }
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Targets[0].Phase)
+	require.Contains(t, current.Status.Targets[0].Message, reasonTimedOut)
+	require.True(t, hasOutstandingMedia(current))
+	require.Equal(t, callsBefore, d.calls)
+}
+
 func TestVirtualMediaMergeCallbackFields(t *testing.T) {
 	cloudInit := metav1.Condition{
 		Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue,
