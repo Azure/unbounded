@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
+use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement, RollbackOutcome};
 use uds_endpoint::{BoundSocket, EndpointOwner, Layout, file_path, open_directory};
 
 const CANONICAL: &str = "endpoint.sock";
@@ -447,8 +447,13 @@ fn rollback_restores_missing_canonical_but_never_swaps_foreign_inodes() {
         if replaced != "missing" {
             fs::write(&path, b"foreign").unwrap();
         }
-        assert_eq!(publication.rollback(), replaced == "missing");
-        assert_eq!(publication.rollback(), replaced == "missing");
+        let expected = if replaced == "missing" {
+            RollbackOutcome::Restored
+        } else {
+            RollbackOutcome::Incomplete
+        };
+        assert_eq!(publication.rollback(), expected);
+        assert_eq!(publication.rollback(), expected);
         if replaced == "missing" {
             assert!(old.owns(CANONICAL));
             assert_eq!(old.basename(), CANONICAL);
@@ -568,7 +573,7 @@ fn failed_later_publish_rolls_back_successes_in_reverse_order() {
 }
 
 #[test]
-fn failed_rollback_is_not_retried_and_keeps_cleanup_names_matching_inodes() {
+fn failed_explicit_rollback_is_not_retried_by_drop_and_keeps_cleanup_names() {
     let fixture = Fixture::new();
     let old = fixture.initial();
     let next = fixture.bind("pending-next");
@@ -596,8 +601,7 @@ fn failed_rollback_is_not_retried_and_keeps_cleanup_names_matching_inodes() {
         )
         .unwrap();
     calls.fail_after.set(Some(0));
-    assert!(!publication.rollback());
-    assert!(!publication.rollback());
+    assert_eq!(publication.rollback(), RollbackOutcome::Incomplete);
     drop(publication);
     assert_eq!(calls.log.borrow().len(), 2);
     assert!(old.owns("pending-next"));
@@ -607,16 +611,17 @@ fn failed_rollback_is_not_retried_and_keeps_cleanup_names_matching_inodes() {
 }
 
 #[test]
-fn rollback_reports_partial_restoration_after_probe_or_rename_failure() {
-    for exchange in [false, true] {
+fn rollback_reports_partial_restoration_and_retries_only_failed_entries() {
+    for exchange in [Some(false), Some(true), None] {
         for failure in ["next-stat", "previous-stat", "rename"] {
-            if !exchange && failure == "previous-stat" {
+            if exchange != Some(true) && failure == "previous-stat" {
                 continue;
             }
             let fixtures = [Fixture::new(), Fixture::new(), Fixture::new()];
             let old: Vec<_> = fixtures
                 .iter()
-                .map(|fixture| exchange.then(|| fixture.initial()))
+                .enumerate()
+                .map(|(id, fixture)| exchange.unwrap_or(id != 1).then(|| fixture.initial()))
                 .collect();
             let next: Vec<_> = fixtures.iter().map(|f| f.bind("pending-next")).collect();
             let calls = Rc::new(Calls::default());
@@ -652,30 +657,39 @@ fn rollback_reports_partial_restoration_after_probe_or_rename_failure() {
                 "rename" => calls.fail_after.set(Some(1)),
                 _ => unreachable!(),
             }
-            assert!(!publication.rollback(), "{exchange}/{failure}");
-            calls.fail_probe.set(None);
-            calls.fail_after.set(None);
-            let attempted = calls.log.borrow().len();
-            assert!(!publication.rollback());
-            drop(publication);
-            assert_eq!(calls.log.borrow().len(), attempted);
-            let mode = if exchange {
-                Rename::Exchange
-            } else {
-                Rename::NoReplace
+            assert_eq!(
+                publication.rollback(),
+                RollbackOutcome::Incomplete,
+                "{exchange:?}/{failure}"
+            );
+            let mode = |id: usize| {
+                if old[id].is_some() {
+                    Rename::Exchange
+                } else {
+                    Rename::NoReplace
+                }
             };
-            let mut expected = vec![(0, mode), (1, mode), (2, mode), (2, mode)];
+            let mut expected = vec![(0, mode(0)), (1, mode(1)), (2, mode(2)), (2, mode(2))];
             if failure == "rename" {
-                expected.push((1, mode));
+                expected.push((1, mode(1)));
             }
-            expected.push((0, mode));
+            expected.push((0, mode(0)));
             assert_eq!(*calls.log.borrow(), expected);
+            let entries: Vec<_> = publication.entries().collect();
+            assert_eq!(entries.len(), 3);
             for id in 0..3 {
                 let restored = id != 1;
+                let entry = &entries[id];
+                assert_eq!(entry.still_published, !restored);
+                assert_eq!(entry.temporary, "pending-next");
+                assert_eq!(entry.canonical, CANONICAL);
+                assert!(Rc::ptr_eq(&entry.next.socket, &next[id]));
+                assert_eq!(entry.previous.is_some(), old[id].is_some());
                 let next_name = if restored { "pending-next" } else { CANONICAL };
                 assert!(next[id].owns(next_name));
                 assert_eq!(next[id].basename(), next_name);
                 if let Some(previous) = &old[id] {
+                    assert!(Rc::ptr_eq(&entry.previous.unwrap().socket, previous));
                     let old_name = if restored { CANONICAL } else { "pending-next" };
                     assert!(previous.owns(old_name));
                     assert_eq!(previous.basename(), old_name);
@@ -683,25 +697,102 @@ fn rollback_reports_partial_restoration_after_probe_or_rename_failure() {
                     assert_eq!(fixtures[id].path(CANONICAL).exists(), !restored);
                 }
             }
-            // Retaining next preserves service after the transient error clears.
+            // The unfinished entry keeps serving until the caller can retry.
             let _client = UnixStream::connect(fixtures[1].path(CANONICAL)).unwrap();
             next[1].accept().unwrap();
+            calls.fail_probe.set(None);
+            calls.fail_after.set(None);
+            assert_eq!(publication.rollback(), RollbackOutcome::Restored);
+            expected.push((1, mode(1)));
+            assert_eq!(*calls.log.borrow(), expected);
+            assert!(publication.entries().all(|entry| !entry.still_published));
+            assert_eq!(publication.rollback(), RollbackOutcome::Restored);
+            drop(publication);
+            assert_eq!(*calls.log.borrow(), expected);
+            for id in 0..3 {
+                assert!(next[id].owns("pending-next"));
+                assert_eq!(next[id].basename(), "pending-next");
+                if let Some(previous) = &old[id] {
+                    assert!(previous.owns(CANONICAL));
+                    assert_eq!(previous.basename(), CANONICAL);
+                    let _client = UnixStream::connect(fixtures[id].path(CANONICAL)).unwrap();
+                    previous.accept().unwrap();
+                } else {
+                    assert!(!fixtures[id].path(CANONICAL).exists());
+                }
+            }
             drop(next);
-            assert!(!fixtures[1].path(CANONICAL).exists());
             if let Some(previous) = &old[1] {
-                assert!(previous.owns("pending-next"));
+                assert!(previous.owns(CANONICAL));
+            } else {
+                assert!(!fixtures[1].path(CANONICAL).exists());
             }
         }
     }
 }
 
 #[test]
+fn incomplete_entry_owners_can_be_retained_without_successful_entries() {
+    let fixtures = [Fixture::new(), Fixture::new()];
+    let calls = Rc::new(Calls::default());
+    let mut publication = Publication::default();
+    let mut next_owners = Vec::new();
+    for (id, fixture) in fixtures.iter().enumerate() {
+        let next = Rc::new(Observed {
+            socket: fixture.bind("pending-next"),
+            id,
+            calls: calls.clone(),
+        });
+        next_owners.push(Rc::downgrade(&next));
+        let previous = Rc::new(Observed {
+            socket: fixture.initial(),
+            id: id + 10,
+            calls: calls.clone(),
+        });
+        publication
+            .publish(
+                Replacement::prepare(
+                    next,
+                    Some(previous),
+                    "pending-next".into(),
+                    CANONICAL.into(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    calls.fail_probe.set(Some(1));
+    assert_eq!(publication.rollback(), RollbackOutcome::Incomplete);
+    let retained: Vec<_> = publication
+        .entries()
+        .filter(|entry| entry.still_published)
+        .map(|entry| (entry.next.clone(), entry.previous.cloned()))
+        .collect();
+    assert_eq!(retained.len(), 1);
+    calls.fail_probe.set(None);
+    let attempts = calls.log.borrow().len();
+    drop(publication);
+    assert_eq!(calls.log.borrow().len(), attempts);
+    assert!(next_owners[0].upgrade().is_none());
+    assert!(next_owners[1].upgrade().is_some());
+    let (next, previous) = &retained[0];
+    assert!(next.owns(CANONICAL));
+    assert!(previous.as_ref().unwrap().owns("pending-next"));
+    let _client = UnixStream::connect(fixtures[1].path(CANONICAL)).unwrap();
+    next.socket.accept().unwrap();
+    drop(retained);
+    assert!(next_owners[1].upgrade().is_none());
+    assert!(!fixtures[1].path(CANONICAL).exists());
+}
+
+#[test]
 fn empty_rollback_reports_success_on_repeated_calls() {
     let mut publication = Publication::<BoundSocket>::default();
-    assert!(publication.rollback());
-    assert!(publication.rollback());
+    assert_eq!(publication.rollback(), RollbackOutcome::Restored);
+    assert_eq!(publication.rollback(), RollbackOutcome::Restored);
     publication.commit();
-    assert!(publication.rollback());
+    assert_eq!(publication.rollback(), RollbackOutcome::Committed);
+    assert_eq!(publication.entries().count(), 0);
 }
 
 #[test]
@@ -736,7 +827,12 @@ fn commit_does_not_rename_or_drop_owners_and_allows_deferred_cleanup() {
     drop(old);
     let deferred: Vec<_> = publication.previous().cloned().collect();
     publication.commit();
-    assert!(!publication.rollback());
+    assert_eq!(publication.rollback(), RollbackOutcome::Committed);
+    assert_eq!(publication.rollback(), RollbackOutcome::Committed);
+    let entry = publication.entries().next().unwrap();
+    assert!(entry.still_published);
+    assert!(Rc::ptr_eq(&entry.next.socket, &next));
+    assert!(Rc::ptr_eq(entry.previous.unwrap(), &deferred[0]));
     assert!(weak.upgrade().is_some());
     assert_eq!(calls.log.borrow().len(), 1);
     drop(publication);
@@ -779,8 +875,8 @@ fn mixed_new_and_replacement_rollback_preserves_held_listeners() {
         .unwrap();
         assert_eq!(publication.publish(replacement).is_err(), id == 2);
     }
-    assert!(publication.rollback());
-    assert!(publication.rollback());
+    assert_eq!(publication.rollback(), RollbackOutcome::Restored);
+    assert_eq!(publication.rollback(), RollbackOutcome::Restored);
     drop(publication);
     assert_eq!(
         &*calls.log.borrow(),
@@ -816,7 +912,7 @@ fn completed_journals_reject_publish_after_commit_or_rollback() {
         if committed {
             publication.commit();
         } else {
-            assert!(publication.rollback());
+            assert_eq!(publication.rollback(), RollbackOutcome::Restored);
         }
         let error = publication.publish(replacement).unwrap_err();
         assert_eq!(
@@ -910,8 +1006,11 @@ fn guarded_new_endpoint_rollback_preserves_foreign_names_and_failed_rename() {
             }
             Guard::RenameFailure => calls.fail_after.set(Some(0)),
         }
-        assert!(!publication.rollback(), "{guard:?}");
-        assert!(!publication.rollback(), "{guard:?}");
+        assert_eq!(
+            publication.rollback(),
+            RollbackOutcome::Incomplete,
+            "{guard:?}"
+        );
         drop(publication);
         assert_eq!(next.basename(), CANONICAL, "{guard:?}");
         assert_eq!(
@@ -966,7 +1065,7 @@ fn absent_canonical_restore_failure_is_guarded_and_not_retried() {
         .unwrap();
     fs::remove_file(fixture.path(CANONICAL)).unwrap();
     calls.fail_after.set(Some(0));
-    assert!(!publication.rollback());
+    assert_eq!(publication.rollback(), RollbackOutcome::Incomplete);
     drop(publication);
     assert_eq!(
         &*calls.log.borrow(),

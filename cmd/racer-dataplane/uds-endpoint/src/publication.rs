@@ -246,20 +246,54 @@ impl<E: Endpoint> Replacement<E> {
     }
 }
 
+/// Result of an explicit rollback attempt. Inspect `Publication::entries` when
+/// restoration is incomplete and retain the affected owners before dropping it.
+#[must_use = "incomplete rollback may leave next owners at canonical names"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollbackOutcome {
+    /// Every journaled entry was restored, or the journal was empty.
+    Restored,
+    /// At least one entry could not be restored. A later call can retry it.
+    Incomplete,
+    /// Commit disabled rollback. No restoration was attempted.
+    Committed,
+}
+
+/// Read-only journal state for one successfully published entry.
+#[derive(Debug)]
+pub struct PublicationEntry<'a, E: Endpoint> {
+    pub next: &'a Rc<E>,
+    pub previous: Option<&'a Rc<E>>,
+    pub temporary: &'a str,
+    pub canonical: &'a str,
+    /// True until this journal restores the entry, including after commit.
+    /// This is not a filesystem probe: interference may have changed the names.
+    /// Retain both owners while handling an incomplete rollback; dropping the
+    /// last next owner may unlink its canonical name.
+    pub still_published: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum State {
+    Active,
+    RollingBack,
+    Committed,
+}
+
 /// A rollback journal. Publish only after all endpoints have been staged.
-/// Drop attempts rollback in reverse order; commit only disarms rollback, retaining
-/// owners so the caller can defer cleanup outside an infallible control commit.
+/// Drop attempts rollback once only if no explicit rollback has started.
+/// Commit disarms rollback and retains owners for deferred cleanup.
 #[derive(Debug)]
 pub struct Publication<E: Endpoint> {
     replacements: Vec<Replacement<E>>,
-    completed: bool,
+    state: State,
 }
 
 impl<E: Endpoint> Default for Publication<E> {
     fn default() -> Self {
         Self {
             replacements: Vec::new(),
-            completed: false,
+            state: State::Active,
         }
     }
 }
@@ -272,7 +306,7 @@ impl<E: Endpoint> Publication<E> {
     /// error if journal reservation fails, or validation/probe/rename error.
     /// Earlier successful entries remain journaled for rollback.
     pub fn publish(&mut self, replacement: Replacement<E>) -> Result<(), E::Error> {
-        if self.completed {
+        if self.state != State::Active {
             return Err(E::completed_error());
         }
         let next = &replacement.next;
@@ -323,27 +357,40 @@ impl<E: Endpoint> Publication<E> {
             .filter_map(|entry| entry.previous.as_ref())
     }
 
+    /// Inspect all entries in publication order without probing or allocating.
+    /// Clone the owners of still-published entries to retain them independently
+    /// of this journal. Keep the journal itself to retry incomplete rollback.
+    pub fn entries(&self) -> impl Iterator<Item = PublicationEntry<'_, E>> {
+        self.replacements.iter().map(|entry| PublicationEntry {
+            next: &entry.next,
+            previous: entry.previous.as_ref(),
+            temporary: &entry.temporary,
+            canonical: &entry.canonical,
+            still_published: entry.published,
+        })
+    }
+
     /// No filesystem calls, allocations, or owner drops.
     pub fn commit(&mut self) {
-        self.completed = true;
+        self.state = State::Committed;
     }
 
     /// Best-effort, scope-independent rollback; never exchange foreign inodes.
     /// An absent canonical name can be restored from the owned previous staging
     /// name. New endpoints move back to their vacant temporary name even when
     /// external references keep their listeners alive.
-    /// Returns true only when every published entry was restored. False means
-    /// owners must be retained while the caller handles incomplete restoration:
-    /// dropping a next owner may still unlink its canonical name.
-    /// Repeated calls return the same result without retrying failed entries.
-    /// After commit, returns false unless there were no published entries.
-    pub fn rollback(&mut self) -> bool {
-        if self.completed {
-            return self.replacements.iter().all(|entry| !entry.published);
+    /// Returns `Restored` only when every entry was restored. On `Incomplete`,
+    /// inspect `entries()` and retain the owners of still-published entries.
+    /// Later calls retry only those entries, in reverse publication order.
+    /// After commit, returns `Committed` even for an empty journal.
+    #[must_use = "inspect incomplete rollback and retain affected owners"]
+    pub fn rollback(&mut self) -> RollbackOutcome {
+        if self.state == State::Committed {
+            return RollbackOutcome::Committed;
         }
-        // Disarm before invoking adapters: rollback is attempted only once even
-        // if an adapter violates the no-panic contract during unwinding.
-        self.completed = true;
+        // Disable publication and implicit Drop retries before invoking adapters,
+        // including if an adapter violates the no-panic contract while unwinding.
+        self.state = State::RollingBack;
         for replacement in self.replacements.iter_mut().rev() {
             if !replacement.published {
                 continue;
@@ -396,12 +443,18 @@ impl<E: Endpoint> Publication<E> {
                 replacement.published = false;
             }
         }
-        self.replacements.iter().all(|entry| !entry.published)
+        if self.replacements.iter().all(|entry| !entry.published) {
+            RollbackOutcome::Restored
+        } else {
+            RollbackOutcome::Incomplete
+        }
     }
 }
 
 impl<E: Endpoint> Drop for Publication<E> {
     fn drop(&mut self) {
-        let _ = self.rollback();
+        if self.state == State::Active {
+            let _ = self.rollback();
+        }
     }
 }

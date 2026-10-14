@@ -149,18 +149,24 @@ ownership and reserves journal storage before mutation. Replacements use
 renames update cleanup bookkeeping. Each rename is atomic, but a multi-endpoint
 publication is not globally atomic: readers can observe intermediate states.
 
-`rollback` and Drop attempt reverse-order restoration only once. Owned replacements
+`rollback` attempts reverse-order restoration. Owned replacements
 are exchanged back; if canonical is absent, the old owned temporary can be moved
 back without replacement. New endpoints move from canonical back to their vacant
 temporary name even when an external `Rc` keeps the listener alive. Foreign names
 are never knowingly exchanged or overwritten. Failed guards or renames leave
-cleanup names unchanged. `rollback() -> bool` returns true only when every
-published entry was restored. False means restoration is incomplete: retain the
-owners while handling the failure, since dropping `next` may still unlink its
-canonical name. Repeated calls return the same result without retrying. After
-commit, rollback returns false unless no entries were published. Drop stays best
-effort and discards the result. Neither form promises full restoration after
-interference or filesystem failure.
+cleanup names unchanged. The must-use `RollbackOutcome` distinguishes `Restored`
+(all entries restored), `Incomplete` (some entries could not be restored), and
+`Committed` (rollback disabled, even for an empty journal).
+
+On `Incomplete`, use `entries()` to inspect each entry's `still_published` flag,
+names, and `next`/`previous` owner references in publication order. This flag tracks
+journal restoration, not current filesystem ownership. Keep the journal and retry
+`rollback()` after fixing the failure; only unfinished entries are retried. If you
+must drop the journal, first clone both owners of each unfinished entry to retain
+them while handling the failure. Dropping the last `next` owner may still unlink
+its canonical name. Drop attempts rollback once only if no explicit rollback has
+started; it never retries an explicit failure. Neither form promises full
+restoration after interference or filesystem failure.
 
 `commit(&mut self)` only disarms rollback: no filesystem calls, allocations, or
 owner drops. `previous()` exposes retained previous owners for deferred cleanup.

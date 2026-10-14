@@ -336,7 +336,10 @@ mod tests {
             if commit {
                 publication.commit();
             } else {
-                publication.rollback();
+                assert_eq!(
+                    publication.rollback(),
+                    crate::publication::RollbackOutcome::Restored
+                );
             }
             let error = publication.publish(replacement).unwrap_err();
             assert_eq!(
@@ -558,7 +561,10 @@ mod tests {
         publication.publish(replacement).unwrap();
         assert!(next.owns("canonical"));
         assert!(previous.owns("temporary"));
-        publication.rollback();
+        assert_eq!(
+            publication.rollback(),
+            crate::publication::RollbackOutcome::Restored
+        );
         assert!(next.owns("temporary"));
         assert!(previous.owns("canonical"));
     }
@@ -640,7 +646,10 @@ mod tests {
                     if commit {
                         publication.commit();
                     } else {
-                        publication.rollback();
+                        assert_eq!(
+                            publication.rollback(),
+                            crate::publication::RollbackOutcome::Restored
+                        );
                         assert!(next.owns("temporary"));
                         if let Some(previous) = &previous {
                             assert!(previous.owns("canonical"));
@@ -700,7 +709,10 @@ mod tests {
         assert!(next.absent("canonical"));
         publication.publish(prepare()).unwrap();
         sim.inject("rename", Fault::Errno(libc::EIO)).unwrap();
-        publication.rollback();
+        assert_eq!(
+            publication.rollback(),
+            crate::publication::RollbackOutcome::Incomplete
+        );
         assert!(next.owns("canonical"));
         assert!(next.absent("temporary"));
         drop((publication, next));
