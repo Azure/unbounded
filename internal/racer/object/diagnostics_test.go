@@ -25,11 +25,12 @@ func TestInvalidResponseCategory(t *testing.T) {
 	}{
 		{"redirect-301", classifyS3Error(originStatusError{301}, false), "redirect"},
 		{"redirect-307", classifyS3Error(originStatusError{307}, false), "redirect"},
-		{"status-405", classifyS3Error(originStatusError{405}, false), "status"},
+		{"status-400", classifyS3Error(originStatusError{400}, false), "status"},
 		{"status-416", classifyS3Error(originStatusError{416}, false), "status"},
 		{"validation", errS3Validation, "validation"},
 		{"unknown", classifyS3Error(errors.New("private"), false), "upstream"},
 		{"not-invalid", classifyS3Error(originStatusError{404}, false), ""},
+		{"delete-marker-405", classifyS3Error(originStatusError{405}, false), ""},
 		{"nil", nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,6 +42,11 @@ func TestInvalidResponseCategory(t *testing.T) {
 				t.Fatal("sub-category changed the error mapping")
 			}
 		})
+	}
+
+	// A delete marker's 405 is not found, which diagnostics log as notfound.
+	if err := classifyS3Error(originStatusError{405}, false); !errors.Is(err, racersdk.ErrNotFound) || errors.Is(err, errInvalidS3Response) {
+		t.Fatalf("405 = %v, want not found", err)
 	}
 
 	if errors.Is(errS3Status, racersdk.ErrUnavailable) {
@@ -142,7 +148,8 @@ func TestSidecarReportsMetadataMismatch(t *testing.T) {
 		return changed, io.NopCloser(strings.NewReader("xxxx")), nil
 	}, &reports)
 
-	w := sidecarTestRequest(h, "GET", "/my-bucket/key", nil)
+	// A suffix range takes the Stat path, whose read is pinned and checked.
+	w := sidecarTestRequest(h, "GET", "/my-bucket/key", http.Header{"Range": {"bytes=-4"}})
 	if w.Code != http.StatusBadGateway || len(reports) != 1 || !errors.Is(reports[0].Err, ErrMetadataMismatch) || reports[0].Bucket != "my-bucket" {
 		t.Fatalf("status %d reports %+v", w.Code, reports)
 	}

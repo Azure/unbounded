@@ -253,7 +253,8 @@ never upstream error text, URLs, keys, queries, or credentials.
   - `tls`: a certificate or TLS failure. The request still fails as
     `ErrUnavailable` (503), but this is usually a configuration error.
   - `redirect`: an S3 3xx, usually a wrong region or addressing style.
-  - `status`: an S3 status with no Racer meaning, such as 400, 405, or 416.
+  - `status`: an S3 status with no Racer meaning, such as 400 or 416.
+    A 405 is not here: it is a delete marker and maps to not found.
   - `validation`: an S3 response that failed HEAD or GET validation.
   - `upstream`: an unclassified failure.
   - `mismatch`: the sidecar saw a pinned read return different metadata.

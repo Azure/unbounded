@@ -23,7 +23,7 @@ func (e *invalidS3Response) Is(target error) bool { return target == errInvalidS
 var (
 	// errS3Redirect is a 3xx, typically a wrong region or addressing style.
 	errS3Redirect error = &invalidS3Response{kind: "redirect"}
-	// errS3Status is an HTTP status with no Racer meaning, such as 400 or 405.
+	// errS3Status is an HTTP status with no Racer meaning, such as 400 or 416.
 	errS3Status error = &invalidS3Response{kind: "status"}
 	// errS3Validation is a response that failed HEAD or GET validation.
 	errS3Validation error = &invalidS3Response{kind: "validation"}
