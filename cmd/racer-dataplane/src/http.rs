@@ -376,7 +376,7 @@ pub fn pool_with_limits(
             max_endpoints,
             idle_timeout,
             waiter_cap: admission.policy().limits().queue_entries.get(),
-            tcp_nodelay: false,
+            tcp_nodelay: true,
         },
     )
 }

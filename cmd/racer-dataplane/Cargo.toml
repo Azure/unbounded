@@ -66,8 +66,15 @@ page-alloc = { path = "alloc", features = ["simulation"] }
 uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
 
 # Keep source locations and inline frames for Parca.
+#
+# The hot path crosses crate boundaries on every operation (racer-dataplane ->
+# uring-runtime -> flow-control -> page-alloc -> http1), so cross-crate inlining
+# is load bearing. `panic = "abort"` is deliberately absent: `catch_unwind` is
+# relied upon by the worker group and the reactor completion loop.
 [profile.release]
 debug = 1
+lto = "thin"
+codegen-units = 1
 
 # Full-page crypto and exhaustive topology checks dominate unoptimized test runs.
 # Keep debug assertions, overflow checks, and debug info while optimizing hot loops.

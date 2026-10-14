@@ -1506,6 +1506,114 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
 }
 
 #[test]
+fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let first = f.copy(1, 113);
+    let metadata = first.metadata.immutable();
+    f.enqueue(first).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    let index = f.store.writer.index();
+    index.publish_version(metadata.clone()).unwrap();
+    index
+        .reserve_hold(
+            &metadata.version,
+            1,
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    let base = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap();
+    let pages = base + super::checkpoint::snapshot_entry_bytes(&metadata);
+    let descriptors = pages + super::checkpoint::snapshot_metadata_bytes(&metadata);
+    let held = descriptors + super::checkpoint::RETAINED_RECORD_BYTES;
+
+    let copy = f.copy(2, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    simulation.inject("write", Fault::Delay(6)).unwrap();
+    let request = scope();
+    let mut progress = f.store.writer.progress(1, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(progress.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    for budget in [0, base - 1, pages - 1, descriptors - 1, held - 1] {
+        let mut snapshot = f.store.checkpoint.snapshot_incremental(budget);
+        assert!(matches!(
+            snapshot.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        assert!(!f.store.writer.paused.get());
+        assert!(f.store.writer.waiters.borrow().is_empty());
+        assert_eq!(f.store.writer.writes_in_flight(), 1);
+        // Acquiring a guard proves the failed cut did not freeze the table.
+        drop(f.segments.freeze().unwrap());
+    }
+    drive(&f.reactor, progress).unwrap();
+    assert!(index.lookup(&id).unwrap().is_some());
+    f.enqueue(f.copy(3, 113)).unwrap();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &scope())),
+        Ok(1)
+    );
+    assert_eq!(f.store.writer.discarded_count(), 0);
+}
+
+#[test]
+fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
+    use super::checkpoint::{CHECKPOINT_VERSION, CheckpointImage, encode};
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.enqueue(f.copy(1, 113)).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    let index = f.store.writer.index();
+    let metadata = index.snapshot().unwrap().entries[0].1.metadata.clone();
+    index.publish_version(metadata.clone()).unwrap();
+    index
+        .reserve_hold(
+            &metadata.version,
+            1,
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    let budget = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap()
+        + super::checkpoint::snapshot_entry_bytes(&metadata)
+        + super::checkpoint::snapshot_metadata_bytes(&metadata)
+        + super::checkpoint::RETAINED_RECORD_BYTES;
+    assert!(matches!(
+        drive(
+            &f.reactor,
+            f.store.checkpoint.snapshot_incremental(budget - 1)
+        ),
+        Err(Error::Overloaded)
+    ));
+    assert!(!f.store.writer.paused.get());
+    let full = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
+    f.store.checkpoint.finish_snapshot();
+    let incremental = drive(&f.reactor, f.store.checkpoint.snapshot_incremental(budget)).unwrap();
+    assert!(f.store.writer.paused.get());
+    let bytes = |shard| {
+        encode(&CheckpointImage {
+            version: CHECKPOINT_VERSION,
+            sequence: 1,
+            shards: vec![shard],
+        })
+        .unwrap()
+    };
+    let full = bytes(full);
+    assert_eq!(bytes(incremental), full);
+    assert_eq!(full.len(), budget + 32 + 4 + 32);
+    f.store.checkpoint.finish_snapshot();
+    assert!(!f.store.writer.paused.get());
+    drop(f.segments.freeze().unwrap());
+}
+
+#[test]
 fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
     let f = Fixture::new();
     let _ = drive(&f.reactor, f.store.open()).unwrap();
@@ -1554,11 +1662,12 @@ fn checkpoint_preflights_segment_metadata_and_page_clones() {
     let metadata = index.snapshot().unwrap().entries[0].1.metadata.clone();
     index.publish_version(metadata.clone()).unwrap();
     let item = super::checkpoint::snapshot_entry_bytes(&metadata);
-    let segment_bytes = f.segments.count() * 128;
+    let descriptor = super::checkpoint::snapshot_metadata_bytes(&metadata);
+    let segment_bytes = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap();
     for budget in [
         segment_bytes - 1,
-        segment_bytes + item - 1,
-        segment_bytes + 2 * item - 1,
+        segment_bytes + descriptor - 1,
+        segment_bytes + descriptor + item - 1,
     ] {
         assert!(matches!(
             drive(&f.reactor, f.store.checkpoint.snapshot_incremental(budget)),
@@ -1569,7 +1678,7 @@ fn checkpoint_preflights_segment_metadata_and_page_clones() {
         drop(frozen);
         drop(f.segments.append(4096).unwrap());
     }
-    let mut budget = item - 1;
+    let mut budget = descriptor - 1;
     assert!(matches!(
         index.snapshot_metadata_budgeted(&mut budget),
         Err(Error::Overloaded)
@@ -1583,7 +1692,7 @@ fn checkpoint_preflights_segment_metadata_and_page_clones() {
         &f.reactor,
         f.store
             .checkpoint
-            .snapshot_incremental(segment_bytes + 2 * item),
+            .snapshot_incremental(segment_bytes + descriptor + item),
     )
     .unwrap();
     assert_eq!(image.index.entries.len(), 1);

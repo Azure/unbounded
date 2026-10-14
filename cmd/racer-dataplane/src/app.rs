@@ -246,6 +246,12 @@ impl Application {
         self.discovered_nics = crate::rdma::inventory();
         let mut plan = AffinityPlan::discover(&self.config)?;
         log_worker_plan("planned", &plan);
+        // Defaulted limits are stated per worker. Scale them to node-wide totals
+        // before sizing partitions them back out, so lane budgets stay constant
+        // as cores are added instead of shrinking until workers are shed.
+        Arc::get_mut(&mut self.config)
+            .ok_or(Error::Internal)?
+            .scale_limits(plan.pairs.len())?;
         self.limits = size_workers_policy(
             &self.config.limits,
             &mut plan,
@@ -2528,6 +2534,10 @@ fn size_workers_policy(
 ) -> Result<Limits> {
     // Reduce shards to fund progress, then rebalance shared crypto execution.
     let mut count = plan.pairs.len();
+    // Shedding a few lanes to fund progress is reasonable; shedding most of them
+    // silently converts a larger host into a smaller dataplane. Past this floor
+    // the configuration is wrong and must say so instead of quietly complying.
+    let floor = plan.pairs.len().div_ceil(2).max(1);
     let mut limiting_resource = None;
     loop {
         let partition = partition_limits_with_cause(node, count, rdma).and_then(|limits| {
@@ -2562,7 +2572,7 @@ fn size_workers_policy(
                 }
                 return Ok(limits);
             }
-            Err((dimension, _)) if count > 1 && !exact => {
+            Err((dimension, _)) if count > floor && !exact => {
                 limiting_resource = Some(dimension);
                 count -= 1;
             }
@@ -2682,7 +2692,7 @@ mod lifecycle_policy_tests {
 
     #[test]
     fn profiling_worker_sizing_preserves_memory_and_ordinary_slots() {
-        let config = Config::from_lookup(|name| {
+        let mut config = Config::from_lookup(|name| {
             Ok(match name {
                 "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                 "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
@@ -2713,6 +2723,7 @@ mod lifecycle_policy_tests {
             pairs: plan.pairs.clone(),
             max_threads: plan.max_threads,
         };
+        config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers_configured(&config.limits, &mut plan, false, true).unwrap();
         size_workers_configured(&config.limits, &mut ordinary_plan, false, false).unwrap();
         assert_eq!(plan.pairs.len(), ordinary_plan.pairs.len());
@@ -2734,7 +2745,7 @@ mod lifecycle_policy_tests {
 
     #[test]
     fn profiling_preserves_ten_io_five_crypto_benchmark_plan() {
-        let config = Config::from_lookup(|name| {
+        let mut config = Config::from_lookup(|name| {
             Ok(match name {
                 "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                 "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
@@ -2768,6 +2779,7 @@ mod lifecycle_policy_tests {
             pairs: enabled.pairs.clone(),
             max_threads: enabled.max_threads,
         };
+        config.scale_limits(enabled.pairs.len()).unwrap();
         size_workers_configured(&config.limits, &mut enabled, false, true).unwrap();
         size_workers_configured(&config.limits, &mut disabled, false, false).unwrap();
         assert_eq!(enabled.pairs.len(), 10);

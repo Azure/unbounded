@@ -157,16 +157,18 @@ impl Checkpointer {
             if owner.frozen.borrow().is_some() {
                 return Err(Error::Overloaded);
             }
+            let segment_bytes = snapshot_base_bytes(owner.segments.count())?;
+            let mut remaining = budget.checked_sub(segment_bytes).ok_or(Error::Overloaded)?;
+            // Inspect borrowed index state before draining writes. Segments owns no
+            // live hold records; Index adds those deadlines to the snapshot.
+            owner.index.preflight_snapshot(&mut remaining)?;
+            remaining = budget - segment_bytes;
             // Keep ownership in the future until success so cancellation also thaws.
             let paused = owner.pause_writer().await?;
             let frozen = owner.segments.freeze()?;
             let result = async {
-                let segment_bytes = owner
-                    .segments
-                    .count()
-                    .checked_mul(128)
-                    .ok_or(Error::Overloaded)?;
-                let mut remaining = budget.checked_sub(segment_bytes).ok_or(Error::Overloaded)?;
+                // Recheck while copying: draining writes can publish pages, and
+                // holds can be added during traversal yields.
                 let metadata = owner.index.snapshot_metadata_budgeted(&mut remaining)?;
                 let mut segments = owner.segments.snapshot();
                 let mut entries = Vec::new();
@@ -246,34 +248,7 @@ impl Checkpointer {
         budget: usize,
     ) -> Result<Operation<'static, ()>> {
         // Bound simultaneous decoded image, encoding and submission scratch.
-        let estimated = shards
-            .iter()
-            .try_fold(0usize, |total, shard| {
-                shard
-                    .index
-                    .entries
-                    .iter()
-                    .try_fold(total, |n, (_, entry)| {
-                        n.checked_add(snapshot_entry_bytes(&entry.metadata))
-                    })
-                    .and_then(|n| {
-                        n.checked_add(
-                            shard
-                                .index
-                                .metadata
-                                .iter()
-                                .map(snapshot_entry_bytes)
-                                .sum::<usize>()
-                                + shard.segments.len() * 128
-                                + shard
-                                    .segments
-                                    .iter()
-                                    .map(|segment| segment.retained_records.len() * 128)
-                                    .sum::<usize>(),
-                        )
-                    })
-            })
-            .ok_or(Error::Overloaded)?;
+        let estimated = snapshot_image_bytes(&shards)?;
         if estimated > budget / 2 {
             return Err(Error::Overloaded);
         }
@@ -310,13 +285,58 @@ impl Drop for Checkpointer {
 }
 
 pub(super) fn snapshot_entry_bytes(metadata: &VersionMetadata) -> usize {
-    2048 + 4
-        * (metadata.version.object.cache.0.len()
-            + metadata.version.etag.as_bytes().len()
-            + metadata
-                .content_type
-                .as_ref()
-                .map_or(0, |mime| mime.as_bytes().len()))
+    PAGE_ENTRY_BYTES + descriptor_string_bytes(metadata)
+}
+
+pub(super) fn snapshot_metadata_bytes(metadata: &VersionMetadata) -> usize {
+    DESCRIPTOR_BYTES + descriptor_string_bytes(metadata)
+}
+
+fn descriptor_string_bytes(metadata: &VersionMetadata) -> usize {
+    // Encoder::descriptor writes each string once. Its three u32 length
+    // prefixes are already included in DESCRIPTOR_BYTES and PAGE_ENTRY_BYTES.
+    metadata.version.object.cache.0.len()
+        + metadata.version.etag.as_bytes().len()
+        + metadata
+            .content_type
+            .as_ref()
+            .map_or(0, |mime| mime.as_bytes().len())
+}
+
+fn snapshot_segment_bytes(records: usize) -> Result<usize> {
+    records
+        .checked_mul(RETAINED_RECORD_BYTES)
+        .and_then(|n| n.checked_add(SEGMENT_BYTES))
+        .ok_or(Error::Overloaded)
+}
+
+pub(super) fn snapshot_base_bytes(segments: usize) -> Result<usize> {
+    segments
+        .checked_mul(snapshot_segment_bytes(0)?)
+        .and_then(|n| n.checked_add(SHARD_BYTES))
+        .ok_or(Error::Overloaded)
+}
+
+fn snapshot_image_bytes(shards: &[ShardImage]) -> Result<usize> {
+    let mut total = HEADER_BYTES + 4 + DIGEST_BYTES;
+    for shard in shards {
+        total = total.checked_add(SHARD_BYTES).ok_or(Error::Overloaded)?;
+        for segment in &shard.segments {
+            total = total
+                .checked_add(snapshot_segment_bytes(segment.retained_records.len())?)
+                .ok_or(Error::Overloaded)?;
+        }
+        for bytes in shard
+            .index
+            .entries
+            .iter()
+            .map(|(_, entry)| snapshot_entry_bytes(&entry.metadata))
+            .chain(shard.index.metadata.iter().map(snapshot_metadata_bytes))
+        {
+            total = total.checked_add(bytes).ok_or(Error::Overloaded)?;
+        }
+    }
+    Ok(total)
 }
 
 fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
@@ -462,6 +482,14 @@ pub(super) const DIGEST_BYTES: usize = 32;
 const MAX_SHARDS: usize = 4096;
 const MAX_ITEMS: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 8192;
+
+// Shared with decode_with_budget/recovery_memory input.count calls for shards,
+// segments, retained records, page entries, and standalone descriptors.
+const SHARD_BYTES: usize = 94; // worker + geometry + digest + three u32 counts.
+const SEGMENT_BYTES: usize = 29; // id + generation + state + used + record count.
+pub(super) const RETAINED_RECORD_BYTES: usize = 20; // offset + seconds + nanos.
+const DESCRIPTOR_BYTES: usize = 52; // key + length + three u32 string lengths.
+const PAGE_ENTRY_BYTES: usize = DESCRIPTOR_BYTES + 64; // descriptor + page fields.
 
 /// Persist allocation geometry so a valid checksum cannot hide incompatible slabs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -797,7 +825,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
     if input.u64()? != bytes.len() as u64 {
         return Err(Error::CorruptRecord);
     }
-    let count = input.count(MAX_SHARDS, 94)?;
+    let count = input.count(MAX_SHARDS, SHARD_BYTES)?;
     let mut shards = Vec::with_capacity(count);
     for _ in 0..count {
         let worker = WorkerId(u16::from_le_bytes(input.array()?));
@@ -811,7 +839,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
             layout_digest: input.array()?,
         };
         geometry.validate()?;
-        let count = input.count(MAX_ITEMS, 29)?;
+        let count = input.count(MAX_ITEMS, SEGMENT_BYTES)?;
         let mut segments = Vec::with_capacity(count);
         for _ in 0..count {
             segments.push(SegmentSnapshot {
@@ -826,7 +854,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                 },
                 used_bytes: input.u64()?,
                 retained_records: {
-                    let count = input.count(MAX_ITEMS, 20)?;
+                    let count = input.count(MAX_ITEMS, RETAINED_RECORD_BYTES)?;
                     let mut records = Vec::with_capacity(count);
                     for _ in 0..count {
                         let offset = input.u64()?;
@@ -844,7 +872,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                 },
             });
         }
-        let count = input.count(MAX_ITEMS, 112)?;
+        let count = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let metadata = input.descriptor()?;
@@ -874,7 +902,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                 },
             ));
         }
-        let count = input.count(MAX_ITEMS, 48)?;
+        let count = input.count(MAX_ITEMS, DESCRIPTOR_BYTES)?;
         let mut metadata = Vec::with_capacity(count);
         for _ in 0..count {
             metadata.push(input.descriptor()?);
@@ -919,7 +947,7 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
     };
     charge(1, std::mem::size_of::<CheckpointImage>())?;
     let mut input = Decoder(&bytes[HEADER_BYTES..bytes.len() - DIGEST_BYTES]);
-    let shards = input.count(MAX_SHARDS, 94)?;
+    let shards = input.count(MAX_SHARDS, SHARD_BYTES)?;
     charge(shards, std::mem::size_of::<ShardImage>() + 512)?;
     for _ in 0..shards {
         input.take(2)?;
@@ -927,24 +955,24 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
         let segment_count = input.u64()?;
         input.take(24)?;
         input.take(32)?;
-        let segments = input.count(MAX_ITEMS, 29)?;
+        let segments = input.count(MAX_ITEMS, SEGMENT_BYTES)?;
         if segment_count != segments as u64 {
             return Err(Error::CorruptRecord);
         }
         charge(segments, std::mem::size_of::<SegmentSnapshot>() + 512)?;
         for _ in 0..segments {
             input.take(25)?;
-            let count = input.count(MAX_ITEMS, 20)?;
+            let count = input.count(MAX_ITEMS, RETAINED_RECORD_BYTES)?;
             charge(count, 128)?;
-            input.take(count * 20)?;
+            input.take(count * RETAINED_RECORD_BYTES)?;
         }
-        let pages = input.count(MAX_ITEMS, 112)?;
+        let pages = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;
         charge(pages, std::mem::size_of::<(PageId, IndexedPage)>() + 512)?;
         for _ in 0..pages {
             charge(input.descriptor_bytes()?, 4)?;
             input.take(64)?;
         }
-        let metadata = input.count(MAX_ITEMS, 48)?;
+        let metadata = input.count(MAX_ITEMS, DESCRIPTOR_BYTES)?;
         charge(metadata, std::mem::size_of::<VersionMetadata>() + 512)?;
         for _ in 0..metadata {
             charge(input.descriptor_bytes()?, 4)?;
@@ -1135,5 +1163,171 @@ impl Recovery {
             })
         });
         Box::pin(async move { result })
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn metadata() -> VersionMetadata {
+        VersionMetadata {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId(crate::test_support::security::CACHE.into()),
+                    key: CacheKey([7; 32]),
+                },
+                etag: StrongEtag::parse(b"\"checkpoint\"").unwrap(),
+            },
+            length: crate::model::PAGE_BYTES,
+            content_type: None,
+        }
+    }
+
+    #[test]
+    fn descriptor_charge_counts_each_string_and_prefix_once() {
+        for mime in [None, Some(b"application/octet-stream".as_slice())] {
+            let mut metadata = metadata();
+            metadata.content_type = mime.map(|m| crate::model::ContentType::parse(m).unwrap());
+            for strings in [false, true] {
+                if strings {
+                    metadata.version.object.cache.0 = "c".repeat(MAX_STRING_BYTES);
+                    metadata.version.etag = StrongEtag::parse(
+                        format!("\"{}\"", "e".repeat(MAX_STRING_BYTES - 2)).as_bytes(),
+                    )
+                    .unwrap();
+                }
+                let mut encoder = Encoder(Vec::new());
+                encoder.descriptor(&metadata).unwrap();
+                assert_eq!(snapshot_metadata_bytes(&metadata), encoder.0.len());
+                assert_eq!(snapshot_entry_bytes(&metadata), encoder.0.len() + 64);
+                assert_eq!(DESCRIPTOR_BYTES, 52);
+                assert_eq!(PAGE_ENTRY_BYTES, 116);
+            }
+        }
+    }
+
+    #[test]
+    fn segment_charge_handles_empty_full_and_overflow() {
+        assert_eq!(snapshot_base_bytes(0), Ok(SHARD_BYTES));
+        assert_eq!(snapshot_segment_bytes(0), Ok(29));
+        assert_eq!(snapshot_segment_bytes(63), Ok(1289));
+        assert_eq!(snapshot_segment_bytes(MAX_ITEMS), Ok(29 + 20 * MAX_ITEMS));
+        assert_eq!(snapshot_segment_bytes(usize::MAX), Err(Error::Overloaded));
+        assert_eq!(snapshot_base_bytes(usize::MAX), Err(Error::Overloaded));
+    }
+
+    #[test]
+    fn image_charge_exactly_matches_encoding_at_record_capacity() {
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
+        let full_record = alignment
+            .extent(
+                0,
+                crate::model::PAGE_BYTES as usize + 16 + super::super::MAX_HEADER_BYTES,
+            )
+            .unwrap()
+            .length();
+        // Include a full 1 GiB segment, plus short records that pack more densely.
+        for (segment_bytes, record_bytes) in [(1 << 30, full_record), (4 * 4096, 4096)] {
+            let capacity = segment_bytes / record_bytes;
+            for records in [0, 1, capacity] {
+                let geometry = CheckpointGeometry::new(
+                    segment_bytes as u64,
+                    segment_bytes as u64,
+                    1,
+                    alignment,
+                )
+                .unwrap();
+                let segments =
+                    Segments::from_geometry(geometry.allocation_geometry().unwrap()).unwrap();
+                let metadata = metadata();
+                let mut entries = Vec::new();
+                let mut retained = Vec::new();
+                for number in 0..records {
+                    let (lease, extent) = segments.append(record_bytes).unwrap();
+                    let mut descriptor = metadata.clone();
+                    descriptor.version.object.key.0[..8]
+                        .copy_from_slice(&(number as u64).to_le_bytes());
+                    entries.push((
+                        PageId {
+                            version: descriptor.version.clone(),
+                            number: PageNumber(0),
+                        },
+                        IndexedPage {
+                            metadata: descriptor,
+                            key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                            location: RecordLocation {
+                                segment: lease.id(),
+                                generation: lease.generation(),
+                                extent,
+                            },
+                        },
+                    ));
+                    retained.push((
+                        extent.offset(),
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(60),
+                    ));
+                }
+                let mut segments = segments.snapshot();
+                segments[0].retained_records = retained;
+                let image = CheckpointImage {
+                    version: CHECKPOINT_VERSION,
+                    sequence: 1,
+                    shards: vec![ShardImage {
+                        worker: WorkerId(0),
+                        geometry,
+                        index: IndexSnapshot {
+                            entries,
+                            metadata: vec![metadata],
+                        },
+                        segments,
+                    }],
+                };
+                let encoded = encode(&image).unwrap();
+                assert_eq!(snapshot_image_bytes(&image.shards).unwrap(), encoded.len());
+                let decoded = decode(&encoded).unwrap();
+                assert_eq!(
+                    decoded.shards[0].segments[0].retained_records.len(),
+                    records
+                );
+                assert_eq!(encode(&decoded).unwrap(), encoded);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_shard_exact_budget_and_unconfigured_zero_segments() {
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            1,
+            crate::test_support::availability(),
+        ));
+        let segments = Rc::new(Segments::new(4096));
+        let checkpoint = Rc::new(Checkpointer::new(PathBuf::new(), index, segments.clone()));
+        assert_eq!(segments.count(), 0);
+        assert!(matches!(
+            futures::executor::block_on(checkpoint.snapshot_incremental(0)),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert!(checkpoint.frozen.borrow().is_none());
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
+        segments.configure(4096, 1, alignment).unwrap();
+        checkpoint
+            .configure_geometry(CheckpointGeometry::new(4096, 4096, 1, alignment).unwrap())
+            .unwrap();
+        let budget = snapshot_base_bytes(1).unwrap();
+        assert!(matches!(
+            futures::executor::block_on(checkpoint.snapshot_incremental(budget - 1)),
+            Err(Error::Overloaded)
+        ));
+        assert!(checkpoint.frozen.borrow().is_none());
+        assert!(checkpoint.paused.borrow().is_none());
+        drop(segments.freeze().unwrap());
+        let shard = futures::executor::block_on(checkpoint.snapshot_incremental(budget)).unwrap();
+        assert!(shard.index.entries.is_empty());
+        assert!(shard.segments[0].retained_records.is_empty());
+        assert!(checkpoint.frozen.borrow().is_some());
+        checkpoint.finish_snapshot();
+        assert!(segments.append(4096).is_ok());
     }
 }

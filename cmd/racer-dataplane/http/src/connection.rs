@@ -334,7 +334,7 @@ impl Default for PoolConfig {
             max_endpoints: 256,
             waiter_cap: 256,
             idle_timeout: Duration::from_secs(30),
-            tcp_nodelay: false,
+            tcp_nodelay: true,
         }
     }
 }

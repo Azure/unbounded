@@ -358,10 +358,13 @@ mod tests {
         );
         assert_eq!(config.slab_bytes, 1024 * 1024 * 1024);
         assert_eq!(
-            config.limits.request_context_bytes,
-            default_config(false).limits.request_context_bytes
+            config.limits.request_context_bytes.get(),
+            values["RACER_REQUEST_CONTEXT_BYTES"]
+                .parse::<usize>()
+                .unwrap()
         );
         let mut plan = four_pair_plan(&config);
+        config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
         assert_eq!(plan.pairs.len(), 5);
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
@@ -460,6 +463,7 @@ mod tests {
                 .unwrap()
             };
             let mut plan = make_plan(&config);
+            config.scale_limits(plan.pairs.len()).unwrap();
             let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
             assert_eq!(plan.pairs.len(), expected);
             for (partition, node) in [
@@ -476,11 +480,19 @@ mod tests {
             let floor = 3 * crate::model::PAGE_BYTES as usize;
             config.limits.plaintext_bytes = NonZeroUsize::new(2 * floor).unwrap();
             let mut plan = make_plan(&config);
-            let limits = size_workers(&config.limits, &mut plan, false).unwrap();
-            assert_eq!(plan.pairs.len(), 2);
+            let result = size_workers(&config.limits, &mut plan, false);
+            let limits = if allow_smt {
+                assert!(matches!(result, Err(Error::InvalidConfiguration)));
+                assert_eq!(plan.pairs.len(), expected);
+                super::super::partition_limits(&config.limits, 2, false).unwrap()
+            } else {
+                assert_eq!(plan.pairs.len(), 2);
+                assert_eq!(plan.crypto_groups(), vec![vec![0, 1]]);
+                result.unwrap()
+            };
             assert_eq!(limits.plaintext_bytes.get(), floor);
             assert_eq!(limits.relay_transfers.get(), 128);
-            assert_eq!(plan.crypto_groups(), vec![vec![0, 1]]);
+            assert_eq!(plan.crypto_groups().len(), if allow_smt { 3 } else { 1 });
             assert!(
                 plan.pairs
                     .iter()
@@ -488,7 +500,9 @@ mod tests {
             );
             assert_eq!(
                 plan.pairs.iter().map(|p| p.worker).collect::<Vec<_>>(),
-                vec![WorkerId(0), WorkerId(1)]
+                (0..if allow_smt { expected } else { 2 })
+                    .map(|id| WorkerId(id as u16))
+                    .collect::<Vec<_>>()
             );
             config.limits.plaintext_bytes = NonZeroUsize::new(floor - 1).unwrap();
             assert!(size_workers(&config.limits, &mut make_plan(&config), false).is_err());
@@ -500,6 +514,7 @@ mod tests {
         use uring_runtime::group::affinity::CpuLocation;
         use uring_runtime::group::affinity::EffectiveTopology;
         let mut config = default_config(false);
+        config.scale_limits(11).unwrap();
         let floor = 3 * crate::model::PAGE_BYTES as usize;
         for supported in 1..=10 {
             config.limits.plaintext_bytes = NonZeroUsize::new(supported * floor).unwrap();
@@ -524,7 +539,20 @@ mod tests {
             )
             .unwrap();
             assert_eq!(plan.pairs.len(), 11);
-            let limits = size_workers(&config.limits, &mut plan, false).unwrap();
+            let result = size_workers(&config.limits, &mut plan, false);
+            let limits = if supported < 6 {
+                assert!(matches!(result, Err(Error::InvalidConfiguration)));
+                assert_eq!(plan.pairs.len(), 11);
+                assert_eq!(
+                    super::super::partition_limits_with_cause(&config.limits, 6, false).err(),
+                    Some(("plaintext_bytes", Error::InvalidConfiguration))
+                );
+                // Partition and placement still support small plans; startup may not shed this far.
+                plan.reduce_workers(supported);
+                super::super::partition_limits(&config.limits, supported, false).unwrap()
+            } else {
+                result.unwrap()
+            };
             assert_eq!(plan.pairs.len(), supported);
             assert_eq!(limits.plaintext_bytes.get(), floor);
             assert!(
@@ -555,8 +583,9 @@ mod tests {
 
     #[test]
     fn native_endpoints_remain_per_io_with_shared_crypto_placement() {
-        let config = default_config(true);
+        let mut config = default_config(true);
         let mut plan = four_pair_plan(&config);
+        config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers(&config.limits, &mut plan, true).unwrap();
         assert!(plan.crypto_groups().len() < plan.pairs.len());
         let native = NativePairs::default();
@@ -579,11 +608,12 @@ mod tests {
 
     #[test]
     fn default_worker_sizing_funds_native_slots_within_node_budgets() {
-        let config = default_config(true);
-        assert_eq!(config.limits.registered_bytes.get(), 128 * 1024 * 1024);
+        let mut config = default_config(true);
+        assert_eq!(config.limits.registered_bytes.get(), 96 * 1024 * 1024);
         let mut plan = four_pair_plan(&config);
+        config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers(&config.limits, &mut plan, true).unwrap();
-        assert_eq!(plan.pairs.len(), 3);
+        assert_eq!(plan.pairs.len(), 5);
         assert_eq!(plan.max_threads, usize::MAX);
         for (worker, pair) in plan.pairs.iter().enumerate() {
             assert_eq!(pair.worker, WorkerId(worker as u16));
@@ -629,7 +659,7 @@ mod tests {
                 .io(pair.worker)
                 .unwrap()
                 .expect("funded native worker");
-            assert_eq!(port.capacity(), 1);
+            assert_eq!(port.capacity(), 2);
             let devices = Devices::new();
             devices.attach(port).unwrap();
             let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
@@ -639,7 +669,7 @@ mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(activation.as_mut().poll(&mut cx).is_pending());
             let used = admission.used(ResourceClass::Registered);
-            assert_eq!(used, 32 * 1024 * 1024 + 8192);
+            assert_eq!(used, 2 * (32 * 1024 * 1024 + 8192));
             assert!(used <= limits.registered_bytes.get());
             total += used;
         }
@@ -649,6 +679,9 @@ mod tests {
     #[test]
     fn native_worker_sizing_observes_exact_slot_boundaries() {
         let mut config = default_config(true);
+        config
+            .scale_limits(four_pair_plan(&config).pairs.len())
+            .unwrap();
         let charge = 32 * 1024 * 1024 + 8192;
         for (budget, expected) in [
             (1, 0),
@@ -667,11 +700,18 @@ mod tests {
             config.limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
             let mut plan = four_pair_plan(&config);
             let result = size_workers(&config.limits, &mut plan, true);
-            if expected == 0 {
+            if expected < 3 {
                 assert!(
                     matches!(result, Err(Error::InvalidConfiguration)),
                     "budget={budget}"
                 );
+                assert_eq!(plan.pairs.len(), 5);
+                if expected > 0 {
+                    let limits =
+                        super::super::partition_limits(&config.limits, expected, true).unwrap();
+                    assert_eq!(slot_count(&limits).unwrap(), 1);
+                    assert!(limits.registered_bytes.get() * expected <= budget);
+                }
             } else {
                 let limits = result.unwrap();
                 assert_eq!(plan.pairs.len(), expected, "budget={budget}");
@@ -690,6 +730,9 @@ mod tests {
     #[test]
     fn http_worker_sizing_ignores_unused_native_capacity() {
         let mut config = default_config(false);
+        config
+            .scale_limits(four_pair_plan(&config).pairs.len())
+            .unwrap();
         for budget in [1, 128 * 1024 * 1024] {
             config.limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
             let mut plan = four_pair_plan(&config);
@@ -707,8 +750,12 @@ mod tests {
                     continue;
                 }
                 let mut plan = four_pair_plan(&config);
-                let limits = size_workers(&config.limits, &mut plan, rdma).unwrap();
-                assert_eq!(plan.pairs.len(), 2);
+                assert!(matches!(
+                    size_workers(&config.limits, &mut plan, rdma),
+                    Err(Error::InvalidConfiguration)
+                ));
+                assert_eq!(plan.pairs.len(), 5);
+                let limits = super::super::partition_limits(&config.limits, 2, rdma).unwrap();
                 assert_eq!(limits.pipes.get(), 1);
             }
             config.limits.pipes = NonZeroUsize::new(16).unwrap();

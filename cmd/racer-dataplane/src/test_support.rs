@@ -345,6 +345,7 @@ pub mod cluster {
                 metadata_entries: count,
                 relay_transfers: count,
             },
+            scaled_limits: Default::default(),
         }
     }
 }

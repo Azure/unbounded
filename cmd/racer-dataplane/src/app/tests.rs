@@ -754,7 +754,7 @@ fn worker_sizing_reports_specific_resource_floor() {
 
 #[test]
 fn topology_budget_partition_preserves_bytes_and_per_worker_search_limit() {
-    let mut limits = Config::from_lookup(|name| {
+    let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
             "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
@@ -762,8 +762,9 @@ fn topology_budget_partition_preserves_bytes_and_per_worker_search_limit() {
             _ => None,
         })
     })
-    .unwrap()
-    .limits;
+    .unwrap();
+    config.scale_limits(2).unwrap();
+    let mut limits = config.limits;
     limits.placement_cache_bytes = NonZeroUsize::new(2049).unwrap();
     limits.path_cache_bytes = NonZeroUsize::new(8193).unwrap();
     let partition = partition_limits(&limits, 2, false).unwrap();
@@ -777,16 +778,102 @@ fn topology_budget_partition_preserves_bytes_and_per_worker_search_limit() {
     );
 }
 
-#[test]
-fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
-    use uring_runtime::group::affinity::CpuLocation;
-    use uring_runtime::reactor::simulation::Simulation;
-    let config = Config::from_lookup(|name| {
+fn queue_limited_plan(planned: usize, supported: usize) -> (Limits, AffinityPlan) {
+    let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
             "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
             "RACER_ENABLE_RDMA" => Some("false".into()),
-            "RACER_QUEUE_ENTRIES" => Some("16".into()),
+            _ => None,
+        })
+    })
+    .unwrap();
+    config.scale_limits(planned).unwrap();
+    config.limits.queue_entries =
+        NonZeroUsize::new((supported * (crate::telemetry::CONTROL_SLOTS + 2)).max(1)).unwrap();
+    let plan = AffinityPlan {
+        max_threads: planned * 2,
+        pairs: (0..planned)
+            .map(|id| {
+                let io = uring_runtime::group::affinity::CpuLocation {
+                    cpu: id,
+                    package: 0,
+                    core: id,
+                    numa_node: Some(0),
+                };
+                crate::worker::WorkerPair {
+                    worker: WorkerId(id as u16),
+                    crypto: io.clone(),
+                    io,
+                    nic: None,
+                }
+            })
+            .collect(),
+    };
+    (config.limits, plan)
+}
+
+#[test]
+fn worker_sizing_rejects_below_half_and_reports_limiting_resource() {
+    const CHILD: &str = "RACER_TEST_SIZING_FLOOR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        for planned in [1usize, 3, 4, 5] {
+            let floor = planned.div_ceil(2).max(1);
+            let (limits, mut plan) = queue_limited_plan(planned, floor - 1);
+            assert_eq!(
+                partition_limits_with_cause(&limits, floor, false).err(),
+                Some(("queue_entries", Error::InvalidConfiguration))
+            );
+            assert!(matches!(
+                size_workers_policy(&limits, &mut plan, false, false, false),
+                Err(Error::InvalidConfiguration)
+            ));
+            assert_eq!(plan.pairs.len(), planned);
+        }
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "app::tests::worker_sizing_rejects_below_half_and_reports_limiting_resource",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for floor in [1, 2, 3] {
+        assert!(stderr.contains(&format!("stage=worker-sizing io_workers={floor} limiting_resource=queue_entries error=InvalidConfiguration")), "{stderr}");
+    }
+}
+
+#[test]
+fn worker_sizing_reduces_at_or_above_half() {
+    for planned in [1usize, 3, 4, 5] {
+        for supported in planned.div_ceil(2)..=planned {
+            let (node, mut plan) = queue_limited_plan(planned, supported);
+            let limits = size_workers_policy(&node, &mut plan, false, false, false).unwrap();
+            assert_eq!(plan.pairs.len(), supported);
+            assert_eq!(
+                limits.queue_entries.get(),
+                crate::telemetry::CONTROL_SLOTS + 2
+            );
+            assert!(limits.queue_entries.get() * supported <= node.queue_entries.get());
+        }
+    }
+}
+
+#[test]
+fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
+    use uring_runtime::group::affinity::CpuLocation;
+    use uring_runtime::reactor::simulation::Simulation;
+    let mut config = Config::from_lookup(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+            "RACER_ENABLE_RDMA" => Some("false".into()),
+            "RACER_QUEUE_ENTRIES" => Some("24".into()),
             _ => None,
         })
     })
@@ -809,14 +896,28 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
     )
     .unwrap();
     assert_eq!(plan.pairs.len(), 5);
+    config.scale_limits(plan.pairs.len()).unwrap();
+    let mut underfunded = config.limits.clone();
+    underfunded.queue_entries = NonZeroUsize::new(16).unwrap();
     for workers in 3..=5 {
+        assert_eq!(
+            partition_limits_with_cause(&underfunded, workers, false).err(),
+            Some(("queue_entries", Error::InvalidConfiguration))
+        );
+    }
+    assert!(matches!(
+        size_workers(&underfunded, &mut plan, false),
+        Err(Error::InvalidConfiguration)
+    ));
+    assert_eq!(plan.pairs.len(), 5);
+    for workers in 4..=5 {
         assert_eq!(
             partition_limits_with_cause(&config.limits, workers, false).err(),
             Some(("queue_entries", Error::InvalidConfiguration))
         );
     }
     let limits = size_workers(&config.limits, &mut plan, false).unwrap();
-    assert_eq!(plan.pairs.len(), 2);
+    assert_eq!(plan.pairs.len(), 3);
     assert_eq!(limits.queue_entries.get(), 8);
 
     let minimum = crate::telemetry::CONTROL_SLOTS + 2;
@@ -934,16 +1035,17 @@ fn worker_sizing_funds_derived_connection_pools() {
     use crate::admission::ResourceClass;
     use uring_runtime::group::affinity::CpuLocation;
     use uring_runtime::group::affinity::EffectiveTopology;
-    let config = Config::from_lookup(|name| {
+    let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
             "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
             "RACER_ENABLE_RDMA" => Some("false".into()),
-            "RACER_CLIENT_CONNECTIONS" => Some("16".into()),
+            "RACER_CLIENT_CONNECTIONS" => Some("36".into()),
             _ => None,
         })
     })
     .unwrap();
+    config.scale_limits(5).unwrap();
     let make_plan = || {
         AffinityPlan::from_topology(
             &config,
@@ -965,7 +1067,20 @@ fn worker_sizing_funds_derived_connection_pools() {
     };
     let mut plan = make_plan();
     assert_eq!(plan.pairs.len(), 5);
+    let mut underfunded = config.limits.clone();
+    underfunded.client_connections = NonZeroUsize::new(16).unwrap();
     for workers in 2..=5 {
+        assert_eq!(
+            partition_limits_with_cause(&underfunded, workers, false).err(),
+            Some(("control_connections", Error::InvalidConfiguration))
+        );
+    }
+    assert!(matches!(
+        size_workers(&underfunded, &mut plan, false),
+        Err(Error::InvalidConfiguration)
+    ));
+    assert_eq!(plan.pairs.len(), 5);
+    for workers in 4..=5 {
         // This cause feeds the production worker-sizing diagnostic, including
         // the last rejected count before reduction succeeds.
         assert_eq!(
@@ -974,9 +1089,9 @@ fn worker_sizing_funds_derived_connection_pools() {
         );
     }
     let limits = size_workers(&config.limits, &mut plan, false).unwrap();
-    assert_eq!(plan.pairs.len(), 1);
-    assert_eq!(plan.crypto_groups(), vec![vec![0]]);
-    assert_eq!(limits.client_connections.get(), 16);
+    assert_eq!(plan.pairs.len(), 3);
+    assert_eq!(plan.crypto_groups(), vec![vec![0, 2], vec![1]]);
+    assert_eq!(limits.client_connections.get(), 12);
 
     for (connections, neighbor, cause) in [
         (3, 2, Some("control_connections")),
@@ -2785,7 +2900,15 @@ fn oversized_populated_shutdown_cut_thaws_and_finishes_drain_without_publication
             .unwrap();
     }
     assert!(index.snapshot_metadata().len() >= 16);
-    worker.checkpoint_budget = 32 * 1024;
+    // Keep the per-worker cut below even its metadata-only encoded size.
+    let metadata_bytes: usize = index
+        .snapshot_metadata()
+        .iter()
+        .map(|metadata| {
+            52 + metadata.version.object.cache.0.len() + metadata.version.etag.as_bytes().len()
+        })
+        .sum();
+    worker.checkpoint_budget = 4 * (metadata_bytes - 1);
     let deadline = scope(Duration::from_secs(5)).unwrap();
     assert_eq!(
         drive(&runtime, &mut engine, worker.drain(&deadline)),
@@ -3968,8 +4091,9 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
         .unwrap();
         assert_eq!(plan.pairs.len(), 3);
         let result = size_workers(&config.limits, &mut plan, false);
-        if budget < floor {
+        if budget < 2 * floor {
             assert!(matches!(result, Err(Error::InvalidConfiguration)));
+            assert_eq!(plan.pairs.len(), 3);
         } else {
             let limits = result.unwrap();
             assert_eq!(plan.pairs.len(), (budget / floor).min(2));

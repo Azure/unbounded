@@ -59,6 +59,35 @@ pub struct Limits {
     pub relay_transfers: NonZeroUsize,
 }
 
+/// Which limit dimensions were left unset in the environment.
+///
+/// Unset dimensions carry per-worker defaults. Worker sizing divides every
+/// node-wide dimension by the I/O worker count, so a fixed node-wide default
+/// shrinks each lane's budget as cores are added and eventually falls under a
+/// per-worker floor. Sizing then sheds workers until the partition fits, which
+/// turns a larger host into a smaller dataplane. Scaling the defaults by the
+/// planned worker count keeps each lane's budget constant instead.
+///
+/// A dimension set explicitly in the environment is node-wide by definition and
+/// is never scaled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScaledLimits {
+    pub plaintext_bytes: bool,
+    pub ciphertext_bytes: bool,
+    pub dirty_bytes: bool,
+    pub registered_bytes: bool,
+    pub request_context_bytes: bool,
+    pub flights: bool,
+    pub queue_entries: bool,
+    pub client_connections: bool,
+    pub pipes: bool,
+    pub placement_cache_bytes: bool,
+    pub cached_paths: bool,
+    pub path_cache_bytes: bool,
+    pub metadata_entries: bool,
+    pub relay_transfers: bool,
+}
+
 pub struct Config {
     pub warm: crate::read::warm::Config,
     pub send_crc_pair: Option<crate::telemetry::Pair>,
@@ -88,7 +117,9 @@ pub struct Config {
     pub enable_rdma: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
-    /// Experimental peer-only TCP_NODELAY; false preserves existing socket defaults.
+    /// Peer-only TCP_NODELAY. Peer exchanges are strictly request/response with
+    /// multi-segment signed heads, so Nagle stalls every round on a delayed ACK.
+    /// Defaults on; set false only to reproduce the pre-nodelay socket behavior.
     pub peer_tcp_nodelay: bool,
     pub pprof_enabled: bool,
     pub control_endpoint: String,
@@ -104,6 +135,8 @@ pub struct Config {
     pub segment_bytes: u64,
     pub free_segment_reserve: usize,
     pub limits: Limits,
+    /// Limit dimensions still carrying per-worker defaults. See [`ScaledLimits`].
+    pub scaled_limits: ScaledLimits,
     /// Per-cache, per-worker origin HTTP cap, separate from peer connections.
     pub origin_connections_per_cache: NonZeroUsize,
     pub request_timeout: Duration,
@@ -204,7 +237,7 @@ impl Config {
             allow_smt: raw.allow_smt.unwrap_or(false),
             enable_rdma,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
-            peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(false),
+            peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
             pprof_enabled: raw.pprof_enabled.unwrap_or(false),
             control_endpoint: raw.control_endpoint,
             peer_listen: parse_listener_address(
@@ -235,22 +268,26 @@ impl Config {
                 .device_directory
                 .unwrap_or_else(|| "/host/dev".into())
                 .into(),
-            slab_bytes: raw.slab_bytes.unwrap_or(1024 * MIB),
-            segment_bytes: raw.segment_bytes.unwrap_or(64 * MIB),
+            slab_bytes: raw.slab_bytes.unwrap_or(16 * 1024 * MIB),
+            segment_bytes: raw.segment_bytes.unwrap_or(1024 * MIB),
             free_segment_reserve: to_usize(raw.free_segment_reserve.unwrap_or(2))?,
             limits: Limits {
-                plaintext_bytes: nonzero_usize(raw.plaintext_bytes.unwrap_or(256 * MIB))?,
-                ciphertext_bytes: nonzero_usize(raw.ciphertext_bytes.unwrap_or(256 * MIB))?,
-                dirty_bytes: nonzero_usize(raw.dirty_bytes.unwrap_or(128 * MIB))?,
-                registered_bytes: nonzero_usize(raw.registered_bytes.unwrap_or(128 * MIB))?,
+                // Byte and count dimensions below are divided by the I/O worker
+                // count during sizing, so their defaults are stated per worker
+                // and multiplied back out by `scale_limits` once the planner
+                // resolves that count. A page is 16 MiB.
+                plaintext_bytes: nonzero_usize(raw.plaintext_bytes.unwrap_or(64 * MIB))?,
+                ciphertext_bytes: nonzero_usize(raw.ciphertext_bytes.unwrap_or(128 * MIB))?,
+                dirty_bytes: nonzero_usize(raw.dirty_bytes.unwrap_or(160 * MIB))?,
+                registered_bytes: nonzero_usize(raw.registered_bytes.unwrap_or(96 * MIB))?,
                 request_context_bytes: nonzero_usize(
-                    raw.request_context_bytes.unwrap_or(64 * MIB),
+                    raw.request_context_bytes.unwrap_or(32 * MIB),
                 )?,
                 flights: nonzero_usize(raw.flights.unwrap_or(64))?,
                 waiters_per_flight: nonzero_usize(raw.waiters_per_flight.unwrap_or(64))?,
                 queue_entries: nonzero_usize(raw.queue_entries.unwrap_or(256))?,
                 connections_per_neighbor: nonzero_usize(raw.connections_per_neighbor.unwrap_or(2))?,
-                client_connections: nonzero_usize(raw.client_connections.unwrap_or(128))?,
+                client_connections: nonzero_usize(raw.client_connections.unwrap_or(64))?,
                 pipes: nonzero_usize(raw.pipes.unwrap_or(16))?,
                 range_window_pages: nonzero_usize(raw.range_window_pages.unwrap_or(2))?,
                 header_bytes: nonzero_usize(raw.header_bytes.unwrap_or(32 * 1024))?,
@@ -263,6 +300,22 @@ impl Config {
                 retained_snapshots: nonzero_usize(raw.retained_snapshots.unwrap_or(2))?,
                 metadata_entries: nonzero_usize(raw.metadata_entries.unwrap_or(4096))?,
                 relay_transfers: nonzero_usize(raw.relay_transfers.unwrap_or(16))?,
+            },
+            scaled_limits: ScaledLimits {
+                plaintext_bytes: raw.plaintext_bytes.is_none(),
+                ciphertext_bytes: raw.ciphertext_bytes.is_none(),
+                dirty_bytes: raw.dirty_bytes.is_none(),
+                registered_bytes: raw.registered_bytes.is_none(),
+                request_context_bytes: raw.request_context_bytes.is_none(),
+                flights: raw.flights.is_none(),
+                queue_entries: raw.queue_entries.is_none(),
+                client_connections: raw.client_connections.is_none(),
+                pipes: raw.pipes.is_none(),
+                placement_cache_bytes: raw.placement_cache_bytes.is_none(),
+                cached_paths: raw.cached_paths.is_none(),
+                path_cache_bytes: raw.path_cache_bytes.is_none(),
+                metadata_entries: raw.metadata_entries.is_none(),
+                relay_transfers: raw.relay_transfers.is_none(),
             },
             origin_connections_per_cache: nonzero_usize(
                 raw.origin_connections_per_cache.unwrap_or(8),
@@ -278,6 +331,55 @@ impl Config {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Multiply every defaulted limit dimension by the planned I/O worker count.
+    ///
+    /// Worker sizing partitions node-wide limits across lanes, so a default
+    /// stated per worker has to be scaled back up before that division or each
+    /// lane receives only a fraction of its intended budget. Explicitly
+    /// configured dimensions are node-wide by definition and are left alone.
+    ///
+    /// A second call is a no-op: the scaling record is consumed, but only once
+    /// every dimension has scaled successfully. Scaling is computed against a
+    /// copy and committed whole, so a rejected worker count or an overflow in
+    /// any one dimension leaves both the limits and the record untouched.
+    pub fn scale_limits(&mut self, io_workers: usize) -> Result<()> {
+        let scaled = self.scaled_limits;
+        let workers = NonZeroUsize::new(io_workers).ok_or(Error::InvalidConfiguration)?;
+        let scale = |value: &mut NonZeroUsize, apply: bool| -> Result<()> {
+            if apply {
+                *value = value
+                    .checked_mul(workers)
+                    .ok_or(Error::InvalidConfiguration)?;
+            }
+            Ok(())
+        };
+        let mut scratch = self.limits.clone();
+        let limits = &mut scratch;
+        scale(&mut limits.plaintext_bytes, scaled.plaintext_bytes)?;
+        scale(&mut limits.ciphertext_bytes, scaled.ciphertext_bytes)?;
+        scale(&mut limits.dirty_bytes, scaled.dirty_bytes)?;
+        scale(&mut limits.registered_bytes, scaled.registered_bytes)?;
+        scale(
+            &mut limits.request_context_bytes,
+            scaled.request_context_bytes,
+        )?;
+        scale(&mut limits.flights, scaled.flights)?;
+        scale(&mut limits.queue_entries, scaled.queue_entries)?;
+        scale(&mut limits.client_connections, scaled.client_connections)?;
+        scale(&mut limits.pipes, scaled.pipes)?;
+        scale(
+            &mut limits.placement_cache_bytes,
+            scaled.placement_cache_bytes,
+        )?;
+        scale(&mut limits.cached_paths, scaled.cached_paths)?;
+        scale(&mut limits.path_cache_bytes, scaled.path_cache_bytes)?;
+        scale(&mut limits.metadata_entries, scaled.metadata_entries)?;
+        scale(&mut limits.relay_transfers, scaled.relay_transfers)?;
+        self.limits = scratch;
+        self.scaled_limits = ScaledLimits::default();
+        Ok(())
     }
 
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
@@ -1449,6 +1551,114 @@ mod tests {
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
     }
 
+    type LimitField = (&'static str, fn(&Limits) -> NonZeroUsize);
+
+    const SCALED_FIELDS: [LimitField; 14] = [
+        ("RACER_PLAINTEXT_BYTES", |l| l.plaintext_bytes),
+        ("RACER_CIPHERTEXT_BYTES", |l| l.ciphertext_bytes),
+        ("RACER_DIRTY_BYTES", |l| l.dirty_bytes),
+        ("RACER_REGISTERED_BYTES", |l| l.registered_bytes),
+        ("RACER_REQUEST_CONTEXT_BYTES", |l| l.request_context_bytes),
+        ("RACER_FLIGHTS", |l| l.flights),
+        ("RACER_QUEUE_ENTRIES", |l| l.queue_entries),
+        ("RACER_CLIENT_CONNECTIONS", |l| l.client_connections),
+        ("RACER_PIPES", |l| l.pipes),
+        ("RACER_PLACEMENT_CACHE_BYTES", |l| l.placement_cache_bytes),
+        ("RACER_CACHED_PATHS", |l| l.cached_paths),
+        ("RACER_PATH_CACHE_BYTES", |l| l.path_cache_bytes),
+        ("RACER_METADATA_ENTRIES", |l| l.metadata_entries),
+        ("RACER_RELAY_TRANSFERS", |l| l.relay_transfers),
+    ];
+
+    #[test]
+    fn scale_limits_multiplies_defaulted_dimensions_only() {
+        for workers in [1, 6, 64] {
+            let mut config = parse(&[]).unwrap();
+            let before = config.limits.clone();
+            config.scale_limits(workers).unwrap();
+            for (name, field) in SCALED_FIELDS {
+                assert_eq!(
+                    field(&config.limits).get(),
+                    field(&before).get() * workers,
+                    "{name}"
+                );
+            }
+            for field in [
+                (|l: &Limits| l.waiters_per_flight) as fn(&Limits) -> NonZeroUsize,
+                |l| l.connections_per_neighbor,
+                |l| l.range_window_pages,
+                |l| l.header_bytes,
+                |l| l.active_path_searches,
+                |l| l.retained_snapshots,
+            ] {
+                assert_eq!(field(&config.limits), field(&before));
+            }
+            assert_eq!(config.scaled_limits, ScaledLimits::default());
+        }
+    }
+
+    #[test]
+    fn scale_limits_preserves_explicit_environment_dimensions() {
+        let defaults = parse(&[]).unwrap();
+        for (explicit, field) in SCALED_FIELDS {
+            let value = field(&defaults.limits).to_string();
+            let mut config = parse(&[(explicit, &value)]).unwrap();
+            config.scale_limits(6).unwrap();
+            for (name, field) in SCALED_FIELDS {
+                let factor = if name == explicit { 1 } else { 6 };
+                assert_eq!(
+                    field(&config.limits).get(),
+                    field(&defaults.limits).get() * factor,
+                    "explicit={explicit} field={name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scale_limits_is_idempotent() {
+        let mut config = parse(&[]).unwrap();
+        config.scale_limits(6).unwrap();
+        let once = config.limits.clone();
+        config.scale_limits(9).unwrap();
+        for (name, field) in SCALED_FIELDS {
+            assert_eq!(field(&config.limits), field(&once), "{name}");
+        }
+    }
+
+    #[test]
+    fn scale_limits_rejects_zero_workers_and_overflow() {
+        let mut config = parse(&[]).unwrap();
+        assert_eq!(config.scale_limits(0), Err(Error::InvalidConfiguration));
+        for (name, field) in SCALED_FIELDS {
+            let mut config = parse(&[]).unwrap();
+            config.scaled_limits = ScaledLimits::default();
+            match name {
+                "RACER_PLAINTEXT_BYTES" => config.scaled_limits.plaintext_bytes = true,
+                "RACER_CIPHERTEXT_BYTES" => config.scaled_limits.ciphertext_bytes = true,
+                "RACER_DIRTY_BYTES" => config.scaled_limits.dirty_bytes = true,
+                "RACER_REGISTERED_BYTES" => config.scaled_limits.registered_bytes = true,
+                "RACER_REQUEST_CONTEXT_BYTES" => config.scaled_limits.request_context_bytes = true,
+                "RACER_FLIGHTS" => config.scaled_limits.flights = true,
+                "RACER_QUEUE_ENTRIES" => config.scaled_limits.queue_entries = true,
+                "RACER_CLIENT_CONNECTIONS" => config.scaled_limits.client_connections = true,
+                "RACER_PIPES" => config.scaled_limits.pipes = true,
+                "RACER_PLACEMENT_CACHE_BYTES" => config.scaled_limits.placement_cache_bytes = true,
+                "RACER_CACHED_PATHS" => config.scaled_limits.cached_paths = true,
+                "RACER_PATH_CACHE_BYTES" => config.scaled_limits.path_cache_bytes = true,
+                "RACER_METADATA_ENTRIES" => config.scaled_limits.metadata_entries = true,
+                "RACER_RELAY_TRANSFERS" => config.scaled_limits.relay_transfers = true,
+                _ => unreachable!(),
+            }
+            let workers = usize::MAX / field(&config.limits).get() + 1;
+            assert_eq!(
+                config.scale_limits(workers),
+                Err(Error::InvalidConfiguration),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn peer_admission_environment_is_bounded_and_node_scoped() {
         let config = parse(&[
@@ -1484,7 +1694,11 @@ mod tests {
     }
 
     fn exact_boolean(name: &str, field: fn(&Config) -> bool) {
-        assert!(!field(&parse(&[]).unwrap()));
+        exact_boolean_default(name, field, false);
+    }
+
+    fn exact_boolean_default(name: &str, field: fn(&Config) -> bool, default: bool) {
+        assert_eq!(field(&parse(&[]).unwrap()), default);
         for (value, expected) in [("true", true), ("false", false)] {
             assert_eq!(field(&parse(&[(name, value)]).unwrap()), expected);
         }
@@ -1512,8 +1726,8 @@ mod tests {
         );
     }
     #[test]
-    fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_off() {
-        exact_boolean("RACER_PEER_TCP_NODELAY", |c| c.peer_tcp_nodelay);
+    fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_on() {
+        exact_boolean_default("RACER_PEER_TCP_NODELAY", |c| c.peer_tcp_nodelay, true);
     }
 
     #[test]

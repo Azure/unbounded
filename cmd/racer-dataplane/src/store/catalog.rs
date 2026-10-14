@@ -411,7 +411,9 @@ impl Index {
         let holds = self.holds.borrow();
         for hold in holds.entries.values().filter(|hold| hold.live()) {
             for location in hold.locations.values() {
-                *remaining = remaining.checked_sub(128).ok_or(Error::Overloaded)?;
+                *remaining = remaining
+                    .checked_sub(super::checkpoint::RETAINED_RECORD_BYTES)
+                    .ok_or(Error::Overloaded)?;
                 segments
                     .get_mut(location.segment.0 as usize)
                     .ok_or(Error::CorruptRecord)?
@@ -824,6 +826,34 @@ impl Index {
         self.state.borrow().metadata.values().cloned().collect()
     }
 
+    /// Reject an already oversized cut without pausing writes or cloning state.
+    pub(super) fn preflight_snapshot(&self, remaining: &mut usize) -> Result<()> {
+        let state = self.state.borrow();
+        for bytes in state
+            .pages
+            .iter()
+            .map(|(_, entry)| super::checkpoint::snapshot_entry_bytes(&entry.metadata))
+            .chain(
+                state
+                    .metadata
+                    .values()
+                    .map(super::checkpoint::snapshot_metadata_bytes),
+            )
+        {
+            *remaining = remaining.checked_sub(bytes).ok_or(Error::Overloaded)?;
+        }
+        let holds = self.holds.borrow();
+        for hold in holds.entries.values().filter(|hold| hold.live()) {
+            let bytes = hold
+                .locations
+                .len()
+                .checked_mul(super::checkpoint::RETAINED_RECORD_BYTES)
+                .ok_or(Error::Overloaded)?;
+            *remaining = remaining.checked_sub(bytes).ok_or(Error::Overloaded)?;
+        }
+        Ok(())
+    }
+
     /// Charge borrowed descriptors before cloning any snapshot strings or vectors.
     pub(super) fn snapshot_metadata_budgeted(
         &self,
@@ -832,7 +862,7 @@ impl Index {
         let state = self.state.borrow();
         for metadata in state.metadata.values() {
             *remaining = remaining
-                .checked_sub(super::checkpoint::snapshot_entry_bytes(metadata))
+                .checked_sub(super::checkpoint::snapshot_metadata_bytes(metadata))
                 .ok_or(Error::Overloaded)?;
         }
         Ok(state.metadata.values().cloned().collect())
