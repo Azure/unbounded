@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,14 @@ type RunReconciler struct {
 	MaxConcurrentRuns  int
 	WorkflowAPIVersion string
 	Recorder           recorder.EventRecorder
+}
+
+func admissionReader(reader client.Reader, fallback client.Reader) client.Reader {
+	if reader != nil {
+		return reader
+	}
+
+	return fallback
 }
 
 func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -309,17 +318,25 @@ func (r *AdmissionReconciler) admitProfile(
 	}
 
 	cleanupFailedAdmission := func(cause error) error {
-		deleteRunErr := r.Delete(context.WithoutCancel(ctx), run)
-		if deleteRunErr != nil && !apierrors.IsNotFound(deleteRunErr) {
-			// Keep the reservation if the run could not be made inert. This
-			// prevents another admission from overlapping the surviving run.
+		cleanupCtx := context.WithoutCancel(ctx)
+		deleteRunErr := r.Delete(cleanupCtx, run, client.Preconditions{UID: &run.UID})
+
+		var surviving signalv1.CertificationRun
+
+		getRunErr := admissionReader(r.Reader, r.Client).Get(cleanupCtx, client.ObjectKeyFromObject(run), &surviving)
+		if !apierrors.IsNotFound(getRunErr) {
+			// A surviving finalizer Run still owns its inputs and cleanup barrier.
 			releaseOnFailure = false
+
+			var confirmErr error
+			if getRunErr != nil {
+				confirmErr = fmt.Errorf("confirm failed admission Run deletion: %w", getRunErr)
+			}
+
+			return errors.Join(cause, client.IgnoreNotFound(deleteRunErr), confirmErr)
 		}
 
-		var deleteSnapshotErr error
-		if !explicit {
-			deleteSnapshotErr = r.Delete(context.WithoutCancel(ctx), snapshot)
-		}
+		deleteSnapshotErr := r.Delete(cleanupCtx, snapshot)
 
 		return errors.Join(cause, client.IgnoreNotFound(deleteRunErr), client.IgnoreNotFound(deleteSnapshotErr))
 	}
@@ -554,8 +571,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if run.Spec.Admission != nil && !run.Status.Phase.Terminal() {
-		if err := r.recoverExplicitWorkflow(ctx, &run); err != nil {
+	if !run.Status.Phase.Terminal() || run.Status.Workflow.Name == "" {
+		if err := r.recoverWorkflow(ctx, &run); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1149,11 +1166,9 @@ func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.Cer
 		return ctrl.Result{}, err
 	}
 
-	if run.Spec.Admission != nil {
-		snapshot := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: run.Spec.Script.ConfigMapName}}
-		if err := r.Delete(ctx, snapshot); err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
+	snapshot := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: run.Spec.Script.ConfigMapName}}
+	if err := r.Delete(ctx, snapshot); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
 	}
 
 	before := run.DeepCopy()
@@ -1214,7 +1229,13 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 	}
 
 	if run.Status.Workflow.Name == "" {
-		return true, nil
+		if err := r.recoverWorkflow(ctx, run); err != nil {
+			return false, err
+		}
+
+		if run.Status.Workflow.Name == "" {
+			return true, nil
+		}
 	}
 
 	workflow := &unstructured.Unstructured{}
@@ -1222,7 +1243,8 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 	workflow.SetNamespace(run.Namespace)
 	workflow.SetName(run.Status.Workflow.Name)
 
-	if err := r.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
+	reader := admissionReader(r.Reader, r.Client)
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
 		if apierrors.IsNotFound(err) {
 			return r.ownedBackendsGone(ctx, run)
 		}
@@ -1243,7 +1265,7 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 		return false, fmt.Errorf("delete Workflow before releasing participants: %w", err)
 	}
 
-	if err := r.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
 		if apierrors.IsNotFound(err) {
 			return r.ownedBackendsGone(ctx, run)
 		}
@@ -1252,6 +1274,73 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 	}
 
 	return false, nil
+}
+
+func (r *RunReconciler) recoverWorkflow(ctx context.Context, run *signalv1.CertificationRun) error {
+	workflows := &unstructured.UnstructuredList{}
+	workflows.SetGroupVersionKind(workflowGVK.GroupVersion().WithKind("WorkflowList"))
+
+	if err := admissionReader(r.Reader, r.Client).List(ctx, workflows, client.InNamespace(run.Namespace)); err != nil {
+		return fmt.Errorf("recover Workflow identity: %w", err)
+	}
+
+	latest := run.Status.Workflow
+
+	for index := range workflows.Items {
+		workflow := &workflows.Items[index]
+		if !metav1.IsControlledBy(workflow, run) {
+			continue
+		}
+
+		if workflow.GetName() == run.Status.Workflow.Name && run.Status.Workflow.UID != "" &&
+			string(workflow.GetUID()) != run.Status.Workflow.UID {
+			return fmt.Errorf("workflow attempt %d UID changed", run.Status.Workflow.Attempt)
+		}
+
+		suffix, found := strings.CutPrefix(workflow.GetName(), run.Name+"-a")
+		if !found {
+			if workflow.GetName() == run.Status.Workflow.Name {
+				continue
+			}
+
+			return fmt.Errorf("owned workflow %s has an unrecognized attempt identity", workflow.GetName())
+		}
+
+		attempt, err := strconv.ParseInt(suffix, 10, 32)
+		if err != nil || attempt < 1 || attempt > int64(run.Spec.MaxAttempts) {
+			if workflow.GetName() == run.Status.Workflow.Name {
+				continue
+			}
+
+			return fmt.Errorf("owned workflow %s has an invalid attempt identity", workflow.GetName())
+		}
+
+		if int32(attempt) < latest.Attempt {
+			continue
+		}
+
+		if int32(attempt) == latest.Attempt && latest.UID != "" && latest.UID != string(workflow.GetUID()) {
+			return fmt.Errorf("workflow attempt %d UID changed", attempt)
+		}
+
+		phase, _, err := unstructured.NestedString(workflow.Object, "status", "phase")
+		if err != nil {
+			return fmt.Errorf("recover Workflow attempt %d phase: %w", attempt, err)
+		}
+
+		latest = signalv1.WorkflowStatus{
+			Name: workflow.GetName(), UID: string(workflow.GetUID()), Attempt: int32(attempt), Phase: phase,
+		}
+	}
+
+	if latest.Name == "" || latest == run.Status.Workflow {
+		return nil
+	}
+
+	before := run.DeepCopy()
+	run.Status.Workflow = latest
+
+	return r.Status().Patch(ctx, run, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func participantNodeUID(run *signalv1.CertificationRun, nodeName string) types.UID {

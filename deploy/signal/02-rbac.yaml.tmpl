@@ -49,6 +49,9 @@ metadata:
   name: project-signal-controller
   namespace: {{ default "project-signal" .Namespace }}
 rules:
+  - apiGroups: ["signal.unbounded-cloud.io"]
+    resources: ["certificationruns"]
+    verbs: ["delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

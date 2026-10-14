@@ -22,14 +22,6 @@ import (
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
-func admissionReader(reader client.Reader, fallback client.Reader) client.Reader {
-	if reader != nil {
-		return reader
-	}
-
-	return fallback
-}
-
 func explicitParticipants(policy signalv1.ParticipantPolicy) bool {
 	return policy.Count > 1 || policy.NodeNames != nil || policy.TopologyKey != ""
 }

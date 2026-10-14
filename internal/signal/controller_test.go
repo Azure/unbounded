@@ -193,6 +193,11 @@ func TestAdmissionFailureMakesCreatedRunInertAndReleasesReservation(t *testing.T
 				if runs.Items[i].DeletionTimestamp.IsZero() {
 					t.Fatalf("run %s remained active after failed admission", runs.Items[i].Name)
 				}
+
+				runReconciler := &RunReconciler{Client: kube}
+				if _, err := runReconciler.reconcileDeleting(context.Background(), &runs.Items[i]); err != nil {
+					t.Fatalf("finalize failed admission: %v", err)
+				}
 			}
 
 			var cleaned corev1.Node

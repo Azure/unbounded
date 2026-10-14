@@ -580,6 +580,15 @@ approved Nodes.
 
 ## Cancellation and cleanup
 
+Cancellation and deletion recover Run-owned Workflows even when creation
+succeeded before the Workflow identity was checkpointed. Reservations remain
+held until UID-bound foreground cleanup completes. Failed admission likewise
+retains a surviving finalizer Run's immutable script snapshot and reservations
+until finalization, including when snapshot binding or deletion fails.
+The controller's Run-delete permission is scoped to its namespace.
+Optional frozen Run inputs retain both their values and their presence, so
+cancellation and finalizer updates work when those inputs were omitted.
+
 Cancel an active run:
 
 ```bash

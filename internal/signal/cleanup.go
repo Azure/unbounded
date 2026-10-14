@@ -45,7 +45,9 @@ func (r *RunReconciler) strictCleanupReady(ctx context.Context, run *signalv1.Ce
 		workflow := &unstructured.Unstructured{}
 		workflow.SetGroupVersionKind(workflowGVK)
 
-		if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}, workflow); err != nil {
+		if err := admissionReader(r.Reader, r.Client).Get(
+			ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}, workflow,
+		); err != nil {
 			if !apierrors.IsNotFound(err) {
 				return false, err
 			}
