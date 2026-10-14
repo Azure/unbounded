@@ -182,6 +182,28 @@ func TestCollectorGetsOnlyNodesReferencedByProfilesOrRuns(t *testing.T) {
 	assert.NotContains(t, snapshot.nodes, "unrelated-node")
 }
 
+func TestCollectorGetsOnlyDeclaredRackMembersWithoutLabelExpansion(t *testing.T) {
+	t.Parallel()
+
+	reader := fixtureReader()
+	reader.profiles[0].Spec.Recurring = nil
+
+	reader.profiles[0].Spec.Participants.NodeNames = []string{
+		"approved-a100", "approved-rack-peer", "approved-rack-peer", "", "REPLACE_WITH_APPROVED_RACK_NODE",
+	}
+	for _, name := range []string{"approved-a100", "approved-rack-peer", "undeclared-rack-peer"} {
+		reader.nodes[name] = corev1.Node{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Labels: map[string]string{"example.invalid/rack": "shared-rack"},
+		}}
+	}
+
+	collector := fixtureCollector(reader)
+	snapshot := collector.Collect(t.Context())
+	assert.Equal(t, []string{"approved-a100", "approved-rack-peer"}, reader.gets)
+	assert.Contains(t, snapshot.nodes, "approved-rack-peer")
+	assert.NotContains(t, snapshot.nodes, "undeclared-rack-peer")
+}
+
 func TestNodeSummaryUsesStatusForProjectedProfile(t *testing.T) {
 	t.Parallel()
 

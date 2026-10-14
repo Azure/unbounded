@@ -78,9 +78,21 @@ spec:
                 properties:
                   count:
                     format: int32
-                    maximum: 1
+                    maximum: 128
                     minimum: 1
                     type: integer
+                  nodeNames:
+                    description: NodeNames declares the complete tested set, not all
+                      members of a physical rack.
+                    items:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                    maxItems: 128
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: set
                   requiredResources:
                     additionalProperties:
                       anyOf:
@@ -140,10 +152,29 @@ spec:
                         type: object
                     type: object
                     x-kubernetes-map-type: atomic
+                  topologyKey:
+                    description: |-
+                      TopologyKey validates the same nonempty label value on every declared member.
+                      It never expands nodeNames by selecting other Nodes with that label.
+                    maxLength: 317
+                    pattern: ^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: topologyKey prefix must not exceed 253 characters
+                      rule: '!self.contains(''/'') || self.matches(''^[^/]{1,253}/[^/]+$'')'
                 required:
                 - count
                 - selector
                 type: object
+                x-kubernetes-validations:
+                - message: nodeNames must contain exactly count members
+                  rule: '!has(self.nodeNames) || size(self.nodeNames) == self.count'
+                - message: nodeNames must be unique
+                  rule: '!has(self.nodeNames) || self.nodeNames.all(n, self.nodeNames.filter(m,
+                    m == n).size() == 1)'
+                - message: grouped participants require explicit nodeNames and topologyKey
+                  rule: self.count == 1 || (has(self.nodeNames) && has(self.topologyKey)
+                    && size(self.topologyKey) > 0)
               purpose:
                 enum:
                 - FullCertification
@@ -369,6 +400,12 @@ spec:
                       format: date-time
                       type: string
                     nodeName:
+                      type: string
+                    nodeUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
                       type: string
                     reason:
                       type: string

@@ -304,11 +304,12 @@ func approvedNodeNames(runs []signalv1.CertificationRun, profiles []signalv1.Cer
 	}
 
 	for i := range profiles {
-		if profiles[i].Spec.Recurring == nil {
-			continue
+		nodeNames := append([]string(nil), profiles[i].Spec.Participants.NodeNames...)
+		if recurring := profiles[i].Spec.Recurring; recurring != nil {
+			nodeNames = append(nodeNames, recurring.NodeNames...)
 		}
 
-		for _, name := range profiles[i].Spec.Recurring.NodeNames {
+		for _, name := range nodeNames {
 			if name != "" && !strings.HasPrefix(name, "REPLACE_WITH_") {
 				names[name] = struct{}{}
 			}

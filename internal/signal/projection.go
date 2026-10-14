@@ -66,6 +66,10 @@ func projectPending(
 
 func projectTesting(ctx context.Context, kube client.Client, run *signalv1.CertificationRun) error {
 	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+		if owner := node.Annotations[ReservationLabel]; owner != "" && owner != run.Name {
+			return nil
+		}
+
 		purpose := effectiveProjectionPurpose(run.Spec.Purpose)
 		if !projectionPurposeAllowed(node, purpose) {
 			return nil
@@ -85,9 +89,19 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 		return nil
 	}
 
+	if run.Spec.Admission != nil {
+		if err := validateAdmissionContract(run); err != nil {
+			return nil
+		}
+	}
+
 	finishedAt := run.Status.FinishedAt.UTC().Format(time.RFC3339)
 
 	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+		if owner := node.Annotations[ReservationLabel]; owner != "" && owner != run.Name {
+			return nil
+		}
+
 		purpose := effectiveProjectionPurpose(run.Spec.Purpose)
 		if !projectionPurposeAllowed(node, purpose) {
 			return nil
@@ -165,7 +179,7 @@ func projectRecurring(
 	profile *signalv1.CertificationProfile,
 	status signalv1.RecurringNodeStatus,
 ) error {
-	participant := signalv1.Participant{NodeName: status.NodeName}
+	participant := signalv1.Participant{NodeName: status.NodeName, NodeUID: status.NodeUID}
 	pinned := signalv1.PinnedProfile{Name: profile.Name, UID: profile.UID, Generation: profile.Generation}
 
 	return projectParticipants(ctx, kube, []signalv1.Participant{participant}, func(node *corev1.Node) error {
@@ -230,7 +244,7 @@ func projectParticipants(
 				return err
 			}
 
-			return kube.Patch(ctx, &node, client.MergeFrom(before))
+			return kube.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 		}); err != nil {
 			return fmt.Errorf("project Node %s status: %w", participant.NodeName, err)
 		}

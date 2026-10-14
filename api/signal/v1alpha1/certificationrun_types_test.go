@@ -33,7 +33,7 @@ func TestGeneratedPlanImmutabilityRulesAllowLegacyStatusUpdatesAndRejectPlanChan
 
 	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
 
-	for _, field := range []string{"participantPlan", "testPlan"} {
+	for _, field := range []string{"participantPlan", "testPlan", "admission"} {
 		t.Run(field, func(t *testing.T) {
 			t.Parallel()
 
@@ -59,9 +59,21 @@ func TestGeneratedPlanImmutabilityRulesAllowLegacyStatusUpdatesAndRejectPlanChan
 				t.Fatal(err)
 			}
 
-			oldPlan := []any{map[string]any{"nodeName": "gpu-0", "nodeUID": "gpu-0-uid", "parameters": map[string]any{"mode": "baseline"}}}
+			var oldPlan any = []any{map[string]any{"nodeName": "gpu-0", "nodeUID": "gpu-0-uid", "parameters": map[string]any{"mode": "baseline"}}}
 
-			newPlan := []any{map[string]any{"nodeName": "gpu-0", "nodeUID": "replacement-uid", "parameters": map[string]any{"mode": "changed"}}}
+			var newPlan any = []any{map[string]any{"nodeName": "gpu-0", "nodeUID": "replacement-uid", "parameters": map[string]any{"mode": "changed"}}}
+
+			if field == "admission" {
+				oldPlan = map[string]any{
+					"participants":  map[string]any{"count": int64(2), "nodeNames": []string{"gpu-0", "gpu-1"}},
+					"topologyValue": "rack-a", "trigger": "manual",
+				}
+				newPlan = map[string]any{
+					"participants":  map[string]any{"count": int64(2), "nodeNames": []string{"gpu-0", "gpu-2"}},
+					"topologyValue": "rack-b", "trigger": "manual",
+				}
+			}
+
 			for _, tc := range []struct {
 				name string
 				old  map[string]any

@@ -15,6 +15,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -34,6 +35,10 @@ type RecurringReconciler struct {
 }
 
 func (r *RecurringReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Reader == nil {
+		r.Reader = mgr.GetAPIReader()
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&signalv1.CertificationProfile{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
@@ -42,7 +47,7 @@ func (r *RecurringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var profile signalv1.CertificationProfile
-	if err := r.Get(ctx, req.NamespacedName, &profile); err != nil {
+	if err := admissionReader(r.Reader, r.Client).Get(ctx, req.NamespacedName, &profile); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -61,7 +66,7 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	before := profile.DeepCopy()
 	profile.Status.ObservedGeneration = profile.Generation
 
-	if err := validateRecurringPolicy(policy); err != nil {
+	if err := validateRecurringMembership(profile.Spec.Participants, policy); err != nil {
 		setProfileCondition(&profile, now, metav1.ConditionFalse, "InvalidPolicy", err.Error())
 
 		return ctrl.Result{RequeueAfter: interval}, r.Status().Patch(ctx, &profile, client.MergeFrom(before))
@@ -85,30 +90,20 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	var runs signalv1.CertificationRunList
-	if err := r.List(ctx, &runs, client.InNamespace(r.Namespace)); err != nil {
+	if err := admissionReader(r.Reader, r.Client).List(ctx, &runs, client.InNamespace(r.Namespace)); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list CertificationRuns: %w", err)
 	}
 
-	activeByProfile, activeByDomain := activeBudgets(runs.Items, &profile)
-	if policy.FailureDomainLabel != "" {
-		for index := range runs.Items {
-			run := &runs.Items[index]
-			if run.Spec.Profile.Name != profile.Name || run.Status.Phase.Terminal() {
-				continue
-			}
+	activeByProfile, _ := activeBudgets(runs.Items, &profile)
 
-			for _, participant := range run.Spec.Participants {
-				var node corev1.Node
-				if err := r.Reader.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
-					continue
-				}
-
-				activeByDomain[node.Labels[policy.FailureDomainLabel]]++
-			}
-		}
+	activeByDomain, err := recurringDomainUsage(ctx, admissionReader(r.Reader, r.Client), runs.Items, profile.Name, policy)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	statuses := make([]signalv1.RecurringNodeStatus, 0, len(policy.NodeNames))
+	explicit := explicitParticipants(profile.Spec.Participants)
+	groupReady := true
 
 	for _, nodeName := range policy.NodeNames {
 		old := recurringNodeStatus(profile.Status.Nodes, nodeName)
@@ -117,23 +112,29 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err != nil {
 			status.Reason = "EvaluationError: " + err.Error()
 			statuses = append(statuses, status)
+			groupReady = false
 
 			continue
 		}
 
 		statuses = append(statuses, status)
 
-		if admitted {
+		groupReady = groupReady && admitted
+		if admitted && !explicit {
 			activeByProfile++
 
 			var node corev1.Node
-			if getErr := r.Reader.Get(ctx, client.ObjectKey{Name: nodeName}, &node); getErr == nil {
+			if getErr := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: nodeName}, &node); getErr == nil {
 				activeByDomain[node.Labels[policy.FailureDomainLabel]]++
 			}
 		}
 	}
 
 	profile.Status.Nodes = statuses
+	if explicit {
+		r.admitRecurringGroup(ctx, &profile, groupReady)
+	}
+
 	setProfileCondition(&profile, now, metav1.ConditionTrue, "Evaluated",
 		fmt.Sprintf("evaluated %d explicitly opted-in nodes", len(statuses)))
 
@@ -175,11 +176,27 @@ func (r *RecurringReconciler) evaluateNode(
 	status.Suspended = false
 
 	var node corev1.Node
-	if err := r.Reader.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+	if err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 		status.IdleSince = nil
 
 		return status, false, fmt.Errorf("get Node: %w", err)
 	}
+
+	// Preserve an unpinned legacy single-node idle clock once. Explicit sets
+	// require an identity-bound observation before starting the idle window.
+	if status.NodeUID == "" {
+		status.LastSuccessfulRun = ""
+		status.LastSuccessfulAt = nil
+	}
+
+	if status.NodeUID != node.UID && (status.NodeUID != "" || explicitParticipants(profile.Spec.Participants)) {
+		status.IdleSince = nil
+		status.LastSuccessfulRun = ""
+		status.LastSuccessfulAt = nil
+		status.NextDueAt = nil
+	}
+
+	status.NodeUID = node.UID
 
 	selector, err := metav1.LabelSelectorAsSelector(&profile.Spec.Participants.Selector)
 	if err != nil {
@@ -212,7 +229,7 @@ func (r *RecurringReconciler) evaluateNode(
 		status.IdleSince = &idleSince
 	}
 
-	nodeRuns := runsForNodeProfile(runs, nodeName, profile.Name)
+	nodeRuns := runsForParticipantProfile(runs, nodeName, node.UID, profile.Name)
 	lastSuccess, consecutiveFailures, latestFailure := runHistory(nodeRuns)
 	status.ConsecutiveFailures = consecutiveFailures
 
@@ -264,6 +281,12 @@ func (r *RecurringReconciler) evaluateNode(
 		return status, false, nil
 	}
 
+	if explicitParticipants(profile.Spec.Participants) {
+		status.Reason = "GroupMemberReady"
+
+		return status, true, nil
+	}
+
 	if err := r.Admission.admitNodeWithTrigger(ctx, &node, profile.Name, "recurring"); err != nil {
 		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
 			status.Reason = "AdmissionRaced"
@@ -282,7 +305,7 @@ func (r *RecurringReconciler) evaluateNode(
 
 func (r *RecurringReconciler) nodeBusy(ctx context.Context, node *corev1.Node) (bool, string, error) {
 	var pods corev1.PodList
-	if err := r.Reader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+	if err := admissionReader(r.Reader, r.Client).List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
 		return true, "WorkloadStateUnavailable", fmt.Errorf("list Node pods: %w", err)
 	}
 
@@ -313,7 +336,7 @@ func (r *RecurringReconciler) nodeBusy(ctx context.Context, node *corev1.Node) (
 
 func (r *RecurringReconciler) activeMachineOperation(ctx context.Context, nodeName string) (bool, error) {
 	var machines machinav1.MachineList
-	if err := r.Reader.List(ctx, &machines); err != nil {
+	if err := admissionReader(r.Reader, r.Client).List(ctx, &machines); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -337,7 +360,7 @@ func (r *RecurringReconciler) activeMachineOperation(ctx context.Context, nodeNa
 	}
 
 	var operations machinav1.MachineOperationList
-	if err := r.Reader.List(ctx, &operations); err != nil {
+	if err := admissionReader(r.Reader, r.Client).List(ctx, &operations); err != nil {
 		return false, fmt.Errorf("list MachineOperations: %w", err)
 	}
 
@@ -396,6 +419,167 @@ func validateRecurringPolicy(policy *signalv1.RecurringPolicy) error {
 		return fmt.Errorf("maxConsecutiveFailures must be positive")
 	}
 
+	seen := map[string]bool{}
+	for _, name := range policy.NodeNames {
+		if name == "" || seen[name] {
+			return fmt.Errorf("recurring nodeNames must be nonempty and unique")
+		}
+
+		seen[name] = true
+	}
+
+	return nil
+}
+
+func validateRecurringMembership(participants signalv1.ParticipantPolicy, policy *signalv1.RecurringPolicy) error {
+	if err := validateParticipantPolicy(participants); err != nil {
+		return err
+	}
+
+	if err := validateRecurringPolicy(policy); err != nil {
+		return err
+	}
+
+	if explicitParticipants(participants) {
+		if len(participants.NodeNames) != len(policy.NodeNames) {
+			return fmt.Errorf("recurring nodeNames must match the exact declared participant set")
+		}
+
+		for _, name := range participants.NodeNames {
+			if !slices.Contains(policy.NodeNames, name) {
+				return fmt.Errorf("recurring nodeNames must match the exact declared participant set")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *RecurringReconciler) admitRecurringGroup(
+	ctx context.Context,
+	profile *signalv1.CertificationProfile,
+	ready bool,
+) {
+	reason := "GroupWaitingForMembers"
+
+	if ready {
+		var node corev1.Node
+
+		err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: profile.Spec.Participants.NodeNames[0]}, &node)
+		if err == nil {
+			err = r.Admission.admitProfile(ctx, &node, profile, "recurring")
+		}
+
+		if err != nil {
+			reason = "GroupAdmissionRejected: " + err.Error()
+		} else {
+			reason = "Admitted"
+		}
+	}
+
+	for index := range profile.Status.Nodes {
+		status := &profile.Status.Nodes[index]
+		if status.Reason != "GroupMemberReady" {
+			continue
+		}
+
+		status.Reason = reason
+		if reason == "Admitted" {
+			status.NextDueAt = nil
+		}
+	}
+}
+
+func recurringDomainUsage(
+	ctx context.Context,
+	reader client.Reader,
+	runs []signalv1.CertificationRun,
+	profileName string,
+	policy *signalv1.RecurringPolicy,
+) (map[string]int32, error) {
+	usage := map[string]int32{}
+	if policy.FailureDomainLabel == "" {
+		return usage, nil
+	}
+
+	for index := range runs {
+		run := &runs[index]
+		if run.Spec.Profile.Name != profileName || !runActive(run) {
+			continue
+		}
+
+		for _, participant := range run.Spec.Participants {
+			var node corev1.Node
+			if err := reader.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
+				return nil, fmt.Errorf("read active failure domain for %s: %w", participant.NodeName, err)
+			}
+
+			usage[node.Labels[policy.FailureDomainLabel]]++
+		}
+	}
+
+	return usage, nil
+}
+
+func validateRecurringRun(
+	ctx context.Context,
+	reader client.Reader,
+	run *signalv1.CertificationRun,
+	nodes []corev1.Node,
+	others []signalv1.CertificationRun,
+	now time.Time,
+) error {
+	admission := run.Spec.Admission
+
+	policy := admission.Recurring
+	if policyExpired(policy, now) {
+		return fmt.Errorf("recurring policy expired before workload admission")
+	}
+
+	active, _ := activeBudgets(others, &signalv1.CertificationProfile{ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Profile.Name}})
+	if active >= policy.MaxConcurrent {
+		return fmt.Errorf("recurring profile concurrency budget is exhausted")
+	}
+
+	domains, err := recurringDomainUsage(ctx, reader, others, run.Spec.Profile.Name, policy)
+	if err != nil {
+		return err
+	}
+
+	requiredByDomain := map[string]int32{}
+
+	for index := range nodes {
+		node := &nodes[index]
+
+		lastSuccess, failures, lastFailure := runHistory(runsForParticipantProfile(others, node.Name, node.UID, run.Spec.Profile.Name))
+		if _, reason := failureGate(policy, failures, lastFailure, now); reason != "" {
+			return fmt.Errorf("participant %s: %s", node.Name, reason)
+		}
+
+		if now.Before(dueAt(policy, admission.IdleSince, lastSuccess)) {
+			return fmt.Errorf("participant %s is not due under the pinned recurring policy", node.Name)
+		}
+
+		if excludedRunActive(others, node.Name, policy.ExclusiveProfiles) {
+			return fmt.Errorf("participant %s has an active exclusive profile", node.Name)
+		}
+
+		if policy.FailureDomainLabel != "" && policy.MaxConcurrentPerFailureDomain > 0 {
+			domain := node.Labels[policy.FailureDomainLabel]
+			if domain == "" {
+				return fmt.Errorf("participant %s has no failure-domain label %s", node.Name, policy.FailureDomainLabel)
+			}
+
+			requiredByDomain[domain]++
+		}
+	}
+
+	for domain, required := range requiredByDomain {
+		if domains[domain]+required > policy.MaxConcurrentPerFailureDomain {
+			return fmt.Errorf("all declared members exceed the failure-domain budget for %s", domain)
+		}
+	}
+
 	return nil
 }
 
@@ -447,7 +631,7 @@ func activeBudgets(runs []signalv1.CertificationRun, profile *signalv1.Certifica
 
 	for index := range runs {
 		run := &runs[index]
-		if run.Spec.Profile.Name != profile.Name || run.Status.Phase.Terminal() {
+		if run.Spec.Profile.Name != profile.Name || !runActive(run) {
 			continue
 		}
 
@@ -460,7 +644,7 @@ func activeBudgets(runs []signalv1.CertificationRun, profile *signalv1.Certifica
 func activeRunForNode(runs []signalv1.CertificationRun, nodeName string) bool {
 	for index := range runs {
 		run := &runs[index]
-		if run.Status.Phase.Terminal() {
+		if !runActive(run) {
 			continue
 		}
 
@@ -477,7 +661,7 @@ func activeRunForNode(runs []signalv1.CertificationRun, nodeName string) bool {
 func excludedRunActive(runs []signalv1.CertificationRun, nodeName string, profiles []string) bool {
 	for index := range runs {
 		run := &runs[index]
-		if run.Status.Phase.Terminal() || !slices.Contains(profiles, run.Spec.Profile.Name) {
+		if !runActive(run) || !slices.Contains(profiles, run.Spec.Profile.Name) {
 			continue
 		}
 
@@ -489,6 +673,11 @@ func excludedRunActive(runs []signalv1.CertificationRun, nodeName string, profil
 	}
 
 	return false
+}
+
+func runActive(run *signalv1.CertificationRun) bool {
+	return !run.Status.Phase.Terminal() ||
+		containsString(run.Finalizers, RunFinalizer) && run.Status.Workflow.Name != "" && !run.Status.Cleanup.ReservationsReleased
 }
 
 func runsForNodeProfile(
@@ -550,6 +739,24 @@ func runHistory(
 	}
 
 	return lastSuccess, consecutiveFailure, latestFailure
+}
+
+func runsForParticipantProfile(
+	runs []signalv1.CertificationRun,
+	nodeName string,
+	nodeUID types.UID,
+	profileName string,
+) []signalv1.CertificationRun {
+	history := runsForNodeProfile(runs, nodeName, profileName)
+
+	matching := make([]signalv1.CertificationRun, 0, len(history))
+	for _, run := range history {
+		if participantNodeUID(&run, nodeName) == nodeUID {
+			matching = append(matching, run)
+		}
+	}
+
+	return matching
 }
 
 func completionTime(run *signalv1.CertificationRun) time.Time {

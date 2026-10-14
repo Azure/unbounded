@@ -63,6 +63,10 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	}
 
 	run := runs.Items[0]
+	if run.Spec.Admission != nil {
+		t.Fatal("a profile without explicit members changed its legacy single-node admission contract")
+	}
+
 	if run.Spec.Script.Digest != digestString(payload) {
 		t.Fatalf("script digest = %q", run.Spec.Script.Digest)
 	}
@@ -117,7 +121,7 @@ func TestParticipantSelectionRejectsUnsupportedMultiNode(t *testing.T) {
 	r := &AdmissionReconciler{Client: kube}
 
 	if _, err := r.selectParticipants(context.Background(), request, profile); err == nil ||
-		!strings.Contains(err.Error(), "multi-participant execution is not implemented") {
+		!strings.Contains(err.Error(), "grouped participants require explicit nodeNames and topologyKey") {
 		t.Fatalf("selectParticipants error = %v", err)
 	}
 }

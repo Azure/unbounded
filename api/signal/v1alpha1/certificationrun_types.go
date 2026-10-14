@@ -61,6 +61,24 @@ type ScriptSnapshot struct {
 	Digest        string `json:"digest"`
 }
 
+// AdmissionSnapshot freezes the membership and guards for explicit-set admission.
+// Runs without this field retain their original single-node admission contract.
+// +kubebuilder:validation:XValidation:rule="has(self.participants.nodeNames)",message="admission requires explicit nodeNames"
+// +kubebuilder:validation:XValidation:rule="!has(self.participants.topologyKey) || (has(self.topologyValue) && size(self.topologyValue) > 0)",message="admission requires the observed topology value"
+// +kubebuilder:validation:XValidation:rule="self.trigger != 'recurring' || (has(self.recurring) && self.recurring.enabled && has(self.idleSince))",message="recurring admission requires an enabled pinned policy and idle observation"
+type AdmissionSnapshot struct {
+	Participants ParticipantPolicy `json:"participants"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$`
+	TopologyValue string `json:"topologyValue,omitempty"`
+	// +kubebuilder:validation:Enum=manual;recurring
+	Trigger   string           `json:"trigger"`
+	Recurring *RecurringPolicy `json:"recurring,omitempty"`
+	// IdleSince is the latest continuous idle observation across all members.
+	IdleSince *metav1.Time `json:"idleSince,omitempty"`
+}
+
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
 // +kubebuilder:validation:XValidation:rule="self.participants == oldSelf.participants",message="participants are immutable"
 // +kubebuilder:validation:XValidation:rule="self.script == oldSelf.script",message="script is immutable"
@@ -75,9 +93,11 @@ type ScriptSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.requestNodeName == oldSelf.requestNodeName",message="requestNodeName is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.participantPlan) == has(oldSelf.participantPlan) && (!has(self.participantPlan) || self.participantPlan == oldSelf.participantPlan)",message="participantPlan is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.testPlan) == has(oldSelf.testPlan) && (!has(self.testPlan) || self.testPlan == oldSelf.testPlan)",message="testPlan is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.admission) == has(oldSelf.admission) && (!has(self.admission) || self.admission == oldSelf.admission)",message="admission is immutable"
 type CertificationRunSpec struct {
 	Profile         PinnedProfile         `json:"profile"`
 	Participants    []Participant         `json:"participants"`
+	Admission       *AdmissionSnapshot    `json:"admission,omitempty"`
 	ParticipantPlan []ParticipantSnapshot `json:"participantPlan,omitempty"`
 	TestPlan        []TestInvocation      `json:"testPlan,omitempty"`
 	Script          ScriptSnapshot        `json:"script"`
@@ -144,6 +164,7 @@ type CleanupStatus struct {
 }
 
 type CertificationRunStatus struct {
+	AdmissionReady bool               `json:"admissionReady,omitempty"`
 	Phase          RunPhase           `json:"phase,omitempty"`
 	ExecutionState string             `json:"executionState,omitempty"`
 	Verdict        string             `json:"verdict,omitempty"`

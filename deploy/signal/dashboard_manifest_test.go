@@ -64,5 +64,17 @@ func TestControllerCanVerifyMPIBackendsAreGoneBeforeReleasingReservations(t *tes
 	require.True(t, found)
 
 	controllerRBAC, _, _ = strings.Cut(controllerRBAC, "\n---")
-	assert.Contains(t, controllerRBAC, `apiGroups: ["kubeflow.org"]`+"\n"+`    resources: ["mpijobs"]`+"\n"+`    verbs: ["list"]`)
+	assert.Contains(t, controllerRBAC, `apiGroups: ["kubeflow.org"]`+"\n"+`    resources: ["mpijobs"]`+"\n"+`    verbs: ["get", "list", "delete"]`)
+}
+
+func TestControllerHasRackAdmissionSafetyReads(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("02-rbac.yaml.tmpl")
+	require.NoError(t, err)
+
+	controllerRBAC, _, _ := strings.Cut(string(content), "\n---")
+	assert.Contains(t, controllerRBAC, `resources: ["nodes"]`+"\n"+`    verbs: ["get", "list", "watch", "patch"]`)
+	assert.Contains(t, controllerRBAC, `resources: ["pods"]`+"\n"+`    verbs: ["get", "list"]`)
+	assert.Contains(t, controllerRBAC, `apiGroups: ["unbounded-cloud.io"]`+"\n"+`    resources: ["machines", "machineoperations"]`+"\n"+`    verbs: ["get", "list"]`)
 }

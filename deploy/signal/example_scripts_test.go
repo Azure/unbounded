@@ -237,20 +237,37 @@ func TestBurnCanaryRejectsSustainedMaterialPowerLimitExcess(t *testing.T) {
 	tempDir := t.TempDir()
 	resultsDir := filepath.Join(tempDir, "results")
 	workDir := filepath.Join(tempDir, "work")
+	clockPath := filepath.Join(tempDir, "telemetry-clock")
 
 	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
+	if err := os.WriteFile(clockPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance the fixture clock per observation, not under host scheduling pressure.
 	for name, contents := range map[string]string{
 		"nvidia-smi": `#!/usr/bin/env bash
+observations="$(<"${TELEMETRY_CLOCK}")"
+printf '%s\n' "$((observations + 1))" >"${TELEMETRY_CLOCK}"
 printf '%s\n' '0, NVIDIA B200, 31, 57, 1060.00, 1000.00, 0, 0, 0x4'
+`,
+		"date": `#!/usr/bin/env bash
+if [[ "$#" != 1 || "$1" != +%s ]]; then
+  printf 'unsupported fixture date arguments: %s\n' "$*" >&2
+  exit 64
+fi
+printf '%s\n' "$((1700000000 + $(<"${TELEMETRY_CLOCK}")))"
 `,
 		"dmesg": `#!/usr/bin/env bash
 printf '%s\n' 'kernel: healthy'
 `,
 		"gpu_burn": `#!/usr/bin/env bash
-sleep "${@: -1}"
+while (( $(<"${TELEMETRY_CLOCK}") <= POWER_LIMIT_CONSECUTIVE_SAMPLES )); do
+  sleep 0.1
+done
 `,
 	} {
 		if err := os.WriteFile(filepath.Join(tempDir, name), []byte(contents), 0o755); err != nil {
@@ -268,6 +285,7 @@ sleep "${@: -1}"
 	cmd.Env = append(
 		os.Environ(),
 		"PATH="+tempDir+":"+os.Getenv("PATH"),
+		"TELEMETRY_CLOCK="+clockPath,
 		"EXPECTED_GPU_PRODUCT_REGEX=^NVIDIA B200$",
 		"EXPECTED_GPU_COUNT=1",
 		"OBSERVED_GPU_CAPACITY=1",
@@ -286,11 +304,18 @@ sleep "${@: -1}"
 		t.Fatalf("burn canary returned infrastructure failure: %v: %s", err, output)
 	}
 
+	t.Logf("sustained power telemetry:\n%s", output)
 	assertFileContents(t, filepath.Join(resultsDir, "verdict"), "Fail")
 	assertFileContents(t, filepath.Join(resultsDir, "reason"), "PowerLimitExceeded")
 
 	if !strings.Contains(string(output), "consecutive_samples=3") {
 		t.Fatalf("missing sustained power evidence: %s", output)
+	}
+
+	for _, sample := range []string{"power_excess_samples=1", "power_excess_samples=2", "power_excess_samples=3"} {
+		if !strings.Contains(string(output), sample) {
+			t.Fatalf("missing power observation %s: %s", sample, output)
+		}
 	}
 }
 

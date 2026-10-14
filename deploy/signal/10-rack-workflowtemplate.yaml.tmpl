@@ -121,6 +121,38 @@ spec:
               parameters:
                 - name: reason
                   value: UnsupportedNodeWorkflow
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`let selected = workflow.parameters['node-workflow-template'];
+                let group = tasks[selected == 'project-signal-gpu-full-node-certification' ? 'full-node'
+                : (selected == 'project-signal-gpu-certification' ? 'identity' : 'mixed-burn')];
+                let encodedVerdicts = group?.outputs?.parameters?.verdict;
+                let verdicts = encodedVerdicts != nil ? fromJSON(encodedVerdicts) : [];
+                let expected = len(fromJSON(workflow.parameters['participant-plan']));
+                workflow.parameters['rack-tests'] != '[]'
+                || selected not in ['project-signal-gpu-full-node-certification', 'project-signal-gpu-certification', 'project-signal-gpu-burn-canary']
+                ? 'Fail'
+                : (any(verdicts, {# == 'Fail'}) ? 'Fail'
+                : (expected > 0 && group.status == 'Succeeded' && len(verdicts) == expected && all(verdicts, {# == 'Pass'})
+                ? 'Pass' : 'Inconclusive'))`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`let selected = workflow.parameters['node-workflow-template'];
+                let group = tasks[selected == 'project-signal-gpu-full-node-certification' ? 'full-node'
+                : (selected == 'project-signal-gpu-certification' ? 'identity' : 'mixed-burn')];
+                let encodedVerdicts = group?.outputs?.parameters?.verdict;
+                let verdicts = encodedVerdicts != nil ? fromJSON(encodedVerdicts) : [];
+                let expected = len(fromJSON(workflow.parameters['participant-plan']));
+                workflow.parameters['rack-tests'] != '[]' ? 'UnsupportedRackTest'
+                : (selected not in ['project-signal-gpu-full-node-certification', 'project-signal-gpu-certification', 'project-signal-gpu-burn-canary']
+                ? 'UnsupportedNodeWorkflow'
+                : (any(verdicts, {# == 'Fail'}) ? 'NodeTestFailed'
+                : (expected > 0 && group.status == 'Succeeded' && len(verdicts) == expected && all(verdicts, {# == 'Pass'})
+                ? 'RackNodeTestsPassed' : 'RequiredTestCoverageMissing')))`}}
 
     - name: unsupported-test
       inputs:

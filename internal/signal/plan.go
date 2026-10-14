@@ -124,7 +124,7 @@ func (r *AdmissionReconciler) snapshotParticipants(
 
 	for _, participant := range participants {
 		var node corev1.Node
-		if err := r.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
+		if err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
 			return nil, fmt.Errorf("snapshot participant %s: %w", participant.NodeName, err)
 		}
 
@@ -156,6 +156,10 @@ func makeTestPlan(spec *signalv1.CertificationRunSpec) ([]signalv1.TestInvocatio
 		return nil, strict, err
 	}
 
+	if len(spec.Participants) > 1 && spec.Workflow.Name != RackCertificationWorkflow {
+		return nil, true, fmt.Errorf("grouped builtin workflows require the rack composition template")
+	}
+
 	inventory := make(map[string]signalv1.ParticipantSnapshot, len(spec.ParticipantPlan))
 	for _, participant := range spec.ParticipantPlan {
 		if _, duplicate := inventory[participant.NodeName]; duplicate {
@@ -176,13 +180,15 @@ func makeTestPlan(spec *signalv1.CertificationRunSpec) ([]signalv1.TestInvocatio
 	definitions := workflowTests(workflow)
 	plan := make([]signalv1.TestInvocation, 0, len(spec.Participants)*len(definitions))
 	seen := make(map[string]bool, len(spec.Participants))
+	seenUIDs := make(map[string]bool, len(spec.Participants))
 
 	for _, participant := range spec.Participants {
-		if participant.NodeName == "" || participant.NodeUID == "" || seen[participant.NodeName] {
+		if participant.NodeName == "" || participant.NodeUID == "" || seen[participant.NodeName] || seenUIDs[string(participant.NodeUID)] {
 			return nil, true, fmt.Errorf("participant names and UIDs must be nonempty and distinct")
 		}
 
 		seen[participant.NodeName] = true
+		seenUIDs[string(participant.NodeUID)] = true
 		parameters := maps.Clone(spec.Parameters)
 
 		if len(inventory) != 0 {

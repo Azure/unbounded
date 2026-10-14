@@ -200,8 +200,8 @@ func TestRackTemplateRetainsMembershipHoldAndRejectsUnsupportedRackTests(t *test
 			r := &AdmissionReconciler{Client: kube}
 
 			if _, err := r.selectParticipants(t.Context(), request, profile); err == nil ||
-				!strings.Contains(err.Error(), "multi-participant execution is not implemented") {
-				t.Fatalf("rack template bypassed the membership hold: %v", err)
+				!strings.Contains(err.Error(), "grouped participants require explicit nodeNames and topologyKey") {
+				t.Fatalf("rack template bypassed the explicit membership requirement: %v", err)
 			}
 
 			for _, value := range []string{`["fabric"]`, "null", `{"test":"fabric"}`} {

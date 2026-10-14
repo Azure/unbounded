@@ -178,14 +178,42 @@ func imageDigest(image string) string {
 }
 
 func admissionStages(run *signalv1.CertificationRun) []StageStatus {
+	eligibilityPhase := "Succeeded"
+	eligibilityMessage := "The approved node satisfied admission policy."
 	reservationPhase := "Succeeded"
+	reservationMessage := "Participants were selected and locked for this run."
+	admissionReason := ""
+
 	if run.Status.Phase == signalv1.RunPhasePending {
 		reservationPhase = "Running"
 	}
 
+	if run.Spec.Admission != nil {
+		admitted := run.Status.AdmissionReady || run.Status.Workflow.UID != ""
+		for _, attempt := range run.Status.Attempts {
+			admitted = admitted || attempt.Workflow.UID != ""
+		}
+
+		switch {
+		case admitted:
+			reservationPhase = "Succeeded"
+			eligibilityMessage = "All declared members satisfied the pinned admission policy."
+			reservationMessage = "The complete declared set passed reservation validation."
+		case run.Status.Phase.Terminal():
+			eligibilityPhase, reservationPhase = "Inconclusive", "Inconclusive"
+			eligibilityMessage = "Whole-set admission did not complete."
+			reservationMessage = "Admission stopped before the complete declared set was reserved."
+			admissionReason = sanitizeDisplay(run.Status.Reason)
+		default:
+			eligibilityPhase, reservationPhase = "Running", "Running"
+			eligibilityMessage = "Validating every declared member against the pinned admission policy."
+			reservationMessage = "Waiting for reservations for the complete declared set."
+		}
+	}
+
 	return []StageStatus{
-		{ID: "eligibility", Name: "Idle eligibility", Phase: "Succeeded", Source: "Project Signal policy", Message: "The approved node satisfied admission policy."},
-		{ID: "reservation", Name: "Reservation", Phase: reservationPhase, Source: "Project Signal policy", Message: "Participants were selected and locked for this run."},
+		{ID: "eligibility", Name: "Idle eligibility", Phase: eligibilityPhase, Source: "Project Signal policy", Message: eligibilityMessage, Reason: admissionReason},
+		{ID: "reservation", Name: "Reservation", Phase: reservationPhase, Source: "Project Signal policy", Message: reservationMessage, Reason: admissionReason},
 		{ID: "snapshot", Name: "Immutable script snapshot", Phase: "Succeeded", Source: "Project Signal policy", Message: "The script, stage plan, profile generation, and digest were pinned."},
 	}
 }

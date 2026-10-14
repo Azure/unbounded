@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -303,4 +304,53 @@ func attemptFinishedAt(workflow *unstructured.Unstructured, now time.Time) metav
 	// Kubernetes metav1.Time persists whole seconds. Keep retries byte-identical
 	// even when the evidence was saved before a status update failed.
 	return metav1.NewTime(now.UTC().Truncate(time.Second))
+}
+
+func (r *RunReconciler) recoverExplicitWorkflow(ctx context.Context, run *signalv1.CertificationRun) error {
+	workflows := &unstructured.UnstructuredList{}
+	workflows.SetGroupVersionKind(workflowGVK.GroupVersion().WithKind("WorkflowList"))
+
+	if err := admissionReader(r.Reader, r.Client).List(ctx, workflows, client.InNamespace(run.Namespace)); err != nil {
+		return fmt.Errorf("recover group Workflow identity: %w", err)
+	}
+
+	latest := run.Status.Workflow
+
+	for index := range workflows.Items {
+		workflow := &workflows.Items[index]
+		if !metav1.IsControlledBy(workflow, run) {
+			continue
+		}
+
+		suffix, found := strings.CutPrefix(workflow.GetName(), run.Name+"-a")
+		if !found {
+			continue
+		}
+
+		attempt, err := strconv.ParseInt(suffix, 10, 32)
+		if err != nil || attempt < 1 || attempt > int64(run.Spec.MaxAttempts) {
+			continue
+		}
+
+		if int32(attempt) < latest.Attempt {
+			continue
+		}
+
+		if int32(attempt) == latest.Attempt && latest.UID != "" && latest.UID != string(workflow.GetUID()) {
+			return fmt.Errorf("group Workflow attempt %d UID changed", attempt)
+		}
+
+		latest = signalv1.WorkflowStatus{
+			Name: workflow.GetName(), UID: string(workflow.GetUID()), Attempt: int32(attempt), Phase: workflowPhase(workflow),
+		}
+	}
+
+	if latest.Name == "" || latest == run.Status.Workflow {
+		return nil
+	}
+
+	before := run.DeepCopy()
+	run.Status.Workflow = latest
+
+	return r.Status().Patch(ctx, run, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }

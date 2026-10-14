@@ -246,6 +246,99 @@ func TestDashboardGroupVerdictDoesNotCertifySuccessfulWorkflow(t *testing.T) {
 	assert.Equal(t, "Fail", detail.ExecutionPlan[1].Verdict)
 }
 
+func TestDashboardRackRunRetainsEveryMembersRequiredCoverage(t *testing.T) {
+	t.Parallel()
+
+	reader := fixtureReader()
+	run := &reader.runs[0]
+	run.Spec.Participants = []signalv1.Participant{
+		{NodeName: "approved-a100", NodeUID: "node-left-uid"},
+		{NodeName: "approved-peer", NodeUID: "node-right-uid"},
+	}
+	run.Status.Phase = signalv1.RunPhaseInconclusive
+	run.Status.Verdict = "Inconclusive"
+	run.Status.Reason = "MissingTestResult"
+	reader.nodes["approved-peer"] = reader.nodes["approved-a100"]
+	peer := reader.nodes["approved-peer"]
+	peer.Name = "approved-peer"
+	reader.nodes["approved-peer"] = peer
+
+	for _, participant := range run.Spec.Participants {
+		for _, id := range []string{"preflight", "gpu-health", "mpi-rank-access", "health-after"} {
+			invocation := signalv1.TestInvocation{ID: id, NodeName: participant.NodeName, NodeUID: participant.NodeUID}
+			run.Spec.TestPlan = append(run.Spec.TestPlan, invocation)
+
+			if participant.NodeName == "approved-peer" && id == "gpu-health" {
+				continue
+			}
+
+			run.Status.TestResults = append(run.Status.TestResults, signalv1.TestResult{
+				TestInvocation: invocation, Attempt: 1, ExecutionState: "Succeeded", Verdict: "Pass",
+				Evidence: signalv1.EvidenceStatus{URI: "kubernetes://signal/configmaps/rack-attempt/evidence.json.gz"},
+			})
+		}
+	}
+
+	collector := fixtureCollector(reader)
+	detail, err := collector.Run(t.Context(), collector.Collect(t.Context()), "run-example")
+	require.NoError(t, err)
+	require.Len(t, detail.Participants, 2)
+	require.Len(t, detail.ExecutionPlan, 8)
+	assert.Equal(t, "Succeeded", detail.ArgoTask.ExecutionState)
+	assert.Equal(t, "Inconclusive", detail.ArgoTask.Verdict)
+	require.Len(t, detail.PlanIssues, 1)
+	assert.Equal(t, "Omitted", detail.ExecutionPlan[5].ExecutionState)
+	assert.Equal(t, "Inconclusive", detail.ExecutionPlan[5].Verdict)
+	assert.Equal(t, "a100-node-2", detail.ExecutionPlan[5].NodeAlias)
+	assert.Equal(t, "Pass", detail.ExecutionPlan[1].Verdict, "another member's matching test ID must not fill missing coverage")
+	assert.Equal(t, "Pass", detail.ExecutionPlan[7].Verdict, "later health cannot erase the missing GPU test")
+}
+
+func TestExplicitSetAdmissionStagesRequireWholeSetReadiness(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		phase      signalv1.RunPhase
+		ready      bool
+		currentUID string
+		earlierUID string
+		legacy     bool
+		want       string
+	}{
+		{name: "pending partial admission", phase: signalv1.RunPhasePending, want: "Running"},
+		{name: "rejected before work", phase: signalv1.RunPhaseInconclusive, want: "Inconclusive"},
+		{name: "whole set ready", phase: signalv1.RunPhasePending, ready: true, want: "Succeeded"},
+		{name: "completed attempt", phase: signalv1.RunPhaseFailed, currentUID: "workflow-uid", want: "Succeeded"},
+		{name: "retained earlier attempt", phase: signalv1.RunPhaseCancelled, earlierUID: "earlier-workflow-uid", want: "Succeeded"},
+		{name: "unexecuted attempt", phase: signalv1.RunPhaseCancelled, want: "Inconclusive"},
+		{name: "legacy terminal contract", phase: signalv1.RunPhaseFailed, legacy: true, want: "Succeeded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			run := &signalv1.CertificationRun{}
+			if !test.legacy {
+				require.NoError(t, json.Unmarshal([]byte(`{"spec":{"admission":{}}}`), run))
+			}
+
+			run.Status.Phase = test.phase
+			run.Status.AdmissionReady = test.ready
+			run.Status.Workflow.UID = test.currentUID
+			run.Status.Attempts = []signalv1.AttemptStatus{{Workflow: signalv1.WorkflowStatus{UID: test.earlierUID}}}
+
+			stages := admissionStages(run)
+			require.GreaterOrEqual(t, len(stages), 2)
+			assert.Equal(t, test.want, stages[0].Phase, "eligibility must not claim partial group admission succeeded")
+			assert.Equal(t, test.want, stages[1].Phase, "reservations must represent the whole declared set")
+
+			if !test.legacy && test.want != "Succeeded" {
+				assert.NotContains(t, stages[1].Message, "locked")
+			}
+		})
+	}
+}
+
 func TestCertificationTestStagesShowConcurrentContainerNodesWithoutPass(t *testing.T) {
 	t.Parallel()
 

@@ -29,7 +29,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
@@ -58,6 +57,7 @@ var workflowGVK = schema.GroupVersionKind{
 
 type AdmissionReconciler struct {
 	client.Client
+	Reader          client.Reader
 	Namespace       string
 	ScriptNamespace string
 	Recorder        recorder.EventRecorder
@@ -66,6 +66,7 @@ type AdmissionReconciler struct {
 
 type RunReconciler struct {
 	client.Client
+	Reader             client.Reader
 	Namespace          string
 	Evidence           EvidenceStore
 	Now                func() time.Time
@@ -75,6 +76,10 @@ type RunReconciler struct {
 }
 
 func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Reader == nil {
+		r.Reader = mgr.GetAPIReader()
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}, builder.WithPredicates(predicate.LabelChangedPredicate{})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
@@ -82,6 +87,10 @@ func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Reader == nil {
+		r.Reader = mgr.GetAPIReader()
+	}
+
 	workflow := &unstructured.Unstructured{}
 	workflow.SetGroupVersionKind(workflowGVK)
 
@@ -116,11 +125,46 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 	profileName string,
 	trigger string,
 ) error {
+	var profile signalv1.CertificationProfile
+	if err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: profileName}, &profile); err != nil {
+		return fmt.Errorf("get CertificationProfile %s: %w", profileName, err)
+	}
+
+	return r.admitProfile(ctx, node, &profile, trigger)
+}
+
+func (r *AdmissionReconciler) admitProfile(
+	ctx context.Context,
+	node *corev1.Node,
+	profile *signalv1.CertificationProfile,
+	trigger string,
+) (retErr error) {
+	explicit := explicitParticipants(profile.Spec.Participants)
+	if err := validateParticipantPolicy(profile.Spec.Participants); err != nil {
+		return fmt.Errorf("profile %s participants: %w", profile.Name, err)
+	}
+
+	if explicit && len(profile.Spec.Participants.NodeNames) > 0 &&
+		!containsString(profile.Spec.Participants.NodeNames, node.Name) {
+		return fmt.Errorf("request node %s is not a declared member of profile %s", node.Name, profile.Name)
+	}
+
 	if runName := node.Annotations[ReservationLabel]; runName != "" {
 		var run signalv1.CertificationRun
 
-		err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run)
+		err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run)
 		if err == nil {
+			if explicit {
+				participants, err := r.selectParticipants(ctx, node, profile)
+				if err != nil {
+					return err
+				}
+
+				if run.Spec.Profile.Name != profile.Name || !sameParticipants(run.Spec.Participants, participants) {
+					return fmt.Errorf("request node %s is reserved by a different profile or member set in run %s", node.Name, runName)
+				}
+			}
+
 			return nil
 		}
 
@@ -131,11 +175,6 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 		return fmt.Errorf("node %s has stale Project Signal reservation %q", node.Name, runName)
 	}
 
-	var profile signalv1.CertificationProfile
-	if err := r.Get(ctx, client.ObjectKey{Name: profileName}, &profile); err != nil {
-		return fmt.Errorf("get CertificationProfile %s: %w", profileName, err)
-	}
-
 	if err := validateStagePlan(profile.Spec.StagePlan); err != nil {
 		return fmt.Errorf("profile %s stage plan: %w", profile.Name, err)
 	}
@@ -144,26 +183,44 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 		return fmt.Errorf("profile %s execution plan: %w", profile.Name, err)
 	}
 
-	participants, err := r.selectParticipants(ctx, node, &profile)
+	participants, err := r.selectParticipants(ctx, node, profile)
 	if err != nil {
 		return err
 	}
 
-	runName := runName(node.Name, profile.Name, r.now())
-	if err := r.reserveParticipants(ctx, participants, runName); err != nil {
-		return err
+	if explicit {
+		exists, err := r.existingExplicitRun(ctx, participants, profile.Name)
+		if err != nil || exists {
+			return err
+		}
 	}
 
-	releaseOnFailure := true
+	nameNode := node.Name
+	if explicit {
+		nameNode = participants[0].NodeName
+	}
+
+	runName := runName(nameNode, profile.Name, r.now())
+
+	releaseOnFailure := !explicit
+	if !explicit {
+		if err := r.reserveParticipants(ctx, participants, runName); err != nil {
+			return err
+		}
+	}
+
 	defer func() {
 		if releaseOnFailure {
-			if err := r.releaseParticipants(context.WithoutCancel(ctx), participants, runName); err != nil {
-				log.FromContext(ctx).Error(err, "failed to roll back participant reservations", "run", runName)
-			}
+			retErr = errors.Join(retErr, r.releaseParticipants(context.WithoutCancel(ctx), participants, runName))
 		}
 	}()
 
-	participantPlan, err := r.snapshotParticipants(ctx, participants, runName)
+	snapshotReservation := runName
+	if explicit {
+		snapshotReservation = ""
+	}
+
+	participantPlan, err := r.snapshotParticipants(ctx, participants, snapshotReservation)
 	if err != nil {
 		return err
 	}
@@ -185,7 +242,7 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 		return err
 	}
 
-	snapshot, scriptDigest, err := r.createSnapshot(ctx, runName, &profile)
+	snapshot, scriptDigest, err := r.createSnapshot(ctx, runName, profile)
 	if err != nil {
 		return err
 	}
@@ -233,6 +290,18 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 		},
 	}
 
+	if explicit {
+		admission, err := r.membershipSnapshot(ctx, participants, profile, trigger)
+		if err != nil {
+			return errors.Join(err, client.IgnoreNotFound(r.Delete(context.WithoutCancel(ctx), snapshot)))
+		}
+
+		run.Spec.Admission = admission
+		if err := validateRunAdmission(ctx, admissionReader(r.Reader, r.Client), run, false, true, r.now()); err != nil {
+			return errors.Join(err, client.IgnoreNotFound(r.Delete(context.WithoutCancel(ctx), snapshot)))
+		}
+	}
+
 	if err := r.Create(ctx, run); err != nil {
 		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
 
@@ -247,7 +316,10 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 			releaseOnFailure = false
 		}
 
-		deleteSnapshotErr := r.Delete(context.WithoutCancel(ctx), snapshot)
+		var deleteSnapshotErr error
+		if !explicit {
+			deleteSnapshotErr = r.Delete(context.WithoutCancel(ctx), snapshot)
+		}
 
 		return errors.Join(cause, client.IgnoreNotFound(deleteRunErr), client.IgnoreNotFound(deleteSnapshotErr))
 	}
@@ -280,13 +352,17 @@ func (r *AdmissionReconciler) selectParticipants(
 	requestNode *corev1.Node,
 	profile *signalv1.CertificationProfile,
 ) ([]signalv1.Participant, error) {
+	if err := validateParticipantPolicy(profile.Spec.Participants); err != nil {
+		return nil, fmt.Errorf("profile %s participants: %w", profile.Name, err)
+	}
+
+	if explicitParticipants(profile.Spec.Participants) {
+		return r.selectExplicitParticipants(ctx, requestNode, profile)
+	}
+
 	count := profile.Spec.Participants.Count
 	if count < 1 {
 		return nil, fmt.Errorf("profile %s participant count must be positive", profile.Name)
-	}
-
-	if count > 1 {
-		return nil, fmt.Errorf("profile %s requests %d participants; multi-participant execution is not implemented", profile.Name, count)
 	}
 
 	selector, err := metav1.LabelSelectorAsSelector(&profile.Spec.Participants.Selector)
@@ -357,27 +433,28 @@ func nodeReady(node *corev1.Node) bool {
 }
 
 func (r *AdmissionReconciler) reserveParticipants(ctx context.Context, participants []signalv1.Participant, runName string) error {
-	reserved := make([]signalv1.Participant, 0, len(participants))
 	for _, participant := range participants {
 		var node corev1.Node
-		if err := r.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
+		if err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
 			return errors.Join(
 				fmt.Errorf("get participant %s: %w", participant.NodeName, err),
-				r.releaseParticipants(context.WithoutCancel(ctx), reserved, runName),
+				r.releaseParticipants(context.WithoutCancel(ctx), participants, runName),
 			)
 		}
 
 		if node.UID != participant.NodeUID {
 			return errors.Join(
 				fmt.Errorf("participant %s identity changed", participant.NodeName),
-				r.releaseParticipants(context.WithoutCancel(ctx), reserved, runName),
+				r.releaseParticipants(context.WithoutCancel(ctx), participants, runName),
 			)
 		}
 
-		if value := node.Annotations[ReservationLabel]; value != "" {
+		if value := node.Annotations[ReservationLabel]; value == runName {
+			continue
+		} else if value != "" {
 			return errors.Join(
 				fmt.Errorf("participant %s is already reserved by %s", participant.NodeName, value),
-				r.releaseParticipants(context.WithoutCancel(ctx), reserved, runName),
+				r.releaseParticipants(context.WithoutCancel(ctx), participants, runName),
 			)
 		}
 
@@ -394,11 +471,9 @@ func (r *AdmissionReconciler) reserveParticipants(ctx context.Context, participa
 		); err != nil {
 			return errors.Join(
 				fmt.Errorf("reserve participant %s: %w", participant.NodeName, err),
-				r.releaseParticipants(context.WithoutCancel(ctx), reserved, runName),
+				r.releaseParticipants(context.WithoutCancel(ctx), participants, runName),
 			)
 		}
-
-		reserved = append(reserved, participant)
 	}
 
 	return nil
@@ -409,7 +484,7 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 
 	for _, participant := range participants {
 		var node corev1.Node
-		if err := r.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
+		if err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
 			if !apierrors.IsNotFound(err) {
 				errs = append(errs, err)
 			}
@@ -428,7 +503,7 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 		before := node.DeepCopy()
 		delete(node.Annotations, ReservationLabel)
 
-		if err := r.Patch(ctx, &node, client.MergeFrom(before)); err != nil {
+		if err := r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -479,6 +554,12 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if run.Spec.Admission != nil && !run.Status.Phase.Terminal() {
+		if err := r.recoverExplicitWorkflow(ctx, &run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	if !run.DeletionTimestamp.IsZero() {
 		return r.reconcileDeleting(ctx, &run)
 	}
@@ -489,6 +570,16 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	if run.Spec.Cancel {
 		return r.cancel(ctx, &run)
+	}
+
+	if run.Spec.Admission != nil && run.Status.Workflow.Name == "" && !run.Status.AdmissionReady {
+		return r.completeExplicitAdmission(ctx, &run)
+	}
+
+	if run.Spec.Admission != nil && run.Status.Workflow.Name != "" {
+		if err := validateRunAdmission(ctx, admissionReader(r.Reader, r.Client), &run, true, false, r.now()); err != nil {
+			return r.rejectAdmission(ctx, &run, err)
+		}
 	}
 
 	if run.Status.Workflow.Name == "" {
@@ -563,9 +654,49 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 }
 
 func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.CertificationRun, attempt int32) (ctrl.Result, error) {
+	if err := validateAdmissionContract(run); err != nil {
+		return r.rejectAdmission(ctx, run, err)
+	}
+
+	if run.Spec.Admission != nil {
+		if !run.Status.AdmissionReady {
+			return r.rejectAdmission(ctx, run, fmt.Errorf("member reservations have not been admitted"))
+		}
+
+		if err := validateRunAdmission(ctx, admissionReader(r.Reader, r.Client), run, true, true, r.now()); err != nil {
+			return r.rejectAdmission(ctx, run, err)
+		}
+
+		if err := r.prepareExplicitSnapshot(ctx, run); err != nil {
+			return r.rejectAdmission(ctx, run, err)
+		}
+
+		var latest signalv1.CertificationRun
+		if err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKeyFromObject(run), &latest); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if latest.Spec.Cancel || !latest.DeletionTimestamp.IsZero() || latest.Status.Phase.Terminal() {
+			return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+		}
+	}
+
 	workflow, err := buildWorkflow(run, attempt)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if run.Spec.Admission != nil && !run.CreationTimestamp.IsZero() {
+		remaining := run.CreationTimestamp.Add(run.Spec.Deadline.Duration).Sub(r.now())
+
+		seconds := int64((remaining + time.Second - 1) / time.Second)
+		if seconds < 1 {
+			return r.rejectAdmission(ctx, run, fmt.Errorf("run deadline expired before workflow creation"))
+		}
+
+		if err := unstructured.SetNestedField(workflow.Object, seconds, "spec", "activeDeadlineSeconds"); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if err := r.Create(ctx, workflow); err != nil {
@@ -879,6 +1010,7 @@ func (r *RunReconciler) evidenceDocument(
 		"runSpec":            run.Spec,
 		"profile":            run.Spec.Profile,
 		"participants":       run.Spec.Participants,
+		"admission":          run.Spec.Admission,
 		"participantPlan":    run.Spec.ParticipantPlan,
 		"testPlan":           run.Spec.TestPlan,
 		"testResults":        run.Status.TestResults,
@@ -1017,6 +1149,13 @@ func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.Cer
 		return ctrl.Result{}, err
 	}
 
+	if run.Spec.Admission != nil {
+		snapshot := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: run.Spec.Script.ConfigMapName}}
+		if err := r.Delete(ctx, snapshot); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	}
+
 	before := run.DeepCopy()
 	run.Finalizers = removeString(run.Finalizers, RunFinalizer)
 
@@ -1024,42 +1163,38 @@ func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.Cer
 }
 
 func (r *RunReconciler) releaseRunReservations(ctx context.Context, run *signalv1.CertificationRun) (bool, error) {
-	for _, participant := range run.Spec.Participants {
-		var node corev1.Node
-		if err := r.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-
-			return false, err
-		}
-
-		if participant.NodeUID != "" && node.UID != participant.NodeUID {
-			continue
-		}
-
-		if node.Annotations[ReservationLabel] != run.Name {
-			continue
-		}
-
-		before := node.DeepCopy()
-		delete(node.Annotations, ReservationLabel)
-
-		if err := r.Patch(ctx, &node, client.MergeFrom(before)); err != nil {
-			return false, err
-		}
+	admission := &AdmissionReconciler{Client: r.Client, Reader: r.Reader}
+	if err := admission.releaseParticipants(ctx, cleanupParticipants(run), run.Name); err != nil {
+		return false, err
 	}
 
 	return true, nil
 }
 
 func (r *RunReconciler) clearRequest(ctx context.Context, run *signalv1.CertificationRun) error {
+	if run.Spec.Admission != nil {
+		var errs []error
+		for _, participant := range cleanupParticipants(run) {
+			errs = append(errs, r.clearNodeRequest(ctx, run, participant.NodeName))
+		}
+
+		return errors.Join(errs...)
+	}
+
+	return r.clearNodeRequest(ctx, run, run.Spec.RequestNodeName)
+}
+
+func (r *RunReconciler) clearNodeRequest(ctx context.Context, run *signalv1.CertificationRun, name string) error {
 	var node corev1.Node
-	if err := r.Get(ctx, client.ObjectKey{Name: run.Spec.RequestNodeName}, &node); err != nil {
+	if err := admissionReader(r.Reader, r.Client).Get(ctx, client.ObjectKey{Name: name}, &node); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 
-	if requestNodeUID := participantNodeUID(run, run.Spec.RequestNodeName); requestNodeUID != "" && node.UID != requestNodeUID {
+	if requestNodeUID := participantNodeUID(run, name); requestNodeUID != "" && node.UID != requestNodeUID {
+		return nil
+	}
+
+	if owner := node.Annotations[ReservationLabel]; owner != "" && owner != run.Name {
 		return nil
 	}
 
@@ -1070,10 +1205,14 @@ func (r *RunReconciler) clearRequest(ctx context.Context, run *signalv1.Certific
 	before := node.DeepCopy()
 	delete(node.Labels, RequestLabel)
 
-	return r.Patch(ctx, &node, client.MergeFrom(before))
+	return r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1.CertificationRun) (bool, error) {
+	if run.Spec.Admission != nil || len(run.Spec.Participants) > 1 {
+		return r.ensureGroupWorkflowsStopped(ctx, run)
+	}
+
 	if run.Status.Workflow.Name == "" {
 		return true, nil
 	}

@@ -554,8 +554,16 @@ func TestRackWorkflowComposesNodeTestsWithoutReplacingParticipantIdentity(t *tes
 	var workflow struct {
 		Spec struct {
 			Templates []struct {
-				Name string `yaml:"name"`
-				DAG  struct {
+				Name    string `yaml:"name"`
+				Outputs struct {
+					Parameters []struct {
+						Name      string `yaml:"name"`
+						ValueFrom struct {
+							Expression string `yaml:"expression"`
+						} `yaml:"valueFrom"`
+					} `yaml:"parameters"`
+				} `yaml:"outputs"`
+				DAG struct {
 					FailFast bool `yaml:"failFast"`
 					Tasks    []struct {
 						Name        string `yaml:"name"`
@@ -586,6 +594,15 @@ func TestRackWorkflowComposesNodeTestsWithoutReplacingParticipantIdentity(t *tes
 		}
 
 		require.False(t, node.DAG.FailFast, "retain results for every reserved node")
+		require.Len(t, node.Outputs.Parameters, 2)
+
+		for _, output := range node.Outputs.Parameters {
+			require.Contains(t, []string{"verdict", "reason"}, output.Name)
+			require.Contains(t, output.ValueFrom.Expression, "len(verdicts) == expected")
+			require.Contains(t, output.ValueFrom.Expression, "expected > 0")
+			require.Contains(t, output.ValueFrom.Expression, "all(verdicts, {# == 'Pass'})")
+			require.Contains(t, output.ValueFrom.Expression, "any(verdicts, {# == 'Fail'})")
+		}
 
 		for _, task := range node.DAG.Tasks {
 			require.True(t, strings.HasPrefix(task.When, "{{="), "evaluate parameter values as strings, not interpolated condition syntax")
@@ -605,6 +622,11 @@ func TestRackWorkflowComposesNodeTestsWithoutReplacingParticipantIdentity(t *tes
 
 			require.Equal(t, "{{item.nodeName}}", parameters["node-name"])
 			require.Equal(t, "{{item.nodeUID}}", parameters["node-uid"])
+
+			if task.Name != "identity" {
+				require.Equal(t, "{{item.observedGPUCapacity}}", parameters["observed-gpu-capacity"])
+				require.Equal(t, "{{item.observedGPUAllocatable}}", parameters["observed-gpu-allocatable"])
+			}
 		}
 	}
 
@@ -615,6 +637,54 @@ func TestRackWorkflowComposesNodeTestsWithoutReplacingParticipantIdentity(t *tes
 	}, nodeGroups)
 	require.Contains(t, rendered.String(), "UnsupportedRackTest")
 	require.Contains(t, rendered.String(), "exit 1")
+}
+
+func TestExplicitRackSampleIsDisabledAndUsesExistingNodeTests(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile("samples/rack-explicit-nodes.yaml")
+	require.NoError(t, err)
+
+	var profile struct {
+		Spec struct {
+			Participants struct {
+				Count       int      `yaml:"count"`
+				NodeNames   []string `yaml:"nodeNames"`
+				TopologyKey string   `yaml:"topologyKey"`
+			} `yaml:"participants"`
+			Workflow struct {
+				Name string `yaml:"name"`
+			} `yaml:"workflow"`
+			Script struct {
+				Key string `yaml:"key"`
+			} `yaml:"script"`
+			RunnerImage string            `yaml:"runnerImage"`
+			Parameters  map[string]string `yaml:"parameters"`
+			Recurring   struct {
+				Enabled   bool     `yaml:"enabled"`
+				NodeNames []string `yaml:"nodeNames"`
+				ExpiresAt string   `yaml:"expiresAt"`
+			} `yaml:"recurring"`
+		} `yaml:"spec"`
+	}
+	require.NoError(t, yaml.Unmarshal(raw, &profile))
+	require.Equal(t, 2, profile.Spec.Participants.Count)
+	require.Len(t, profile.Spec.Participants.NodeNames, profile.Spec.Participants.Count)
+	require.Contains(t, profile.Spec.Participants.TopologyKey, "REPLACE_WITH_VERIFIED")
+
+	for _, name := range profile.Spec.Participants.NodeNames {
+		require.True(t, strings.HasPrefix(name, "REPLACE_WITH_APPROVED_RACK_NODE_"))
+	}
+
+	require.Equal(t, "project-signal-rack-certification", profile.Spec.Workflow.Name)
+	require.Equal(t, "project-signal-gpu-full-node-certification", profile.Spec.Parameters["node-workflow-template"])
+	require.Equal(t, "gpu-full-node.sh", profile.Spec.Script.Key)
+	require.Equal(t, "[]", profile.Spec.Parameters["rack-tests"])
+	require.Equal(t, "REPLACE_WITH_VERIFIED_GPU_COUNT", profile.Spec.Parameters["expected-gpu-count"])
+	require.True(t, strings.HasPrefix(profile.Spec.RunnerImage, "REPLACE_WITH_"))
+	require.False(t, profile.Spec.Recurring.Enabled)
+	require.Equal(t, profile.Spec.Participants.NodeNames, profile.Spec.Recurring.NodeNames)
+	require.Equal(t, "1970-01-01T00:00:00Z", profile.Spec.Recurring.ExpiresAt)
 }
 
 func TestGPUInvocationsRejectFailedQueriesEvenWithPlausibleOutput(t *testing.T) {

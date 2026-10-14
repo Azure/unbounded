@@ -99,6 +99,9 @@ with the run's immutable evidence instead of depending on pod-log retention.
   watches the Project Signal namespace.
 - Kubeflow MPI Operator `kubeflow.org/v2beta1` MPIJob API for the included
   WorkflowTemplate.
+- Readable Unbounded `Machine` and `MachineOperation` APIs for grouped admission
+  safety checks, in addition to Pod and Node reads. Unavailable safety state
+  does not permit a group to run.
 - Controller and dashboard images built from `cmd/project-signal-controller`
   and `cmd/project-signal-dashboard`.
 - A reviewed runner image containing Bash, `nvidia-smi`, Open MPI, and the
@@ -113,10 +116,12 @@ The portable node templates retain single-Node placement. The
 `project-signal-rack-certification` composition template passes each
 participant's snapshotted identity and inventory to those same node templates;
 a comma-separated participant list is never used as a pod hostname.
-**Multi-Node profile admission is not enabled yet.** The API still requires
-`participants.count: 1` while the rack membership contract is pending. The
-composition template is not permission to bypass controller-managed admission
-or reservations by submitting unreserved participant lists directly to Argo.
+Grouped profiles declare exact `participants.nodeNames` and a `topologyKey`;
+the controller validates the same nonempty label value on every declared
+member. The label validates membership, but never expands the approved set.
+Existing single-Node profiles with `participants.count: 1` do not need either
+new field. Do not bypass controller-managed admission or reservations by
+submitting participant lists directly to Argo.
 
 ## Render the example
 
@@ -228,6 +233,74 @@ kubectl label node <approved-node> \
 The controller removes the request after admission and uses
 `signal.unbounded-cloud.io/reserved-by` while the run is active.
 
+## Explicit rack groups
+
+`samples/rack-explicit-nodes.yaml` is a disabled, placeholder-only example. It
+uses the existing full-node tests on two explicitly approved Nodes:
+
+```yaml
+participants:
+  count: 2
+  nodeNames:
+    - REPLACE_WITH_APPROVED_RACK_NODE_A
+    - REPLACE_WITH_APPROVED_RACK_NODE_B
+  topologyKey: REPLACE_WITH_VERIFIED_RACK_LABEL
+workflow:
+  name: project-signal-rack-certification
+parameters:
+  node-workflow-template: project-signal-gpu-full-node-certification
+  rack-tests: "[]"
+```
+
+Replace every placeholder and verify each member before requesting the group.
+`count` must match the number of distinct declared names, up to 128. Every Node
+must exist, match the profile's selector and admission guards, and carry the
+same nonempty value for `topologyKey`. A request from a Node outside that list
+cannot expand or trigger the group. The admitted run freezes member UIDs,
+per-member GPU inventory, and topology so a recreated Node or changed rack
+label cannot silently stand in for the approved member on a later attempt.
+Profiles with `count > 1` must use `project-signal-rack-certification`, not a
+native single-Node entrypoint.
+
+Apply the existing manual trigger to any declared member to request the entire
+set. Duplicate member requests reuse the active exact-set Run, not one Run per
+member. Matching requests are cleared during group cleanup; unrelated requests
+and competing reservations are not removed.
+Manual groups require current workload and maintenance idle safety, but do
+not opt into the separate recurring minimum idle window, expiry, backoff,
+or concurrency policy.
+
+Workload admission is all-or-none for the declared set: no Workflow starts
+until every member is reserved and revalidated. The individual Kubernetes
+writes are not a transaction. A partial acquisition failure rolls back only
+reservations owned by that run, never a competing owner's reservation. Cleanup
+errors remain explicit and are retried; the controller does not execute a
+smaller subset as a fallback.
+
+The durable pending Run and finalizer precede reservation writes.
+`spec.admission` freezes the exact participant policy, shared topology value,
+trigger, and applicable recurring guards; `spec.participants` pins expected
+Node UIDs. `status.admissionReady` records whole-set reservation readiness.
+It is historical, not a permanent guarantee that every reservation is still
+held, and is never a hardware certification verdict.
+Every attempt revalidates the frozen membership rather than trusting a later
+profile edit. Waiting for admission consumes the existing Run deadline instead
+of resetting the time budget.
+
+The rack Workflow fans out the same node templates with `failFast: false`,
+preserving individual results on every member. Its root verdict checks the
+expected number of node-group outcomes; missing results are inconclusive and
+any typed failure prevents a pass. The controller additionally validates every
+required node/test/attempt and its provenance before accepting the group.
+Cancellation applies to the whole Workflow, and reservations remain protected
+by the existing foreground Workflow/MPI cleanup barriers.
+
+**The declared list defines the tested scope.** A shared label does not prove
+that the list contains every physical rack member. Grouping these existing
+node tests does not certify inter-node fabric or a multi-node collective.
+`rack-tests` has no supported nonempty execution inventory in this baseline;
+requesting one fails explicitly instead of running a successful placeholder.
+
 ## Recurring admission
 
 `spec.recurring` is an explicit opt-in policy. When enabled, it requires:
@@ -244,6 +317,15 @@ A Node is busy when it has a nonterminal Pod not controlled by a DaemonSet, an
 active reservation, or an active Unbounded `MachineOperation`. The controller
 persists idle and run history in profile status so restarts do not erase the
 policy state.
+
+For an explicit rack group, `recurring.nodeNames` must equal
+`participants.nodeNames`, and every member must satisfy the due, idle, expiry,
+backoff, eligibility, and concurrency guards before a single grouped Run is
+admitted. Profile concurrency counts Runs; failure-domain usage charges each
+member, so the budget must accommodate the entire declared set in each domain.
+The disabled rack sample's values are not permission to increase those budgets
+or start recurring work without review. Recurring status records Node UIDs;
+a recreated Node cannot inherit another UID's idle window or successful result.
 
 ## Typed results
 

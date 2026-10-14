@@ -6,6 +6,7 @@ package v1alpha1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type ScriptReference struct {
@@ -43,10 +44,31 @@ type ExecutionBackend struct {
 	Queue      string `json:"queue,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.nodeNames) || size(self.nodeNames) == self.count",message="nodeNames must contain exactly count members"
+// +kubebuilder:validation:XValidation:rule="!has(self.nodeNames) || self.nodeNames.all(n, self.nodeNames.filter(m, m == n).size() == 1)",message="nodeNames must be unique"
+// +kubebuilder:validation:XValidation:rule="self.count == 1 || (has(self.nodeNames) && has(self.topologyKey) && size(self.topologyKey) > 0)",message="grouped participants require explicit nodeNames and topologyKey"
 type ParticipantPolicy struct {
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1
+	// +kubebuilder:validation:Maximum=128
 	Count int32 `json:"count"`
+
+	// NodeNames declares the complete tested set, not all members of a physical rack.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=128
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	NodeNames []string `json:"nodeNames,omitempty"`
+
+	// TopologyKey validates the same nonempty label value on every declared member.
+	// It never expands nodeNames by selecting other Nodes with that label.
+	// +optional
+	// +kubebuilder:validation:MaxLength=317
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="!self.contains('/') || self.matches('^[^/]{1,253}/[^/]+$')",message="topologyKey prefix must not exceed 253 characters"
+	TopologyKey string `json:"topologyKey,omitempty"`
 
 	Selector metav1.LabelSelector `json:"selector"`
 
@@ -88,6 +110,7 @@ type RecurringPolicy struct {
 
 type RecurringNodeStatus struct {
 	NodeName            string       `json:"nodeName"`
+	NodeUID             types.UID    `json:"nodeUID,omitempty"`
 	IdleSince           *metav1.Time `json:"idleSince,omitempty"`
 	LastEvaluatedAt     *metav1.Time `json:"lastEvaluatedAt,omitempty"`
 	LastSuccessfulRun   string       `json:"lastSuccessfulRun,omitempty"`

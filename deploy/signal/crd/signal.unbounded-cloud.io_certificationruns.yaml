@@ -57,6 +57,189 @@ spec:
             type: object
           spec:
             properties:
+              admission:
+                description: |-
+                  AdmissionSnapshot freezes the membership and guards for explicit-set admission.
+                  Runs without this field retain their original single-node admission contract.
+                properties:
+                  idleSince:
+                    description: IdleSince is the latest continuous idle observation
+                      across all members.
+                    format: date-time
+                    type: string
+                  participants:
+                    properties:
+                      count:
+                        format: int32
+                        maximum: 128
+                        minimum: 1
+                        type: integer
+                      nodeNames:
+                        description: NodeNames declares the complete tested set, not
+                          all members of a physical rack.
+                        items:
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                        maxItems: 128
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: set
+                      requiredResources:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                      selector:
+                        description: |-
+                          A label selector is a label query over a set of resources. The result of matchLabels and
+                          matchExpressions are ANDed. An empty label selector matches all objects. A null
+                          label selector matches no objects.
+                        properties:
+                          matchExpressions:
+                            description: matchExpressions is a list of label selector
+                              requirements. The requirements are ANDed.
+                            items:
+                              description: |-
+                                A label selector requirement is a selector that contains values, a key, and an operator that
+                                relates the key and values.
+                              properties:
+                                key:
+                                  description: key is the label key that the selector
+                                    applies to.
+                                  type: string
+                                operator:
+                                  description: |-
+                                    operator represents a key's relationship to a set of values.
+                                    Valid operators are In, NotIn, Exists and DoesNotExist.
+                                  type: string
+                                values:
+                                  description: |-
+                                    values is an array of string values. If the operator is In or NotIn,
+                                    the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                    the values array must be empty. This array is replaced during a strategic
+                                    merge patch.
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              required:
+                              - key
+                              - operator
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          matchLabels:
+                            additionalProperties:
+                              type: string
+                            description: |-
+                              matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                              map is equivalent to an element of matchExpressions, whose key field is "key", the
+                              operator is "In", and the values array contains only "value". The requirements are ANDed.
+                            type: object
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      topologyKey:
+                        description: |-
+                          TopologyKey validates the same nonempty label value on every declared member.
+                          It never expands nodeNames by selecting other Nodes with that label.
+                        maxLength: 317
+                        pattern: ^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$
+                        type: string
+                        x-kubernetes-validations:
+                        - message: topologyKey prefix must not exceed 253 characters
+                          rule: '!self.contains(''/'') || self.matches(''^[^/]{1,253}/[^/]+$'')'
+                    required:
+                    - count
+                    - selector
+                    type: object
+                    x-kubernetes-validations:
+                    - message: nodeNames must contain exactly count members
+                      rule: '!has(self.nodeNames) || size(self.nodeNames) == self.count'
+                    - message: nodeNames must be unique
+                      rule: '!has(self.nodeNames) || self.nodeNames.all(n, self.nodeNames.filter(m,
+                        m == n).size() == 1)'
+                    - message: grouped participants require explicit nodeNames and
+                        topologyKey
+                      rule: self.count == 1 || (has(self.nodeNames) && has(self.topologyKey)
+                        && size(self.topologyKey) > 0)
+                  recurring:
+                    properties:
+                      enabled:
+                        type: boolean
+                      evaluationInterval:
+                        type: string
+                      exclusiveProfiles:
+                        items:
+                          type: string
+                        type: array
+                      expiresAt:
+                        format: date-time
+                        type: string
+                      failureBackoff:
+                        type: string
+                      failureDomainLabel:
+                        type: string
+                      maxConcurrent:
+                        format: int32
+                        type: integer
+                      maxConcurrentPerFailureDomain:
+                        format: int32
+                        type: integer
+                      maxConsecutiveFailures:
+                        format: int32
+                        type: integer
+                      minIdleDuration:
+                        type: string
+                      nodeNames:
+                        items:
+                          type: string
+                        type: array
+                      notBefore:
+                        format: date-time
+                        type: string
+                      validFor:
+                        type: string
+                    required:
+                    - enabled
+                    - expiresAt
+                    - failureBackoff
+                    - maxConcurrent
+                    - maxConsecutiveFailures
+                    - minIdleDuration
+                    - nodeNames
+                    - validFor
+                    type: object
+                  topologyValue:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$
+                    type: string
+                  trigger:
+                    enum:
+                    - manual
+                    - recurring
+                    type: string
+                required:
+                - participants
+                - trigger
+                type: object
+                x-kubernetes-validations:
+                - message: admission requires explicit nodeNames
+                  rule: has(self.participants.nodeNames)
+                - message: admission requires the observed topology value
+                  rule: '!has(self.participants.topologyKey) || (has(self.topologyValue)
+                    && size(self.topologyValue) > 0)'
+                - message: recurring admission requires an enabled pinned policy and
+                    idle observation
+                  rule: self.trigger != 'recurring' || (has(self.recurring) && self.recurring.enabled
+                    && has(self.idleSince))
               backend:
                 properties:
                   apiVersion:
@@ -307,8 +490,13 @@ spec:
             - message: testPlan is immutable
               rule: has(self.testPlan) == has(oldSelf.testPlan) && (!has(self.testPlan)
                 || self.testPlan == oldSelf.testPlan)
+            - message: admission is immutable
+              rule: has(self.admission) == has(oldSelf.admission) && (!has(self.admission)
+                || self.admission == oldSelf.admission)
           status:
             properties:
+              admissionReady:
+                type: boolean
               attempts:
                 items:
                   properties:
