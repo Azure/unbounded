@@ -109,11 +109,13 @@ func (l *logLimiter) allow(key string) (bool, int) {
 	return true, 0
 }
 
-// awsLogger forwards SDK warnings, and SDK debug lines when debug is set, to
-// the process log (stderr). SDK messages are authored by the SDK; they are
-// quoted so they cannot forge diagnostic fields.
+// awsLogger records that the SDK emitted a warning, or a debug line when
+// debug is set, on the process log (stderr). It writes only fixed fields: the
+// SDK's format string and arguments are never printed, because they can carry
+// upstream error text, object keys, and URLs (for example, the retry
+// middleware includes the original error in its messages).
 func awsLogger(debug bool) logging.Logger {
-	return logging.LoggerFunc(func(classification logging.Classification, format string, v ...any) {
+	return logging.LoggerFunc(func(classification logging.Classification, _ string, _ ...any) {
 		level := "warn"
 
 		switch classification {
@@ -128,11 +130,13 @@ func awsLogger(debug bool) logging.Logger {
 			return
 		}
 
-		log.Printf("racer-object: mode=origin event=aws_sdk level=%s message=%q", level, fmt.Sprintf(format, v...))
+		log.Print("racer-object: mode=origin event=aws_sdk level=" + level)
 	})
 }
 
-// awsLogMode enables only retry and deprecation logs in debug mode. Request
+// awsLogMode enables only retry and deprecation logs in debug mode. awsLogger
+// reduces them to fixed fields, so they show only that the SDK retried or
+// warned, not why. Request
 // and response logging is never enabled: it prints headers (including the
 // SigV4 Authorization header), bodies, and signing details.
 func awsLogMode(debug bool) aws.ClientLogMode {

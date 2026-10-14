@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -137,21 +138,33 @@ func TestSidecarVersionMismatchIsDebug(t *testing.T) {
 }
 
 func TestAWSLogger(t *testing.T) {
+	const sentinel = "PRIVATE-SENTINEL"
+
+	args := []any{
+		"private/" + sentinel + "/key",
+		"https://bucket.example/" + sentinel + "?X-Amz-Signature=" + sentinel,
+		errors.New("AccessDenied: " + sentinel + "\nlevel=forged"),
+	}
+
 	for _, debug := range []bool{false, true} {
 		t.Run(fmt.Sprint(debug), func(t *testing.T) {
 			output := captureDiagnosticLog(t)
 			logger := awsLogger(debug)
 
-			logger.Logf(logging.Warn, "retry %s", "quota\nlevel=forged")
-			logger.Logf(logging.Debug, "checksum skipped")
-			logger.Logf(logging.Classification("OTHER"), "ignored")
+			logger.Logf(logging.Warn, "retry %s %s %v", args...)
+			logger.Logf(logging.Debug, "unretryable "+sentinel+" %s %s %v", args...)
+			logger.Logf(logging.Classification("OTHER"), "ignored %s", sentinel)
 
 			got := output.String()
-			if !strings.Contains(got, `event=aws_sdk level=warn message="retry quota\nlevel=forged"`) {
-				t.Fatalf("warning missing or unquoted: %q", got)
+			if strings.Contains(got, sentinel) || strings.Contains(got, "forged") {
+				t.Fatalf("SDK message text leaked: %q", got)
 			}
 
-			if strings.Contains(got, "checksum skipped") != debug || strings.Contains(got, "ignored") {
+			if strings.Count(got, "event=aws_sdk level=warn\n") != 1 {
+				t.Fatalf("warning missing: %q", got)
+			}
+
+			if strings.Contains(got, "event=aws_sdk level=debug\n") != debug || strings.Count(got, "\n") != map[bool]int{false: 1, true: 2}[debug] {
 				t.Fatalf("debug=%v filtering wrong: %q", debug, got)
 			}
 		})

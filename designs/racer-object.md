@@ -266,9 +266,11 @@ never upstream error text, URLs, keys, queries, or credentials.
   `--log-level=debug`.
 - Other lines are logged at `level=warn`. Each event and category can log 10
   lines per minute. The first line after that minute adds `suppressed=<n>`.
-- The AWS SDK logger writes SDK warnings to stderr as `event=aws_sdk`. With
-  `--log-level=debug`, it also writes SDK debug lines and retry and deprecation
-  logs. Request, response, and signing logs are never enabled, because they
+- The AWS SDK logger writes one `event=aws_sdk level=warn` line to stderr per
+  SDK warning. With `--log-level=debug`, it also writes `level=debug` lines for
+  SDK debug, retry, and deprecation logs. Only these fixed fields are written:
+  SDK message text is dropped, because it can include upstream error messages,
+  object keys, and URLs. Request, response, and signing logs are never enabled, because they
   print the SigV4 `Authorization` header and bodies.
 
 `--log-level` accepts `info` (the default) or `debug` in both modes.
