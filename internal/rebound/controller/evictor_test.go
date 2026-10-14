@@ -145,6 +145,8 @@ func TestEvictorReadsLiveLedger(t *testing.T) {
 func TestEvictorLedgerChangesDuringPodList(t *testing.T) {
 	old := grant("tenant-a", "g", "n1", time.Hour)
 	old.UID = "a"
+	renewed := grant("tenant-a", "g", "n1", 2*time.Hour)
+	renewed.UID = "a"
 	handoff := grant("tenant-b", "g", "n1", time.Hour)
 	handoff.UID = "b"
 
@@ -186,6 +188,20 @@ func TestEvictorLedgerChangesDuringPodList(t *testing.T) {
 			// The listed tenant-b pod was not judged against tenant-a's grant.
 			// The second list sees both pods under tenant-b's grant.
 			want: []string{"tenant-b/new", "tenant-b/p"},
+		},
+		{
+			name: "grant renewed during first list",
+			during: func(ctx context.Context, c client.WithWatch, lists int) error {
+				if lists > 1 {
+					return nil
+				}
+
+				return update(ctx, c, renewed)
+			},
+			// A new expiry changes the node's records, so the pods are
+			// listed again.
+			lists: 2,
+			want:  []string{"tenant-a/p"},
 		},
 		{
 			name: "ledger keeps changing",
@@ -250,8 +266,22 @@ func TestEvictorLedgerChangesDuringPodList(t *testing.T) {
 func TestEvictorLedgerChangesDuringDelete(t *testing.T) {
 	old := grant("tenant-a", "g", "n1", time.Minute)
 	old.UID = "a"
+	renewed := grant("tenant-a", "g", "n1", time.Hour)
+	renewed.UID = "a"
 	handoff := grant("tenant-b", "g", "n1", time.Hour)
 	handoff.UID = "b"
+
+	// update replaces the ledger with one holding grants, as another writer would.
+	update := func(ctx context.Context, c client.WithWatch, grants ...*ledger.Grant) error {
+		var cm corev1.ConfigMap
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm); err != nil {
+			return err
+		}
+
+		cm.Data = configMap(t, grants...).Data
+
+		return c.Update(ctx, &cm)
+	}
 
 	tests := []struct {
 		name string
@@ -264,18 +294,20 @@ func TestEvictorLedgerChangesDuringDelete(t *testing.T) {
 		{
 			name: "handoff during first delete",
 			during: func(ctx context.Context, c client.WithWatch, _ *evictor) error {
-				var cm corev1.ConfigMap
-				if err := c.Get(ctx, types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm); err != nil {
-					return err
-				}
-
-				cm.Data = configMap(t, handoff).Data
-
-				return c.Update(ctx, &cm)
+				return update(ctx, c, handoff)
 			},
 			want: []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
 			// tenant-a's pod is now an intruder on tenant-b's node.
 			after: []string{"tenant-b/p", "tenant-b/q"},
+		},
+		{
+			name: "grant renewed during first delete",
+			during: func(ctx context.Context, c client.WithWatch, _ *evictor) error {
+				return update(ctx, c, renewed)
+			},
+			// A new expiry changes the node's records and stops the sweep.
+			want:  []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
+			after: []string{"tenant-a/p"},
 		},
 		{
 			name: "grant expires during first delete",
@@ -335,6 +367,168 @@ func TestEvictorLedgerChangesDuringDelete(t *testing.T) {
 			_, err = r.Reconcile(t.Context(), req)
 			require.NoError(t, err)
 			require.ElementsMatch(t, tt.after, remaining(t, c))
+		})
+	}
+}
+
+// changeOtherNode updates the ledger for a node other than n1, as traffic for
+// other grants would. It adds a grant and, from the second call on, removes
+// the previous one, which leaves a release record for its node.
+func changeOtherNode(ctx context.Context, c client.WithWatch, n int) error {
+	var cm corev1.ConfigMap
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm); err != nil {
+		return err
+	}
+
+	l := ledger.Parse(cm.Data)
+
+	g := grant("elsewhere", "g"+strconv.Itoa(n), "other"+strconv.Itoa(n), time.Hour)
+	g.UID = types.UID("elsewhere-" + strconv.Itoa(n))
+	g.CreatedAt = testNow.Add(-time.Minute)
+
+	if err := l.Add(g); err != nil {
+		return err
+	}
+
+	if n > 1 {
+		l.Remove(types.NamespacedName{Namespace: "elsewhere", Name: "g" + strconv.Itoa(n-1)}, testNow)
+	}
+
+	cm.Data = l.Encode()
+
+	return c.Update(ctx, &cm)
+}
+
+func TestEvictorIgnoresOtherNodeLedgerChanges(t *testing.T) {
+	for name, tc := range map[string]struct {
+		// onList and onDelete change the ledger for another node inside
+		// every pod list and every pod delete.
+		onList, onDelete bool
+	}{
+		"during pod list": {onList: true},
+		"during deletes":  {onDelete: true},
+		"during both":     {onList: true, onDelete: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lists, deletes, changes := 0, 0, 0
+			funcs := &interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if err := c.List(ctx, list, opts...); err != nil {
+						return err
+					}
+
+					if _, ok := list.(*corev1.PodList); !ok {
+						return nil
+					}
+
+					lists++
+
+					if !tc.onList {
+						return nil
+					}
+
+					changes++
+
+					return changeOtherNode(ctx, c, changes)
+				},
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if err := c.Delete(ctx, obj, opts...); err != nil {
+						return err
+					}
+
+					deletes++
+
+					if !tc.onDelete {
+						return nil
+					}
+
+					changes++
+
+					return changeOtherNode(ctx, c, changes)
+				},
+			}
+
+			g := grant("tenant", "g", "n1", time.Hour)
+			g.UID = "u1"
+			r, c := newEvictor(t, configMap(t, g), funcs,
+				pod("intruder", "p", "n1", testNow),
+				pod("intruder", "q", "n1", testNow),
+				pod("other", "p", "n1", testNow),
+				pod("tenant", "p", "n1", testNow),
+			)
+
+			result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}})
+			require.NoError(t, err)
+			require.Equal(t, sweepInterval, result.RequeueAfter)
+			require.Equal(t, 1, lists)
+			require.Equal(t, 3, deletes)
+			require.Positive(t, changes)
+			require.Equal(t, []string{"tenant/p"}, remaining(t, c))
+		})
+	}
+}
+
+func TestSameNodeRecords(t *testing.T) {
+	g := &ledger.Grant{
+		Namespace: "tenant", Name: "g", UID: "u1", NamespaceUID: "ns1",
+		Nodes: []string{"a"}, CreatedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour),
+	}
+	release := func(uid types.UID) *ledger.Release {
+		return &ledger.Release{
+			UID: uid, Namespace: "old", NamespaceUID: "ns0", Nodes: []string{"a"},
+			CreatedAt: testNow.Add(-2 * time.Hour), ReleasedAt: testNow.Add(-time.Hour), DropAt: testNow.Add(time.Hour),
+		}
+	}
+	releases := []*ledger.Release{release("r1"), release("r2")}
+
+	require.True(t, sameNodeRecords(nil, nil, nil, nil))
+	require.True(t, sameNodeRecords(nil, nil, nil, []*ledger.Release{}))
+	require.True(t, sameNodeRecords(g, releases, g, releases))
+
+	// Copies from another ledger version, with fields that do not affect
+	// the node and with the releases in another order.
+	other := *g
+	other.Nodes = []string{"a", "b"}
+	other.Holder = "someone"
+	other.CreatedAt = testNow
+	r1, r2 := *releases[0], *releases[1]
+	r1.Nodes = []string{"a", "c"}
+	require.True(t, sameNodeRecords(g, releases, &other, []*ledger.Release{&r2, &r1}))
+	require.Equal(t, types.UID("r1"), releases[0].UID, "inputs must not be reordered")
+
+	require.False(t, sameNodeRecords(g, releases, nil, releases))
+	require.False(t, sameNodeRecords(nil, releases, g, releases))
+	require.False(t, sameNodeRecords(g, releases, g, releases[:1]))
+	require.False(t, sameNodeRecords(g, nil, g, releases))
+
+	for name, change := range map[string]func(*ledger.Grant){
+		"namespace":     func(g *ledger.Grant) { g.Namespace = "other" },
+		"name":          func(g *ledger.Grant) { g.Name = "other" },
+		"uid":           func(g *ledger.Grant) { g.UID = "other" },
+		"namespace uid": func(g *ledger.Grant) { g.NamespaceUID = "other" },
+		"expiry":        func(g *ledger.Grant) { g.ExpiresAt = g.ExpiresAt.Add(time.Second) },
+	} {
+		t.Run("grant "+name, func(t *testing.T) {
+			changed := *g
+			change(&changed)
+			require.False(t, sameNodeRecords(g, releases, &changed, releases))
+			require.False(t, sameNodeRecords(&changed, releases, g, releases))
+		})
+	}
+
+	for name, change := range map[string]func(*ledger.Release){
+		"uid":           func(r *ledger.Release) { r.UID = "other" },
+		"namespace":     func(r *ledger.Release) { r.Namespace = "other" },
+		"namespace uid": func(r *ledger.Release) { r.NamespaceUID = "other" },
+		"created":       func(r *ledger.Release) { r.CreatedAt = r.CreatedAt.Add(time.Second) },
+		"released":      func(r *ledger.Release) { r.ReleasedAt = r.ReleasedAt.Add(time.Second) },
+		"drop":          func(r *ledger.Release) { r.DropAt = r.DropAt.Add(time.Second) },
+	} {
+		t.Run("release "+name, func(t *testing.T) {
+			changed := *releases[1]
+			change(&changed)
+			require.False(t, sameNodeRecords(g, releases, g, []*ledger.Release{releases[0], &changed}))
+			require.False(t, sameNodeRecords(g, []*ledger.Release{releases[0], &changed}, g, releases))
 		})
 	}
 }

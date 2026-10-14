@@ -4,9 +4,11 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -68,7 +70,8 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 
 	// The ledger can change while pods are listed. For example, the node can
 	// move to another namespace whose new pods are in the list. Only judge
-	// pods against a ledger version that did not change during the list.
+	// pods against node records that did not change during the list. All
+	// grants share one ledger, so changes for other nodes are ignored.
 	for attempt := 1; ; attempt++ {
 		if active == nil && len(releases) == 0 {
 			return ctrl.Result{}, nil
@@ -83,18 +86,18 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 			return ctrl.Result{}, err
 		}
 
-		// Use the records from the second read so expiry is checked again.
-		active, releases = afterActive, afterReleases
+		unchanged := after == version || sameNodeRecords(active, releases, afterActive, afterReleases)
 
-		if after == version {
+		// Use the records from the second read so expiry is checked again.
+		version, active, releases = after, afterActive, afterReleases
+
+		if unchanged {
 			break
 		}
 
 		if attempt == maxListAttempts {
 			return ctrl.Result{}, fmt.Errorf("ledger changed while listing pods on node %s", node)
 		}
-
-		version = after
 	}
 
 	var errs []error
@@ -141,14 +144,30 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		// moves to another namespace. The UID precondition does not catch
 		// that, so recheck the ledger and leave the rest to a new sweep.
 		// Within one version, the grant can only change by expiring, so a
-		// metadata read is enough.
+		// metadata read is enough. A new version is read in full and only
+		// stops the sweep if it changed this node's records.
 		current, err := r.liveLedgerVersion(ctx)
 		if err != nil {
 			errs = append(errs, err)
 			break
 		}
 
-		if current != version || (active != nil && active.Expired(r.clock.Now())) {
+		if current != version {
+			recorded, currentActive, currentReleases, err := r.recordsAt(ctx, current, node)
+			if err != nil {
+				errs = append(errs, err)
+				break
+			}
+
+			if !sameNodeRecords(active, releases, currentActive, currentReleases) {
+				superseded = true
+				break
+			}
+
+			version = recorded
+		}
+
+		if active != nil && active.Expired(r.clock.Now()) {
 			superseded = true
 			break
 		}
@@ -200,8 +219,17 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 // fetches the full ledger only when its version is not cached.
 func (r *evictor) ledgerRecords(ctx context.Context, node string) (string, *ledger.Grant, []*ledger.Release, error) {
 	version, err := r.liveLedgerVersion(ctx)
-	if err != nil || version == "" {
+	if err != nil {
 		return "", nil, nil, err
+	}
+
+	return r.recordsAt(ctx, version, node)
+}
+
+// recordsAt is ledgerRecords after the metadata read that returned version.
+func (r *evictor) recordsAt(ctx context.Context, version, node string) (string, *ledger.Grant, []*ledger.Release, error) {
+	if version == "" {
+		return "", nil, nil, nil
 	}
 
 	g, releases, ok := r.cachedRecords(version, node)
@@ -280,6 +308,35 @@ func (r *evictor) lookupLocked(node string) (*ledger.Grant, []*ledger.Release) {
 	g, _ := r.cachedLedger.Get(key)
 
 	return g, r.releasesByNode[node]
+}
+
+// sameNodeRecords reports whether two reads of a node's records judge pods
+// the same way: the same unexpired grant, or none, and the same release
+// records in any order. Expired grants are already nil from ledgerRecords,
+// so a grant that expired between the reads counts as a change.
+func sameNodeRecords(aActive *ledger.Grant, aReleases []*ledger.Release, bActive *ledger.Grant, bReleases []*ledger.Release) bool {
+	if (aActive == nil) != (bActive == nil) {
+		return false
+	}
+
+	if aActive != nil && (aActive.Namespace != bActive.Namespace || aActive.Name != bActive.Name ||
+		aActive.UID != bActive.UID || aActive.NamespaceUID != bActive.NamespaceUID ||
+		!aActive.ExpiresAt.Equal(bActive.ExpiresAt)) {
+		return false
+	}
+
+	if len(aReleases) != len(bReleases) {
+		return false
+	}
+
+	byUID := func(x, y *ledger.Release) int { return cmp.Compare(x.UID, y.UID) }
+	a := slices.SortedFunc(slices.Values(aReleases), byUID)
+	b := slices.SortedFunc(slices.Values(bReleases), byUID)
+
+	return slices.EqualFunc(a, b, func(x, y *ledger.Release) bool {
+		return x.UID == y.UID && x.Namespace == y.Namespace && x.NamespaceUID == y.NamespaceUID &&
+			x.CreatedAt.Equal(y.CreatedAt) && x.ReleasedAt.Equal(y.ReleasedAt) && x.DropAt.Equal(y.DropAt)
+	})
 }
 
 // shouldEvict reports whether pod must be deleted. namespaceUID returns the
