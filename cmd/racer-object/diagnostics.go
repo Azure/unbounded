@@ -70,6 +70,7 @@ func diagnosticCategory(err error, fallback string) string {
 		{racersdk.ErrRangeNotSatisfiable, "range"},
 		{racersdk.ErrInvalidRequest, "invalid"},
 		{racersdk.ErrUnavailable, "unavailable"},
+		{object.ErrMetadataMismatch, "mismatch"},
 		{os.ErrInvalid, "invalid"},
 	} {
 		if errors.Is(err, entry.cause) {
@@ -165,4 +166,11 @@ func diagnoseOrigin(origin racersdk.Origin) racersdk.Origin {
 
 		return metadata, body, err
 	}
+}
+
+// logSidecarFailure logs a sidecar 5xx. Only fixed fields are printed: the
+// method is one of GET or HEAD, and the bucket was validated by the sidecar.
+func logSidecarFailure(failure object.SidecarFailure) {
+	log.Printf("racer-object: mode=sidecar event=response_failed method=%s status=%d category=%s bucket=%q",
+		failure.Method, failure.Status, diagnosticCategory(failure.Err, "upstream"), failure.Bucket)
 }

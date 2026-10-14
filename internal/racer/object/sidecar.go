@@ -22,6 +22,9 @@ import (
 type SidecarConfig struct {
 	Namespace string
 	Buckets   []string
+	// OnFailure, when set, is called for each 5xx the sidecar returns because
+	// of an SDK or upstream failure. Nil disables reporting.
+	OnFailure func(SidecarFailure)
 }
 
 // sidecarClient is the part of [racersdk.Client] the sidecar uses.
@@ -31,8 +34,9 @@ type sidecarClient interface {
 }
 
 type sidecar struct {
-	client sidecarClient
-	scope  scope
+	client    sidecarClient
+	scope     scope
+	onFailure func(SidecarFailure)
 }
 
 // NewSidecar serves a read-only, trusted pod endpoint. The caller owns the client
@@ -56,7 +60,7 @@ func NewSidecar(client *racersdk.Client, config SidecarConfig) (http.Handler, er
 		return nil, errors.New("racer-object: invalid sidecar bucket")
 	}
 
-	return &sidecar{client: client, scope: bound}, nil
+	return &sidecar{client: client, scope: bound, onFailure: config.OnFailure}, nil
 }
 
 func (s *sidecar) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +110,7 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 func (s *sidecar) statThenRead(w http.ResponseWriter, r *http.Request, request racersdk.Request, version string, conditions sidecarConditions) sidecarFailure {
 	m, err := s.client.Stat(r.Context(), request)
 	if err != nil {
-		return sidecarSDKFailure(err)
+		return s.sdkFailure(r, err)
 	}
 
 	if failure, done := conditions.evaluate(w, m.ETag); done {
@@ -142,7 +146,7 @@ func (s *sidecar) direct(w http.ResponseWriter, r *http.Request, request racersd
 	}
 
 	if err != nil {
-		return sidecarSDKFailure(err)
+		return s.sdkFailure(r, err)
 	}
 
 	defer func() { _ = v.Close() }() //nolint:errcheck // Close releases admission; its error cannot change the response.
@@ -159,15 +163,15 @@ func (s *sidecar) direct(w http.ResponseWriter, r *http.Request, request racersd
 
 	// Racer accepted the requested range, so it must equal the selection.
 	if offset != uint64(options.Offset) || options.Length != 0 && length != uint64(options.Length) {
-		return http.StatusBadGateway
+		return s.report(r, http.StatusBadGateway, ErrMetadataMismatch)
 	}
 
 	return sidecarRead{m, version, offset, length, partial}.writeBody(w, v)
 }
 
 // sidecarDirectRange returns the read for a GET that does not need the size
-// up front: no byte range, or a valid "bytes=N-" or "bytes=N-M" range. Suffix
-// and invalid ranges keep the Stat path and its existing responses.
+// up front: no byte range, an ignored one, or a valid "bytes=N-" or "bytes=N-M"
+// range. Suffix and unsatisfiable ranges keep the Stat path.
 func sidecarDirectRange(h http.Header) (racersdk.ReadOptions, bool) {
 	// With an effectively unbounded size, offsets and lengths are exact.
 	offset, length, partial, status := sidecarRange(h, math.MaxInt64)
@@ -225,14 +229,14 @@ func (s *sidecar) stream(w http.ResponseWriter, r *http.Request, request racersd
 		ETag: read.metadata.ETag, Offset: int64(read.offset), Length: int64(read.length),
 	})
 	if err != nil {
-		return sidecarSDKFailure(err)
+		return s.sdkFailure(r, err)
 	}
 
 	defer func() { _ = v.Close() }() //nolint:errcheck // Close releases admission; its error cannot change the response.
 
 	// An ETag pin must not change the headers selected by Stat.
 	if m := v.Metadata(); m.Size != read.metadata.Size || m.ContentType != read.metadata.ContentType {
-		return http.StatusBadGateway
+		return s.report(r, http.StatusBadGateway, ErrMetadataMismatch)
 	}
 
 	return read.writeBody(w, v)

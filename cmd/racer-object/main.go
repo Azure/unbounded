@@ -396,7 +396,7 @@ func runSidecar(ctx context.Context, o options) error {
 	}
 	defer closeResource(client)
 
-	handler, err := object.NewSidecar(client, object.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets})
+	handler, err := object.NewSidecar(client, object.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets, OnFailure: logSidecarFailure})
 	if err != nil {
 		return safeDiagnostic("could not configure sidecar", "config", err)
 	}

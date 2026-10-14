@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
 
+	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
@@ -39,5 +41,29 @@ func TestDiagnosticCategoryTLS(t *testing.T) {
 	plain := fmt.Errorf("%w: %w", racersdk.ErrUnavailable, &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED})
 	if got := diagnosticCategory(plain, "fallback"); got != "connectionrefused" {
 		t.Fatalf("non-TLS send failure category = %q", got)
+	}
+}
+
+func TestLogSidecarFailure(t *testing.T) {
+	output := captureDiagnosticLog(t)
+
+	logSidecarFailure(object.SidecarFailure{
+		Method: "GET", Status: 503, Bucket: "my-bucket",
+		Err: fmt.Errorf("%s: %w", diagnosticSecret, racersdk.ErrUnavailable),
+	})
+	logSidecarFailure(object.SidecarFailure{Method: "HEAD", Status: 502, Bucket: "b", Err: object.ErrMetadataMismatch})
+
+	got := output.String()
+	for _, want := range []string{
+		`mode=sidecar event=response_failed method=GET status=503 category=unavailable bucket="my-bucket"`,
+		`method=HEAD status=502 category=mismatch bucket="b"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in %q", want, got)
+		}
+	}
+
+	if strings.Contains(got, diagnosticSecret) {
+		t.Fatal("sidecar failure log leaked cause text")
 	}
 }
