@@ -18,7 +18,6 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
@@ -272,10 +271,6 @@ func (nspawnNodeOperator) RepaveNode(
 	downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, newCfg)
 	if err != nil {
 		return fmt.Errorf("resolve download overrides: %w", err)
-	}
-
-	if err := host.PrepareNVIDIAIMEXDRA(log, &newCfg.AgentConfig).Do(ctx); err != nil {
-		return fmt.Errorf("prepare NVIDIA IMEX DRA host: %w", err)
 	}
 
 	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, downloads)

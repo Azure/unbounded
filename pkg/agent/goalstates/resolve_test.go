@@ -87,13 +87,19 @@ func TestResolveKubeletAddsIMEXModeLabelWithoutMutatingConfig(t *testing.T) {
 		Cluster: config.AgentClusterConfig{CaCertBase64: "Y2E=", ClusterDNS: "10.0.0.10"},
 		Kubelet: config.AgentKubeletConfig{Labels: map[string]string{"env": "test"}},
 		NVIDIA: &config.NVIDIAConfig{
-			IMEX: &config.NVIDIAIMEXConfig{Mode: config.NVIDIAIMEXModeDRA},
+			IMEX: &config.NVIDIAIMEXConfig{
+				Mode:               config.NVIDIAIMEXModeDRA,
+				HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+				HostProfileVersion: "v2026.10.14-1",
+			},
 		},
 	}
 
 	got, err := resolveKubelet(cfg)
 	require.NoError(t, err)
 	require.Equal(t, "DRA", got.NodeLabels[config.NVIDIAIMEXModeLabelKey])
+	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", got.NodeLabels[config.NVIDIAHostProfileLabelKey])
+	require.Equal(t, "v2026-10-14-1", got.NodeLabels[config.NVIDIAHostProfileVersionLabelKey])
 	require.NotContains(t, cfg.Kubelet.Labels, config.NVIDIAIMEXModeLabelKey)
 }
 
@@ -103,13 +109,19 @@ func TestResolveKubeletRemovesUnconfiguredIMEXModeLabel(t *testing.T) {
 	cfg := &config.AgentConfig{
 		Cluster: config.AgentClusterConfig{CaCertBase64: "Y2E=", ClusterDNS: "10.0.0.10"},
 		Kubelet: config.AgentKubeletConfig{
-			Labels: map[string]string{config.NVIDIAIMEXModeLabelKey: string(config.NVIDIAIMEXModeDRA)},
+			Labels: map[string]string{
+				config.NVIDIAIMEXModeLabelKey:           string(config.NVIDIAIMEXModeDRA),
+				config.NVIDIAHostProfileLabelKey:        "old-profile",
+				config.NVIDIAHostProfileVersionLabelKey: "v0",
+			},
 		},
 	}
 
 	got, err := resolveKubelet(cfg)
 	require.NoError(t, err)
 	require.NotContains(t, got.NodeLabels, config.NVIDIAIMEXModeLabelKey)
+	require.NotContains(t, got.NodeLabels, config.NVIDIAHostProfileLabelKey)
+	require.NotContains(t, got.NodeLabels, config.NVIDIAHostProfileVersionLabelKey)
 	require.Equal(t, string(config.NVIDIAIMEXModeDRA), cfg.Kubelet.Labels[config.NVIDIAIMEXModeLabelKey])
 }
 

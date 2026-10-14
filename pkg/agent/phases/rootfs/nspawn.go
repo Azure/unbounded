@@ -152,12 +152,6 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		return fmt.Errorf("create container image archive mount point: %w", err)
 	}
 
-	if goalState.Nvidia.IMEXMode == config.NVIDIAIMEXModeDRA {
-		if err := ensureNVIDIAIMEXChannelsDir("/dev/nvidia-caps-imex-channels"); err != nil {
-			return err
-		}
-	}
-
 	templateData := nspawnTemplateData{
 		MachineName:                  machineName,
 		BPFFSMountPath:               goalstates.BPFFSMountPath(machineName),
@@ -238,32 +232,9 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	return nil
 }
 
-func ensureNVIDIAIMEXChannelsDir(path string) error {
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		return fmt.Errorf("create NVIDIA IMEX channels directory: %w", err)
-	}
-
-	if err := os.Chmod(path, 0o755); err != nil {
-		return fmt.Errorf("set NVIDIA IMEX channels directory permissions: %w", err)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("inspect NVIDIA IMEX channels directory: %w", err)
-	}
-
-	if !info.IsDir() {
-		return fmt.Errorf("NVIDIA IMEX channels path %s is not a directory", path)
-	}
-
-	return nil
-}
-
 func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {
-	for _, path := range []string{nvidia.NvidiaSMIPath, nvidia.NvidiaIMEXPath, nvidia.NvidiaIMEXCtlPath} {
-		if path != "" {
-			return filepath.Dir(path)
-		}
+	if nvidia.NvidiaSMIPath != "" {
+		return filepath.Dir(nvidia.NvidiaSMIPath)
 	}
 
 	return ""

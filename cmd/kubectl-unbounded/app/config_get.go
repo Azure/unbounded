@@ -123,7 +123,11 @@ func runConfigGetOne(ctx context.Context, c client.WithWatch, name string, out i
 		}
 
 		if mc.Spec.Template.Agent.NVIDIA != nil && mc.Spec.Template.Agent.NVIDIA.IMEX != nil {
-			printConfig(out, "nvidia-imex-mode", string(mc.Spec.Template.Agent.NVIDIA.IMEX.Mode))
+			imex := mc.Spec.Template.Agent.NVIDIA.IMEX
+			printConfig(out, "nvidia-imex-mode", string(imex.Mode))
+			printConfig(out, "nvidia-host-profile", imex.HostProfile)
+			printConfig(out, "nvidia-host-profile-version", imex.HostProfileVersion)
+			printConfig(out, "nvidia-host-profile-digest", imex.HostProfileDigest)
 		}
 	}
 

@@ -34,8 +34,11 @@ type (
 )
 
 const (
-	NVIDIAIMEXModeDRA      = config.NVIDIAIMEXModeDRA
-	NVIDIAIMEXModeLabelKey = config.NVIDIAIMEXModeLabelKey
+	NVIDIAIMEXModeDRA                    = config.NVIDIAIMEXModeDRA
+	NVIDIAIMEXModeLabelKey               = config.NVIDIAIMEXModeLabelKey
+	NVIDIAHostProfileLabelKey            = config.NVIDIAHostProfileLabelKey
+	NVIDIAHostProfileVersionLabelKey     = config.NVIDIAHostProfileVersionLabelKey
+	NVIDIAHostProfileDigestAnnotationKey = config.NVIDIAHostProfileDigestAnnotationKey
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -275,7 +278,12 @@ func NVIDIAConfigFromSpec(spec *v1alpha3.MachineConfigurationNVIDIA) *NVIDIAConf
 
 	out := &NVIDIAConfig{}
 	if spec.IMEX != nil {
-		out.IMEX = &NVIDIAIMEXConfig{Mode: NVIDIAIMEXMode(spec.IMEX.Mode)}
+		out.IMEX = &NVIDIAIMEXConfig{
+			Mode:               NVIDIAIMEXMode(spec.IMEX.Mode),
+			HostProfile:        spec.IMEX.HostProfile,
+			HostProfileVersion: spec.IMEX.HostProfileVersion,
+			HostProfileDigest:  spec.IMEX.HostProfileDigest,
+		}
 	}
 
 	return out

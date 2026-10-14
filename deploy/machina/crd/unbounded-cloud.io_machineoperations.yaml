@@ -372,17 +372,47 @@ spec:
                                     integration.
                                   properties:
                                     imex:
-                                      description: IMEX configures multi-node NVLink
-                                        IMEX preparation.
+                                      description: IMEX configures validation and
+                                        exposure for multi-node NVLink.
                                       properties:
+                                        hostProfile:
+                                          description: |-
+                                            HostProfile is the immutable host qualification profile recorded by the
+                                            provisioned image.
+                                          maxLength: 63
+                                          minLength: 1
+                                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                          type: string
+                                        hostProfileDigest:
+                                          description: |-
+                                            HostProfileDigest is the sha256 digest of the RFC 8785 canonical
+                                            qualification document produced with the host image.
+                                          pattern: ^sha256:[a-f0-9]{64}$
+                                          type: string
+                                        hostProfileVersion:
+                                          description: HostProfileVersion is the expected
+                                            version of HostProfile.
+                                          maxLength: 63
+                                          minLength: 1
+                                          pattern: ^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$
+                                          type: string
                                         mode:
                                           description: |-
-                                            Mode selects the IMEX lifecycle owner. DRA prepares the node for NVIDIA
-                                            DRA ComputeDomains; an empty value disables IMEX preparation.
+                                            Mode selects the IMEX lifecycle owner. DRA exposes a prequalified node to
+                                            NVIDIA DRA ComputeDomains; an empty value disables IMEX exposure.
                                           enum:
                                           - DRA
                                           type: string
                                       type: object
+                                      x-kubernetes-validations:
+                                      - message: mode DRA requires hostProfile, hostProfileVersion,
+                                          and hostProfileDigest
+                                        rule: '!has(self.mode) || (has(self.hostProfile)
+                                          && has(self.hostProfileVersion) && has(self.hostProfileDigest))'
+                                      - message: host qualification fields require
+                                          mode DRA
+                                        rule: has(self.mode) || (!has(self.hostProfile)
+                                          && !has(self.hostProfileVersion) && !has(self.hostProfileDigest))
                                   type: object
                               type: object
                             host:

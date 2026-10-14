@@ -2072,7 +2072,10 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 				Agent: &v1alpha3.MachineConfigurationAgent{
 					NVIDIA: &v1alpha3.MachineConfigurationNVIDIA{
 						IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
-							Mode: v1alpha3.NVIDIAIMEXModeDRA,
+							Mode:               v1alpha3.NVIDIAIMEXModeDRA,
+							HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+							HostProfileVersion: "v1",
+							HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 						},
 					},
 				},
@@ -2094,6 +2097,8 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 	resolved, err = resolver.ResolveFileByPath(t.Context(), "config", nodeWithIMEX, "ghcr.io/test/image:v1")
 	require.NoError(t, err)
 	require.Contains(t, string(resolved.Data), `"Mode": "DRA"`)
+	require.Contains(t, string(resolved.Data), `"HostProfile": "hillsboro-gb200-gpu-operator-ready"`)
+	require.Contains(t, string(resolved.Data), `"HostProfileDigest": "sha256:aaaaaaaa`)
 }
 
 func TestHTTPServer_Start_Shutdown(t *testing.T) {

@@ -96,8 +96,8 @@ const (
 	// the Node and the agent repaves with the desired version.
 	MachineConditionRepavePending = "RepavePending"
 
-	// MachineConditionNVIDIAIMEXPrepared indicates whether the agent prepared
-	// the host and nspawn boundary for the configured NVIDIA IMEX lifecycle.
+	// MachineConditionNVIDIAIMEXPrepared indicates whether the agent validated
+	// the prequalified host and exposed its IMEX devices to nspawn.
 	// It does not assert that a DRA ComputeDomain is ready.
 	MachineConditionNVIDIAIMEXPrepared = "NVIDIAIMEXPrepared"
 )

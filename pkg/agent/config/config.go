@@ -111,28 +111,42 @@ type GantryConfig struct {
 
 // NVIDIAConfig holds optional NVIDIA host integration settings.
 type NVIDIAConfig struct {
-	// IMEX configures multi-node NVLink IMEX preparation.
+	// IMEX configures validation and exposure for multi-node NVLink.
 	IMEX *NVIDIAIMEXConfig `json:"IMEX,omitempty"`
 }
 
 // NVIDIAIMEXConfig configures NVIDIA IMEX integration.
 type NVIDIAIMEXConfig struct {
 	// Mode selects the owner of the IMEX daemon and channel lifecycle.
-	// Empty disables IMEX preparation.
+	// Empty disables IMEX exposure.
 	Mode NVIDIAIMEXMode `json:"Mode,omitempty"`
+
+	// HostProfile identifies the immutable host qualification profile.
+	HostProfile string `json:"HostProfile,omitempty"`
+
+	// HostProfileVersion is the expected version of HostProfile.
+	HostProfileVersion string `json:"HostProfileVersion,omitempty"`
+
+	// HostProfileDigest is the sha256 digest of the RFC 8785 canonical
+	// qualification document produced with the host image.
+	HostProfileDigest string `json:"HostProfileDigest,omitempty"`
 }
 
 // NVIDIAIMEXMode identifies the supported IMEX lifecycle owner.
 type NVIDIAIMEXMode string
 
 const (
-	// NVIDIAIMEXModeDRA prepares the host and nspawn boundary for NVIDIA DRA
+	// NVIDIAIMEXModeDRA validates and exposes a prequalified host to NVIDIA DRA
 	// ComputeDomains, which own IMEX daemon and channel lifecycle.
 	NVIDIAIMEXModeDRA NVIDIAIMEXMode = "DRA"
 
 	// NVIDIAIMEXModeLabelKey reports the configured lifecycle owner. It is not
 	// a readiness label; workloads must still use a ready DRA ComputeDomain.
 	NVIDIAIMEXModeLabelKey = "nvidia.unbounded-cloud.io/imex-mode"
+
+	NVIDIAHostProfileLabelKey            = "nvidia.unbounded-cloud.io/host-profile"
+	NVIDIAHostProfileVersionLabelKey     = "nvidia.unbounded-cloud.io/host-profile-version"
+	NVIDIAHostProfileDigestAnnotationKey = "nvidia.unbounded-cloud.io/host-profile-digest"
 )
 
 // IMEXDRAEnabled reports whether NVIDIA DRA owns IMEX lifecycle.
@@ -231,7 +245,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	if a.NVIDIA != nil {
 		out.NVIDIA = &NVIDIAConfig{}
 		if a.NVIDIA.IMEX != nil {
-			out.NVIDIA.IMEX = &NVIDIAIMEXConfig{Mode: a.NVIDIA.IMEX.Mode}
+			imex := *a.NVIDIA.IMEX
+			out.NVIDIA.IMEX = &imex
 		}
 	}
 
@@ -314,12 +329,111 @@ func (a *AgentConfig) validateNVIDIA() error {
 		return nil
 	}
 
-	switch a.NVIDIA.IMEX.Mode {
-	case "", NVIDIAIMEXModeDRA:
+	imex := a.NVIDIA.IMEX
+
+	switch imex.Mode {
+	case "":
+		if strings.TrimSpace(imex.HostProfile) != "" ||
+			strings.TrimSpace(imex.HostProfileVersion) != "" ||
+			strings.TrimSpace(imex.HostProfileDigest) != "" {
+			return fmt.Errorf("NVIDIA.IMEX host qualification fields require Mode %q", NVIDIAIMEXModeDRA)
+		}
+
 		return nil
+	case NVIDIAIMEXModeDRA:
+		var errs []error
+		if strings.TrimSpace(imex.HostProfile) == "" {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfile is required"))
+		} else if !validDNSLabelValue(imex.HostProfile) {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfile must be a lowercase DNS label of at most 63 characters"))
+		}
+		if strings.TrimSpace(imex.HostProfileVersion) == "" {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileVersion is required"))
+		} else if NormalizeNVIDIAProfileVersionLabel(imex.HostProfileVersion) == "" {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileVersion must normalize to a lowercase DNS label of at most 63 characters"))
+		}
+		if !validSHA256Digest(imex.HostProfileDigest) {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileDigest must be sha256:<64 lowercase hexadecimal characters>"))
+		}
+
+		return errors.Join(errs...)
 	default:
 		return fmt.Errorf("NVIDIA.IMEX.Mode must be %q or empty", NVIDIAIMEXModeDRA)
 	}
+}
+
+func validSHA256Digest(value string) bool {
+	const prefix = "sha256:"
+
+	digest := strings.TrimPrefix(value, prefix)
+	if len(value) == len(digest) || len(digest) != 64 {
+		return false
+	}
+
+	for _, char := range digest {
+		if !strings.ContainsRune("0123456789abcdef", char) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validDNSLabelValue(value string) bool {
+	if len(value) == 0 || len(value) > 63 {
+		return false
+	}
+
+	for index, char := range value {
+		firstOrLast := index == 0 || index == len(value)-1
+		if firstOrLast {
+			if !isASCIILowerAlphaNumeric(char) {
+				return false
+			}
+
+			continue
+		}
+
+		if !isASCIILowerAlphaNumeric(char) && char != '-' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isASCIILowerAlphaNumeric(char rune) bool {
+	return char >= 'a' && char <= 'z' ||
+		char >= '0' && char <= '9'
+}
+
+// NormalizeNVIDIAProfileVersionLabel converts an external profile version to
+// the DNS-safe value used in Node labels. The full version remains in the
+// MachineConfiguration and the qualification evidence.
+func NormalizeNVIDIAProfileVersionLabel(version string) string {
+	var normalized strings.Builder
+	previousHyphen := false
+
+	for _, char := range strings.ToLower(strings.TrimSpace(version)) {
+		if isASCIILowerAlphaNumeric(char) {
+			normalized.WriteRune(char)
+			previousHyphen = false
+
+			continue
+		}
+
+		if normalized.Len() > 0 && !previousHyphen {
+			normalized.WriteByte('-')
+			previousHyphen = true
+		}
+	}
+
+	value := strings.Trim(normalized.String(), "-")
+	if !validDNSLabelValue(value) {
+		return ""
+	}
+
+	return value
 }
 
 // ValidateAdditionalHostDevices checks that configured host device paths and

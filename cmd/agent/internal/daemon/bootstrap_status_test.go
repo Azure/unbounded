@@ -124,7 +124,7 @@ func TestBootstrapStatusReporter_SucceededSetsIMEXPreparedCondition(t *testing.T
 	require.NoError(t, reporter.client.Get(ctx, client.ObjectKey{Name: cfg.MachineName}, &got))
 	cond := findMachineCondition(t, got.Status.Conditions, v1alpha3.MachineConditionNVIDIAIMEXPrepared)
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
-	assert.Equal(t, "Prepared", cond.Reason)
+	assert.Equal(t, "HostQualified", cond.Reason)
 	assert.Contains(t, cond.Message, "does not assert ComputeDomain readiness")
 }
 
@@ -174,7 +174,30 @@ func TestSetNVIDIAIMEXPreparedCondition(t *testing.T) {
 	}
 }
 
-func TestSyncNVIDIAIMEXNodeLabel(t *testing.T) {
+func TestSetNVIDIAIMEXQualificationFailedCondition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	machine := v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "gb200", Generation: 9}}
+	kubeClient := fakeBootstrapStatusClient(&machine)
+
+	require.NoError(t, setNVIDIAIMEXQualificationFailedCondition(
+		ctx,
+		kubeClient,
+		machine.Name,
+		errors.New("qualification digest mismatch"),
+	))
+
+	var got v1alpha3.Machine
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Name: machine.Name}, &got))
+	condition := findMachineCondition(t, got.Status.Conditions, v1alpha3.MachineConditionNVIDIAIMEXPrepared)
+	assert.Equal(t, metav1.ConditionFalse, condition.Status)
+	assert.Equal(t, "HostQualificationFailed", condition.Reason)
+	assert.Equal(t, "qualification digest mismatch", condition.Message)
+	assert.Equal(t, int64(9), condition.ObservedGeneration)
+}
+
+func TestSyncNVIDIAIMEXNodeMetadata(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -182,21 +205,40 @@ func TestSyncNVIDIAIMEXNodeLabel(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "gb200",
 			Labels: map[string]string{
-				provision.NVIDIAIMEXModeLabelKey: string(provision.NVIDIAIMEXModeDRA),
+				provision.NVIDIAIMEXModeLabelKey:           string(provision.NVIDIAIMEXModeDRA),
+				provision.NVIDIAHostProfileLabelKey:        "old-profile",
+				provision.NVIDIAHostProfileVersionLabelKey: "v0",
+			},
+			Annotations: map[string]string{
+				provision.NVIDIAHostProfileDigestAnnotationKey: "sha256:old",
 			},
 		},
 	}
 	kubeClient := fakeBootstrapStatusClient(node)
 
-	require.NoError(t, syncNVIDIAIMEXNodeLabel(ctx, kubeClient, node.Name, false))
+	require.NoError(t, syncNVIDIAIMEXNodeMetadata(ctx, kubeClient, node.Name, nil))
 
 	var got corev1.Node
 	require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, &got))
 	assert.NotContains(t, got.Labels, provision.NVIDIAIMEXModeLabelKey)
+	assert.NotContains(t, got.Labels, provision.NVIDIAHostProfileLabelKey)
+	assert.NotContains(t, got.Labels, provision.NVIDIAHostProfileVersionLabelKey)
+	assert.NotContains(t, got.Annotations, provision.NVIDIAHostProfileDigestAnnotationKey)
 
-	require.NoError(t, syncNVIDIAIMEXNodeLabel(ctx, kubeClient, node.Name, true))
+	imex := &provision.NVIDIAIMEXConfig{
+		Mode:               provision.NVIDIAIMEXModeDRA,
+		HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+		HostProfileVersion: "v2026.10.14-1",
+		HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	require.NoError(t, syncNVIDIAIMEXNodeMetadata(ctx, kubeClient, node.Name, imex))
 	require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, &got))
 	assert.Equal(t, string(provision.NVIDIAIMEXModeDRA), got.Labels[provision.NVIDIAIMEXModeLabelKey])
+	assert.Equal(t, imex.HostProfile, got.Labels[provision.NVIDIAHostProfileLabelKey])
+	assert.Equal(t, "v2026-10-14-1", got.Labels[provision.NVIDIAHostProfileVersionLabelKey])
+	assert.Equal(t, imex.HostProfileDigest, got.Annotations[provision.NVIDIAHostProfileDigestAnnotationKey])
+
+	require.NoError(t, syncNVIDIAIMEXNodeMetadata(ctx, kubeClient, node.Name, imex))
 }
 
 func findMachineCondition(t *testing.T, conditions []metav1.Condition, conditionType string) metav1.Condition {

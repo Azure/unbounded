@@ -27,8 +27,11 @@ func TestRunConfigCreate_NVIDIAIMEXDRA(t *testing.T) {
 	var out bytes.Buffer
 
 	err := runConfigCreate(context.Background(), kubeClient, "gb200-dra", configCreateOpts{
-		updateStrategy: "OnDelete",
-		nvidiaIMEXMode: string(v1alpha3.NVIDIAIMEXModeDRA),
+		updateStrategy:    "OnDelete",
+		nvidiaIMEXMode:    string(v1alpha3.NVIDIAIMEXModeDRA),
+		nvidiaHostProfile: "hillsboro-gb200-gpu-operator-ready",
+		nvidiaProfileVer:  "v1",
+		nvidiaProfileHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}, &out)
 	require.NoError(t, err)
 
@@ -39,8 +42,25 @@ func TestRunConfigCreate_NVIDIAIMEXDRA(t *testing.T) {
 	require.NotNil(t, got.Spec.Template.Agent.NVIDIA)
 	require.NotNil(t, got.Spec.Template.Agent.NVIDIA.IMEX)
 	require.Equal(t, v1alpha3.NVIDIAIMEXModeDRA, got.Spec.Template.Agent.NVIDIA.IMEX.Mode)
+	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", got.Spec.Template.Agent.NVIDIA.IMEX.HostProfile)
+	require.Equal(t, "v1", got.Spec.Template.Agent.NVIDIA.IMEX.HostProfileVersion)
+	require.Equal(t, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", got.Spec.Template.Agent.NVIDIA.IMEX.HostProfileDigest)
 	require.Contains(t, out.String(), "nvidia-imex-mode")
 	require.Contains(t, out.String(), "DRA")
+}
+
+func TestRunConfigCreate_RequiresNVIDIAHostQualification(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1alpha3.AddToScheme(scheme))
+
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	err := runConfigCreate(context.Background(), kubeClient, "invalid", configCreateOpts{
+		updateStrategy: "OnDelete",
+		nvidiaIMEXMode: string(v1alpha3.NVIDIAIMEXModeDRA),
+	}, &bytes.Buffer{})
+	require.ErrorContains(t, err, "--nvidia-host-profile is required")
 }
 
 func TestRunConfigCreate_RejectsUnknownNVIDIAIMEXMode(t *testing.T) {

@@ -216,7 +216,12 @@ func TestBuildReplaceAgentConfigUsesFrozenTemplateAfterMachineEdit(t *testing.T)
 	template := &api.MachineConfigurationTemplate{
 		Agent: &api.MachineConfigurationAgent{
 			NVIDIA: &api.MachineConfigurationNVIDIA{
-				IMEX: &api.MachineConfigurationNVIDIAIMEX{Mode: api.NVIDIAIMEXModeDRA},
+				IMEX: &api.MachineConfigurationNVIDIAIMEX{
+					Mode:               api.NVIDIAIMEXModeDRA,
+					HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+					HostProfileVersion: "v1",
+					HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				},
 			},
 		},
 	}
@@ -226,6 +231,7 @@ func TestBuildReplaceAgentConfigUsesFrozenTemplateAfterMachineEdit(t *testing.T)
 	require.NotNil(t, cfg.NVIDIA)
 	require.NotNil(t, cfg.NVIDIA.IMEX)
 	require.Equal(t, provision.NVIDIAIMEXModeDRA, cfg.NVIDIA.IMEX.Mode)
+	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", cfg.NVIDIA.IMEX.HostProfile)
 }
 
 func TestHostReplaceRefusesUnsupportedFormatBeforeProvider(t *testing.T) {

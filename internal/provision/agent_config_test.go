@@ -209,7 +209,12 @@ func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
 		AgentConfig: AgentConfig{
 			OCIImage: "existing-image",
 			NVIDIA: &NVIDIAConfig{
-				IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+				IMEX: &NVIDIAIMEXConfig{
+					Mode:               NVIDIAIMEXModeDRA,
+					HostProfile:        "old-profile",
+					HostProfileVersion: "v0",
+					HostProfileDigest:  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				},
 			},
 		},
 	}
@@ -218,7 +223,10 @@ func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
 		Agent: &v1alpha3.MachineConfigurationAgent{
 			NVIDIA: &v1alpha3.MachineConfigurationNVIDIA{
 				IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
-					Mode: v1alpha3.NVIDIAIMEXModeDRA,
+					Mode:               v1alpha3.NVIDIAIMEXModeDRA,
+					HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+					HostProfileVersion: "v1",
+					HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				},
 			},
 		},
@@ -228,12 +236,20 @@ func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
 	require.NotNil(t, cfg.NVIDIA)
 	require.NotNil(t, cfg.NVIDIA.IMEX)
 	require.Equal(t, NVIDIAIMEXModeDRA, cfg.NVIDIA.IMEX.Mode)
+	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", cfg.NVIDIA.IMEX.HostProfile)
+	require.Equal(t, "v1", cfg.NVIDIA.IMEX.HostProfileVersion)
+	require.Equal(t, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.NVIDIA.IMEX.HostProfileDigest)
 
 	ApplyMachineConfigurationTemplate(&cfg, v1alpha3.MachineConfigurationTemplate{})
 	require.Nil(t, cfg.NVIDIA)
 
 	cfg.NVIDIA = &NVIDIAConfig{
-		IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+		IMEX: &NVIDIAIMEXConfig{
+			Mode:               NVIDIAIMEXModeDRA,
+			HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+			HostProfileVersion: "v1",
+			HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
 	}
 	ApplyMachineConfigurationTemplate(&cfg, v1alpha3.MachineConfigurationTemplate{
 		Agent: &v1alpha3.MachineConfigurationAgent{},

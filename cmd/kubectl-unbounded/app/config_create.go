@@ -26,6 +26,9 @@ func configCreateCommand() *cobra.Command {
 		updateStrategy    string
 		priority          int32
 		nvidiaIMEXMode    string
+		nvidiaHostProfile string
+		nvidiaProfileVer  string
+		nvidiaProfileHash string
 	)
 
 	cmd := &cobra.Command{
@@ -58,6 +61,9 @@ Example:
 				updateStrategy:    updateStrategy,
 				priority:          priority,
 				nvidiaIMEXMode:    nvidiaIMEXMode,
+				nvidiaHostProfile: nvidiaHostProfile,
+				nvidiaProfileVer:  nvidiaProfileVer,
+				nvidiaProfileHash: nvidiaProfileHash,
 			}, cmd.OutOrStdout())
 		},
 	}
@@ -69,6 +75,9 @@ Example:
 	cmd.Flags().StringVar(&updateStrategy, "update-strategy", "OnDelete", "Update strategy: OnDelete or RollingUpdate")
 	cmd.Flags().Int32Var(&priority, "priority", 0, "Priority for machine selector ordering")
 	cmd.Flags().StringVar(&nvidiaIMEXMode, "nvidia-imex-mode", "", "NVIDIA IMEX lifecycle mode: DRA")
+	cmd.Flags().StringVar(&nvidiaHostProfile, "nvidia-host-profile", "", "Prequalified NVIDIA host profile name")
+	cmd.Flags().StringVar(&nvidiaProfileVer, "nvidia-host-profile-version", "", "Prequalified NVIDIA host profile version")
+	cmd.Flags().StringVar(&nvidiaProfileHash, "nvidia-host-profile-digest", "", "sha256 digest of the RFC 8785 canonical host qualification document")
 
 	return cmd
 }
@@ -81,6 +90,9 @@ type configCreateOpts struct {
 	updateStrategy    string
 	priority          int32
 	nvidiaIMEXMode    string
+	nvidiaHostProfile string
+	nvidiaProfileVer  string
+	nvidiaProfileHash string
 }
 
 func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts configCreateOpts, out io.Writer) error {
@@ -125,6 +137,19 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 		return fmt.Errorf("invalid NVIDIA IMEX mode %q: supported value is %q", opts.nvidiaIMEXMode, v1alpha3.NVIDIAIMEXModeDRA)
 	}
 
+	if opts.nvidiaIMEXMode == string(v1alpha3.NVIDIAIMEXModeDRA) {
+		switch {
+		case strings.TrimSpace(opts.nvidiaHostProfile) == "":
+			return fmt.Errorf("--nvidia-host-profile is required with --nvidia-imex-mode=DRA")
+		case strings.TrimSpace(opts.nvidiaProfileVer) == "":
+			return fmt.Errorf("--nvidia-host-profile-version is required with --nvidia-imex-mode=DRA")
+		case strings.TrimSpace(opts.nvidiaProfileHash) == "":
+			return fmt.Errorf("--nvidia-host-profile-digest is required with --nvidia-imex-mode=DRA")
+		}
+	} else if opts.nvidiaHostProfile != "" || opts.nvidiaProfileVer != "" || opts.nvidiaProfileHash != "" {
+		return fmt.Errorf("NVIDIA host qualification flags require --nvidia-imex-mode=DRA")
+	}
+
 	if opts.agentImage != "" || opts.nvidiaIMEXMode != "" {
 		mc.Spec.Template.Agent = &v1alpha3.MachineConfigurationAgent{
 			Image: opts.agentImage,
@@ -132,7 +157,10 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 		if opts.nvidiaIMEXMode != "" {
 			mc.Spec.Template.Agent.NVIDIA = &v1alpha3.MachineConfigurationNVIDIA{
 				IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
-					Mode: v1alpha3.NVIDIAIMEXMode(opts.nvidiaIMEXMode),
+					Mode:               v1alpha3.NVIDIAIMEXMode(opts.nvidiaIMEXMode),
+					HostProfile:        opts.nvidiaHostProfile,
+					HostProfileVersion: opts.nvidiaProfileVer,
+					HostProfileDigest:  opts.nvidiaProfileHash,
 				},
 			}
 		}
@@ -154,6 +182,9 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 
 	if opts.nvidiaIMEXMode != "" {
 		printConfig(out, "nvidia-imex-mode", opts.nvidiaIMEXMode)
+		printConfig(out, "nvidia-host-profile", opts.nvidiaHostProfile)
+		printConfig(out, "nvidia-host-profile-version", opts.nvidiaProfileVer)
+		printConfig(out, "nvidia-host-profile-digest", opts.nvidiaProfileHash)
 	}
 
 	if len(opts.nodeLabels) > 0 {

@@ -74,7 +74,7 @@ func NewBootstrapStatusReporter(ctx context.Context, log *slog.Logger, cfg *prov
 // Running reports that initial bootstrap is in progress.
 func (r *BootstrapStatusReporter) Running(ctx context.Context) {
 	r.set(ctx, metav1.ConditionFalse, "Running", "unbounded-agent bootstrap is running")
-	r.setIMEX(ctx, metav1.ConditionFalse, "Preparing", "NVIDIA IMEX DRA host preparation is in progress")
+	r.setIMEX(ctx, metav1.ConditionFalse, "Validating", "NVIDIA IMEX DRA host qualification is being validated")
 }
 
 // Failed reports that initial bootstrap failed.
@@ -93,8 +93,8 @@ func (r *BootstrapStatusReporter) Succeeded(ctx context.Context) {
 	r.setIMEX(
 		ctx,
 		metav1.ConditionTrue,
-		"Prepared",
-		"host and nspawn are prepared for NVIDIA DRA IMEX; this does not assert ComputeDomain readiness",
+		"HostQualified",
+		"prequalified host evidence is valid and the nspawn boundary exposes NVIDIA DRA IMEX; this does not assert ComputeDomain readiness",
 	)
 }
 

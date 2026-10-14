@@ -20,6 +20,8 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
@@ -58,13 +60,13 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 	if !hasDrift(active.Config, &desiredConfig.AgentConfig) {
 		r.log.Info("repave skipped because no desired configuration drift exists")
 
-		if err := syncNVIDIAIMEXNodeLabel(
+		if err := syncNVIDIAIMEXNodeMetadata(
 			ctx,
 			r.Client,
 			nodeName,
-			desiredConfig.IMEXDRAEnabled(),
+			nvidiaIMEXConfig(&desiredConfig.AgentConfig),
 		); err != nil {
-			return reconcile.Result{}, fmt.Errorf("synchronize NVIDIA IMEX Node label: %w", err)
+			return reconcile.Result{}, fmt.Errorf("synchronize NVIDIA IMEX Node metadata: %w", err)
 		}
 
 		if err := markAppliedConfiguration(
@@ -81,16 +83,27 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 	}
 
 	if err := r.nodeOperator.RepaveNode(ctx, r.log, active, desiredConfig); err != nil {
+		if desiredConfig.IMEXDRAEnabled() && errors.Is(err, goalstates.ErrNVIDIAHostUnqualified) {
+			if statusErr := setNVIDIAIMEXQualificationFailedCondition(
+				ctx,
+				r.Client,
+				r.machineName,
+				err,
+			); statusErr != nil {
+				r.log.Warn("failed to report NVIDIA host qualification failure", "error", statusErr)
+			}
+		}
+
 		return reconcile.Result{}, fmt.Errorf("update node for repave: %w", err)
 	}
 
-	if err := syncNVIDIAIMEXNodeLabel(
+	if err := syncNVIDIAIMEXNodeMetadata(
 		ctx,
 		r.Client,
 		nodeName,
-		desiredConfig.IMEXDRAEnabled(),
+		nvidiaIMEXConfig(&desiredConfig.AgentConfig),
 	); err != nil {
-		return reconcile.Result{}, fmt.Errorf("synchronize NVIDIA IMEX Node label: %w", err)
+		return reconcile.Result{}, fmt.Errorf("synchronize NVIDIA IMEX Node metadata: %w", err)
 	}
 
 	if err := markAppliedConfiguration(
@@ -106,7 +119,20 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 	return reconcile.Result{}, nil
 }
 
-func syncNVIDIAIMEXNodeLabel(ctx context.Context, c client.Client, nodeName string, enabled bool) error {
+func nvidiaIMEXConfig(cfg *provision.AgentConfig) *provision.NVIDIAIMEXConfig {
+	if cfg == nil || cfg.NVIDIA == nil {
+		return nil
+	}
+
+	return cfg.NVIDIA.IMEX
+}
+
+func syncNVIDIAIMEXNodeMetadata(
+	ctx context.Context,
+	c client.Client,
+	nodeName string,
+	imex *provision.NVIDIAIMEXConfig,
+) error {
 	if nodeName == "" {
 		return fmt.Errorf("node name is empty")
 	}
@@ -119,19 +145,36 @@ func syncNVIDIAIMEXNodeLabel(ctx context.Context, c client.Client, nodeName stri
 	if node.Labels == nil {
 		node.Labels = map[string]string{}
 	}
+	if node.Annotations == nil {
+		node.Annotations = map[string]string{}
+	}
 
-	if enabled {
-		if node.Labels[provision.NVIDIAIMEXModeLabelKey] == string(provision.NVIDIAIMEXModeDRA) {
+	if imex != nil && imex.Mode == provision.NVIDIAIMEXModeDRA {
+		profileVersionLabel := config.NormalizeNVIDIAProfileVersionLabel(imex.HostProfileVersion)
+		if node.Labels[provision.NVIDIAIMEXModeLabelKey] == string(provision.NVIDIAIMEXModeDRA) &&
+			node.Labels[provision.NVIDIAHostProfileLabelKey] == imex.HostProfile &&
+			node.Labels[provision.NVIDIAHostProfileVersionLabelKey] == profileVersionLabel &&
+			node.Annotations[provision.NVIDIAHostProfileDigestAnnotationKey] == imex.HostProfileDigest {
 			return nil
 		}
 
 		node.Labels[provision.NVIDIAIMEXModeLabelKey] = string(provision.NVIDIAIMEXModeDRA)
+		node.Labels[provision.NVIDIAHostProfileLabelKey] = imex.HostProfile
+		node.Labels[provision.NVIDIAHostProfileVersionLabelKey] = profileVersionLabel
+		node.Annotations[provision.NVIDIAHostProfileDigestAnnotationKey] = imex.HostProfileDigest
 	} else {
-		if _, ok := node.Labels[provision.NVIDIAIMEXModeLabelKey]; !ok {
+		_, modePresent := node.Labels[provision.NVIDIAIMEXModeLabelKey]
+		_, profilePresent := node.Labels[provision.NVIDIAHostProfileLabelKey]
+		_, versionPresent := node.Labels[provision.NVIDIAHostProfileVersionLabelKey]
+		_, digestPresent := node.Annotations[provision.NVIDIAHostProfileDigestAnnotationKey]
+		if !modePresent && !profilePresent && !versionPresent && !digestPresent {
 			return nil
 		}
 
 		delete(node.Labels, provision.NVIDIAIMEXModeLabelKey)
+		delete(node.Labels, provision.NVIDIAHostProfileLabelKey)
+		delete(node.Labels, provision.NVIDIAHostProfileVersionLabelKey)
+		delete(node.Annotations, provision.NVIDIAHostProfileDigestAnnotationKey)
 	}
 
 	if err := c.Update(ctx, &node); err != nil {
@@ -215,10 +258,36 @@ func setNVIDIAIMEXPreparedCondition(machine *v1alpha3.Machine, enabled bool) {
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               v1alpha3.MachineConditionNVIDIAIMEXPrepared,
 		Status:             metav1.ConditionTrue,
-		Reason:             "Prepared",
-		Message:            "host and nspawn are prepared for NVIDIA DRA IMEX; this does not assert ComputeDomain readiness",
+		Reason:             "HostQualified",
+		Message:            "prequalified host evidence is valid and the nspawn boundary exposes NVIDIA DRA IMEX; this does not assert ComputeDomain readiness",
 		ObservedGeneration: machine.Generation,
 	})
+}
+
+func setNVIDIAIMEXQualificationFailedCondition(
+	ctx context.Context,
+	c client.Client,
+	machineName string,
+	qualificationErr error,
+) error {
+	var machine v1alpha3.Machine
+	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+		return fmt.Errorf("get Machine %s: %w", machineName, err)
+	}
+
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineConditionNVIDIAIMEXPrepared,
+		Status:             metav1.ConditionFalse,
+		Reason:             "HostQualificationFailed",
+		Message:            truncateBootstrapConditionMessage(qualificationErr.Error()),
+		ObservedGeneration: machine.Generation,
+	})
+
+	if err := c.Status().Update(ctx, &machine); err != nil {
+		return fmt.Errorf("update Machine %s NVIDIA qualification condition: %w", machineName, err)
+	}
+
+	return nil
 }
 
 func configFromApplied(applied *provision.AgentConfig) provision.UnboundedAgentConfig {

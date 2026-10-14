@@ -4,14 +4,116 @@
 package goalstates
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 )
+
+const testNVIDIAQualificationDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func ptr[T any](value T) *T {
+	return &value
+}
+
+func validTestNVIDIAQualification() NVIDIAIMEXQualification {
+	return NVIDIAIMEXQualification{
+		SchemaVersion:   1,
+		Profile:         "hillsboro-gb200-gpu-operator-ready",
+		ProfileVersion:  "v2026.10.14-1",
+		ContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+		Architecture:    "arm64",
+		Image: NVIDIAQualificationImage{
+			ID:      ptr("hillsboro-azl3-gb200"),
+			Version: ptr("2026.10.14"),
+			Digest:  ptr("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		},
+		Distro: NVIDIAQualificationDistro{
+			Name:        "Azure Linux",
+			Version:     "3.0",
+			Kernel:      "6.18.48.1-1.azl3.aarch64",
+			KernelDevel: "6.18.48.1-1.azl3.aarch64",
+		},
+		Driver: NVIDIAQualificationPackage{
+			Branch:           "580",
+			Version:          "580.159.04",
+			UserspaceVersion: "580.159.04",
+			Package:          "cuda-open-hwe-580.159.04-2_6.18.48.1.1.azl3.aarch64",
+		},
+		FabricManager: NVIDIAQualificationPackage{
+			Version: "580.159.04",
+			Package: "nvidia-fabric-manager-580.159.04-1.azl3.aarch64",
+		},
+		NSCQ: NVIDIAQualificationPackage{
+			Version: "580.159.04",
+			Package: "libnvidia-nscq-580.159.04-1.azl3.aarch64",
+		},
+		IMEX: NVIDIAQualificationIMEX{
+			Package:       ptr("nvidia-imex-580.159.04-1.azl3.aarch64"),
+			Version:       ptr("580.159.04"),
+			ExpectedPaths: []string{"/usr/bin/nvidia-imex", "/usr/bin/nvidia-imex-ctl"},
+			Service: NVIDIAQualificationService{
+				Name:   "nvidia-imex.service",
+				Masked: true,
+			},
+			LifecycleOwner: "gpu-operator-dra-driverManaged",
+		},
+		Toolkit: NVIDIAQualificationToolkit{
+			Version:        ptr("1.19.1"),
+			MinimumVersion: "1.18.0",
+			Ready:          true,
+		},
+		ContainerRuntime: NVIDIAQualificationContainerRuntime{
+			Name:               "containerd",
+			Version:            ptr("2.0.6"),
+			MinimumVersion:     "2.0.0",
+			CDIEnabled:         true,
+			CDISpecDirectories: []string{"/etc/cdi", "/var/run/cdi"},
+		},
+		Prerequisites: NVIDIAQualificationPrerequisites{
+			RequiredFiles:         []string{"/usr/bin/nvidia-smi", "/usr/bin/nvidia-imex", "/usr/bin/nvidia-imex-ctl"},
+			RequiredServices:      []string{"containerd.service", "nvidia-fabricmanager.service", "nvidia-imex.service"},
+			RequiredDevices:       []string{"/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2", "/dev/nvidia3", "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-caps"},
+			RequiredKernelModules: []string{"nvidia", "nvidia_drm", "nvidia_modeset", "nvidia_uvm", "mana", "mana_ib", "gdma"},
+		},
+		Acceptance: NVIDIAQualificationAcceptance{
+			ContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+			ResultVersion:   "hillsboro-gb200-acceptance/v1",
+			Status:          "qualified",
+			QualifiedAt:     ptr("2026-10-14T00:00:00Z"),
+			Evidence: NVIDIAQualificationEvidence{
+				GPUCount:        ptr(4),
+				FourGPUDetected: true,
+				LocalNVLink: NVIDIAQualificationNVLink{
+					Checked:  true,
+					Healthy:  true,
+					Evidence: ptr("nvidia-smi nvlink --status passed"),
+				},
+			},
+			FailClosedReasons: []string{},
+		},
+		Integrity: NVIDIAQualificationIntegrity{
+			ArtifactPath:     nvidiaIMEXQualificationPath,
+			Canonicalization: "RFC8785-JCS",
+			Encoding:         "UTF-8-without-BOM",
+			DigestAlgorithm:  "sha256",
+			DigestSidecar:    "nvidia-gpu-operator.json.sha256",
+		},
+		Authenticity: NVIDIAQualificationAuthenticity{
+			Status:                "verified",
+			RequiredBeforeRelease: true,
+			Attestation:           ptr("attestation://hillsboro/image/2026.10.14"),
+		},
+		DocumentDigest: testNVIDIAQualificationDigest,
+	}
+}
 
 func TestNVIDIAStateAvailable(t *testing.T) {
 	t.Parallel()
@@ -48,18 +150,284 @@ func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	require.NotContains(t, devices, nonChannel)
 }
 
+func TestNvidiaLocalNVLinkStatusHealthyRequiresEveryGPU(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, nvidiaLocalNVLinkStatusHealthy([]byte(
+		"GPU 0:\n Link 0: 50 GB/s\n"+
+			"GPU 1:\n Link 0: 50 GB/s\n"+
+			"GPU 2:\n Link 0: 50 GB/s\n",
+	)))
+	require.False(t, nvidiaLocalNVLinkStatusHealthy([]byte(
+		"GPU 0:\n Link 0: 50 GB/s\n"+
+			"GPU 1:\n Link 0: inactive\n"+
+			"GPU 2:\n Link 0: 50 GB/s\n"+
+			"GPU 3:\n Link 0: 50 GB/s\n",
+	)))
+	require.True(t, nvidiaLocalNVLinkStatusHealthy([]byte(
+		"GPU 0:\n Link 0: 50 GB/s\n"+
+			"GPU 1:\n Link 0: 50 GB/s\n"+
+			"GPU 2:\n Link 0: 50 GB/s\n"+
+			"GPU 3:\n Link 0: 50 GB/s\n",
+	)))
+}
+
+func TestDiscoverNVIDIABinaryRequiresExecutableRegularFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nvidia-imex")
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	require.Empty(t, discoverNVIDIABinaryIn("nvidia-imex", []string{dir}))
+
+	require.NoError(t, os.Chmod(path, 0o755))
+	require.Equal(t, path, discoverNVIDIABinaryIn("nvidia-imex", []string{dir}))
+
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Mkdir(path, 0o755))
+	require.Empty(t, discoverNVIDIABinaryIn("nvidia-imex", []string{dir}))
+}
+
+func TestResolveNVIDIAIMEXQualification(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "nvidia-gpu-operator.json")
+	qualification := validTestNVIDIAQualification()
+	qualification.DocumentDigest = ""
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	data, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	digest := fmt.Sprintf("%x", sha256.Sum256(data))
+	require.NoError(t, os.WriteFile(path+".sha256", []byte(digest+"  "+filepath.Base(path)+"\n"), 0o600))
+
+	got, err := resolveNVIDIAIMEXQualification(path)
+	require.NoError(t, err)
+	require.Equal(t, 1, got.SchemaVersion)
+	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", got.Profile)
+	require.Equal(t, "580.159.04", got.Driver.Version)
+	require.Equal(t, "nvidia-imex-580.159.04-1.azl3.aarch64", *got.IMEX.Package)
+	require.True(t, validSHA256Digest(got.DocumentDigest))
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	qualification := validTestNVIDIAQualification()
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &document))
+	document["unexpected"] = true
+	encoded, err = json.Marshal(document)
+	require.NoError(t, err)
+	canonical, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "qualification.json")
+	require.NoError(t, os.WriteFile(path, canonical, 0o600))
+
+	_, err = resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, "unknown field")
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsMissingRequiredFalseField(t *testing.T) {
+	t.Parallel()
+
+	qualification := validTestNVIDIAQualification()
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &document))
+	imex := document["imex"].(map[string]any)
+	service := imex["service"].(map[string]any)
+	delete(service, "enabled")
+	encoded, err = json.Marshal(document)
+	require.NoError(t, err)
+	canonical, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "nvidia-gpu-operator.json")
+	require.NoError(t, os.WriteFile(path, canonical, 0o600))
+
+	_, err = resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, `required field "imex.service.enabled" is missing`)
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsUnknownNestedField(t *testing.T) {
+	t.Parallel()
+
+	qualification := validTestNVIDIAQualification()
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &document))
+	imex := document["imex"].(map[string]any)
+	service := imex["service"].(map[string]any)
+	service["unexpected"] = true
+	encoded, err = json.Marshal(document)
+	require.NoError(t, err)
+	canonical, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "nvidia-gpu-operator.json")
+	require.NoError(t, os.WriteFile(path, canonical, 0o600))
+
+	_, err = resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, `unknown field "unexpected"`)
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsNullArray(t *testing.T) {
+	t.Parallel()
+
+	qualification := validTestNVIDIAQualification()
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &document))
+	acceptance := document["acceptance"].(map[string]any)
+	acceptance["failClosedReasons"] = nil
+	encoded, err = json.Marshal(document)
+	require.NoError(t, err)
+	canonical, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "nvidia-gpu-operator.json")
+	require.NoError(t, os.WriteFile(path, canonical, 0o600))
+
+	_, err = resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, `required field "acceptance.failClosedReasons" must be an array`)
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsDuplicateFields(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "qualification.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"schemaVersion":1,"schemaVersion":1}`), 0o600))
+
+	_, err := resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, "duplicate qualification field")
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsNoncanonicalBytes(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "qualification.json")
+	require.NoError(t, os.WriteFile(path, []byte("{\"schemaVersion\":1}\n"), 0o600))
+
+	_, err := resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, "not RFC 8785 canonical JSON")
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsSidecarMismatch(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "nvidia-gpu-operator.json")
+	qualification := validTestNVIDIAQualification()
+	qualification.DocumentDigest = ""
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	data, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	require.NoError(t, os.WriteFile(path+".sha256", []byte(strings.Repeat("0", 64)+"  "+filepath.Base(path)+"\n"), 0o600))
+
+	_, err = resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, "does not match canonical artifact")
+}
+
+func TestResolveNVIDIAIMEXQualificationRequiresSidecar(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "nvidia-gpu-operator.json")
+	qualification := validTestNVIDIAQualification()
+	qualification.DocumentDigest = ""
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	data, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	_, err = resolveNVIDIAIMEXQualification(path)
+	require.ErrorContains(t, err, "digest sidecar")
+}
+
+func TestCanonicalNVIDIAQualificationMatchesProducerBlockedExample(t *testing.T) {
+	t.Parallel()
+
+	qualification := validTestNVIDIAQualification()
+	qualification.DocumentDigest = ""
+	qualification.Image = NVIDIAQualificationImage{}
+	qualification.IMEX.Package = nil
+	qualification.IMEX.Version = nil
+	qualification.Toolkit.Version = nil
+	qualification.Toolkit.Ready = false
+	qualification.ContainerRuntime.Version = nil
+	qualification.ContainerRuntime.CDIEnabled = false
+	qualification.Acceptance.Status = "blocked"
+	qualification.Acceptance.QualifiedAt = nil
+	qualification.Acceptance.Evidence = NVIDIAQualificationEvidence{
+		GPUCount: nil,
+		LocalNVLink: NVIDIAQualificationNVLink{
+			Evidence: nil,
+		},
+	}
+	qualification.Acceptance.FailClosedReasons = []string{
+		"Approved nvidia-imex package/version/digest is unavailable.",
+		"NVIDIA Container Toolkit 1.18.0 or newer is unavailable from an approved repository.",
+		"Immutable image identity, package digests, hardware allowlists, and authenticity attestation are unresolved.",
+	}
+	qualification.Authenticity.Status = "unavailable"
+	qualification.Authenticity.Attestation = nil
+
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	canonical, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+	require.Equal(
+		t,
+		"d82bdff682685fa4c78bf52b3dd57a7287919606820e02079f2cba33644a1e51",
+		fmt.Sprintf("%x", sha256.Sum256(canonical)),
+	)
+}
+
 func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 	t.Parallel()
 
+	imex := &config.NVIDIAIMEXConfig{
+		Mode:               config.NVIDIAIMEXModeDRA,
+		HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+		HostProfileVersion: "v2026.10.14-1",
+		HostProfileDigest:  testNVIDIAQualificationDigest,
+	}
+
 	valid := func() NvidiaHost {
+		qualification := validTestNVIDIAQualification()
+
 		return NvidiaHost{
-			GPUDevicePaths:           []string{"/dev/nvidia0", "/dev/nvidia-caps"},
+			GPUDevicePaths: []string{
+				"/dev/nvidia0",
+				"/dev/nvidia1",
+				"/dev/nvidia2",
+				"/dev/nvidia3",
+				"/dev/nvidiactl",
+				"/dev/nvidia-uvm",
+				"/dev/nvidia-caps",
+				"/dev/nvidia-caps-imex-channels",
+			},
+			NvidiaSMIPath:            "/usr/bin/nvidia-smi",
 			NvidiaIMEXPath:           "/usr/bin/nvidia-imex",
 			NvidiaIMEXCtlPath:        "/usr/bin/nvidia-imex-ctl",
-			DriverVersion:            "580.178.04",
+			DriverVersion:            "580.159.04",
 			IMEXManagementCapability: true,
 			IMEXDeviceClass:          true,
 			IMEXServiceUnitState:     "masked",
+			HostKernelVersion:        "6.18.48.1-1.azl3.aarch64",
+			HostArchitecture:         "arm64",
+			HostDistroVersion:        "3.0",
+			LocalNVLinkHealthy:       true,
+			IMEXQualification:        &qualification,
 		}
 	}
 
@@ -69,21 +437,29 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		distro  string
 		wantErr string
 	}{
-		{name: "supported", distro: hostDistroUbuntu2404},
+		{name: "supported", distro: hostDistroAzureLinux3},
 		{
 			name: "missing binaries",
 			mutate: func(host *NvidiaHost) {
 				host.NvidiaIMEXPath = ""
 			},
-			distro:  hostDistroUbuntu2404,
-			wantErr: "nvidia-imex and nvidia-imex-ctl",
+			distro:  hostDistroAzureLinux3,
+			wantErr: "required binaries",
+		},
+		{
+			name: "missing nvidia-smi",
+			mutate: func(host *NvidiaHost) {
+				host.NvidiaSMIPath = ""
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "required binaries",
 		},
 		{
 			name: "missing management capability",
 			mutate: func(host *NvidiaHost) {
 				host.IMEXManagementCapability = false
 			},
-			distro:  hostDistroUbuntu2404,
+			distro:  hostDistroAzureLinux3,
 			wantErr: "fabric-imex-mgmt",
 		},
 		{
@@ -91,23 +467,47 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 			mutate: func(host *NvidiaHost) {
 				host.IMEXDeviceClass = false
 			},
-			distro:  hostDistroUbuntu2404,
+			distro:  hostDistroAzureLinux3,
 			wantErr: "character-device class",
 		},
 		{
 			name: "missing capability directory",
 			mutate: func(host *NvidiaHost) {
-				host.GPUDevicePaths = []string{"/dev/nvidia0"}
+				host.GPUDevicePaths = []string{
+					"/dev/nvidia0",
+					"/dev/nvidia1",
+					"/dev/nvidia2",
+					"/dev/nvidia3",
+					"/dev/nvidiactl",
+					"/dev/nvidia-uvm",
+					"/dev/nvidia-caps-imex-channels",
+				}
 			},
-			distro:  hostDistroUbuntu2404,
+			distro:  hostDistroAzureLinux3,
 			wantErr: "/dev/nvidia-caps",
+		},
+		{
+			name: "missing channel directory",
+			mutate: func(host *NvidiaHost) {
+				host.GPUDevicePaths = []string{
+					"/dev/nvidia0",
+					"/dev/nvidia1",
+					"/dev/nvidia2",
+					"/dev/nvidia3",
+					"/dev/nvidiactl",
+					"/dev/nvidia-uvm",
+					"/dev/nvidia-caps",
+				}
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "preprovisioned /dev/nvidia-caps-imex-channels",
 		},
 		{
 			name: "host service active",
 			mutate: func(host *NvidiaHost) {
 				host.IMEXServiceActive = true
 			},
-			distro:  hostDistroUbuntu2404,
+			distro:  hostDistroAzureLinux3,
 			wantErr: "service to be inactive",
 		},
 		{
@@ -115,7 +515,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 			mutate: func(host *NvidiaHost) {
 				host.IMEXServiceUnitState = "disabled"
 			},
-			distro:  hostDistroUbuntu2404,
+			distro:  hostDistroAzureLinux3,
 			wantErr: "service to be masked",
 		},
 		{
@@ -123,13 +523,183 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 			mutate: func(host *NvidiaHost) {
 				host.DriverVersion = "570.172.08"
 			},
-			distro:  hostDistroUbuntu2404,
-			wantErr: "driver 580 or later",
+			distro:  hostDistroAzureLinux3,
+			wantErr: "running NVIDIA version",
 		},
 		{
-			name:    "unsupported OS",
+			name: "missing qualification",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification = nil
+			},
 			distro:  hostDistroAzureLinux3,
-			wantErr: "unsupported on host distribution",
+			wantErr: "host qualification evidence",
+		},
+		{
+			name: "unsupported qualification schema",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.SchemaVersion = 2
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "schemaVersion 1",
+		},
+		{
+			name: "profile mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.ProfileVersion = "v2"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "expected hillsboro-gb200-gpu-operator-ready/v2026.10.14-1",
+		},
+		{
+			name: "qualification digest mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.DocumentDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "qualification digest",
+		},
+		{
+			name: "invalid image digest",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Image.Digest = ptr("sha256:invalid")
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "immutable image ID",
+		},
+		{
+			name:    "distro mismatch",
+			distro:  hostDistroUbuntu2404,
+			wantErr: "OS/kernel",
+		},
+		{
+			name: "distribution version mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.HostDistroVersion = "24.04.1"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "OS/kernel",
+		},
+		{
+			name: "architecture mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.HostArchitecture = "amd64"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "running architecture",
+		},
+		{
+			name: "kernel mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.HostKernelVersion = "6.18.48.1-1.azl3"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "OS/kernel",
+		},
+		{
+			name: "driver branch mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Driver.Branch = "570"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "qualification driver",
+		},
+		{
+			name: "driver mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.DriverVersion = "580.178.04"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "running NVIDIA version",
+		},
+		{
+			name: "userspace mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Driver.UserspaceVersion = "580.178.04"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "qualification driver",
+		},
+		{
+			name: "IMEX package mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.IMEX.Package = nil
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "approved IMEX package evidence",
+		},
+		{
+			name: "IMEX version mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.IMEX.Version = ptr("580.178.04")
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "approved IMEX package evidence",
+		},
+		{
+			name: "unqualified service ownership",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.IMEX.Service.Masked = false
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "service ownership",
+		},
+		{
+			name: "missing toolkit evidence",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Toolkit.Ready = false
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "Container Toolkit 1.18.0",
+		},
+		{
+			name: "CDI disabled",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.ContainerRuntime.CDIEnabled = false
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "containerd 2.0.0",
+		},
+		{
+			name: "unsupported acceptance result version",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Acceptance.ResultVersion = "unsupported"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "acceptance status is blocked or unsupported",
+		},
+		{
+			name: "failed acceptance test",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Acceptance.Status = "blocked"
+				host.IMEXQualification.Acceptance.FailClosedReasons = []string{"blocked"}
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "acceptance status is blocked",
+		},
+		{
+			name: "GPU count mismatch",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Acceptance.Evidence.GPUCount = ptr(8)
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "requires four GPUs",
+		},
+		{
+			name: "runtime local NVLink unhealthy",
+			mutate: func(host *NvidiaHost) {
+				host.LocalNVLinkHealthy = false
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "healthy verified local NVLink",
+		},
+		{
+			name: "authenticity unavailable",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Authenticity.Status = "unavailable"
+				host.IMEXQualification.Authenticity.Attestation = nil
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "authenticity is not verified",
 		},
 	}
 
@@ -142,7 +712,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 				tt.mutate(&host)
 			}
 
-			got, err := configureNVIDIAIMEX(host, config.NVIDIAIMEXModeDRA, tt.distro)
+			got, err := configureNVIDIAIMEX(host, imex, tt.distro)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				return
@@ -162,7 +732,7 @@ func TestConfigureNVIDIAIMEXDisabledRemovesExposure(t *testing.T) {
 		GPUDevicePaths:    []string{"/dev/nvidia0", "/dev/nvidia-caps-imex-channels"},
 		NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
 		NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
-	}, "", hostDistroUbuntu2404)
+	}, nil, hostDistroAzureLinux3)
 	require.NoError(t, err)
 	require.NotContains(t, got.GPUDevicePaths, "/dev/nvidia-caps-imex-channels")
 	require.Empty(t, got.NvidiaIMEXPath)

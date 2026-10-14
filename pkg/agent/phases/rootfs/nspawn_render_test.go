@@ -261,28 +261,6 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	require.NotContains(t, overrideBuf.String(), "DevicePolicy=")
 }
 
-func TestNvidiaHostBinDirFallsBackToIMEX(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, "/usr/bin", nvidiaHostBinDir(goalstates.NvidiaHost{
-		NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
-		NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
-	}))
-}
-
-func TestEnsureNVIDIAIMEXChannelsDirIsIdempotent(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "nvidia-caps-imex-channels")
-	require.NoError(t, ensureNVIDIAIMEXChannelsDir(path))
-	require.NoError(t, ensureNVIDIAIMEXChannelsDir(path))
-
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	require.True(t, info.IsDir())
-	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
-}
-
 func TestPathsExcluding(t *testing.T) {
 	t.Parallel()
 

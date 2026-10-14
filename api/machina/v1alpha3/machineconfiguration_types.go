@@ -150,18 +150,41 @@ type MachineConfigurationAgent struct {
 
 // MachineConfigurationNVIDIA configures NVIDIA host integration.
 type MachineConfigurationNVIDIA struct {
-	// IMEX configures multi-node NVLink IMEX preparation.
+	// IMEX configures validation and exposure for multi-node NVLink.
 	// +optional
 	IMEX *MachineConfigurationNVIDIAIMEX `json:"imex,omitempty"`
 }
 
 // MachineConfigurationNVIDIAIMEX configures NVIDIA IMEX integration.
+// +kubebuilder:validation:XValidation:rule="!has(self.mode) || (has(self.hostProfile) && has(self.hostProfileVersion) && has(self.hostProfileDigest))",message="mode DRA requires hostProfile, hostProfileVersion, and hostProfileDigest"
+// +kubebuilder:validation:XValidation:rule="has(self.mode) || (!has(self.hostProfile) && !has(self.hostProfileVersion) && !has(self.hostProfileDigest))",message="host qualification fields require mode DRA"
 type MachineConfigurationNVIDIAIMEX struct {
-	// Mode selects the IMEX lifecycle owner. DRA prepares the node for NVIDIA
-	// DRA ComputeDomains; an empty value disables IMEX preparation.
+	// Mode selects the IMEX lifecycle owner. DRA exposes a prequalified node to
+	// NVIDIA DRA ComputeDomains; an empty value disables IMEX exposure.
 	// +optional
 	// +kubebuilder:validation:Enum=DRA
 	Mode NVIDIAIMEXMode `json:"mode,omitempty"`
+
+	// HostProfile is the immutable host qualification profile recorded by the
+	// provisioned image.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	HostProfile string `json:"hostProfile,omitempty"`
+
+	// HostProfileVersion is the expected version of HostProfile.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`
+	HostProfileVersion string `json:"hostProfileVersion,omitempty"`
+
+	// HostProfileDigest is the sha256 digest of the RFC 8785 canonical
+	// qualification document produced with the host image.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
+	HostProfileDigest string `json:"hostProfileDigest,omitempty"`
 }
 
 // NVIDIAIMEXMode identifies the supported NVIDIA IMEX lifecycle owner.

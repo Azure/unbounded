@@ -67,24 +67,46 @@ func resolveNSpawnConfig(
 		return nil, fmt.Errorf("resolve nvidia host: %w", err)
 	}
 
-	imexMode := config.NVIDIAIMEXMode("")
+	var imex *config.NVIDIAIMEXConfig
 	if cfg.NVIDIA != nil && cfg.NVIDIA.IMEX != nil {
-		imexMode = cfg.NVIDIA.IMEX.Mode
+		imex = cfg.NVIDIA.IMEX
 	}
 
-	if imexMode == config.NVIDIAIMEXModeDRA {
+	if imex != nil && imex.Mode == config.NVIDIAIMEXModeDRA {
 		if err := ValidateNVIDIAIMEXKubernetesVersion(cfg.Cluster.Version); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", ErrNVIDIAHostUnqualified, err)
+		}
+
+		if nvidia.IMEXQualification == nil {
+			qualification, err := resolveNVIDIAIMEXQualification(nvidiaIMEXQualificationPath)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrNVIDIAHostUnqualified, err)
+			}
+
+			nvidia.IMEXQualification = qualification
 		}
 	}
 
-	nvidia, err = configureNVIDIAIMEX(nvidia, imexMode, detectHostDistro())
+	nvidia, err = configureNVIDIAIMEX(nvidia, imex, detectHostDistro())
 	if err != nil {
+		if imex != nil && imex.Mode == config.NVIDIAIMEXModeDRA {
+			return nil, fmt.Errorf("%w: %v", ErrNVIDIAHostUnqualified, err)
+		}
+
 		return nil, fmt.Errorf("resolve nvidia IMEX: %w", err)
 	}
 
 	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
 	if nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
+		if imex != nil && imex.Mode == config.NVIDIAIMEXModeDRA {
+			return nil, fmt.Errorf(
+				"%w: %w for machine %s: fresh host state is incomplete",
+				ErrNVIDIAHostUnqualified,
+				ErrNVIDIAStateUnavailable,
+				machineName,
+			)
+		}
+
 		return nil, fmt.Errorf("%w for machine %s: fresh host state is incomplete", ErrNVIDIAStateUnavailable, machineName)
 	}
 
@@ -114,8 +136,7 @@ func resolveNSpawnConfig(
 }
 
 // ValidateNVIDIAIMEXKubernetesVersion checks the Kubernetes floor required by
-// NVIDIA DRA ComputeDomains before host preparation mutates package or service
-// state.
+// NVIDIA DRA ComputeDomains before the agent exposes a qualified host.
 func ValidateNVIDIAIMEXKubernetesVersion(value string) error {
 	const (
 		minMajor = 1
@@ -291,9 +312,15 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 	}
 
 	delete(labels, config.NVIDIAIMEXModeLabelKey)
+	delete(labels, config.NVIDIAHostProfileLabelKey)
+	delete(labels, config.NVIDIAHostProfileVersionLabelKey)
 
 	if cfg.IMEXDRAEnabled() {
 		labels[config.NVIDIAIMEXModeLabelKey] = string(config.NVIDIAIMEXModeDRA)
+		labels[config.NVIDIAHostProfileLabelKey] = cfg.NVIDIA.IMEX.HostProfile
+		labels[config.NVIDIAHostProfileVersionLabelKey] = config.NormalizeNVIDIAProfileVersionLabel(
+			cfg.NVIDIA.IMEX.HostProfileVersion,
+		)
 	}
 
 	nodeIP := strings.TrimSpace(cfg.Kubelet.NodeIP)
@@ -423,6 +450,19 @@ func hostDistroFromOSRelease(path string) (string, error) {
 }
 
 func hostDistroFromOSReleaseData(data []byte) string {
+	return hostDistroFromOSReleaseValues(osReleaseValues(data))
+}
+
+func hostDistroVersionFromOSRelease(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+
+	return osReleaseValues(data)["VERSION_ID"]
+}
+
+func osReleaseValues(data []byte) map[string]string {
 	values := make(map[string]string)
 
 	for _, rawLine := range strings.Split(string(data), "\n") {
@@ -439,7 +479,7 @@ func hostDistroFromOSReleaseData(data []byte) string {
 		values[key] = normalizeOSReleaseValue(value)
 	}
 
-	return hostDistroFromOSReleaseValues(values)
+	return values
 }
 
 func hostDistroFromOSReleaseValues(values map[string]string) string {

@@ -47,13 +47,12 @@ type hostPackageManager struct {
 }
 
 type installPackages struct {
-	log      *slog.Logger
-	packages []string
+	log *slog.Logger
 }
 
 // InstallPackages returns a task that installs the required OS packages on the host.
-func InstallPackages(log *slog.Logger, packages ...string) phases.Task {
-	return &installPackages{log: log, packages: packages}
+func InstallPackages(log *slog.Logger) phases.Task {
+	return &installPackages{log: log}
 }
 
 func (ip *installPackages) Name() string { return "install-packages" }
@@ -66,10 +65,7 @@ func (ip *installPackages) Do(ctx context.Context) error {
 
 	var missing []string
 
-	packages := append([]string(nil), pm.requiredPackages...)
-	packages = append(packages, ip.packages...)
-
-	for _, pkg := range packages {
+	for _, pkg := range pm.requiredPackages {
 		if !pm.installed(ctx, ip.log, pkg) {
 			missing = append(missing, pkg)
 		}

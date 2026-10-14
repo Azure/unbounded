@@ -280,9 +280,55 @@ func TestAgentConfig_Validate(t *testing.T) {
 			name: "NVIDIA IMEX DRA",
 			mutate: func(cfg *AgentConfig) {
 				cfg.NVIDIA = &NVIDIAConfig{
-					IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+					IMEX: &NVIDIAIMEXConfig{
+						Mode:               NVIDIAIMEXModeDRA,
+						HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+						HostProfileVersion: "v1",
+						HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					},
 				}
 			},
+		},
+		{
+			name: "NVIDIA IMEX missing host profile",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NVIDIA = &NVIDIAConfig{
+					IMEX: &NVIDIAIMEXConfig{
+						Mode:               NVIDIAIMEXModeDRA,
+						HostProfileVersion: "v1",
+						HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					},
+				}
+			},
+			wantErr: "NVIDIA.IMEX.HostProfile is required",
+		},
+		{
+			name: "NVIDIA IMEX invalid host profile label",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NVIDIA = &NVIDIAConfig{
+					IMEX: &NVIDIAIMEXConfig{
+						Mode:               NVIDIAIMEXModeDRA,
+						HostProfile:        "Hillsboro profile",
+						HostProfileVersion: "v1",
+						HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					},
+				}
+			},
+			wantErr: "lowercase DNS label",
+		},
+		{
+			name: "NVIDIA IMEX invalid host profile digest",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NVIDIA = &NVIDIAConfig{
+					IMEX: &NVIDIAIMEXConfig{
+						Mode:               NVIDIAIMEXModeDRA,
+						HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+						HostProfileVersion: "v1",
+						HostProfileDigest:  "sha256:ABC",
+					},
+				}
+			},
+			wantErr: "64 lowercase hexadecimal",
 		},
 		{
 			name: "unsupported NVIDIA IMEX mode",
@@ -364,7 +410,12 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 		}},
 		Gantry: &GantryConfig{Disabled: true},
 		NVIDIA: &NVIDIAConfig{
-			IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+			IMEX: &NVIDIAIMEXConfig{
+				Mode:               NVIDIAIMEXModeDRA,
+				HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+				HostProfileVersion: "v1",
+				HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
 		},
 	}
 
@@ -398,6 +449,16 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
 	require.True(t, original.Gantry.Disabled)
 	require.Equal(t, NVIDIAIMEXModeDRA, original.NVIDIA.IMEX.Mode)
+	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", original.NVIDIA.IMEX.HostProfile)
+	require.Equal(t, "v1", original.NVIDIA.IMEX.HostProfileVersion)
+	require.Equal(t, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", original.NVIDIA.IMEX.HostProfileDigest)
+}
+
+func TestNormalizeNVIDIAProfileVersionLabel(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "v2026-10-14-1", NormalizeNVIDIAProfileVersionLabel("v2026.10.14-1"))
+	require.Empty(t, NormalizeNVIDIAProfileVersionLabel(strings.Repeat("a", 64)))
 }
 
 func TestAgentKubeletConfigValidate(t *testing.T) {

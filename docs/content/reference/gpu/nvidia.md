@@ -63,12 +63,23 @@ full sequence is:
 
 ## Multi-node NVLink with IMEX
 
-IMEX is disabled by default. Enable host preparation only for machines that
-will use NVIDIA DRA ComputeDomains:
+IMEX is disabled by default. Unbounded does not install or repair NVIDIA
+drivers or IMEX userspace. Enable exposure only after the host-image pipeline
+has applied and tested a qualified profile:
+
+> The committed Hillsboro profile `v2026.10.14-1` is currently blocked and is
+> documentation/validation input only. Do not enable it until `aks-flex-dev`
+> publishes a passing authenticated result and a reviewed canonical digest.
+> The accepted producer contract is in `aks-flex-dev` commit
+> `84bae02adb8265dc8fb7d65b3c958048e22f7732` under
+> `labs/gb200-hillsboro/gpu-operator-ownership/`.
 
 ```bash
 kubectl unbounded machine config create gb200-dra \
-  --nvidia-imex-mode=DRA
+  --nvidia-imex-mode=DRA \
+  --nvidia-host-profile=hillsboro-gb200-gpu-operator-ready \
+  --nvidia-host-profile-version=v2026.10.14-1 \
+  --nvidia-host-profile-digest=sha256:<canonical-qualification-digest>
 ```
 
 The corresponding API field is:
@@ -80,19 +91,29 @@ spec:
       nvidia:
         imex:
           mode: DRA
+          hostProfile: hillsboro-gb200-gpu-operator-ready
+          hostProfileVersion: v2026.10.14-1
+          hostProfileDigest: sha256:<canonical-qualification-digest>
 ```
 
-This is a strict capability gate. When selected, bootstrap installs the
-branch-matched IMEX package from the host's existing NVIDIA package repository,
-disables and masks the host daemon for DRA ownership, and then fails unless all
-of the following are true:
+This is a strict, read-only capability gate. Goal-state resolution occurs
+before normal host preparation and fails unless all of the following are true:
 
-- The host is Ubuntu 24.04 with NVIDIA driver 580 or later.
-- The configured NVIDIA repository contains an IMEX package whose full package
-  version matches the active driver. Current driver 580 repositories publish
-  this as `nvidia-imex` (for example,
-  `nvidia-imex=580.178.04-1ubuntu1`); older repositories may use a
-  branch-suffixed name such as `nvidia-imex-580`. The matching package provides
+- `/etc/unbounded/host-capabilities/nvidia-gpu-operator.json` records the
+  expected schema, profile and version, contract/result versions, immutable
+  image identity, authenticity attestation, OS, architecture, exact kernel and
+  kernel-devel, driver branch and exact driver/userspace/package versions,
+  driver-matched IMEX package, runtime/CDI versions and readiness, GPU count,
+  local NVLink result, host service ownership, device prerequisites, and
+  versioned acceptance result.
+- The artifact is RFC 8785 canonical UTF-8 JSON with no BOM or trailing
+  newline. Its required sidecar contains the lowercase SHA-256 digest, two
+  spaces, `nvidia-gpu-operator.json`, and one newline. The configured digest
+  binds the evidence content but remains separate from the required verified
+  authenticity attestation.
+- The running OS, architecture, kernel, NVIDIA version, and GPU count match
+  the qualification evidence, and the NVIDIA driver is branch 580 or later.
+- The preinstalled driver-matched IMEX package provides
   `/usr/bin/nvidia-imex`, `/usr/bin/nvidia-imex-ctl`, and
   `nvidia-imex.service`.
 - The loaded driver exposes
@@ -100,34 +121,48 @@ of the following are true:
   `nvidia-caps-imex-channels` character-device class in `/proc/devices`.
 - The host `nvidia-imex.service` is inactive and masked. NVIDIA DRA, not host
   systemd, owns the daemon and channel lifecycle in this mode.
-- `/dev/nvidia-caps` is available.
+- `/dev/nvidia-caps` and `/dev/nvidia-caps-imex-channels` are already
+  available.
+- The authenticated acceptance evidence and a read-only runtime probe both
+  report four GPUs with healthy local NVLink. Multi-node NVLink remains a
+  post-join ComputeDomain and workload validation.
 
-The NVIDIA driver package repository must already be configured. Unbounded
-derives the IMEX package branch from the active kernel driver, but does not
-install or change the driver itself. Azure Linux 3, Ubuntu 26.04, driver
-branches older than 580, missing package repositories, and unsupported host
-capabilities fail closed until a validated package contract is added. See
-NVIDIA's
+The `aks-flex-dev` Hillsboro image pipeline owns package installation,
+service state, acceptance testing, and the qualification marker. Unbounded
+never uses the distro package manager for IMEX and never starts, stops,
+enables, disables, or masks the host service. Missing or mismatched evidence
+fails before Node registration, rather than joining as a CPU-only fallback.
+See the
+[GPU Operator and IMEX decision guide]({{< relref "reference/gpu/nvidia-gpu-operator" >}})
+and NVIDIA's
 [IMEX service installation guide](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html)
 for the package, daemon, configuration, and channel-device contract.
 
 When enabled, the agent:
 
-1. Creates `/dev/nvidia-caps-imex-channels` as a root-owned `0755` directory
-   if it does not exist.
-2. Bind-mounts `/dev/nvidia-caps` and
+1. Validates the qualified image evidence and current runtime prerequisites.
+2. Bind-mounts the preexisting `/dev/nvidia-caps` and
    `/dev/nvidia-caps-imex-channels` into nspawn and grants their named systemd
    device classes.
-3. Copies the host-matched `nvidia-imex` and `nvidia-imex-ctl` binaries into
-   `/run/nvidia/driver/usr/bin`.
-4. Labels the Node `nvidia.unbounded-cloud.io/imex-mode=DRA`.
-5. Reports `Machine.status.conditions[type=NVIDIAIMEXPrepared]`.
+3. Labels the Node with the validated profile name/version and
+   `nvidia.unbounded-cloud.io/imex-mode=DRA`, and records the full
+   qualification digest in
+   `nvidia.unbounded-cloud.io/host-profile-digest`.
+4. Reports `Machine.status.conditions[type=NVIDIAIMEXPrepared]`.
 
-The label and condition mean only that the host and nspawn boundary are
-prepared. They do **not** mean a ComputeDomain is ready or that an IMEX domain
-is `UP`. Workloads must use a ready NVIDIA DRA ComputeDomain and its
+The label and `NVIDIAIMEXPrepared=True, reason=HostQualified` condition mean
+only that the prequalified host evidence is valid and the nspawn boundary is
+exposed. They do **not** mean a ComputeDomain is ready or that an IMEX domain is
+`UP`. Workloads must use a ready NVIDIA DRA ComputeDomain and its
 ResourceClaims. Do not schedule MNNVL workloads from Node Ready, GPU count, or
-the preparation label alone.
+the host-qualified label alone.
+
+Qualification failure prevents Node registration. When bootstrap credentials
+are already available, or during a repave, the Machine condition is set to
+`False` with reason `HostQualificationFailed` and the exact mismatch in the
+message. Attestation-based first boot can fail before cluster credentials
+exist; in that case the local bootstrap error is authoritative and no Node is
+registered.
 
 Unbounded does not write `/etc/nvidia-imex/config.cfg`, choose channel IDs, or
 assign node membership. The DRA controller derives membership from the
@@ -146,10 +181,11 @@ also be removed from DRA nodes before enabling `GPUCluster`; otherwise the same
 GPUs can be advertised simultaneously through `nvidia.com/gpu` and DRA
 `ResourceSlice` objects.
 
-Unbounded prepares the host and nspawn boundary only. It does not install GPU
-Operator, create `GPUCluster`, or deploy NVIDIA DRA operands. For example, GPU
-Operator v26.7.2 with DRA driver v0.5.1 renders the preinstalled-driver path
-from these values:
+Unbounded validates and exposes the qualified host and nspawn boundary only.
+It does not install GPU Operator, create `GPUCluster`, or deploy NVIDIA DRA
+operands. The `aks-flex-dev` deployment definition owns those resources. For
+example, the evaluated GPU Operator v26.7.2 and DRA driver v0.5.1
+preinstalled-driver path uses:
 
 ```yaml
 clusterPolicy:
@@ -190,15 +226,14 @@ to every GPU workload and is not automatically configured by Unbounded.
 
 ### Disable and rollback
 
-To disable preparation, remove `agent.nvidia.imex` from the
+To disable exposure, remove `agent.nvidia.imex` from the
 MachineConfiguration and repave the node. The regenerated nspawn configuration
-omits the IMEX directory bind, named device permission, and staged IMEX
-binaries. The host directory is left in place because deleting it could race
-an allocated ComputeDomain. The agent clears the `NVIDIAIMEXPrepared`
-condition, but intentionally leaves the host package installed and the host
-service masked. Delete workloads and ResourceClaims and allow the GPU Operator
-teardown hooks to complete before repaving, removing the package, or restoring
-host-managed daemon ownership.
+omits the IMEX directory bind and named device permission. The host directory
+is left in place because deleting it could race an allocated ComputeDomain.
+The agent clears the `NVIDIAIMEXPrepared` condition and profile metadata. Host
+packages and service state remain owned by the qualified image.
+Delete workloads and ResourceClaims and allow the GPU Operator teardown hooks
+to complete before repaving or applying a different host image.
 
 ## Prepared Driver Root
 
