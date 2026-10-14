@@ -283,10 +283,17 @@ func (l *Ledger) Releases() []*Release {
 	return out
 }
 
-// Remove deletes a grant and records a Release for it at now. It reports
-// whether the grant existed.
+// Remove deletes a grant and records a Release for it. The grant ends at now,
+// or at ExpiresAt if it has already expired, so pods created after expiry are
+// not treated as created during the grant. Release retention starts at now.
+// It reports whether the grant existed.
 func (l *Ledger) Remove(key types.NamespacedName, now time.Time) bool {
-	return l.remove(key, now, now)
+	releasedAt := now
+	if g, ok := l.grants[key]; ok && g.Expired(now) {
+		releasedAt = g.ExpiresAt
+	}
+
+	return l.remove(key, releasedAt, now)
 }
 
 func (l *Ledger) remove(key types.NamespacedName, releasedAt, now time.Time) bool {

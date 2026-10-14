@@ -121,6 +121,18 @@ func TestRemove(t *testing.T) {
 	}}, l.Releases())
 }
 
+func TestRemoveExpiredEndsAtExpiry(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	require.NoError(t, l.Add(g))
+	now := g.ExpiresAt.Add(5 * time.Minute)
+	require.True(t, l.Remove(g.Key(), now))
+	require.Equal(t, []*Release{{
+		UID: "first", Namespace: "tenant", Nodes: []string{"node-a"},
+		CreatedAt: g.CreatedAt, ReleasedAt: g.ExpiresAt, DropAt: now.Add(ReleaseRetention),
+	}}, l.Releases())
+}
+
 func TestReleaseRoundTrip(t *testing.T) {
 	l := New()
 	g := testGrant("first", "node-a")

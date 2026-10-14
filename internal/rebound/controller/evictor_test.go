@@ -248,9 +248,9 @@ func TestEvictorReleaseRequeueDeadline(t *testing.T) {
 func TestEvictorReleaseIndex(t *testing.T) {
 	l := ledger.New()
 	for _, g := range []*ledger.Grant{
-		{Namespace: "first", Name: "g", UID: "u1", Nodes: []string{"a", "b"}, CreatedAt: testNow.Add(-time.Hour)},
-		{Namespace: "second", Name: "g", UID: "u2", Nodes: []string{"a", "c"}, CreatedAt: testNow.Add(-time.Hour)},
-		{Namespace: "third", Name: "g", UID: "u3", Nodes: []string{"d"}, CreatedAt: testNow.Add(-time.Hour)},
+		{Namespace: "first", Name: "g", UID: "u1", Nodes: []string{"a", "b"}, CreatedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour)},
+		{Namespace: "second", Name: "g", UID: "u2", Nodes: []string{"a", "c"}, CreatedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour)},
+		{Namespace: "third", Name: "g", UID: "u3", Nodes: []string{"d"}, CreatedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour)},
 	} {
 		require.NoError(t, l.Add(g))
 		require.True(t, l.Remove(g.Key(), testNow))
@@ -280,7 +280,7 @@ func TestEvictorReleaseIndex(t *testing.T) {
 	require.Equal(t, []string{"third/p"}, remaining(t, c))
 
 	l.Reap(testNow.Add(ledger.ReleaseRetention), nil)
-	g := &ledger.Grant{Namespace: "third", Name: "new", UID: "u4", Nodes: []string{"a"}, CreatedAt: testNow.Add(-time.Hour)}
+	g := &ledger.Grant{Namespace: "third", Name: "new", UID: "u4", Nodes: []string{"a"}, CreatedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour)}
 	require.NoError(t, l.Add(g))
 	require.True(t, l.Remove(g.Key(), testNow))
 	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(cm), cm))
