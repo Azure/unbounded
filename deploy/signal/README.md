@@ -46,8 +46,9 @@ Controller code never contains certification script bodies.
 
 ## Per-test execution
 
-The included templates expose real test invocations rather than treating a
-successful suite container as a certification pass:
+For newly admitted built-in runs, the included templates expose real test
+invocations rather than treating a successful suite container as a certification
+pass:
 
 | Node workflow | Individually tracked tests |
 | --- | --- |
@@ -267,9 +268,20 @@ including actual Argo task/container identity, effective parameters, script
 digest, measurements, and a per-attempt evidence reference.
 `status.attempts` retains the aggregate outcome and evidence for every completed
 or interrupted attempt; `status.evidence` points to the final summary.
-New required workflow arguments `participant-plan` and `test-plan` cannot be
-overridden by profile parameters. Existing runs and custom templates without
-an immutable test plan retain the legacy root verdict/reason contract.
+The workflow arguments `participant-plan` and `test-plan` cannot be overridden
+by profile parameters. Newly admitted built-in runs always freeze their required
+test plan. Existing runs without one keep an empty workflow test plan and use
+the compatibility branch, including on retry: an old immutable burn snapshot
+executes once, without new component arguments or required output files.
+Their original script, image, placement, deadlines, reservations, and cleanup
+remain in force; per-test coverage is not retroactively claimed for an opaque
+snapshot. Fresh admission uses the new test boundaries.
+
+Both compatibility and planned entrypoints retain root `verdict` and `reason`
+outputs. These aggregate required test results rather than forwarding only the
+last health check. A passing final health check cannot erase an earlier failure,
+and missing required execution cannot become `Pass`. Unknown custom templates
+without an immutable test plan retain the legacy root-output contract.
 
 Inline Argo node status and base64/gzip `compressedNodes` are supported, with
 decoded node status bounded at 16 MiB. Malformed or oversized status is

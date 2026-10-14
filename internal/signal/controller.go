@@ -541,8 +541,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	case "Succeeded":
-		verdict := workflowParameter(workflow, "verdict")
-		reason := workflowParameter(workflow, "reason")
+		parameter := workflowParameter
+		if len(run.Spec.TestPlan) == 0 && supportedNodeWorkflow(run.Spec.Workflow.Name) {
+			parameter = workflowRootParameter
+		}
+
+		verdict := parameter(workflow, "verdict")
+		reason := parameter(workflow, "reason")
 
 		if verdict == "" {
 			verdict = "Inconclusive"
@@ -754,7 +759,7 @@ func (r *RunReconciler) retryOrFinish(
 			return ctrl.Result{}, err
 		}
 
-		if collection.strict {
+		if requiresWorkflowCleanup(run) {
 			stopped, err := r.ensureWorkflowStopped(ctx, run)
 			if err != nil {
 				return ctrl.Result{}, err
@@ -819,7 +824,7 @@ func (r *RunReconciler) finish(
 		return ctrl.Result{}, err
 	}
 
-	if !collection.strict {
+	if !requiresWorkflowCleanup(run) {
 		if err := projectTerminal(ctx, r.Client, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1121,6 +1126,14 @@ func participantNodeUID(run *signalv1.CertificationRun, nodeName string) types.U
 }
 
 func workflowParameter(workflow *unstructured.Unstructured, name string) string {
+	return workflowResultParameter(workflow, name, true)
+}
+
+func workflowRootParameter(workflow *unstructured.Unstructured, name string) string {
+	return workflowResultParameter(workflow, name, false)
+}
+
+func workflowResultParameter(workflow *unstructured.Unstructured, name string, allowTaskFallback bool) string {
 	parameters, _, err := unstructured.NestedSlice(workflow.Object, "status", "outputs", "parameters")
 	if err == nil {
 		if value := parameterValue(parameters, name); value != "" {
@@ -1152,6 +1165,10 @@ func workflowParameter(workflow *unstructured.Unstructured, name string) string 
 				return value
 			}
 		}
+	}
+
+	if !allowTaskFallback {
+		return ""
 	}
 
 	fallback := ""

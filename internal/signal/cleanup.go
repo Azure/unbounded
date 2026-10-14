@@ -16,12 +16,16 @@ import (
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
+func requiresWorkflowCleanup(run *signalv1.CertificationRun) bool {
+	return supportedNodeWorkflow(run.Spec.Workflow.Name) || run.Spec.Workflow.Name == RackCertificationWorkflow
+}
+
 func (r *RunReconciler) strictCleanupReady(ctx context.Context, run *signalv1.CertificationRun) (bool, error) {
-	_, strict, planErr := effectiveTestPlan(run)
-	if !strict {
+	if !requiresWorkflowCleanup(run) {
 		return true, nil
 	}
 
+	_, _, planErr := effectiveTestPlan(run)
 	if planErr != nil {
 		return r.ensureWorkflowStopped(ctx, run)
 	}

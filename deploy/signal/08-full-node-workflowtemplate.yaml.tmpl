@@ -19,7 +19,9 @@ spec:
       - name: run-uid
       - name: participants
       - name: participant-plan
+        value: "[]"
       - name: test-plan
+        value: "[]"
       - name: script-configmap
       - name: script-key
       - name: script-digest
@@ -43,6 +45,29 @@ spec:
   templates:
     - name: certification
       steps:
+        - - name: legacy
+            when: "{{`{{=workflow.parameters['test-plan'] == '[]'}}`}}"
+            template: legacy-certification
+          - name: planned
+            when: "{{`{{=workflow.parameters['test-plan'] != '[]'}}`}}"
+            template: planned-certification
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`workflow.parameters['test-plan'] == '[]'
+                ? (steps.legacy.status == 'Succeeded' ? steps.legacy.outputs.parameters.verdict : 'Inconclusive')
+                : (steps.planned.status == 'Succeeded' ? steps.planned.outputs.parameters.verdict : 'Inconclusive')`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`workflow.parameters['test-plan'] == '[]'
+                ? (steps.legacy.status == 'Succeeded' ? steps.legacy.outputs.parameters.reason : 'RequiredTestCoverageMissing')
+                : (steps.planned.status == 'Succeeded' ? steps.planned.outputs.parameters.reason : 'RequiredTestCoverageMissing')`}}
+
+    - name: planned-certification
+      steps:
         - - name: node
             template: node-tests
             arguments:
@@ -55,6 +80,14 @@ spec:
                   value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
                 - name: observed-gpu-allocatable
                   value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{steps.node.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{steps.node.outputs.parameters.reason}}`}}"
 
     - name: node-tests
       inputs:
@@ -151,6 +184,38 @@ spec:
                   value: health-after
                 - name: gpu-count
                   value: "1"
+
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`((tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail')
+                || (tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Fail')
+                || (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail')
+                || (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail'))
+                ? 'Fail'
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? 'Pass' : 'Inconclusive')`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail'
+                ? tasks['node-health'].outputs.parameters.reason
+                : (tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Fail'
+                ? tasks['gpu-health'].outputs.parameters.reason
+                : (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail'
+                ? tasks['mpi-backend'].outputs.parameters.reason
+                : (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail'
+                ? tasks['health-after'].outputs.parameters.reason
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? 'NodeTestsPassed' : 'RequiredTestCoverageMissing'))))`}}
 
     - name: full-node-stage
       inputs:
@@ -344,3 +409,149 @@ spec:
           kind: MPIJob
           metadata:
             name: "{{`{{=sprig.trunc(40, workflow.name)}}`}}-{{`{{=sprig.trunc(12, sprig.sha256sum(inputs.parameters['node-name']))}}`}}"
+
+    - name: legacy-certification
+      dag:
+        tasks:
+          - name: node-health
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: preflight
+                - name: gpu-count
+                  value: "1"
+          - name: workload
+            dependencies: [node-health]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: workload
+                - name: gpu-count
+                  value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+          - name: workload-skipped
+            dependencies: [node-health]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} != Pass"
+            template: skipped-workload
+          - name: mpi-backend
+            dependencies: [workload]
+            when: "{{`{{=tasks['node-health'].outputs.parameters.verdict == 'Pass' && tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Pass'}}`}}"
+            template: full-node-mpi-backend
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{workflow.parameters.participants}}`}}"
+                - name: node-uid
+                  value: ""
+                - name: gpu-count
+                  value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+                - name: device-inventory
+                  value: ""
+            hooks:
+              exit:
+                template: cleanup-mpi
+                arguments:
+                  parameters:
+                    - name: node-name
+                      value: "{{`{{workflow.parameters.participants}}`}}"
+          - name: health-after
+            dependencies: [mpi-backend]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: health-after
+                - name: gpu-count
+                  value: "1"
+          - name: health-after-preflight-failure
+            dependencies: [workload-skipped]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} != Pass"
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: health-after
+                - name: gpu-count
+                  value: "1"
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`((tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail')
+                || (tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Fail')
+                || (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail')
+                || (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail')
+                || (tasks['health-after-preflight-failure'].status == 'Succeeded'
+                && tasks['health-after-preflight-failure'].outputs.parameters.verdict == 'Fail'))
+                ? 'Fail'
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? 'Pass' : 'Inconclusive')`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail'
+                ? tasks['node-health'].outputs.parameters.reason
+                : (tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Fail'
+                ? tasks.workload.outputs.parameters.reason
+                : (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail'
+                ? tasks['mpi-backend'].outputs.parameters.reason
+                : (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail'
+                ? tasks['health-after'].outputs.parameters.reason
+                : (tasks['health-after-preflight-failure'].status == 'Succeeded'
+                && tasks['health-after-preflight-failure'].outputs.parameters.verdict == 'Fail'
+                ? tasks['health-after-preflight-failure'].outputs.parameters.reason
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? tasks['node-health'].outputs.parameters.reason : 'RequiredTestCoverageMissing')))))`}}
+
+    - name: legacy-full-node-stage
+      inputs:
+        parameters:
+          - name: stage-name
+          - name: gpu-count
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+      podSpecPatch: >-
+        {"tolerations": {{`{{workflow.parameters.tolerations}}`}},
+        "containers":[{"name":"main","resources":{"limits":{"nvidia.com/gpu":"{{`{{inputs.parameters.gpu-count}}`}}"}}}]}
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
+        env:
+          - name: PROJECT_SIGNAL_STAGE_NAME
+            value: "{{`{{inputs.parameters.stage-name}}`}}"
+          - name: EXPECTED_GPU_PRODUCT_REGEX
+            value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+          - name: EXPECTED_GPU_COUNT
+            value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+          - name: OBSERVED_GPU_CAPACITY
+            value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
+          - name: OBSERVED_GPU_ALLOCATABLE
+            value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+          - name: results
+            mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /results/verdict
+          - name: reason
+            valueFrom:
+              path: /results/reason

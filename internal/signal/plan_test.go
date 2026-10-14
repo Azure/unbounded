@@ -221,7 +221,6 @@ func TestWorkflowPlansAreReservedAndKeepLegacyParticipants(t *testing.T) {
 	run := builtinTestRun(t, FullNodeCertificationWorkflow)
 	run.Spec.Parameters[ParticipantPlanParameter] = "untrusted"
 	run.Spec.Parameters[TestPlanParameter] = "untrusted"
-	run.Spec.TestPlan = nil
 
 	workflow, err := buildWorkflow(run, 1)
 	if err != nil {

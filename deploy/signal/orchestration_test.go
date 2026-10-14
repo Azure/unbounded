@@ -303,9 +303,24 @@ func (run *groupedBurn) wait(t *testing.T, canceled bool) {
 
 type workflowManifest struct {
 	Spec struct {
+		Arguments struct {
+			Parameters []struct {
+				Name  string `yaml:"name"`
+				Value string `yaml:"value"`
+			} `yaml:"parameters"`
+		} `yaml:"arguments"`
 		Templates []struct {
 			Name         string `yaml:"name"`
 			PodSpecPatch string `yaml:"podSpecPatch"`
+			Steps        [][]struct {
+				Name     string `yaml:"name"`
+				When     string `yaml:"when"`
+				Template string `yaml:"template"`
+			} `yaml:"steps"`
+			Container struct {
+				Command []string `yaml:"command"`
+				Args    []string `yaml:"args"`
+			} `yaml:"container"`
 			ContainerSet struct {
 				Containers []struct {
 					Name         string   `yaml:"name"`
@@ -319,8 +334,13 @@ type workflowManifest struct {
 			} `yaml:"containerSet"`
 			Outputs struct {
 				Parameters []struct {
-					Name  string `yaml:"name"`
-					Value string `yaml:"value"`
+					Name      string `yaml:"name"`
+					Value     string `yaml:"value"`
+					ValueFrom struct {
+						Expression string `yaml:"expression"`
+						Parameter  string `yaml:"parameter"`
+						Path       string `yaml:"path"`
+					} `yaml:"valueFrom"`
 				} `yaml:"parameters"`
 			} `yaml:"outputs"`
 		} `yaml:"templates"`
@@ -439,6 +459,83 @@ func TestNativeTestInvocationsRetainIdentityAndEvidence(t *testing.T) {
 			require.ElementsMatch(t, test.templates, found)
 			require.Contains(t, rendered.String(), "--cascade=foreground")
 			require.Contains(t, rendered.String(), "--wait=true")
+		})
+	}
+}
+
+func TestNativeEntrypointsPreserveLegacyScriptsAndRootOutputs(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct{ file, legacyLeaf string }{
+		{"04-workflowtemplate.yaml.tmpl", "legacy-node-health"},
+		{"08-full-node-workflowtemplate.yaml.tmpl", "legacy-full-node-stage"},
+		{"09-burn-workflowtemplate.yaml.tmpl", "legacy-burn-canary"},
+	} {
+		t.Run(test.file, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := os.ReadFile(test.file)
+			require.NoError(t, err)
+			renderer, err := template.New("workflow").Funcs(sprig.TxtFuncMap()).Parse(string(raw))
+			require.NoError(t, err)
+
+			var rendered bytes.Buffer
+			require.NoError(t, renderer.Execute(&rendered, map[string]any{"Namespace": "project-signal"}))
+
+			var workflow workflowManifest
+			require.NoError(t, yaml.Unmarshal(rendered.Bytes(), &workflow))
+
+			defaults := map[string]string{}
+			for _, parameter := range workflow.Spec.Arguments.Parameters {
+				defaults[parameter.Name] = parameter.Value
+			}
+
+			require.Equal(t, "[]", defaults["participant-plan"])
+			require.Equal(t, "[]", defaults["test-plan"])
+
+			found := []string{}
+
+			for _, node := range workflow.Spec.Templates {
+				switch node.Name {
+				case "certification":
+					found = append(found, node.Name)
+					require.Len(t, node.Steps, 1)
+					require.Len(t, node.Steps[0], 2)
+					require.Equal(t, "legacy-certification", node.Steps[0][0].Template)
+					require.Equal(t, "{{=workflow.parameters['test-plan'] == '[]'}}", node.Steps[0][0].When)
+					require.Equal(t, "planned-certification", node.Steps[0][1].Template)
+					require.Equal(t, "{{=workflow.parameters['test-plan'] != '[]'}}", node.Steps[0][1].When)
+					require.Len(t, node.Outputs.Parameters, 2)
+
+					for _, output := range node.Outputs.Parameters {
+						require.Contains(t, []string{"verdict", "reason"}, output.Name)
+						require.Contains(t, output.ValueFrom.Expression, "steps.legacy")
+						require.Contains(t, output.ValueFrom.Expression, "steps.planned")
+						require.Contains(t, output.ValueFrom.Expression, "Succeeded")
+					}
+				case "planned-certification", "legacy-certification":
+					found = append(found, node.Name)
+					require.Len(t, node.Outputs.Parameters, 2, node.Name)
+
+					for _, output := range node.Outputs.Parameters {
+						require.Contains(t, []string{"verdict", "reason"}, output.Name)
+					}
+				case test.legacyLeaf:
+					found = append(found, node.Name)
+					require.Equal(t, []string{"/bin/bash", "/scripts/{{workflow.parameters.script-key}}"}, node.Container.Command)
+					require.Empty(t, node.Container.Args, "never pass component arguments to an immutable legacy script")
+					require.Empty(t, node.ContainerSet.Containers, "a legacy burn snapshot must execute once")
+					require.Len(t, node.Outputs.Parameters, 2)
+
+					for _, output := range node.Outputs.Parameters {
+						require.Equal(t, "/results/"+output.Name, output.ValueFrom.Path)
+					}
+				}
+			}
+
+			require.ElementsMatch(t, []string{
+				"certification", "planned-certification", "legacy-certification", test.legacyLeaf,
+			}, found)
 		})
 	}
 }

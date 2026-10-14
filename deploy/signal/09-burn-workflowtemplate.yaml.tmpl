@@ -19,7 +19,9 @@ spec:
       - name: run-uid
       - name: participants
       - name: participant-plan
+        value: "[]"
       - name: test-plan
+        value: "[]"
       - name: script-configmap
       - name: script-key
       - name: script-digest
@@ -50,6 +52,29 @@ spec:
   templates:
     - name: certification
       steps:
+        - - name: legacy
+            when: "{{`{{=workflow.parameters['test-plan'] == '[]'}}`}}"
+            template: legacy-certification
+          - name: planned
+            when: "{{`{{=workflow.parameters['test-plan'] != '[]'}}`}}"
+            template: planned-certification
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`workflow.parameters['test-plan'] == '[]'
+                ? (steps.legacy.status == 'Succeeded' ? steps.legacy.outputs.parameters.verdict : 'Inconclusive')
+                : (steps.planned.status == 'Succeeded' ? steps.planned.outputs.parameters.verdict : 'Inconclusive')`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`workflow.parameters['test-plan'] == '[]'
+                ? (steps.legacy.status == 'Succeeded' ? steps.legacy.outputs.parameters.reason : 'RequiredTestCoverageMissing')
+                : (steps.planned.status == 'Succeeded' ? steps.planned.outputs.parameters.reason : 'RequiredTestCoverageMissing')`}}
+
+    - name: planned-certification
+      steps:
         - - name: node
             template: node-tests
             arguments:
@@ -62,6 +87,14 @@ spec:
                   value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
                 - name: observed-gpu-allocatable
                   value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{steps.node.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{steps.node.outputs.parameters.reason}}`}}"
 
     - name: node-tests
       inputs:
@@ -258,4 +291,87 @@ spec:
           - name: storage-integrity-measurements
             valueFrom:
               path: /results/storage-integrity-measurements.txt
+
+    - name: legacy-certification
+      dag:
+        tasks:
+          - name: burn
+            template: legacy-burn-canary
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{tasks.burn.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{tasks.burn.outputs.parameters.reason}}`}}"
+
+    - name: legacy-burn-canary
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+      podSpecPatch: >-
+        {"hostPID":true,
+        "tolerations": {{`{{workflow.parameters.tolerations}}`}},
+        "containers":[{"name":"main","resources":{
+        "requests":{"cpu":"8","memory":"16Gi","ephemeral-storage":"8Gi"},
+        "limits":{"cpu":"8","memory":"16Gi","ephemeral-storage":"8Gi",
+        "nvidia.com/gpu":"{{`{{workflow.parameters.expected-gpu-count}}`}}"}}}]}
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
+        securityContext:
+          privileged: true
+          allowPrivilegeEscalation: true
+        env:
+          - name: EXPECTED_GPU_PRODUCT_REGEX
+            value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+          - name: EXPECTED_GPU_COUNT
+            value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+          - name: OBSERVED_GPU_CAPACITY
+            value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
+          - name: OBSERVED_GPU_ALLOCATABLE
+            value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+          - name: BURN_DURATION_SECONDS
+            value: "{{`{{workflow.parameters.burn-duration-seconds}}`}}"
+          - name: SAMPLE_INTERVAL_SECONDS
+            value: "{{`{{workflow.parameters.sample-interval-seconds}}`}}"
+          - name: POWER_LIMIT_TOLERANCE_PERCENT
+            value: "{{`{{workflow.parameters.power-limit-tolerance-percent}}`}}"
+          - name: POWER_LIMIT_CONSECUTIVE_SAMPLES
+            value: "{{`{{workflow.parameters.power-limit-consecutive-samples}}`}}"
+          - name: CPU_WORKERS
+            value: "{{`{{workflow.parameters.cpu-workers}}`}}"
+          - name: MEMORY_MIB
+            value: "{{`{{workflow.parameters.memory-mib}}`}}"
+          - name: STORAGE_MIB
+            value: "{{`{{workflow.parameters.storage-mib}}`}}"
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+          - name: results
+            mountPath: /results
+          - name: work
+            mountPath: /work
+          - name: memory-work
+            mountPath: /work/memory
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: work
+          emptyDir:
+            sizeLimit: 8Gi
+        - name: memory-work
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /results/verdict
+          - name: reason
+            valueFrom:
+              path: /results/reason
               default: ""

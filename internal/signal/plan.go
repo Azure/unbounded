@@ -219,12 +219,17 @@ func makeTestPlan(spec *signalv1.CertificationRunSpec) ([]signalv1.TestInvocatio
 }
 
 func effectiveTestPlan(run *signalv1.CertificationRun) ([]signalv1.TestInvocation, bool, error) {
+	// An absent immutable plan selects the original script/template protocol.
+	if len(run.Spec.TestPlan) == 0 {
+		return nil, false, nil
+	}
+
 	plan, strict, err := makeTestPlan(&run.Spec)
 	if err != nil || !strict {
 		return nil, strict, err
 	}
 
-	if len(run.Spec.TestPlan) != 0 && !reflect.DeepEqual(plan, run.Spec.TestPlan) {
+	if !reflect.DeepEqual(plan, run.Spec.TestPlan) {
 		return plan, true, fmt.Errorf("immutable test plan does not match the builtin workflow and participant parameters")
 	}
 
