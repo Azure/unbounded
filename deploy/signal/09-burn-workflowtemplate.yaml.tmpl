@@ -61,9 +61,9 @@ spec:
     - name: burn-canary
       nodeSelector:
         kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
-      hostPID: true
       podSpecPatch: >-
-        {"tolerations": {{`{{workflow.parameters.tolerations}}`}},
+        {"hostPID":true,
+        "tolerations": {{`{{workflow.parameters.tolerations}}`}},
         "containers":[{"name":"main","resources":{
         "requests":{"cpu":"8","memory":"16Gi","ephemeral-storage":"8Gi"},
         "limits":{"cpu":"8","memory":"16Gi","ephemeral-storage":"8Gi",

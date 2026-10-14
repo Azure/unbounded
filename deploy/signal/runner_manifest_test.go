@@ -99,7 +99,7 @@ func TestBurnCanaryUsesPinnedRunnerAndDiagnosticProjection(t *testing.T) {
 
 	for _, setting := range []string{
 		"project-signal-gpu-burn-canary",
-		`hostPID: true`,
+		`"hostPID":true`,
 		`privileged: true`,
 		`"nvidia.com/gpu":"{{` + "`{{workflow.parameters.expected-gpu-count}}`" + `}}"`,
 		`name: burn-duration-seconds`,
