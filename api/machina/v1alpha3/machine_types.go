@@ -387,6 +387,7 @@ type RedfishSpec struct {
 type PXESpec struct {
 	// Image is an OCI image reference containing the machine disk image.
 	// The image must contain /disk/disk.img.gz.
+	// VirtualMedia requires a digest reference (image@sha256:...).
 	// Example: "ghcr.io/azure/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
@@ -407,6 +408,8 @@ type PXESpec struct {
 	// NetbootImage is an OCI image reference containing the PXE boot
 	// artifacts used to install Image. When omitted, metalman uses the
 	// default netboot image that corresponds to its release.
+	// VirtualMedia requires this field to be set to a digest reference
+	// (image@sha256:...).
 	// +optional
 	NetbootImage string `json:"netbootImage,omitempty"`
 
@@ -422,6 +425,7 @@ type PXESpec struct {
 	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
 	// HTTP boot with a URL derived from the netboot image metadata.
 	// VirtualMedia mounts an operation-owned bootstrap ISO through Redfish.
+	// It requires redfish, a digest Image, and a digest NetbootImage.
 	// +kubebuilder:validation:Enum=PXE;HTTP;VirtualMedia
 	// +kubebuilder:default=PXE
 	// +optional
