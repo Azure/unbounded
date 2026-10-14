@@ -103,7 +103,8 @@ func TestCreateReapsExpired(t *testing.T) {
 			old := created(t, s, ctx, "first", "node-a")
 			c, ok := s.clock.(*clocktesting.FakeClock)
 			require.True(t, ok)
-			c.Step(time.Hour)
+			// Expiry starts the handoff cooldown. Step past both.
+			c.Step(time.Hour + ledger.HandoffCooldown)
 
 			before := cached(t, s).Data
 

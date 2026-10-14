@@ -42,6 +42,14 @@ const (
 	// The evictor must act on it within this time.
 	ReleaseRetention = 10 * time.Minute
 
+	// HandoffCooldown is how long a node cannot be granted again after a grant
+	// on it ends. The evictor issues a delete authorized by an active grant
+	// only within HandoffCooldown minus a margin of the ledger read that
+	// authorized it, and cancels it at that point. So a delete authorized by
+	// the old grant has finished before a new grant can admit pods. See
+	// evictor.Reconcile for the margin and the clock assumptions.
+	HandoffCooldown = 10 * time.Second
+
 	grantKeyPrefix   = "_grant."
 	releaseKeyPrefix = "_release."
 )
@@ -93,6 +101,18 @@ type ConflictError struct {
 
 func (e *ConflictError) Error() string {
 	return fmt.Sprintf("nodes already granted: %s", strings.Join(e.Nodes, ", "))
+}
+
+// CooldownError reports nodes whose previous grant ended less than
+// HandoffCooldown ago.
+type CooldownError struct {
+	Nodes      []string
+	RetryAfter time.Duration
+}
+
+func (e *CooldownError) Error() string {
+	return fmt.Sprintf("nodes were released less than %s ago, retry in %s: %s",
+		HandoffCooldown, e.RetryAfter.Round(time.Second), strings.Join(e.Nodes, ", "))
 }
 
 // ExistsError reports that a grant with the same name already exists.
@@ -319,6 +339,52 @@ func (l *Ledger) Add(g *Grant) error {
 	}
 
 	return nil
+}
+
+// CheckCooldown returns *CooldownError if any of nodes has a release record
+// that ended less than HandoffCooldown before now, and nil otherwise.
+//
+// The cooldown counts from ReleasedAt, which is the grant's expiry for a grant
+// reaped after it expired. That is enough: the evictor treats a grant as gone
+// from its expiry, whether or not it is still in the ledger.
+func (l *Ledger) CheckCooldown(nodes []string, now time.Time) error {
+	want := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		want[n] = true
+	}
+
+	var (
+		fenced []string
+		until  time.Time
+	)
+
+	for _, r := range l.releases {
+		end := r.ReleasedAt.Add(HandoffCooldown)
+		if !now.Before(end) {
+			continue
+		}
+
+		hit := false
+
+		for _, n := range r.Nodes {
+			if want[n] {
+				fenced = append(fenced, n)
+				hit = true
+			}
+		}
+
+		if hit && end.After(until) {
+			until = end
+		}
+	}
+
+	if len(fenced) == 0 {
+		return nil
+	}
+
+	slices.Sort(fenced)
+
+	return &CooldownError{Nodes: slices.Compact(fenced), RetryAfter: until.Sub(now)}
 }
 
 // Releases returns all release records sorted by UID.

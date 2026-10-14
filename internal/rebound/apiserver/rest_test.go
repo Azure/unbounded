@@ -711,6 +711,13 @@ func TestWatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Wait out the handoff cooldown from the delete above.
+	fc, ok := s.clock.(*clocktesting.FakeClock)
+	if !ok {
+		t.Fatal("expected fake clock")
+	}
+
+	fc.Step(ledger.HandoffCooldown)
 	created(t, s, ctx, "third", "node-a")
 	cached(t, s)
 	event(t, quiet, watch.Added, "third", "5")
@@ -913,4 +920,52 @@ func TestStorageErrors(t *testing.T) {
 	if err := storageError("test", ledger.ErrTooLarge); !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "ledger full") {
 		t.Fatalf("full ledger: %v", err)
 	}
+}
+
+func TestCreateHandoffCooldown(t *testing.T) {
+	s, _, ctx := fixture(t)
+
+	c, ok := s.clock.(*clocktesting.FakeClock)
+	if !ok {
+		t.Fatal("expected fake clock")
+	}
+
+	created(t, s, ctx, "first", "node-a")
+
+	if _, _, err := s.Delete(ctx, "first", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	cached(t, s)
+
+	other := request.WithNamespace(ctx, "other")
+
+	c.Step(ledger.HandoffCooldown - time.Second)
+
+	before := cached(t, s).Data
+
+	for _, dryRun := range []bool{true, false} {
+		opts := &metav1.CreateOptions{}
+		if dryRun {
+			opts.DryRun = []string{metav1.DryRunAll}
+		}
+
+		_, err := s.Create(other, grant("next", "node-a"), nil, opts)
+
+		var status apierrors.APIStatus
+		if !apierrors.IsConflict(err) || !errors.As(err, &status) || status.Status().Details.RetryAfterSeconds != 1 ||
+			!strings.Contains(err.Error(), "node-a") {
+			t.Fatalf("expected cooldown conflict, got %v", err)
+		}
+	}
+
+	if !reflect.DeepEqual(before, cached(t, s).Data) {
+		t.Fatal("cooldown changed ledger")
+	}
+
+	// Other nodes are not fenced.
+	created(t, s, other, "elsewhere", "node-b")
+
+	c.Step(time.Second)
+	created(t, s, other, "next", "node-a")
 }

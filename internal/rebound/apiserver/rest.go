@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -314,6 +315,12 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 			}
 		}
 
+		// A node whose previous grant just ended may still have pod
+		// deletes in flight that the old grant authorized.
+		if err := l.CheckCooldown(record.Nodes, now); err != nil {
+			return err
+		}
+
 		return l.Add(record)
 	})
 	if err != nil {
@@ -508,6 +515,7 @@ func dryRun(values []string) bool { return slices.Contains(values, metav1.DryRun
 func storageError(name string, err error) error {
 	var (
 		conflict      *ledger.ConflictError
+		cooldown      *ledger.CooldownError
 		exists        *ledger.ExistsError
 		validationErr *mutationError
 	)
@@ -515,6 +523,11 @@ func storageError(name string, err error) error {
 	switch {
 	case errors.As(err, &conflict):
 		return apierrors.NewConflict(rebound.GroupResource(), name, err)
+	case errors.As(err, &cooldown):
+		status := apierrors.NewConflict(rebound.GroupResource(), name, err)
+		status.ErrStatus.Details.RetryAfterSeconds = int32(math.Ceil(cooldown.RetryAfter.Seconds()))
+
+		return status
 	case errors.As(err, &exists):
 		return apierrors.NewAlreadyExists(rebound.GroupResource(), name)
 	case errors.Is(err, ledger.ErrTooLarge):

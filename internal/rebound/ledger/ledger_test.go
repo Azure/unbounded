@@ -353,3 +353,63 @@ func TestSize(t *testing.T) {
 	require.Equal(t, 9, Size(map[string]string{"abc": "de", "f": "ghi"}))
 	require.Equal(t, 4, Size(map[string]string{"é": "é"}))
 }
+
+func TestCheckCooldown(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a", "node-b")
+	require.NoError(t, l.Add(g))
+
+	// Removed before expiry: the cooldown counts from the removal.
+	removed := g.CreatedAt.Add(time.Minute)
+	require.True(t, l.Remove(g.Key(), removed))
+
+	require.NoError(t, l.CheckCooldown([]string{"node-c"}, removed))
+
+	err := l.CheckCooldown([]string{"node-c", "node-b", "node-a"}, removed.Add(time.Second))
+
+	var cooldown *CooldownError
+	require.ErrorAs(t, err, &cooldown)
+	require.Equal(t, []string{"node-a", "node-b"}, cooldown.Nodes)
+	require.Equal(t, HandoffCooldown-time.Second, cooldown.RetryAfter)
+
+	require.NoError(t, l.CheckCooldown([]string{"node-a"}, removed.Add(HandoffCooldown)))
+
+	// Release records outlive the cooldown, so pruning cannot end it early.
+	_, next := l.Reap(removed.Add(HandoffCooldown-time.Nanosecond), nil)
+	require.Len(t, l.Releases(), 1)
+	require.Equal(t, removed.Add(ReleaseRetention), next)
+}
+
+func TestCheckCooldownExpiredGrant(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	require.NoError(t, l.Add(g))
+
+	// A grant reaped late ends at its expiry, so the cooldown does too.
+	reaped := g.ExpiresAt.Add(HandoffCooldown / 2)
+	l.Reap(reaped, nil)
+	require.Error(t, l.CheckCooldown([]string{"node-a"}, reaped))
+	require.NoError(t, l.CheckCooldown([]string{"node-a"}, g.ExpiresAt.Add(HandoffCooldown)))
+
+	l = New()
+	require.NoError(t, l.Add(testGrant("second", "node-a")))
+	l.Reap(g.ExpiresAt.Add(time.Hour), nil)
+	require.NoError(t, l.CheckCooldown([]string{"node-a"}, g.ExpiresAt.Add(time.Hour)))
+}
+
+func TestCheckCooldownLatestRelease(t *testing.T) {
+	end := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	// Older records without dropAt still fence their nodes.
+	l := Parse(map[string]string{
+		"_release.old": `{"namespace":"tenant","nodes":["node-a"],"createdAt":"2026-10-13T11:00:00Z","releasedAt":"2026-10-13T11:59:58Z"}`,
+		"_release.new": `{"namespace":"tenant","nodes":["node-a"],"createdAt":"2026-10-13T11:00:00Z","releasedAt":"2026-10-13T12:00:00Z","dropAt":"2026-10-13T12:10:00Z"}`,
+	})
+	require.Len(t, l.Releases(), 2)
+
+	err := l.CheckCooldown([]string{"node-a"}, end)
+
+	var cooldown *CooldownError
+	require.ErrorAs(t, err, &cooldown)
+	require.Equal(t, HandoffCooldown, cooldown.RetryAfter)
+	require.Contains(t, err.Error(), "retry in 10s")
+}
