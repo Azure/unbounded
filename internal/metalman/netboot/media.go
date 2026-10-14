@@ -442,7 +442,7 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 	}
 	// Ubuntu GRUB builds use different compiled prefixes. All copies contain
 	// only the same live config handoff, never install intent or credentials.
-	// On Rack SCM USB media, GRUB sees (hd0,gpt2) and finds its config next
+	// On rack manager USB media, GRUB sees (hd0,gpt2) and finds its config next
 	// to the EFI binary.
 	for _, dst := range []string{"/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"} {
 		if err := run(ctx, "mcopy", "-i", fat, configPath, "::"+dst); err != nil {
@@ -457,7 +457,7 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 	}
 
 	// Use the same FAT image for El Torito EFI boot and a GPT EFI System
-	// Partition, since Rack SCM exposes the image as a removable USB disk.
+	// Partition, since some rack managers expose the image as a removable USB disk.
 	return run(ctx, "xorriso", "-as", "mkisofs", "-quiet", "-V", "UBMEDIA", "--modification-date=2020010100000000", "--set_all_file_dates", "2020010100000000", "-o", filepath.Join(dir, "bootstrap.iso"), "-append_partition", "2", "0xef", fat, "-appended_part_as_gpt", "-e", "--interval:appended_partition_2:all::", "-no-emul-boot", root)
 }
 

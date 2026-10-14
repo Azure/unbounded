@@ -130,7 +130,7 @@ const (
 type Client struct {
 	session  *bmcSession
 	deviceID string
-	rscm     *rackSCM
+	rack     *rackManager
 }
 
 // Dial connects to a BMC and returns a ready-to-use Client.
@@ -145,14 +145,14 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 		pass:       pass,
 	}
 
-	rack, err := detectRackSCM(ctx, s)
+	rack, err := detectRackManager(ctx, s)
 	if err != nil {
 		httpClient.CloseIdleConnections()
 		return nil, err
 	}
 
 	if rack != nil {
-		return &Client{session: s, deviceID: rack.slot, rscm: rack}, nil
+		return &Client{session: s, deviceID: rack.slot, rack: rack}, nil
 	}
 
 	token, location, err := createSession(ctx, httpClient, url, user, pass)
@@ -178,14 +178,14 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 func (c *Client) Close() {
 	c.session.close()
 
-	if c.rscm != nil {
+	if c.rack != nil {
 		c.session.httpClient.CloseIdleConnections()
 	}
 }
 
 // PowerState returns the current power state of the system.
 func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return c.rackPowerState(ctx)
 	}
 
@@ -214,7 +214,7 @@ func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 
 // Reset sends a ComputerSystem.Reset action.
 func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
-	if c.rscm != nil {
+	if c.rack != nil {
 		if resetType != ResetForceOff && resetType != ResetOn {
 			return ErrUnsupported
 		}
@@ -241,7 +241,7 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 
 // GetBootConfig returns the current boot source override configuration.
 func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return c.rackBootConfig(ctx)
 	}
 
@@ -288,7 +288,7 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 // SetBootOverride sets the boot source override target and enabled mode.
 // Returns ErrUnsupported if the BMC does not support the PATCH.
 func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled BootEnabled) error {
-	if c.rscm != nil {
+	if c.rack != nil {
 		if target != BootTargetPxe && target != BootTargetHdd {
 			return ErrUnsupported
 		}
@@ -334,7 +334,7 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 // SetHTTPBootOverride sets a persistent Redfish UEFI HTTP boot override.
 // Returns ErrUnsupported if the BMC does not support the PATCH.
 func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return ErrUnsupported
 	}
 
@@ -370,7 +370,7 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 // GetBIOSHTTPBootURI returns the pending BIOS UEFI HTTP boot URI.
 // Returns ErrUnsupported if the BMC does not support BIOS settings.
 func (c *Client) GetBIOSHTTPBootURI(ctx context.Context) (string, error) {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return "", ErrUnsupported
 	}
 
@@ -406,7 +406,7 @@ func (c *Client) GetBIOSHTTPBootURI(ctx context.Context) (string, error) {
 // SetBIOSHTTPBootURI sets the pending BIOS UEFI HTTP boot URI.
 // Returns ErrUnsupported if the BMC does not support BIOS settings.
 func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return ErrUnsupported
 	}
 
@@ -438,7 +438,7 @@ func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
 // SetBIOSStaticIPv4 sets pending BIOS UEFI HTTP boot IPv4 settings.
 // Returns ErrUnsupported if the BMC does not support BIOS settings.
 func (c *Client) SetBIOSStaticIPv4(ctx context.Context, config StaticIPv4Config) error {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return ErrUnsupported
 	}
 
@@ -488,7 +488,7 @@ func (c *Client) SetBIOSStaticIPv4(ctx context.Context, config StaticIPv4Config)
 // The interface is selected by MACAddress or PermanentMACAddress.
 // Returns ErrUnsupported if the BMC does not expose writable EthernetInterface resources.
 func (c *Client) SetStaticIPv4(ctx context.Context, config StaticIPv4Config) error {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return ErrUnsupported
 	}
 
@@ -545,7 +545,7 @@ func (c *Client) SetStaticIPv4(ctx context.Context, config StaticIPv4Config) err
 // DisableBootOverride disables the boot source override.
 // Returns ErrUnsupported if the BMC does not support disabling.
 func (c *Client) DisableBootOverride(ctx context.Context) error {
-	if c.rscm != nil {
+	if c.rack != nil {
 		return c.rackSetBoot(ctx, "None")
 	}
 

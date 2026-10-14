@@ -302,7 +302,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 					return failTarget(target, reasonTimedOut, "host did not boot the virtual media", now)
 				}
 
-				// Firmware 1.23.13 can keep a broken virtual drive for an image
+				// Some firmware can keep a broken virtual drive for an image
 				// name, and mounting the same name again does not fix it. Replace
 				// the staged image with a new name before the next boot.
 				b.BootAttempts++
@@ -452,7 +452,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 }
 
 // newMediaID returns 128 random bits as an unguessable capability. The
-// ub-<32 lowercase hex>.iso name stays below Rack SCM's 40-character limit.
+// ub-<32 lowercase hex>.iso name stays below the 40-character limit of tested rack manager firmware.
 func newMediaID() (string, error) {
 	var capability [16]byte
 	if _, err := rand.Read(capability[:]); err != nil {

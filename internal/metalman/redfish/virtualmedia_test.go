@@ -214,7 +214,7 @@ func TestVirtualMediaRecovery(t *testing.T) {
 				switch r.URL.Path {
 				case rackManagerPath + "/SystemPower":
 					_, _ = w.Write([]byte(`{"System Power States":{"7":"Off"}}`))
-				case rackManagerPath + "/Actions/Oem/Microsoft.SystemPowerOn":
+				case rackPowerOnPath:
 					restores++
 
 					w.WriteHeader(http.StatusNoContent)
@@ -237,7 +237,7 @@ func TestVirtualMediaRecovery(t *testing.T) {
 			})
 			c := dialRack(t, srv, "7")
 			now := time.Now()
-			c.rscm.now = func() time.Time { return now }
+			c.rack.now = func() time.Time { return now }
 
 			invoke := func() error {
 				if operation == "mount" {
@@ -261,16 +261,16 @@ func TestVirtualMediaRecovery(t *testing.T) {
 			}
 
 			require.Zero(t, restores)
-			require.False(t, c.rscm.attempted)
-			require.True(t, c.rscm.deadline.IsZero())
-			require.Empty(t, c.rscm.pending)
+			require.False(t, c.rack.attempted)
+			require.True(t, c.rack.deadline.IsZero())
+			require.Empty(t, c.rack.pending)
 			require.ErrorIs(t, c.Reset(t.Context(), ResetOn), ErrNotReady)
-			deadline := c.rscm.deadline
+			deadline := c.rack.deadline
 
 			require.ErrorIs(t, invoke(), ErrNotReady)
 			require.ErrorIs(t, invoke(), ErrNotReady)
 			require.Equal(t, 1, restores)
-			require.Equal(t, deadline, c.rscm.deadline)
+			require.Equal(t, deadline, c.rack.deadline)
 
 			now = now.Add(rackRecoveryGrace + time.Second)
 
@@ -282,9 +282,9 @@ func TestVirtualMediaRecovery(t *testing.T) {
 			ready = true
 
 			require.NoError(t, invoke())
-			require.True(t, c.rscm.attempted)
+			require.True(t, c.rack.attempted)
 			require.NoError(t, c.Reset(t.Context(), ResetOn))
-			require.False(t, c.rscm.attempted)
+			require.False(t, c.rack.attempted)
 		})
 	}
 }
@@ -359,7 +359,7 @@ func TestVirtualMediaCleanupNothingMounted(t *testing.T) {
 			unmounts++
 
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(completionBody("Failure", "Error unmounting remote media redirection: Rmedia Support is not enabled", true)))
+			_, _ = w.Write([]byte(completionBody("Failure", "Error unmounting remote media: Remote media support is not enabled", true)))
 		default:
 			t.Errorf("unexpected request %s", r.URL.Path)
 		}
@@ -513,7 +513,7 @@ func TestVirtualMediaRecoveryFailure(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		case rackManagerPath + "/SystemPower":
 			_, _ = w.Write([]byte(`{"System Power States":{"7":"Off"}}`))
-		case rackManagerPath + "/Actions/Oem/Microsoft.SystemPowerOn":
+		case rackPowerOnPath:
 			restores++
 
 			w.WriteHeader(http.StatusForbidden)

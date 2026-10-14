@@ -171,14 +171,24 @@ on these endpoints. Tested firmware ignores `Once` and keeps every boot override
 
 Set `spec.host.netboot.bootProtocol: VirtualMedia` to boot an operation-owned UEFI
 ISO through a supported rack manager. Metalman detects the endpoint from
-`redfish.url`, such as `https://manager:8080/7`; there is no public `RackSCM` field.
+`redfish.url`, such as `https://manager:8080/7`; there is no vendor-specific field.
 This mode is opt-in and does not change the default PXE or HTTP paths.
 
+A supported rack manager is one Redfish service in front of the BMCs of many
+servers. It must provide:
+
+- Each server at `/<slot>/redfish/v1/System`.
+- `/redfish/v1/Managers/RackManager`, with an OEM action whose name ends in
+  `#SystemPower.On`, and the `SystemPower` power map.
+- `Tftp.Get` and `Tftp.Delete` actions under `RackManager/Tftp`.
+- `ComputerSystem.RemoteDriveMount` and `ComputerSystem.RemoteDriveUnmount` on
+  each server, and the `RemoteDrive` boot target.
+
 {{< callout type="warning" >}}
-Partly tested on hardware: one arm64 server behind a rack manager running firmware
-1.23.13. On that setup, staging, mounting, UEFI boot from the ISO, static GRUB
-networking, kernel and initrd download, cleanup, and reboot to disk all worked.
-A full disk install, amd64, Secure Boot, and other firmware are not yet tested.
+Tested on one arm64 server behind one rack manager. A full install worked:
+staging, mounting, UEFI boot from the ISO, static GRUB networking, disk install,
+cleanup, reboot to disk, and cluster join. amd64, Secure Boot, and other rack
+manager firmware are not yet tested.
 {{< /callout >}}
 
 ### Requirements
@@ -294,7 +304,7 @@ Restore connectivity and let cleanup finish; do not remove the finalizer to bypa
 
 ### Hardware results
 
-Tested on one arm64 server behind a rack manager running firmware 1.23.13:
+Tested on one arm64 server behind one rack manager:
 
 - `RemoteDriveMount.ImageName` finds files staged by `Tftp.Get`. Image names must
   be shorter than 40 characters, so Metalman uses `ub-<32 hex>.iso` and
@@ -305,8 +315,8 @@ Tested on one arm64 server behind a rack manager running firmware 1.23.13:
   seconds. Metalman allows three minutes for each rack manager request.
 - Unmount can be repeated. Deleting a missing file returns "No such file or
   directory", which Metalman treats as already deleted.
-- Unmount fails with "Rmedia Support is not enabled" when nothing is mounted,
-  for example after a power cycle. Metalman treats this as unmounted.
+- Unmount fails with a "... support is not enabled" message when nothing is
+  mounted, for example after a power cycle. Metalman treats this as unmounted.
 - After a power cycle that follows a media boot, the first mount of a new name
   often leaves no usable drive. Linux saw the disk but reads failed, or the BMC
   USB devices were missing, and UEFI did not find a USB boot device. Mounting the
@@ -321,8 +331,6 @@ Tested on one arm64 server behind a rack manager running firmware 1.23.13:
 
 ### Hardware validation checklist
 
-- Run a full disk install. Confirm the installer reaches `/complete` and `/ready`,
-  and the installed host joins the cluster. Reboot again and confirm no reinstall.
 - Boot the ISO on amd64 and with Secure Boot on.
 - Test a server whose slot AC power is off, and other rack manager firmware.
 - Restart Metalman during staging, installation, and cleanup. Test callback and

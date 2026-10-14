@@ -18,8 +18,8 @@ type Source struct {
 
 // PrimerName returns a second name for the same ISO, or "" when name has no
 // reserved prefix. Some managers attach a readable drive only after a mount
-// under a different name, so clients may mount this name first. Rack SCM
-// firmware 1.23.13 showed this after power cycles that followed a media boot.
+// under a different name, so clients may mount this name first. Tested rack
+// manager firmware showed this after power cycles that followed a media boot.
 func PrimerName(name string) string {
 	rest, ok := strings.CutPrefix(name, "ub-")
 	if !ok {

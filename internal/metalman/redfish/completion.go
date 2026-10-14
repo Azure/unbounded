@@ -6,15 +6,53 @@ package redfish
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 )
 
+// completionMessage is one @Message.ExtendedInfo entry. Some rack managers
+// report the command result as a CompletionCode inside a vendor Oem object.
+// The vendor key is not fixed, so every Oem object is checked.
 type completionMessage struct {
-	Oem struct {
-		Microsoft struct {
-			CompletionCode string
-			Description    string
-		} `json:"Microsoft"`
-	} `json:"Oem"`
+	Oem map[string]json.RawMessage `json:"Oem"`
+}
+
+// completion returns the first CompletionCode found in the vendor Oem
+// objects, in key order. It returns ok false if there is none.
+func (m completionMessage) completion() (code, description string, ok bool, err error) {
+	keys := make([]string, 0, len(m.Oem))
+	for key := range m.Oem {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	for _, key := range keys {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(m.Oem[key], &fields) != nil {
+			continue
+		}
+
+		raw, found := fields["CompletionCode"]
+		if !found {
+			continue
+		}
+
+		if err := json.Unmarshal(raw, &code); err != nil {
+			return "", "", false, fmt.Errorf("parsing %s completion code: %w", key, err)
+		}
+
+		// The description is optional context. A missing or non-string value
+		// leaves it empty.
+		if raw, found := fields["Description"]; found {
+			if json.Unmarshal(raw, &description) != nil {
+				description = ""
+			}
+		}
+
+		return code, description, true, nil
+	}
+
+	return "", "", false, nil
 }
 
 type completionFailure struct {
@@ -22,10 +60,10 @@ type completionFailure struct {
 }
 
 func (e *completionFailure) Error() string {
-	return "Microsoft CompletionCode Failure: " + e.description
+	return "completion code Failure: " + e.description
 }
 
-// checkCompletion only checks the Microsoft status extension, not the error key.
+// checkCompletion only checks vendor completion codes, not the error key.
 // Some rack managers put successful command results inside error.
 func checkCompletion(data []byte) error {
 	var root map[string]json.RawMessage
@@ -48,12 +86,17 @@ func checkCompletion(data []byte) error {
 
 		var messages []completionMessage
 		if err := json.Unmarshal(raw, &messages); err != nil {
-			return fmt.Errorf("parsing Microsoft completion status: %w", err)
+			return fmt.Errorf("parsing completion status: %w", err)
 		}
 
 		for _, message := range messages {
-			if message.Oem.Microsoft.CompletionCode == "Failure" {
-				return &completionFailure{description: message.Oem.Microsoft.Description}
+			code, description, ok, err := message.completion()
+			if err != nil {
+				return err
+			}
+
+			if ok && code == "Failure" {
+				return &completionFailure{description: description}
 			}
 		}
 	}

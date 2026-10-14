@@ -76,8 +76,8 @@ uses the `PXESpec` type; there is no top-level `spec.pxe` field.
 | `host.netboot.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
 
 `VirtualMedia` requires `redfish` with a supported rack-manager URL such as
-`https://manager:8080/7`. Endpoint detection is automatic; there is no public
-`RackSCM` field. Both `image` and the explicit `netbootImage` must use `@sha256:`
+`https://manager:8080/7`. Endpoint detection is automatic; there is no
+vendor-specific field. Both `image` and the explicit `netbootImage` must use `@sha256:`
 with 64 lowercase hex digits. The netboot image must contain the updated
 `unbounded-uefi-v1` artifacts, not just older PXE files.
 

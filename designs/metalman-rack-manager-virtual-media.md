@@ -1,7 +1,7 @@
 # Metalman: Rack Manager Support and Virtual Media Install
 
-This doc explains how Metalman manages servers behind a rack manager (Rack SCM),
-and how it reimages them by booting a small ISO through the rack manager's
+This doc explains how Metalman manages servers behind an OpenBMC-style rack
+manager, and how it reimages them by booting a small ISO through the rack manager's
 virtual drive. It covers the Redfish client, the operation state machine, the
 ISO, the installer, the machine images, and what we learned on real hardware.
 
@@ -9,26 +9,26 @@ For setup steps and the user-facing contract, see the
 [PXE guide](../docs/content/guides/pxe.md), sections "Virtual media
 (experimental)" and "Machine images". This doc explains the internals.
 
-Line numbers below refer to commit `c6198af43` on `metalman-extended`.
+Line numbers are a guide and may drift as the code changes.
 
 ## Background
 
-A rack manager fronts up to 48 servers ("slots"). Its Redfish API is not
-standard:
+A rack manager fronts many servers ("slots") and talks to each server's BMC.
+Its Redfish API is not standard:
 
 - Each server lives under a path prefix: `https://manager/7/redfish/v1/System`
   is slot 7. Note `System`, not `Systems/{id}`.
 - Rack-wide actions live at the root: `/redfish/v1/Managers/RackManager/...`.
-- Most responses carry a Microsoft completion code. A request can return HTTP
-  200 and still fail.
+- Most responses carry a completion code in an OEM extension. A request can
+  return HTTP 200 and still fail.
 - There is no session login. Only HTTP basic auth works.
 
-The vendor spec (`tmp/redfish-spec.pdf`, firmware 1.45.5) is the starting point,
-but the tested rack ran firmware 1.23.13 and behaved differently in several
-places. Where they differ, the code follows the hardware.
+The code avoids vendor names. It finds OEM data and actions by shape, not by
+vendor key (see "Detection"). Where documented behavior and tested firmware
+differ, the code follows the hardware.
 
-The servers we target (GB200 arm64) get DHCP from a network we do not control,
-so PXE is not an option. Instead Metalman builds a per-machine ISO, stages it on
+The servers we target get DHCP from a network we do not control, so PXE is not
+an option. Instead Metalman builds a per-machine ISO, stages it on
 the rack manager, mounts it as a virtual drive, and boots the host from it.
 
 ## Design rules
@@ -46,7 +46,7 @@ the rack manager, mounts it as a virtual drive, and boots the host from it.
 
 | Part | Code | Role |
 |---|---|---|
-| Rack manager client | `internal/metalman/redfish/rscm.go` | Detection, slot paths, completion codes, power, boot override |
+| Rack manager client | `internal/metalman/redfish/rackmanager.go` | Detection, slot paths, completion codes, power, boot override |
 | Virtual media client | `internal/metalman/redfish/virtualmedia.go` | Stage, mount, boot, cleanup, delete |
 | Shared interfaces | `internal/metalman/bootmedia/types.go` | `Provider` (builds ISOs) and `Client` (talks to the BMC) |
 | Operation controller | `internal/metalman/machineops/virtualmedia.go` | Phase state machine, retries, cleanup, finalizer |
@@ -60,40 +60,44 @@ the rack manager, mounts it as a virtual drive, and boots the host from it.
 
 ### Detection
 
-`Dial` calls `detectRackSCM` (`rscm.go:44-108`) only when the URL has a path.
-It sends `GET /redfish/v1/Managers/RackManager` to the origin root and checks:
+`Dial` calls `detectRackManager` (`rackmanager.go:50`) only when the URL has a
+path. It sends `GET /redfish/v1/Managers/RackManager` to the origin root and
+checks:
 
 - `Id` is `RackManager` and `@odata.id` matches.
-- `Oem.Microsoft.@odata.type` looks like `#OcsRackManager.*.RackManager`.
-- The path is a slot number from `/1` to `/48`.
+- `Actions.Oem` has an action whose name ends in `#SystemPower.On` and whose
+  target is under the rack manager (`slotPowerOnTarget`, `:122`). The client
+  saves that target and uses it for slot power-on. No vendor key is hardcoded.
+- The path is a positive slot number, such as `/7`.
 
 If the probe fails for any reason other than the caller's context or a TLS pin
 mismatch, Metalman falls back to standard Redfish. So a normal BMC behind a
 proxy path still works.
 
 Once confirmed, the client uses a copy of the pinned HTTP client with a
-three-minute timeout (`rscm.go:100-105`), because some rack actions block for a
+three-minute timeout (`rackmanager.go:112`), because some rack actions block for a
 long time (see "Hardware findings").
 
 ### Requests and errors
 
-`rackRequest` (`rscm.go:111`) checks both the HTTP status and the completion
-code. The code can be at the top level or inside an `error` object. A
-`Success` inside `error` counts as success.
+`rackRequest` (`rackmanager.go:144`) checks both the HTTP status and the
+completion code. The code can be at the top level or inside an `error` object.
+The client reads `CompletionCode` from any key under `Oem`
+(`completion.go:21`). A `Success` inside `error` counts as success.
 
-`rackUnavailable` (`rscm.go:342`) decides when the slot's BMC is not answering
+`rackUnavailable` (`rackmanager.go:375`) decides when the slot's BMC is not answering
 (for example "failed to query" or "failed to discover"). These errors may turn
-into `ErrNotReady` (`rscm.go:23`), which tells the controller to wait instead
+into `ErrNotReady` (`rackmanager.go:24`), which tells the controller to wait instead
 of using up an attempt.
 
 ### Power
 
 - Power state comes from the blade (`GET /{slot}/redfish/v1/System`). If that
-  fails, the rack power map (`SystemPower`) is used (`rscm.go:173`).
+  fails, the rack power map (`SystemPower`) is used (`rackmanager.go:206`).
 - Power off is `ComputerSystem.Reset` with `ForceOff`. Power on uses `On`.
 - If the BMC does not answer and the rack shows the slot off, Metalman sends
-  the rack's `SystemPowerOn` action once and waits up to ten minutes
-  (`rscm.go:250-325`). It does this only for `Reset(On)` and for clearing the
+  the discovered slot power-on action once and waits up to ten minutes
+  (`rackmanager.go:283-370`). It does this only for `Reset(On)` and for clearing the
   boot override, because on tested firmware this action also turns the host on.
   Cleanup and media steps never change power.
 
@@ -112,10 +116,10 @@ All methods are in `redfish/virtualmedia.go`. Names must match
 | Method | Requests | Notes |
 |---|---|---|
 | `StageVirtualMedia` (`:53`) | `POST /redfish/v1/Managers/RackManager/Tftp/Actions/Tftp.Get` with `{Server, File}`, for the primer name and then the real name | The rack pulls the file from Metalman over TFTP (UDP 69). Blocks until done. |
-| `MountVirtualMedia` (`:83`) | `POST /{slot}/redfish/v1/System/Actions/ComputerSystem.RemoteDriveMount` with `{ImageName}`, primer then real | About 20 seconds each. |
-| `SetVirtualMediaBoot` (`:103`) | `PATCH System` with mode `UEFI`, then target `RemoteDrive` | |
-| `CleanupVirtualMedia` (`:123`) | `PATCH` target `Hdd`, then `RemoteDriveUnmount` | "Rmedia support is not enabled" means nothing is mounted, so it counts as success. |
-| `DeleteVirtualMedia` (`:154`) | `Tftp.Delete` for primer and real name | "No such file or directory" counts as success. |
+| `MountVirtualMedia` (`:82`) | `POST /{slot}/redfish/v1/System/Actions/ComputerSystem.RemoteDriveMount` with `{ImageName}`, primer then real | About 20 seconds each. |
+| `SetVirtualMediaBoot` (`:102`) | `PATCH System` with mode `UEFI`, then target `RemoteDrive` | |
+| `CleanupVirtualMedia` (`:122`) | `PATCH` target `Hdd`, then `RemoteDriveUnmount` | An unmount error saying support "is not enabled" means nothing is mounted, so it counts as success. |
+| `DeleteVirtualMedia` (`:155`) | `Tftp.Delete` for primer and real name | "No such file or directory" counts as success. |
 
 The primer name is `up-<id>.iso` (`bootmedia.PrimerName`, `types.go:23`). It is
 the same ISO. See "Why two mounts" below.
@@ -306,7 +310,8 @@ runs on the Azure Linux kernel (see "Netboot image"). Main steps in
 `images/netboot/Containerfile`:
 
 - The installer kernel comes from Azure Linux 3.0 (`:6-10`). The Ubuntu generic
-  kernel has no driver for the Microsoft MANA NIC used by GB200 hosts.
+  kernel has no driver for the MANA NIC (upstream `mana` driver) on the tested
+  hosts.
 - Azure Linux ships compressed modules. The build decompresses them and runs
   `depmod` (`:35-36`), so the Ubuntu initrd's tools can load them.
 - `init.cpio` copies network, storage, file system, crypto, and lib modules,
@@ -320,7 +325,7 @@ runs on the Azure Linux kernel (see "Netboot image"). Main steps in
 
 | Image | Contents |
 |---|---|
-| `host-ubuntu2404` | Ubuntu 24.04 cloud image. No MANA driver, so it has no network on GB200. |
+| `host-ubuntu2404` | Ubuntu 24.04 cloud image. No MANA driver, so it has no network on hosts that use a MANA NIC. |
 | `host-azurelinux3` | Azure Linux 3.0, generic for amd64 and arm64. |
 | `host-azurelinux3-nvidia` | Same, with the HWE kernel and NVIDIA open driver. |
 
@@ -356,9 +361,9 @@ the released agent until they are.
 
 ## Hardware findings
 
-Tested on one GB200 arm64 server, slot 28, rack manager firmware 1.23.13.
+Tested on one arm64 server behind one rack manager.
 
-### Behavior that differs from the spec
+### Firmware behavior to know
 
 - `RemoteDriveMount` image names must be shorter than 40 characters. That is
   why the ID is 32 hex characters.
@@ -369,13 +374,13 @@ Tested on one GB200 arm64 server, slot 28, rack manager firmware 1.23.13.
 - The rack's TFTP client sends no options (512-byte blocks), about 1 to 3 MB/s.
   Keep the ISO small.
 - `ForceOff` works, though the system does not list it.
-- The rack power map shows host power, not slot AC. `SystemPowerOn` turns the
+- The rack power map shows host power, not slot AC. The slot power-on action turns the
   host on.
-- Unmounting when nothing is mounted fails with "Rmedia Support is not
-  enabled". Deleting a missing file fails with "No such file or directory".
-- `GET .../Tftp` (the file list) hangs for minutes. `Tftp/FileInfo/<name>/sha256`
-  works, but `includehash` from the spec does not.
-- An absent slot returns HTTP 500 "Failed to discover system control interface".
+- Unmounting when nothing is mounted fails with an error saying remote media
+  support "is not enabled". Deleting a missing file fails with "No such file
+  or directory".
+- `GET .../Tftp` (the file list) hangs for minutes. Metalman never calls it.
+- An absent slot returns HTTP 500 with a "failed to discover" message.
 
 ### Why two mounts
 

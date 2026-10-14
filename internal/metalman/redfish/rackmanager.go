@@ -12,13 +12,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// ErrNotReady means a blade is waking after an AC power-on request.
+// ErrNotReady means a blade is waking after a slot power-on request.
 // The caller must retry the original operation. It has not completed yet.
 var ErrNotReady = errors.New("BMC is not ready after AC power on")
 
@@ -29,9 +30,14 @@ const (
 	rackRequestTimeout = 3 * time.Minute
 )
 
-type rackSCM struct {
+// rackManager talks to a rack manager that fronts many blade BMCs. A blade
+// is addressed by a slot number placed before /redfish in the URL, for example
+// https://manager/7/redfish/v1/System. Rack-wide resources live at the origin
+// root under /redfish/v1/Managers/RackManager.
+type rackManager struct {
 	root             *bmcSession
 	slot             string
+	powerOnTarget    string
 	mu               sync.Mutex
 	now              func() time.Time
 	attempted        bool
@@ -41,7 +47,7 @@ type rackSCM struct {
 	pendingCompleted bool
 }
 
-func detectRackSCM(ctx context.Context, blade *bmcSession) (*rackSCM, error) {
+func detectRackManager(ctx context.Context, blade *bmcSession) (*rackManager, error) {
 	u, err := url.Parse(blade.baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing BMC URL: %w", err)
@@ -70,19 +76,22 @@ func detectRackSCM(ctx context.Context, blade *bmcSession) (*rackSCM, error) {
 	var manager struct {
 		ID      string `json:"Id"`
 		ODataID string `json:"@odata.id"`
-		Oem     struct {
-			Microsoft struct {
-				Type string `json:"@odata.type"`
-			} `json:"Microsoft"`
-		} `json:"Oem"`
+		Actions struct {
+			Oem map[string]struct {
+				Target string `json:"target"`
+			} `json:"Oem"`
+		} `json:"Actions"`
 	}
 	if err := json.Unmarshal(data, &manager); err != nil {
 		return nil, nil
 	}
 
-	if manager.ID != "RackManager" || manager.ODataID != rackManagerPath ||
-		!strings.HasPrefix(manager.Oem.Microsoft.Type, "#OcsRackManager.") ||
-		!strings.HasSuffix(manager.Oem.Microsoft.Type, ".RackManager") {
+	if manager.ID != "RackManager" || manager.ODataID != rackManagerPath {
+		return nil, nil
+	}
+
+	powerOnTarget := slotPowerOnTarget(manager.Actions.Oem)
+	if powerOnTarget == "" {
 		return nil, nil
 	}
 
@@ -93,8 +102,8 @@ func detectRackSCM(ctx context.Context, blade *bmcSession) (*rackSCM, error) {
 	slot := strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), "/")
 
 	n, err := strconv.Atoi(slot)
-	if err != nil || n < 1 || n > 48 || strconv.Itoa(n) != slot || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("RSCM URL path must be a slot from /1 to /48, got %q", u.EscapedPath())
+	if err != nil || n < 1 || strconv.Itoa(n) != slot || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("rack manager URL path must be a slot number such as /7, got %q", u.EscapedPath())
 	}
 
 	// Synchronous TFTP transfers and remote-drive mounts can exceed 30 seconds.
@@ -104,7 +113,31 @@ func detectRackSCM(ctx context.Context, blade *bmcSession) (*rackSCM, error) {
 	blade.httpClient = &httpClient
 	root.httpClient = &httpClient
 
-	return &rackSCM{root: root, slot: slot, now: time.Now}, nil
+	return &rackManager{root: root, slot: slot, powerOnTarget: powerOnTarget, now: time.Now}, nil
+}
+
+// slotPowerOnTarget finds the vendor action that powers on one slot. Its key
+// ends with "#SystemPower.On", after a vendor schema prefix. The target must
+// be under the rack manager.
+func slotPowerOnTarget(actions map[string]struct {
+	Target string `json:"target"`
+},
+) string {
+	keys := make([]string, 0, len(actions))
+	for key := range actions {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	for _, key := range keys {
+		target := actions[key].Target
+		if strings.HasSuffix(key, "#SystemPower.On") && strings.HasPrefix(target, rackManagerPath+"/") {
+			return target
+		}
+	}
+
+	return ""
 }
 
 // rackRequest rejects malformed successful responses before recovery can hide them.
@@ -124,11 +157,11 @@ func rackRequest(ctx context.Context, session *bmcSession, method, path string, 
 
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(data, &object); err != nil {
-		return nil, fmt.Errorf("parsing RSCM %s %s: %w", method, path, err)
+		return nil, fmt.Errorf("parsing rack manager response %s %s: %w", method, path, err)
 	}
 
 	if object == nil {
-		return nil, fmt.Errorf("RSCM %s %s returned no object", method, path)
+		return nil, fmt.Errorf("rack manager %s %s returned no object", method, path)
 	}
 
 	if raw, ok := object["error"]; ok {
@@ -140,7 +173,7 @@ func rackRequest(ctx context.Context, session *bmcSession, method, path string, 
 		}
 
 		for _, message := range result.Info {
-			if message.Oem.Microsoft.CompletionCode != "Success" {
+			if code, _, _, err := message.completion(); err != nil || code != "Success" {
 				return nil, redfishResponseError(method, path, status, data, nil)
 			}
 		}
@@ -149,7 +182,7 @@ func rackRequest(ctx context.Context, session *bmcSession, method, path string, 
 	return data, nil
 }
 
-func (r *rackSCM) power(ctx context.Context) (PowerState, error) {
+func (r *rackManager) power(ctx context.Context) (PowerState, error) {
 	data, err := rackRequest(ctx, r.root, http.MethodGet, rackManagerPath+"/SystemPower", nil)
 	if err != nil {
 		return "", err
@@ -171,7 +204,7 @@ func (r *rackSCM) power(ctx context.Context) (PowerState, error) {
 }
 
 func (c *Client) rackPowerState(ctx context.Context) (PowerState, error) {
-	r := c.rscm
+	r := c.rack
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -208,7 +241,7 @@ func (c *Client) rackPowerState(ctx context.Context) (PowerState, error) {
 }
 
 func (c *Client) rackBootConfig(ctx context.Context) (BootConfig, error) {
-	r := c.rscm
+	r := c.rack
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -248,7 +281,7 @@ func (c *Client) rackSetBoot(ctx context.Context, target string) error {
 }
 
 func (c *Client) rackMutate(ctx context.Context, method, path string, body any, restore bool) error {
-	r := c.rscm
+	r := c.rack
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -257,7 +290,7 @@ func (c *Client) rackMutate(ctx context.Context, method, path string, body any, 
 
 // rackMutateLocked requires the rack mutex to be held.
 func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body any, restore bool) error {
-	r := c.rscm
+	r := c.rack
 
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -298,7 +331,7 @@ func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body
 		r.pending = operation
 		r.deadline = r.now().Add(rackRecoveryGrace)
 
-		_, err := rackRequest(ctx, r.root, http.MethodPost, rackManagerPath+"/Actions/Oem/Microsoft.SystemPowerOn",
+		_, err := rackRequest(ctx, r.root, http.MethodPost, r.powerOnTarget,
 			map[string]string{"system_id": r.slot})
 		if err != nil {
 			r.recoveryError = fmt.Errorf("restoring AC power for slot %s: %w", r.slot, err)
@@ -310,7 +343,7 @@ func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body
 }
 
 // rearmCompletedRecovery runs with mu held. Failed or incomplete episodes stay latched.
-func (r *rackSCM) rearmCompletedRecovery() {
+func (r *rackManager) rearmCompletedRecovery() {
 	if !r.pendingCompleted || r.recoveryError != nil || r.now().Before(r.deadline) {
 		return
 	}
@@ -322,7 +355,7 @@ func (r *rackSCM) rearmCompletedRecovery() {
 }
 
 // readiness is called with mu held. The deadline never moves on a retry.
-func (r *rackSCM) readiness(cause error) error {
+func (r *rackManager) readiness(cause error) error {
 	if r.recoveryError != nil {
 		return r.recoveryError
 	}
