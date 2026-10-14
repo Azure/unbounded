@@ -1,0 +1,43 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+package ipam;
+option go_package = "github.com/Azure/unbounded/internal/net/ipam/proto";
+
+message GetIPAMConfigRequest {
+  uint32 version = 1;
+}
+
+message Range {
+  string subnet = 1;
+}
+
+message RangeSet {
+  repeated Range ranges = 1;
+}
+
+message Config {
+  repeated RangeSet ranges = 1;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  NOT_READY = 1;
+  INVALID_REQUEST = 2;
+  UNSUPPORTED_VERSION = 3;
+  INTERNAL = 4;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+}
+
+message GetIPAMConfigResponse {
+  uint32 version = 1;
+  oneof payload {
+    Config config = 2;
+    Error error = 3;
+  }
+}

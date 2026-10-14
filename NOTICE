@@ -326,6 +326,20 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/containerd/typeurl/blob/v2.3.0/LICENSE
+  - dependency: github.com/containernetworking/cni
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containernetworking/cni/blob/v1.3.1/LICENSE
+  - dependency: github.com/containernetworking/plugins
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containernetworking/plugins/blob/v1.9.1/LICENSE
   - dependency: github.com/coreos/go-iptables
     ecosystem: go
     copyright:
