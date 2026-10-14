@@ -768,6 +768,24 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		return repavePowerError(target, err)
 	}
 
+	if target.Stage == v1alpha3.OperationStagePoweringOn && target.LastAttemptAt != nil {
+		if state == redfish.PowerOn {
+			return repaveBootRequested(target, now)
+		}
+
+		if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+			if state == redfish.PowerOff {
+				return requestRepavePowerOn(ctx, pc, target, now)
+			}
+
+			target.Message = "waiting for power on before PXE repave"
+
+			return targetChange{target: target}
+		}
+
+		// An expired power-on falls back to the normal repave flow below.
+	}
+
 	// Readiness must be checked before an expired repave attempt can fail.
 	if target.Stage == v1alpha3.OperationStageWaitingRepave && target.LastAttemptAt != nil && target.Attempts >= r.maxAttempts() {
 		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("timed out waiting for PXE repave after %d attempts", target.Attempts), now)
@@ -807,10 +825,29 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
+	return requestRepavePowerOn(ctx, pc, waitingTarget, now)
+}
+
+func requestRepavePowerOn(ctx context.Context, pc PowerClient, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
-		return repavePowerError(waitingTarget, err)
+		if errors.Is(err, redfish.ErrNotReady) {
+			if target.Stage != v1alpha3.OperationStagePoweringOn || target.LastAttemptAt == nil {
+				target.LastAttemptAt = &now
+			}
+
+			target.Stage = v1alpha3.OperationStagePoweringOn
+			target.Message = fmt.Sprintf("waiting for power on before PXE repave: %v", err)
+
+			return targetChange{target: target}
+		}
+
+		return repavePowerError(target, err)
 	}
 
+	return repaveBootRequested(target, now)
+}
+
+func repaveBootRequested(target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	target.Stage = v1alpha3.OperationStageWaitingRepave
 	target.Attempts++
 	target.LastAttemptAt = &now

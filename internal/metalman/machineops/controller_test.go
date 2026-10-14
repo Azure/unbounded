@@ -157,6 +157,8 @@ func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
 			now := fixedNow()
 			r.Now = func() metav1.Time { return now }
 			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}}
+			pendingPowerOn := tc.kind == v1alpha3.OperationHostReplace && tc.method == "On"
+			pendingSince := now
 
 			for range r.MaxAttempts + 1 {
 				result, err := r.Reconcile(t.Context(), req)
@@ -169,9 +171,17 @@ func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
 				require.Equal(t, v1alpha3.OperationPhaseInProgress, waiting.Status.Phase)
 				require.Equal(t, v1alpha3.OperationPhaseInProgress, target.Phase)
 				require.Equal(t, int32(1), target.Attempts)
-				require.True(t, lastAttempt.Equal(target.LastAttemptAt))
-				require.Equal(t, tc.stage, target.Stage)
-				require.Equal(t, waitingErr.Error(), target.Message)
+
+				if pendingPowerOn {
+					require.True(t, pendingSince.Equal(target.LastAttemptAt))
+					require.Equal(t, v1alpha3.OperationStagePoweringOn, target.Stage)
+					require.Equal(t, "waiting for power on before PXE repave: "+waitingErr.Error(), target.Message)
+				} else {
+					require.True(t, lastAttempt.Equal(target.LastAttemptAt))
+					require.Equal(t, tc.stage, target.Stage)
+					require.Equal(t, waitingErr.Error(), target.Message)
+				}
+
 				require.Nil(t, target.CompletedAt)
 
 				now = metav1.NewTime(now.Add(2 * time.Minute))
@@ -616,6 +626,187 @@ func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationStageWaitingRepave, inProgress.Status.Targets[0].Stage)
 	require.Equal(t, int32(1), inProgress.Status.Targets[0].Attempts)
 	require.Equal(t, []string{"machine-1:SetBootOverride:Pxe:Continuous", "machine-1:On"}, power.calls)
+}
+
+func TestReconcilerFinishesPendingRepavePowerOn(t *testing.T) {
+	t.Parallel()
+
+	for _, stage := range []v1alpha3.OperationStage{v1alpha3.OperationStageWaitingRepave, v1alpha3.OperationStageWaitingOff} {
+		for _, becomesOn := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/becomesOn=%t", stage, becomesOn), func(t *testing.T) {
+				t.Parallel()
+
+				machine := testBareMetalMachine("machine-1", "rack-a")
+				op := testOperation("op-pending-on", v1alpha3.OperationHostReplace)
+				op.Spec.MachineRef = machine.Name
+				op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+					MachineRef:    machine.Name,
+					Phase:         v1alpha3.OperationPhaseInProgress,
+					Stage:         stage,
+					Attempts:      2,
+					LastAttemptAt: ptrTo(metav1.NewTime(fixedNow().Add(-2 * time.Minute))),
+				}}
+				c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, op).WithStatusSubresource(op).Build()
+				power := &recordingPowerClient{
+					states:       map[string]redfish.PowerState{machine.Name: redfish.PowerOff},
+					methodErrors: map[string]error{"On": fmt.Errorf("blade waking: %w", redfish.ErrNotReady)},
+				}
+				r := testReconciler(c, power, "rack-a")
+				now := fixedNow()
+				pendingSince := now
+				r.Now = func() metav1.Time { return now }
+				req := ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}}
+				_, err := r.Reconcile(t.Context(), req)
+				require.NoError(t, err)
+
+				var updated v1alpha3.MachineOperation
+				require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+				target := updated.Status.Targets[0]
+				require.Equal(t, v1alpha3.OperationStagePoweringOn, target.Stage)
+				require.Equal(t, int32(2), target.Attempts)
+				require.True(t, pendingSince.Equal(target.LastAttemptAt))
+				require.Contains(t, target.Message, "waiting for power on before PXE repave")
+
+				expectedCalls := []string{"machine-1:SetBootOverride:Pxe:Continuous", "machine-1:On"}
+				require.Equal(t, expectedCalls, power.calls)
+
+				if becomesOn {
+					// Slot recovery can power on the host even when Reset returns ErrNotReady.
+					power.states[machine.Name] = redfish.PowerOn
+				} else {
+					for range 2 {
+						now = metav1.NewTime(now.Add(10 * time.Second))
+						_, err = r.Reconcile(t.Context(), req)
+						require.NoError(t, err)
+						require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+						target = updated.Status.Targets[0]
+						require.Equal(t, v1alpha3.OperationStagePoweringOn, target.Stage)
+						require.Equal(t, int32(2), target.Attempts)
+						require.True(t, pendingSince.Equal(target.LastAttemptAt))
+
+						expectedCalls = append(expectedCalls, "machine-1:On")
+						require.Equal(t, expectedCalls, power.calls)
+					}
+
+					delete(power.methodErrors, "On")
+
+					expectedCalls = append(expectedCalls, "machine-1:On")
+				}
+
+				now = metav1.NewTime(now.Add(10 * time.Second))
+				_, err = r.Reconcile(t.Context(), req)
+				require.NoError(t, err)
+				require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+				target = updated.Status.Targets[0]
+				require.Equal(t, v1alpha3.OperationPhaseInProgress, target.Phase)
+				require.Equal(t, v1alpha3.OperationStageWaitingRepave, target.Stage)
+				require.Equal(t, int32(3), target.Attempts)
+				require.True(t, now.Equal(target.LastAttemptAt))
+				require.Equal(t, "requested PXE repave boot", target.Message)
+				require.Equal(t, expectedCalls, power.calls)
+
+				installStarted := now
+				now = metav1.NewTime(now.Add(r.powerActionTimeout() - time.Second))
+				_, err = r.Reconcile(t.Context(), req)
+				require.NoError(t, err)
+				require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+				target = updated.Status.Targets[0]
+				require.Equal(t, v1alpha3.OperationPhaseInProgress, target.Phase)
+				require.Equal(t, v1alpha3.OperationStageWaitingRepave, target.Stage)
+				require.Equal(t, int32(3), target.Attempts)
+				require.True(t, installStarted.Equal(target.LastAttemptAt))
+				require.Equal(t, expectedCalls, power.calls)
+			})
+		}
+	}
+}
+
+func TestRepavePendingPowerOnTimeout(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		state     redfish.PowerState
+		elapsed   time.Duration
+		stage     v1alpha3.OperationStage
+		attempts  int32
+		calls     []string
+		freshTime bool
+	}{
+		{"transient before timeout", "PoweringOn", time.Minute - time.Second, v1alpha3.OperationStagePoweringOn, 1, nil, false},
+		{"transient at timeout", "PoweringOn", time.Minute, v1alpha3.OperationStageWaitingOff, 1, []string{"machine-1:ForceOff"}, true},
+		{"off at timeout", redfish.PowerOff, time.Minute, v1alpha3.OperationStageWaitingRepave, 2, []string{"machine-1:SetBootOverride:Pxe:Continuous", "machine-1:On"}, true},
+		{"on after timeout", redfish.PowerOn, 2 * time.Minute, v1alpha3.OperationStageWaitingRepave, 2, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: tc.state}}
+			r := testReconciler(nil, power, "rack-a")
+			r.PowerActionTimeout = time.Minute
+			now := fixedNow()
+			pendingSince := metav1.NewTime(now.Add(-tc.elapsed))
+			target := v1alpha3.MachineOperationTargetStatus{
+				MachineRef: machine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+				Stage: v1alpha3.OperationStagePoweringOn, Attempts: 1, LastAttemptAt: &pendingSince,
+			}
+
+			change := r.waitForRepaveBoot(t.Context(), machine, target, now)
+			require.NoError(t, change.err)
+			require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
+			require.Equal(t, tc.stage, change.target.Stage)
+			require.Equal(t, tc.attempts, change.target.Attempts)
+			require.Equal(t, tc.calls, power.calls)
+
+			if tc.freshTime {
+				require.True(t, now.Equal(change.target.LastAttemptAt))
+			} else {
+				require.True(t, pendingSince.Equal(change.target.LastAttemptAt))
+			}
+		})
+	}
+}
+
+func TestRepavePendingPowerOnErrorsPreserveTransition(t *testing.T) {
+	t.Parallel()
+
+	for _, method := range []string{"factory", "state", "On"} {
+		for _, failure := range []error{redfish.ErrNotReady, errors.New("AC recovery grace expired")} {
+			t.Run(method+"/"+failure.Error(), func(t *testing.T) {
+				t.Parallel()
+
+				machine := testBareMetalMachine("machine-1", "rack-a")
+				power := &recordingPowerClient{
+					states:       map[string]redfish.PowerState{machine.Name: redfish.PowerOff},
+					methodErrors: map[string]error{method: failure},
+				}
+				r := testReconciler(nil, power, "rack-a")
+				target := v1alpha3.MachineOperationTargetStatus{
+					MachineRef: machine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+					Stage: v1alpha3.OperationStagePoweringOn, Attempts: 2,
+					LastAttemptAt: ptrTo(metav1.NewTime(fixedNow().Add(-10 * time.Second))),
+				}
+
+				change := r.waitForRepaveBoot(t.Context(), machine, target, fixedNow())
+				if errors.Is(failure, redfish.ErrNotReady) {
+					require.NoError(t, change.err)
+					require.Contains(t, change.target.Message, failure.Error())
+					target.Message = change.target.Message
+				} else {
+					require.ErrorIs(t, change.err, failure)
+				}
+
+				require.Equal(t, target, change.target)
+
+				if method == "On" {
+					require.Equal(t, []string{"machine-1:On"}, power.calls)
+				} else {
+					require.Empty(t, power.calls)
+				}
+			})
+		}
+	}
 }
 
 func TestReconcilerRetriesHostReplacePowerOffAfterTimeout(t *testing.T) {
