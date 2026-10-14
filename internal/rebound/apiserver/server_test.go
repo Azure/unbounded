@@ -414,6 +414,15 @@ func TestServer(t *testing.T) {
 
 	requestHTTP(http.MethodGet, path+"?fieldSelector=metadata.name%3Dhttp-test", "", nil, http.StatusOK)
 
+	// Clients that prefer protobuf, such as the namespace controller, must fall
+	// back to JSON because NodeGrant has no protobuf encoding. Metadata-only
+	// lists still use protobuf, which their meta.k8s.io types support.
+	var list metav1.TypeMeta
+	require.NoError(t, json.Unmarshal(requestHTTP(http.MethodGet, path, "application/vnd.kubernetes.protobuf, application/json", nil, http.StatusOK), &list))
+	require.Equal(t, rebound.Kind+"List", list.Kind)
+	requestHTTP(http.MethodGet, path, "application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,"+
+		"application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json", nil, http.StatusOK)
+
 	watchCtx, stopWatch := context.WithCancel(t.Context())
 	defer stopWatch()
 

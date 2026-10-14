@@ -203,6 +203,7 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 
 	storage := newStorage(ledger.Store{Client: cfg.Client, Namespace: cfg.Namespace}, o.MaxTTL, o.MaxNodesPerGrant, cfg.Clock)
 	group := genericapiserver.NewDefaultAPIGroupInfo(rebound.GroupName, scheme, runtime.NewParameterCodec(scheme), codecs)
+	group.NegotiatedSerializer = withoutProtobuf{codecs}
 
 	group.VersionedResourcesStorageMap[rebound.SchemeGroupVersion.Version] = map[string]rest.Storage{rebound.Resource: storage}
 	if err := server.InstallAPIGroup(&group); err != nil {
@@ -249,4 +250,23 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	return s.server.PrepareRun().RunWithContext(ctx)
+}
+
+// withoutProtobuf removes protobuf from the media types the API group offers.
+// NodeGrant has no protobuf encoding, so clients that prefer protobuf, such as
+// the namespace controller, must get JSON instead of a 406 error.
+type withoutProtobuf struct {
+	serializer.CodecFactory
+}
+
+func (w withoutProtobuf) SupportedMediaTypes() []runtime.SerializerInfo {
+	var infos []runtime.SerializerInfo
+
+	for _, info := range w.CodecFactory.SupportedMediaTypes() {
+		if info.MediaType != runtime.ContentTypeProtobuf {
+			infos = append(infos, info)
+		}
+	}
+
+	return infos
 }
