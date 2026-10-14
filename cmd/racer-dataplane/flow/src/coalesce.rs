@@ -358,6 +358,8 @@ fn wake_all(wakers: Vec<Waker>) {
 /// Shared-result cohorts whose callers own execution rather than electing leaders.
 /// Dropping receivers cannot remove real work. Dropping a completion sender
 /// closes receivers but keeps its entry until completion is confirmed.
+/// Supervisors can discover these entries with [`shared::Table::lost_keys`], then
+/// use [`shared::Table::evict_lost`] after confirming the real work has ended.
 pub mod shared {
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -379,7 +381,7 @@ pub mod shared {
     /// require_sync::<flow_control::coalesce::shared::Table<u32, u32>>();
     /// ```
     pub struct Table<K, V: Clone> {
-        entries: RefCell<BTreeMap<K, Indexed<V>>>,
+        entries: RefCell<BTreeMap<Rc<K>, Indexed<V>>>,
 
         lost_completions: Cell<u64>,
     }
@@ -402,7 +404,8 @@ pub mod shared {
     }
 
     impl<K, V: Clone> Table<K, V> {
-        /// Count lost completion owners, saturating rather than wrapping.
+        /// Count all lost completion owners, including evicted entries, saturating
+        /// rather than wrapping. Use [`Self::lost_keys`] to discover retained losses.
         pub fn lost_completion_count(&self) -> u64 {
             self.lost_completions.get()
         }
@@ -430,6 +433,9 @@ pub mod shared {
         /// Recover a lost-owner entry only after independently confirming real work
         /// has finished. Cancellation alone is not sufficient. Live owners cannot be
         /// evicted. Old receivers keep their closed result; new starts get a new slot.
+        /// A [`Self::lost_keys`] snapshot is not an eviction permit: coordinate
+        /// recovery with other supervisors and confirm work for the current entry,
+        /// not an earlier operation under the same key.
         pub fn evict_lost(&self, key: &K) -> bool {
             let removed = {
                 let mut entries = self.entries.borrow_mut();
@@ -445,6 +451,27 @@ pub mod shared {
         }
     }
 
+    impl<K: Clone, V: Clone> Table<K, V> {
+        /// Snapshot retained lost-owner keys in key order, excluding live owners
+        /// and finished entries. This scans the full index but removes nothing;
+        /// repeated calls keep reporting a loss until [`Self::evict_lost`] removes it.
+        /// Discovery does not allow new work or prove that old work has ended.
+        ///
+        /// Key clones run outside the table borrow and may reenter or unwind.
+        /// The snapshot can become stale, including during cloning. Before eviction,
+        /// independently confirm that the current work for the key has ended.
+        pub fn lost_keys(&self) -> Vec<K> {
+            let keys: Vec<_> = self
+                .entries
+                .borrow()
+                .iter()
+                .filter(|(_, entry)| !entry.live.get())
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.into_iter().map(|key| (*key).clone()).collect()
+        }
+    }
+
     impl<K: Ord + Clone, V: Clone + 'static> Table<K, V> {
         /// Called after miss-only admission, without yielding between get and start.
         /// Recheck after key cloning: an occupied key joins without completion
@@ -454,7 +481,7 @@ pub mod shared {
             key: K,
             closed: V,
         ) -> (Receiver<V>, Option<Completion<K, V>>) {
-            let index_key = key.clone();
+            let index_key = Rc::new(key.clone());
             let (send, receive) = oneshot::channel();
             let receive = async move { receive.await.unwrap_or(closed) }
                 .boxed_local()
@@ -549,6 +576,135 @@ pub mod shared {
     mod tests {
         use super::*;
         use futures::executor::block_on;
+
+        #[test]
+        fn lost_keys_excludes_live_and_finished_entries_without_draining() {
+            let table = Rc::new(Table::default());
+            assert!(table.lost_keys().is_empty());
+            let (live_reader, live) = table.start(2, Err::<u32, _>("closed"));
+            drop(live_reader);
+            for (key, result) in [(3, Ok(7)), (4, Err("io"))] {
+                let (reader, completion) = table.start(key, Err("closed"));
+                completion.unwrap().finish(result);
+                assert_eq!(block_on(reader), result);
+            }
+            assert!(table.lost_keys().is_empty());
+            for key in [5, 1] {
+                let (reader, completion) = table.start(key, Err("closed"));
+                drop(completion);
+                drop(reader);
+            }
+            for _ in 0..3 {
+                assert_eq!(table.lost_keys(), vec![1, 5]);
+                assert_eq!(table.len(), 3);
+                assert_eq!(table.lost_completion_count(), 2);
+                assert!(!table.evict_lost(&2));
+                assert!(!table.evict_lost(&3));
+                let (joined, rejected) = table.start(1, Err("other"));
+                assert!(rejected.is_none());
+                assert_eq!(block_on(joined), Err("closed"));
+            }
+            assert!(table.evict_lost(&1));
+            assert_eq!(table.lost_keys(), vec![5]);
+            assert!(table.evict_lost(&5));
+            assert!(table.lost_keys().is_empty());
+            live.unwrap().finish(Ok(9));
+            assert!(table.is_empty());
+            assert_eq!(table.lost_completion_count(), 2);
+        }
+
+        #[test]
+        fn discovered_losses_require_work_confirmation_before_restart() {
+            let table = Rc::new(Table::default());
+            for losses in 1..=3 {
+                let work_running = Cell::new(true);
+                let (old, completion) = table.start("page".to_owned(), Err::<u32, _>("closed"));
+                assert!(completion.is_some());
+                drop(completion);
+                let keys = table.lost_keys();
+                assert_eq!(keys, vec!["page"]);
+                assert_eq!(table.lost_completion_count(), losses);
+                assert!(work_running.get());
+                let (joined, rejected) = table.start(keys[0].clone(), Err("other"));
+                assert!(rejected.is_none());
+                assert_eq!(block_on(joined), Err("closed"));
+                assert_eq!(table.lost_keys(), keys);
+
+                // The supervisor confirms completion through its own work tracker.
+                work_running.set(false);
+                assert!(!work_running.get());
+                assert!(table.evict_lost(&keys[0]));
+                assert!(!table.evict_lost(&keys[0]));
+                assert!(table.lost_keys().is_empty());
+                let (fresh, completion) = table.start(keys[0].clone(), Err("new closed"));
+                assert!(completion.is_some());
+                work_running.set(true);
+                assert!(table.lost_keys().is_empty());
+                assert!(!table.evict_lost(&keys[0]));
+                assert_eq!(block_on(old), Err("closed"));
+                work_running.set(false);
+                completion.unwrap().finish(Ok(7));
+                assert_eq!(block_on(fresh), Ok(7));
+                assert!(table.lost_keys().is_empty());
+                assert!(table.is_empty());
+                assert_eq!(table.lost_completion_count(), losses);
+            }
+        }
+
+        #[test]
+        fn lost_keys_clone_can_reenter_or_unwind_without_losing_discovery() {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+
+            thread_local! {
+                static ON_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+            }
+
+            #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+            struct Key(u32);
+
+            impl Clone for Key {
+                fn clone(&self) -> Self {
+                    let callback = ON_CLONE.with(|slot| slot.borrow_mut().take());
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                    Self(self.0)
+                }
+            }
+
+            let table = Rc::new(Table::default());
+            for key in [1, 2] {
+                let (reader, completion) = table.start(Key(key), 0);
+                drop(completion);
+                drop(reader);
+            }
+            ON_CLONE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|| panic!("snapshot clone failed")));
+            });
+            assert!(catch_unwind(AssertUnwindSafe(|| table.lost_keys())).is_err());
+            assert_eq!(table.lost_keys(), vec![Key(1), Key(2)]);
+            assert_eq!(table.lost_completion_count(), 2);
+
+            let replacement = Rc::new(RefCell::new(None));
+            ON_CLONE.with(|slot| {
+                let table = table.clone();
+                let replacement = replacement.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    assert!(table.evict_lost(&Key(1)));
+                    let (reader, completion) = table.start(Key(1), 0);
+                    drop(reader);
+                    *replacement.borrow_mut() = completion;
+                    assert_eq!(table.lost_keys(), vec![Key(2)]);
+                }));
+            });
+            assert_eq!(table.lost_keys(), vec![Key(1), Key(2)]);
+            assert_eq!(table.lost_keys(), vec![Key(2)]);
+            assert!(!table.evict_lost(&Key(1)));
+            replacement.borrow_mut().take().unwrap().finish(7);
+            assert!(table.evict_lost(&Key(2)));
+            assert!(table.lost_keys().is_empty());
+            assert_eq!(table.lost_completion_count(), 2);
+        }
 
         #[test]
         fn occupied_start_drops_unused_key_and_closed_value_outside_borrow() {
