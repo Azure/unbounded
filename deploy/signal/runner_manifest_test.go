@@ -138,4 +138,8 @@ func TestBurnRunnerPinsCUDAAndGPUBurn(t *testing.T) {
 	assert.Contains(t, containerfile, "make -C /src/gpu-burn COMPUTE=100")
 	assert.Contains(t, containerfile, "compare.fatbin /usr/local/bin/compare.fatbin")
 	assert.Contains(t, containerfile, "WORKDIR /usr/local/bin")
+
+	makefile, err := os.ReadFile("../../Makefile")
+	require.NoError(t, err)
+	assert.Contains(t, string(makefile), "SIGNAL_DAPPLE_BURN_RUNNER_IMAGE ?= docker.io/kechomicrosoft/project-signal-burn-runner@sha256:a665064c123d613cd10722cd52d4d4a1c5c7af4d8ece20bad9060f1555e5bd2f")
 }

@@ -105,7 +105,7 @@ SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
 SIGNAL_DAPPLE_MANIFEST_TEMPLATES_DIR := deploy/signal-dapple
 SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR := deploy/signal-dapple/rendered
 SIGNAL_DAPPLE_RUNNER_IMAGE ?= projectsignalpublic.azurecr.io/project-signal-runner@sha256:68a667b87491ed3fd1d56f4f8746bc52526e7b67a7b45456b779103f642922aa
-SIGNAL_DAPPLE_BURN_RUNNER_IMAGE ?= example.invalid/project-signal-burn-runner:replace-me
+SIGNAL_DAPPLE_BURN_RUNNER_IMAGE ?= docker.io/kechomicrosoft/project-signal-burn-runner@sha256:a665064c123d613cd10722cd52d4d4a1c5c7af4d8ece20bad9060f1555e5bd2f
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
