@@ -906,3 +906,61 @@ func TestVirtualMediaAbandonsDeadInstallerAfterTimeout(t *testing.T) {
 		})
 	}
 }
+
+func TestVirtualMediaReleasesAfterCloudInitFailure(t *testing.T) {
+	r, _, _, op := mediaFixture(t)
+	current := mediaInstalling(t, r, op.Name)
+	current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+	current.Status.Targets[0].BootMedia.ImageWritten = true
+	current.Status.Targets[0].BootMedia.RebootRequestedAt = ptrTo(fixedNow())
+	require.NoError(t, r.Status().Update(t.Context(), current))
+
+	require.True(t, mediaBootUnconfirmed(current.Status.Targets[0]))
+
+	current.Status.Targets[0].Conditions = []metav1.Condition{{
+		Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Failed",
+		Message:            "stage failed",
+		LastTransitionTime: fixedNow(),
+	}}
+	require.NoError(t, r.Status().Update(t.Context(), current))
+
+	for range 6 {
+		current = mediaStep(t, r, op.Name)
+	}
+
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
+	require.True(t, current.Status.Targets[0].BootMedia.Released)
+	require.False(t, current.Status.Targets[0].BootMedia.Abandoned)
+	require.False(t, hasOutstandingMedia(current))
+	require.NotContains(t, current.Finalizers, mediaFinalizer)
+}
+
+func TestCloudInitReported(t *testing.T) {
+	tests := []struct {
+		name string
+		cond *metav1.Condition
+		want bool
+	}{
+		{name: "missing", want: false},
+		{name: "pending", cond: &metav1.Condition{Status: metav1.ConditionUnknown, Reason: "Pending"}, want: false},
+		{name: "in progress", cond: &metav1.Condition{Status: metav1.ConditionFalse, Reason: "InProgress"}, want: false},
+		{name: "failed", cond: &metav1.Condition{Status: metav1.ConditionFalse, Reason: "Failed"}, want: true},
+		{name: "succeeded", cond: &metav1.Condition{Status: metav1.ConditionTrue, Reason: "Succeeded"}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := v1alpha3.MachineOperationTargetStatus{}
+
+			if tt.cond != nil {
+				c := *tt.cond
+				c.Type = v1alpha3.MachineOperationConditionCloudInitDone
+				target.Conditions = []metav1.Condition{c}
+			}
+
+			require.Equal(t, tt.want, cloudInitReported(target))
+		})
+	}
+}
