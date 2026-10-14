@@ -137,7 +137,39 @@ member. Follow NVIDIA's
 and
 [ComputeDomain security guidance](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dra-cds.html#security).
 Do not install the legacy `ClusterPolicy` device-plugin stack and the DRA
-`GPUCluster` stack together.
+`GPUCluster` stack together. A standalone NVIDIA device-plugin deployment must
+also be removed from DRA nodes before enabling `GPUCluster`; otherwise the same
+GPUs can be advertised simultaneously through `nvidia.com/gpu` and DRA
+`ResourceSlice` objects.
+
+Unbounded prepares the host and nspawn boundary only. It does not install GPU
+Operator, create `GPUCluster`, or deploy NVIDIA DRA operands. For example, GPU
+Operator v26.7.2 with DRA driver v0.5.1 renders the preinstalled-driver path
+from these values:
+
+```yaml
+clusterPolicy:
+  deployCR: false
+gpuCluster:
+  deployCR: true
+driver:
+  enabled: false
+  nvidiaDriverCRD:
+    enabled: true
+    deployDefaultCR: false
+draDriver:
+  computeDomains:
+    enabled: true
+```
+
+The resulting singleton `GPUCluster/gpu-cluster` causes GPU Operator to manage
+the `nvidia-dra-driver-kubelet-plugin` DaemonSet,
+`nvidia-dra-driver-controller` Deployment, ComputeDomain CRDs and controller,
+ResourceClaim templates, workload-scoped IMEX channels, and the
+`compute-domain-daemon.nvidia.com` and
+`compute-domain-default-channel.nvidia.com` DeviceClasses. Keep that ownership
+in GPU Operator; do not duplicate it in MachineConfiguration or workload
+bootstrap scripts.
 
 ### Security model
 
