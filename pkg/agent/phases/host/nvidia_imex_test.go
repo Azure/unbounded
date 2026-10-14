@@ -48,6 +48,7 @@ func TestResolveNVIDIAIMEXPackage(t *testing.T) {
 		t.Parallel()
 
 		var queried []string
+
 		spec, err := resolveNVIDIAIMEXPackageWith("580.178.04", 580, func(name string) (string, error) {
 			queried = append(queried, name)
 
@@ -62,6 +63,7 @@ func TestResolveNVIDIAIMEXPackage(t *testing.T) {
 		t.Parallel()
 
 		var queried []string
+
 		spec, err := resolveNVIDIAIMEXPackageWith("580.178.04", 580, func(name string) (string, error) {
 			queried = append(queried, name)
 			if name == "nvidia-imex" {
