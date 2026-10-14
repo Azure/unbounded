@@ -127,7 +127,7 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	provider := certs.NewProvider(kube, cfg.namespace)
+	provider := certs.NewProvider(kube, cfg.namespace, serviceName)
 	rotator := &certs.Rotator{
 		Client:         kube,
 		Aggregator:     agg,

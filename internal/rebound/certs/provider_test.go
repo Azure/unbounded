@@ -41,7 +41,7 @@ func eventually(t *testing.T, condition func() bool) {
 
 func TestProviderWatchReadinessAndHotSwap(t *testing.T) {
 	r, clock := fixture()
-	p := NewProvider(r.Client, "unbounded-system")
+	p := NewProvider(r.Client, "unbounded-system", "rebound")
 	p.clock = clock
 	l := &listener{}
 	p.AddListener(l)
@@ -172,7 +172,7 @@ func TestProviderWatchReadinessAndHotSwap(t *testing.T) {
 
 func TestWaitReadyCancellation(t *testing.T) {
 	r, _ := fixture()
-	p := NewProvider(r.Client, "")
+	p := NewProvider(r.Client, "", "")
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
@@ -198,7 +198,7 @@ func TestProviderCertificateValidity(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			clock.SetTime(tt.now)
 
-			p := NewProvider(r.Client, "")
+			p := NewProvider(r.Client, "", "")
 			p.clock = clock
 			l := &listener{}
 			p.AddListener(l)
@@ -214,7 +214,7 @@ func TestProviderCertificateValidity(t *testing.T) {
 
 	clock.SetTime(leaf.NotBefore)
 
-	p := NewProvider(r.Client, "")
+	p := NewProvider(r.Client, "", "")
 	p.clock = clock
 	p.load(secret)
 	require.NoError(t, p.Check(nil))
@@ -238,7 +238,7 @@ func TestProviderAcceptsFreshCertificateWithLaggingClock(t *testing.T) {
 	reconcile(t, r)
 	secret := getSecret(t, r)
 
-	p := NewProvider(r.Client, "")
+	p := NewProvider(r.Client, "", "")
 	p.clock = clocktesting.NewFakeClock(issuerClock.Now().Add(-time.Minute))
 	p.load(secret)
 	require.True(t, p.Ready())
@@ -257,7 +257,7 @@ func TestProviderRetainsValidPair(t *testing.T) {
 	r, clock := fixture()
 	reconcile(t, r)
 	secret := getSecret(t, r)
-	p := NewProvider(r.Client, "")
+	p := NewProvider(r.Client, "", "")
 	p.clock = clock
 	l := &listener{}
 	p.AddListener(l)
@@ -279,4 +279,165 @@ func TestProviderRetainsValidPair(t *testing.T) {
 		require.EqualValues(t, 1, l.calls.Load())
 		require.NoError(t, p.Check(nil))
 	}
+}
+
+func TestProviderVerifiesIdentityAndTrust(t *testing.T) {
+	r, clock := fixture()
+	r.Namespace, r.ServiceName = "custom-namespace", "custom-service"
+	reconcile(t, r)
+	secret := getSecret(t, r)
+	ca, signer, err := loadCA(secret.Data["ca.crt"], secret.Data["ca.key"], clock.Now())
+	require.NoError(t, err)
+	unrelatedCert, unrelatedKey, err := issue(clock.Now(), r.CALifetime, nil, nil, nil)
+	require.NoError(t, err)
+	unrelatedCA, unrelatedSigner, err := loadCA(unrelatedCert, unrelatedKey, clock.Now())
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name   string
+		modify func(*corev1.Secret)
+	}{
+		{
+			name: "wrong DNS names",
+			modify: func(s *corev1.Secret) {
+				cert, key, err := issue(clock.Now(), r.LeafLifetime, []string{"wrong.other.svc", "wrong.other.svc.cluster.local"}, ca, signer)
+				require.NoError(t, err)
+
+				s.Data[corev1.TLSCertKey], s.Data[corev1.TLSPrivateKeyKey] = cert, key
+			},
+		},
+		{
+			name: "missing cluster local DNS name",
+			modify: func(s *corev1.Secret) {
+				cert, key, err := issue(clock.Now(), r.LeafLifetime, r.dnsNames()[:1], ca, signer)
+				require.NoError(t, err)
+
+				s.Data[corev1.TLSCertKey], s.Data[corev1.TLSPrivateKeyKey] = cert, key
+			},
+		},
+		{
+			name: "missing short service DNS name",
+			modify: func(s *corev1.Secret) {
+				cert, key, err := issue(clock.Now(), r.LeafLifetime, r.dnsNames()[1:2], ca, signer)
+				require.NoError(t, err)
+
+				s.Data[corev1.TLSCertKey], s.Data[corev1.TLSPrivateKeyKey] = cert, key
+			},
+		},
+		{
+			name: "unrelated signing CA",
+			modify: func(s *corev1.Secret) {
+				cert, key, err := issue(clock.Now(), r.LeafLifetime, r.dnsNames(), unrelatedCA, unrelatedSigner)
+				require.NoError(t, err)
+
+				s.Data[corev1.TLSCertKey], s.Data[corev1.TLSPrivateKeyKey] = cert, key
+			},
+		},
+		{
+			name:   "bundle takes precedence over signing CA",
+			modify: func(s *corev1.Secret) { s.Data["ca-bundle.crt"] = unrelatedCert },
+		},
+		{
+			name:   "invalid bundle does not fall back",
+			modify: func(s *corev1.Secret) { s.Data["ca-bundle.crt"] = []byte("broken") },
+		},
+		{
+			name:   "empty bundle does not fall back",
+			modify: func(s *corev1.Secret) { s.Data["ca-bundle.crt"] = nil },
+		},
+		{
+			name: "missing trust",
+			modify: func(s *corev1.Secret) {
+				delete(s.Data, "ca-bundle.crt")
+				delete(s.Data, "ca.crt")
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewProvider(r.Client, r.Namespace, r.ServiceName)
+			p.clock = clock
+			l := &listener{}
+			p.AddListener(l)
+
+			bad := secret.DeepCopy()
+			tt.modify(bad)
+			p.load(bad)
+			require.False(t, p.Ready())
+			cert, key := p.CurrentCertKeyContent()
+			require.Empty(t, cert)
+			require.Empty(t, key)
+			require.Zero(t, l.calls.Load())
+
+			select {
+			case <-p.ready:
+				t.Fatal("invalid certificate signaled readiness")
+			default:
+			}
+
+			p.load(secret)
+			require.NoError(t, p.WaitReady(t.Context()))
+			p.load(bad)
+			cert, key = p.CurrentCertKeyContent()
+			require.Equal(t, secret.Data[corev1.TLSCertKey], cert)
+			require.Equal(t, secret.Data[corev1.TLSPrivateKeyKey], key)
+			require.EqualValues(t, 1, l.calls.Load())
+			require.True(t, p.Ready())
+		})
+	}
+
+	t.Run("fallback to signing CA", func(t *testing.T) {
+		p := NewProvider(r.Client, r.Namespace, r.ServiceName)
+		p.clock = clock
+		fallback := secret.DeepCopy()
+		delete(fallback.Data, "ca-bundle.crt")
+		p.load(fallback)
+		require.True(t, p.Ready())
+		cert, key := p.CurrentCertKeyContent()
+		require.Equal(t, secret.Data[corev1.TLSCertKey], cert)
+		require.Equal(t, secret.Data[corev1.TLSPrivateKeyKey], key)
+	})
+}
+
+func TestProviderAcceptsNextCADuringRotation(t *testing.T) {
+	r, clock := fixture()
+	reconcile(t, r)
+	initial := getSecret(t, r)
+	ca, err := parseCertificate(initial.Data["ca.crt"])
+	require.NoError(t, err)
+	clock.SetTime(renewAt(ca))
+	reconcile(t, r)
+	staged := getSecret(t, r)
+	verify(t, r, staged, 2)
+
+	p := NewProvider(r.Client, r.Namespace, r.ServiceName)
+	p.clock = clock
+	l := &listener{}
+	p.AddListener(l)
+	p.load(staged)
+	require.True(t, p.Ready())
+
+	nextCA, nextSigner, err := loadCA(staged.Data["next-ca.crt"], staged.Data["next-ca.key"], clock.Now())
+	require.NoError(t, err)
+	cert, key, err := issue(clock.Now(), r.LeafLifetime, r.dnsNames(), nextCA, nextSigner)
+	require.NoError(t, err)
+
+	candidate := staged.DeepCopy()
+	candidate.Data[corev1.TLSCertKey], candidate.Data[corev1.TLSPrivateKeyKey] = cert, key
+	p.load(candidate)
+	currentCert, currentKey := p.CurrentCertKeyContent()
+	require.Equal(t, cert, currentCert)
+	require.Equal(t, key, currentKey)
+	require.EqualValues(t, 2, l.calls.Load())
+	require.True(t, p.Ready())
+
+	clock.Step(r.CAGrace)
+	reconcile(t, r)
+	promoted := getSecret(t, r)
+	verify(t, r, promoted, 2)
+	p.load(promoted)
+	currentCert, currentKey = p.CurrentCertKeyContent()
+	require.Equal(t, promoted.Data[corev1.TLSCertKey], currentCert)
+	require.Equal(t, promoted.Data[corev1.TLSPrivateKeyKey], currentKey)
+	require.EqualValues(t, 3, l.calls.Load())
+	require.True(t, p.Ready())
 }

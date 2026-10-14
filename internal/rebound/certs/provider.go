@@ -17,6 +17,7 @@ import (
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 )
 
@@ -33,17 +34,25 @@ type Provider struct {
 	ready     chan struct{}
 	clock     clock.PassiveClock
 	leaf      *x509.Certificate
+	names     []string
 }
 
-func NewProvider(client kubernetes.Interface, namespace string) *Provider {
+func NewProvider(client kubernetes.Interface, namespace, serviceName string) *Provider {
 	if namespace == "" {
 		namespace = "unbounded-system"
 	}
+
+	if serviceName == "" {
+		serviceName = "rebound"
+	}
+
+	base := serviceName + "." + namespace + ".svc"
 
 	return &Provider{
 		informer: coreinformers.NewFilteredSecretInformer(client, namespace, 0, cache.Indexers{}, selectName(SecretName)),
 		ready:    make(chan struct{}),
 		clock:    clock.RealClock{},
+		names:    []string{base, base + ".cluster.local"},
 	}
 }
 
@@ -82,7 +91,31 @@ func (p *Provider) load(obj any) {
 
 	now := p.clock.Now()
 	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
+		klog.ErrorS(fmt.Errorf("serving certificate is not valid now"), "Rejected rebound serving certificate")
 		return
+	}
+
+	bundle, ok := secret.Data["ca-bundle.crt"]
+	if !ok {
+		bundle = secret.Data["ca.crt"]
+	}
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(bundle) {
+		klog.ErrorS(fmt.Errorf("missing or invalid CA bundle"), "Rejected rebound serving certificate")
+		return
+	}
+
+	for _, name := range p.names {
+		if _, err := leaf.Verify(x509.VerifyOptions{
+			Roots:       roots,
+			DNSName:     name,
+			KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			CurrentTime: now,
+		}); err != nil {
+			klog.ErrorS(err, "Rejected rebound serving certificate", "dnsName", name)
+			return
+		}
 	}
 
 	p.mu.Lock()
