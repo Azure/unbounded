@@ -338,9 +338,9 @@ impl PageCrypto {
                 .await?
             {
                 CryptoOutput::Decrypted(page, _original_ciphertext) => Ok(page),
-                CryptoOutput::Encrypted(..) | CryptoOutput::Checksummed(_) => {
-                    Err(Error::CorruptRecord)
-                }
+                CryptoOutput::Encrypted(..)
+                | CryptoOutput::Checksummed(_)
+                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -370,9 +370,9 @@ impl PageCrypto {
                 .await?
             {
                 CryptoOutput::Encrypted(plaintext, ciphertext) => Ok((plaintext, ciphertext)),
-                CryptoOutput::Decrypted(..) | CryptoOutput::Checksummed(_) => {
-                    Err(Error::CorruptRecord)
-                }
+                CryptoOutput::Decrypted(..)
+                | CryptoOutput::Checksummed(_)
+                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -406,7 +406,24 @@ impl PageCryptoEngine {
             key,
             scope,
         } = job;
-        let prepared = Self::prepare(&input, &key, &scope, &mut permit);
+        let input = match input {
+            CryptoInput::VerifyEnvelope(job) => {
+                let outcome = job.verify(&scope);
+                permit.executed(measurement_start);
+                return CryptoCompletion {
+                    permit,
+                    outcome,
+                    _key: key,
+                };
+            }
+            input => input,
+        };
+        let prepared = Self::prepare(
+            &input,
+            key.as_ref().expect("page job key"),
+            &scope,
+            &mut permit,
+        );
         if let Some(sample) = &mut permit.send_sample
             && let CryptoInput::Checksum { ciphertext } = &input
             && let Ok(aad) = page_aad(ciphertext.envelope())
@@ -456,6 +473,7 @@ impl PageCryptoEngine {
         }
         key.require_purpose(KeyPurpose::Page)?;
         let (envelope, mut bytes) = match input {
+            CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
             CryptoInput::Checksum { .. } => unreachable!("checksum handled above"),
             CryptoInput::Encrypt {
                 page,
@@ -557,6 +575,7 @@ impl PageCryptoEngine {
         mut bytes: Zeroizing<Vec<u8>>,
     ) -> CryptoOutcome {
         match input {
+            CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
             CryptoInput::Checksum { ciphertext } => {
                 CryptoOutcome::Completed(CryptoOutput::Checksummed(ciphertext))
             }
@@ -982,8 +1001,10 @@ impl PartialOrd for CryptoId {
     }
 }
 /// Output capacity was admitted on I/O. The engine cannot reach Admission,
-/// flights, metadata catalogs, storage, credentials, or any Rc service graph.
+/// flights, metadata catalogs, storage services, or any I/O-owned Rc service graph.
 pub enum CryptoInput {
+    /// Authenticate owned headers and hops without touching page body bytes.
+    VerifyEnvelope(Box<crate::peer::forwarding::EnvelopeJob>),
     /// Check a stored CRC without allocating plaintext or running AEAD.
     Checksum { ciphertext: CiphertextPage },
     Decrypt {
@@ -997,6 +1018,7 @@ pub enum CryptoInput {
     },
 }
 pub enum CryptoOutput {
+    EnvelopeVerified(Box<crate::peer::forwarding::EnvelopeOutput>),
     Checksummed(CiphertextPage),
     /// Retain original ciphertext through completion too; I/O decides whether to
     /// retain it for peer copies/persistence after consuming the completion.
@@ -1159,7 +1181,7 @@ impl CryptoCompletion {
 }
 pub struct CryptoJob {
     pub(crate) input: CryptoInput,
-    pub(crate) key: KeyLease,
+    pub(crate) key: Option<KeyLease>,
     pub(crate) scope: RequestScope,
     // Engine loss drops payload owners before releasing diagnostic admission.
     pub(crate) permit: CryptoPermit,
@@ -1167,9 +1189,13 @@ pub struct CryptoJob {
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
         use uring_runtime::reactor::IoBuffer;
-        self.measurement.checksum_only = matches!(input, CryptoInput::Checksum { .. });
+        self.measurement.checksum_only = matches!(
+            input,
+            CryptoInput::Checksum { .. } | CryptoInput::VerifyEnvelope(_)
+        );
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {
+            CryptoInput::VerifyEnvelope(_) => 0,
             CryptoInput::Encrypt { plaintext, .. } => {
                 plaintext.bytes().map_or(0, |b| b.len() as u64)
             }
@@ -1180,7 +1206,7 @@ impl CryptoPermit {
         CryptoJob {
             permit: self,
             input,
-            key,
+            key: Some(key),
             scope,
         }
     }
@@ -1206,7 +1232,7 @@ pub enum CryptoOutcome {
 pub struct CryptoCompletion {
     pub(crate) outcome: CryptoOutcome,
     pub(crate) permit: CryptoPermit,
-    pub(crate) _key: KeyLease,
+    pub(crate) _key: Option<KeyLease>,
 }
 impl CryptoCompletion {
     fn decrypt_failure(&self) -> Option<crate::telemetry::DecryptFailure> {
@@ -1353,6 +1379,13 @@ pub struct CryptoClient {
     executor: offload::Client<CryptoId, CryptoCompletion, RequestScope>,
 }
 impl CryptoClient {
+    pub(crate) fn verify_envelope<'a>(
+        &'a self,
+        job: Box<crate::peer::forwarding::EnvelopeJob>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, CryptoOutput> {
+        self.execute_inner(CryptoInput::VerifyEnvelope(job), None, scope, None)
+    }
     pub fn new(port: IoCryptoPort) -> Self {
         let executor = offload::Client::new(NonZeroUsize::new(port.queue.capacity()).unwrap());
         Self {
@@ -1386,6 +1419,15 @@ impl CryptoClient {
         scope: &'a RequestScope,
         sample: Option<crate::telemetry::Work>,
     ) -> Operation<'a, CryptoOutput> {
+        self.execute_inner(input, Some(key), scope, sample)
+    }
+    fn execute_inner<'a>(
+        &'a self,
+        input: CryptoInput,
+        key: Option<KeyLease>,
+        scope: &'a RequestScope,
+        sample: Option<crate::telemetry::Work>,
+    ) -> Operation<'a, CryptoOutput> {
         Box::pin(async move {
             let completion = self
                 .executor
@@ -1401,7 +1443,18 @@ impl CryptoClient {
                         if let Some(sample) = &sample {
                             sample.identify(reservation.id());
                         }
-                        CryptoPermit::new(reservation, sample).job(input, key, scope.clone())
+                        let mut permit = CryptoPermit::new(reservation, sample);
+                        if let Some(key) = key {
+                            permit.job(input, key, scope.clone())
+                        } else {
+                            permit.measurement.checksum_only = true;
+                            CryptoJob {
+                                input,
+                                key: None,
+                                scope: scope.clone(),
+                                permit,
+                            }
+                        }
                     },
                     |job| {
                         job.permit.submitted();
@@ -3967,7 +4020,7 @@ mod tests {
             };
             assert_eq!(completion.id(), id);
             assert!(io.poll_reserve(&mut cx, next).is_pending());
-            assert_eq!(completion._key.id(), descriptor.key_id);
+            assert_eq!(completion._key.as_ref().unwrap().id(), descriptor.key_id);
             match &completion.outcome {
                 CryptoOutcome::Completed(CryptoOutput::Decrypted(clear, original)) => {
                     assert!(!canceled && !corrupt);

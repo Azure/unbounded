@@ -1435,8 +1435,8 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         );
         assert_eq!(
             Rc::strong_count(&crypto),
-            3,
-            "runtime and page facade share one local crypto client"
+            4,
+            "runtime, page facade, and forwarding share one local crypto client"
         );
         let second_admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             config.limits.clone(),

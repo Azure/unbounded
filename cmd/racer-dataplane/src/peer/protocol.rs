@@ -58,8 +58,9 @@ pub enum FetchMode {
 pub struct Signatures {
     inner: Rc<peer_wire::Signatures>,
 
-    #[cfg(test)]
     keys: Rc<Keyring>,
+
+    certificates: Rc<Certificates>,
 }
 pub use peer_wire::SignedHead;
 pub struct VerifiedHead {
@@ -79,8 +80,8 @@ impl Signatures {
 
     pub fn new(keys: Rc<Keyring>, certificates: Rc<Certificates>) -> Self {
         Self {
-            #[cfg(test)]
             keys: keys.clone(),
+            certificates: certificates.clone(),
             inner: Rc::new(peer_wire::Signatures::new(
                 keys,
                 certificates,
@@ -90,6 +91,9 @@ impl Signatures {
     }
     pub fn node(&self) -> &NodeId {
         self.inner.node()
+    }
+    pub(crate) fn for_offload(&self) -> (Keyring, racer_crypto::identity::CertificateVerifier) {
+        ((*self.keys).clone(), self.certificates.for_offload())
     }
     /// Sign retained provenance. Replay admission belongs exclusively to the
     /// immediate-hop head signed by the owning connection session.
@@ -1703,9 +1707,11 @@ pub(crate) mod tests {
             )
         }
         pub(crate) fn signer(session: &Session) -> Rc<Signatures> {
+            let keys = peer_wire::test_util::keys(&session.signatures);
             Rc::new(Signatures {
                 inner: session.signatures.clone(),
-                keys: peer_wire::test_util::keys(&session.signatures),
+                certificates: Rc::new(Certificates::new(keys.cluster().clone(), keys.clone())),
+                keys,
             })
         }
         pub(crate) fn hello(signatures: &Signatures, peer: &NodeId) -> MessageHead {

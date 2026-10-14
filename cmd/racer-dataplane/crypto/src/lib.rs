@@ -302,6 +302,7 @@ pub mod identity {
     }
 
     /// A cluster/node view of shared epochs, responsible for admission and rotation.
+    #[derive(Clone)]
     pub struct Keyring {
         cluster: ClusterId,
 
@@ -427,7 +428,25 @@ pub mod identity {
 
         keys: Rc<Keyring>,
 
-        cache: RefCell<VecDeque<CachedPeer>>,
+        cache: Arc<Mutex<VecDeque<CachedPeer>>>,
+    }
+
+    /// Sendable verifier state. Current epochs remain shared, not snapshotted.
+    pub struct CertificateVerifier {
+        cluster: ClusterId,
+        keys: Keyring,
+        cache: Arc<Mutex<VecDeque<CachedPeer>>>,
+    }
+
+    impl CertificateVerifier {
+        /// Rebuild local ownership on the destination thread.
+        pub fn into_local(self) -> Certificates {
+            Certificates {
+                cluster: self.cluster,
+                keys: Rc::new(self.keys),
+                cache: self.cache,
+            }
+        }
     }
 
     /// Only successful certificate validation can construct a verified peer.
@@ -628,7 +647,16 @@ pub mod identity {
             Self {
                 cluster,
                 keys,
-                cache: RefCell::new(VecDeque::new()),
+                cache: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+
+        /// Share the bounded chain cache without sending an Rc across threads.
+        pub fn for_offload(&self) -> CertificateVerifier {
+            CertificateVerifier {
+                cluster: self.cluster.clone(),
+                keys: (*self.keys).clone(),
+                cache: self.cache.clone(),
             }
         }
 
@@ -636,7 +664,7 @@ pub mod identity {
         fn key(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifyingKey> {
             let roots = self.keys.peer_trust_roots()?;
             let now = unix_time().as_secs();
-            let mut cache = self.cache.borrow_mut();
+            let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
             cache.retain(|entry| {
                 Arc::ptr_eq(&entry.roots, &roots) && now >= entry.checked && now < entry.until
             });
@@ -648,7 +676,7 @@ pub mod identity {
             }
             drop(cache);
             let verified = verify_chain(&roots, chain, &self.cluster, expected)?;
-            let mut cache = self.cache.borrow_mut();
+            let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
             // At most 64 exact, wire-bounded chains (4 MiB of chain bytes).
             if cache.len() == 64 {
                 cache.pop_front();

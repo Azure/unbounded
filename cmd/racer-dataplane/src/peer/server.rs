@@ -392,7 +392,10 @@ impl PeerServer {
                     .admit_native(&request, control, &request_scope)?,
                 _ => None,
             };
-            let request = self.forwarding.verify_request(request)?;
+            let request = self
+                .forwarding
+                .verify_request_async(request, &request_scope)
+                .await?;
             let membership = self
                 .relay
                 .network
@@ -648,7 +651,7 @@ impl PeerServer {
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             scope.check()?;
-            let request = self.forwarding.verify_request(request)?;
+            let request = self.forwarding.verify_request_async(request, scope).await?;
             let membership = self
                 .relay
                 .network

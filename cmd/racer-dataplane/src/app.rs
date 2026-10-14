@@ -777,7 +777,10 @@ impl WorkerApplication {
             keys.clone(),
         ));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
-        let forwarding = Rc::new(Forwarding::new(signatures.clone()));
+        let forwarding = Rc::new(Forwarding::with_crypto(
+            signatures.clone(),
+            runtime.crypto.clone(),
+        ));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
         let control = if worker == node.control_worker {

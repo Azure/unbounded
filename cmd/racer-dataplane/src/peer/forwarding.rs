@@ -68,6 +68,90 @@ use std::sync::Arc;
 
 pub struct Forwarding {
     signatures: Rc<Signatures>,
+    crypto: Option<Rc<crate::security::CryptoClient>>,
+}
+
+enum EnvelopeInput {
+    Request(SignedRequest),
+    Response(SignedResponse, RequestBinding),
+    Opaque(ForwardedHead, usize, RequestBinding),
+}
+
+/// Verified owners returned through the bounded crypto completion queue.
+pub enum EnvelopeOutput {
+    Request(VerifiedRequest),
+    Response(VerifiedResponse),
+    Opaque(ForwardedHead),
+}
+
+/// Owned envelopes and shared epochs, with no worker-local Rc graph.
+pub struct EnvelopeJob {
+    keys: racer_crypto::identity::Keyring,
+    certificates: racer_crypto::identity::CertificateVerifier,
+    input: EnvelopeInput,
+}
+
+impl EnvelopeJob {
+    pub(crate) fn verify(
+        self,
+        scope: &crate::runtime::RequestScope,
+    ) -> crate::security::CryptoOutcome {
+        let Self {
+            keys,
+            certificates,
+            input,
+        } = self;
+        let certificates = Rc::new(certificates.into_local());
+        let verifier = Forwarding::new(Rc::new(Signatures::new(Rc::new(keys), certificates)));
+        let proof = scope
+            .check()
+            .and_then(|()| match &input {
+                EnvelopeInput::Request(request) => verifier.verify_request_parts(request),
+                EnvelopeInput::Response(response, binding) => verifier
+                    .verify_response_parts(response, binding)
+                    .map(|(origin, forwarders)| (binding.clone(), origin, forwarders)),
+                EnvelopeInput::Opaque(auth, length, binding) => {
+                    let expected = protocol::opaque_response_head(&auth.original.head, *length)?;
+                    verifier
+                        .verify_response_head(auth, &expected, binding)
+                        .map(|(origin, forwarders)| (binding.clone(), origin, forwarders))
+                }
+            })
+            .and_then(|proof| {
+                scope.check()?;
+                Ok(proof)
+            });
+        match proof {
+            Ok((binding, origin, forwarders)) => {
+                let output = match input {
+                    EnvelopeInput::Request(signed) => EnvelopeOutput::Request(VerifiedRequest {
+                        signed,
+                        binding,
+                        origin,
+                        forwarders,
+                    }),
+                    EnvelopeInput::Response(response, _) => EnvelopeOutput::Response(
+                        Forwarding::finish_response(response, &binding, origin, forwarders),
+                    ),
+                    EnvelopeInput::Opaque(auth, ..) => EnvelopeOutput::Opaque(auth),
+                };
+                crate::security::CryptoOutcome::Completed(
+                    crate::security::CryptoOutput::EnvelopeVerified(Box::new(output)),
+                )
+            }
+            Err(error) => {
+                let (keys, certificates) = verifier.signatures.for_offload();
+                crate::security::CryptoOutcome::Failed {
+                    input: crate::security::CryptoInput::VerifyEnvelope(Box::new(Self {
+                        keys,
+                        certificates,
+                        input,
+                    })),
+                    error,
+                }
+            }
+        }
+    }
 }
 pub use peer_wire::ForwardedHead;
 
@@ -219,6 +303,7 @@ impl Forwarding {
             path: route.0.visited,
         })
     }
+    #[cfg(test)]
     pub(crate) fn verify_opaque(
         &self,
         auth: &ForwardedHead,
@@ -229,8 +314,108 @@ impl Forwarding {
         self.verify_response_head(auth, &expected, request)?;
         Ok(())
     }
+    /// Synchronous signing and verification facade. Async production use requires
+    /// `with_crypto`; only unit fixtures may execute async work inline.
     pub fn new(signatures: Rc<Signatures>) -> Self {
-        Self { signatures }
+        Self {
+            signatures,
+            crypto: None,
+        }
+    }
+    /// Use the worker's existing bounded crypto helper for envelope verification.
+    pub fn with_crypto(
+        signatures: Rc<Signatures>,
+        crypto: Rc<crate::security::CryptoClient>,
+    ) -> Self {
+        Self {
+            signatures,
+            crypto: Some(crypto),
+        }
+    }
+    async fn verify_envelope(
+        &self,
+        input: EnvelopeInput,
+        scope: &crate::runtime::RequestScope,
+    ) -> Result<EnvelopeOutput> {
+        let (keys, certificates) = self.signatures.for_offload();
+        let job = Box::new(EnvelopeJob {
+            keys,
+            certificates,
+            input,
+        });
+        let output = if let Some(crypto) = &self.crypto {
+            crypto.verify_envelope(job, scope).await?
+        } else {
+            #[cfg(not(test))]
+            return Err(Error::InvalidConfiguration);
+            #[cfg(test)]
+            match job.verify(scope) {
+                crate::security::CryptoOutcome::Completed(output) => output,
+                crate::security::CryptoOutcome::Failed { error, .. } => return Err(error),
+            }
+        };
+        match output {
+            crate::security::CryptoOutput::EnvelopeVerified(output) => Ok(*output),
+            _ => Err(Error::Internal),
+        }
+    }
+    /// Verify the complete request off-lane, retaining its charged input until reap.
+    pub async fn verify_request_async(
+        &self,
+        request: SignedRequest,
+        scope: &crate::runtime::RequestScope,
+    ) -> Result<VerifiedRequest> {
+        match self
+            .verify_envelope(EnvelopeInput::Request(request), scope)
+            .await?
+        {
+            EnvelopeOutput::Request(request) => Ok(request),
+            _ => Err(Error::Internal),
+        }
+    }
+    /// Verify response authority and every reverse hop on the crypto helper.
+    pub async fn verify_response_async(
+        &self,
+        response: SignedResponse,
+        request: &RequestBinding,
+        scope: &crate::runtime::RequestScope,
+    ) -> Result<VerifiedResponse> {
+        match self
+            .verify_envelope(EnvelopeInput::Response(response, request.clone()), scope)
+            .await?
+        {
+            EnvelopeOutput::Response(response) => Ok(response),
+            _ => Err(Error::Internal),
+        }
+    }
+    pub(crate) async fn verify_opaque_async(
+        &self,
+        auth: ForwardedHead,
+        length: usize,
+        request: &RequestBinding,
+        scope: &crate::runtime::RequestScope,
+    ) -> Result<ForwardedHead> {
+        match self
+            .verify_envelope(EnvelopeInput::Opaque(auth, length, request.clone()), scope)
+            .await?
+        {
+            EnvelopeOutput::Opaque(auth) => Ok(auth),
+            _ => Err(Error::Internal),
+        }
+    }
+    pub(crate) async fn forward_opaque_async(
+        &self,
+        auth: ForwardedHead,
+        length: usize,
+        request: &RequestBinding,
+        previous: &NodeId,
+        scope: &crate::runtime::RequestScope,
+    ) -> Result<ForwardedHead> {
+        let mut auth = self
+            .verify_opaque_async(auth, length, request, scope)
+            .await?;
+        self.append_response_head(&mut auth, request, previous)?;
+        Ok(auth)
     }
     /// Encode and sign a fresh local attempt, retaining request-binding context
     /// for its eventual response. Direct sends target the route destination.
@@ -277,6 +462,18 @@ impl Forwarding {
     /// Verify original and every historical hop, identity, logical-field agreement,
     /// and monotonic routing limits. Socket admission must precede this call.
     pub fn verify_request(&self, request: SignedRequest) -> Result<VerifiedRequest> {
+        let (binding, origin, forwarders) = self.verify_request_parts(&request)?;
+        Ok(VerifiedRequest {
+            signed: request,
+            binding,
+            origin,
+            forwarders,
+        })
+    }
+    fn verify_request_parts(
+        &self,
+        request: &SignedRequest,
+    ) -> Result<(RequestBinding, VerifiedPeer, Vec<VerifiedPeer>)> {
         let auth = &request.authentication;
         if auth.hops.len() >= protocol::MAX_HOPS {
             return Err(Error::HopBudgetExhausted);
@@ -327,12 +524,7 @@ impl Forwarding {
             path,
             deadline,
         };
-        Ok(VerifiedRequest {
-            signed: request,
-            binding,
-            origin,
-            forwarders,
-        })
+        Ok((binding, origin, forwarders))
     }
     /// Sign all local outcomes, including misses/errors, against the exact request.
     pub fn sign_response(
@@ -378,9 +570,17 @@ impl Forwarding {
     /// ```
     pub fn verify_response(
         &self,
-        mut response: SignedResponse,
+        response: SignedResponse,
         request: &RequestBinding,
     ) -> Result<VerifiedResponse> {
+        let (origin, forwarders) = self.verify_response_parts(&response, request)?;
+        Ok(Self::finish_response(response, request, origin, forwarders))
+    }
+    fn verify_response_parts(
+        &self,
+        response: &SignedResponse,
+        request: &RequestBinding,
+    ) -> Result<(VerifiedPeer, Vec<VerifiedPeer>)> {
         let path = protocol::decode_nodes(
             field(
                 &response.authentication.original.head,
@@ -393,8 +593,14 @@ impl Forwarding {
             &signed_digest(&request.original)?,
             &path,
         )?;
-        let (origin, forwarders) =
-            self.verify_response_head(&response.authentication, &expected, request)?;
+        self.verify_response_head(&response.authentication, &expected, request)
+    }
+    fn finish_response(
+        mut response: SignedResponse,
+        request: &RequestBinding,
+        origin: VerifiedPeer,
+        forwarders: Vec<VerifiedPeer>,
+    ) -> VerifiedResponse {
         // Diagnostic context belongs to this received lease, never its shared bytes.
         // Extraction cannot change the verified response's delivery behavior.
         let provenance = (|| {
@@ -435,12 +641,12 @@ impl Forwarding {
             }
             _ => {}
         }
-        Ok(VerifiedResponse {
+        VerifiedResponse {
             signed: response,
             binding: request.clone(),
             origin,
             forwarders,
-        })
+        }
     }
 
     fn verify_response_head(
@@ -514,6 +720,7 @@ impl Forwarding {
     }
     /// Verify canonical metadata and the complete reverse chain before forwarding
     /// an opaque fixed-length HTTP body. No ciphertext owner or decryptor is used.
+    #[cfg(test)]
     pub(crate) fn forward_opaque(
         &self,
         mut auth: ForwardedHead,
@@ -521,8 +728,7 @@ impl Forwarding {
         request: &RequestBinding,
         previous: &NodeId,
     ) -> Result<ForwardedHead> {
-        let expected = crate::peer::protocol::opaque_response_head(&auth.original.head, length)?;
-        self.verify_response_head(&auth, &expected, request)?;
+        self.verify_opaque(&auth, length, request)?;
         self.append_response_head(&mut auth, request, previous)?;
         Ok(auth)
     }
@@ -883,6 +1089,402 @@ mod tests {
                     .collect(),
             },
             response: PeerResponse::Miss,
+        }
+    }
+    mod offload_tests {
+        use super::*;
+        use crate::security::{CryptoClient, CryptoPort, PageCryptoEngine};
+        use std::future::Future;
+        use std::num::NonZeroUsize;
+        use std::task::{Context, Poll};
+
+        fn pair(signatures: Rc<Signatures>) -> (Forwarding, Rc<CryptoClient>, CryptoPort) {
+            let (io, port) = crate::security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+            let client = Rc::new(CryptoClient::new(io));
+            (
+                Forwarding::with_crypto(signatures, client.clone()),
+                client,
+                port,
+            )
+        }
+
+        fn complete(client: &CryptoClient, port: &mut CryptoPort) {
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready(Ok(Some(job))) = port.poll_job(&mut cx) else {
+                panic!("expected queued verification");
+            };
+            let caller = std::thread::current().id();
+            let environment = uring_runtime::environment::Environment::current();
+            let completion = std::thread::spawn(move || {
+                let _guard = environment.enter();
+                assert_ne!(caller, std::thread::current().id());
+                PageCryptoEngine::process(job)
+            })
+            .join()
+            .unwrap();
+            assert!(port.complete(completion).is_ok());
+            client.poll_budgeted(1).unwrap();
+        }
+
+        fn run<T>(
+            future: impl Future<Output = Result<T>>,
+            client: &CryptoClient,
+            port: &mut CryptoPort,
+        ) -> Result<T> {
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(client.outstanding(), 1);
+            complete(client, port);
+            let Poll::Ready(result) = future.as_mut().poll(&mut cx) else {
+                panic!("completion must wake verification");
+            };
+            assert_eq!(client.outstanding(), 0);
+            result
+        }
+
+        fn copy_request(signed: &SignedRequest) -> SignedRequest {
+            let mut logical = request(71);
+            logical.route = signed.request.route.clone();
+            SignedRequest {
+                authentication: ForwardedHead {
+                    original: signed.authentication.original.clone(),
+                    hops: signed.authentication.hops.iter().map(clone_head).collect(),
+                },
+                request: logical,
+            }
+        }
+
+        fn corrupt(head: &mut SignedHead) {
+            head.signature[0] ^= 1;
+            head.head
+                .headers
+                .iter_mut()
+                .find(|h| h.name == "signature")
+                .unwrap()
+                .value = format!("racer=:{}:", protocol::binary(&head.signature)).into_bytes();
+        }
+
+        #[test]
+        fn offloaded_maximum_chain_round_trip_and_each_bad_hop() {
+            let signatures = network(9);
+            let forwarding: Vec<_> = signatures.iter().cloned().map(Forwarding::new).collect();
+            let mut logical = request(71);
+            logical.route.destination = node(8);
+            logical.route.remaining_links = 8;
+            let scope = logical.origin.scope().clone();
+            let (mut signed, outstanding) =
+                forwarding[0].sign_request_to(logical, &node(1)).unwrap();
+            for (index, relay) in forwarding.iter().enumerate().take(8).skip(1) {
+                let admitted = relay.verify_request(signed).unwrap();
+                let mut route = admitted.request().route.clone();
+                route.visited.push(node(index));
+                route.remaining_links -= 1;
+                signed = relay
+                    .append_request(admitted, &node(index + 1), route)
+                    .unwrap();
+            }
+            assert_eq!(signed.authentication.hops.len(), 7);
+            let (destination, client, mut port) = pair(signatures[8].clone());
+            for index in 0..8 {
+                let mut bad = copy_request(&signed);
+                if index == 0 {
+                    let mut original = clone_head(&bad.authentication.original);
+                    corrupt(&mut original);
+                    bad.authentication.original = Arc::new(original);
+                } else {
+                    corrupt(&mut bad.authentication.hops[index - 1]);
+                }
+                let expected = destination
+                    .verify_request(copy_request(&bad))
+                    .err()
+                    .unwrap();
+                assert_eq!(expected, Error::Unauthorized);
+                assert_eq!(
+                    run(
+                        destination.verify_request_async(bad, &scope),
+                        &client,
+                        &mut port
+                    )
+                    .err(),
+                    Some(expected)
+                );
+            }
+            let mut excessive = copy_request(&signed);
+            excessive
+                .authentication
+                .hops
+                .push(clone_head(&signed.authentication.hops[0]));
+            let mut invalid = clone_head(&excessive.authentication.original);
+            corrupt(&mut invalid);
+            excessive.authentication.original = Arc::new(invalid);
+            assert_eq!(
+                run(
+                    destination.verify_request_async(excessive, &scope),
+                    &client,
+                    &mut port
+                )
+                .err(),
+                Some(Error::HopBudgetExhausted)
+            );
+            let admitted = run(
+                destination.verify_request_async(signed, &scope),
+                &client,
+                &mut port,
+            )
+            .unwrap();
+            assert_eq!(admitted.origin().node(), &node(0));
+            assert_eq!(admitted.forwarders().len(), 7);
+            let mut response = destination
+                .sign_response(admitted.binding(), PeerResponse::Miss)
+                .unwrap();
+            for index in (1..8).rev() {
+                let mut binding = outstanding.clone();
+                binding.path = (0..=index).map(node).collect();
+                let verified = forwarding[index]
+                    .verify_response(response, &binding)
+                    .unwrap();
+                response = forwarding[index]
+                    .append_response(verified, &node(index - 1))
+                    .unwrap();
+            }
+            let (sender, client, mut port) = pair(signatures[0].clone());
+            for index in 0..7 {
+                let mut bad = copy_response(&response);
+                corrupt(&mut bad.authentication.hops[index]);
+                let expected = sender
+                    .verify_response(copy_response(&bad), &outstanding)
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    run(
+                        sender.verify_response_async(bad, &outstanding, &scope),
+                        &client,
+                        &mut port
+                    )
+                    .err(),
+                    Some(expected)
+                );
+            }
+            let opaque = run(
+                sender.verify_opaque_async(
+                    copy_response(&response).authentication,
+                    0,
+                    &outstanding,
+                    &scope,
+                ),
+                &client,
+                &mut port,
+            )
+            .unwrap();
+            assert_eq!(opaque.hops.len(), 7);
+            assert_eq!(
+                run(
+                    sender.verify_opaque_async(
+                        copy_response(&response).authentication,
+                        1,
+                        &outstanding,
+                        &scope
+                    ),
+                    &client,
+                    &mut port
+                )
+                .err(),
+                Some(Error::InvalidRequest)
+            );
+            let verified = run(
+                sender.verify_response_async(response, &outstanding, &scope),
+                &client,
+                &mut port,
+            )
+            .unwrap();
+            assert_eq!(verified.origin().node(), &node(8));
+            assert_eq!(verified.forwarders().len(), 7);
+        }
+
+        #[test]
+        fn offloaded_strict_signature_rejections_match_inline() {
+            let signatures = network(3);
+            let sender = Forwarding::new(signatures[0].clone());
+            let (receiver, client, mut port) = pair(signatures[2].clone());
+            let scope = request(71).origin.scope().clone();
+            for fault in 0..3 {
+                let (mut signed, _) = sender.sign_request(request(71)).unwrap();
+                let mut original = clone_head(&signed.authentication.original);
+                match fault {
+                    0 => {
+                        original.signature[..32].fill(0);
+                        original.signature[0] = 1;
+                    }
+                    1 => original.signature[32..].fill(255),
+                    _ => {
+                        original.signature.pop();
+                    }
+                }
+                original
+                    .head
+                    .headers
+                    .iter_mut()
+                    .find(|h| h.name == "signature")
+                    .unwrap()
+                    .value =
+                    format!("racer=:{}:", protocol::binary(&original.signature)).into_bytes();
+                signed.authentication.original = Arc::new(original);
+                assert_eq!(
+                    receiver.verify_request(copy_request(&signed)).err(),
+                    Some(Error::Unauthorized)
+                );
+                assert_eq!(
+                    run(
+                        receiver.verify_request_async(signed, &scope),
+                        &client,
+                        &mut port
+                    )
+                    .err(),
+                    Some(Error::Unauthorized)
+                );
+            }
+        }
+
+        #[test]
+        fn offloaded_cancellation_capacity_deadline_and_abandoned_fences() {
+            let signatures = network(3);
+            let sender = Forwarding::new(signatures[0].clone());
+            let (receiver, client, mut port) = pair(signatures[2].clone());
+            let scope = request(72).origin.scope().clone();
+            let make = || sender.sign_request(request(72)).unwrap().0;
+            let mut first = Box::pin(receiver.verify_request_async(make(), &scope));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            let waiting_scope = request(73).origin.scope().clone();
+            let mut waiting = Box::pin(receiver.verify_request_async(make(), &waiting_scope));
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            let mut overflow = Box::pin(receiver.verify_request_async(make(), &scope));
+            assert!(matches!(
+                overflow.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            waiting_scope.cancellation.cancel().unwrap();
+            assert!(matches!(
+                waiting.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            scope.cancellation.cancel().unwrap();
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(client.outstanding(), 1);
+            complete(&client, &mut port);
+            assert!(matches!(
+                first.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            assert_eq!(client.outstanding(), 0);
+            let mut canceled = Box::pin(receiver.verify_request_async(make(), &scope));
+            assert!(matches!(
+                canceled.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            assert_eq!(client.outstanding(), 0);
+            let clock = uring_runtime::environment::SimulationClock::new(929);
+            let _guard = clock.environment(0).enter();
+            let scope = RequestScope::new(
+                RequestId([74; 16]),
+                uring_runtime::environment::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            let mut expired = Box::pin(receiver.verify_request_async(make(), &scope));
+            assert!(expired.as_mut().poll(&mut cx).is_pending());
+            clock.advance(Duration::from_secs(2));
+            complete(&client, &mut port);
+            assert!(matches!(
+                expired.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::DeadlineExceeded))
+            ));
+            let scope = RequestScope::new(
+                RequestId([75; 16]),
+                uring_runtime::environment::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let mut abandoned = Box::pin(receiver.verify_request_async(make(), &scope));
+            assert!(abandoned.as_mut().poll(&mut cx).is_pending());
+            drop(abandoned);
+            assert_eq!(client.outstanding(), 1);
+            complete(&client, &mut port);
+            assert_eq!(client.outstanding(), 0);
+            let mut late_cancel = Box::pin(receiver.verify_request_async(make(), &scope));
+            assert!(late_cancel.as_mut().poll(&mut cx).is_pending());
+            complete(&client, &mut port);
+            scope.cancellation.cancel().unwrap();
+            assert!(matches!(
+                late_cancel.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            assert_eq!(client.outstanding(), 0);
+            let scope = RequestScope::new(
+                RequestId([77; 16]),
+                uring_runtime::environment::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            client.close_submissions().unwrap();
+            let mut closed = Box::pin(receiver.verify_request_async(make(), &scope));
+            assert!(matches!(
+                closed.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+        }
+
+        #[test]
+        fn offloaded_verification_observes_rotation_after_submission() {
+            use crate::test_support::security::{ca, identities, mac_test_keys};
+            use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle, SCHEMA_VERSION};
+            for retire_roots in [false, true] {
+                let identities = identities(
+                    ClusterId(node(99).0),
+                    &[node(0), node(1), node(2)],
+                    mac_test_keys,
+                );
+                let sender = Forwarding::new(identities[0].signatures.clone());
+                let (receiver, client, mut port) = pair(identities[2].signatures.clone());
+                let scope = request(76).origin.scope().clone();
+                let make = || sender.sign_request(request(76)).unwrap().0;
+                run(
+                    receiver.verify_request_async(make(), &scope),
+                    &client,
+                    &mut port,
+                )
+                .unwrap();
+                let mut future = Box::pin(receiver.verify_request_async(make(), &scope));
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert!(future.as_mut().poll(&mut cx).is_pending());
+                let roots = if retire_roots {
+                    vec![ca().0.der().to_vec()]
+                } else {
+                    (*identities[2].keys.peer_trust_roots().unwrap()).clone()
+                };
+                identities[2]
+                    .keys
+                    .install(KeyringBundle {
+                        schema_version: SCHEMA_VERSION,
+                        cluster: ClusterId(node(99).0),
+                        generation: BundleGeneration(2),
+                        peer_trust_roots: roots,
+                        cache_keys: if retire_roots {
+                            mac_test_keys()
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                    .unwrap();
+                complete(&client, &mut port);
+                let expected = if retire_roots {
+                    Error::Unauthorized
+                } else {
+                    Error::MissingKey
+                };
+                assert!(
+                    matches!(future.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error == expected)
+                );
+                assert_eq!(client.outstanding(), 0);
+            }
         }
     }
     #[test]

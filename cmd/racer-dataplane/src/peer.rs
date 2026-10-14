@@ -405,7 +405,10 @@ impl Relay {
             scope.check()?;
             match response {
                 transport::RelayResponse::Complete(response) => {
-                    let response = self.forwarding.verify_response(response, &binding)?;
+                    let response = self
+                        .forwarding
+                        .verify_response_async(response, &binding, &scope)
+                        .await?;
                     self.forwarding
                         .append_response(response, &previous)
                         .map(transport::RelayResponse::Complete)
@@ -415,12 +418,10 @@ impl Relay {
                     connection,
                     length,
                 } => {
-                    let authentication = self.forwarding.forward_opaque(
-                        authentication,
-                        length,
-                        &binding,
-                        &previous,
-                    )?;
+                    let authentication = self
+                        .forwarding
+                        .forward_opaque_async(authentication, length, &binding, &previous, &scope)
+                        .await?;
                     Ok(transport::RelayResponse::Http {
                         authentication,
                         connection,
@@ -671,7 +672,9 @@ impl Requester {
                 return Err(Error::Internal);
             };
             scope.check()?;
-            let response = forwarding.verify_response(response, &binding)?;
+            let response = forwarding
+                .verify_response_async(response, &binding, &scope)
+                .await?;
             timing.success(&response);
             Ok(response)
         })
@@ -722,7 +725,9 @@ impl Requester {
             let response = observer.result(
                 Stage::PeerVerify,
                 &scope,
-                forwarding.verify_response(response, &binding),
+                forwarding
+                    .verify_response_async(response, &binding, &scope)
+                    .await,
             )?;
             timing.success(&response);
             Ok(response)
@@ -866,7 +871,10 @@ impl Requester {
                 .await;
             // Receiving a signed envelope is not proof. Recover only after the
             // complete reverse chain and original request binding are verified.
-            let response = response.and_then(|response| self.verify_exchange(response, &binding));
+            let response = match response {
+                Ok(response) => self.verify_exchange(response, &binding, &scope).await,
+                Err(error) => Err(error),
+            };
             use crate::topology::LinkOutcome;
             let outcome = match &response {
                 Ok(transport::RelayResponse::Complete(_)) => Some(LinkOutcome::Success),
@@ -897,10 +905,11 @@ impl Requester {
         })
     }
 
-    fn verify_exchange(
+    async fn verify_exchange(
         &self,
         response: transport::RelayResponse,
         binding: &crate::peer::forwarding::RequestBinding,
+        scope: &RequestScope,
     ) -> Result<transport::RelayResponse> {
         let forwarding = match self {
             Self::Network { forwarding, .. } => forwarding,
@@ -911,14 +920,17 @@ impl Requester {
         };
         match response {
             transport::RelayResponse::Complete(response) => forwarding
-                .verify_response(response, binding)
+                .verify_response_async(response, binding, scope)
+                .await
                 .map(|verified| transport::RelayResponse::Complete(verified.into_signed())),
             transport::RelayResponse::Http {
                 authentication,
                 mut connection,
                 length,
             } => {
-                forwarding.verify_opaque(&authentication, length, binding)?;
+                let authentication = forwarding
+                    .verify_opaque_async(authentication, length, binding, scope)
+                    .await?;
                 // All Racer outcomes use HTTP 200. Inspect the authenticated
                 // outcome, exactly as the materialized path does, not HTTP status.
                 connection.state_mut().exchange.verified_response(

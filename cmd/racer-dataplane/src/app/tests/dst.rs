@@ -862,11 +862,19 @@ mod scenarios {
         let (contending, binding) = signed(1);
         let (retry, retry_binding) = signed(2);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        // Do not tick the owner yet: the first server holds a live selection while
-        // its real WorkerDirectory dispatch waits in the selected worker's mailbox.
+        // Drive only verification, not the owner mailbox. The first server must
+        // hold a live selection before the other server finishes verification.
         let mut held = servers[0].dispatch(first, &scope);
         assert!(held.as_mut().poll(&mut cx).is_pending());
+        let worker = &mut harness.nodes[target].workers[0];
+        worker.crypto.poll_budgeted(&mut cx, 1).unwrap();
+        worker.runtime.crypto.poll_budgeted(1).unwrap();
+        assert!(held.as_mut().poll(&mut cx).is_pending());
         let mut rejected = servers[1].dispatch(contending, &scope);
+        assert!(rejected.as_mut().poll(&mut cx).is_pending());
+        let worker = &mut harness.nodes[target].workers[1];
+        worker.crypto.poll_budgeted(&mut cx, 1).unwrap();
+        worker.runtime.crypto.poll_budgeted(1).unwrap();
         let Poll::Ready(Ok(response)) = rejected.as_mut().poll(&mut cx) else {
             panic!("second server must reject the same live subscription");
         };
