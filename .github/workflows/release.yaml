@@ -25,8 +25,9 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact image)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           orca, gantry, host-ubuntu2404,
-#                           inventory-aggregator, inventory-inspector, inventory-viewer)
+#                           orca, gantry, host-ubuntu2404, host-azurelinux3,
+#                           host-azurelinux3-nvidia, inventory-aggregator,
+#                           inventory-inspector, inventory-viewer)
 #         -> gantry-chart  (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> finalize          (attach extras + krew manifest)
@@ -813,8 +814,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest the component images that have no
   # release-time image ordering requirements.
-  # Go components cross-compile natively for amd64 and arm64; host-ubuntu2404
-  # publishes both platforms for PXE architecture support.
+  # Go components cross-compile natively for amd64 and arm64; the host-* machine
+  # images publish both platforms for PXE architecture support.
   # ---------------------------------------------------------------------------
   component-images:
     needs: version
@@ -859,6 +860,14 @@ jobs:
             trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: false
+          - name: host-azurelinux3
+            file: images/host-azurelinux3/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: false
+          - name: host-azurelinux3-nvidia
+            file: images/host-azurelinux3-nvidia/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: false
           - name: inventory-aggregator
