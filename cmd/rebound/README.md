@@ -70,7 +70,8 @@ kubectl delete ngr train
   - While a grant is active, pods from other namespaces on its nodes. This runs
     when the grant is created and every 15 seconds after.
   - When a grant expires or is deleted, pods from its namespace that were created
-    on its nodes while it was active. Pods that were there before the grant stay.
+    or scheduled onto its nodes while it was active. Pods that were there before
+    the grant stay.
 
   Pods are deleted with a zero grace period, and PodDisruptionBudgets do not apply.
   The grant's TTL is the grace period. Pods in `ExcludedNamespaces`, mirror pods,
@@ -151,8 +152,9 @@ authorization are also accepted. Run `rebound --help` for the full list.
 - The reaper enforces expiry shortly after `expiresAt`, so node restrictions may
   linger briefly, and pods are deleted a little later than `expiresAt`.
 - Pod `creationTimestamp` has one-second precision and comes from the API server
-  clock. A pod created in the same second a grant starts counts as created during
-  the grant. Pods created in the same second the grant ends are kept.
+  clock. The scheduled time has the same precision. A pod created or scheduled in
+  the same second a grant starts counts as during the grant. Pods created in the
+  same second the grant ends are kept.
 - Release records are kept for 10 minutes from when they are written, even if the
   leader removes an expired grant late. Pods created after expiry are not deleted
   by that release. If the leader cannot process a release before its record is

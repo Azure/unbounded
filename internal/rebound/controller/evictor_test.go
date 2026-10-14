@@ -867,6 +867,140 @@ func TestEvictorReleaseSecondPrecision(t *testing.T) {
 	require.ElementsMatch(t, []string{"tenant/before-release-same-second", "tenant/after-release-same-second"}, remaining(t, c))
 }
 
+func scheduled(p *corev1.Pod, status corev1.ConditionStatus, at time.Time) *corev1.Pod {
+	p.Status.Conditions = append(p.Status.Conditions, corev1.PodCondition{
+		Type:               corev1.PodScheduled,
+		Status:             status,
+		LastTransitionTime: metav1.Time{Time: at},
+	})
+
+	return p
+}
+
+func TestEvictorReleaseScheduledTime(t *testing.T) {
+	createdAt := testNow.Add(-10*time.Minute + 300*time.Millisecond)
+	releasedAt := testNow.Add(-time.Minute + 300*time.Millisecond)
+	before := createdAt.Add(-5 * time.Minute)
+	during := testNow.Add(-5 * time.Minute)
+	after := testNow.Add(-30 * time.Second)
+
+	for name, tc := range map[string]struct {
+		pod  *corev1.Pod
+		kept bool
+	}{
+		// A pod left Pending before the grant and bound during it.
+		"created before, scheduled during": {
+			pod: scheduled(pod("tenant", "p", "a", before), corev1.ConditionTrue, during),
+		},
+		"created before, scheduled in grant start second": {
+			pod: scheduled(pod("tenant", "p", "a", before), corev1.ConditionTrue, createdAt.Truncate(time.Second)),
+		},
+		"created and scheduled before": {
+			pod:  scheduled(pod("tenant", "p", "a", before), corev1.ConditionTrue, before.Add(time.Second)),
+			kept: true,
+		},
+		"created before, scheduled in prior second": {
+			pod:  scheduled(pod("tenant", "p", "a", before), corev1.ConditionTrue, createdAt.Truncate(time.Second).Add(-time.Second)),
+			kept: true,
+		},
+		"created before, not scheduled": {
+			pod:  scheduled(pod("tenant", "p", "a", before), corev1.ConditionFalse, during),
+			kept: true,
+		},
+		"created during, not scheduled": {
+			pod: scheduled(pod("tenant", "p", "a", during), corev1.ConditionFalse, before),
+		},
+		"created before, no condition": {
+			pod:  pod("tenant", "p", "a", before),
+			kept: true,
+		},
+		"created during, no condition": {
+			pod: pod("tenant", "p", "a", during),
+		},
+		"created before, zero scheduled time": {
+			pod:  scheduled(pod("tenant", "p", "a", before), corev1.ConditionTrue, time.Time{}),
+			kept: true,
+		},
+		// The upper bound uses creationTimestamp.
+		"created during, scheduled after release": {
+			pod: scheduled(pod("tenant", "p", "a", during), corev1.ConditionTrue, after),
+		},
+		"created after release": {
+			pod:  scheduled(pod("tenant", "p", "a", after), corev1.ConditionTrue, after),
+			kept: true,
+		},
+		"other namespace, created before, scheduled during": {
+			pod:  scheduled(pod("other", "p", "a", before), corev1.ConditionTrue, during),
+			kept: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := grant("tenant", "g", "a", time.Hour)
+			g.UID = "u1"
+			g.CreatedAt = createdAt
+
+			l := ledger.New()
+			require.NoError(t, l.Add(g))
+			require.True(t, l.Remove(g.Key(), releasedAt))
+
+			cm := configMap(t)
+			cm.Data = l.Encode()
+
+			r, c := newEvictor(t, cm, nil, tc.pod)
+
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+			require.NoError(t, err)
+
+			if tc.kept {
+				require.ElementsMatch(t, []string{tc.pod.Namespace + "/p"}, remaining(t, c))
+			} else {
+				require.Empty(t, remaining(t, c))
+			}
+		})
+	}
+}
+
+func TestPlacedAt(t *testing.T) {
+	created := testNow.Add(-time.Hour)
+
+	for name, tc := range map[string]struct {
+		conditions []corev1.PodCondition
+		want       time.Time
+	}{
+		"no conditions": {want: created},
+		"scheduled later": {
+			conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Time{Time: testNow}}},
+			want:       testNow,
+		},
+		"scheduled earlier": {
+			conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Time{Time: created.Add(-time.Minute)}}},
+			want:       created,
+		},
+		"scheduled zero": {
+			conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+			want:       created,
+		},
+		"not scheduled": {
+			conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, LastTransitionTime: metav1.Time{Time: testNow}}},
+			want:       created,
+		},
+		"unknown scheduled": {
+			conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionUnknown, LastTransitionTime: metav1.Time{Time: testNow}}},
+			want:       created,
+		},
+		"other condition": {
+			conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Time{Time: testNow}}},
+			want:       created,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := pod("tenant", "p", "a", created)
+			p.Status.Conditions = tc.conditions
+			require.Equal(t, tc.want, placedAt(p))
+		})
+	}
+}
+
 func TestEvictorReleaseLaterSweep(t *testing.T) {
 	g := grant("tenant", "g", "a", time.Hour)
 	g.UID = "u1"

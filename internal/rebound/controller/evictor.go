@@ -36,8 +36,8 @@ const maxListAttempts = 3
 //
 //   - While a grant is active, pods from other namespaces.
 //   - After a grant is removed, pods from its namespace that were created
-//     while it was active. A namespace recreated with the same name does not
-//     count as the grant's namespace.
+//     or scheduled onto the node while it was active. A namespace recreated
+//     with the same name does not count as the grant's namespace.
 //
 // Pods are deleted with a zero grace period and PodDisruptionBudgets do not
 // apply: the grant's TTL is the grace period.
@@ -359,12 +359,21 @@ func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []
 		return true, nil
 	}
 
-	// creationTimestamp has one-second precision, so truncate both grant boundaries.
-	// Keep pods from the release second to avoid deleting pods admitted after release.
-	// This also keeps pods created just before release in that same second.
+	// A release covers pods placed on the node while the grant was active.
+	// The lower bound uses placedAt, not creationTimestamp: a pod created and
+	// left Pending before the grant can be bound to the node during it. The
+	// upper bound uses creationTimestamp, since pods created after release
+	// were admitted under whatever holds the node next.
+	//
+	// Both timestamps have one-second precision, so truncate both grant
+	// boundaries. Keep pods created in the release second to avoid deleting
+	// pods admitted after release. This also keeps pods created just before
+	// release in that same second.
 	created := pod.CreationTimestamp.Time
+	placed := placedAt(pod)
+
 	for _, rel := range releases {
-		if pod.Namespace != rel.Namespace || created.Before(rel.CreatedAt.Truncate(time.Second)) || !created.Before(rel.ReleasedAt.Truncate(time.Second)) {
+		if pod.Namespace != rel.Namespace || placed.Before(rel.CreatedAt.Truncate(time.Second)) || !created.Before(rel.ReleasedAt.Truncate(time.Second)) {
 			continue
 		}
 
@@ -416,6 +425,24 @@ func (r *evictor) mapLedger(_ context.Context, obj client.Object) []ctrl.Request
 	}
 
 	return requests
+}
+
+// placedAt returns when pod was placed on its node: the later of its
+// creationTimestamp and the lastTransitionTime of its PodScheduled=True
+// condition. The API server sets that condition when it binds a pod, so a
+// pod that waited in Pending is placed when it is bound. For a pod created
+// with spec.nodeName set, kubelet sets the condition after creation, and
+// placement happens no earlier than creation.
+func placedAt(pod *corev1.Pod) time.Time {
+	placed := pod.CreationTimestamp.Time
+
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionTrue && c.LastTransitionTime.After(placed) {
+			placed = c.LastTransitionTime.Time
+		}
+	}
+
+	return placed
 }
 
 // isMirrorPod reports whether pod looks like a kubelet mirror pod: it has
