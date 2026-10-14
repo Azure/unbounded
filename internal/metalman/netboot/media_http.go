@@ -196,6 +196,7 @@ func (p *MediaProvider) recordFirstBootCondition(ctx context.Context, o *mediaOw
 
 // artifactOwner claims the original lease before a mutable Machine IP lookup.
 // A revoked claim stays blocked rather than falling through to PXE serving.
+// Retained Machine identity also blocks requests from an edited live lease.
 func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwner, bool, error) {
 	var ops v1alpha3.MachineOperationList
 
@@ -207,6 +208,11 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 		return nil, true, err
 	}
 
+	machine, err := p.liveMachineByIP(ctx, ip)
+	if err != nil {
+		return nil, true, err
+	}
+
 	var found *mediaOwner
 
 	claimed := false
@@ -214,7 +220,17 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 
 	for _, op := range ops.Items {
 		for _, target := range op.Status.Targets {
-			if !mediaInSite(target.BootMedia, p.Site) || target.BootMedia.Netboot == nil || len(target.BootMedia.Netboot.DHCPLeases) == 0 || target.BootMedia.Netboot.DHCPLeases[0].IPv4 != ip {
+			b := target.BootMedia
+			if !mediaInSite(b, p.Site) {
+				continue
+			}
+
+			frozenIP := b.Netboot != nil && len(b.Netboot.DHCPLeases) > 0 && b.Netboot.DHCPLeases[0].IPv4 == ip
+			if !frozenIP {
+				if machine != nil && target.MachineRef == machine.Name && b.MachineUID == machine.UID && !mediaArtifactsReleased(&op, target) {
+					return nil, true, fmt.Errorf("live Machine lease is claimed by retained boot media")
+				}
+
 				continue
 			}
 
@@ -243,7 +259,7 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 		return found, true, nil
 	}
 
-	if claimed && outstanding == 0 && p.nonMediaSuccessor(ctx, ip, ops.Items) {
+	if claimed && outstanding == 0 && nonMediaSuccessor(machine, ops.Items) {
 		return nil, false, nil
 	}
 
@@ -255,19 +271,17 @@ func mediaArtifactsReleased(op *v1alpha3.MachineOperation, target v1alpha3.Machi
 		(op.Status.IsTerminal() || target.Phase == v1alpha3.OperationPhaseComplete || target.Phase == v1alpha3.OperationPhaseFailed)
 }
 
-// Released history yields only to an explicit live PXE/HTTP install. Changing
-// the Machine protocol alone must not revive a stale install request.
-func (p *MediaProvider) nonMediaSuccessor(ctx context.Context, ip string, ops []v1alpha3.MachineOperation) bool {
+func (p *MediaProvider) liveMachineByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
 	var machines v1alpha3.MachineList
 	if err := p.Client.List(ctx, &machines); err != nil {
-		return false
+		return nil, err
 	}
 
 	var machine *v1alpha3.Machine
 
 	for i := range machines.Items {
 		m := &machines.Items[i]
-		if m.Labels["unbounded-cloud.io/site"] != p.Site || !m.DeletionTimestamp.IsZero() || m.Spec.Netboot() == nil {
+		if m.Labels["unbounded-cloud.io/site"] != p.Site || m.Spec.Netboot() == nil {
 			continue
 		}
 
@@ -277,14 +291,20 @@ func (p *MediaProvider) nonMediaSuccessor(ctx context.Context, ip string, ops []
 			}
 
 			if machine != nil && machine.Name != m.Name {
-				return false
+				return nil, fmt.Errorf("ambiguous live Machine lease")
 			}
 
 			machine = m
 		}
 	}
 
-	if machine == nil {
+	return machine, nil
+}
+
+// Released history yields only to an explicit live PXE/HTTP install. Changing
+// the Machine protocol alone must not revive a stale install request.
+func nonMediaSuccessor(machine *v1alpha3.Machine, ops []v1alpha3.MachineOperation) bool {
+	if machine == nil || !machine.DeletionTimestamp.IsZero() {
 		return false
 	}
 
@@ -299,15 +319,7 @@ func (p *MediaProvider) nonMediaSuccessor(ctx context.Context, ip string, ops []
 			continue
 		}
 
-		if len(op.Status.Targets) == 0 {
-			return true
-		}
-
-		for _, target := range op.Status.Targets {
-			if target.MachineRef == machine.Name && target.BootMedia == nil {
-				return true
-			}
-		}
+		return true
 	}
 
 	return false

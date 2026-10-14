@@ -358,6 +358,10 @@ func (f *FileResolver) installRequested(ctx context.Context, node *v1alpha3.Mach
 		return false, nil
 	}
 
+	if node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
+		return false, nil
+	}
+
 	var list v1alpha3.MachineOperationList
 	if err := f.Reader.List(ctx, &list); err != nil {
 		return false, fmt.Errorf("list MachineOperations: %w", err)
@@ -386,7 +390,7 @@ func operationRequestsInstall(op *v1alpha3.MachineOperation, machineName string)
 			continue
 		}
 
-		return target.Phase != v1alpha3.OperationPhaseComplete && target.Phase != v1alpha3.OperationPhaseFailed
+		return target.BootMedia == nil && target.Phase != v1alpha3.OperationPhaseComplete && target.Phase != v1alpha3.OperationPhaseFailed
 	}
 
 	return len(op.Status.Targets) == 0 && op.Spec.MachineRef == machineName

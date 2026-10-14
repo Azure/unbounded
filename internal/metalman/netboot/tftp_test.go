@@ -58,7 +58,6 @@ func TestTFTPMediaLeaseAuthorization(t *testing.T) {
 				}
 			case "unclaimed IP":
 				m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.40"
-				wantAllowed = true
 			case "no media claim":
 				objects = []client.Object{m}
 				wantAllowed = true
