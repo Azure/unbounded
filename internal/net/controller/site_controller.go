@@ -274,46 +274,8 @@ func NewSiteController(
 		AddFunc: func(obj interface{}) {
 			sc.enqueueNode(obj)
 		},
-		UpdateFunc: func(old, new interface{}) {
-			oldNode := old.(*corev1.Node) //nolint:errcheck
-			newNode := new.(*corev1.Node) //nolint:errcheck
-			// Re-process if addresses changed, site label changed, WireGuard pubkey changed, or podCIDRs changed
-			if !nodeAddressesEqual(oldNode, newNode) ||
-				getNodeSiteLabel(oldNode) != getNodeSiteLabel(newNode) ||
-				getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
-				!labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels)) ||
-				oldNode.Spec.PodCIDR != newNode.Spec.PodCIDR ||
-				!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
-				sc.markSiteSlicesDirty(getNodeSiteLabel(oldNode), getNodeSiteLabel(newNode))
-				sc.enqueueNode(new)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			var node *corev1.Node
-
-			switch t := obj.(type) {
-			case *corev1.Node:
-				node = t
-			case cache.DeletedFinalStateUnknown:
-				var ok bool
-
-				node, ok = t.Obj.(*corev1.Node)
-				if !ok {
-					klog.Errorf("DeletedFinalStateUnknown contained non-Node object: %#v", t.Obj)
-					sc.enqueueSiteChange()
-
-					return
-				}
-			default:
-				klog.Errorf("Delete event contained non-Node object: %#v", obj)
-				sc.enqueueSiteChange()
-
-				return
-			}
-
-			sc.releaseNodeCIDRs(node)
-			sc.markSiteSlicesDirty(getNodeSiteLabel(node))
-		},
+		UpdateFunc: sc.handleNodeUpdate,
+		DeleteFunc: sc.handleNodeDelete,
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add node event handler: %w", err)
 	}
@@ -340,9 +302,7 @@ func NewSiteController(
 		AddFunc: func(obj interface{}) {
 			sc.markSliceObjectDirty(obj)
 		},
-		UpdateFunc: func(old, new interface{}) {
-			sc.markSliceObjectDirty(new)
-		},
+		UpdateFunc: sc.handleSliceUpdate,
 		DeleteFunc: func(obj interface{}) {
 			sc.markSliceObjectDirty(obj)
 		},
@@ -2707,6 +2667,61 @@ func (sc *SiteController) markSiteSlicesDirty(siteNames ...string) {
 	if hasWork {
 		sc.slicesDirty.Store(true)
 	}
+}
+
+func (sc *SiteController) handleNodeUpdate(old, new interface{}) {
+	oldNode := old.(*corev1.Node) //nolint:errcheck
+	newNode := new.(*corev1.Node) //nolint:errcheck
+	// Re-process if addresses changed, site label changed, WireGuard pubkey changed, or podCIDRs changed
+	if !nodeAddressesEqual(oldNode, newNode) ||
+		getNodeSiteLabel(oldNode) != getNodeSiteLabel(newNode) ||
+		getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
+		!labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels)) ||
+		oldNode.Spec.PodCIDR != newNode.Spec.PodCIDR ||
+		!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
+		sc.markSiteSlicesDirty(append(sc.nodeSliceSites(oldNode), sc.nodeSliceSites(newNode)...)...)
+		sc.enqueueNode(new)
+	}
+}
+
+func (sc *SiteController) handleNodeDelete(obj interface{}) {
+	var node *corev1.Node
+
+	switch t := obj.(type) {
+	case *corev1.Node:
+		node = t
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+
+		node, ok = t.Obj.(*corev1.Node)
+		if !ok {
+			klog.Errorf("DeletedFinalStateUnknown contained non-Node object: %#v", t.Obj)
+			sc.enqueueSiteChange()
+
+			return
+		}
+	default:
+		klog.Errorf("Delete event contained non-Node object: %#v", obj)
+		sc.enqueueSiteChange()
+
+		return
+	}
+
+	sc.releaseNodeCIDRs(node)
+	sc.markSiteSlicesDirty(sc.nodeSliceSites(node)...)
+}
+
+// handleSliceUpdate dirties both Sites when a slice's siteName changes, so the
+// original Site can repair a slice that the new Site deletes as extra.
+func (sc *SiteController) handleSliceUpdate(old, new interface{}) {
+	sc.markSliceObjectDirty(old)
+	sc.markSliceObjectDirty(new)
+}
+
+// nodeSliceSites returns the Sites whose slices may include node. Membership
+// is IP-derived, while the label may lag or disagree, so both are returned.
+func (sc *SiteController) nodeSliceSites(node *corev1.Node) []string {
+	return []string{getNodeSiteLabel(node), sc.GetSiteForNode(node)}
 }
 
 func (sc *SiteController) markSliceObjectDirty(obj interface{}) {
