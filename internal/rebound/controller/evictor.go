@@ -155,7 +155,11 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 
 		ctrl.LoggerFrom(ctx).Info("deleting pod not allowed by node grant", "node", node, "pod", client.ObjectKeyFromObject(pod))
 
-		err = r.client.Delete(ctx, pod, client.GracePeriodSeconds(0), client.Preconditions{UID: &pod.UID})
+		// The resourceVersion precondition makes the delete fail with a
+		// conflict if the pod changed since it was listed, for example by
+		// finishing. Conflicts are ignored and the next sweep looks again.
+		err = r.client.Delete(ctx, pod, client.GracePeriodSeconds(0),
+			client.Preconditions{UID: &pod.UID, ResourceVersion: &pod.ResourceVersion})
 		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 			errs = append(errs, err)
 		}

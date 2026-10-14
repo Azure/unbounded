@@ -911,8 +911,42 @@ func TestEvictorDeleteErrors(t *testing.T) {
 			do.ApplyOptions(opts)
 			require.Equal(t, int64(0), *do.GracePeriodSeconds)
 			require.Equal(t, types.UID("other/p"), *do.Preconditions.UID)
+			require.NotNil(t, do.Preconditions.ResourceVersion)
+			require.NotEmpty(t, *do.Preconditions.ResourceVersion)
 		})
 	}
+}
+
+// A pod that finishes after the list must not be deleted: the delete carries
+// the listed resourceVersion, so the API server rejects it with a conflict.
+func TestEvictorDeleteSkipsPodChangedAfterList(t *testing.T) {
+	var changed bool
+
+	funcs := &interceptor.Funcs{Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, o ...client.DeleteOption) error {
+		if !changed {
+			changed = true
+
+			live := &corev1.Pod{}
+			require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(obj), live))
+
+			live.Status.Phase = corev1.PodSucceeded
+			require.NoError(t, c.Status().Update(ctx, live))
+		}
+
+		return c.Delete(ctx, obj, o...)
+	}}
+	r, c := newEvictor(t, configMap(t, grant("tenant", "g", "a", time.Hour)), funcs, pod("other", "p", "a", testNow))
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+	require.NoError(t, err)
+
+	live := &corev1.Pod{}
+	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: "other", Name: "p"}, live))
+	require.Equal(t, corev1.PodSucceeded, live.Status.Phase)
+
+	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+	require.NoError(t, err)
+	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: "other", Name: "p"}, live))
 }
 
 func TestEvictorSkipsPodsAlreadyForceDeleted(t *testing.T) {
