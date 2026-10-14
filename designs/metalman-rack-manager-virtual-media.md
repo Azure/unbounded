@@ -36,7 +36,9 @@ the rack manager, mounts it as a virtual drive, and boots the host from it.
 - **No vendor terms in the public API.** The slot is part of `redfish.url`
   (for example `https://manager/28`). Metalman detects a rack manager by itself.
   The only new public value is the generic `bootProtocol: VirtualMedia`.
-- **PXE and HTTP boot are unchanged.**
+- **Virtual media is opt-in.** PXE and HTTP keep their boot paths, but now wait on
+  `ErrNotReady` without consuming attempts (`controller.go`, `repavePowerError`
+  and `retryTarget`).
 - **Fail closed.** A host must never boot the installer twice by accident, and
   must not reboot before its boot override is restored.
 - **Durable state.** All progress is saved on the `MachineOperation`, so a
@@ -60,7 +62,7 @@ the rack manager, mounts it as a virtual drive, and boots the host from it.
 
 ### Detection
 
-`Dial` calls `detectRackManager` (`rackmanager.go:50`) only when the URL has a
+`Dial` calls `detectRackManager` (`rackmanager.go:57`) only when the URL has a
 path. It sends `GET /redfish/v1/Managers/RackManager` to the origin root and
 checks:
 
@@ -75,17 +77,17 @@ mismatch, Metalman falls back to standard Redfish. So a normal BMC behind a
 proxy path still works.
 
 Once confirmed, the client uses a copy of the pinned HTTP client with a
-three-minute timeout (`rackmanager.go:112`), because some rack actions block for a
+three-minute timeout (`rackmanager.go:119`), because some rack actions block for a
 long time (see "Hardware findings").
 
 ### Requests and errors
 
-`rackRequest` (`rackmanager.go:144`) checks both the HTTP status and the
+`rackRequest` (`rackmanager.go:151`) checks both the HTTP status and the
 completion code. The code can be at the top level or inside an `error` object.
 The client reads `CompletionCode` from any key under `Oem`
-(`completion.go:21`). A `Success` inside `error` counts as success.
+(`completion.go:22`). A `Success` inside `error` counts as success.
 
-`rackUnavailable` (`rackmanager.go:375`) decides when the slot's BMC is not answering
+`rackUnavailable` (`rackmanager.go:378`) decides when the slot's BMC is not answering
 (for example "failed to query" or "failed to discover"). These errors may turn
 into `ErrNotReady` (`rackmanager.go:24`), which tells the controller to wait instead
 of using up an attempt.
@@ -93,11 +95,11 @@ of using up an attempt.
 ### Power
 
 - Power state comes from the blade (`GET /{slot}/redfish/v1/System`). If that
-  fails, the rack power map (`SystemPower`) is used (`rackmanager.go:206`).
+  fails, the rack power map (`SystemPower`) is used (`rackmanager.go:213`).
 - Power off is `ComputerSystem.Reset` with `ForceOff`. Power on uses `On`.
 - If the BMC does not answer and the rack shows the slot off, Metalman sends
   the discovered slot power-on action once and waits up to ten minutes
-  (`rackmanager.go:283-370`). It does this only for `Reset(On)` and for clearing the
+  (`rackmanager.go:295-347`). It does this only for `Reset(On)` and for clearing the
   boot override, because on tested firmware this action also turns the host on.
   Cleanup and media steps never change power.
 
@@ -110,8 +112,8 @@ Metalman always sets `Hdd` again after an install.
 ## Virtual media client
 
 All methods are in `redfish/virtualmedia.go`. Names must match
-`ub-<1-32 hex>.iso` and the server must be a literal IPv4 address
-(`virtualmedia.go:38`).
+`ub-<1-32 hex>.iso` (`virtualmedia.go:33`). Staging also requires the server to
+be a literal IPv4 address (`virtualmedia.go:43`).
 
 | Method | Requests | Notes |
 |---|---|---|
@@ -121,13 +123,13 @@ All methods are in `redfish/virtualmedia.go`. Names must match
 | `CleanupVirtualMedia` (`:122`) | `PATCH` target `Hdd`, then `RemoteDriveUnmount` | An unmount error saying support "is not enabled" means nothing is mounted, so it counts as success. |
 | `DeleteVirtualMedia` (`:155`) | `Tftp.Delete` for primer and real name | "No such file or directory" counts as success. |
 
-The primer name is `up-<id>.iso` (`bootmedia.PrimerName`, `types.go:23`). It is
+The primer name is `up-<id>.iso` (`bootmedia.PrimerName`, `bootmedia/types.go:23`). It is
 the same ISO. See "Why two mounts" below.
 
 ## The operation state machine
 
 A `HostReplace` operation on a Machine with `bootProtocol: VirtualMedia` runs
-`advanceVirtualMedia` (`machineops/virtualmedia.go:268-452`). State is kept in
+`advanceVirtualMedia` (`machineops/virtualmedia.go:259-443`). State is kept in
 `target.bootMedia` on the operation status.
 
 ### Start
@@ -164,7 +166,7 @@ get a fixed ten-minute grace per phase that does not reset on retries.
 ### Did the host boot the media?
 
 When GRUB on the ISO first fetches its config, the HTTP handler saves
-`loaderStartedAt` before it answers (`media_http.go:199-214`). This is the
+`loaderStartedAt` before it answers (`media_http.go:200-215`). This is the
 proof that the host booted the media.
 
 If `loaderStartedAt` is still empty ten minutes after power on
@@ -219,15 +221,17 @@ Ownership also ends in two more cases, so a machine is never locked forever:
 
 ### Inputs
 
-- Both `image` and `netbootImage` must be pinned by digest (`media.go:270`).
-- The netboot image metadata must declare `mediaFormat: unbounded-uefi-v1` and
-  name its shim and GRUB files (`media.go:294`).
+- Both `image` and `netbootImage` must be pinned by digest (`media.go:265`).
+- The netboot image metadata must declare `mediaFormat: unbounded-uefi-v1`
+  (`media.go:290`). Shim and GRUB filenames are fixed by architecture, not metadata.
 - The first DHCP lease must have a lowercase MAC, IPv4 address, mask, and a
   gateway in the subnet (`validateMediaLease`, `:234`).
 - `--serve-url` must be plain HTTP with an IPv4 host and no path.
 
 The cache key includes the ISO format version (`unbounded-uefi-hybrid-v2`,
 `:36`), so old ISOs are not reused after a format change.
+Each cache entry keeps only `bootstrap.iso` and `identity`; temporary build files
+are discarded.
 
 ### Layout
 
@@ -262,10 +266,10 @@ HTTP, so the server decides at fetch time whether an install is still allowed.
 
 ### Serving
 
-- **TFTP** (`tftp.go:68-81`): requests for `ub-<id>.iso` or `up-<id>.iso` are
+- **TFTP** (`tftp.go:60-84`): requests for `ub-<id>.iso` or `up-<id>.iso` are
   served before the normal source-IP lookup, because the requester is the rack
   manager, not the host. The name is the capability.
-- **HTTP** (`http.go:70-71`, `media_http.go:135-267`):
+- **HTTP** (`http.go:70-71`, `media_http.go:136-268`):
 
 | Path | Method | Behavior |
 |---|---|---|
@@ -275,7 +279,7 @@ HTTP, so the server decides at fetch time whether an install is still allowed.
 
 All three require the request to come from the first lease's IP. Kernel,
 initrd, `init.cpio`, and disk image downloads use the normal artifact handler,
-which serves the frozen images for the IP (`http.go:162-183`). It uses
+which serves the frozen images for the IP (`http.go:150-190`). It uses
 `http.ServeFile`, so range requests work. GRUB needs them to load a gzip arm64
 kernel.
 
@@ -295,10 +299,10 @@ runs on the Azure Linux kernel (see "Netboot image"). Main steps in
 3. Wait up to 30 seconds for the target disk to appear (`:321`).
 4. Download `disk.img.gz` and write it with `dd`.
 5. Mount the new root and write network config:
-   - If the image has `/etc/netplan`, write a netplan file.
-   - Else if it has `/etc/systemd/network`, write
+   - If the image has `/etc/systemd/network` and no `/etc/netplan`, write
      `10-unbounded-metal.network` and remove the image's default DHCP file
      (`:371-394`).
+   - Otherwise write a netplan file.
 6. Write the cloud-init NoCloud seed URL, and add a UEFI boot entry.
 7. With virtual media: POST `complete`, then poll `ready` until it returns 200
    (`:494-512`). On errors it keeps retrying in RAM. It never drops to a shell,
@@ -418,3 +422,8 @@ media on the first try. The boot retry remains as a backstop.
   be slow or hit firmware limits.
 - The installer picks the largest disk if `targetDisk` is not set. Set it.
 - The ISO's GRUB networking assumes the firmware exposes the NIC to UEFI.
+- Hardware fault checks remain: restart Metalman during staging, installation,
+  and cleanup; test callback and BMC failures and operation deletion. Confirm
+  the installer waits in RAM, late cleanup permits reboot without reinstalling,
+  and pending cleanup blocks the next operation even if rack deletion fails
+  after a safe reboot.

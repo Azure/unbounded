@@ -269,20 +269,22 @@ after a controller restart. Each entry includes:
 | `providerOperation` | ProviderOperationStatus | Resumable external operation metadata, including provider, operation ID, and an opaque non-secret resume token. |
 | `bootMedia` | MachineOperationBootMediaStatus | Metalman's saved virtual-media ownership, frozen netboot inputs, source, phase, cleanup flags, and reboot acknowledgment. Controller-owned; do not edit. |
 
-Virtual-media callbacks are target-scoped. After `/complete` saves `imageWritten`,
-the installer waits for `/ready`. `cleaned` means boot-safe cleanup: `Hdd` restored
-and the drive unmounted. `/ready` saves
-`rebootRequestedAt` before returning success. Rack deletion (`stagedDeleted`) and
-local release (`released`) are separate; failed deletion retains ownership without
-blocking a safe reboot.
+Key `bootMedia` fields:
 
-The installer retries bounded `curl` requests in RAM until acknowledged, without
-reinstalling or rebooting early. Frozen netboot inputs remain in use despite Machine
-edits. Callbacks use the original first lease and can confirm cleanup after failure
-or a deletion request while the operation exists. The
-`metalman.unbounded-cloud.io/boot-media` finalizer retains ownership until cleanup
-and any pending reboot handoff finish, blocking another host operation on the same
-machine or BMC. See the virtual media guide for deadlines and hardware checks.
+| Field | Meaning |
+|---|---|
+| `netboot` | Frozen settings, including the first lease used for callbacks. |
+| `imageWritten` | The target's `/complete` callback confirmed the disk write. |
+| `cleaned` | `Hdd` restored and remote drive unmounted; safe to reboot. |
+| `rebootRequestedAt` | Saved by `/ready` before it permits reboot. |
+| `stagedDeleted` | Staged rack files deleted. Separate from boot-safe cleanup. |
+| `released` | Local ISO cache removed; does not alone end ownership. |
+| `abandoned` | Ownership ended after the installer failed to finish within the retention deadline. |
+
+The `metalman.unbounded-cloud.io/boot-media` finalizer protects cleanup and reboot
+handoff. Do not remove it to bypass a blocked operation. See
+[install and cleanup]({{< relref "/guides/pxe" >}}#install-and-cleanup) for recovery,
+ownership rules, and deadlines.
 
 ### status
 
@@ -545,19 +547,19 @@ The `httpBootPath` field specifies the file path, relative to metalman's HTTP
 artifact server, used for `spec.host.netboot.bootProtocol: HTTP`. If `httpBootPath` is
 omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
 
-Virtual media also requires these metadata fields (amd64 example):
+Virtual media also requires this metadata field:
 
 ```yaml
 mediaFormat: unbounded-uefi-v1
-mediaShim: shimx64.efi
-mediaGrub: grubx64.efi
 ```
 
-For arm64, use `shimaa64.efi` and `grubaa64.efi`. Publish the matching EFI files,
+EFI filenames are fixed by architecture: `shimx64.efi` and `grubx64.efi` for amd64,
+or `shimaa64.efi` and `grubaa64.efi` for arm64. Publish these files,
 updated `grub/grub.cfg.tmpl`, and installer overlay from `images/netboot` together;
 adding metadata to an old artifact is not enough. This format supports the live
-install authorization and cleanup callback barrier. See the virtual media guide
-for what has been tested on hardware.
+install authorization and cleanup callback barrier. See the
+[virtual media guide]({{< relref "/guides/pxe" >}}#virtual-media-experimental)
+for hardware test coverage.
 
 ---
 

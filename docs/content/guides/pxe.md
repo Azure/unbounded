@@ -108,8 +108,9 @@ The installer in the netboot image runs the Azure Linux kernel, so it has
 drivers for NICs such as Microsoft MANA. It still boots through the Ubuntu shim
 and GRUB. Running this installer with Secure Boot on is not supported yet.
 
-The installer writes the machine's static network settings as netplan when the
-image has `/etc/netplan`, and as a systemd-networkd file otherwise.
+The installer writes static network settings as a systemd-networkd file only when
+the image has `/etc/systemd/network` and no `/etc/netplan`. Otherwise it writes
+netplan configuration.
 
 See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Machine spec.
 
@@ -258,85 +259,39 @@ Request installation with `kubectl unbounded machine repave rack-slot-7`.
 
 ### Install and cleanup
 
-Metalman saves ownership and a cleanup finalizer on the `HostReplace` operation,
-builds and stages the ISO, powers the host off, mounts the ISO, selects UEFI
-`RemoteDrive`, then powers the host on. The ISO selects the NIC by MAC, sets static
-networking, and fetches live install instructions and artifacts over HTTP.
-The operation keeps its frozen netboot settings despite later Machine edits,
-including the original first lease for downloads and callbacks.
+1. Request the repave and watch the `HostReplace` target status. Metalman saves
+   ownership, stages the ISO, and boots it through UEFI `RemoteDrive`. It uses
+   frozen netboot settings, including the original first lease, despite Machine edits.
+2. After writing the disk, the installer waits for Metalman to restore `Hdd` and
+   unmount the drive before rebooting. Cleanup never changes power. Failed rack-file
+   deletion retains ownership but does not block a safe reboot.
+3. If cleanup stalls, restore BMC and callback connectivity. The installer retries
+   in RAM without dropping to a shell, rebooting early, or writing the disk again.
+   Callbacks remain available after failure or a deletion request while the
+   operation exists; new installs are no longer authorized.
 
-After writing the disk, the installer calls its operation-scoped `/complete`
-endpoint and waits for `/ready`. This is a reboot barrier: Metalman restores
-`Hdd` and unmounts the remote drive before saving boot-safe cleanup. `/ready`
-then saves the reboot acknowledgment before allowing reboot. Rack-file deletion
-and local-media release are separate cleanup steps: a failed rack deletion keeps
-ownership but does not block a safe reboot. Cleanup never changes power. If the
-BMC does not answer, cleanup keeps retrying until both `Hdd` and unmount succeed.
+The default install deadline is one hour, separate from the five-minute
+power-action timeout and ten-minute BMC readiness grace. If GRUB does not fetch
+its config within ten minutes of power-on, Metalman cleans up and retries with
+new media, for three boots total. An operation timeout alone does not end the
+installer's callback wait or release ownership.
 
-If callbacks fail, the installer stays in RAM and keeps retrying with bounded
-`curl` requests. It does not drop to a shell, reboot early, or write the disk
-again. Late cleanup can therefore let the same installer reboot. Callbacks from
-the original lease still work after operation failure or a deletion request while
-the operation exists. New install work is no longer authorized in those states.
+Cleanup resumes across controller restarts, failure, and operation deletion.
+Pending cleanup or reboot handoff blocks other host operations on the same machine
+or BMC. After cleanup, a started install keeps ownership until first-boot cloud-init
+reports success or failure. If it never reports, ownership ends one install deadline
+after cleanup or reboot handoff, and Metalman sets `abandoned`. A host that never
+booted the media releases ownership after cleanup.
 
-The default installation deadline is one hour, separate from the five-minute
-power-action timeout and ten-minute BMC readiness grace. An operation timeout does
-not end the installer's safe callback wait or release ownership by itself.
+{{< callout type="warning" >}}
+Do not remove the cleanup finalizer to bypass a blocked operation. Restore
+connectivity and let cleanup finish.
+{{< /callout >}}
 
-Metalman records `loaderStartedAt` when GRUB on the ISO first fetches its install
-config. If that does not happen within ten minutes of power-on, Metalman assumes
-the host did not boot the media. It restores `Hdd`, unmounts, deletes the staged
-ISO, and builds a new one under a new name. Then it stages it, powers the host off,
-mounts it, selects `RemoteDrive`, and powers on. A new name is needed because the
-tested firmware can keep a broken drive for an image name, even after a remount.
-It tries three boots in total, then fails
-the target. `bootAttempts` counts the retries.
-
-The finalizer also drives cleanup after failure or operation deletion, using saved
-state across controller restarts. Pending cleanup or reboot handoff blocks another
-host operation on the same machine or BMC, even when the old operation is terminal.
-For started installs, ownership remains until successful first-boot cloud-init
-confirms the host rebooted. This keeps `/ready` available if its response is lost.
-If the host never booted the media, ownership ends after cleanup. If the installer
-started but cloud-init never reports, ownership ends one install deadline after
-cleanup or reboot handoff, and Metalman sets `abandoned`.
-Restore connectivity and let cleanup finish; do not remove the finalizer to bypass it.
-
-### Hardware results
-
-Tested on one arm64 server behind one rack manager:
-
-- `RemoteDriveMount.ImageName` finds files staged by `Tftp.Get`. Image names must
-  be shorter than 40 characters, so Metalman uses `ub-<32 hex>.iso` and
-  `up-<32 hex>.iso`.
-- The host sees the mounted image as a removable USB disk, not a CD. Metalman
-  builds a hybrid ISO with a GPT EFI system partition so UEFI can boot it.
-- `Tftp.Get` and `RemoteDriveMount` block until done. A mount takes about 20
-  seconds. Metalman allows three minutes for each rack manager request.
-- Unmount can be repeated. Deleting a missing file returns "No such file or
-  directory", which Metalman treats as already deleted.
-- Unmount fails with a "... support is not enabled" message when nothing is
-  mounted, for example after a power cycle. Metalman treats this as unmounted.
-- After a power cycle that follows a media boot, the first mount of a new name
-  often leaves no usable drive. Linux saw the disk but reads failed, or the BMC
-  USB devices were missing, and UEFI did not find a USB boot device. Mounting the
-  same name again did not help. A second mount of another name always gave a
-  working drive. So Metalman stages the ISO under two names, `up-<id>.iso` and
-  `ub-<id>.iso`, mounts `up-` first and then `ub-`, and deletes both in cleanup.
-- `ForceOff` works even though the system does not list it as an allowed reset.
-- The rack power map shows host power, not slot AC power. The slot power-on
-  action also powers on the host.
-- GRUB found the NIC by MAC and used the static lease. GRUB needs HTTP range
-  requests to load a gzip arm64 kernel. Metalman's HTTP server supports them.
-
-### Hardware validation checklist
-
-- Boot the ISO on amd64 and with Secure Boot on.
-- Test a server whose slot AC power is off, and other rack manager firmware.
-- Restart Metalman during staging, installation, and cleanup. Test callback and
-  BMC failures and operation deletion. Confirm the installer waits in RAM, late
-  cleanup permits reboot without reinstalling, and pending cleanup blocks the next
-  operation even if rack deletion fails after a safe reboot.
+See the [operation status fields]({{< relref "/reference/machina-crd" >}}#machineoperation)
+for saved progress. Before using other hardware, validate media boot, callback and
+BMC failures, controller restarts, and operation deletion. Confirm cleanup permits
+reboot without reinstalling and blocks conflicting operations until ownership ends.
 
 ## Cloud-Init Customization
 
@@ -400,7 +355,7 @@ flow above.
 3. **GRUB decision.** A rendered `grub.cfg` checks for an active `HostReplace` `MachineOperation` targeting the Machine. If a repave is requested, GRUB boots the PXE installer; otherwise it chainloads the local OS. When a Machine has multiple DHCP leases, metalman renders the lease matching the request source IP and passes that lease's MAC as `unbounded.boot_mac`.
 4. **Installer (initrd overlay).** An init script in the initrd:
    - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP and DNS from kernel cmdline.
-   - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. The default netboot image also serves the selected lease as NoCloud `network-config`.
+   - Writes MAC-based static network settings using systemd-networkd only when the target has `/etc/systemd/network` and no `/etc/netplan`; otherwise it uses netplan. It disables cloud-init network rendering to avoid conflicting DHCP settings. The default netboot image also serves the selected lease as NoCloud `network-config`.
    - Downloads the gzip-compressed raw disk image from the machine image over HTTP (retries up to 120 times).
    - Writes the image to `spec.host.netboot.targetDisk` when set, otherwise to an automatically selected block device.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.
@@ -468,7 +423,12 @@ Running metalman's DHCP server on a network segment that already has an active D
 ## Limitations
 
 {{< callout type="note" >}}
-Only Ubuntu 24.04 images are currently supported. The PXE/HTTP repave boot request timeout is fixed at 30 minutes. Virtual-media deadlines are listed above.
+Ubuntu 24.04 and Azure Linux 3.0 machine image builds are available, including an
+Azure Linux NVIDIA variant. Available builds do not imply hardware validation:
+virtual media has been tested only on the arm64 setup described above, not on
+amd64 or other rack manager firmware. Secure Boot is not supported for the installer.
+The PXE/HTTP repave boot request timeout is fixed at 30 minutes. Virtual-media
+deadlines are listed above.
 {{< /callout >}}
 
 ## See Also
