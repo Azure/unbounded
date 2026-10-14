@@ -11,9 +11,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	"github.com/Azure/unbounded/internal/rebound/ledger"
 )
@@ -99,26 +102,48 @@ func mirrorGrant(node *corev1.Node, grant *ledger.Grant) {
 	node.Spec.Taints = taints
 }
 
-func (r *nodeMirror) mapLedger(ctx context.Context, obj client.Object) []ctrl.Request {
-	cm, ok := obj.(*corev1.ConfigMap)
-	if !ok || cm.Namespace != r.namespace || cm.Name != ledger.ConfigMapName {
-		return nil
-	}
-
-	names := make(map[string]struct{})
-
-	for _, g := range ledger.Parse(cm.Data).Grants() {
-		for _, node := range g.Nodes {
-			names[node] = struct{}{}
+// ledgerHandler enqueues every node named by the ledger before and after a
+// change. Nodes dropped from the ledger appear only in the old object, so
+// using both lets the mirror clear their labels and taint without a separate
+// node list that could fail and lose the event. Nodes left over from before a
+// restart are covered because the Node watch enqueues every node on start.
+func (r *nodeMirror) ledgerHandler() handler.EventHandler {
+	enqueue := func(q workqueue.TypedRateLimitingInterface[ctrl.Request], objs ...client.Object) {
+		for _, req := range r.ledgerNodes(objs...) {
+			q.Add(req)
 		}
 	}
 
-	var nodes corev1.NodeList
-	if err := r.reader.List(ctx, &nodes, client.HasLabels{LabelNamespace}); err != nil {
-		ctrl.LoggerFrom(ctx).Error(err, "list granted nodes for ledger event")
-	} else {
-		for _, node := range nodes.Items {
-			names[node.Name] = struct{}{}
+	return handler.Funcs{
+		CreateFunc: func(_ context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueue(q, e.Object)
+		},
+		UpdateFunc: func(_ context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueue(q, e.ObjectOld, e.ObjectNew)
+		},
+		DeleteFunc: func(_ context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueue(q, e.Object)
+		},
+		GenericFunc: func(_ context.Context, e event.GenericEvent, q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+			enqueue(q, e.Object)
+		},
+	}
+}
+
+// ledgerNodes returns one request per node named by any of the ledger objects.
+func (r *nodeMirror) ledgerNodes(objs ...client.Object) []ctrl.Request {
+	names := make(map[string]struct{})
+
+	for _, obj := range objs {
+		cm, ok := obj.(*corev1.ConfigMap)
+		if !ok || cm.Namespace != r.namespace || cm.Name != ledger.ConfigMapName {
+			continue
+		}
+
+		for _, g := range ledger.Parse(cm.Data).Grants() {
+			for _, node := range g.Nodes {
+				names[node] = struct{}{}
+			}
 		}
 	}
 

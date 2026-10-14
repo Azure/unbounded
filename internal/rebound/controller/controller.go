@@ -85,7 +85,7 @@ func Setup(mgr ctrl.Manager, opts Options) error {
 		Named("rebound-node-mirror").
 		WithOptions(leader).
 		For(&corev1.Node{}).
-		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(mirror.mapLedger), filter).
+		Watches(&corev1.ConfigMap{}, mirror.ledgerHandler(), filter).
 		Complete(mirror); err != nil {
 		return fmt.Errorf("set up rebound node mirror: %w", err)
 	}

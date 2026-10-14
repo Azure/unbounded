@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -419,30 +420,69 @@ func TestMirrorRepairsTaints(t *testing.T) {
 	}, node.Spec.Taints)
 }
 
-func TestMapLedgerAndPredicates(t *testing.T) {
+func TestMirrorLedgerNodesAndPredicates(t *testing.T) {
 	cm := configMap(t, grant("tenant", "one", "desired", time.Minute), grant("tenant", "two", "both", time.Minute))
-	c := clientBuilder(t,
-		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "actual", Labels: map[string]string{LabelNamespace: "old"}}},
-		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "both", Labels: map[string]string{LabelNamespace: "tenant"}}},
-		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "unrelated"}},
-	).Build()
-	r := &nodeMirror{reader: c, namespace: "system"}
-	requests := r.mapLedger(t.Context(), cm)
+	r := &nodeMirror{namespace: "system"}
 	require.ElementsMatch(t, []ctrl.Request{
-		{NamespacedName: types.NamespacedName{Name: "actual"}},
 		{NamespacedName: types.NamespacedName{Name: "both"}},
 		{NamespacedName: types.NamespacedName{Name: "desired"}},
-	}, requests)
+	}, r.ledgerNodes(cm))
 
 	p := ledgerPredicate("system")
 	require.True(t, p.Create(event.CreateEvent{Object: cm}))
 	require.True(t, p.Delete(event.DeleteEvent{Object: cm}))
-	cm.Namespace = "other"
-	require.False(t, p.Create(event.CreateEvent{Object: cm}))
-	require.Empty(t, r.mapLedger(t.Context(), cm))
-	cm.Namespace, cm.Name = "system", "other"
-	require.False(t, p.Create(event.CreateEvent{Object: cm}))
-	require.Empty(t, r.mapLedger(t.Context(), cm))
-	require.Empty(t, r.mapLedger(t.Context(), &corev1.Node{}))
+
+	other := cm.DeepCopy()
+	other.Namespace = "other"
+	require.False(t, p.Create(event.CreateEvent{Object: other}))
+	require.Empty(t, r.ledgerNodes(other))
+	other.Namespace, other.Name = "system", "other"
+	require.False(t, p.Create(event.CreateEvent{Object: other}))
+	require.Empty(t, r.ledgerNodes(other))
+	require.Empty(t, r.ledgerNodes(&corev1.Node{}))
 	require.Equal(t, singleton(t.Context(), cm), singleton(t.Context(), &corev1.Namespace{}))
+}
+
+// A grant removed from the ledger appears only in the old object, so the
+// update handler must enqueue nodes from both sides.
+func TestMirrorLedgerHandlerEnqueuesRemovedNodes(t *testing.T) {
+	r := &nodeMirror{namespace: "system"}
+	oldCM := configMap(t, grant("tenant", "gone", "removed", time.Minute), grant("tenant", "kept", "kept", time.Minute))
+	newCM := configMap(t, grant("tenant", "kept", "kept", time.Minute), grant("tenant", "new", "added", time.Minute))
+
+	drain := func(q workqueue.TypedRateLimitingInterface[ctrl.Request]) []string {
+		var names []string
+
+		for q.Len() > 0 {
+			req, _ := q.Get()
+			names = append(names, req.Name)
+			q.Done(req)
+		}
+
+		return names
+	}
+	newQueue := func() workqueue.TypedRateLimitingInterface[ctrl.Request] {
+		q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[ctrl.Request]())
+		t.Cleanup(q.ShutDown)
+
+		return q
+	}
+
+	h := r.ledgerHandler()
+
+	q := newQueue()
+	h.Update(t.Context(), event.UpdateEvent{ObjectOld: oldCM, ObjectNew: newCM}, q)
+	require.ElementsMatch(t, []string{"removed", "kept", "added"}, drain(q))
+
+	q = newQueue()
+	h.Delete(t.Context(), event.DeleteEvent{Object: oldCM}, q)
+	require.ElementsMatch(t, []string{"removed", "kept"}, drain(q))
+
+	q = newQueue()
+	h.Create(t.Context(), event.CreateEvent{Object: newCM}, q)
+	require.ElementsMatch(t, []string{"kept", "added"}, drain(q))
+
+	q = newQueue()
+	h.Generic(t.Context(), event.GenericEvent{Object: newCM}, q)
+	require.ElementsMatch(t, []string{"kept", "added"}, drain(q))
 }
