@@ -90,6 +90,49 @@ Do not combine these stages in one Helm upgrade. A new pod can create a
 higher-numbered Lease while old pods are still running, which makes the old
 pods reject their next chair snapshot.
 
+## Metrics
+
+Each agent serves Prometheus metrics on port `9095` (`/metrics`). Set
+`metricsService.enabled=true` to render `Service/gantry-metrics`, a headless
+Service over the agents that also lists NotReady agents. Use
+`metricsService.annotations` for annotation-driven scrapers, for example a
+Datadog endpoints check that scrapes every agent from its own node:
+
+```yaml
+metricsService:
+  enabled: true
+  annotations:
+    ad.datadoghq.com/endpoints.checks: |
+      {"openmetrics": {"init_config": {}, "instances": [{
+        "openmetrics_endpoint": "http://%%host%%:9095/metrics",
+        "namespace": "gantry", "metrics": [".*"]}]}}
+
+## Agent rollout
+
+`updateStrategy.rollingUpdate.maxUnavailable` sets the agent DaemonSet's
+rolling-update step as a positive count or percentage. The default `50%`
+replaces half of the agents at once; lower it on large clusters to bound how
+many nodes lose their local mirror during a rollout:
+
+```sh
+--set-string updateStrategy.rollingUpdate.maxUnavailable=10%
+```
+
+## Peer transfer tuning
+
+`gantry.peerFetchTimeout` (default `15m`) caps one complete peer blob request,
+including streaming the body. It is a safety ceiling, not a stall detector:
+the HTTP/2 transport separately probes connections after 10s without reads.
+A value much lower than a large layer's transfer time makes requesters abandon
+progressing transfers and switch providers.
+
+`gantry.transferMaxConcurrentServes` (default `10`) caps concurrent peer blob
+serves per agent. Requests over the cap receive 429 so the requester
+re-discovers another provider. `0` means unlimited.
+
+Use `gantry.config` only when a setting has no dedicated value; it replaces
+the entire generated configuration.
+
 ## Operator Profile
 
 ```sh

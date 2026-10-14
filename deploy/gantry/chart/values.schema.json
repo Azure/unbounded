@@ -6,10 +6,12 @@
     "image",
     "namespace",
     "manager",
+    "updateStrategy",
     "nodeSelector",
     "tolerations",
     "containerd",
     "nodeConfig",
+    "metricsService",
     "registryCredentials",
     "resources",
     "gantry"
@@ -67,6 +69,36 @@
       "enum": [
         "helm"
       ]
+    },
+    "updateStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rollingUpdate"
+      ],
+      "properties": {
+        "rollingUpdate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "maxUnavailable"
+          ],
+          "properties": {
+            "maxUnavailable": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^([1-9][0-9]?|100)%$"
+                }
+              ]
+            }
+          }
+        }
+      }
     },
     "nodeSelector": {
       "type": "object",
@@ -143,6 +175,25 @@
         }
       }
     },
+    "metricsService": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "annotations"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "registryCredentials": {
       "type": "object",
       "additionalProperties": false,
@@ -184,6 +235,8 @@
         "pprofListen",
         "chairCount",
         "chairSeedCount",
+        "peerFetchTimeout",
+        "transferMaxConcurrentServes",
         "upstreamRegistries"
       ],
       "properties": {
@@ -200,6 +253,14 @@
         "chairSeedCount": {
           "type": "integer",
           "minimum": 1
+        },
+        "peerFetchTimeout": {
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+        },
+        "transferMaxConcurrentServes": {
+          "type": "integer",
+          "minimum": 0
         },
         "upstreamRegistries": {
           "type": "array",
