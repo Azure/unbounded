@@ -1018,6 +1018,90 @@ func TestVirtualMediaMergeKeepsLoaderStartOverStaleRetry(t *testing.T) {
 	require.Equal(t, started, updated.BootMedia.LoaderStartedAt)
 }
 
+func TestVirtualMediaMergeLoaderStartWithFailure(t *testing.T) {
+	tests := []struct {
+		name           string
+		elapsed        time.Duration
+		loaderStarts   bool
+		machineChanged bool
+		wantMessage    string
+		wantFailed     bool
+	}{
+		{
+			name: "final boot timeout with loader start", elapsed: 10 * time.Minute, loaderStarts: true,
+			wantMessage: "host did not boot the virtual media",
+		},
+		{
+			name: "final boot timeout without loader start", elapsed: 10 * time.Minute,
+			wantMessage: "host did not boot the virtual media", wantFailed: true,
+		},
+		{
+			name: "install timeout with loader start", elapsed: time.Hour, loaderStarts: true,
+			wantMessage: "virtual media progress timed out in Installing", wantFailed: true,
+		},
+		{
+			name: "Machine changed with loader start", elapsed: 10 * time.Minute, loaderStarts: true, machineChanged: true,
+			wantMessage: "Machine identity or ownership changed", wantFailed: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, d, machine, op := mediaFixture(t)
+			current := mediaInstalling(t, r, op.Name)
+			current.Status.Targets[0].BootMedia.BootAttempts = mediaMaxBootAttempts - 1
+			require.NoError(t, r.Status().Update(t.Context(), current))
+			snapshot := current.DeepCopy()
+
+			if tt.machineChanged {
+				machine.UID = "replacement-machine-uid"
+				require.NoError(t, r.Update(t.Context(), machine))
+			}
+
+			r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(tt.elapsed)) }
+			change := r.advanceVirtualMedia(t.Context(), snapshot, machine, snapshot.Status.Targets[0], r.now())
+			require.NoError(t, change.err)
+			require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
+			require.NotNil(t, change.target.CompletedAt)
+			require.Contains(t, change.target.Message, tt.wantMessage)
+			require.Nil(t, change.target.BootMedia.LoaderStartedAt)
+			require.Equal(t, int32(mediaMaxBootAttempts-1), change.target.BootMedia.BootAttempts)
+
+			// The loader start is saved after the timeout decision but before its write.
+			if tt.loaderStarts {
+				current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(r.now())
+				require.NoError(t, r.Status().Update(t.Context(), current))
+			}
+
+			require.NoError(t, r.applyTargetChanges(t.Context(), op.Name, []targetChange{change}, false))
+
+			var saved v1alpha3.MachineOperation
+			require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: op.Name}, &saved))
+			target := saved.Status.Targets[0]
+			require.Equal(t, current.Status.Targets[0].BootMedia, target.BootMedia)
+
+			if tt.wantFailed {
+				require.Equal(t, v1alpha3.OperationPhaseFailed, target.Phase)
+				require.True(t, change.target.CompletedAt.Equal(target.CompletedAt))
+				require.Equal(t, change.target.Message, target.Message)
+				require.Equal(t, v1alpha3.OperationPhaseFailed, saved.Status.Phase)
+				require.NotNil(t, saved.Status.CompletedAt)
+			} else {
+				require.Equal(t, v1alpha3.OperationPhaseInProgress, target.Phase)
+				require.Nil(t, target.CompletedAt)
+				require.Contains(t, target.Message, "write the boot image")
+				require.Equal(t, v1alpha3.OperationPhaseInProgress, saved.Status.Phase)
+				require.Nil(t, saved.Status.CompletedAt)
+
+				calls := slices.Clone(d.calls)
+				current = mediaStep(t, r, op.Name)
+				require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+				require.False(t, current.Status.Targets[0].BootMedia.Cleaned)
+				require.Equal(t, calls, d.calls)
+			}
+		})
+	}
+}
+
 func TestVirtualMediaFailedBootReleasesWithoutHandoff(t *testing.T) {
 	r, d, _, op := mediaFixture(t)
 	mediaInstalling(t, r, op.Name)

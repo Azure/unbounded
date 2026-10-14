@@ -35,6 +35,8 @@ const mediaReadinessGrace = 10 * time.Minute
 // virtual media.
 const mediaMaxBootAttempts = 3
 
+const mediaNoLoaderTimeoutMessage = "host did not boot the virtual media"
+
 func (r *Reconciler) reader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader
@@ -318,7 +320,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 				// No installer can run before the loader fetches its config,
 				// so a fresh power cycle is safe.
 				if b.BootAttempts+1 >= mediaMaxBootAttempts {
-					return failTarget(target, reasonTimedOut, "host did not boot the virtual media", now)
+					return failTarget(target, reasonTimedOut, mediaNoLoaderTimeoutMessage, now)
 				}
 
 				// Some firmware can keep a broken virtual drive for an image
@@ -576,6 +578,14 @@ func mergeMediaCallbacks(updated *v1alpha3.MachineOperationTargetStatus, latest 
 
 	if latest.BootMedia.LoaderStartedAt != nil && updated.BootMedia.LoaderStartedAt == nil {
 		updated.BootMedia.LoaderStartedAt = latest.BootMedia.LoaderStartedAt.DeepCopy()
+		if updated.Phase == v1alpha3.OperationPhaseFailed && updated.Message == reasonTimedOut+": "+mediaNoLoaderTimeoutMessage {
+			// The final boot timeout leaves BootAttempts unchanged. Undo only
+			// this no-loader failure, not an install timeout or another failure.
+			updated.Phase = latest.Phase
+			updated.CompletedAt = latest.CompletedAt.DeepCopy()
+			updated.Message = "waiting for virtual media installer to write the boot image"
+		}
+
 		if updated.BootMedia.BootAttempts != latest.BootMedia.BootAttempts {
 			// A boot retry was decided before the loader start was seen. The
 			// installer is running, so keep waiting for it instead.
