@@ -430,10 +430,13 @@ func TestProviderAcceptsNextCADuringRotation(t *testing.T) {
 	require.EqualValues(t, 2, l.calls.Load())
 	require.True(t, p.Ready())
 
+	// Confirm publication to start the grace, then let it elapse.
+	reconcile(t, r)
 	clock.Step(r.CAGrace)
 	reconcile(t, r)
 	promoted := getSecret(t, r)
 	verify(t, r, promoted, 2)
+	require.Equal(t, staged.Data["next-ca.crt"], promoted.Data["ca.crt"])
 	p.load(promoted)
 	currentCert, currentKey = p.CurrentCertKeyContent()
 	require.Equal(t, promoted.Data[corev1.TLSCertKey], currentCert)

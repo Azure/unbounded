@@ -203,13 +203,21 @@ func TestCARotationStages(t *testing.T) {
 	}
 
 	clock.SetTime(renewAt(ca))
-	reconcile(t, r)
+	// Staging publishes the bundle but cannot start the grace in the same pass.
+	require.Equal(t, retryInterval, reconcile(t, r))
 	staged := getSecret(t, r)
 
 	oldLeaf := verify(t, r, staged, 2)
 	if !bytes.Equal(staged.Data["ca.crt"], initial.Data["ca.crt"]) || len(staged.Data["next-ca.key"]) == 0 {
 		t.Fatal("CA was not staged")
 	}
+
+	require.NotContains(t, staged.Annotations, nextAddedAt)
+
+	// The next pass sees the published bundle and starts the grace then.
+	clock.Step(5 * time.Second)
+	require.Equal(t, r.CAGrace, reconcile(t, r))
+	require.Equal(t, clock.Now().Format(time.RFC3339Nano), getSecret(t, r).Annotations[nextAddedAt])
 
 	clock.Step(r.CAGrace - time.Second)
 
@@ -271,12 +279,17 @@ func TestMissingAPIServiceAndPublicationGrace(t *testing.T) {
 	}
 
 	staged := getSecret(t, r)
+	require.NotEmpty(t, staged.Data["next-ca.crt"])
+	require.NotContains(t, staged.Annotations, nextAddedAt)
+
 	clock.Step(2 * r.CAGrace)
 	reconcile(t, r)
 
 	if !bytes.Equal(getSecret(t, r).Data["ca.crt"], staged.Data["ca.crt"]) {
 		t.Fatal("promoted without publication")
 	}
+
+	require.NotContains(t, getSecret(t, r).Annotations, nextAddedAt)
 
 	if _, err := services.Create(t.Context(), &aggregatorv1.APIService{ObjectMeta: metav1.ObjectMeta{Name: r.APIServiceName}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -285,6 +298,7 @@ func TestMissingAPIServiceAndPublicationGrace(t *testing.T) {
 	reconcile(t, r)
 	// Publication has succeeded. The next pass starts a fresh full grace.
 	reconcile(t, r)
+	require.Equal(t, clock.Now().Format(time.RFC3339Nano), getSecret(t, r).Annotations[nextAddedAt])
 	clock.Step(r.CAGrace - time.Second)
 	reconcile(t, r)
 
@@ -295,6 +309,96 @@ func TestMissingAPIServiceAndPublicationGrace(t *testing.T) {
 	clock.Step(time.Second)
 	reconcile(t, r)
 	verify(t, r, getSecret(t, r), 2)
+}
+
+// The grace must run from when trust is confirmed, not from when the CA was
+// staged, or aggregators may not have reloaded trust before promotion.
+func TestDelayedPublicationStartsGrace(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		publish func(t *testing.T, r *Rotator)
+	}{
+		{
+			name: "rotator retry publishes",
+			publish: func(t *testing.T, r *Rotator) {
+				// This pass publishes; the following pass confirms it.
+				reconcile(t, r)
+			},
+		},
+		{
+			name: "failed update lands late",
+			publish: func(t *testing.T, r *Rotator) {
+				services := r.Aggregator.ApiregistrationV1().APIServices()
+				service, err := services.Get(t.Context(), r.APIServiceName, metav1.GetOptions{})
+				require.NoError(t, err)
+
+				service.Spec.CABundle = getSecret(t, r).Data["ca-bundle.crt"]
+				service.Spec.InsecureSkipTLSVerify = false
+				_, err = services.Update(t.Context(), service, metav1.UpdateOptions{})
+				require.NoError(t, err)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, clock := fixture()
+			reconcile(t, r)
+			initial := getSecret(t, r)
+
+			ca, err := parseCertificate(initial.Data["ca.crt"])
+			require.NoError(t, err)
+
+			fail := true
+
+			r.Aggregator.(*aggregatorfake.Clientset).PrependReactor("update", "apiservices", func(clienttesting.Action) (bool, runtime.Object, error) {
+				if fail {
+					return true, nil, fmt.Errorf("unavailable")
+				}
+
+				return false, nil, nil
+			})
+
+			staging := renewAt(ca)
+			clock.SetTime(staging)
+
+			delay, err := r.Reconcile(t.Context())
+			require.Error(t, err)
+			require.Equal(t, retryInterval, delay)
+
+			staged := getSecret(t, r)
+			require.NotEmpty(t, staged.Data["next-ca.crt"])
+			require.NotContains(t, staged.Annotations, nextAddedAt)
+
+			// Publication keeps failing; the grace must not start.
+			clock.Step(time.Minute)
+
+			_, err = r.Reconcile(t.Context())
+			require.Error(t, err)
+			require.NotContains(t, getSecret(t, r).Annotations, nextAddedAt)
+
+			published := staging.Add(r.CAGrace / 2)
+			clock.SetTime(published)
+
+			fail = false
+
+			tc.publish(t, r)
+			reconcile(t, r)
+			require.Equal(t, published.Format(time.RFC3339Nano), getSecret(t, r).Annotations[nextAddedAt])
+
+			for _, at := range []time.Time{staging.Add(r.CAGrace), published.Add(r.CAGrace - time.Second)} {
+				clock.SetTime(at)
+				reconcile(t, r)
+				require.Equal(t, initial.Data["ca.crt"], getSecret(t, r).Data["ca.crt"], "promoted before a full grace at %s", at)
+			}
+
+			clock.SetTime(published.Add(r.CAGrace))
+			reconcile(t, r)
+
+			promoted := getSecret(t, r)
+			verify(t, r, promoted, 2)
+			require.Equal(t, staged.Data["next-ca.crt"], promoted.Data["ca.crt"])
+			require.Equal(t, initial.Data["ca.crt"], promoted.Data["prev-ca.crt"])
+		})
+	}
 }
 
 func TestCorruptedSecretRecovery(t *testing.T) {
@@ -450,12 +554,17 @@ func TestPublicationFailureDoesNotWriteLoop(t *testing.T) {
 
 	clock.SetTime(renewAt(ca))
 	reconcile(t, r)
+	// Confirm publication so the grace has started before trust is lost.
+	reconcile(t, r)
+	require.Contains(t, getSecret(t, r).Annotations, nextAddedAt)
 
 	if err := r.Aggregator.ApiregistrationV1().APIServices().Delete(t.Context(), r.APIServiceName, metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	reconcile(t, r)
+	require.NotContains(t, getSecret(t, r).Annotations, nextAddedAt)
+
 	client := r.Client.(*fake.Clientset)
 	client.ClearActions()
 	clock.Step(time.Second)

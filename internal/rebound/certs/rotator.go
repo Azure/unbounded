@@ -233,8 +233,10 @@ func (r *Rotator) reconcileSecret(s *corev1.Secret, now time.Time, published boo
 			return now, issueErr
 		}
 
+		// Leave the grace unstarted. The Secret and APIService are not written
+		// yet, so a later pass starts it once it sees the published bundle.
 		s.Data["next-ca.crt"], s.Data["next-ca.key"] = cert, key
-		s.Annotations[nextAddedAt] = now.Format(time.RFC3339Nano)
+		delete(s.Annotations, nextAddedAt)
 	}
 
 	if leafErr != nil || !validLeaf(leaf, ca, r.dnsNames(), now) {
@@ -259,6 +261,7 @@ func (r *Rotator) reconcileSecret(s *corev1.Secret, now time.Time, published boo
 	if len(s.Data["next-ca.crt"]) > 0 {
 		added, parseErr := time.Parse(time.RFC3339Nano, s.Annotations[nextAddedAt])
 		if parseErr != nil {
+			// Come back to confirm publication and start the grace.
 			due = earlier(due, now.Add(retryInterval))
 		} else {
 			due = earlier(due, added.Add(r.CAGrace))
