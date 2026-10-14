@@ -43,7 +43,16 @@ impl BoundSocket {
         let directory_handle = sim.open(None, &directory, libc::O_PATH | libc::O_DIRECTORY)?;
         let path = directory.join(basename);
         let listener = sim.listen(SocketAddress::Unix(path.clone()))?;
-        let (inode, _) = sim.metadata(&path)?;
+        let (inode, _) = match sim.metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // Listen created this entry. These synchronous simulation calls cannot
+                // yield or run user callbacks, so no replacement can appear before unlink.
+                // No BoundSocket exists yet to clean up; preserve the metadata error.
+                let _ = sim.unlink(&path);
+                return Err(error);
+            }
+        };
         let bound = Self {
             sim,
             listener,
@@ -307,6 +316,48 @@ mod tests {
     }
 
     #[test]
+    fn bind_metadata_failure_cleans_up_and_allows_rebind() {
+        for errno in [libc::EIO, libc::EACCES, libc::EMFILE, libc::ENOENT] {
+            let sim = Simulation::new();
+            let directory = PathBuf::from("/sockets");
+            let path = directory.join("temporary");
+            sim.inject("metadata", Fault::Errno(errno)).unwrap();
+            let error = bind(sim.clone(), directory.clone(), "temporary")
+                .err()
+                .expect("metadata must fail after listen");
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(
+                sim.metadata(&path).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert_eq!(sim.live_handles(), 0);
+
+            let socket = bind(sim.clone(), directory, "temporary").unwrap();
+            let client = sim.connect(SocketAddress::Unix(path.clone())).unwrap();
+            let accepted = socket.accept().unwrap();
+            drop((client, accepted, socket));
+            assert_eq!(
+                sim.metadata(&path).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert_eq!(sim.live_handles(), 0);
+        }
+    }
+
+    #[test]
+    fn bind_metadata_error_takes_precedence_over_cleanup_error() {
+        let sim = Simulation::new();
+        sim.inject("metadata", Fault::Errno(libc::EIO)).unwrap();
+        sim.inject("unlink", Fault::Errno(libc::EACCES)).unwrap();
+        let error = bind(sim.clone(), "/sockets".into(), "temporary")
+            .err()
+            .expect("metadata must fail after listen");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(sim.live_handles(), 0);
+        assert!(sim.metadata(Path::new("/sockets/temporary")).is_ok());
+    }
+
+    #[test]
     fn bind_sets_private_mode_and_cleans_up_on_chmod_failure() {
         let sim = Simulation::new();
         let directory = PathBuf::from("/sockets");
@@ -500,6 +551,16 @@ mod tests {
         let socket = bind(sim.clone(), "/sockets".into(), "temporary").unwrap();
         let before = sim.metadata(Path::new("/sockets/temporary")).unwrap();
         for errno in [libc::EACCES, libc::EIO, libc::EMFILE] {
+            sim.inject("metadata", Fault::Errno(errno)).unwrap();
+            assert_eq!(
+                socket.set_mode(0o640).unwrap_err().raw_os_error(),
+                Some(errno)
+            );
+            assert_eq!(
+                sim.metadata(Path::new("/sockets/temporary")).unwrap(),
+                before
+            );
+            assert_eq!(sim.live_handles(), 2);
             sim.inject("metadata", Fault::Errno(errno)).unwrap();
             assert_eq!(
                 socket.owns_checked("temporary").unwrap_err().raw_os_error(),
