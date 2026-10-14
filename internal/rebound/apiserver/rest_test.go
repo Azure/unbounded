@@ -685,9 +685,19 @@ func TestWatch(t *testing.T) {
 		t.Fatal("stop blocked")
 	}
 
+	quiet, err := s.Watch(ctx, &metainternal.ListOptions{SendInitialEvents: ptr.To(false)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created(t, s, ctx, "third", "node-a")
+	cached(t, s)
+	event(t, quiet, watch.Added, "third", "5")
+	quiet.Stop()
+
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	canceled, err := s.Watch(cancelCtx, &metainternal.ListOptions{ResourceVersion: "4"})
+	canceled, err := s.Watch(cancelCtx, &metainternal.ListOptions{ResourceVersion: "5"})
 	if err != nil {
 		t.Fatal(err)
 	}

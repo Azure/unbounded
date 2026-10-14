@@ -97,15 +97,8 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 
 	var initial []watch.Event
 
-	if options.ResourceVersion == "" || options.ResourceVersion == "0" {
-		current := s.current
-		for _, g := range current.ledger.Grants() {
-			obj := grantObject(g, current.rv)
-			if !g.Expired(s.clock.Now()) && match(obj) {
-				initial = append(initial, watch.Event{Type: watch.Added, Object: obj})
-			}
-		}
-	} else {
+	switch {
+	case options.ResourceVersion != "" && options.ResourceVersion != "0":
 		index, err := s.watchHistoryIndex(ctx, options.ResourceVersion)
 		if err != nil {
 			return nil, err
@@ -113,6 +106,17 @@ func (s *storage) Watch(ctx context.Context, options *metainternal.ListOptions) 
 
 		for i := index + 1; i < len(s.history); i++ {
 			initial = append(initial, s.history[i].matching(match)...)
+		}
+	case options.SendInitialEvents != nil && !*options.SendInitialEvents:
+		// An explicit sendInitialEvents=false starts at the current state
+		// without replaying it.
+	default:
+		current := s.current
+		for _, g := range current.ledger.Grants() {
+			obj := grantObject(g, current.rv)
+			if !g.Expired(s.clock.Now()) && match(obj) {
+				initial = append(initial, watch.Event{Type: watch.Added, Object: obj})
+			}
 		}
 	}
 
