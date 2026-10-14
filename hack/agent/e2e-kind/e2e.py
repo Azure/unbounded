@@ -1684,6 +1684,8 @@ ACL_IMAGE_VERSION = os.environ.get("ACL_IMAGE_VERSION", "")
 # not the az default.
 ACL_IMAGE_RESOURCE_GROUP = os.environ.get("ACL_IMAGE_RESOURCE_GROUP", "")
 ACL_IMAGE_SUBSCRIPTION = os.environ.get("ACL_IMAGE_SUBSCRIPTION", "")
+# The shared gallery API version used to find the latest image version.
+ACL_GALLERY_API_VERSION = "2025-03-03"
 ACL_GALLERY_IMAGE_PATTERN = re.compile(r"/SharedGalleries/([^/]+)/Images/([^/]+)")
 
 # The manifest source.
@@ -1769,14 +1771,14 @@ def acl_gallery_version() -> str:
     version = ACL_IMAGE_VERSION
     if not version:
         gallery, image = acl_gallery_image()
-        version = acl_az([
-            "sig", "image-version", "show-shared",
-            "--gallery-unique-name", gallery,
-            "--gallery-image-definition", image,
-            "--gallery-image-version", "latest",
-            "--location", ACL_IMAGE_GALLERY_LOCATION,
-            "--query", "name", "-o", "tsv",
-        ])
+        # az rest with a pinned api-version, not az sig image-version
+        # show-shared: newer az releases send an api-version that the shared
+        # gallery provider does not serve, and the lookup fails.
+        subscription = ACL_IMAGE_SUBSCRIPTION or "{subscriptionId}"
+        url = (f"https://management.azure.com/subscriptions/{subscription}/providers/Microsoft.Compute"
+               f"/locations/{ACL_IMAGE_GALLERY_LOCATION}/sharedGalleries/{gallery}/images/{image}"
+               f"/versions/latest?api-version={ACL_GALLERY_API_VERSION}")
+        version = acl_az_rest(url, "name")
         log(f"Azure Container Linux gallery version {version} is the latest of {ACL_IMAGE_GALLERY_IMAGE}")
 
     _check_acl_build_id(version, "ACL_IMAGE_VERSION" if ACL_IMAGE_VERSION else "the gallery's latest version")
@@ -1792,6 +1794,18 @@ def acl_az(args: list[str]) -> str:
         return capture(_acl_az_command(args))
     except subprocess.CalledProcessError as exc:
         die(f"az {' '.join(args[:3])} failed (exit {exc.returncode}): {(exc.stderr or '').strip()[-2000:]}")
+        raise AssertionError("unreachable") from exc
+
+
+def acl_az_rest(url: str, query: str) -> str:
+    """GET an Azure Resource Manager URL with az rest and return the field
+    query selects. The URL names the subscription itself, since az rest does
+    not take --subscription; az fills in {subscriptionId} with its default."""
+    try:
+        return capture(["az", "rest", "--method", "get", "--url", url,
+                        "--query", query, "-o", "tsv", "--only-show-errors"])
+    except subprocess.CalledProcessError as exc:
+        die(f"az rest GET {url} failed (exit {exc.returncode}): {(exc.stderr or '').strip()[-2000:]}")
         raise AssertionError("unreachable") from exc
 
 
