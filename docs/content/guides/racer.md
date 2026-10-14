@@ -138,6 +138,10 @@ cached data is not migrated between slab files and devices.
 
 ## 3. Connect Your Application
 
+To read an S3 bucket or Azure container without writing code, use the
+`racer-object` adapter instead of this section. See
+[Cache an S3 Bucket with Racer]({{< relref "guides/racer-s3" >}}).
+
 Run exactly **one origin owner per volume per node**, on **every eligible node
 that can be selected to supply origin reads**, not just on the requesting node.
 Use matching placement/tolerations for Racer and the adapters, typically a
