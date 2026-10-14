@@ -263,6 +263,40 @@ func TestReaperNamespaceUID(t *testing.T) {
 	}
 }
 
+func TestReaperStampsReleaseAfterNamespaceLookup(t *testing.T) {
+	g := grant("missing", "gone", "node", time.Hour)
+	g.UID = "grant-uid"
+	kube := kubefake.NewClientset(configMap(t, g))
+	clk := clocktesting.NewFakeClock(testNow)
+	reader := clientBuilder(t).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			clk.Step(ledger.HandoffCooldown)
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+	r := &reaper{reader: reader, apiReader: reader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clk}
+	_, err := r.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err)
+
+	afterLookup := testNow.Add(2 * ledger.HandoffCooldown)
+	require.Equal(t, afterLookup, clk.Now())
+
+	cm, err := kube.CoreV1().ConfigMaps("system").Get(t.Context(), ledger.ConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	l := ledger.Parse(cm.Data)
+	require.Empty(t, l.Grants())
+	releases := l.Releases()
+	require.Len(t, releases, 1)
+	require.True(t, afterLookup.Equal(releases[0].ReleasedAt), "ReleasedAt %v, want %v", releases[0].ReleasedAt, afterLookup)
+	require.True(t, afterLookup.Add(ledger.ReleaseRetention).Equal(releases[0].DropAt), "DropAt %v", releases[0].DropAt)
+
+	var cooldown *ledger.CooldownError
+	require.ErrorAs(t, l.CheckCooldown([]string{"node"}, clk.Now()), &cooldown)
+	require.Equal(t, ledger.HandoffCooldown, cooldown.RetryAfter)
+}
+
 func TestReaperMixedNamespaceUIDs(t *testing.T) {
 	old := grant("tenant", "old", "old-node", time.Hour)
 	old.NamespaceUID = "old"

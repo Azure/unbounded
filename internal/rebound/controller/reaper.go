@@ -64,7 +64,10 @@ func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, er
 			keep[key] = err == nil && ns.DeletionTimestamp.IsZero() && (g.NamespaceUID == "" || ns.UID == g.NamespaceUID)
 		}
 
-		removed, next = l.Reap(now, func(g *ledger.Grant) bool { return keep[namespaceKey{g.Namespace, g.NamespaceUID}] })
+		// Re-read the clock after the namespace lookups: a stale time would
+		// backdate ReleasedAt for removed live grants, shortening both the
+		// handoff cooldown and release retention.
+		removed, next = l.Reap(r.clock.Now(), func(g *ledger.Grant) bool { return keep[namespaceKey{g.Namespace, g.NamespaceUID}] })
 
 		return nil
 	})
