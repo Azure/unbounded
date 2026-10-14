@@ -150,7 +150,8 @@ authorization are also accepted. Run `rebound --help` for the full list.
   API server's parameter cache. For a short time after a grant is created
   (typically seconds), pods from other namespaces may still be placed on its nodes.
 - The reaper enforces expiry shortly after `expiresAt`, so node restrictions may
-  linger briefly, and pods are deleted a little later than `expiresAt`.
+  linger briefly, and pods are deleted a little later than `expiresAt`. Until then,
+  `get`, `list`, and `watch` still return the grant, with `expiresAt` in the past.
 - Pod `creationTimestamp` has one-second precision and comes from the API server
   clock. The scheduled time has the same precision. A pod created or scheduled in
   the same second a grant starts counts as during the grant. Pods created in the

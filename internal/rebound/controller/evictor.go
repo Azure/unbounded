@@ -363,7 +363,11 @@ func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []
 	// The lower bound uses placedAt, not creationTimestamp: a pod created and
 	// left Pending before the grant can be bound to the node during it. The
 	// upper bound uses creationTimestamp, since pods created after release
-	// were admitted under whatever holds the node next.
+	// were admitted under whatever holds the node next. It does not use
+	// placedAt: kubelet can set PodScheduled after release for a pod created
+	// with spec.nodeName during the grant, and that pod must not outlive it.
+	// The cost is that a pod created before release but bound after it is
+	// deleted once; its replacement is created after release and is kept.
 	//
 	// Both timestamps have one-second precision, so truncate both grant
 	// boundaries. Keep pods created in the release second to avoid deleting
