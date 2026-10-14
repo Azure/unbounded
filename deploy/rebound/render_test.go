@@ -274,13 +274,9 @@ func assertRBAC(t *testing.T, objects map[string]*unstructured.Unstructured, nam
 	require.Equal(t, []string{"rebound.unbounded-cloud.io"}, edit.Rules[0].APIGroups)
 	require.Equal(t, []string{"nodegrants"}, edit.Rules[0].Resources)
 	require.Equal(t, []string{"get", "list", "watch", "create", "delete", "deletecollection"}, edit.Rules[0].Verbs)
-	require.NotContains(t, edit.Labels, "rbac.authorization.k8s.io/aggregate-to-view")
-
+	// Creating grants is opt-in: it must not be aggregated into any built-in role.
 	for _, target := range []string{"view", "edit", "admin"} {
 		require.Equal(t, "true", view.Labels["rbac.authorization.k8s.io/aggregate-to-"+target])
-
-		if target != "view" {
-			require.Equal(t, "true", edit.Labels["rbac.authorization.k8s.io/aggregate-to-"+target])
-		}
+		require.NotContains(t, edit.Labels, "rbac.authorization.k8s.io/aggregate-to-"+target)
 	}
 }

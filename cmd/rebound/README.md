@@ -39,8 +39,15 @@ kubectl delete ngr train
   owner references, finalizers, deletion timestamps, and deletion grace periods.
 - **Status:** the server sets `status.nodes` (sorted node names), `status.holder`
   (the user who created the grant), and `status.expiresAt`.
-- **Access:** plain RBAC. The `view` role can read grants. `edit` and `admin` can
-  also create and delete them.
+- **Access:** plain RBAC. The `view`, `edit`, and `admin` roles can read grants.
+  Creating and deleting grants needs the `rebound-nodegrants-edit` ClusterRole,
+  which is not added to any built-in role. A grant can take any node and deletes
+  other namespaces' pods on it, so bind the role only where it is needed:
+
+  ```sh
+  kubectl create rolebinding nodegrants --namespace team-a \
+    --clusterrole rebound-nodegrants-edit --user alice
+  ```
 
 ## How it works
 

@@ -116,13 +116,13 @@ rules:
     resources: [nodegrants]
     verbs: [get, list, watch]
 ---
+# Not aggregated into edit or admin. A grant can take any node in the cluster
+# and deletes other namespaces' pods on it, so bind this role on purpose with a
+# RoleBinding in each namespace that may hold grants.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: rebound-nodegrants-edit
-  labels:
-    rbac.authorization.k8s.io/aggregate-to-edit: "true"
-    rbac.authorization.k8s.io/aggregate-to-admin: "true"
 rules:
   - apiGroups: [rebound.unbounded-cloud.io]
     resources: [nodegrants]
