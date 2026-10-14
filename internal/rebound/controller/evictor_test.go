@@ -170,6 +170,81 @@ func TestEvictorRelease(t *testing.T) {
 	require.ElementsMatch(t, []string{"tenant/before", "tenant/after", "other/unrelated", "tenant/elsewhere"}, remaining(t, c))
 }
 
+func TestEvictorReleaseNamespaceUID(t *testing.T) {
+	boom := errors.New("boom")
+
+	for name, tc := range map[string]struct {
+		releaseUID types.UID
+		liveUID    types.UID
+		getErr     error
+		kept       bool
+	}{
+		"recreated namespace": {releaseUID: "old", liveUID: "new", kept: true},
+		"same namespace":      {releaseUID: "old", liveUID: "old"},
+		"deleted namespace":   {releaseUID: "old", getErr: apierrors.NewNotFound(corev1.Resource("namespaces"), "tenant"), kept: true},
+		"lookup error":        {releaseUID: "old", getErr: boom, kept: true},
+		"legacy release":      {liveUID: "new"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := grant("tenant", "g", "a", time.Hour)
+			g.UID = "u1"
+			g.NamespaceUID = tc.releaseUID
+			g.CreatedAt = testNow.Add(-10 * time.Minute)
+
+			l := ledger.New()
+			require.NoError(t, l.Add(g))
+			require.True(t, l.Remove(g.Key(), testNow.Add(-time.Minute)))
+
+			cm := configMap(t)
+			cm.Data = l.Encode()
+
+			gets := 0
+			funcs := &interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				ns, ok := obj.(*corev1.Namespace)
+				if !ok {
+					return c.Get(ctx, key, obj, opts...)
+				}
+
+				gets++
+
+				if tc.getErr != nil {
+					return tc.getErr
+				}
+
+				ns.Name, ns.UID = key.Name, tc.liveUID
+
+				return nil
+			}}
+			r, c := newEvictor(t, cm, funcs,
+				pod("tenant", "first", "a", testNow.Add(-5*time.Minute)),
+				pod("tenant", "second", "a", testNow.Add(-4*time.Minute)),
+			)
+
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+			if tc.getErr != nil && !apierrors.IsNotFound(tc.getErr) {
+				require.ErrorIs(t, err, tc.getErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			if tc.kept {
+				require.ElementsMatch(t, []string{"tenant/first", "tenant/second"}, remaining(t, c))
+			} else {
+				require.Empty(t, remaining(t, c))
+			}
+
+			switch {
+			case tc.releaseUID == "":
+				require.Zero(t, gets)
+			case tc.getErr != nil && !apierrors.IsNotFound(tc.getErr):
+				require.Equal(t, 2, gets)
+			default:
+				require.Equal(t, 1, gets)
+			}
+		})
+	}
+}
+
 func TestEvictorReleaseSecondPrecision(t *testing.T) {
 	releasedAt := testNow.Add(-time.Minute + 300*time.Millisecond)
 	g := grant("tenant", "old", "a", time.Hour)
@@ -446,10 +521,14 @@ func TestEvictorSkipsPodsAlreadyForceDeleted(t *testing.T) {
 	p.DeletionGracePeriodSeconds = new(int64)
 
 	r, _ := newEvictor(t, nil, nil)
-	require.False(t, r.shouldEvict(p, grant("tenant", "g", "a", time.Hour), nil))
+	evict, err := r.shouldEvict(p, grant("tenant", "g", "a", time.Hour), nil, nil)
+	require.NoError(t, err)
+	require.False(t, evict)
 
 	p.DeletionGracePeriodSeconds = nil
-	require.True(t, r.shouldEvict(p, grant("tenant", "g", "a", time.Hour), nil))
+	evict, err = r.shouldEvict(p, grant("tenant", "g", "a", time.Hour), nil, nil)
+	require.NoError(t, err)
+	require.True(t, evict)
 }
 
 func TestEvictorMapLedger(t *testing.T) {

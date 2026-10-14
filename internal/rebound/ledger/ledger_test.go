@@ -179,6 +179,29 @@ func TestReleaseRoundTrip(t *testing.T) {
 	require.Equal(t, types.UID("first"), parsed.Releases()[0].UID)
 }
 
+func TestReleaseNamespaceUID(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	g.NamespaceUID = "tenant-uid"
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), g.CreatedAt.Add(time.Minute)))
+	require.Equal(t, types.UID("tenant-uid"), l.Releases()[0].NamespaceUID)
+
+	data := l.Encode()
+	require.Contains(t, data["_release.first"], `"namespaceUID":"tenant-uid"`)
+	require.Equal(t, data, Parse(data).Encode())
+	require.Equal(t, l.Releases(), Parse(data).Releases())
+
+	// Releases of grants without a namespace UID, and older records, omit it.
+	legacy := New()
+	g = testGrant("legacy", "node-a")
+	require.NoError(t, legacy.Add(g))
+	require.True(t, legacy.Remove(g.Key(), g.CreatedAt.Add(time.Minute)))
+	data = legacy.Encode()
+	require.NotContains(t, data["_release.legacy"], "namespaceUID")
+	require.Empty(t, Parse(data).Releases()[0].NamespaceUID)
+}
+
 func TestRemoveWithoutUIDRecordsNoRelease(t *testing.T) {
 	l := New()
 	g := testGrant("first", "node-a")

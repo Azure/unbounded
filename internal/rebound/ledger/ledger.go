@@ -72,15 +72,18 @@ func (g *Grant) Expired(now time.Time) bool {
 }
 
 // Release records a removed grant. Pods in Namespace on Nodes that were
-// created while the grant was active are evicted. ReleasedAt is the grant's
+// created while the grant was active are evicted. NamespaceUID is the grant's
+// namespace UID, so pods in a namespace recreated with the same name are not
+// evicted; it is empty for older records and grants. ReleasedAt is the grant's
 // end time; DropAt is when the record can be removed.
 type Release struct {
-	UID        types.UID `json:"-"`
-	Namespace  string    `json:"namespace"`
-	Nodes      []string  `json:"nodes"`
-	CreatedAt  time.Time `json:"createdAt"`
-	ReleasedAt time.Time `json:"releasedAt"`
-	DropAt     time.Time `json:"dropAt"`
+	UID          types.UID `json:"-"`
+	Namespace    string    `json:"namespace"`
+	NamespaceUID types.UID `json:"namespaceUID,omitempty"`
+	Nodes        []string  `json:"nodes"`
+	CreatedAt    time.Time `json:"createdAt"`
+	ReleasedAt   time.Time `json:"releasedAt"`
+	DropAt       time.Time `json:"dropAt"`
 }
 
 // ConflictError reports nodes that are already granted.
@@ -335,8 +338,8 @@ func (l *Ledger) remove(key types.NamespacedName, releasedAt, now time.Time) boo
 
 	if g.UID != "" {
 		l.releases[g.UID] = &Release{
-			UID: g.UID, Namespace: g.Namespace, Nodes: g.Nodes, CreatedAt: g.CreatedAt,
-			ReleasedAt: releasedAt, DropAt: now.Add(ReleaseRetention),
+			UID: g.UID, Namespace: g.Namespace, NamespaceUID: g.NamespaceUID, Nodes: g.Nodes,
+			CreatedAt: g.CreatedAt, ReleasedAt: releasedAt, DropAt: now.Add(ReleaseRetention),
 		}
 	}
 

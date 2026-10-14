@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -29,7 +30,8 @@ const sweepInterval = 15 * time.Second
 //
 //   - While a grant is active, pods from other namespaces.
 //   - After a grant is removed, pods from its namespace that were created
-//     while it was active.
+//     while it was active. A namespace recreated with the same name does not
+//     count as the grant's namespace.
 //
 // Pods are deleted with a zero grace period and PodDisruptionBudgets do not
 // apply: the grant's TTL is the grace period.
@@ -76,15 +78,45 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 
 	var errs []error
 
+	// Namespace UIDs read live during this reconcile. Empty means not found.
+	uids := make(map[string]types.UID)
+	namespaceUID := func(name string) (types.UID, error) {
+		if uid, ok := uids[name]; ok {
+			return uid, nil
+		}
+
+		var ns corev1.Namespace
+
+		err := r.apiReader.Get(ctx, types.NamespacedName{Name: name}, &ns)
+
+		switch {
+		case apierrors.IsNotFound(err):
+			uids[name] = ""
+		case err != nil:
+			return "", fmt.Errorf("get namespace %s: %w", name, err)
+		default:
+			uids[name] = ns.UID
+		}
+
+		return uids[name], nil
+	}
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !r.shouldEvict(pod, active, releases) {
+
+		evict, err := r.shouldEvict(pod, active, releases, namespaceUID)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		if !evict {
 			continue
 		}
 
 		ctrl.LoggerFrom(ctx).Info("deleting pod not allowed by node grant", "node", node, "pod", client.ObjectKeyFromObject(pod))
 
-		err := r.client.Delete(ctx, pod, client.GracePeriodSeconds(0), client.Preconditions{UID: &pod.UID})
+		err = r.client.Delete(ctx, pod, client.GracePeriodSeconds(0), client.Preconditions{UID: &pod.UID})
 		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 			errs = append(errs, err)
 		}
@@ -136,21 +168,24 @@ func (r *evictor) nodeRecords(cm *corev1.ConfigMap, node string) (*ledger.Grant,
 	return g, r.releasesByNode[node]
 }
 
-func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []*ledger.Release) bool {
+// shouldEvict reports whether pod must be deleted. namespaceUID returns the
+// live UID of a namespace, or "" if it does not exist. It is only called for
+// pods that match a release recorded with a namespace UID.
+func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []*ledger.Release, namespaceUID func(string) (types.UID, error)) (bool, error) {
 	if r.exempt[pod.Namespace] || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-		return false
+		return false, nil
 	}
 
 	if isMirrorPod(pod) {
-		return false
+		return false, nil
 	}
 
 	if g := pod.DeletionGracePeriodSeconds; pod.DeletionTimestamp != nil && g != nil && *g == 0 {
-		return false
+		return false, nil
 	}
 
 	if active != nil && pod.Namespace != active.Namespace {
-		return true
+		return true, nil
 	}
 
 	// creationTimestamp has one-second precision, so truncate both grant boundaries.
@@ -158,12 +193,28 @@ func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []
 	// This also keeps pods created just before release in that same second.
 	created := pod.CreationTimestamp.Time
 	for _, rel := range releases {
-		if pod.Namespace == rel.Namespace && !created.Before(rel.CreatedAt.Truncate(time.Second)) && created.Before(rel.ReleasedAt.Truncate(time.Second)) {
-			return true
+		if pod.Namespace != rel.Namespace || created.Before(rel.CreatedAt.Truncate(time.Second)) || !created.Before(rel.ReleasedAt.Truncate(time.Second)) {
+			continue
+		}
+
+		// Releases without a namespace UID match by name only.
+		if rel.NamespaceUID == "" {
+			return true, nil
+		}
+
+		// A namespace recreated with the same name is not the grant's namespace.
+		// If the namespace is gone, its pods are garbage collected anyway.
+		uid, err := namespaceUID(pod.Namespace)
+		if err != nil {
+			return false, err
+		}
+
+		if uid == rel.NamespaceUID {
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // mapLedger enqueues every node named by a grant or a release.
