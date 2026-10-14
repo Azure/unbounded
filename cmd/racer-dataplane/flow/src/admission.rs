@@ -75,7 +75,7 @@ pub enum Outcome {
     Neutral,
 }
 
-/// Admission observations emitted synchronously in state-transition order.
+/// Admission observations emitted synchronously after each state transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Aggregate, per-key, or record capacity rejected the attempt.
@@ -100,19 +100,24 @@ pub enum Event {
     LinkFailure,
 }
 
-/// Callbacks run synchronously under the admission lock and must not reenter it.
+/// Callbacks run outside the admission lock and may reenter admission.
+/// Values are transition snapshots and can arrive out of order across threads.
+/// Panics propagate from acquisition and observation after state is committed.
+/// Release notifications suppress panics so unwinding can still release capacity.
 pub trait Observer {
-    /// Record an admission or outcome event without reentering the owner.
+    /// Record an admission or outcome event.
     fn event(&self, event: Event);
 
-    /// Publish the current active count without reentering the owner.
+    /// Publish the active count captured by a transition.
     fn active(&self, active: usize);
 
-    /// Publish the current adaptive limit without reentering the owner.
+    /// Publish the adaptive limit captured by a transition.
     fn limit(&self, limit: usize);
 }
 
 /// Shared total and per-key admission with generation-fenced peer recovery.
+/// Poisoned state rejects new work; existing permits still release their counts.
+/// Key comparisons run under the lock and must be bounded and non-reentrant.
 pub struct Adaptive<K, O> {
     config: Config,
 
@@ -129,7 +134,9 @@ struct State<K> {
 
     limit: usize,
 
-    updated: Instant,
+    pressure_updated: Instant,
+
+    recovery_updated: Instant,
 
     peers: BTreeMap<K, Peer>,
 }
@@ -166,6 +173,7 @@ pub struct Permit<K: Ord + Clone, O: Observer> {
 
 impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
     /// Validate positive limits and publish the initial aggregate ceiling.
+    /// The clock runs outside the lock and must not panic, including during drop.
     pub fn new(config: Config, observer: O, now: fn() -> Instant) -> Result<Arc<Self>> {
         if config.total == 0
             || config.per_key == 0
@@ -175,6 +183,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             return Err(Error::InvalidInput);
         }
         observer.limit(config.total);
+        let started = now();
         Ok(Arc::new(Self {
             config,
             observer,
@@ -182,7 +191,8 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             state: Mutex::new(State {
                 active: 0,
                 limit: config.total,
-                updated: now(),
+                pressure_updated: started,
+                recovery_updated: started,
                 peers: BTreeMap::new(),
             }),
         }))
@@ -221,6 +231,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         let retired;
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
+            drop(state);
             self.observer.event(Event::Rejected);
             return Err(Error::Overloaded);
         }
@@ -237,25 +248,32 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                 })
                 .next();
             if retired.is_none() {
+                drop(state);
                 self.observer.event(Event::Rejected);
                 return Err(Error::Overloaded);
             }
         }
-        let peer = state.peers.entry(indexed).or_insert(Peer {
-            active: 0,
-            limit: self.config.per_key,
-            generation: Some(0),
-            retry: None,
-            probe: false,
-            updated: now,
-            idle_since: None,
-        });
+        let peer = if let Some(peer) = state.peers.get_mut(key) {
+            peer
+        } else {
+            state.peers.entry(indexed).or_insert(Peer {
+                active: 0,
+                limit: self.config.per_key,
+                generation: Some(0),
+                retry: None,
+                probe: false,
+                updated: now,
+                idle_since: None,
+            })
+        };
         if peer.generation.is_none() || peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now))
         {
+            drop(state);
             self.observer.event(Event::CircuitRejected);
             return Err(Error::Unavailable);
         }
         if peer.active >= peer.limit {
+            drop(state);
             self.observer.event(Event::Rejected);
             return Err(Error::Overloaded);
         }
@@ -267,17 +285,20 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             .generation
             .expect("admission rejects exhausted generations");
         state.active += 1;
-        self.observer.active(state.active);
-        self.observer.event(Event::Accepted);
-        if probe {
-            self.observer.event(Event::Probe);
-        }
-        Ok(Arc::new(Permit {
+        let active = state.active;
+        let permit = Arc::new(Permit {
             owner: self.clone(),
             key: owned,
             generation,
             probe,
-        }))
+        });
+        drop(state);
+        self.observer.active(active);
+        self.observer.event(Event::Accepted);
+        if probe {
+            self.observer.event(Event::Probe);
+        }
+        Ok(permit)
     }
 }
 
@@ -290,22 +311,30 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         };
         let config = self.owner.config;
         if outcome == Outcome::LocalPressure {
-            self.owner.observer.event(Event::LocalPressure);
-            if now.saturating_duration_since(state.updated) >= config.backoff {
+            let limit = if now.saturating_duration_since(state.pressure_updated) >= config.backoff {
                 state.limit = (state.limit / 2).max(1);
-                state.updated = now;
-                self.owner.observer.limit(state.limit);
+                state.pressure_updated = now;
+                Some(state.limit)
+            } else {
+                None
+            };
+            drop(state);
+            self.owner.observer.event(Event::LocalPressure);
+            if let Some(limit) = limit {
+                self.owner.observer.limit(limit);
             }
             return;
         }
-        if outcome == Outcome::Verified
+        let limit = if outcome == Outcome::Verified
             && state.limit < config.total
-            && now.saturating_duration_since(state.updated) >= config.recovery
+            && now.saturating_duration_since(state.recovery_updated) >= config.recovery
         {
             state.limit = state.limit.saturating_add(1).min(config.total);
-            state.updated = now;
-            self.owner.observer.limit(state.limit);
-        }
+            state.recovery_updated = now;
+            Some(state.limit)
+        } else {
+            None
+        };
         let peer = state
             .peers
             .get_mut(&self.key)
@@ -316,29 +345,28 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
             Outcome::LocalPressure => Event::LocalPressure,
             Outcome::Neutral => return,
         };
-        self.owner.observer.event(event);
-        if peer.generation != Some(self.generation) {
-            return;
-        }
         match outcome {
+            _ if peer.generation != Some(self.generation) => {}
             Outcome::PeerFailure => {
                 peer.limit = (peer.limit / 2).max(1);
                 peer.generation = self.generation.checked_add(1);
                 peer.retry = Some(Deadline::after(now, config.backoff));
                 peer.updated = now;
             }
-            Outcome::Verified => {
-                if peer.retry.is_some() && !self.probe {
-                    return;
-                }
+            Outcome::Verified if peer.retry.is_none() || self.probe => {
                 peer.retry = None;
                 if now.saturating_duration_since(peer.updated) >= config.recovery {
                     peer.limit = peer.limit.saturating_add(1).min(config.per_key);
                     peer.updated = now;
                 }
             }
-            Outcome::LocalPressure | Outcome::Neutral => {}
+            Outcome::Verified | Outcome::LocalPressure | Outcome::Neutral => {}
         }
+        drop(state);
+        if let Some(limit) = limit {
+            self.owner.observer.limit(limit);
+        }
+        self.owner.observer.event(event);
     }
 }
 
@@ -346,9 +374,7 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
     /// Release final ownership and renew backoff for an unsuccessful probe.
     fn drop(&mut self) {
         let now = (self.owner.now)();
-        let Ok(mut state) = self.owner.state.lock() else {
-            return;
-        };
+        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
         let peer = state
             .peers
             .get_mut(&self.key)
@@ -367,7 +393,11 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
             }
         }
         state.active -= 1;
-        self.owner.observer.active(state.active);
+        let active = state.active;
+        drop(state);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.owner.observer.active(active);
+        }));
     }
 }
 
@@ -384,6 +414,7 @@ mod circuit {
     };
 
     /// Local endpoint health with bounded records and completion-owned probes.
+    /// Key comparisons run under map borrows and must be bounded and non-reentrant.
     ///
     /// The authority belongs to one worker even when keys themselves are shared:
     ///
@@ -429,6 +460,7 @@ mod circuit {
     }
 
     /// Local exclusive half-open ownership; healthy acquisitions need no record.
+    #[must_use = "retain the probe until the admitted operation completes"]
     pub struct Probe<'a, K: Ord> {
         health: &'a Circuits<K>,
 
@@ -439,7 +471,8 @@ mod circuit {
         /// Release exclusivity without erasing the probe's timeout.
         fn drop(&mut self) {
             if let Some(key) = &self.key {
-                self.health.probes.borrow_mut().remove(key);
+                let removed = self.health.probes.borrow_mut().take(key);
+                drop(removed);
             }
         }
     }
@@ -459,7 +492,7 @@ mod circuit {
 
         /// Acquire an exclusive half-open guard, or an untracked healthy guard.
         pub fn acquire(&self, key: &K, now: Instant) -> Result<Probe<'_, K>> {
-            if !self.try_acquire(key, now) {
+            if !self.available(key, now) {
                 return Err(Error::Unavailable);
             }
             let probe = self.states.borrow().contains_key(key);
@@ -470,7 +503,28 @@ mod circuit {
                 // Complete application cloning before publishing exclusive ownership.
                 let indexed = key.clone();
                 let owned = key.clone();
-                self.probes.borrow_mut().insert(indexed);
+                // Clones may reenter admission. Recheck before moving either key
+                // into the set so rejected keys drop after the borrow is released.
+                let mut probes = self.probes.borrow_mut();
+                if probes.contains(key) {
+                    return Err(Error::Unavailable);
+                }
+                let mut states = self.states.borrow_mut();
+                let Some(state) = states.get_mut(key) else {
+                    return Ok(Probe {
+                        health: self,
+                        key: None,
+                    });
+                };
+                if !state.available(now) {
+                    return Err(Error::Unavailable);
+                }
+                if probes.len() >= self.capacity {
+                    return Err(Error::Overloaded);
+                }
+                probes.insert(indexed);
+                state.probe_until = Some(Deadline::after(now, self.probe_timeout));
+                state.pending_backoff = None;
                 Some(owned)
             } else {
                 None
@@ -480,7 +534,8 @@ mod circuit {
 
         /// Remove failure state without releasing any owned probe.
         pub fn success(&self, key: &K) {
-            self.states.borrow_mut().remove(key);
+            let removed = self.states.borrow_mut().remove_entry(key);
+            drop(removed);
         }
 
         /// Record a caller-classified failure using caller-selected retry jitter.
@@ -493,16 +548,22 @@ mod circuit {
             now: Instant,
             backoff: impl FnOnce(&K, u32) -> Duration,
         ) -> Result<()> {
+            // Keep unused keys outside the borrow, including on errors and unwind.
+            let indexed = key.clone();
             let mut states = self.states.borrow_mut();
             if !states.contains_key(key) && states.len() >= self.capacity {
                 return Err(Error::Overloaded);
             }
-            let state = states.entry(key.clone()).or_insert(Circuit {
-                failures: 0,
-                retry_at: Deadline::At(now),
-                probe_until: None,
-                pending_backoff: None,
-            });
+            let state = if let Some(state) = states.get_mut(key) {
+                state
+            } else {
+                states.entry(indexed).or_insert(Circuit {
+                    failures: 0,
+                    retry_at: Deadline::At(now),
+                    probe_until: None,
+                    pending_backoff: None,
+                })
+            };
             state.failures = state.failures.saturating_add(1);
             let failures = state.failures;
             let pending = Rc::new(());
@@ -536,6 +597,8 @@ mod circuit {
         }
 
         /// Admit an unowned probe that becomes eligible again after its timeout.
+        /// This legacy method cannot fence completion; prefer `acquire` for work
+        /// that must stay exclusive until its owner releases the probe.
         pub fn try_acquire(&self, key: &K, now: Instant) -> bool {
             if self.probes.borrow().contains(key) {
                 return false;
@@ -554,7 +617,12 @@ mod circuit {
 
         /// Forget excluded failure records without releasing owned probes.
         pub fn retain(&self, keys: &[K]) {
-            self.states.borrow_mut().retain(|key, _| keys.contains(key));
+            // Declare removed keys first so even a comparison panic releases the borrow.
+            let mut removed = Vec::new();
+            let mut states = self.states.borrow_mut();
+            removed.extend(states.extract_if(.., |key, _| !keys.contains(key)));
+            drop(states);
+            drop(removed);
         }
 
         /// Count retained failure records, not active probes.
@@ -572,6 +640,297 @@ mod circuit {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::{
+            cell::Cell,
+            cmp::Ordering,
+            panic::{AssertUnwindSafe, catch_unwind},
+        };
+
+        type KeyCallback = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+        struct ReentrantKey {
+            id: u8,
+
+            on_drop: KeyCallback,
+
+            on_clone: KeyCallback,
+
+            clone_at: Rc<Cell<usize>>,
+
+            panic_eq: Rc<Cell<bool>>,
+        }
+
+        impl ReentrantKey {
+            fn new(id: u8) -> Self {
+                Self {
+                    id,
+                    on_drop: Rc::new(RefCell::new(None)),
+                    on_clone: Rc::new(RefCell::new(None)),
+                    clone_at: Rc::new(Cell::new(0)),
+                    panic_eq: Rc::new(Cell::new(false)),
+                }
+            }
+
+            fn on_drop(&self, callback: impl FnOnce() + 'static) {
+                *self.on_drop.borrow_mut() = Some(Box::new(callback));
+            }
+        }
+
+        impl Clone for ReentrantKey {
+            fn clone(&self) -> Self {
+                let remaining = self.clone_at.get().saturating_sub(1);
+                self.clone_at.set(remaining);
+                if remaining == 0 {
+                    let callback = self.on_clone.borrow_mut().take();
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                }
+                Self {
+                    id: self.id,
+                    on_drop: self.on_drop.clone(),
+                    on_clone: self.on_clone.clone(),
+                    clone_at: self.clone_at.clone(),
+                    panic_eq: self.panic_eq.clone(),
+                }
+            }
+        }
+
+        impl PartialEq for ReentrantKey {
+            fn eq(&self, other: &Self) -> bool {
+                assert!(!other.panic_eq.get(), "key comparison failed");
+                self.id == other.id
+            }
+        }
+
+        impl Eq for ReentrantKey {}
+
+        impl PartialOrd for ReentrantKey {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for ReentrantKey {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.id.cmp(&other.id)
+            }
+        }
+
+        impl Drop for ReentrantKey {
+            fn drop(&mut self) {
+                let callback = self.on_drop.borrow_mut().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+        }
+
+        #[test]
+        fn probe_clone_reentry_rechecks_ownership() {
+            check_probe_clone_reentry(true);
+        }
+
+        #[test]
+        fn probe_clone_reentry_rechecks_capacity() {
+            check_probe_clone_reentry(false);
+        }
+
+        fn check_probe_clone_reentry(same_key: bool) {
+            for clone_at in [1, 2] {
+                for capacity in [1, 2] {
+                    let now = Instant::now();
+                    let health = Rc::new(Circuits::new(capacity, Duration::ZERO));
+                    let key = ReentrantKey::new(7);
+                    health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                    let nested_key = Rc::new(RefCell::new(None));
+                    let saved = nested_key.clone();
+                    let owner = health.clone();
+                    let drops = Rc::new(Cell::new(0));
+                    let observed = drops.clone();
+                    let on_drop = key.on_drop.clone();
+                    key.clone_at.set(clone_at);
+                    *key.on_clone.borrow_mut() = Some(Box::new(move || {
+                        let outer = ReentrantKey::new(7);
+                        let nested = ReentrantKey::new(if same_key { 7 } else { 8 });
+                        if !same_key {
+                            owner.success(&outer);
+                            owner.failure(&nested, now, |_, _| Duration::ZERO).unwrap();
+                        }
+                        let mut probe = owner.acquire(&nested, now).unwrap();
+                        // Transfer the key to rebuild the guard after this callback returns.
+                        *saved.borrow_mut() = probe.key.take();
+                        drop(probe);
+                        if !same_key {
+                            owner.success(&nested);
+                            owner.failure(&outer, now, |_, _| Duration::ZERO).unwrap();
+                        }
+                        *on_drop.borrow_mut() = Some(Box::new(move || {
+                            // Rejected clones must drop after releasing the probes borrow.
+                            let _probes = owner.probes.borrow_mut();
+                            observed.set(observed.get() + 1);
+                        }));
+                    }));
+
+                    let result = health.acquire(&key, now);
+                    let nested = Probe {
+                        health: &health,
+                        key: nested_key.borrow_mut().take(),
+                    };
+                    assert!(nested.key.is_some());
+                    if same_key {
+                        assert!(matches!(result, Err(Error::Unavailable)));
+                    } else if capacity == 1 {
+                        assert!(matches!(result, Err(Error::Overloaded)));
+                    } else {
+                        assert!(result.is_ok());
+                        assert_eq!(health.probes.borrow().len(), 2);
+                    }
+                    drop(result);
+                    assert_eq!(drops.get(), 1);
+                    assert_eq!(health.probes.borrow().len(), 1);
+                    let lookup = ReentrantKey::new(if same_key { 7 } else { 8 });
+                    assert!(!health.available(&lookup, now));
+                    assert!(matches!(
+                        health.acquire(&lookup, now),
+                        Err(Error::Unavailable)
+                    ));
+                    drop(nested);
+                    assert!(health.probes.borrow().is_empty());
+                    assert!(health.acquire(&key, now).is_ok());
+                }
+            }
+        }
+
+        #[test]
+        fn probe_key_drop_reenters_after_release_on_success_error_and_unwind() {
+            for exit in [0, 1, 2] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::ZERO));
+                let key = ReentrantKey::new(7);
+                health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                let drops = Rc::new(Cell::new(0));
+                let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+                    let _probe = health.acquire(&key, now)?;
+                    let owner = health.clone();
+                    let lookup = key.clone();
+                    let observed = drops.clone();
+                    key.on_drop(move || {
+                        assert!(owner.available(&lookup, now));
+                        drop(owner.acquire(&lookup, now).unwrap());
+                        observed.set(observed.get() + 1);
+                    });
+                    match exit {
+                        0 => Ok(()),
+                        1 => Err(Error::Unavailable),
+                        _ => panic!("operation failed"),
+                    }
+                }));
+                match exit {
+                    0 => assert_eq!(result.unwrap(), Ok(())),
+                    1 => assert_eq!(result.unwrap(), Err(Error::Unavailable)),
+                    _ => assert!(result.is_err()),
+                }
+                assert_eq!(drops.get(), 1);
+                assert!(health.available(&key, now));
+            }
+        }
+
+        #[test]
+        fn removed_failure_keys_reenter_without_releasing_owned_probe() {
+            for retain in [false, true] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::ZERO));
+                let key = ReentrantKey::new(7);
+                health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                let probe = health.acquire(&key, now).unwrap();
+                let owner = health.clone();
+                let lookup = key.clone();
+                let drops = Rc::new(Cell::new(0));
+                let observed = drops.clone();
+                key.on_drop(move || {
+                    assert!(owner.is_empty());
+                    assert!(!owner.available(&lookup, now));
+                    owner.failure(&lookup, now, |_, _| Duration::ZERO).unwrap();
+                    observed.set(observed.get() + 1);
+                });
+                if retain {
+                    health.retain(&[]);
+                } else {
+                    health.success(&key);
+                }
+                assert_eq!(drops.get(), 1);
+                assert_eq!(health.len(), 1);
+                assert!(!health.available(&key, now));
+                drop(probe);
+                assert!(health.available(&key, now));
+            }
+        }
+
+        #[test]
+        fn retain_comparison_unwind_drops_extracted_keys_after_borrow() {
+            let now = Instant::now();
+            let health = Rc::new(Circuits::new(2, Duration::ZERO));
+            let first = ReentrantKey::new(1);
+            let second = ReentrantKey::new(2);
+            for key in [&first, &second] {
+                health.failure(key, now, |_, _| Duration::ZERO).unwrap();
+            }
+            let owner = health.clone();
+            let drops = Rc::new(Cell::new(0));
+            let observed = drops.clone();
+            first.on_drop(move || {
+                assert_eq!(owner.len(), 1);
+                owner.retain(&[]);
+                observed.set(observed.get() + 1);
+            });
+            second.panic_eq.set(true);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                health.retain(&[ReentrantKey::new(3)]);
+            }));
+            second.panic_eq.set(false);
+            assert!(result.is_err());
+            assert_eq!(drops.get(), 1);
+            assert!(health.is_empty());
+        }
+
+        #[test]
+        fn failure_unused_key_drop_reenters_on_update_error_and_unwind() {
+            for exit in [0, 1, 2] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::ZERO));
+                let existing = ReentrantKey::new(1);
+                health
+                    .failure(&existing, now, |_, _| Duration::ZERO)
+                    .unwrap();
+                let key = if exit == 1 {
+                    ReentrantKey::new(2)
+                } else {
+                    existing.clone()
+                };
+                let owner = health.clone();
+                let drops = Rc::new(Cell::new(0));
+                let observed = drops.clone();
+                key.on_drop(move || {
+                    assert_eq!(owner.len(), 1);
+                    owner.retain(&[]);
+                    observed.set(observed.get() + 1);
+                });
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    health.failure(&key, now, |_, _| {
+                        assert_ne!(exit, 2, "backoff failed");
+                        Duration::ZERO
+                    })
+                }));
+                match exit {
+                    0 => assert_eq!(result.unwrap(), Ok(())),
+                    1 => assert_eq!(result.unwrap(), Err(Error::Overloaded)),
+                    _ => assert!(result.is_err()),
+                }
+                assert_eq!(drops.get(), 1);
+                assert!(health.is_empty());
+            }
+        }
 
         /// Oversized retry delays stay closed to probes until explicit success.
         #[test]
@@ -726,7 +1085,7 @@ mod circuit {
             assert!(health.available(&7, now + timeout));
         }
 
-        /// Failed key cloning must not leave an exclusive probe without an owner.
+        /// Failed cloning neither owns a probe nor delays the next attempt.
         #[test]
         fn review_regression_probe_clone_panic_allows_acquisition_after_timeout() {
             use std::{
@@ -761,7 +1120,8 @@ mod circuit {
                 PANIC_AT.store(usize::MAX, Ordering::SeqCst);
                 assert!(result.is_err());
                 assert_eq!(CLONES.load(Ordering::SeqCst), panic_at);
-                assert!(!health.available(&Key, now));
+                assert!(health.available(&Key, now));
+                assert!(health.states.borrow()[&Key].probe_until.is_none());
                 let retry = now + timeout;
                 let probe = health
                     .acquire(&Key, retry)
@@ -826,7 +1186,7 @@ mod circuit {
 
         /// Probe capacity and failure records remain independent after success.
         #[test]
-        fn full_probe_set_preserves_rejected_attempt_timeout() {
+        fn full_probe_set_does_not_arm_rejected_attempt_timeout() {
             let now = Instant::now();
             let timeout = Duration::from_secs(1);
             let health = Circuits::new(1, timeout);
@@ -842,10 +1202,53 @@ mod circuit {
             health.failure(&8, now, |_, _| Duration::ZERO).unwrap();
             assert!(health.available(&8, now));
             assert!(matches!(health.acquire(&8, now), Err(Error::Overloaded)));
+            assert!(health.states.borrow()[&8].probe_until.is_none());
             drop(held);
-            assert!(!health.available(&8, now));
-            assert!(matches!(health.acquire(&8, now), Err(Error::Unavailable)));
+            assert!(health.available(&8, now));
+            let probe = health.acquire(&8, now).unwrap();
+            assert!(!health.available(&8, now + timeout));
+            drop(probe);
             assert!(health.acquire(&8, now + timeout).is_ok());
+        }
+
+        /// A failure or removal during cloning takes precedence over the attempt.
+        #[test]
+        fn probe_clone_reentry_rechecks_failure_state() {
+            for remove in [false, true] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::from_secs(1)));
+                let key = ReentrantKey::new(7);
+                health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                let owner = health.clone();
+                *key.on_clone.borrow_mut() = Some(Box::new(move || {
+                    let lookup = ReentrantKey::new(7);
+                    if remove {
+                        owner.success(&lookup);
+                    } else {
+                        owner
+                            .failure(&lookup, now, |_, _| Duration::from_secs(10))
+                            .unwrap();
+                    }
+                }));
+                let result = health.acquire(&key, now);
+                if remove {
+                    assert!(result.unwrap().key.is_none());
+                    assert!(health.is_empty());
+                } else {
+                    assert!(matches!(result, Err(Error::Unavailable)));
+                    assert!(
+                        health
+                            .states
+                            .borrow()
+                            .get(&key)
+                            .unwrap()
+                            .probe_until
+                            .is_none()
+                    );
+                    assert!(health.acquire(&key, now + Duration::from_secs(10)).is_ok());
+                }
+                assert!(health.probes.borrow().is_empty());
+            }
         }
     }
 }
@@ -860,7 +1263,8 @@ mod handoff {
     };
 
     /// Bounds queued, delivered, and outstanding offered items with reservations.
-    /// Callbacks execute under the handoff lock and must not reenter it.
+    /// Callbacks execute under the handoff lock and must be bounded and non-reentrant.
+    /// A panic poisons handoff admission; `close` can still drain queued ownership.
     pub trait Admission {
         /// Ownership that retains capacity until final admitted work completes.
         type Reservation;
@@ -919,6 +1323,7 @@ mod handoff {
     }
 
     /// Shared handoff bounded by admission, not a separate queue-slot limit.
+    /// Key comparisons run under the lock and must be bounded and non-reentrant.
     pub struct Handoff<K, A: Admission, T>(Mutex<State<K, A, T>>);
 
     /// Capacity reserved on a selected target before constructing its payload.
@@ -1047,7 +1452,8 @@ mod handoff {
 
     impl<K, A: Admission, T> Offer<K, A, T> {
         /// Build only on an open target; the envelope retains admission itself.
-        /// The closure executes under the handoff lock and must not reenter it.
+        /// The closure executes under the handoff lock and must be bounded and
+        /// non-reentrant. A panic poisons admission; `close` can still drain it.
         pub fn deliver(self, item: impl FnOnce() -> T) -> Result<()> {
             let mut state = self.handoff.0.lock().map_err(|_| Error::Unavailable)?;
             let target = &mut state.targets[self.target].1;
@@ -1353,6 +1759,34 @@ mod handoff {
 
         struct Ready;
 
+        /// A factory panic closes admission but queued ownership can still drain.
+        #[test]
+        fn handoff_factory_poison_still_allows_close() {
+            let handoff = Arc::new(Handoff::<_, Ready, u8>::new(&[1]));
+            handoff.install(&1, Ready).unwrap();
+            handoff
+                .reserve(Waker::noop())
+                .unwrap()
+                .deliver(|| 7)
+                .unwrap();
+            let offer = handoff.reserve(Waker::noop()).unwrap();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = offer.deliver(|| panic!("factory failed"));
+                }))
+                .is_err()
+            );
+            assert!(matches!(
+                handoff.reserve(Waker::noop()),
+                Err(Error::Unavailable)
+            ));
+            handoff.close(&1);
+            let state = handoff.0.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(state.targets[0].1.closed);
+            assert!(state.targets[0].1.queue.is_empty());
+            assert!(state.targets[0].1.admission.is_none());
+        }
+
         impl Admission for Ready {
             type Reservation = ();
 
@@ -1442,6 +1876,7 @@ mod hedge {
     }
 
     /// Process-shared slot and cost limits, independent of worker registries.
+    /// Poisoned state rejects new work but keeps existing alarms drainable.
     pub struct Hedges {
         slots: usize,
 
@@ -1496,15 +1931,12 @@ mod hedge {
             let wakes: Vec<_> = self
                 .state
                 .lock()
-                .map(|mut state| {
-                    state
-                        .alarms
-                        .values_mut()
-                        .filter(|a| now >= a.due)
-                        .filter_map(|a| a.wake.take())
-                        .collect()
-                })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| e.into_inner())
+                .alarms
+                .values_mut()
+                .filter(|a| now >= a.due)
+                .filter_map(|a| a.wake.take())
+                .collect();
             for wake in wakes {
                 wake.wake();
             }
@@ -1516,7 +1948,7 @@ mod hedge {
         pub fn delay(&self, now: Instant, cx: &mut Context<'_>) -> Poll<()> {
             // Waker clone and drop callbacks may reenter the hedge registry.
             let wake = cx.waker().clone();
-            let mut state = self.owner.state.lock().expect("hedge alarm lock");
+            let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
             let alarm = state.alarms.get_mut(&self.id).expect("live hedge alarm");
             let (result, previous) = if now >= alarm.due {
                 (Poll::Ready(()), alarm.wake.take())
@@ -1532,11 +1964,14 @@ mod hedge {
     impl Drop for Permit {
         /// Remove the alarm and return its cost only at final ownership release.
         fn drop(&mut self) {
-            let alarm = self.owner.state.lock().ok().and_then(|mut state| {
-                let alarm = state.alarms.remove(&self.id)?;
-                state.used -= alarm.cost;
-                Some(alarm)
-            });
+            let alarm = {
+                let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let alarm = state.alarms.remove(&self.id);
+                if let Some(alarm) = &alarm {
+                    state.used -= alarm.cost;
+                }
+                alarm
+            };
             drop(alarm);
         }
     }
@@ -1561,6 +1996,45 @@ mod hedge {
             fn wake(self: Arc<Self>) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
+        }
+
+        /// Poison closes new admission without stranding live costs or alarms.
+        #[test]
+        fn hedge_poison_preserves_existing_alarm_and_release() {
+            let now = Instant::now();
+            let owner = Hedges::new(2, 10);
+            let permit = owner.acquire(7, now + Duration::from_secs(1)).unwrap();
+            let poisoned = owner.clone();
+            assert!(
+                std::thread::spawn(move || {
+                    let _state = poisoned.state.lock().unwrap();
+                    panic!("poison hedge state");
+                })
+                .join()
+                .is_err()
+            );
+            assert!(matches!(owner.acquire(1, now), Err(Error::Unavailable)));
+            let counter = Arc::new(Counter::default());
+            let waker = Waker::from(counter.clone());
+            assert!(
+                permit
+                    .delay(now, &mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            owner.poll(now + Duration::from_secs(1));
+            assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+            assert!(
+                permit
+                    .delay(
+                        now + Duration::from_secs(1),
+                        &mut Context::from_waker(&waker)
+                    )
+                    .is_ready()
+            );
+            std::thread::spawn(move || drop(permit)).join().unwrap();
+            let state = owner.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.used, 0);
+            assert!(state.alarms.is_empty());
         }
 
         struct DelayCallbacks {
@@ -1917,6 +2391,171 @@ mod tests {
         }
     }
 
+    /// Poison closes admission while existing owners still return their counts.
+    #[test]
+    fn adaptive_poison_rejects_new_work_but_releases_live_permit() {
+        let owner = Adaptive::new(config(), Counts::default(), Instant::now).unwrap();
+        let permit = owner.acquire(&1).unwrap();
+        let poisoned = owner.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _state = poisoned.state.lock().unwrap();
+                panic!("poison adaptive state");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(!owner.available(&1));
+        assert!(!owner.hedge_available(&1));
+        assert!(matches!(owner.acquire(&2), Err(Error::Unavailable)));
+        permit.observe(Outcome::Verified);
+        std::thread::spawn(move || drop(permit)).join().unwrap();
+        let state = owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(state.active, 0);
+        assert_eq!(state.peers[&1].active, 0);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+    }
+
+    /// Every observer hook can inspect state and fail without stranding ownership.
+    #[test]
+    fn adaptive_observer_panics_preserve_cross_thread_accounting() {
+        use std::{
+            panic::{AssertUnwindSafe, catch_unwind},
+            sync::{
+                Weak,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+
+        #[derive(Default)]
+        struct Panics {
+            owner: OnceLock<Weak<Adaptive<u8, Self>>>,
+
+            mode: AtomicUsize,
+        }
+
+        impl Panics {
+            fn check(&self, mode: usize) {
+                if let Some(owner) = self.owner.get().and_then(Weak::upgrade) {
+                    assert!(
+                        owner.state.try_lock().is_ok(),
+                        "observer holds admission lock"
+                    );
+                    let _ = owner.available(&1);
+                }
+                assert_ne!(self.mode.load(Ordering::SeqCst), mode, "observer failed");
+            }
+        }
+
+        impl Observer for Panics {
+            fn event(&self, event: Event) {
+                self.check(match event {
+                    Event::Accepted => 1,
+                    Event::Probe => 2,
+                    Event::Rejected => 3,
+                    Event::CircuitRejected => 4,
+                    _ => 5,
+                });
+            }
+
+            fn active(&self, active: usize) {
+                self.check(if active == 0 { 6 } else { 7 });
+            }
+
+            fn limit(&self, _: usize) {
+                self.check(8);
+            }
+        }
+
+        for mode in [1, 2, 7] {
+            let owner = Adaptive::new(config(), Panics::default(), Instant::now).unwrap();
+            assert!(owner.observer.owner.set(Arc::downgrade(&owner)).is_ok());
+            if mode == 2 {
+                drop(owner.acquire(&1).unwrap());
+                owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
+                    Some(Deadline::At(Instant::now()));
+            }
+            owner.observer.mode.store(mode, Ordering::SeqCst);
+            assert!(catch_unwind(AssertUnwindSafe(|| owner.acquire(&1))).is_err());
+            let state = owner.state.lock().unwrap();
+            assert_eq!(state.active, 0);
+            assert_eq!(state.peers[&1].active, 0);
+            assert!(!state.peers[&1].probe);
+        }
+
+        for outcome in [
+            Outcome::PeerFailure,
+            Outcome::LocalPressure,
+            Outcome::Verified,
+        ] {
+            for mode in [5, 8] {
+                let owner = Adaptive::new(
+                    Config {
+                        backoff: Duration::ZERO,
+                        recovery: Duration::ZERO,
+                        ..config()
+                    },
+                    Panics::default(),
+                    Instant::now,
+                )
+                .unwrap();
+                assert!(owner.observer.owner.set(Arc::downgrade(&owner)).is_ok());
+                let permit = owner.acquire(&1).unwrap();
+                if outcome == Outcome::Verified {
+                    owner.state.lock().unwrap().limit = 2;
+                }
+                owner.observer.mode.store(mode, Ordering::SeqCst);
+                let result = catch_unwind(AssertUnwindSafe(|| permit.observe(outcome)));
+                assert_eq!(
+                    result.is_err(),
+                    mode == 5 || outcome != Outcome::PeerFailure
+                );
+                assert_eq!(owner.state.lock().unwrap().active, 1);
+                if outcome == Outcome::PeerFailure {
+                    assert!(owner.state.lock().unwrap().peers[&1].retry.is_some());
+                }
+                owner.observer.mode.store(6, Ordering::SeqCst);
+                std::thread::spawn(move || drop(permit)).join().unwrap();
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+                owner.observer.mode.store(0, Ordering::SeqCst);
+                let permit = owner.acquire(&2).unwrap();
+                let fence = permit.clone();
+                drop(permit);
+                assert_eq!(owner.state.lock().unwrap().active, 1);
+                std::thread::spawn(move || drop(fence)).join().unwrap();
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+            }
+        }
+
+        for mode in [3, 4] {
+            let owner = Adaptive::new(
+                Config {
+                    per_key: 1,
+                    ..config()
+                },
+                Panics::default(),
+                Instant::now,
+            )
+            .unwrap();
+            let held = owner.acquire(&1).unwrap();
+            if mode == 4 {
+                held.observe(Outcome::PeerFailure);
+            }
+            owner.observer.mode.store(mode, Ordering::SeqCst);
+            assert!(catch_unwind(AssertUnwindSafe(|| owner.acquire(&1))).is_err());
+            assert_eq!(owner.state.lock().unwrap().active, 1);
+            owner.observer.mode.store(6, Ordering::SeqCst);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    let _held = held;
+                    panic!("caller failed");
+                }))
+                .is_err()
+            );
+            assert_eq!(owner.state.lock().unwrap().active, 0);
+        }
+    }
+
     /// Oversized peer backoff must not panic, poison state, or retire early.
     #[test]
     fn duration_overflow_adaptive_failure() {
@@ -2081,6 +2720,54 @@ mod tests {
         }
     }
 
+    /// Unused clones of existing keys drop outside the lock on every exit.
+    #[test]
+    fn adaptive_existing_key_drop_can_reenter_after_unlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static OWNER: OnceLock<std::sync::Weak<Adaptive<Key, Counts>>> = OnceLock::new();
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        static BLOCKED: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+        struct Key;
+
+        impl Drop for Key {
+            fn drop(&mut self) {
+                let Some(owner) = OWNER.get().and_then(std::sync::Weak::upgrade) else {
+                    return;
+                };
+                DROPS.fetch_add(1, Ordering::SeqCst);
+                if owner.state.try_lock().is_err() {
+                    BLOCKED.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    assert!(owner.available(self));
+                }
+            }
+        }
+
+        let owner = Adaptive::new(
+            Config {
+                total: 3,
+                per_key: 2,
+                ..config()
+            },
+            Counts::default(),
+            Instant::now,
+        )
+        .unwrap();
+        assert!(OWNER.set(Arc::downgrade(&owner)).is_ok());
+        let key = Key;
+        let first = owner.acquire(&key).unwrap();
+        let second = owner.acquire(&key).unwrap();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+        assert!(matches!(owner.acquire(&key), Err(Error::Overloaded)));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+        drop((first, second));
+        assert_eq!(owner.state.lock().unwrap().active, 0);
+        assert_eq!(BLOCKED.load(Ordering::SeqCst), 0);
+    }
+
     /// Retired keys can reenter after publication; rejected attempts keep accounting.
     #[test]
     fn adaptive_retired_key_drop_can_reenter_after_unlock() {
@@ -2197,11 +2884,11 @@ mod tests {
         drop(probe);
         assert!(owner.available(&1));
         let work = owner.acquire(&2).unwrap();
-        owner.state.lock().unwrap().updated = Instant::now() - config().backoff;
+        owner.state.lock().unwrap().pressure_updated = Instant::now() - config().backoff;
         work.observe(Outcome::LocalPressure);
         assert_eq!(*owner.observer.limit.lock().unwrap(), 2);
         assert!(owner.available(&2));
-        owner.state.lock().unwrap().updated = Instant::now() - config().recovery;
+        owner.state.lock().unwrap().recovery_updated = Instant::now() - config().recovery;
         work.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), 3);
     }
@@ -2300,17 +2987,17 @@ mod tests {
             let owner = Adaptive::new(config, Counts::default(), now).unwrap();
             let work = owner.acquire(&1).unwrap();
             let updated = now() - config.backoff.max(config.recovery);
-            owner.state.lock().unwrap().updated = updated;
+            owner.state.lock().unwrap().pressure_updated = updated;
 
             for _ in 0..2 {
                 work.observe(Outcome::Verified);
                 let state = owner.state.lock().unwrap();
                 assert_eq!(state.limit, config.total);
-                assert_eq!(state.updated, updated);
+                assert_eq!(state.pressure_updated, updated);
             }
             work.observe(Outcome::LocalPressure);
             assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
-            assert_eq!(owner.state.lock().unwrap().updated, now());
+            assert_eq!(owner.state.lock().unwrap().pressure_updated, now());
             assert_eq!(owner.state.lock().unwrap().peers[&1].limit, config.per_key);
             assert!(owner.available(&1));
             assert_eq!(
@@ -2325,9 +3012,9 @@ mod tests {
         }
     }
 
-    /// Restoring the final slot still starts backoff and rate-limits pressure.
+    /// Restoring a slot leaves the independent pressure backoff unchanged.
     #[test]
-    fn recovery_restoring_slot_advances_pressure_backoff() {
+    fn recovery_restoring_slot_preserves_pressure_backoff() {
         fn now() -> Instant {
             static NOW: OnceLock<Instant> = OnceLock::new();
             *NOW.get_or_init(Instant::now)
@@ -2339,15 +3026,15 @@ mod tests {
         {
             let mut state = owner.state.lock().unwrap();
             state.limit = config.total - 1;
-            state.updated = now() - config.recovery;
+            state.recovery_updated = now() - config.recovery;
         }
         work.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
-        assert_eq!(owner.state.lock().unwrap().updated, now());
+        assert_eq!(owner.state.lock().unwrap().recovery_updated, now());
         work.observe(Outcome::LocalPressure);
         assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
 
-        owner.state.lock().unwrap().updated = now() - config.backoff;
+        owner.state.lock().unwrap().pressure_updated = now() - config.backoff;
         work.observe(Outcome::LocalPressure);
         assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
         work.observe(Outcome::LocalPressure);
@@ -2369,6 +3056,41 @@ mod tests {
 
         fn advance(duration: Duration) {
             CLOCK.set(now() + duration);
+        }
+
+        /// Frequent recoveries cannot postpone an independently due reduction.
+        #[test]
+        fn recovery_shorter_than_backoff_does_not_starve_pressure() {
+            let config = Config {
+                total: 32,
+                per_key: 32,
+                backoff: Duration::from_secs(10),
+                recovery: Duration::from_secs(1),
+                ..config()
+            };
+            let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+            let work = owner.acquire(&1).unwrap();
+            advance(config.backoff);
+            work.observe(Outcome::LocalPressure);
+            let reduced = now();
+            assert_eq!(owner.state.lock().unwrap().limit, 16);
+            for expected in 17..=25 {
+                advance(config.recovery);
+                work.observe(Outcome::Verified);
+                work.observe(Outcome::LocalPressure);
+                let state = owner.state.lock().unwrap();
+                assert_eq!(state.limit, expected);
+                assert_eq!(state.pressure_updated, reduced);
+            }
+            advance(config.recovery);
+            work.observe(Outcome::Verified);
+            work.observe(Outcome::LocalPressure);
+            assert_eq!(owner.state.lock().unwrap().limit, 13);
+            work.observe(Outcome::Verified);
+            assert_eq!(owner.state.lock().unwrap().limit, 13);
+            advance(config.recovery);
+            work.observe(Outcome::Verified);
+            assert_eq!(owner.state.lock().unwrap().limit, 14);
         }
 
         #[test]

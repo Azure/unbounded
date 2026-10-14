@@ -438,7 +438,7 @@ mod quota_tests {
             self.max_keys
         }
 
-        /// Only the waking class notifies admission waiters on drop.
+        /// Only the waking class notifies admission waiters on release.
         fn wakes(class: Resource) -> bool {
             class == Resource::Waking
         }
@@ -465,7 +465,7 @@ mod quota_tests {
         }
     }
 
-    /// Splitting is accounting-neutral; shrinking releases both budgets silently.
+    /// Splitting is accounting-neutral; shrinking wakes after releasing both budgets.
     #[test]
     fn keyed_split_shrink_and_cross_thread_drop_keep_exact_accounting() {
         /// Assert that local authority does not prevent transferable charges.
@@ -493,14 +493,24 @@ mod quota_tests {
             assert_eq!(charge.amount(), 60);
         }
         charge.shrink(60).unwrap();
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            0,
+            "no-op shrink must not wake"
+        );
         charge.shrink(20).unwrap();
         assert_eq!(shared.used(Resource::Waking), 60);
-        assert_eq!(wake.0.load(Ordering::SeqCst), 0, "shrink must not wake");
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            1,
+            "released capacity must wake"
+        );
         let refill = quotas.reserve(Some(&1), Resource::Waking, 40).unwrap();
         assert_eq!(shared.used(Resource::Waking), 100);
+        shared.register(&Waker::from(wake.clone()));
         std::thread::spawn(move || drop(split)).join().unwrap();
         assert_eq!(shared.used(Resource::Waking), 60);
-        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(wake.0.load(Ordering::SeqCst), 2);
         drop((refill, charge));
         assert_eq!(shared.used(Resource::Waking), 0);
         let next = quotas.reserve(Some(&2), Resource::Waking, 100).unwrap();
@@ -508,7 +518,7 @@ mod quota_tests {
         assert!(quotas.policy().rejected.lock().unwrap().is_empty());
     }
 
-    /// Retaining backing transfers surplus admission but not the donor's key owner.
+    /// Exact retention leaves even an empty donor's key owned until final drop.
     #[test]
     fn recycler_transfers_surplus_and_empty_donor_still_owns_key_until_drop() {
         let size = 1 << 20;
@@ -516,17 +526,15 @@ mod quota_tests {
         let shared = quotas.shared();
         let wake = Arc::new(WakeCount::default());
         shared.register(&Waker::from(wake.clone()));
-        let mut donor = quotas
-            .reserve(Some(&1), Resource::Waking, 2 * size)
-            .unwrap();
+        let mut donor = quotas.reserve(Some(&1), Resource::Waking, size).unwrap();
         let mut bytes = donor.buffer(size).unwrap();
         bytes.fill(0xa7);
         bytes.truncate(1);
         donor.recycle(bytes);
         assert_eq!(donor.amount(), 0);
         assert_eq!(donor.key(), Some(&1));
-        assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
-        assert_eq!(shared.used(Resource::Waking), 2 * size);
+        assert_eq!(quotas.retained_buffer_bytes(), size);
+        assert_eq!(shared.used(Resource::Waking), size);
         assert_eq!(wake.0.load(Ordering::SeqCst), 0);
         assert_eq!(donor.shrink(1), Err(Error::InvalidInput));
         assert!(matches!(donor.split(1), Err(Error::InvalidInput)));
@@ -539,10 +547,7 @@ mod quota_tests {
         ));
         assert!(matches!(
             &quotas.policy().rejected.lock().unwrap()[..],
-            [
-                Rejection::Keys { used: 1, limit: 1 },
-                Rejection::Keys { used: 1, limit: 1 }
-            ]
+            [Rejection::Keys { used: 1, limit: 1 }]
         ));
         shared.register(&Waker::from(wake.clone()));
         std::thread::spawn(move || drop(donor)).join().unwrap();
@@ -551,6 +556,34 @@ mod quota_tests {
         assert_eq!(shared.used(Resource::Waking), 0);
         assert_eq!(shared.used(Resource::Silent), 1);
         drop(next);
+        assert_eq!(shared.used(Resource::Silent), 0);
+    }
+
+    /// Surplus stays with the donor; shared pressure needs explicit local reclaim.
+    #[test]
+    fn recycler_retains_exact_capacity_and_shared_reclaim_is_explicit() {
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(3 * size, 1));
+        let shared = quotas.shared();
+        let mut donor = quotas
+            .reserve(Some(&1), Resource::Silent, 3 * size)
+            .unwrap();
+        donor.recycle(vec![0xa7; size]);
+        assert_eq!(donor.amount(), 2 * size);
+        assert_eq!(donor.key(), Some(&1));
+        assert_eq!(quotas.retained_buffer_bytes(), size);
+        assert_eq!(shared.used(Resource::Silent), 3 * size);
+        drop(donor);
+        assert_eq!(shared.used(Resource::Silent), size);
+        assert!(matches!(
+            shared.reserve(Resource::Silent, 3 * size),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(quotas.retained_buffer_bytes(), size);
+        quotas.reclaim_buffers();
+        let full = shared.reserve(Resource::Silent, 3 * size).unwrap();
+        let replacement = quotas.reserve(Some(&2), Resource::Waking, 1).unwrap();
+        drop((full, replacement));
         assert_eq!(shared.used(Resource::Silent), 0);
     }
 
@@ -601,8 +634,8 @@ mod quota_tests {
             let rejected = quotas.policy().rejected.lock().unwrap();
             assert_eq!(
                 rejected.len(),
-                5,
-                "shared attempts once; local retries once"
+                3,
+                "each call attempts once without reclaimed backing"
             );
             for event in rejected.iter() {
                 assert!(matches!(
@@ -844,7 +877,7 @@ mod coalesce_tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     thread_local! {
         /// Callback invoked only by synchronous wakes on the current test worker.
@@ -893,8 +926,9 @@ mod coalesce_tests {
     /// Register a flight wake target through the caller-owned borrow boundary.
     fn register_flight_waker(owner: &RefCell<Option<Waker>>, waker: &Waker) {
         let waker = waker.clone();
-        let retired = flight::update(owner, |slot, _| flight::state::store_waker(slot, waker));
-        drop(retired);
+        flight::update(owner, |slot, txn| {
+            txn.retire(flight::state::store_waker(slot, waker));
+        });
     }
 
     /// Empty, different, and equal slots transfer ownership without callbacks.
@@ -913,22 +947,22 @@ mod coalesce_tests {
             *slot.borrow_mut() = Some(Box::new(move || dropped.set(true)));
         });
         let duplicate = cohort_waker();
-        let retired = flight::update(&owner, |slot, _| {
+        flight::update(&owner, |slot, txn| {
             assert!(flight::state::store_waker(slot, waker).is_none());
             let retired = flight::state::store_waker(slot, duplicate).unwrap();
             assert!(slot.as_ref().unwrap().will_wake(&retired));
             assert!(!cloned.get());
             assert!(!dropped.get());
-            retired
+            txn.retire(retired);
         });
-        drop(retired);
         assert!(dropped.get());
         let latest = Waker::from(Arc::new(Reenter));
         let replacement = latest.clone();
-        let retired = flight::update(&owner, |slot, _| {
-            flight::state::store_waker(slot, replacement)
+        flight::update(&owner, |slot, txn| {
+            let retired = flight::state::store_waker(slot, replacement);
+            assert!(retired.as_ref().unwrap().will_wake(&cohort_waker()));
+            txn.retire(retired);
         });
-        assert!(retired.as_ref().unwrap().will_wake(&cohort_waker()));
         assert!(owner.borrow().as_ref().unwrap().will_wake(&latest));
         assert!(!cloned.get());
         ON_COHORT_CLONE.with(|slot| slot.borrow_mut().take());
@@ -996,6 +1030,522 @@ mod coalesce_tests {
     #[test]
     fn flight_store_waker_identical_drop_reentry() {
         check_flight_store_waker_drop_reentry(true);
+    }
+
+    /// Detach retires the whole waiter without running callbacks in the transaction.
+    #[test]
+    fn flight_detach_drop_reentry() {
+        for phase in 0..5 {
+            for final_waiter in [false, true] {
+                let owner = Rc::new(RefCell::new(State::<
+                    u32,
+                    u32,
+                    Published<u32, u32>,
+                    CountingPolicy,
+                >::default()));
+                let due = Instant::now();
+                flight::update(&owner, |state, txn| {
+                    for id in 1..=if final_waiter { 1 } else { 2 } {
+                        assert!(
+                            state
+                                .register(
+                                    id,
+                                    CountingPolicy {
+                                        due,
+                                        checks: Rc::new(Cell::new(0)),
+                                        error: Rc::new(Cell::new(None)),
+                                    },
+                                    true,
+                                    true,
+                                )
+                                .is_ok()
+                        );
+                    }
+                    state.replace_phase(
+                        match phase {
+                            0 => Phase::RetryPending,
+                            1 => Phase::Acquiring,
+                            2 => Phase::Draining(Outcome::Retry),
+                            3 => Phase::Complete(7),
+                            _ => Phase::Failed(8),
+                        },
+                        txn,
+                    );
+                    state.leader = matches!(phase, 1 | 2).then_some(1);
+                    state.register_waker(1, cohort_waker(), txn);
+                });
+                let called = Rc::new(Cell::new(0));
+                ON_COHORT_DROP.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new({
+                        let owner = owner.clone();
+                        let called = called.clone();
+                        move || {
+                            flight::update(&owner, |state, txn| {
+                                assert!(!state.waiters().contains_key(&1));
+                                assert!(!state.deadlines().contains_key(&(due, 1)));
+                                assert_eq!(state.waiters().len(), usize::from(!final_waiter));
+                                assert_eq!(state.deadlines().len(), usize::from(!final_waiter));
+                                assert_eq!(state.leader, matches!(phase, 1 | 2).then_some(1));
+                                assert!(match phase {
+                                    0 => matches!(state.phase(), Phase::RetryPending),
+                                    1 => matches!(state.phase(), Phase::Acquiring),
+                                    2 => matches!(state.phase(), Phase::Draining(Outcome::Retry)),
+                                    3 => matches!(state.phase(), Phase::Complete(7)),
+                                    _ => matches!(state.phase(), Phase::Failed(8)),
+                                });
+                                txn.retire(state.detach(2));
+                            });
+                            called.set(called.get() + 1);
+                        }
+                    }));
+                });
+                flight::update(&owner, |state, txn| {
+                    assert!(state.detach(99).is_none());
+                    assert_eq!(state.waiters().len(), if final_waiter { 1 } else { 2 });
+                    assert_eq!(state.deadlines().len(), state.waiters().len());
+                    let retired = state.detach(1);
+                    assert!(retired.as_ref().unwrap().waker().is_some());
+                    assert_eq!(called.get(), 0);
+                    txn.retire(retired);
+                });
+                assert_eq!(called.get(), 1);
+                assert!(flight::update(&owner, |state, _| state.detach(1)).is_none());
+                assert!(owner.borrow().waiters().is_empty());
+                assert!(owner.borrow().deadlines().is_empty());
+                assert!(ON_COHORT_DROP.with(|slot| slot.borrow().is_none()));
+            }
+        }
+    }
+
+    /// A waiter without a waker still retains its policy until retirement.
+    #[test]
+    fn flight_detach_policy_drop_reentry_without_waker() {
+        struct Policy {
+            due: Instant,
+            on_drop: Option<Box<dyn FnOnce()>>,
+        }
+
+        impl WaiterPolicy for Policy {
+            type Error = u8;
+
+            fn check(&self, _: Instant) -> Option<u8> {
+                None
+            }
+
+            fn deadline(&self) -> Instant {
+                self.due
+            }
+        }
+
+        impl Drop for Policy {
+            fn drop(&mut self) {
+                self.on_drop.take().unwrap()();
+            }
+        }
+
+        let owner = Rc::new(RefCell::new(State::<u32, u32, u32, Policy>::default()));
+        let called = Rc::new(Cell::new(false));
+        let policy = Policy {
+            due: Instant::now(),
+            on_drop: Some(Box::new({
+                let owner = owner.clone();
+                let called = called.clone();
+                move || {
+                    flight::update(&owner, |state, _| {
+                        assert!(state.waiters().is_empty());
+                        assert!(state.deadlines().is_empty());
+                        assert!(state.detach(1).is_none());
+                    });
+                    called.set(true);
+                }
+            })),
+        };
+        flight::update(&owner, |state, txn| {
+            assert!(state.register(1, policy, true, true).is_ok());
+            let retired = state.detach(1);
+            assert!(retired.as_ref().unwrap().waker().is_none());
+            assert!(!called.get());
+            txn.retire(retired);
+        });
+        assert!(called.get());
+    }
+
+    struct DropProbe {
+        due: Instant,
+        on_drop: Option<Box<dyn FnOnce()>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            if let Some(callback) = self.on_drop.take() {
+                callback();
+            }
+        }
+    }
+
+    impl WaiterPolicy for DropProbe {
+        type Error = u8;
+
+        fn check(&self, _: Instant) -> Option<u8> {
+            None
+        }
+
+        fn deadline(&self) -> Instant {
+            self.due
+        }
+    }
+
+    type DropState = State<DropProbe, DropProbe, Published<DropProbe, DropProbe>, DropProbe>;
+
+    #[derive(Default)]
+    struct Count(std::sync::atomic::AtomicUsize);
+
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// All phases retire results and policies only after shutdown is visible.
+    #[test]
+    fn flight_stop_drop_reentry_all_phases() {
+        for phase in 0..7 {
+            for waiter_count in 0..=2 {
+                let owner = Rc::new(RefCell::new(DropState::default()));
+                let dropped = Rc::new(Cell::new(0));
+                let borrowed = Rc::new(Cell::new(0));
+                let probe = || DropProbe {
+                    due: Instant::now(),
+                    on_drop: Some(Box::new({
+                        let owner = Rc::downgrade(&owner);
+                        let dropped = dropped.clone();
+                        let borrowed = borrowed.clone();
+                        move || {
+                            let owner = owner.upgrade().unwrap();
+                            if owner.try_borrow_mut().is_err() {
+                                borrowed.set(borrowed.get() + 1);
+                                return;
+                            }
+                            flight::update(&owner, |state, _| {
+                                assert!(state.waiters().is_empty());
+                                assert!(state.deadlines().is_empty());
+                                assert!(matches!(
+                                    state.phase(),
+                                    Phase::Draining(Outcome::Failed(8))
+                                ));
+                                assert!(state.detach(1).is_none());
+                            });
+                            dropped.set(dropped.get() + 1);
+                        }
+                    })),
+                };
+                let wake_count = Arc::new(Count::default());
+                flight::update(&owner, |state, txn| {
+                    state.replace_phase(
+                        match phase {
+                            0 => Phase::RetryPending,
+                            1 => Phase::Acquiring,
+                            2 => Phase::Draining(Outcome::Retry),
+                            3 => Phase::Draining(Outcome::Failed(7)),
+                            4 => Phase::Draining(Outcome::Published(Published::Complete(probe()))),
+                            5 => Phase::Complete(probe()),
+                            _ => Phase::Failed(7),
+                        },
+                        txn,
+                    );
+                    state.leader = matches!(phase, 1..=4).then_some(1);
+                    for id in 1..=waiter_count {
+                        assert!(state.register(id, probe(), true, true).is_ok());
+                        // Include a policy with no parked waker.
+                        if id == 1 {
+                            state.register_waker(id, Waker::from(wake_count.clone()), txn);
+                        }
+                    }
+                });
+                flight::update(&owner, |state, txn| {
+                    let retired = state.stop(8, txn);
+                    assert_eq!(dropped.get(), 0);
+                    assert_eq!(retired.waiters.len(), waiter_count as usize);
+                    assert!(
+                        retired
+                            .waiters
+                            .values()
+                            .all(|waiter| waiter.error() == Some(8) && waiter.waker().is_none())
+                    );
+                    assert!(match phase {
+                        0 => matches!(retired.phase, Phase::RetryPending),
+                        1 => matches!(retired.phase, Phase::Acquiring),
+                        2 => matches!(retired.phase, Phase::Draining(Outcome::Retry)),
+                        3 => matches!(retired.phase, Phase::Draining(Outcome::Failed(7))),
+                        4 => matches!(retired.phase, Phase::Draining(Outcome::Published(_))),
+                        5 => matches!(retired.phase, Phase::Complete(_)),
+                        _ => matches!(retired.phase, Phase::Failed(7)),
+                    });
+                    txn.retire(retired);
+                });
+                assert_eq!(borrowed.get(), 0, "phase {phase}, waiters {waiter_count}");
+                assert_eq!(
+                    wake_count.0.load(std::sync::atomic::Ordering::Relaxed),
+                    usize::from(waiter_count > 0)
+                );
+                assert_eq!(
+                    dropped.get(),
+                    waiter_count + u64::from(matches!(phase, 4 | 5))
+                );
+                flight::update(&owner, |state, txn| {
+                    let retired = state.stop(8, txn);
+                    txn.retire(retired);
+                });
+                flight::update(&owner, |state, wakes| {
+                    assert_eq!(state.leader, matches!(phase, 1..=4).then_some(1));
+                    let retired = state.settle(false, 9, std::convert::identity, wakes);
+                    let unchanged = retired.is_none();
+                    wakes.retire(retired);
+                    assert!(unchanged);
+                    assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
+                    let retired = state.settle(true, 9, std::convert::identity, wakes);
+                    let unchanged = retired.is_none();
+                    wakes.retire(retired);
+                    assert!(unchanged);
+                    assert!(matches!(state.phase(), Phase::Failed(8)));
+                    assert!(state.leader.is_none());
+                });
+                assert_eq!(
+                    wake_count.0.load(std::sync::atomic::Ordering::Relaxed),
+                    usize::from(waiter_count > 0)
+                );
+            }
+        }
+    }
+
+    /// Other phase replacements also return old results instead of dropping them.
+    #[test]
+    fn flight_phase_replacement_drop_reentry() {
+        for revoke in [false, true] {
+            for complete in [false, true] {
+                let owner = Rc::new(RefCell::new(DropState::default()));
+                let called = Rc::new(Cell::new(false));
+                let value = DropProbe {
+                    due: Instant::now(),
+                    on_drop: Some(Box::new({
+                        let owner = Rc::downgrade(&owner);
+                        let called = called.clone();
+                        move || {
+                            flight::update(&owner.upgrade().unwrap(), |state, _| {
+                                assert!(matches!(state.phase(), Phase::Draining(Outcome::Retry)));
+                            });
+                            called.set(true);
+                        }
+                    })),
+                };
+                flight::update(&owner, |state, txn| {
+                    state.replace_phase(
+                        if complete {
+                            Phase::Complete(value)
+                        } else {
+                            Phase::Draining(Outcome::Published(Published::Partial(value)))
+                        },
+                        txn,
+                    );
+                });
+                flight::update(&owner, |state, txn| {
+                    let retired = if revoke {
+                        state.revoke(8, txn)
+                    } else {
+                        state.begin_completion(Outcome::Retry)
+                    };
+                    assert!(!called.get());
+                    txn.retire(retired);
+                });
+                assert!(called.get());
+            }
+        }
+    }
+
+    /// Settlement and refresh retain old partials until the owner borrow is released.
+    #[test]
+    fn flight_partial_replacement_drop_reentry() {
+        for refresh in [false, true] {
+            for complete in [false, true] {
+                let owner = Rc::new(RefCell::new(DropState::default()));
+                let called = Rc::new(Cell::new(false));
+                let previous = DropProbe {
+                    due: Instant::now(),
+                    on_drop: Some(Box::new({
+                        let owner = Rc::downgrade(&owner);
+                        let called = called.clone();
+                        move || {
+                            flight::update(&owner.upgrade().unwrap(), |state, _| {
+                                assert!(state.leader.is_none());
+                                if complete {
+                                    assert!(matches!(state.phase(), Phase::Complete(_)));
+                                    assert!(state.partial().is_none());
+                                } else {
+                                    assert!(matches!(state.phase(), Phase::RetryPending));
+                                    assert!(state.partial().is_some());
+                                }
+                            });
+                            called.set(true);
+                        }
+                    })),
+                };
+                flight::update(&owner, |state, txn| {
+                    state.replace_partial(Some(previous), txn);
+                    let value = DropProbe {
+                        due: Instant::now(),
+                        on_drop: None,
+                    };
+                    state.replace_phase(
+                        Phase::Draining(Outcome::Published(if complete {
+                            Published::Complete(value)
+                        } else {
+                            Published::Partial(value)
+                        })),
+                        txn,
+                    );
+                    state.leader = Some(1);
+                });
+                let settle = |idle| {
+                    let now = Instant::now();
+                    flight::update(&owner, |state, txn| {
+                        let retired = if refresh {
+                            state.refresh(idle, 9, 8, now, std::convert::identity, txn)
+                        } else {
+                            state.settle(idle, 9, std::convert::identity, txn)
+                        };
+                        let replaced = retired.is_some();
+                        txn.retire(retired);
+                        replaced
+                    })
+                };
+                assert!(!settle(false));
+                assert!(!called.get());
+                assert!(settle(true));
+                assert!(called.get());
+                assert!(!settle(true));
+            }
+        }
+    }
+
+    /// Shutdown retains partials and cannot clear retained or taken operation slots.
+    #[test]
+    fn flight_stop_retains_partial_and_real_operation_fence() {
+        let owner = Rc::new(RefCell::new((
+            DropState::default(),
+            Operations::<()>::default(),
+        )));
+        let called = Rc::new(Cell::new(false));
+        let partial = DropProbe {
+            due: Instant::now(),
+            on_drop: Some(Box::new({
+                let owner = Rc::downgrade(&owner);
+                let called = called.clone();
+                move || {
+                    flight::update(&owner.upgrade().unwrap(), |(state, operations), _| {
+                        assert!(matches!(state.phase(), Phase::Failed(8)));
+                        assert!(state.partial().is_none());
+                        assert!(operations.is_empty());
+                    });
+                    called.set(true);
+                }
+            })),
+        };
+        flight::update(&owner, |(state, operations), txn| {
+            state.replace_partial(Some(partial), txn);
+            state.replace_phase(Phase::Acquiring, txn);
+            state.leader = Some(1);
+            operations.insert(1, ()).unwrap();
+            let retired = state.stop(8, txn);
+            txn.retire(retired);
+        });
+        for take in [false, true] {
+            flight::update(&owner, |(state, operations), wakes| {
+                if take {
+                    operations.take(1).unwrap();
+                }
+                let retired = state.settle(operations.is_empty(), 9, std::convert::identity, wakes);
+                let unchanged = retired.is_none();
+                wakes.retire(retired);
+                assert!(unchanged);
+                assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
+                assert!(state.partial().is_some());
+                assert_eq!(state.leader, Some(1));
+            });
+            assert!(!called.get());
+        }
+        flight::update(&owner, |(state, operations), wakes| {
+            operations.complete(1).unwrap();
+            let retired = state.settle(operations.is_empty(), 9, std::convert::identity, wakes);
+            let unchanged = retired.is_none();
+            wakes.retire(retired);
+            assert!(unchanged);
+            assert!(matches!(state.phase(), Phase::Failed(8)));
+            assert!(state.leader.is_none());
+            state.replace_partial(None, wakes);
+            assert!(!called.get());
+        });
+        assert!(called.get());
+    }
+
+    /// Shutdown drops policies and results before wakes, without bypassing settlement.
+    #[test]
+    fn flight_stop_wake_reentry_preserves_completion_fence() {
+        let owner = Rc::new(RefCell::new(DropState::default()));
+        let called = Rc::new(Cell::new(false));
+        let dropped = Rc::new(Cell::new(0));
+        let probe = || DropProbe {
+            due: Instant::now(),
+            on_drop: Some(Box::new({
+                let owner = owner.clone();
+                let dropped = dropped.clone();
+                let called = called.clone();
+                move || {
+                    assert!(!called.get());
+                    let state = owner.borrow_mut();
+                    assert!(state.waiters().is_empty());
+                    assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
+                    dropped.set(dropped.get() + 1);
+                }
+            })),
+        };
+        let waker = on_wake({
+            let owner = owner.clone();
+            let called = called.clone();
+            let dropped = dropped.clone();
+            move || {
+                assert_eq!(
+                    dropped.get(),
+                    2,
+                    "retired values must drop before notification"
+                );
+                flight::update(&owner, |state, wakes| {
+                    assert!(state.waiters().is_empty());
+                    assert!(state.deadlines().is_empty());
+                    assert!(state.detach(1).is_none());
+                    let retired = state.settle(false, 9, std::convert::identity, wakes);
+                    wakes.retire(retired);
+                    assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
+                    let retired = state.settle(true, 9, std::convert::identity, wakes);
+                    wakes.retire(retired);
+                    assert!(matches!(state.phase(), Phase::Failed(8)));
+                });
+                called.set(true);
+            }
+        });
+        flight::update(&owner, |state, txn| {
+            assert!(state.register(1, probe(), true, true).is_ok());
+            state.replace_phase(
+                Phase::Draining(Outcome::Published(Published::Complete(probe()))),
+                txn,
+            );
+            state.register_waker(1, waker, txn);
+            let retired = state.stop(8, txn);
+            assert!(!called.get());
+            assert_eq!(dropped.get(), 0);
+            txn.retire(retired);
+        });
+        assert_eq!(dropped.get(), 2);
+        assert!(called.get());
     }
 
     /// Clone and replacement callbacks may poll, retry, or finish the same cohort.
@@ -1408,11 +1958,43 @@ mod coalesce_tests {
 
     impl Entry for OwnedEntry {
         /// This fixture has no caller policy to refresh.
-        fn refresh(&mut self, _: &mut Vec<Waker>) {}
+        fn refresh(&mut self, _: &mut flight::Txn) {}
 
         /// Require explicit completion of every retained operation.
         fn quiescent(&self) -> bool {
             self.0.is_empty()
+        }
+    }
+
+    struct OwnedAccess<'a>(&'a mut OwnedEntry);
+
+    impl OwnedAccess<'_> {
+        fn insert(
+            &mut self,
+            id: u64,
+            resource: ReentrantResource,
+        ) -> Result<(), ReentrantResource> {
+            self.0.0.insert(id, resource)
+        }
+
+        fn take(&mut self, id: u64) -> Result<ReentrantResource, Stale> {
+            self.0.0.take(id)
+        }
+
+        fn complete(&mut self, id: u64) -> Result<(), Stale> {
+            self.0.0.complete(id)
+        }
+
+        fn len(&self) -> usize {
+            self.0.0.len()
+        }
+    }
+
+    impl flight::Access for OwnedEntry {
+        type View<'a> = OwnedAccess<'a>;
+
+        fn access(&mut self) -> OwnedAccess<'_> {
+            OwnedAccess(self)
         }
     }
 
@@ -1424,10 +2006,18 @@ mod coalesce_tests {
     }
 
     impl Entry for DroppableEntry {
-        fn refresh(&mut self, _: &mut Vec<Waker>) {}
+        fn refresh(&mut self, _: &mut flight::Txn) {}
 
         fn quiescent(&self) -> bool {
             self.quiescent
+        }
+    }
+
+    impl flight::Access for DroppableEntry {
+        type View<'a> = &'a mut bool;
+
+        fn access(&mut self) -> &mut bool {
+            &mut self.quiescent
         }
     }
 
@@ -1462,24 +2052,23 @@ mod coalesce_tests {
                 })
                 .is_ok()
             );
-            let rejected = flight::update(&table, |table, _| {
-                table.insert(1, entry(rejected_dropped.clone()))
+            flight::update(&table, |table, txn| {
+                let rejected = table.insert(1, entry(rejected_dropped.clone()));
+                assert!(rejected.is_err());
+                assert!(!original_dropped.get(), "occupied entry must stay owned");
+                assert!(!rejected_dropped.get(), "rejection must return ownership");
+                txn.retire(rejected);
             });
-            assert!(rejected.is_err());
-            assert!(!original_dropped.get(), "occupied entry must stay owned");
-            assert!(!rejected_dropped.get(), "rejection must return ownership");
-            drop(rejected);
             assert!(rejected_dropped.get());
             assert!(unlocked.get());
             assert!(!original_dropped.get());
-            let removed = flight::update(&table, |table, _| {
-                assert_eq!(table.len(), 1);
-                table.get_mut(&1).unwrap().quiescent = true;
-                table.remove_quiescent(&1)
-            });
             // The original destructor also reenters after explicit removal.
             unlocked.set(false);
-            drop(removed);
+            flight::update(&table, |table, txn| {
+                assert_eq!(table.len(), 1);
+                *table.access(&1).unwrap() = true;
+                assert!(txn.remove_quiescent(table, &1));
+            });
             assert!(original_dropped.get());
             assert!(unlocked.get());
         }
@@ -1506,10 +2095,10 @@ mod coalesce_tests {
             let dropped = dropped.clone();
             move || {
                 let table = table.upgrade().unwrap();
-                drop(flight::update(&table, |table, wakes| {
+                flight::update(&table, |table, wakes| {
                     assert!(table.is_empty());
                     let removed = table.sweep(1, wakes);
-                    assert!(removed.is_empty());
+                    assert_eq!(removed, 0);
                     assert_eq!(table.next_waiter_id(), Ok(1));
                     assert!(
                         table
@@ -1523,7 +2112,7 @@ mod coalesce_tests {
                             .is_ok()
                     );
                     removed
-                }));
+                });
                 dropped.set(dropped.get() + 1);
             }
         })));
@@ -1539,29 +2128,27 @@ mod coalesce_tests {
                 )
                 .is_ok()
         );
-        let removed = flight::update(&table, |table, wakes| {
+        flight::update(&table, |table, wakes| {
             assert!(table.remove_quiescent(&2).is_none());
             assert!(table.remove_quiescent(&1).is_none());
-            assert!(table.sweep(1, wakes).is_empty());
-            table.get_mut(&1).unwrap().quiescent = true;
-            assert!(table.sweep(0, wakes).is_empty());
+            assert_eq!(table.sweep(1, wakes), 0);
+            *table.access(&1).unwrap() = true;
+            assert_eq!(table.sweep(0, wakes), 0);
             assert_eq!(table.len(), 1);
             let removed = if sweep {
                 table.sweep(1, wakes)
             } else {
-                table.remove_quiescent(&1).into_iter().collect()
+                usize::from(wakes.remove_quiescent(table, &1))
             };
-            assert_eq!(removed.len(), 1);
+            assert_eq!(removed, 1);
             assert!(table.is_empty());
             assert!(table.remove_quiescent(&1).is_none());
             assert_eq!(dropped.get(), 0);
             removed
         });
-        assert_eq!(dropped.get(), 0);
-        drop(removed);
         assert_eq!(dropped.get(), 1);
         assert_eq!(table.borrow_mut().next_waiter_id(), Ok(2));
-        drop(flight::update(&table, |table, wakes| table.sweep(1, wakes)));
+        flight::update(&table, |table, wakes| table.sweep(1, wakes));
         assert_eq!(table.borrow().len(), 1, "replacement remains indexed");
         assert_eq!(dropped.get(), 1);
     }
@@ -1576,12 +2163,12 @@ mod coalesce_tests {
             let dropped = dropped.clone();
             move || {
                 let table = table.upgrade().unwrap();
-                drop(flight::update(&table, |table, wakes| {
+                flight::update(&table, |table, wakes| {
                     let removed = table.sweep(1, wakes);
                     assert_eq!(table.len(), 1);
                     assert!(table.remove_quiescent(&1).is_none());
                     removed
-                }));
+                });
                 dropped.set(true);
             }
         })));
@@ -1590,22 +2177,21 @@ mod coalesce_tests {
             assert_eq!(table.next_waiter_id(), Ok(2));
             let id = table.next_operation_id().unwrap();
             assert!(table.insert(1, OwnedEntry::default()).is_ok());
-            table.get_mut(&1).unwrap().0.insert(id, resource);
-            assert_eq!(table.get_mut(&1).unwrap().0.complete(id), Err(Stale));
+            assert!(table.access(&1).unwrap().insert(id, resource).is_ok());
+            assert_eq!(table.access(&1).unwrap().complete(id), Err(Stale));
             id
         });
         flight::update(&table, |table, wakes| table.stop(wakes, |_, _| {}));
         assert!(table.borrow().is_stopping());
-        let resource = flight::update(&table, |table, _| {
-            let operations = &mut table.get_mut(&1).unwrap().0;
+        flight::update(&table, |table, txn| {
+            let mut operations = table.access(&1).unwrap();
             let resource = operations.take(id).unwrap();
             assert!(matches!(operations.take(id), Err(Stale)));
             assert!(matches!(operations.take(id + 1), Err(Stale)));
             assert_eq!(operations.complete(id + 1), Err(Stale));
             assert_eq!(operations.len(), 1);
-            resource
+            txn.retire(resource);
         });
-        drop(resource);
         assert!(dropped.get());
         assert_eq!(table.borrow().len(), 1);
         let notified = Rc::new(Cell::new(false));
@@ -1617,15 +2203,13 @@ mod coalesce_tests {
                 notified.set(true);
             }
         });
-        drop(flight::update(&table, |table, _| {
-            table.register_drain(waker)
-        }));
-        drop(flight::update(&table, |table, wakes| {
-            let operations = &mut table.get_mut(&1).unwrap().0;
+        flight::update(&table, |table, txn| txn.register_drain(table, waker));
+        flight::update(&table, |table, wakes| {
+            let mut operations = table.access(&1).unwrap();
             operations.complete(id).unwrap();
             assert_eq!(operations.complete(id), Err(Stale));
             table.sweep(1, wakes)
-        }));
+        });
         assert!(notified.get());
     }
 
@@ -1639,35 +2223,200 @@ mod coalesce_tests {
         let checks = Rc::new(Cell::new(0));
         let error = Rc::new(Cell::new(None));
         for id in 0..66 {
-            state.register(
-                id,
-                CountingPolicy {
-                    due: now,
-                    checks: checks.clone(),
-                    error: error.clone(),
-                },
-                true,
-                true,
+            assert!(
+                state
+                    .register(
+                        id,
+                        CountingPolicy {
+                            due: now,
+                            checks: checks.clone(),
+                            error: error.clone(),
+                        },
+                        true,
+                        true,
+                    )
+                    .is_ok()
             );
         }
         assert_eq!(state.elect(0, &mut identity, 2), Ok(true));
         error.set(Some(7));
-        let mut wakes = Vec::new();
-        state.refresh(false, 9, 8, || now, std::convert::identity, &mut wakes);
-        assert_eq!(checks.get(), 65);
-        assert_eq!(state.deadlines.len(), 1);
-        assert_eq!(state.waiters[&0].error, Some(7));
-        assert!(state.waiters[&65].error.is_none());
-        assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
-        assert_eq!(state.elect(65, &mut identity, 2), Ok(false));
-        assert_eq!(identity.generation, 1);
+        let owner = RefCell::new(state);
+        flight::update_at(&owner, now, |state, wakes| {
+            let retired = state.refresh(false, 9, 8, now, std::convert::identity, wakes);
+            wakes.retire(retired);
+            assert_eq!(checks.get(), 65);
+            assert_eq!(state.deadlines().len(), 1);
+            assert_eq!(state.waiters()[&0].error(), Some(7));
+            assert!(state.waiters()[&65].error().is_none());
+            assert!(matches!(state.phase(), Phase::Draining(Outcome::Retry)));
+            assert_eq!(state.elect(65, &mut identity, 2), Ok(false));
+            assert_eq!(identity.generation, 1);
 
-        state.refresh(false, 9, 8, || now, std::convert::identity, &mut wakes);
+            let retired = state.refresh(false, 9, 8, now, std::convert::identity, wakes);
+            wakes.retire(retired);
+            assert_eq!(checks.get(), 66);
+            assert!(state.deadlines().is_empty());
+            assert!(matches!(state.phase(), Phase::Draining(Outcome::Retry)));
+            let retired = state.settle(true, 9, std::convert::identity, wakes);
+            wakes.retire(retired);
+            assert!(matches!(state.phase(), Phase::Failed(9)));
+        });
+    }
+
+    /// Deferred deadlines cannot starve later failures or exceed the refresh quantum.
+    #[test]
+    fn deferred_deadlines_rotate_past_full_quantum() {
+        let owner = RefCell::new(State::<u32, u32, Published<u32, u32>, CountingPolicy>::default());
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let checks = Rc::new(Cell::new(0));
+        let deferred = Rc::new(Cell::new(None));
+        let failed = Rc::new(Cell::new(Some(7)));
+        flight::update_at(&owner, now, |state, _| {
+            for id in 0..66 {
+                assert!(
+                    state
+                        .register(
+                            id,
+                            CountingPolicy {
+                                due: if id == 65 { later } else { now },
+                                checks: checks.clone(),
+                                error: if id < 64 {
+                                    deferred.clone()
+                                } else {
+                                    failed.clone()
+                                },
+                            },
+                            true,
+                            true
+                        )
+                        .is_ok()
+                );
+            }
+        });
+        let refresh = |now| {
+            flight::update_at(&owner, now, |state, txn| {
+                let retired = state.refresh(false, 9, 8, txn.now(), std::convert::identity, txn);
+                txn.retire(retired);
+            })
+        };
+        refresh(now);
+        assert_eq!(checks.get(), 64);
+        assert!(owner.borrow().waiters()[&64].error().is_none());
+        refresh(now);
+        assert_eq!(checks.get(), 128);
+        assert_eq!(owner.borrow().waiters()[&64].error(), Some(7));
+        assert_eq!(owner.borrow().deadlines().len(), 65);
+        assert!(owner.borrow().waiters()[&65].error().is_none());
+
+        deferred.set(Some(8));
+        refresh(now);
+        assert_eq!(checks.get(), 192);
+        assert_eq!(owner.borrow().deadlines().len(), 1);
+        assert!(
+            owner
+                .borrow()
+                .waiters()
+                .values()
+                .take(64)
+                .all(|waiter| waiter.error() == Some(8))
+        );
+        refresh(now);
+        assert_eq!(checks.get(), 192, "future deadlines are not visited");
+        refresh(later);
+        assert_eq!(checks.get(), 193);
+        assert_eq!(owner.borrow().waiters()[&65].error(), Some(7));
+        assert!(owner.borrow().deadlines().is_empty());
+    }
+
+    /// Clock callbacks run before borrowing; expiry uses one snapshot and a fixed budget.
+    #[test]
+    fn refresh_clock_reentry_uses_one_snapshot_and_bounded_expiry() {
+        /// Advance the clock during policy checks without changing fixed deadlines.
+        struct AdvancingPolicy {
+            due: Instant,
+            clock: Rc<Cell<Instant>>,
+            later: Instant,
+            checks: Rc<Cell<usize>>,
+        }
+
+        impl WaiterPolicy for AdvancingPolicy {
+            type Error = u8;
+
+            fn check(&self, now: Instant) -> Option<u8> {
+                self.checks.set(self.checks.get() + 1);
+                self.clock.set(self.later);
+                (now >= self.due).then_some(7)
+            }
+
+            fn deadline(&self) -> Instant {
+                self.due
+            }
+        }
+
+        let owner =
+            RefCell::new(State::<u32, u32, Published<u32, u32>, AdvancingPolicy>::default());
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let clock = Rc::new(Cell::new(now));
+        let checks = Rc::new(Cell::new(0));
+        flight::update(&owner, |state, _| {
+            for id in 0..66 {
+                assert!(
+                    state
+                        .register(
+                            id,
+                            AdvancingPolicy {
+                                due: if id < 65 { now } else { later },
+                                clock: clock.clone(),
+                                later,
+                                checks: checks.clone(),
+                            },
+                            true,
+                            true,
+                        )
+                        .is_ok()
+                );
+            }
+        });
+        let samples = Cell::new(0);
+        let sample = || {
+            flight::update(&owner, |state, _| assert_eq!(state.waiters().len(), 66));
+            samples.set(samples.get() + 1);
+            clock.get()
+        };
+        let snapshot = sample();
+        let refresh = |snapshot| {
+            flight::update(&owner, |state, txn| {
+                let retired = state.refresh(false, 9, 8, snapshot, std::convert::identity, txn);
+                assert!(retired.is_none());
+                txn.retire(retired);
+            });
+        };
+        refresh(snapshot);
+        assert_eq!(samples.get(), 1);
+        assert_eq!(checks.get(), 64);
+        assert_eq!(clock.get(), later);
+        assert_eq!(owner.borrow().deadlines().len(), 2);
+        assert!(owner.borrow().waiters()[&64].error().is_none());
+
+        refresh(snapshot);
+        assert_eq!(checks.get(), 65);
+        assert_eq!(owner.borrow().deadlines().len(), 1);
+        assert!(owner.borrow().waiters()[&65].error().is_none());
+        refresh(snapshot);
+        assert_eq!(checks.get(), 65);
+        assert_eq!(samples.get(), 1);
+
+        let snapshot = sample();
+        refresh(snapshot);
+        assert_eq!(samples.get(), 2);
         assert_eq!(checks.get(), 66);
-        assert!(state.deadlines.is_empty());
-        assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
-        state.settle(true, 9, std::convert::identity, &mut wakes);
-        assert!(matches!(state.phase, Phase::Failed(9)));
+        assert!(owner.borrow().deadlines().is_empty());
+        assert_eq!(owner.borrow().waiters()[&65].error(), Some(7));
+        refresh(snapshot);
+        assert_eq!(checks.get(), 66);
+        assert_eq!(samples.get(), 2);
     }
 
     /// Fixed-deadline policy with observable checks and externally injected failures.
@@ -1684,7 +2433,7 @@ mod coalesce_tests {
         type Error = u8;
 
         /// Count policy evaluation and return the current injected failure.
-        fn check(&self) -> Option<Self::Error> {
+        fn check(&self, _: Instant) -> Option<Self::Error> {
             self.checks.set(self.checks.get() + 1);
             self.error.get()
         }

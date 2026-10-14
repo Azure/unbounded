@@ -10,7 +10,7 @@ use std::{
     collections::VecDeque,
     future::poll_fn,
     io,
-    os::fd::{AsFd, AsRawFd, FromRawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
     rc::{Rc, Weak},
     task::{Poll, Waker},
 };
@@ -34,6 +34,8 @@ pub struct PipePool<P: Policy> {
     waiting: Waiters,
 
     idle: Rc<RefCell<Vec<PipeResources<P>>>>,
+
+    _stop_observer: Rc<dyn Fn()>,
 }
 
 /// Shared local queue whose head alone attempts scheduled admission.
@@ -74,7 +76,14 @@ impl<P: Policy> Drop for Waiting<P> {
     fn drop(&mut self) {
         {
             let mut queue = self.queue.borrow_mut();
-            queue.retain(|entry| !Rc::ptr_eq(entry, &self.entry));
+            if queue
+                .front()
+                .is_some_and(|entry| Rc::ptr_eq(entry, &self.entry))
+            {
+                queue.pop_front();
+            } else {
+                queue.retain(|entry| !Rc::ptr_eq(entry, &self.entry));
+            }
             if queue.is_empty() {
                 // Do not retain queue storage after its admission charges leave.
                 *queue = VecDeque::new();
@@ -120,7 +129,9 @@ impl<P: Policy> Drop for PipeLease<P> {
         // Never recycle canceled/partially drained payloads: close those pipes.
         if let Some(resources) = self.resources.take()
             && resources.buffered == 0
-            && self.quotas.upgrade().is_some_and(|q| !q.is_stopped())
+            && self.quotas.upgrade().is_some_and(|q| {
+                !q.is_stopped() || P::allows_stopped(resources._reservation.class())
+            })
             && let Some(pool) = self.pool.upgrade()
         {
             pool.borrow_mut().push(resources);
@@ -139,13 +150,39 @@ impl<P: Policy> PipePool<P> {
         waiter_class: P::Class,
         waiter_limit: usize,
     ) -> Self {
+        let waiting = Waiters::default();
+        let idle = Rc::new(RefCell::new(Vec::<PipeResources<P>>::new()));
+        let stop_observer: Rc<dyn Fn()> = {
+            let waiting = waiting.clone();
+            let idle = idle.clone();
+            Rc::new(move || {
+                let retired = if P::allows_stopped(pipe_class) {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut *idle.borrow_mut())
+                };
+                // Consume all registrations before any destructor or wake can
+                // reenter. Keep futures and their context charges caller-owned.
+                let wakes: Vec<_> = waiting
+                    .borrow()
+                    .iter()
+                    .filter_map(|entry| entry.borrow_mut().take())
+                    .collect();
+                drop(retired);
+                for wake in wakes {
+                    wake.wake();
+                }
+            })
+        };
+        quotas.observe_stop(&stop_observer);
         Self {
             quotas,
             pipe_class,
             waiter_class,
             waiter_limit,
-            waiting: Rc::default(),
-            idle: Rc::default(),
+            waiting,
+            idle,
+            _stop_observer: stop_observer,
         }
     }
 
@@ -165,9 +202,9 @@ impl<P: Policy> PipePool<P> {
         self.idle.borrow().len()
     }
 
-    /// Drain idle pipes on stop without releasing resources still owned by leases.
+    /// Drain idle pipes when stop forbids this class, leaving active leases owned.
     fn check_running(&self) -> Result<()> {
-        if self.quotas.is_stopped() {
+        if self.quotas.is_stopped() && !P::allows_stopped(self.pipe_class) {
             let idle = std::mem::take(&mut *self.idle.borrow_mut());
             // Charge destruction may reenter the pool; release the borrow first.
             drop(idle);
@@ -183,7 +220,8 @@ impl<P: Policy> PipePool<P> {
     /// only after queue capacity and its byte charge are secured, never on the
     /// immediate path. Its returned closure registers cancellation notification
     /// with each poll's waker and owns the registration until this wait ends.
-    /// The caller must arrange polls for deadlines, quota stop, or charges held
+    /// Local quota stop wakes all queued acquisitions after retiring forbidden
+    /// idle pipes. The caller must arrange polls for deadlines or charges held
     /// outside this pool; pipe returns and queue removal wake the FIFO head.
     /// No timer, polling loop, or self-wake is created here.
     pub async fn acquire_wait<E, Check, Subscribe, Register>(
@@ -232,13 +270,16 @@ impl<P: Policy> PipePool<P> {
             let wake = cx.waker().clone();
             let old = waiting.entry.borrow_mut().replace(wake);
             drop(old);
+            // Clone/drop callbacks may stop after the first check, including
+            // before this entry publishes its notification. Never miss that stop.
+            self.check_running()?;
             if self
                 .waiting
                 .borrow()
                 .front()
                 .is_some_and(|entry| Rc::ptr_eq(entry, &waiting.entry))
             {
-                match self.acquire() {
+                match self.acquire_turn(Some(&waiting.entry)) {
                     Err(Error::Overloaded) => {}
                     result => return Poll::Ready(result.map_err(E::from)),
                 }
@@ -248,15 +289,38 @@ impl<P: Policy> PipePool<P> {
         .await
     }
 
-    /// Reserve before creating descriptors. Exhaustion never waits for a reader.
+    /// Reserve before creating descriptors. Exhaustion or queued predecessors
+    /// return Overloaded without waiting or bypassing the FIFO.
     pub fn acquire(&self) -> Result<PipeLease<P>> {
+        self.acquire_turn(None)
+    }
+
+    /// Admit only the queued head, or an immediate caller when no queue exists.
+    fn acquire_turn(&self, entry: Option<&Rc<RefCell<Option<Waker>>>>) -> Result<PipeLease<P>> {
         self.check_running()?;
+        self.check_turn(entry)?;
         if let Some(resources) = self.idle.borrow_mut().pop() {
             return Ok(self.lease(resources));
         }
         let reservation = self.quotas.reserve(None, self.pipe_class, 1)?;
         reservation.validate(self.pipe_class, 1)?;
+        // Policy callbacks during reservation can publish a queued predecessor.
+        if let Err(error) = self.check_turn(entry) {
+            drop(reservation);
+            wake_front(&self.waiting);
+            return Err(error);
+        }
         Ok(self.lease(PipeResources::new(reservation)?))
+    }
+
+    /// Recheck queue ownership after callbacks without holding a queue borrow.
+    fn check_turn(&self, entry: Option<&Rc<RefCell<Option<Waker>>>>) -> Result<()> {
+        let queue = self.waiting.borrow();
+        match (queue.front(), entry) {
+            (None, None) => Ok(()),
+            (Some(head), Some(entry)) if Rc::ptr_eq(head, entry) => Ok(()),
+            _ => Err(Error::Overloaded),
+        }
     }
 
     /// Attach local recycling and notification to uniquely owned resources.
@@ -345,10 +409,13 @@ impl<P: Policy> PipeLease<P> {
         }
     }
 
-    /// Receive opaque socket pages directly into an empty bounded pipe. No user
+    /// Receive opaque socket pages into the free capacity of a bounded pipe. No user
     /// buffer is borrowed or retained by this synchronous nonblocking syscall.
     /// The descriptor is validated as a nonblocking stream socket. Callers must
     /// not concurrently clear O_NONBLOCK through a duplicate descriptor.
+    /// A zero count returns zero after validation. A positive count on a full
+    /// pipe returns WouldBlock, not EOF. Partially filled pipes accept a bounded
+    /// prefix, but kernel page-slot limits may also return WouldBlock.
     pub fn try_splice_from(&mut self, socket: &Descriptor, count: usize) -> io::Result<usize> {
         #[cfg(feature = "simulation")]
         if socket.as_sim().is_some() || self.resources.as_ref().unwrap().write.as_sim().is_some() {
@@ -356,7 +423,13 @@ impl<P: Policy> PipeLease<P> {
         }
         validate_socket(socket)?;
         let pipe = self.resources.as_mut().unwrap();
+        if count == 0 {
+            return Ok(0);
+        }
         let count = count.min(pipe.capacity - pipe.buffered);
+        if count == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        }
         // SAFETY: socket is a validated nonblocking stream; this pipe owns
         // both ends, offsets are null, and no userspace pointer enters the kernel.
         let received = syscall_count(unsafe {
@@ -387,6 +460,11 @@ impl<P: Policy> PipeLease<P> {
     /// to the caller; this method never waits or retains a borrowed buffer.
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
+        let count = bytes.len().min(pipe.capacity - pipe.buffered);
+        if count == 0 && !bytes.is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        }
+        let bytes = &bytes[..count];
         #[cfg(feature = "simulation")]
         if let Some(handle) = pipe.write.as_sim() {
             let written = handle.pipe_write(bytes)?;
@@ -395,13 +473,8 @@ impl<P: Policy> PipeLease<P> {
         }
         // SAFETY: the initialized slice stays live for this nonblocking syscall.
         // The read end is owned by this lease, so this cannot generate SIGPIPE.
-        let written = unsafe {
-            libc::write(
-                pipe.write.as_raw_fd(),
-                bytes.as_ptr().cast(),
-                bytes.len().min(pipe.capacity),
-            )
-        };
+        let written =
+            unsafe { libc::write(pipe.write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
         let written = syscall_count(written)?;
         pipe.buffered += written;
         Ok(written)
@@ -448,16 +521,24 @@ impl<P: Policy> PipeLease<P> {
                 _ => return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
             }
         }
-        self.try_splice_to(socket, count)
+        self.try_splice_to(socket.as_fd(), count)
     }
 
     /// Transfer copied kernel pipe bytes to a nonblocking stream socket. The
     /// caller retains both owners through this synchronous syscall. Unsupported
     /// splice errors leave the bytes in the pipe for an independent copy fallback.
     /// Callers must not concurrently clear O_NONBLOCK through a duplicate FD.
-    pub fn try_splice_to(&mut self, socket: &impl AsFd, count: usize) -> io::Result<usize> {
-        validate_socket(socket)?;
-        self.splice_to_fd(socket.as_fd().as_raw_fd(), count)
+    /// This native-only API requires an explicit OS descriptor borrow. Runtime
+    /// descriptors, including simulation, use `try_splice_descriptor` instead.
+    /// A preexisting pending SIGPIPE returns EOPNOTSUPP without transferring bytes,
+    /// so callers can use their copy fallback without changing the pending signal.
+    pub fn try_splice_to(&mut self, socket: BorrowedFd<'_>, count: usize) -> io::Result<usize> {
+        #[cfg(feature = "simulation")]
+        if self.resources.as_ref().unwrap().read.as_sim().is_some() {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        validate_socket(&socket)?;
+        self.splice_to_fd(socket.as_raw_fd(), count)
     }
 
     /// Drain to a stream socket. Like `try_splice_to`, this safe API validates
@@ -474,8 +555,16 @@ impl<P: Policy> PipeLease<P> {
             return Ok(0);
         }
         // Unlike send, splice has no MSG_NOSIGNAL. Mask only on this worker and
-        // only across the syscall, consuming our own EPIPE signal before restore.
+        // only across the syscall. Even a positive partial splice can generate
+        // SIGPIPE, so the guard consumes new signals regardless of the result.
         let signal = SigpipeGuard::block()?;
+        // sigpending combines thread and process queues. A process-pending signal
+        // does not coalesce with splice's new thread signal. Do not splice when
+        // either queue is occupied: consuming could steal the caller's signal,
+        // while skipping consumption could leave a new signal behind.
+        if signal.was_pending {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
         // SAFETY: owned live FDs, null offsets for pipe/socket, no userspace page
         // pointers, and both ends are nonblocking. No vmsplice/GIFT is involved.
         let result = syscall_count(unsafe {
@@ -488,12 +577,6 @@ impl<P: Policy> PipeLease<P> {
                 libc::SPLICE_F_NONBLOCK,
             )
         });
-        if result
-            .as_ref()
-            .is_err_and(|e| e.raw_os_error() == Some(libc::EPIPE))
-        {
-            signal.consume_generated();
-        }
         drop(signal);
         if let Ok(sent) = result {
             pipe.buffered -= sent;
@@ -513,7 +596,10 @@ fn validate_socket(socket: &impl AsFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     if flags & libc::O_NONBLOCK == 0 {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "splice requires a nonblocking socket",
+        ));
     }
     let mut kind: libc::c_int = 0;
     let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
@@ -528,10 +614,20 @@ fn validate_socket(socket: &impl AsFd) -> io::Result<()> {
         )
     } < 0
     {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTSOCK) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "splice requires a stream socket",
+            ));
+        }
+        return Err(error);
     }
     if kind != libc::SOCK_STREAM {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "splice requires a stream socket",
+        ));
     }
     Ok(())
 }
@@ -582,8 +678,8 @@ impl SigpipeGuard {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        // SAFETY: zero timeout never waits; only our thread's blocked SIGPIPE is
-        // consumed. Preserve a signal that was pending before entering the guard.
+        // SAFETY: zero timeout never waits; SIGPIPE is blocked on this thread.
+        // Neither pending queue held SIGPIPE when this guard was installed.
         while unsafe { libc::sigtimedwait(&self.set, std::ptr::null_mut(), &timeout) } < 0 {
             if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 break;
@@ -593,8 +689,9 @@ impl SigpipeGuard {
 }
 
 impl Drop for SigpipeGuard {
-    /// Restore the exact mask saved after successful installation.
+    /// Consume any new SIGPIPE, then restore the exact saved mask.
     fn drop(&mut self) {
+        self.consume_generated();
         // SAFETY: restore the exact thread mask saved by successful pthread_sigmask.
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) };
     }
@@ -630,10 +727,187 @@ mod tests {
         task::{Context, Wake},
     };
 
+    /// A child process gives SIGPIPE its real disposition without changing peers.
+    #[test]
+    fn sigpipe_guard_preserves_pending_signals_and_mask() {
+        const CHILD: &str = "FLOW_PIPE_SIGPIPE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The child and all its harness threads inherit this thread's mask.
+            // Restore it immediately after spawn; no parent disposition changes.
+            let mask = SigpipeGuard::block().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipe::tests::sigpipe_guard_preserves_pending_signals_and_mask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn();
+            drop(mask);
+            let status = child.unwrap().wait().unwrap();
+            assert!(status.success(), "SIGPIPE child failed: {status}");
+            return;
+        }
+        // SAFETY: only this isolated child changes the process disposition. Every
+        // generated signal is blocked and consumed before its mask is restored.
+        unsafe {
+            assert_ne!(libc::signal(libc::SIGPIPE, libc::SIG_DFL), libc::SIG_ERR);
+        }
+        for blocked in [false, true] {
+            for preexisting in [false, true] {
+                let outer = SigpipeGuard::block().unwrap();
+                // SAFETY: initialized sets and the current thread are used only.
+                unsafe {
+                    if !blocked && !preexisting {
+                        assert_eq!(
+                            libc::pthread_sigmask(
+                                libc::SIG_UNBLOCK,
+                                &outer.set,
+                                std::ptr::null_mut()
+                            ),
+                            0
+                        );
+                    }
+                    if preexisting {
+                        assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE), 0);
+                    }
+                }
+                let before = current_signal_mask();
+                let guard = SigpipeGuard::block().unwrap();
+                assert_eq!(guard.was_pending, preexisting);
+                // Model a positive partial result with a newly pending signal.
+                // This avoids relying on a timing-sensitive socket disconnect.
+                unsafe {
+                    assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE), 0);
+                }
+                assert!(sigpipe_pending());
+                assert_eq!(syscall_count(1).unwrap(), 1);
+                drop(guard);
+                assert_eq!(sigpipe_pending(), preexisting);
+                let after = current_signal_mask();
+                for signal in 1..=libc::SIGRTMAX() {
+                    // SAFETY: both sets are initialized and signal is in range.
+                    assert_eq!(unsafe { libc::sigismember(&before, signal) }, unsafe {
+                        libc::sigismember(&after, signal)
+                    });
+                }
+                outer.consume_generated();
+                assert!(!sigpipe_pending());
+                drop(outer);
+            }
+        }
+        // Exercise an actual splice-generated EPIPE with SIGPIPE no longer ignored.
+        splice_rejects_blocking_socket_and_handles_disconnect_without_losing_bytes();
+        assert!(!sigpipe_pending());
+
+        for process_pending in [false, true] {
+            for thread_pending in [false, true] {
+                let outer = SigpipeGuard::block().unwrap();
+                // SAFETY: this isolated child's threads all block SIGPIPE.
+                unsafe {
+                    if process_pending {
+                        assert_eq!(libc::kill(libc::getpid(), libc::SIGPIPE), 0);
+                    }
+                    if thread_pending {
+                        assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE), 0);
+                    }
+                }
+                let before = current_signal_mask();
+                let pool = new_pool(admission(1));
+                let mut pipe = pool.acquire().unwrap();
+                pipe.try_write(b"abc").unwrap();
+                let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                socket.set_nonblocking(true).unwrap();
+                drop(peer);
+                let error = pipe.try_splice_to(socket.as_fd(), 3).unwrap_err();
+                if process_pending || thread_pending {
+                    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+                    assert!(splice_unsupported(&error));
+                } else {
+                    assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+                }
+                assert_eq!(pipe.buffered(), 3);
+                let mut bytes = [0; 3];
+                assert_eq!(pipe.try_read(&mut bytes).unwrap(), 3);
+                assert_eq!(&bytes, b"abc");
+                let after = current_signal_mask();
+                for signal in 1..=libc::SIGRTMAX() {
+                    // SAFETY: initialized sets and an in-range signal number.
+                    assert_eq!(unsafe { libc::sigismember(&before, signal) }, unsafe {
+                        libc::sigismember(&after, signal)
+                    });
+                }
+                // Another thread can consume only the shared process signal,
+                // proving we preserved its queue, not just the combined bit.
+                assert_eq!(
+                    std::thread::spawn(take_pending_sigpipe).join().unwrap(),
+                    process_pending.then_some(libc::SIGPIPE)
+                );
+                assert_eq!(
+                    take_pending_sigpipe(),
+                    thread_pending.then_some(libc::SIGPIPE)
+                );
+                assert_eq!(take_pending_sigpipe(), None);
+                assert!(!sigpipe_pending());
+                drop(outer);
+            }
+        }
+    }
+
+    /// Consume one blocked signal for queue-isolation assertions.
+    fn take_pending_sigpipe() -> Option<libc::c_int> {
+        // SAFETY: local initialized storage and a zero timeout; callers block SIGPIPE.
+        unsafe {
+            let mut set = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout);
+            if result == libc::SIGPIPE {
+                Some(result)
+            } else {
+                assert_eq!(result, -1);
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+                None
+            }
+        }
+    }
+
+    /// Read the current thread mask without changing it.
+    fn current_signal_mask() -> libc::sigset_t {
+        // SAFETY: the output points to local initialized storage; null set is a query.
+        unsafe {
+            let mut mask = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask),
+                0
+            );
+            mask
+        }
+    }
+
+    /// Read whether either the current thread or process has a pending SIGPIPE.
+    fn sigpipe_pending() -> bool {
+        // SAFETY: sigpending initializes the local set before it is queried.
+        unsafe {
+            let mut pending = std::mem::zeroed();
+            assert_eq!(libc::sigpending(&mut pending), 0);
+            libc::sigismember(&pending, libc::SIGPIPE) == 1
+        }
+    }
+
     /// Independent pipe, waiter-context, and payload fixture resources.
     #[derive(Clone, Copy)]
     enum ResourceClass {
         Pipe,
+
+        StopPipe,
 
         RequestContext,
 
@@ -641,7 +915,7 @@ mod tests {
     }
 
     impl crate::Class for ResourceClass {
-        const COUNT: usize = 3;
+        const COUNT: usize = 4;
 
         /// Select the fixture's stable per-class counter.
         fn index(self) -> usize {
@@ -672,7 +946,7 @@ mod tests {
                 }
             }
             match class {
-                ResourceClass::Pipe => self.pipes,
+                ResourceClass::Pipe | ResourceClass::StopPipe => self.pipes,
                 _ => self.context,
             }
         }
@@ -684,7 +958,12 @@ mod tests {
 
         /// Pipe release can notify an explicitly registered quota waiter.
         fn wakes(class: ResourceClass) -> bool {
-            matches!(class, ResourceClass::Pipe)
+            matches!(class, ResourceClass::Pipe | ResourceClass::StopPipe)
+        }
+
+        /// Only the explicitly opted-in pipe class may admit after stop.
+        fn allows_stopped(class: ResourceClass) -> bool {
+            matches!(class, ResourceClass::StopPipe)
         }
 
         /// Pipe counts do not authorize userspace page backing.
@@ -905,6 +1184,47 @@ mod tests {
         assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
     }
 
+    /// Multiple returns wake each queued successor before immediate callers enter.
+    #[test]
+    fn immediate_acquisition_cannot_bypass_fifo_after_multiple_returns() {
+        let pool = new_pool(admission(2));
+        let held = [pool.acquire().unwrap(), pool.acquire().unwrap()];
+        let first_count = Arc::new(WakeCounter::default());
+        let second_count = Arc::new(WakeCounter::default());
+        let first_waker = Waker::from(first_count.clone());
+        let second_waker = Waker::from(second_count.clone());
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut second_cx = Context::from_waker(&second_waker);
+        let mut first = acquire_wait(&pool);
+        let mut second = acquire_wait(&pool);
+        assert!(first.as_mut().poll(&mut first_cx).is_pending());
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+        drop(held);
+        assert_eq!(first_count.count(), 1);
+        assert_eq!(second_count.count(), 0);
+        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+        let Poll::Ready(Ok(first_lease)) = first.as_mut().poll(&mut first_cx) else {
+            panic!("head must acquire first returned pipe");
+        };
+        assert_eq!(second_count.count(), 1, "head completion forwards the wake");
+        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
+        let Poll::Ready(Ok(second_lease)) = second.as_mut().poll(&mut second_cx) else {
+            panic!("successor must acquire second returned pipe without another release");
+        };
+        assert!(pool.waiting.borrow().is_empty());
+        drop((first_lease, second_lease));
+        assert!(pool.acquire().is_ok());
+
+        let held = [pool.acquire().unwrap(), pool.acquire().unwrap()];
+        let mut canceled = acquire_wait(&pool);
+        assert!(canceled.as_mut().poll(&mut first_cx).is_pending());
+        drop(held);
+        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
+        drop(canceled);
+        assert!(pool.acquire().is_ok());
+    }
+
     /// Distinguish application gate rejection from flow-control exhaustion.
     #[derive(Debug, PartialEq)]
     enum GateError {
@@ -930,6 +1250,13 @@ mod tests {
             assert!(!splice_unsupported(&io::Error::from_raw_os_error(code)));
         }
         assert!(!splice_unsupported(&io::Error::other("custom")));
+    }
+
+    /// Caller contract failures must not select an unsupported-splice fallback.
+    fn assert_invalid_socket(error: io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.raw_os_error(), None);
+        assert!(!splice_unsupported(&error));
     }
 
     /// Immediate acquisition skips subscription and failed waits roll back fully.
@@ -1218,16 +1545,8 @@ mod tests {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         let socket = Descriptor::from(std::os::fd::OwnedFd::from(socket));
         pipe.try_write(b"out").unwrap();
-        assert_eq!(
-            pipe.try_splice_connection(&socket)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EINVAL)
-        );
-        assert_eq!(
-            pipe.try_splice_from(&socket, 1).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
+        assert_invalid_socket(pipe.try_splice_connection(&socket).unwrap_err());
+        assert_invalid_socket(pipe.try_splice_from(&socket, 1).unwrap_err());
         assert_eq!(pipe.buffered(), 3);
         socket.set_nonblocking().unwrap();
         assert_eq!(pipe.try_splice_connection(&socket).unwrap(), 3);
@@ -1239,6 +1558,46 @@ mod tests {
         assert_eq!(pipe.try_splice_from(&socket, 3).unwrap(), 3);
         assert_eq!(pipe.try_read(&mut bytes).unwrap(), 3);
         assert_eq!(&bytes, b"in!");
+    }
+
+    /// Full capacity is backpressure; only a drained socket reports EOF.
+    #[test]
+    fn splice_from_full_partial_zero_and_eof_are_distinct() {
+        use std::{io::Write, os::unix::net::UnixStream};
+        let pool = new_pool(admission(1));
+        let mut pipe = pool.acquire().unwrap();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = Descriptor::from(std::os::fd::OwnedFd::from(socket));
+        let capacity = pipe.capacity();
+        let bytes = vec![0x5a; capacity];
+        assert_eq!(pipe.try_write(&bytes).unwrap(), capacity);
+        peer.write_all(b"next").unwrap();
+        assert_eq!(pipe.try_splice_from(&socket, 0).unwrap(), 0);
+        assert_eq!(
+            pipe.try_splice_from(&socket, 1).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(pipe.buffered(), capacity);
+        let mut drained = vec![0; capacity];
+        assert_eq!(pipe.try_read(&mut drained).unwrap(), capacity);
+        assert_eq!(drained, bytes);
+        // One page leaves a free slot even on a two-page pipe under UID pressure.
+        // SAFETY: sysconf has no pointer arguments.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert!(capacity > page);
+        assert_eq!(pipe.try_write(&bytes[..page]).unwrap(), page);
+        assert_eq!(pipe.try_splice_from(&socket, usize::MAX).unwrap(), 4);
+        assert_eq!(pipe.buffered(), page + 4);
+        assert_eq!(pipe.try_read(&mut drained).unwrap(), page + 4);
+        assert_eq!(&drained[page..page + 4], b"next");
+        assert_eq!(
+            pipe.try_splice_from(&socket, 1).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(peer);
+        assert_eq!(pipe.try_splice_from(&socket, 1).unwrap(), 0);
+        assert_eq!(pipe.buffered(), 0);
     }
 
     /// Simulated descriptors preserve byte counts, pooling, and partial close.
@@ -1291,6 +1650,14 @@ mod tests {
         let _environment = sim.enter();
         let mut simulated_pipe = pool.acquire().unwrap();
         let (simulated_socket, _peer) = sim.socket_pair();
+
+        assert_eq!(
+            simulated_pipe
+                .try_splice_to(real_socket.as_fd(), 1)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
 
         for (pipe, socket) in [
             (&mut real_pipe, &simulated_socket),
@@ -1345,6 +1712,51 @@ mod tests {
         );
     }
 
+    /// Stop opt-in applies to pipe reuse and creation, not to new waiter contexts.
+    #[test]
+    fn stopped_pool_honors_pipe_and_waiter_class_policy() {
+        let quotas = admission(2);
+        let pool = PipePool::new(
+            quotas.clone(),
+            ResourceClass::StopPipe,
+            ResourceClass::RequestContext,
+            8,
+        );
+        let first = pool.acquire().unwrap();
+        let second = pool.acquire().unwrap();
+        let mut admitted_wait = acquire_wait(&pool);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(admitted_wait.as_mut().poll(&mut cx).is_pending());
+        drop(first);
+        quotas.stop();
+        assert_eq!(pool.idle_count(), 1, "allowed idle pipes remain reusable");
+        // Existing admitted waiter context may finish; its pipe class allows stop.
+        let Poll::Ready(Ok(first)) = admitted_wait.as_mut().poll(&mut cx) else {
+            panic!("allowed pipe class must remain available after stop");
+        };
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        let mut denied_wait = acquire_wait(&pool);
+        assert!(matches!(
+            denied_wait.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        drop(first);
+        assert_eq!(pool.idle_count(), 1);
+        let mut reused = pool.acquire().unwrap();
+        reused.try_write(b"discard").unwrap();
+        drop(reused);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(quotas.used(ResourceClass::StopPipe), 1);
+        let fresh = pool.acquire().unwrap();
+        assert_eq!(quotas.used(ResourceClass::StopPipe), 2);
+        drop((fresh, second));
+        assert_eq!(pool.idle_count(), 2);
+        drop((admitted_wait, denied_wait));
+        drop(pool);
+        assert_eq!(quotas.used(ResourceClass::StopPipe), 0);
+    }
+
     /// Stop observation drains idle owners but leaves active work and waiters owned.
     #[test]
     fn review_regression_stop_drains_idle_on_all_acquisition_paths() {
@@ -1384,6 +1796,8 @@ mod tests {
             assert_eq!(pool.idle_count(), 2);
             assert_eq!(quotas.used(ResourceClass::Pipe), 3);
             quotas.stop();
+            assert_eq!(pool.idle_count(), 0, "stop must eagerly retire idle pipes");
+            assert_eq!(quotas.used(ResourceClass::Pipe), 1);
             match path {
                 0 => assert!(matches!(pool.acquire(), Err(Error::Unavailable))),
                 1 => assert!(matches!(
@@ -1443,7 +1857,6 @@ mod tests {
         let first = pool.acquire().unwrap();
         let second = pool.acquire().unwrap();
         drop((first, second));
-        quotas.stop();
         let called = Rc::new(std::cell::Cell::new(false));
         let callback_called = called.clone();
         let callback_pool = pool.clone();
@@ -1452,13 +1865,193 @@ mod tests {
             assert_eq!(event, "wake");
             assert_eq!(callback_pool.idle_count(), 0);
             assert!(matches!(callback_pool.acquire(), Err(Error::Unavailable)));
+            callback_pool.quotas().stop();
             callback_called.set(true);
         });
+        quotas.stop();
         assert!(matches!(pool.acquire(), Err(Error::Unavailable)));
         waker_callbacks::clear();
         assert!(called.get());
         assert_eq!(quotas.used(ResourceClass::Pipe), 0);
         assert_eq!(pool.idle_count(), 0);
+    }
+
+    /// Stop reaches every pool and queued entry without waiting for active leases.
+    #[test]
+    fn stop_wakes_all_pool_queues_after_idle_retirement() {
+        let quotas = admission(2);
+        let first_pool = new_pool(quotas.clone());
+        let second_pool = new_pool(quotas.clone());
+        let held = first_pool.acquire().unwrap();
+        let idle = second_pool.acquire().unwrap();
+        let counters: Vec<_> = (0..4).map(|_| Arc::new(WakeCounter::default())).collect();
+        let wakers: Vec<_> = counters.iter().cloned().map(Waker::from).collect();
+        let mut waits = [
+            acquire_wait(&first_pool),
+            acquire_wait(&first_pool),
+            acquire_wait(&second_pool),
+            acquire_wait(&second_pool),
+        ];
+        for (wait, waker) in waits.iter_mut().zip(&wakers) {
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(waker))
+                    .is_pending()
+            );
+        }
+        drop(idle);
+        // The follower stays queued even though the head can now reuse an idle pipe.
+        assert!(
+            waits[3]
+                .as_mut()
+                .poll(&mut Context::from_waker(&wakers[3]))
+                .is_pending()
+        );
+        let before: Vec<_> = counters.iter().map(|counter| counter.count()).collect();
+        quotas.stop();
+        assert_eq!(quotas.used(ResourceClass::Pipe), 1);
+        assert_eq!(second_pool.idle_count(), 0);
+        assert_eq!(counters[0].count(), before[0] + 1);
+        assert_eq!(counters[1].count(), before[1] + 1);
+        // The second pool head already has a return notification; its follower
+        // must be notified directly rather than depending on that head to poll.
+        assert_eq!(counters[3].count(), before[3] + 1);
+        assert_eq!(
+            quotas.used(ResourceClass::RequestContext),
+            4 * first_pool.waiter_bytes()
+        );
+        for (wait, waker) in waits.iter_mut().zip(&wakers) {
+            assert!(matches!(
+                wait.as_mut().poll(&mut Context::from_waker(waker)),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+        }
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        drop(held);
+        assert_eq!(quotas.used(ResourceClass::Pipe), 0);
+        quotas.stop();
+    }
+
+    /// Stop from a waker clone cannot leave a non-head acquisition asleep.
+    #[test]
+    fn stop_during_queue_waker_clone_is_observed_before_pending() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        let _held = pool.acquire().unwrap();
+        let mut first = acquire_wait(&pool);
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let mut second = acquire_wait(&pool);
+        let wake = waker_callbacks::waker();
+        waker_callbacks::on_callback(move |event| {
+            assert_eq!(event, "clone");
+            quotas.stop();
+        });
+        assert!(matches!(
+            second.as_mut().poll(&mut Context::from_waker(&wake)),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        waker_callbacks::clear();
+    }
+
+    /// Notifications see retired charges and can reenter without any pool borrow.
+    #[test]
+    fn stop_queue_wake_reenters_after_retirement() {
+        let quotas = admission(1);
+        let pool = Rc::new(new_pool(quotas.clone()));
+        let held = pool.acquire().unwrap();
+        let mut first = acquire_wait(&pool);
+        let mut second = acquire_wait(&pool);
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let wake = waker_callbacks::waker();
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        drop(held);
+        let called = Rc::new(std::cell::Cell::new(false));
+        let callback_called = called.clone();
+        let callback_pool = pool.clone();
+        waker_callbacks::on_callback(move |event| {
+            assert_eq!(event, "wake");
+            assert_eq!(callback_pool.idle_count(), 0);
+            assert_eq!(callback_pool.quotas().used(ResourceClass::Pipe), 0);
+            assert_eq!(callback_pool.waiting.borrow_mut().len(), 2);
+            assert!(matches!(callback_pool.acquire(), Err(Error::Unavailable)));
+            callback_pool.quotas().stop();
+            callback_called.set(true);
+        });
+        quotas.stop();
+        waker_callbacks::clear();
+        assert!(called.get());
+    }
+
+    /// An admitted waiter for an allowed class may stay pending and later succeed.
+    #[test]
+    fn stop_notification_preserves_allowed_queued_acquisition() {
+        let quotas = admission(1);
+        let pool = PipePool::new(
+            quotas.clone(),
+            ResourceClass::StopPipe,
+            ResourceClass::RequestContext,
+            8,
+        );
+        let held = pool.acquire().unwrap();
+        let mut wait = acquire_wait(&pool);
+        let counter = Arc::new(WakeCounter::default());
+        let wake = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&wake);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        quotas.stop();
+        assert_eq!(counter.count(), 1);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            quotas.used(ResourceClass::RequestContext),
+            pool.waiter_bytes()
+        );
+        drop(held);
+        assert_eq!(counter.count(), 2);
+        let Poll::Ready(Ok(lease)) = wait.as_mut().poll(&mut cx) else {
+            panic!("allowed waiter must still acquire after stop");
+        };
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        drop(lease);
+        assert_eq!(pool.idle_count(), 1);
+        quotas.stop();
+        assert_eq!(pool.idle_count(), 1);
+    }
+
+    /// The weak registry neither retains pools nor creates a quota ownership cycle.
+    #[test]
+    fn stop_observers_do_not_retain_dropped_pools() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        drop(pool.acquire().unwrap());
+        let idle = Rc::downgrade(&pool.idle);
+        let observer = Rc::downgrade(&pool._stop_observer);
+        drop(pool);
+        assert!(idle.upgrade().is_none());
+        assert!(observer.upgrade().is_none());
+        assert_eq!(quotas.used(ResourceClass::Pipe), 0);
+        let pool = new_pool(quotas.clone());
+        assert_eq!(quotas.stop_observers.borrow().len(), 1);
+        quotas.stop();
+        assert!(quotas.stop_observers.borrow().is_empty());
+        assert!(matches!(pool.acquire(), Err(Error::Unavailable)));
+        let weak = Rc::downgrade(&quotas);
+        drop((pool, quotas));
+        assert!(weak.upgrade().is_none());
     }
 
     /// A lease outliving its pool continues to hold capacity until drop.
@@ -1520,6 +2113,101 @@ mod tests {
             drop(waiting);
             assert_eq!(pool.waiting.borrow().capacity(), 0);
             assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        }
+    }
+
+    /// Successful heads leave later slots in place unless storage must shrink.
+    #[test]
+    fn queued_success_pops_heads_without_compacting_successors() {
+        const WAITERS: usize = 32;
+        let quotas = admission(1);
+        let pool = PipePool::new(
+            quotas.clone(),
+            ResourceClass::Pipe,
+            ResourceClass::RequestContext,
+            WAITERS,
+        );
+        let held = pool.acquire().unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut waiting: VecDeque<_> = (0..WAITERS).map(|_| acquire_wait(&pool)).collect();
+        for wait in &mut waiting {
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        }
+        drop(held);
+        while let Some(mut wait) = waiting.pop_front() {
+            let next_slot = {
+                let queue = pool.waiting.borrow();
+                (queue.len() > 1 && queue.capacity() <= (queue.len() - 1) * 2)
+                    .then(|| std::ptr::from_ref(&queue[1]))
+            };
+            let Poll::Ready(Ok(lease)) = wait.as_mut().poll(&mut cx) else {
+                panic!("head must acquire the returned pipe");
+            };
+            if let Some(next_slot) = next_slot {
+                let queue = pool.waiting.borrow();
+                assert_eq!(std::ptr::from_ref(queue.front().unwrap()), next_slot);
+            }
+            assert_eq!(pool.waiting.borrow().len(), waiting.len());
+            assert_eq!(
+                quotas.used(ResourceClass::RequestContext),
+                waiting.len() * pool.waiter_bytes()
+            );
+            if let Some(next) = waiting.front_mut() {
+                assert!(next.as_mut().poll(&mut cx).is_pending());
+            }
+            drop(lease);
+        }
+        assert_eq!(pool.waiting.borrow().capacity(), 0);
+        assert!(pool.acquire().is_ok());
+    }
+
+    /// Head, middle, tail, and singleton cancellation preserve the surviving FIFO.
+    #[test]
+    fn canceled_waiter_removes_only_its_slot_and_preserves_progress() {
+        for (count, canceled) in [(1, 0), (5, 0), (5, 2), (5, 4)] {
+            let quotas = admission(1);
+            let pool = new_pool(quotas.clone());
+            let held = pool.acquire().unwrap();
+            let counters: Vec<_> = (0..count)
+                .map(|_| Arc::new(WakeCounter::default()))
+                .collect();
+            let mut waiting: Vec<_> = (0..count).map(|_| acquire_wait(&pool)).collect();
+            for (wait, counter) in waiting.iter_mut().zip(&counters) {
+                let waker = Waker::from(counter.clone());
+                assert!(
+                    wait.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
+            let mut expected = pool.waiting.borrow().clone();
+            expected.remove(canceled);
+            drop(waiting.remove(canceled));
+            {
+                let queue = pool.waiting.borrow();
+                assert_eq!(queue.len(), expected.len());
+                assert!(queue.iter().zip(&expected).all(|(a, b)| Rc::ptr_eq(a, b)));
+            }
+            assert_eq!(
+                quotas.used(ResourceClass::RequestContext),
+                waiting.len() * pool.waiter_bytes()
+            );
+            for (index, counter) in counters.iter().enumerate() {
+                let head = if canceled == 0 { 1 } else { 0 };
+                assert_eq!(counter.count(), usize::from(index == head));
+            }
+            let mut cx = Context::from_waker(Waker::noop());
+            for wait in &mut waiting {
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+            }
+            drop(held);
+            for mut wait in waiting {
+                assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+            }
+            assert!(pool.waiting.borrow().is_empty());
+            assert_eq!(pool.waiting.borrow().capacity(), 0);
+            assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+            assert!(pool.acquire().is_ok());
         }
     }
 
@@ -1627,6 +2315,56 @@ mod tests {
         assert_eq!(&out[..6], b"second");
     }
 
+    /// Oversized writes fill the free suffix, and drained pipes remain reusable.
+    fn assert_oversized_write_uses_remaining_capacity() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        let capacity = pool.acquire().unwrap().capacity();
+        for requested in [2, libc::PIPE_BUF, capacity + 1] {
+            assert_eq!(pool.idle_count(), 1);
+            let mut pipe = pool.acquire().unwrap();
+            assert_eq!(pool.idle_count(), 0);
+            assert_eq!(pipe.buffered(), 0);
+            assert_eq!(pipe.try_write(&[]).unwrap(), 0);
+            let prefix = vec![0x5a; capacity - 1];
+            assert_eq!(pipe.try_write(&prefix).unwrap(), prefix.len());
+            assert_eq!(pipe.buffered(), capacity - 1);
+            assert_eq!(pipe.try_write(&vec![0xa5; requested]).unwrap(), 1);
+            assert_eq!(pipe.buffered(), capacity);
+            assert_eq!(pipe.try_write(&[]).unwrap(), 0);
+            assert_eq!(
+                pipe.try_write(b"full").unwrap_err().raw_os_error(),
+                Some(libc::EAGAIN)
+            );
+            assert_eq!(pipe.buffered(), capacity);
+            let mut bytes = vec![0; capacity];
+            assert_eq!(pipe.try_read(&mut bytes).unwrap(), capacity);
+            assert_eq!(&bytes[..capacity - 1], prefix.as_slice());
+            assert_eq!(bytes[capacity - 1], 0xa5);
+            assert_eq!(pipe.buffered(), 0);
+            drop(pipe);
+            assert_eq!(pool.idle_count(), 1);
+            assert_eq!(quotas.used(ResourceClass::Pipe), 1);
+        }
+        drop(pool);
+        assert_eq!(quotas.used(ResourceClass::Pipe), 0);
+    }
+
+    /// Native small writes must not stall when their prefix fits the free suffix.
+    #[test]
+    fn native_oversized_write_uses_remaining_capacity() {
+        assert_oversized_write_uses_remaining_capacity();
+    }
+
+    /// Simulation uses the same bounded-prefix contract as native pipes.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn simulation_oversized_write_uses_remaining_capacity() {
+        let sim = uring_runtime::reactor::simulation::Simulation::new();
+        let _environment = sim.enter();
+        assert_oversized_write_uses_remaining_capacity();
+    }
+
     /// Copied pages remain intact after source reuse, partial drain, and pipe reuse.
     #[test]
     fn copied_splice_survives_source_reuse_and_partial_drain() {
@@ -1639,9 +2377,9 @@ mod tests {
         let mut source = b"copied kernel pages".to_vec();
         assert_eq!(pipe.try_write(&source).unwrap(), source.len());
         source.fill(0);
-        assert_eq!(pipe.try_splice_to(&socket, 6).unwrap(), 6);
+        assert_eq!(pipe.try_splice_to(socket.as_fd(), 6).unwrap(), 6);
         assert_eq!(pipe.buffered(), 13);
-        assert_eq!(pipe.try_splice_to(&socket, usize::MAX).unwrap(), 13);
+        assert_eq!(pipe.try_splice_to(socket.as_fd(), usize::MAX).unwrap(), 13);
         assert_eq!(pipe.buffered(), 0);
         // Socket-owned kernel pages survive both pipe closure and quota reuse.
         drop(pipe);
@@ -1661,15 +2399,14 @@ mod tests {
         let mut pipe = pool.acquire().unwrap();
         pipe.try_write(b"abc").unwrap();
         let (socket, peer) = UnixStream::pair().unwrap();
-        assert_eq!(
-            pipe.try_splice_to(&socket, 3).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
+        assert_invalid_socket(pipe.try_splice_to(socket.as_fd(), 3).unwrap_err());
         assert_eq!(pipe.buffered(), 3);
         socket.set_nonblocking(true).unwrap();
         drop(peer);
         assert_eq!(
-            pipe.try_splice_to(&socket, 3).unwrap_err().raw_os_error(),
+            pipe.try_splice_to(socket.as_fd(), 3)
+                .unwrap_err()
+                .raw_os_error(),
             Some(libc::EPIPE)
         );
         assert_eq!(pipe.buffered(), 3);
@@ -1698,16 +2435,13 @@ mod tests {
             }
         }
         assert_eq!(
-            pipe.try_splice_to(&socket, 7).unwrap_err().kind(),
+            pipe.try_splice_to(socket.as_fd(), 7).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         assert_eq!(pipe.buffered(), 7);
         let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         datagram.set_nonblocking(true).unwrap();
-        assert_eq!(
-            pipe.try_splice_to(&datagram, 7).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
+        assert_invalid_socket(pipe.try_splice_to(datagram.as_fd(), 7).unwrap_err());
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/null")
@@ -1717,10 +2451,7 @@ mod tests {
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        assert_eq!(
-            pipe.try_splice_to(&file, 7).unwrap_err().raw_os_error(),
-            Some(libc::ENOTSOCK)
-        );
+        assert_invalid_socket(pipe.try_splice_to(file.as_fd(), 7).unwrap_err());
         let mut bytes = [0; 7];
         assert_eq!(pipe.try_read(&mut bytes).unwrap(), 7);
         assert_eq!(&bytes, b"pending");
