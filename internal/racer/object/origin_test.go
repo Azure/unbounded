@@ -567,7 +567,8 @@ func TestOriginRejectsGetMetadataAndClosesBodies(t *testing.T) {
 			} else {
 				want := errInvalidS3Response
 				if mode == "etag" {
-					want = racersdk.ErrVersionMismatch
+					// The request is unpinned, so a changed GET ETag is an overwrite race.
+					want = racersdk.ErrUnavailable
 				}
 
 				if mode == "error-body" {
@@ -1063,6 +1064,136 @@ func TestOriginPinnedHeadAndRaceFailures(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOriginGetPinnedToHeadVersion(t *testing.T) {
+	for _, tt := range []struct {
+		name, requested, headVersion, wantGet string
+	}{
+		{"versioned-bucket-unpinned", "", "v-head", "v-head"},
+		{"unversioned-bucket", "", "", ""},
+		{"explicit-version", "v-req", "v-req", "v-req"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &originS3Stub{
+				head: func(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+					head := originHead(5)
+					if tt.headVersion != "" {
+						head.VersionId = aws.String(tt.headVersion)
+					}
+
+					return head, nil
+				},
+				get: func(_ context.Context, in *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+					if tt.wantGet == "" && in.VersionId != nil {
+						t.Errorf("GET sent version %q for an unversioned object", aws.ToString(in.VersionId))
+					}
+
+					if aws.ToString(in.VersionId) != tt.wantGet {
+						t.Errorf("GET version = %q, want %q", aws.ToString(in.VersionId), tt.wantGet)
+					}
+
+					out := originPage(io.NopCloser(strings.NewReader("hello")), 0, 4, 5)
+					if tt.headVersion != "" {
+						out.VersionId = aws.String(tt.headVersion)
+					}
+
+					return out, nil
+				},
+			}
+			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+
+			got, err := originReadValue(t, client, objectRequest(t, tt.requested))
+			if err != nil || string(got) != "hello" {
+				t.Fatalf("GET = %q, error = %v", got, err)
+			}
+		})
+	}
+}
+
+func TestOriginUnpinnedRaceIsUnavailable(t *testing.T) {
+	for _, mode := range []string{"get-precondition", "get-status-412", "missing-get", "changed-get-etag", "get-forbidden"} {
+		for _, pinned := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/pinned=%t", mode, pinned), func(t *testing.T) {
+				stub := &originS3Stub{
+					head: func(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+						return originHead(5), nil
+					},
+					get: func(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+						switch mode {
+						case "get-precondition":
+							return nil, &smithy.GenericAPIError{Code: "PreconditionFailed"}
+						case "get-status-412":
+							return nil, originStatusError{412}
+						case "missing-get":
+							return nil, &smithy.GenericAPIError{Code: "NoSuchKey"}
+						case "get-forbidden":
+							return nil, &smithy.GenericAPIError{Code: "AccessDenied"}
+						}
+
+						out := originPage(io.NopCloser(strings.NewReader("hello")), 0, 4, 5)
+						out.ETag = aws.String(`"new-version"`)
+
+						return out, nil
+					},
+				}
+				client := originClient(t, stub, OriginConfig{Namespace: "store"})
+
+				var options []racersdk.ReadOptions
+				if pinned {
+					options = append(options, racersdk.ReadOptions{ETag: `"opaque-multipart-2"`})
+				}
+
+				_, err := originReadValue(t, client, objectRequest(t, ""), options...)
+
+				want := racersdk.ErrUnavailable
+				if pinned {
+					want = racersdk.ErrVersionMismatch
+				}
+
+				if mode == "get-forbidden" {
+					want = racersdk.ErrForbidden
+				}
+
+				originAssertError(t, err, want)
+
+				if !pinned && errors.Is(err, racersdk.ErrVersionMismatch) {
+					t.Fatal("unpinned race reported a version mismatch", err)
+				}
+			})
+		}
+	}
+}
+
+func TestUnpinnedRace(t *testing.T) {
+	unpinned := racersdk.OriginRequest{}
+	pinned := racersdk.OriginRequest{ETag: `"tag"`}
+
+	if unpinnedRace(unpinned, nil) != nil || unpinnedRace(pinned, nil) != nil {
+		t.Fatal("nil error changed")
+	}
+
+	cause := &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "private"}
+	wrapped := classifyS3Error(cause, true)
+
+	err := unpinnedRace(unpinned, wrapped)
+	if !errors.Is(err, racersdk.ErrUnavailable) || errors.Is(err, racersdk.ErrVersionMismatch) || !errors.Is(err, cause) ||
+		strings.Contains(err.Error(), "private") {
+		t.Fatal("unpinned S3 race", err)
+	}
+
+	err = unpinnedRace(unpinned, racersdk.ErrVersionMismatch)
+	if !errors.Is(err, racersdk.ErrUnavailable) || errors.Is(err, racersdk.ErrVersionMismatch) {
+		t.Fatal("unpinned validation race", err)
+	}
+
+	if err := unpinnedRace(pinned, wrapped); err != wrapped {
+		t.Fatal("pinned mismatch changed", err)
+	}
+
+	if err := unpinnedRace(unpinned, errInvalidS3Response); err != errInvalidS3Response {
+		t.Fatal("unrelated error changed", err)
 	}
 }
 

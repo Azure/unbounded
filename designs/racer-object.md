@@ -73,16 +73,21 @@ The origin refuses delete markers and objects with a
 that header on.
 
 **Pages.** Racer asks for pages of 16 MiB. The origin sends a ranged GET with
-`If-Match` set to the ETag from the metadata. It then checks the reply: ETag,
+`If-Match` set to the ETag from the metadata. When the request names no
+version but HEAD returned a version id, the GET is pinned to that version id,
+so an overwrite with identical bytes cannot fail the version check. It then checks the reply: ETag,
 length, `Content-Range`, content type, version id, and encoding must all
 match. The body goes straight to the SDK, which fails the read if the body is
 short or too long.
 
 **Changed objects.** If the object changed between the HEAD and the GET, the
-ETag no longer matches and the origin returns `ErrVersionMismatch`. It checks
-this itself and does not rely on the store honoring `If-Match`. A pinned
-object that has since been deleted is also a version mismatch, not "not
-found".
+ETag no longer matches. If Racer pinned an ETag, the origin returns
+`ErrVersionMismatch`. If Racer did not pin one (a bootstrap read), the ETag
+came from the origin's own HEAD, so the origin returns `ErrUnavailable`
+instead: a retry sees the new version, and Racer never gets a 412 for an ETag
+it did not ask for. The origin checks this itself and does not rely on the
+store honoring `If-Match`. A pinned object that has since been deleted is also
+a version mismatch, not "not found".
 
 **Errors.** S3 error codes and HTTP status codes are mapped to `racersdk`
 errors (not found, forbidden, unauthorized, version mismatch, unavailable).

@@ -269,19 +269,47 @@ func (o *objectOrigin) readPage(ctx context.Context, request racersdk.OriginRequ
 	first := request.Offset
 	last := first + min(request.Length, metadata.Size-first) - 1
 
+	// Pin GET to the version HEAD saw, so an overwrite with identical bytes
+	// (same ETag, new version) between HEAD and GET cannot fail the version
+	// comparison in validateObjectPage. Unversioned buckets return no version
+	// ID from HEAD, so none is sent.
+	version := input.VersionId
+	if version == nil && aws.ToString(head.VersionId) != "" {
+		version = head.VersionId
+	}
+
 	get := &s3.GetObjectInput{
-		Bucket: input.Bucket, Key: input.Key, VersionId: input.VersionId,
+		Bucket: input.Bucket, Key: input.Key, VersionId: version,
 		IfMatch: aws.String(metadata.ETag), Range: aws.String(fmt.Sprintf("bytes=%d-%d", first, last)),
 	}
 
 	output, err := o.client.GetObject(ctx, get)
 	if err != nil {
-		return responseBody(output), classifyS3Error(err, true)
+		return responseBody(output), unpinnedRace(request, classifyS3Error(err, true))
 	}
 
 	// Transfer even a rejected body to the SDK, which closes it exactly once.
 	// Do not limit the reader: the SDK must detect short and excess bodies.
-	return responseBody(output), validateObjectPage(output, head, metadata, first, last)
+	return responseBody(output), unpinnedRace(request, validateObjectPage(output, head, metadata, first, last))
+}
+
+// unpinnedRace reports a HEAD/GET mismatch as retryable when Racer did not pin
+// an ETag. The ETag GET fails to match came from this origin's own HEAD, so
+// ErrVersionMismatch (412 to Racer) would name a version the caller never asked
+// for. The object changed underneath the read; a retry observes the new version.
+func unpinnedRace(request racersdk.OriginRequest, err error) error {
+	if request.ETag != "" || !errors.Is(err, racersdk.ErrVersionMismatch) {
+		return err
+	}
+
+	// Keep only the upstream cause: wrapping err itself would leave
+	// ErrVersionMismatch reachable through errors.Is.
+	var upstream privateS3Error
+	if errors.As(err, &upstream) {
+		return fmt.Errorf("%w: object changed during read: %w", racersdk.ErrUnavailable, upstream)
+	}
+
+	return fmt.Errorf("%w: object changed during read", racersdk.ErrUnavailable)
 }
 
 func (o *objectOrigin) headMetadata(head *s3.HeadObjectOutput, object Object) (racersdk.Metadata, error) {
