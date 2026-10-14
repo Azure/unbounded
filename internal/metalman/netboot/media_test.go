@@ -909,6 +909,37 @@ func TestMediaRejectPathAliasesAndArtifactDrift(t *testing.T) {
 	require.Equal(t, op.Status.Targets[0].BootMedia.Netboot.Image, o.machine.Spec.Netboot().Image)
 }
 
+func TestMediaRevokedLeaseClaimBlocksReassignedIP(t *testing.T) {
+	for _, released := range []bool{false, true} {
+		t.Run(fmt.Sprintf("released=%t", released), func(t *testing.T) {
+			p, _, op := mediaFixture(t, "amd64")
+			// A failed operation for another Machine still claims the IP. Its
+			// installer may be running, so its claim must not be ignored.
+			stale := &v1alpha3.MachineOperation{ObjectMeta: metav1.ObjectMeta{Name: "stale", UID: "stale-uid"}, Spec: v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace}, Status: v1alpha3.MachineOperationStatus{
+				Phase: v1alpha3.OperationPhaseFailed,
+				Targets: []v1alpha3.MachineOperationTargetStatus{{MachineRef: "old-host", Phase: v1alpha3.OperationPhaseFailed, BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+					ID: strings.Repeat("d", 32), Site: "site-a", MachineUID: "old-host-uid", Netboot: op.Status.Targets[0].BootMedia.Netboot.DeepCopy(), Phase: "Installing",
+					Cleaned: released, Released: released,
+				}}},
+			}}
+			require.NoError(t, p.Client.Create(t.Context(), stale))
+			require.NoError(t, p.Client.Status().Update(t.Context(), stale))
+
+			o, claimed, err := p.artifactOwner(t.Context(), "192.0.2.20")
+			require.True(t, claimed)
+
+			if released {
+				require.NoError(t, err)
+				require.Equal(t, op.Name, o.op.Name)
+
+				return
+			}
+
+			require.ErrorContains(t, err, "ambiguous media lease")
+		})
+	}
+}
+
 func TestMediaCallbackPersistenceFailure(t *testing.T) {
 	p, _, op := mediaFixture(t, "amd64")
 	p.Client = interceptor.NewClient(p.Client.(client.WithWatch), interceptor.Funcs{SubResourcePatch: func(context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption) error {

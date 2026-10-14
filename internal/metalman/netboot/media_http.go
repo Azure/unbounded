@@ -210,7 +210,7 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 	var found *mediaOwner
 
 	claimed := false
-	outstanding := false
+	outstanding := 0
 
 	for _, op := range ops.Items {
 		for _, target := range op.Status.Targets {
@@ -224,24 +224,26 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 				continue
 			}
 
-			outstanding = true
+			outstanding++
 
 			o, err := p.owner(ctx, target.BootMedia.ID)
 			if err == nil && validateMediaLease(o.status().Netboot) == nil {
-				if found != nil {
-					return nil, true, fmt.Errorf("ambiguous media lease")
-				}
-
 				found = o
 			}
 		}
+	}
+
+	// A revoked claim may still have a running installer, so any second
+	// unreleased claim on the same IP makes the request ambiguous.
+	if outstanding > 1 {
+		return nil, true, fmt.Errorf("ambiguous media lease")
 	}
 
 	if found != nil {
 		return found, true, nil
 	}
 
-	if claimed && !outstanding && p.nonMediaSuccessor(ctx, ip, ops.Items) {
+	if claimed && outstanding == 0 && p.nonMediaSuccessor(ctx, ip, ops.Items) {
 		return nil, false, nil
 	}
 
