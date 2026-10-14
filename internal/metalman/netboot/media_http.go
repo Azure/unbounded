@@ -44,7 +44,7 @@ func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOw
 			target := &op.Status.Targets[j]
 
 			b := target.BootMedia
-			if b == nil || b.Site != p.Site || b.Netboot == nil || len(b.Netboot.DHCPLeases) == 0 || b.Netboot.DHCPLeases[0].IPv4 != ip || !b.ImageWritten || b.RebootRequestedAt == nil || b.Abandoned {
+			if !mediaInSite(b, p.Site) || b.Netboot == nil || len(b.Netboot.DHCPLeases) == 0 || b.Netboot.DHCPLeases[0].IPv4 != ip || !b.ImageWritten || b.RebootRequestedAt == nil || b.Abandoned {
 				continue
 			}
 
@@ -97,7 +97,7 @@ func (p *MediaProvider) rejectFirstBootFallback(ctx context.Context, machine *v1
 
 		for _, target := range op.Status.Targets {
 			b := target.BootMedia
-			if b == nil {
+			if !mediaInSite(b, p.Site) {
 				continue
 			}
 
@@ -167,7 +167,7 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 
 	for _, op := range ops.Items {
 		for _, target := range op.Status.Targets {
-			if target.BootMedia == nil || target.BootMedia.Site != p.Site || target.BootMedia.Netboot == nil || len(target.BootMedia.Netboot.DHCPLeases) == 0 || target.BootMedia.Netboot.DHCPLeases[0].IPv4 != ip {
+			if !mediaInSite(target.BootMedia, p.Site) || target.BootMedia.Netboot == nil || len(target.BootMedia.Netboot.DHCPLeases) == 0 || target.BootMedia.Netboot.DHCPLeases[0].IPv4 != ip {
 				continue
 			}
 

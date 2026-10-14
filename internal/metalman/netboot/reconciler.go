@@ -114,7 +114,7 @@ func (r *OCIReconciler) mapOperationToImage(_ context.Context, obj client.Object
 
 	for _, target := range op.Status.Targets {
 		media := target.BootMedia
-		if media == nil || media.Netboot == nil || media.Site != r.Site || mediaArtifactsReleased(op, target) {
+		if !mediaInSite(media, r.Site) || media.Netboot == nil || mediaArtifactsReleased(op, target) {
 			continue
 		}
 

@@ -73,6 +73,10 @@ func (o *mediaOwner) status() *v1alpha3.MachineOperationBootMediaStatus {
 	return o.op.Status.Targets[o.index].BootMedia
 }
 
+func mediaInSite(media *v1alpha3.MachineOperationBootMediaStatus, site string) bool {
+	return media != nil && media.Site == site
+}
+
 // callbackOwner uses the frozen lease even after cleanup, failure, or Machine
 // deletion. A running installer must still be able to cross the reboot barrier.
 // Abandonment ends callback authorization when retention expires.
@@ -96,7 +100,7 @@ func (p *MediaProvider) callbackOwner(ctx context.Context, id string) (*mediaOwn
 
 		for j := range op.Status.Targets {
 			t := &op.Status.Targets[j]
-			if t.BootMedia == nil || t.BootMedia.Site != p.Site || t.BootMedia.ID != id {
+			if !mediaInSite(t.BootMedia, p.Site) || t.BootMedia.ID != id {
 				continue
 			}
 

@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,6 +14,86 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+func TestMediaSiteFirstBootFallback(t *testing.T) {
+	for _, protocol := range []string{v1alpha3.PXEBootProtocolPXE, v1alpha3.PXEBootProtocolHTTP} {
+		for _, sites := range []struct{ provider, media string }{
+			{provider: "site-a", media: "site-b"},
+			{provider: "site-a", media: ""},
+			{provider: "", media: "site-b"},
+			{provider: "site-a", media: "site-a"},
+			{provider: "", media: ""},
+		} {
+			for _, collision := range []string{"lease", "machine", "both"} {
+				for _, source := range []string{"direct", "forwarded"} {
+					t.Run(strings.Join([]string{protocol, sites.provider, sites.media, collision, source}, "/"), func(t *testing.T) {
+						h, m, op := firstBootFixture(t)
+						h.Media.Site = sites.provider
+						b := op.Status.Targets[0].BootMedia
+						b.Site = sites.media
+						b.RebootRequestedAt = nil
+						m.Labels["unbounded-cloud.io/site"] = sites.provider
+						m.Spec.Netboot().BootProtocol = protocol
+						m.Spec.Netboot().NetbootImage = b.Netboot.NetbootImage
+
+						m.Spec.Netboot().CloudInit = b.Netboot.CloudInit.DeepCopy()
+						if collision != "machine" {
+							m.Spec.Netboot().DHCPLeases[0].IPv4 = b.Netboot.DHCPLeases[0].IPv4
+						}
+
+						if collision == "lease" {
+							op.Status.Targets[0].MachineRef = "foreign-host"
+						}
+
+						require.NoError(t, h.Media.Client.Update(t.Context(), m))
+						require.NoError(t, h.Media.Client.Status().Update(t.Context(), op))
+						before := op.DeepCopy()
+						ip := m.Spec.Netboot().DHCPLeases[0].IPv4
+
+						remote, forwarded := ip, ""
+						if source == "forwarded" {
+							remote, forwarded = "192.0.2.30", ip
+						}
+
+						want := http.StatusOK
+						if sites.provider == sites.media {
+							want = http.StatusNotFound
+						}
+
+						for _, name := range []string{"meta-data", "vendor-data", "network-config", "user-data"} {
+							w := firstBootRequest(h, "/cloud-init/"+name, remote, "", forwarded)
+							require.Equal(t, want, w.Code, w.Body.String())
+
+							if want == http.StatusOK {
+								if name == "user-data" {
+									require.Equal(t, "#cloud-config\nhostname: frozen-host\n", w.Body.String())
+								} else {
+									require.Equal(t, m.Name+" "+ip+" 192.0.2.254", w.Body.String())
+								}
+							}
+						}
+
+						require.Equal(t, want, firstBootRequest(h, "/unbounded-agent/install-log", remote, "install output", forwarded).Code)
+						require.Equal(t, want, firstBootRequest(h, "/cloudinit/log", remote, `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`, forwarded).Code)
+						require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+						require.Equal(t, before.Status, op.Status)
+
+						recorder := h.StatusRecorder.(*recordingStatusRecorder)
+						if want == http.StatusOK {
+							require.Len(t, recorder.conditionEvents(), 1)
+							require.Equal(t, m.Name, recorder.conditionEvents()[0].machineName)
+							require.Equal(t, metav1.ConditionTrue, recorder.conditionEvents()[0].condition.Status)
+							require.Equal(t, []string{m.Name}, recorder.cloudInitDoneEvents())
+						} else {
+							require.Empty(t, recorder.conditionEvents())
+							require.Empty(t, recorder.cloudInitDoneEvents())
+						}
+					})
+				}
+			}
+		}
+	}
+}
 
 func TestMediaSiteLookups(t *testing.T) {
 	for _, providerSite := range []string{"site-a", ""} {
