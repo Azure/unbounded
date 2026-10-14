@@ -131,7 +131,8 @@ func (p *MediaProvider) nonMediaSuccessor(ctx context.Context, ip string, ops []
 }
 
 // ServeHTTP serves only operation-scoped control requests. Ordinary artifact
-// downloads stay on the existing HTTP root and use the host source-IP lookup.
+// downloads stay on the HTTP root, where frozen media lease claims take
+// precedence over the host source-IP lookup, including revoked claims.
 func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 

@@ -146,7 +146,7 @@ tar --create --file=/rootfs.tar --numeric-owner --xattrs \
   --exclude=./rootfs.tar --exclude=./proc --exclude=./sys --exclude=./dev \
   --exclude=./run --exclude=./tmp --exclude=./var/cache/tdnf \
   --exclude=./etc/resolv.conf --exclude=./etc/hostname --exclude=./etc/hosts \
-  --exclude=./.dockerenv \
+  --exclude=./.dockerenv --exclude=./usr/local/bin/build-rootfs \
   -C / .
 echo "$KVER" > /rootfs.kver
 }

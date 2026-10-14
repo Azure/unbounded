@@ -121,7 +121,11 @@ link_disk_ids() {
 }
 
 target_disk_exists() {
-    link_disk_ids
+    [ -e "$TARGET_DISK" ] && return 0
+    case "$TARGET_DISK" in
+        /dev/disk/by-id/*) link_disk_ids ;;
+        *) return 1 ;;
+    esac
     [ -e "$TARGET_DISK" ]
 }
 

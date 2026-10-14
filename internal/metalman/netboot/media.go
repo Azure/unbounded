@@ -153,7 +153,7 @@ func (p *MediaProvider) Prepare(ctx context.Context, machine *v1alpha3.Machine, 
 		return bootmedia.Source{}, err
 	}
 
-	if machine == nil || op == nil || machine.UID != o.machine.UID || op.UID != o.op.UID || op.Name != o.op.Name || o.status().Cleaned || o.status().ImageWritten {
+	if machine == nil || op == nil || machine.UID != o.machine.UID || op.UID != o.op.UID || op.Name != o.op.Name {
 		return bootmedia.Source{}, fmt.Errorf("media is not owned by this active install")
 	}
 
@@ -197,10 +197,6 @@ func (p *MediaProvider) OpenISO(ctx context.Context, name string) (*os.File, err
 	o, err := p.owner(ctx, id)
 	if err != nil {
 		return nil, err
-	}
-
-	if o.status().Cleaned || o.status().ImageWritten {
-		return nil, fmt.Errorf("media install authorization ended")
 	}
 
 	path, err := p.ensureISO(ctx, o)
@@ -291,8 +287,23 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 		return "", err
 	}
 
-	if meta.MediaFormat != mediaFormat || meta.MediaShim != shim || meta.MediaGRUB != grub {
+	if meta.MediaFormat != mediaFormat {
 		return "", fmt.Errorf("netboot image lacks compatible %s media artifacts", mediaFormat)
+	}
+
+	var efiPaths []string
+
+	for _, name := range []string{shim, grub} {
+		path, tmpl, err := p.Resolver.Cache.ResolvePathForArchitecture(spec.NetbootImage, arch, name)
+		if err != nil {
+			return "", err
+		}
+
+		if tmpl {
+			return "", fmt.Errorf("media EFI payload must not be a template")
+		}
+
+		efiPaths = append(efiPaths, path)
 	}
 	// Validate the live installer template and its static values before any
 	// BMC power action, but never copy the rendered install intent into the ISO.
@@ -300,7 +311,7 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 		return "", err
 	}
 
-	config, err := bootstrapConfig(spec, u, o.status().ID)
+	config, err := bootstrapConfig(spec.DHCPLeases[0], u, o.status().ID)
 	if err != nil {
 		return "", err
 	}
@@ -338,7 +349,7 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 	buildCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
-	if err := p.buildISO(buildCtx, stage, spec, boot, shim, grub, config); err != nil {
+	if err := p.buildISO(buildCtx, stage, boot, efiPaths[0], efiPaths[1], config); err != nil {
 		return "", err
 	}
 
@@ -353,16 +364,11 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 	return iso, nil
 }
 
-func bootstrapConfig(spec *v1alpha3.PXESpec, u *url.URL, id string) ([]byte, error) {
-	if err := validateMediaLease(spec); err != nil {
-		return nil, err
-	}
-
+// bootstrapConfig renders the lease already validated by ensureISO.
+func bootstrapConfig(l v1alpha3.DHCPLease, u *url.URL, id string) ([]byte, error) {
 	if !mediaIDPattern.MatchString(id) {
 		return nil, fmt.Errorf("invalid media ID")
 	}
-
-	l := spec.DHCPLeases[0]
 
 	prefix, err := subnetPrefix(l.SubnetMask)
 	if err != nil {
@@ -386,7 +392,13 @@ func bootstrapConfig(spec *v1alpha3.PXESpec, u *url.URL, id string) ([]byte, err
 	return []byte(b.String()), nil
 }
 
-func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3.PXESpec, boot, shim, grub string, config []byte) error {
+func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub string, config []byte) error {
+	dir, err := os.MkdirTemp(filepath.Dir(stage), ".iso-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir) //nolint:errcheck // Best-effort removal of build intermediates.
+
 	root := filepath.Join(dir, "root")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
@@ -421,17 +433,8 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 		return err
 	}
 
-	for _, item := range []struct{ from, to string }{{shim, boot}, {grub, grub}} {
-		src, tmpl, err := p.Resolver.Cache.ResolvePathForArchitecture(spec.NetbootImage, spec.TargetArchitecture(), item.from)
-		if err != nil {
-			return err
-		}
-
-		if tmpl {
-			return fmt.Errorf("media EFI payload must not be a template")
-		}
-
-		if err := run(ctx, "mcopy", "-i", fat, src, "::/EFI/BOOT/"+item.to); err != nil {
+	for _, item := range []struct{ from, to string }{{shim, boot}, {grub, filepath.Base(grub)}} {
+		if err := run(ctx, "mcopy", "-i", fat, item.from, "::/EFI/BOOT/"+item.to); err != nil {
 			return err
 		}
 	}
@@ -458,7 +461,7 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 
 	// Use the same FAT image for El Torito EFI boot and a GPT EFI System
 	// Partition, since some rack managers expose the image as a removable USB disk.
-	return run(ctx, "xorriso", "-as", "mkisofs", "-quiet", "-V", "UBMEDIA", "--modification-date=2020010100000000", "--set_all_file_dates", "2020010100000000", "-o", filepath.Join(dir, "bootstrap.iso"), "-append_partition", "2", "0xef", fat, "-appended_part_as_gpt", "-e", "--interval:appended_partition_2:all::", "-no-emul-boot", root)
+	return run(ctx, "xorriso", "-as", "mkisofs", "-quiet", "-V", "UBMEDIA", "--modification-date=2020010100000000", "--set_all_file_dates", "2020010100000000", "-o", filepath.Join(stage, "bootstrap.iso"), "-append_partition", "2", "0xef", fat, "-appended_part_as_gpt", "-e", "--interval:appended_partition_2:all::", "-no-emul-boot", root)
 }
 
 // normalizeMediaFAT removes wall-clock directory timestamps, without touching

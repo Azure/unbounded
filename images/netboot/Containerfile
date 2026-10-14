@@ -77,23 +77,11 @@ RUN chmod 755 /tmp/initrd-root/init && \
     cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
     KVER=$(ls /lib/modules | head -1) && \
     KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
-    mkdir -p "${KMOD}/kernel/drivers/net" \
-             "${KMOD}/kernel/drivers/scsi" \
-             "${KMOD}/kernel/drivers/ata" \
-             "${KMOD}/kernel/drivers/nvme" \
-             "${KMOD}/kernel/drivers/virtio" \
-             "${KMOD}/kernel/drivers/block" \
-             "${KMOD}/kernel/fs" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/net/." "${KMOD}/kernel/drivers/net/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." "${KMOD}/kernel/drivers/scsi/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/ata/." "${KMOD}/kernel/drivers/ata/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/nvme/." "${KMOD}/kernel/drivers/nvme/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." "${KMOD}/kernel/drivers/virtio/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/block/." "${KMOD}/kernel/drivers/block/" && \
-    cp -a "/lib/modules/${KVER}/kernel/fs/." "${KMOD}/kernel/fs/" && \
-    mkdir -p "${KMOD}/kernel/crypto" "${KMOD}/kernel/lib" && \
-    cp -a "/lib/modules/${KVER}/kernel/crypto/." "${KMOD}/kernel/crypto/" && \
-    cp -a "/lib/modules/${KVER}/kernel/lib/." "${KMOD}/kernel/lib/" && \
+    for dir in drivers/net drivers/scsi drivers/ata drivers/nvme \
+               drivers/virtio drivers/block fs crypto lib; do \
+        mkdir -p "${KMOD}/kernel/${dir}" && \
+        cp -a "/lib/modules/${KVER}/kernel/${dir}/." "${KMOD}/kernel/${dir}/" || exit 1; \
+    done && \
     (cd "${KMOD}" && find kernel -name '*.ko*') > /tmp/initrd-modules && \
     awk -F': ' 'NR==FNR { want[$1] = 1; next } ($1 in want) { n = split($2, d, " "); for (i = 1; i <= n; i++) print d[i] }' \
         /tmp/initrd-modules "/lib/modules/${KVER}/modules.dep" | sort -u > /tmp/initrd-deps && \
@@ -115,10 +103,10 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
 	if [ "${TARGETARCH}" = "amd64" ]; then \
 		cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
 		cp /artifacts/shimx64.efi /disk/bootx64.efi && \
-		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" "mediaFormat: unbounded-uefi-v1" "mediaShim: shimx64.efi" "mediaGrub: grubx64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" "mediaFormat: unbounded-uefi-v1" > /disk/metadata.yaml; \
 	elif [ "${TARGETARCH}" = "arm64" ]; then \
 		cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" "mediaFormat: unbounded-uefi-v1" "mediaShim: shimaa64.efi" "mediaGrub: grubaa64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" "mediaFormat: unbounded-uefi-v1" > /disk/metadata.yaml; \
 	fi
 
 COPY images/netboot/assets/grub.cfg.tmpl /disk/grub/grub.cfg.tmpl

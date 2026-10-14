@@ -99,7 +99,7 @@ func mediaFixture(t *testing.T, arch string) (*MediaProvider, *v1alpha3.Machine,
 	require.NoError(t, err)
 	cache := NewOCICache(t.TempDir())
 	require.NoError(t, populateOCICacheForArchitecture(cache.CacheDir, strings.Repeat("a", 64), arch, map[string][]byte{
-		"metadata.yaml": []byte(fmt.Sprintf("mediaFormat: %s\nmediaShim: %s\nmediaGrub: %s\n", mediaFormat, shim, grub)),
+		"metadata.yaml": []byte("mediaFormat: " + mediaFormat + "\n"),
 		shim:            []byte("unchanged shim " + arch), grub: []byte("unchanged grub " + arch), "grub/grub.cfg.tmpl": tmpl,
 	}))
 	cache.SetDigestForArchitecture(ref, arch, "sha256:"+strings.Repeat("a", 64))
@@ -142,7 +142,19 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 
 			var calls []string
 
-			p.Run = mockMediaRunner(t, &calls)
+			var config []byte
+
+			run := mockMediaRunner(t, &calls)
+			p.Run = func(ctx context.Context, name string, args ...string) error {
+				if name == "mcopy" && args[len(args)-1] == "::/EFI/BOOT/grub.cfg" {
+					var err error
+
+					config, err = os.ReadFile(args[len(args)-2])
+					require.NoError(t, err)
+				}
+
+				return run(ctx, name, args...)
+			}
 			id := op.Status.Targets[0].BootMedia.ID
 			source, err := p.Prepare(t.Context(), machine, op, id)
 			require.NoError(t, err)
@@ -163,8 +175,15 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 			require.Contains(t, payload, "-append_partition 2 0xef ")
 			require.Contains(t, payload, "-appended_part_as_gpt -e --interval:appended_partition_2:all:: -no-emul-boot")
 
-			config, err := os.ReadFile(filepath.Join(p.CacheDir, "bootmedia", id, "grub.cfg"))
+			entries, err := os.ReadDir(filepath.Join(p.CacheDir, "bootmedia", id))
 			require.NoError(t, err)
+			require.Len(t, entries, 2)
+			require.Equal(t, "bootstrap.iso", entries[0].Name())
+			require.Equal(t, "identity", entries[1].Name())
+
+			builds, err := os.ReadDir(filepath.Join(p.CacheDir, "bootmedia"))
+			require.NoError(t, err)
+			require.Len(t, builds, 1, "build intermediates must be removed")
 
 			for _, wanted := range []string{"net_add_addr ubprobe efinet0 0.0.0.0", "net_add_addr ubprobe efinet63 0.0.0.0", "$net_ubprobe_mac", "02:11:22:33:44:55", "net_add_addr ubnet $ubnic 192.0.2.20", "net_del_route ubnet:local", "net_add_route ublocal 192.0.2.0/24 ubnet", "net_add_route ubdefault 0.0.0.0/0 gw 192.0.2.1", "configfile (http,192.0.2.2:8080)/bootmedia/" + id + "/grub.cfg"} {
 				require.Contains(t, string(config), wanted)
@@ -173,6 +192,9 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 			for _, forbidden := range []string{"dhcp", "unbounded.image_url", "password", "token", "chainloader"} {
 				require.NotContains(t, string(config), forbidden)
 			}
+
+			require.Contains(t, string(config), "for ubtry in 1 2 3 4 5 6 7 8 9 10; do")
+			require.Contains(t, string(config), "sleep 6\ndone\nhalt\n")
 
 			count := len(calls)
 			restarted := &MediaProvider{Resolver: p.Resolver, Client: p.Client, CacheDir: p.CacheDir, TFTPServer: p.TFTPServer, Run: p.Run}
@@ -573,13 +595,113 @@ func TestMediaIdentityAndOldImage(t *testing.T) {
 }
 
 func TestMediaNoInstallHalts(t *testing.T) {
-	tmpl, err := os.ReadFile("../../../images/netboot/assets/grub.cfg.tmpl")
+	p, _, op := mediaFixture(t, "amd64")
+	id := op.Status.Targets[0].BootMedia.ID
+	w := mediaRequest(p, id, http.MethodGet, "grub.cfg", "192.0.2.20")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "halt\n", w.Body.String())
+}
+
+func TestMediaRenderingRequestsInstall(t *testing.T) {
+	p, _, op := mediaFixture(t, "amd64")
+	require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("a", 64), map[string][]byte{
+		"grub/grub.cfg.tmpl": []byte("{{ .VirtualMedia }} {{ .InstallRequested }}"),
+	}))
+	o, err := p.owner(t.Context(), op.Status.Targets[0].BootMedia.ID)
 	require.NoError(t, err)
-	data, err := renderTemplate(string(tmpl), templateData{VirtualMedia: true})
+	data, err := p.installerConfig(o)
 	require.NoError(t, err)
-	require.Contains(t, string(data), "halt")
-	require.NotContains(t, string(data), "chainloader")
-	require.NotContains(t, string(data), "linux")
+	require.Equal(t, "true true", string(data))
+}
+
+func TestMediaEFIArtifacts(t *testing.T) {
+	for _, arch := range []string{"amd64", "arm64"} {
+		for _, state := range []string{"legacy metadata", "missing shim", "missing grub", "template shim", "template grub"} {
+			t.Run(arch+"/"+state, func(t *testing.T) {
+				p, m, op := mediaFixture(t, arch)
+				dir := p.Resolver.Cache.DiskDirForArchitecture("sha256:"+strings.Repeat("a", 64), arch)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "metadata.yaml"), []byte("mediaFormat: "+mediaFormat+"\nmediaShim: ignored\nmediaGrub: ignored\n"), 0o600))
+
+				var calls []string
+
+				p.Run = mockMediaRunner(t, &calls)
+				id := op.Status.Targets[0].BootMedia.ID
+				_, err := p.Prepare(t.Context(), m, op, id)
+				require.NoError(t, err, "legacy metadata fields must remain accepted")
+
+				count := len(calls)
+
+				if state == "legacy metadata" {
+					return
+				}
+
+				suffix := "x64.efi"
+				if arch == "arm64" {
+					suffix = "aa64.efi"
+				}
+
+				_, payload, _ := strings.Cut(state, " ")
+				path := filepath.Join(dir, payload+suffix)
+				require.NoError(t, os.Remove(path))
+
+				if strings.HasPrefix(state, "template") {
+					require.NoError(t, os.WriteFile(path+".tmpl", []byte("not an EFI binary"), 0o600))
+				}
+
+				_, err = p.Prepare(t.Context(), m, op, id)
+				require.Error(t, err, "validate EFI files even when the ISO is cached")
+				require.Len(t, calls, count)
+			})
+		}
+	}
+}
+
+func TestInstallerTargetDiskExists(t *testing.T) {
+	content, err := os.ReadFile("../../../images/netboot/assets/init")
+	require.NoError(t, err)
+
+	_, function, found := strings.Cut(string(content), "target_disk_exists() {")
+	require.True(t, found)
+	function, _, found = strings.Cut(function, "\n}\n")
+	require.True(t, found)
+	dir := t.TempDir()
+	function = strings.ReplaceAll(function, "/dev/disk/by-id/", dir+"/by-id/")
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "by-id"), 0o700))
+
+	script := "set -eu\ntarget_disk_exists() {" + function + "\n}\n" + `
+calls=0
+link_disk_ids() {
+    calls=$((calls + 1))
+    [ "$create" = no ] || : > "$TARGET_DISK"
+}
+TARGET_DISK=/dev/null
+target_disk_exists
+[ "$calls" -eq 0 ]
+TARGET_DISK="$1/missing"
+if target_disk_exists; then exit 1; fi
+[ "$calls" -eq 0 ]
+TARGET_DISK="$1/by-id/disk"
+create=no
+if target_disk_exists; then exit 1; fi
+[ "$calls" -eq 1 ]
+create=yes
+target_disk_exists
+[ "$calls" -eq 2 ]
+target_disk_exists
+[ "$calls" -eq 2 ]
+`
+	require.NoError(t, runMediaCommand(t.Context(), "sh", "-c", script, "target-disk-test", dir))
+}
+
+func TestNetbootContainerfileShellSyntax(t *testing.T) {
+	content, err := os.ReadFile("../../../images/netboot/Containerfile")
+	require.NoError(t, err)
+
+	for _, line := range strings.Split(strings.ReplaceAll(string(content), "\\\n", ""), "\n") {
+		if script, ok := strings.CutPrefix(line, "RUN "); ok {
+			require.NoError(t, runMediaCommand(t.Context(), "sh", "-n", "-c", script))
+		}
+	}
 }
 
 func TestMediaRealToolsOptional(t *testing.T) {
@@ -613,15 +735,14 @@ func TestMediaRealToolsOptional(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, sha256.Sum256(first), sha256.Sum256(second), "regeneration must preserve ISO bytes")
 
-	fatPath := filepath.Join(p.CacheDir, "bootmedia", id, "efi.img")
-	fat, err := os.ReadFile(fatPath)
-	require.NoError(t, err)
-	require.Len(t, fat, 8<<20)
-	assertHybridEFI(t, second, fat)
+	fat := assertHybridEFI(t, second)
+	fatPath := filepath.Join(t.TempDir(), "efi.img")
+	require.NoError(t, os.WriteFile(fatPath, fat, 0o600))
 	// Inspect the FAT payload, not only command arguments.
-	for _, name := range []string{"BOOTX64.EFI", "grubx64.efi", "grub.cfg"} {
+	for _, path := range []string{"/EFI/BOOT/BOOTX64.EFI", "/EFI/BOOT/grubx64.efi", "/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"} {
+		name := filepath.Base(path)
 		output := filepath.Join(t.TempDir(), name)
-		require.NoError(t, runMediaCommand(t.Context(), "mcopy", "-i", fatPath, "::/EFI/BOOT/"+name, output))
+		require.NoError(t, runMediaCommand(t.Context(), "mcopy", "-i", fatPath, "::"+path, output))
 		content, err := os.ReadFile(output)
 		require.NoError(t, err)
 
@@ -639,7 +760,7 @@ func TestMediaRealToolsOptional(t *testing.T) {
 	}
 }
 
-func assertHybridEFI(t *testing.T, iso, fat []byte) {
+func assertHybridEFI(t *testing.T, iso []byte) []byte {
 	t.Helper()
 
 	// GPT uses 512-byte sectors and stores the EFI System GUID in mixed endian.
@@ -656,7 +777,10 @@ func assertHybridEFI(t *testing.T, iso, fat []byte) {
 	end := (binary.LittleEndian.Uint64(partition[40:48]) + 1) * 512
 	require.Less(t, start, end)
 	require.LessOrEqual(t, end, uint64(len(iso)))
-	require.Equal(t, fat, iso[start:end], "GPT partition 2 must contain the FAT image")
+	fat := iso[start:end]
+	require.Len(t, fat, 8<<20, "GPT partition 2 must contain the 8 MiB FAT image")
+	require.Equal(t, "FAT16   ", string(fat[54:62]))
+	require.Equal(t, byte(1), fat[13], "FAT must use one sector per cluster")
 
 	// El Torito uses 2048-byte sectors. Its EFI entry must point to that same ESP.
 	bootRecord := iso[17*2048 : 18*2048]
@@ -670,4 +794,6 @@ func assertHybridEFI(t *testing.T, iso, fat []byte) {
 	require.Equal(t, byte(0x88), catalog[32], "El Torito entry must be bootable")
 	require.Equal(t, byte(0), catalog[33], "El Torito must use no emulation")
 	require.Equal(t, start, uint64(binary.LittleEndian.Uint32(catalog[40:44]))*2048)
+
+	return fat
 }

@@ -1,8 +1,4 @@
 {{ if not .InstallRequested }}
-{{ if .VirtualMedia }}
-# Never chainload this ISO again when install authorization has ended.
-halt
-{{ else }}
 # No pending repave. Chainload the locally installed bootloader.
 insmod part_gpt
 insmod fat
@@ -26,9 +22,7 @@ if search --no-floppy --set=root --file /EFI/ubuntu/shimaa64.efi; then
   boot
 fi
 {{ end }}
-{{ end }}
 
-{{ if or .InstallRequested (not .VirtualMedia) }}
 set default=0
 set timeout=0
 
@@ -60,4 +54,3 @@ menuentry "Unbounded Metal Install" {
     ---
   initrd {{ .ArtifactRoot }}/initrd {{ .ArtifactRoot }}/init.cpio
 }
-{{ end }}
