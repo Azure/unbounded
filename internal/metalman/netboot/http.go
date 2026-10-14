@@ -95,8 +95,8 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	return nil
 }
 
-// normalizePath collapses redundant slashes in the request path before the
-// ServeMux routes it. When shim is HTTP-booted from the web root it requests
+// normalizePath canonicalizes paths before routing, authorization, and file
+// resolution. When shim is HTTP-booted from the web root it requests
 // its second stage as "//grubx64.efi": it appends its absolute-path loader name
 // to its boot URL's directory. Go's ServeMux would answer that with a 307
 // redirect, which shim refuses to follow (it treats the 3xx as EFI_HTTP_ERROR
@@ -104,36 +104,30 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 // file directly with a 200.
 func normalizePath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cleaned := cleanRequestPath(r.URL.Path)
+
 		// Capabilities must not gain aliases through path normalization.
-		if strings.Contains(r.URL.Path, "bootmedia") && (r.URL.RawPath != "" || cleanRequestPath(r.URL.Path) != r.URL.Path) {
+		if strings.Contains(r.URL.Path, "bootmedia") && (r.URL.RawPath != "" || cleaned != r.URL.Path) {
 			http.NotFound(w, r)
 			return
 		}
 
-		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
-			r.URL.Path = cleaned
-			r.URL.RawPath = ""
-		}
+		// ServeMux must route the same decoded path that the handlers check.
+		r.URL.Path = cleaned
+		r.URL.RawPath = ""
 
 		next.ServeHTTP(w, r)
 	})
 }
 
-// cleanRequestPath normalizes a URL path the same way path.Clean does, so the
-// middleware can collapse unclean paths (e.g. "//grubx64.efi") that the
-// ServeMux would otherwise redirect. A trailing slash is preserved to mirror
-// ServeMux behavior.
+// cleanRequestPath removes duplicate slashes, dot segments, and trailing
+// slashes so authorization checks match the cache resolver's path cleaning.
 func cleanRequestPath(p string) string {
 	if p == "" {
 		return "/"
 	}
 
-	cleaned := path.Clean(p)
-	if cleaned != "/" && strings.HasSuffix(p, "/") {
-		cleaned += "/"
-	}
-
-	return cleaned
+	return path.Clean(p)
 }
 
 func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {

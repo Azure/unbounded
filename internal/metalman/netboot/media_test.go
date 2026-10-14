@@ -77,14 +77,13 @@ func firstBootRequest(h *HTTPServer, path, ip, body string, forwarded ...string)
 
 	w := httptest.NewRecorder()
 
-	switch path {
-	case "/cloudinit/log":
-		h.handleCloudInitLog(w, r)
-	case "/unbounded-agent/install-log":
-		h.handleInstallLog(w, r)
-	default:
-		h.handleFile(w, r)
-	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", h.handleCloudInitLog)
+	mux.HandleFunc("POST /unbounded-agent/install-log", h.handleInstallLog)
+	mux.HandleFunc("GET /pxe/disable", h.handleDisablePXE)
+	mux.HandleFunc("POST /pxe/disable", h.handleDisablePXE)
+	mux.HandleFunc("GET /", h.handleFile)
+	normalizePath(mux).ServeHTTP(w, r)
 
 	return w
 }
@@ -275,6 +274,96 @@ func TestMediaFirstBootIgnoresForwardedLease(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 	require.Empty(t, o.op.Status.Targets[o.index].Conditions)
+}
+
+func TestMediaPathAliasesAuthorization(t *testing.T) {
+	for _, scenario := range []string{"direct owner", "forged IP", "changed protocol", "changed protocol forged IP"} {
+		t.Run(scenario, func(t *testing.T) {
+			h, m, op := firstBootFixture(t)
+			b := op.Status.Targets[0].BootMedia
+			m.Spec.Netboot().NetbootImage = b.Netboot.NetbootImage
+			m.Spec.Netboot().CloudInit = b.Netboot.CloudInit.DeepCopy()
+
+			m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.20"
+			if strings.HasPrefix(scenario, "changed protocol") {
+				m.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolPXE
+			}
+
+			require.NoError(t, h.Media.Client.Update(t.Context(), m))
+			require.NoError(t, populateOCICache(h.Media.CacheDir, strings.Repeat("a", 64), map[string][]byte{
+				"grub/grub.cfg.tmpl": []byte("unscoped install configuration"),
+				"vmlinuz.tmpl":       []byte("unscoped kernel"),
+			}))
+
+			remote, forwarded := "192.0.2.20", ""
+
+			forged := strings.Contains(scenario, "forged")
+			if forged {
+				remote, forwarded = "192.0.2.30", "192.0.2.20"
+			}
+
+			for _, endpoint := range []struct{ path, body string }{
+				{path: "/grub/grub.cfg"},
+				{path: "/vmlinuz"},
+				{path: "/cloud-init/meta-data"},
+				{path: "/cloud-init/user-data"},
+				{path: "/cloud-init/vendor-data"},
+				{path: "/cloud-init/network-config"},
+				{path: "/cloudinit/log", body: `{"name":"init-local","event_type":"start"}`},
+				{path: "/unbounded-agent/install-log", body: "install output"},
+				{path: "/pxe/disable"},
+				{path: "/pxe/disable", body: "disable"},
+			} {
+				firstBoot := strings.HasPrefix(endpoint.path, "/cloud") || endpoint.path == "/unbounded-agent/install-log"
+				// These combinations use legacy PXE authorization even on the canonical path.
+				if !firstBoot && (scenario == "changed protocol forged IP" || (endpoint.path == "/pxe/disable" && scenario == "changed protocol")) {
+					continue
+				}
+
+				want := http.StatusNotFound
+				if firstBoot && !forged {
+					want = http.StatusOK
+				}
+
+				for _, alias := range requestPathAliases(endpoint.path) {
+					t.Run(alias+"/"+endpoint.body, func(t *testing.T) {
+						w := firstBootRequest(h, alias, remote, endpoint.body, forwarded)
+						require.Equal(t, want, w.Code, w.Body.String())
+
+						if want == http.StatusOK && strings.HasPrefix(endpoint.path, "/cloud-init/") {
+							if endpoint.path == "/cloud-init/user-data" {
+								require.Equal(t, "#cloud-config\nhostname: frozen-host\n", w.Body.String())
+							} else {
+								require.Equal(t, "host 192.0.2.20 192.0.2.1", w.Body.String())
+							}
+						}
+
+						if forged {
+							require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+							require.Empty(t, op.Status.Targets[0].Conditions)
+						}
+					})
+				}
+			}
+
+			require.Empty(t, h.StatusRecorder.(*recordingStatusRecorder).conditionEvents())
+		})
+	}
+}
+
+func requestPathAliases(path string) []string {
+	return []string{
+		path,
+		path + "/",
+		path + "//",
+		strings.ReplaceAll(path, "/", "//"),
+		"/./" + strings.TrimPrefix(path, "/"),
+		"/unused/.." + path,
+		path + "/.",
+		path + "/child/..",
+		strings.ReplaceAll(path, "/", "/%2e/"),
+		"/" + strings.ReplaceAll(strings.TrimPrefix(path, "/"), "/", "%2f"),
+	}
 }
 
 func TestFirstBootForwardedAuthorization(t *testing.T) {
@@ -721,7 +810,7 @@ func TestMediaRejectPathAliasesAndArtifactDrift(t *testing.T) {
 	p, m, op := mediaFixture(t, "amd64")
 
 	id := op.Status.Targets[0].BootMedia.ID
-	for _, path := range []string{"/bootmedia/" + id + "/../grub.cfg", "/bootmedia//" + id + "/grub.cfg", "/bootmedia/%63" + id[1:] + "/grub.cfg"} {
+	for _, path := range []string{"/bootmedia/" + id + "/../grub.cfg", "/bootmedia//" + id + "/grub.cfg", "/bootmedia/%63" + id[1:] + "/grub.cfg", "/bootmedia/" + id + "/grub.cfg/"} {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
 		r.RemoteAddr = "192.0.2.20:4321"
 		w := httptest.NewRecorder()
@@ -940,15 +1029,20 @@ func TestMediaKernelHTTPRange(t *testing.T) {
 	p, _, _ := mediaFixture(t, "arm64")
 	require.NoError(t, populateOCICacheForArchitecture(p.CacheDir, strings.Repeat("a", 64), "arm64", map[string][]byte{"vmlinuz": []byte("gzip kernel payload")}))
 	h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
-	r := httptest.NewRequest(http.MethodGet, "/vmlinuz", nil)
-	r.RemoteAddr = "192.0.2.20:4321"
-	r.Header.Set("Range", "bytes=5-10")
 
-	w := httptest.NewRecorder()
-	h.handleFile(w, r)
-	require.Equal(t, http.StatusPartialContent, w.Code)
-	require.Equal(t, "bytes 5-10/19", w.Header().Get("Content-Range"))
-	require.Equal(t, "kernel", w.Body.String())
+	for _, alias := range requestPathAliases("/vmlinuz") {
+		t.Run(alias, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, alias, nil)
+			r.RemoteAddr = "192.0.2.20:4321"
+			r.Header.Set("Range", "bytes=5-10")
+
+			w := httptest.NewRecorder()
+			normalizePath(http.HandlerFunc(h.handleFile)).ServeHTTP(w, r)
+			require.Equal(t, http.StatusPartialContent, w.Code)
+			require.Equal(t, "bytes 5-10/19", w.Header().Get("Content-Range"))
+			require.Equal(t, "kernel", w.Body.String())
+		})
+	}
 }
 
 func TestMediaIdentityAndOldImage(t *testing.T) {

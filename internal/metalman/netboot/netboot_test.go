@@ -3975,8 +3975,13 @@ func TestCleanRequestPath(t *testing.T) {
 		{"/bootx64.efi", "/bootx64.efi"},
 		{"//grubx64.efi", "/grubx64.efi"},
 		{"/a//b", "/a/b"},
-		{"/dir/", "/dir/"},
-		{"/dir//", "/dir/"},
+		{"/dir/", "/dir"},
+		{"/dir//", "/dir"},
+		{"/grub/./grub.cfg/", "/grub/grub.cfg"},
+		{"/unused/../vmlinuz//", "/vmlinuz"},
+		{"//cloud-init//vendor-data/", "/cloud-init/vendor-data"},
+		{"/cloud-init/vendor-data/child/..", "/cloud-init/vendor-data"},
+		{"/../../", "/"},
 	}
 
 	for _, tc := range cases {
