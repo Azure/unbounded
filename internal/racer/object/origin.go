@@ -541,7 +541,9 @@ func s3Error(err error) error {
 
 func s3APIError(code string) error {
 	switch code {
-	case "NoSuchKey", "NoSuchBucket", "NoSuchVersion", "NotFound":
+	// S3 answers a GET or HEAD of a delete marker's version ID with
+	// MethodNotAllowed (405), so a delete marker reads as not found.
+	case "NoSuchKey", "NoSuchBucket", "NoSuchVersion", "NotFound", "MethodNotAllowed":
 		return racersdk.ErrNotFound
 	case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken", "InvalidToken", "TokenRefreshRequired":
 		return racersdk.ErrForbidden
@@ -560,7 +562,8 @@ func s3HTTPError(code int) error {
 		return racersdk.ErrUnauthorized
 	case code == 403:
 		return racersdk.ErrForbidden
-	case code == 404:
+	case code == 404 || code == 405:
+		// 405 is S3's answer for a delete marker requested by version ID.
 		return racersdk.ErrNotFound
 	case code == 412:
 		return racersdk.ErrVersionMismatch

@@ -68,7 +68,11 @@ from cache; the TTL is not just an admission hint. Zero expires metadata
 immediately. Supported content types are normalized for the SDK metadata
 format; missing or unsupported values become `application/octet-stream`.
 The raw HEAD and GET content types must still match.
-The origin refuses delete markers and objects with a
+Delete markers are reported as not found. S3 itself answers a delete marker
+with an error: 404 when it is the current version, and 405
+`MethodNotAllowed` when its version id is requested explicitly; the origin
+maps both to not found. A successful reply flagged as a delete marker is
+refused as an invalid response. The origin also refuses objects with a
 `Content-Encoding` other than identity, because the SDK has no way to pass
 that header on.
 

@@ -608,6 +608,7 @@ func TestOriginErrorClassification(t *testing.T) {
 		{&smithy.GenericAPIError{Code: "NoSuchVersion"}, racersdk.ErrNotFound},
 		{&smithy.GenericAPIError{Code: "NoSuchBucket"}, racersdk.ErrNotFound},
 		{&smithy.GenericAPIError{Code: "NotFound"}, racersdk.ErrNotFound},
+		{&smithy.GenericAPIError{Code: "MethodNotAllowed"}, racersdk.ErrNotFound},
 		{&smithy.GenericAPIError{Code: "AccessDenied"}, racersdk.ErrForbidden},
 		{&smithy.GenericAPIError{Code: "InvalidAccessKeyId"}, racersdk.ErrForbidden},
 		{&smithy.GenericAPIError{Code: "SignatureDoesNotMatch"}, racersdk.ErrForbidden},
@@ -625,6 +626,8 @@ func TestOriginErrorClassification(t *testing.T) {
 		{originStatusError{401}, racersdk.ErrUnauthorized},
 		{originStatusError{403}, racersdk.ErrForbidden},
 		{originStatusError{404}, racersdk.ErrNotFound},
+		{originStatusError{405}, racersdk.ErrNotFound},
+		{originStatusError{406}, errInvalidS3Response},
 		{originStatusError{412}, racersdk.ErrVersionMismatch},
 		{originStatusError{416}, errInvalidS3Response},
 		{originStatusError{408}, racersdk.ErrUnavailable},
@@ -1197,12 +1200,64 @@ func TestUnpinnedRace(t *testing.T) {
 	}
 }
 
+// TestOriginAWSClientDeleteMarker drives the real AWS client against S3's
+// delete-marker replies: HEAD has no body, so only the 405 status classifies
+// it, while GET carries a MethodNotAllowed error code.
+func TestOriginAWSClientDeleteMarker(t *testing.T) {
+	var gets atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("versionId") != "marker" {
+			t.Errorf("request version = %q", r.URL.Query().Get("versionId"))
+		}
+
+		w.Header().Set("x-amz-delete-marker", "true")
+		w.Header().Set("x-amz-version-id", "marker")
+
+		if r.Method == http.MethodGet {
+			gets.Add(1)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, `<Error><Code>MethodNotAllowed</Code><Message>private</Message></Error>`)
+
+			return
+		}
+
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	t.Cleanup(server.Close)
+
+	origin, err := NewOrigin(testS3Client(t, server), OriginConfig{Namespace: "store"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := objectRequest(t, "marker")
+
+	client := testSDKClient(t, origin)
+
+	_, err = client.Stat(t.Context(), request)
+	originAssertError(t, err, racersdk.ErrNotFound)
+
+	// GET error bodies are classified by code; drive GetObject directly since
+	// the origin stops after the failed HEAD.
+	_, err = testS3Client(t, server).GetObject(t.Context(), &s3.GetObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("key"), VersionId: aws.String("marker"),
+	})
+	originAssertError(t, classifyS3Error(err, false), racersdk.ErrNotFound)
+
+	if gets.Load() != 1 {
+		t.Fatal("GET count", gets.Load())
+	}
+}
+
 func TestOriginUpstreamErrorsBridge(t *testing.T) {
 	for _, tt := range []struct {
 		code string
 		want error
 	}{
 		{"NoSuchKey", racersdk.ErrNotFound},
+		{"MethodNotAllowed", racersdk.ErrNotFound},
 		{"AccessDenied", racersdk.ErrForbidden},
 		{"SlowDown", racersdk.ErrUnavailable},
 		{"InvalidRange", errInvalidS3Response},
