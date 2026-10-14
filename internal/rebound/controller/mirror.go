@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +27,12 @@ type nodeMirror struct {
 	reader    client.Reader
 	namespace string
 	clock     clock.Clock
+
+	// One ledger update enqueues every granted node, so parse it once per
+	// version instead of once per node.
+	ledgerMu      sync.Mutex
+	ledgerVersion string
+	cachedLedger  *ledger.Ledger
 }
 
 func (r *nodeMirror) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -39,14 +46,9 @@ func (r *nodeMirror) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	l := ledger.Parse(cm.Data)
-
-	var grant *ledger.Grant
-	if key, ok := l.NodeGrant(node.Name); ok {
-		grant, _ = l.Get(key)
-		if grant.Expired(r.clock.Now()) {
-			grant = nil
-		}
+	grant := r.nodeGrant(&cm, node.Name)
+	if grant != nil && grant.Expired(r.clock.Now()) {
+		grant = nil
 	}
 
 	before := node.DeepCopy()
@@ -63,6 +65,27 @@ func (r *nodeMirror) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// nodeGrant returns the read-only grant holding node, parsing the ledger only
+// when its resourceVersion changes.
+func (r *nodeMirror) nodeGrant(cm *corev1.ConfigMap, node string) *ledger.Grant {
+	r.ledgerMu.Lock()
+	defer r.ledgerMu.Unlock()
+
+	if r.cachedLedger == nil || r.ledgerVersion != cm.ResourceVersion {
+		r.cachedLedger = ledger.Parse(cm.Data)
+		r.ledgerVersion = cm.ResourceVersion
+	}
+
+	key, ok := r.cachedLedger.NodeGrant(node)
+	if !ok {
+		return nil
+	}
+
+	g, _ := r.cachedLedger.Get(key)
+
+	return g
 }
 
 func mirrorGrant(node *corev1.Node, grant *ledger.Grant) {

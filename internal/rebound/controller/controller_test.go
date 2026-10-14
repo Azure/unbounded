@@ -486,3 +486,27 @@ func TestMirrorLedgerHandlerEnqueuesRemovedNodes(t *testing.T) {
 	h.Generic(t.Context(), event.GenericEvent{Object: newCM}, q)
 	require.ElementsMatch(t, []string{"kept", "added"}, drain(q))
 }
+
+func TestMirrorParsesLedgerOncePerVersion(t *testing.T) {
+	r := &nodeMirror{namespace: "system"}
+	cm := configMap(t, grant("tenant", "g", "a", time.Minute))
+
+	g := r.nodeGrant(cm, "a")
+	require.NotNil(t, g)
+	require.Equal(t, "g", g.Name)
+
+	cached := r.cachedLedger
+	require.Nil(t, r.nodeGrant(cm, "b"))
+	require.Same(t, cached, r.cachedLedger)
+
+	// Same resourceVersion: the cached parse is reused even if the data differs.
+	cm.Data = configMap(t, grant("tenant", "other", "b", time.Minute)).Data
+	require.Equal(t, "g", r.nodeGrant(cm, "a").Name)
+	require.Same(t, cached, r.cachedLedger)
+
+	// New resourceVersion: the ledger is parsed again.
+	cm.ResourceVersion = "8"
+	require.Nil(t, r.nodeGrant(cm, "a"))
+	require.Equal(t, "other", r.nodeGrant(cm, "b").Name)
+	require.NotSame(t, cached, r.cachedLedger)
+}
