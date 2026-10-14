@@ -4,7 +4,7 @@
 package v1alpha1
 
 //go:generate go tool controller-gen object:headerFile=../../../hack/boilerplate.go.txt paths=.
-//go:generate go tool openapi-gen --output-file zz_generated.openapi.go --output-dir . --output-pkg github.com/Azure/unbounded/api/rebound/v1alpha1 --go-header-file ../../../hack/boilerplate.go.txt --report-filename /dev/null k8s.io/apimachinery/pkg/apis/meta/v1 k8s.io/apimachinery/pkg/runtime k8s.io/apimachinery/pkg/version github.com/Azure/unbounded/api/rebound/v1alpha1
+//go:generate go tool openapi-gen --output-file zz_generated.openapi.go --output-model-name-file zz_generated.model_name.go --readonly-pkg k8s.io/apimachinery/pkg/apis/meta/v1 --readonly-pkg k8s.io/apimachinery/pkg/runtime --readonly-pkg k8s.io/apimachinery/pkg/version --output-dir . --output-pkg github.com/Azure/unbounded/api/rebound/v1alpha1 --go-header-file ../../../hack/boilerplate.go.txt --report-filename /dev/null k8s.io/apimachinery/pkg/apis/meta/v1 k8s.io/apimachinery/pkg/runtime k8s.io/apimachinery/pkg/version github.com/Azure/unbounded/api/rebound/v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

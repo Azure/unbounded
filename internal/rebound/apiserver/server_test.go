@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"slices"
@@ -449,6 +450,30 @@ func TestServer(t *testing.T) {
 
 	requestHTTP(http.MethodGet, "/openapi/v2", "", nil, http.StatusOK)
 	requestHTTP(http.MethodGet, "/openapi/v3", "", nil, http.StatusOK)
+
+	// kubectl finds the schema for client-side validation by the
+	// x-kubernetes-group-version-kind extension. Without it, kubectl falls back
+	// to listing CRDs, which most grant users cannot do.
+	data = requestHTTP(http.MethodGet, "/openapi/v3/apis/"+rebound.SchemeGroupVersion.String(), "", nil, http.StatusOK)
+
+	var openAPI struct {
+		Components struct {
+			Schemas map[string]struct {
+				GVK []map[string]string `json:"x-kubernetes-group-version-kind"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(data, &openAPI); err != nil {
+		t.Fatal(err)
+	}
+
+	model := openAPI.Components.Schemas[rebound.NodeGrant{}.OpenAPIModelName()]
+
+	wantGVK := map[string]string{"group": rebound.GroupName, "version": rebound.SchemeGroupVersion.Version, "kind": rebound.Kind}
+	if len(model.GVK) != 1 || !maps.Equal(model.GVK[0], wantGVK) {
+		t.Fatalf("NodeGrant schema GVK: %+v", model.GVK)
+	}
+
 	requestHTTP(http.MethodGet, path+"?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan", "", nil, http.StatusBadRequest)
 	denied.Store(true)
 	requestHTTP(http.MethodGet, path, "", nil, http.StatusForbidden)

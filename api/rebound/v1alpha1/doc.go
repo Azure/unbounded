@@ -7,5 +7,6 @@
 //
 // +kubebuilder:object:generate=true
 // +k8s:openapi-gen=true
+// +k8s:openapi-model-package=io.unbounded-cloud.rebound.v1alpha1
 // +groupName=rebound.unbounded-cloud.io
 package v1alpha1

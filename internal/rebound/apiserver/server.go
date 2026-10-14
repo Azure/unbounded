@@ -139,9 +139,18 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	config.EffectiveVersion = compatibility.NewEffectiveVersionFromString("1.37.0", "", "")
 	config.EnableProfiling = false
-	config.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(rebound.GetOpenAPIDefinitions, openapi.NewDefinitionNamer(scheme))
+	// The namer tags each schema with its group, version, and kind, which kubectl
+	// needs for client-side validation. It gets a scheme without the internal
+	// version so the published schema lists only v1alpha1.
+	namerScheme := runtime.NewScheme()
+	if err := rebound.AddToScheme(namerScheme); err != nil {
+		return nil, err
+	}
 
-	config.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(rebound.GetOpenAPIDefinitions, openapi.NewDefinitionNamer(scheme))
+	namer := openapi.NewDefinitionNamer(namerScheme)
+	config.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(rebound.GetOpenAPIDefinitions, namer)
+
+	config.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(rebound.GetOpenAPIDefinitions, namer)
 	success := false
 
 	defer func() {
