@@ -85,12 +85,14 @@ type AdmissionSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.workflow == oldSelf.workflow",message="workflow is immutable"
 // +kubebuilder:validation:XValidation:rule="self.backend == oldSelf.backend",message="backend is immutable"
 // +kubebuilder:validation:XValidation:rule="self.runnerImage == oldSelf.runnerImage",message="runnerImage is immutable"
-// +kubebuilder:validation:XValidation:rule="self.parameters == oldSelf.parameters",message="parameters are immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.parameters) == has(oldSelf.parameters) && (!has(self.parameters) || self.parameters == oldSelf.parameters)",message="parameters are immutable"
 // +kubebuilder:validation:XValidation:rule="self.evidencePath == oldSelf.evidencePath",message="evidencePath is immutable"
 // +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
 // +kubebuilder:validation:XValidation:rule="self.maxAttempts == oldSelf.maxAttempts",message="maxAttempts is immutable"
-// +kubebuilder:validation:XValidation:rule="self.tolerations == oldSelf.tolerations",message="tolerations are immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.tolerations) == has(oldSelf.tolerations) && (!has(self.tolerations) || self.tolerations == oldSelf.tolerations)",message="tolerations are immutable"
 // +kubebuilder:validation:XValidation:rule="self.requestNodeName == oldSelf.requestNodeName",message="requestNodeName is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.purpose) == has(oldSelf.purpose) && (!has(self.purpose) || self.purpose == oldSelf.purpose)",message="purpose is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.stagePlan) == has(oldSelf.stagePlan) && (!has(self.stagePlan) || self.stagePlan == oldSelf.stagePlan)",message="stagePlan is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.participantPlan) == has(oldSelf.participantPlan) && (!has(self.participantPlan) || self.participantPlan == oldSelf.participantPlan)",message="participantPlan is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.testPlan) == has(oldSelf.testPlan) && (!has(self.testPlan) || self.testPlan == oldSelf.testPlan)",message="testPlan is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.admission) == has(oldSelf.admission) && (!has(self.admission) || self.admission == oldSelf.admission)",message="admission is immutable"
@@ -105,9 +107,7 @@ type CertificationRunSpec struct {
 	Backend         ExecutionBackend      `json:"backend"`
 	RunnerImage     string                `json:"runnerImage"`
 	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="purpose is immutable"
-	Purpose CertificationPurpose `json:"purpose,omitempty"`
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="stagePlan is immutable"
+	Purpose         CertificationPurpose `json:"purpose,omitempty"`
 	StagePlan       []CertificationStage `json:"stagePlan,omitempty"`
 	Parameters      map[string]string    `json:"parameters,omitempty"`
 	EvidencePath    string               `json:"evidencePath"`

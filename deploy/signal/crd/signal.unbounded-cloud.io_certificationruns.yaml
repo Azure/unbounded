@@ -329,9 +329,6 @@ spec:
                 - TargetedVerification
                 - Diagnostic
                 type: string
-                x-kubernetes-validations:
-                - message: purpose is immutable
-                  rule: self == oldSelf
               requestNodeName:
                 type: string
               runnerImage:
@@ -373,9 +370,6 @@ spec:
                   - required
                   type: object
                 type: array
-                x-kubernetes-validations:
-                - message: stagePlan is immutable
-                  rule: self == oldSelf
               testPlan:
                 items:
                   properties:
@@ -473,7 +467,8 @@ spec:
             - message: runnerImage is immutable
               rule: self.runnerImage == oldSelf.runnerImage
             - message: parameters are immutable
-              rule: self.parameters == oldSelf.parameters
+              rule: has(self.parameters) == has(oldSelf.parameters) && (!has(self.parameters)
+                || self.parameters == oldSelf.parameters)
             - message: evidencePath is immutable
               rule: self.evidencePath == oldSelf.evidencePath
             - message: deadline is immutable
@@ -481,9 +476,16 @@ spec:
             - message: maxAttempts is immutable
               rule: self.maxAttempts == oldSelf.maxAttempts
             - message: tolerations are immutable
-              rule: self.tolerations == oldSelf.tolerations
+              rule: has(self.tolerations) == has(oldSelf.tolerations) && (!has(self.tolerations)
+                || self.tolerations == oldSelf.tolerations)
             - message: requestNodeName is immutable
               rule: self.requestNodeName == oldSelf.requestNodeName
+            - message: purpose is immutable
+              rule: has(self.purpose) == has(oldSelf.purpose) && (!has(self.purpose)
+                || self.purpose == oldSelf.purpose)
+            - message: stagePlan is immutable
+              rule: has(self.stagePlan) == has(oldSelf.stagePlan) && (!has(self.stagePlan)
+                || self.stagePlan == oldSelf.stagePlan)
             - message: participantPlan is immutable
               rule: has(self.participantPlan) == has(oldSelf.participantPlan) && (!has(self.participantPlan)
                 || self.participantPlan == oldSelf.participantPlan)
