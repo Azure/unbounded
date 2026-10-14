@@ -237,6 +237,41 @@ boundary; it does not make every parser error an application XML error.
   to 5s without canceling them first. After that, it cancels remaining
   requests and closes their connections.
 
+## Diagnostics
+
+Logs go to stderr. They contain only fixed categories and validated fields,
+never upstream error text, URLs, keys, queries, or credentials.
+
+- Origin mode logs `event=request_failed category=<category>` per failed
+  origin request.
+- Sidecar mode logs `event=response_failed method=<GET|HEAD> status=<5xx>
+  category=<category> bucket=<bucket>` for each 5xx caused by the cache or
+  upstream. The bucket is logged because it is operator configuration and has
+  passed the allowlist. The key is not logged, because keys may carry tenant
+  or user data.
+- Categories that need a closer look:
+  - `tls`: a certificate or TLS failure. The request still fails as
+    `ErrUnavailable` (503), but this is usually a configuration error.
+  - `redirect`: an S3 3xx, usually a wrong region or addressing style.
+  - `status`: an S3 status with no Racer meaning, such as 400, 405, or 416.
+  - `validation`: an S3 response that failed HEAD or GET validation.
+  - `upstream`: an unclassified failure.
+  - `mismatch`: the sidecar saw a pinned read return different metadata.
+  - `redirect`, `status`, `validation`, and `upstream` all map to 502.
+    The categories exist only in origin logs. The sidecar sees the 502 that
+    Racer returns, which it logs as `upstream`.
+- Expected outcomes (`notfound`, `forbidden`, `unauthorized`, `canceled`,
+  `versionmismatch`, `invalid`, `range`) are logged only with
+  `--log-level=debug`.
+- Other lines are logged at `level=warn`. Each event and category can log 10
+  lines per minute. The first line after that minute adds `suppressed=<n>`.
+- The AWS SDK logger writes SDK warnings to stderr as `event=aws_sdk`. With
+  `--log-level=debug`, it also writes SDK debug lines and retry and deprecation
+  logs. Request, response, and signing logs are never enabled, because they
+  print the SigV4 `Authorization` header and bodies.
+
+`--log-level` accepts `info` (the default) or `debug` in both modes.
+
 ## Bucket allowlist
 
 `--bucket` may be repeated in both modes. If set, other buckets are refused:
