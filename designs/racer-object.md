@@ -155,24 +155,55 @@ reach it.
   headers still return 501, including owner checks, SSE-C, and requester-pays.
   Signing headers such as `x-amz-date` and `x-amz-content-sha256` are ignored.
 
-**Flow.**
+**Flow.** The sidecar parses the range first. Open and suffix ranges are
+supported and clamped to the size. The `bytes` unit is case-insensitive. As
+RFC 9110 section 14.2 allows and S3 does, a `Range` that cannot be used is
+ignored and the full object is served with 200. This covers unknown units,
+malformed values, multi-range sets, a last position before the first, and
+repeated `Range` headers. Only a valid single byte range that the object
+cannot satisfy returns 416: one that starts at or past the end, a zero-length
+suffix, or any byte range on an empty object. Conditions are checked before
+the range: `If-Match` (strong compare, 412), then `If-None-Match` (weak
+compare, 304).
+
+A GET with no byte range or an ignored one, an open range (`bytes=N-`), or a
+closed range (`bytes=N-M`) does not need the size up front, so it skips Stat:
+
+1. GET asks Racer for the range without an ETag pin.
+2. The conditions and the range are checked against the metadata that Racer
+   returns with the read. Racer serves every page of a read from that one
+   version, so the headers always describe the body. On a failed condition
+   the read is closed without sending any of the body.
+3. The SDK does not clamp a range that ends past the object, and fails with
+   `ErrRangeNotSatisfiable` instead. The sidecar then falls back to the Stat
+   flow below, which clamps the range or returns 416 with the size in
+   `Content-Range`.
+4. The body is written with `WriteTo`.
+
+HEAD, suffix ranges (`bytes=-N`), and that fallback need the size first:
 
 1. Stat the object in Racer.
-2. Check `If-Match` (strong compare, 412) and `If-None-Match` (weak compare,
-   304).
-3. Parse the range. Open and suffix ranges are supported and clamped to the
-   size. The `bytes` unit is case-insensitive. As RFC 9110 section 14.2
-   allows and S3 does, a `Range` that cannot be used is ignored and the full
-   object is served with 200. This covers unknown units, malformed values,
-   multi-range sets, a last position before the first, and repeated `Range`
-   headers. Only a valid single byte range that the object cannot satisfy
-   returns 416: one that starts at or past the end, a zero-length suffix, or
-   any byte range on an empty object.
-4. HEAD returns 200 with headers, even for a ranged HEAD. This matches S3.
-5. GET asks Racer for the range, pinned to the ETag from step 1. If the size
+2. Check the conditions and the range against the Stat metadata.
+3. HEAD returns 200 with headers, even for a ranged HEAD. This matches S3.
+4. GET asks Racer for the range, pinned to the ETag from step 1. If the size
    or content type changed, it returns 502. An internal pin failure returns
-   503, not 412: only a failed client `If-Match` condition returns 412.
-6. The body is written with `WriteTo`.
+   503, not 412: only a failed client `If-Match` condition returns 412. A
+   direct read is never pinned, so a GET without conditions never returns 412.
+5. The body is written with `WriteTo`.
+
+**Concurrency limits.** The listener accepts up to 128 connections. Behind it,
+SDK calls wait in fixed lanes, and a call fails at once with `ErrUnavailable`,
+which the sidecar returns as 503, when its lane's queue is full. Calls that
+do queue fail the same way if they wait too long.
+
+- GET reads use the SDK's bulk lane: 64 concurrent transfers
+  (`ClientConfig.MaxConnections`, left at its default) and a queue of 128.
+  That is more than the listener admits, so direct GETs, including parallel
+  ranged GETs from S3 transfer tools, are bounded by the listener.
+- Stat uses a separate lane with 4 connections and a queue of 16 that cannot
+  be configured. HEAD, suffix ranges, and closed ranges that end past the
+  object all Stat first, so about 20 of them in the Stat phase at once is the
+  ceiling: more get an immediate 503. Size HEAD-heavy clients for this.
 
 **Copying with splice.** For HTTP/1, `WriteTo` moves bytes from the Racer
 socket to the TCP socket with `splice()`, so the data does not pass through
