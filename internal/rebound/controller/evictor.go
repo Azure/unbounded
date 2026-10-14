@@ -158,6 +158,9 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		// The resourceVersion precondition makes the delete fail with a
 		// conflict if the pod changed since it was listed, for example by
 		// finishing. Conflicts are ignored and the next sweep looks again.
+		// Nothing ties this delete to the ledger version checked above, so a
+		// handoff that lands between the two calls can still delete a pod
+		// the new grant allows. The README lists this as a known limit.
 		err = r.client.Delete(ctx, pod, client.GracePeriodSeconds(0),
 			client.Preconditions{UID: &pod.UID, ResourceVersion: &pod.ResourceVersion})
 		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
