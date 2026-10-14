@@ -157,8 +157,8 @@ func TestBindingTargetKindCEL(t *testing.T) {
 					}
 
 					require.Equal(t, namespace == "team-a", policyAllows(t, policy, map[string]any{
-						"object": map[string]any{"metadata": map[string]any{}, "target": target.fields},
-						"params": ledger,
+						"object":  map[string]any{"metadata": map[string]any{}, "target": target.fields},
+						"params":  ledger,
 						"request": podRequest(namespace, resource, subresource),
 					}))
 				})
