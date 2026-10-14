@@ -17,7 +17,7 @@ import (
 func TestExampleScriptsAreConfigMapDataAndParseAsBash(t *testing.T) {
 	t.Parallel()
 
-	raw, err := os.ReadFile("03-scripts.yaml.tmpl")
+	raw, err := os.ReadFile("testdata/legacy/03-scripts.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,8 +36,8 @@ func TestExampleScriptsAreConfigMapDataAndParseAsBash(t *testing.T) {
 		t.Fatalf("parse script ConfigMap: %v", err)
 	}
 
-	if manifest.Kind != "ConfigMap" || len(manifest.Data) == 0 {
-		t.Fatalf("expected a ConfigMap containing example scripts, got %#v", manifest)
+	if manifest.Kind != "ConfigMap" || len(manifest.Data) != 3 {
+		t.Fatalf("expected a ConfigMap containing the three legacy scripts, got %#v", manifest)
 	}
 
 	for name, script := range manifest.Data {
@@ -322,7 +322,7 @@ done
 func certificationScript(t *testing.T, name string) string {
 	t.Helper()
 
-	raw, err := os.ReadFile("03-scripts.yaml.tmpl")
+	raw, err := os.ReadFile("testdata/legacy/03-scripts.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

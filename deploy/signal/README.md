@@ -1,4 +1,4 @@
-# Project Signal example
+# Project Signal runtime
 
 Project Signal is an example Kubernetes controller for admitting approved,
 idle Nodes to a hardware certification workflow. It separates admission policy
@@ -11,12 +11,23 @@ from execution:
 - An execution backend performs coordinated work. The included example uses
   Kubeflow MPI Operator `MPIJob`.
 
-This directory includes an educational one-GPU identity example and a bounded,
-non-destructive full-node GPU workflow. The full-node workflow snapshots Node
-GPU capacity and allocatable inventory at admission, fails before requesting
-the full GPU set when inventory is incomplete, then validates every allocated
-GPU and MPI rank-to-GPU access. It is not a substitute for an
-organization-reviewed burn-in or performance qualification suite.
+The upstream runtime owns reusable per-test and explicit-rack orchestration,
+not executable certification releases:
+
+| Owner / surface | Contents |
+| --- | --- |
+| Upstream `deploy/signal/`, `api/signal/`, and controller/dashboard code | APIs, admission, reservations, immutable plans and evidence, typed results, four built-in WorkflowTemplates, cleanup, and legacy compatibility. |
+| `CloudNativeCompute/aks-flex-infra` | Executable certification payloads, MPI dispatchers, runner image recipes, reviewed environment profiles, and pipeline packaging. |
+| Opt-in `deploy/signal-examples/` | One educational identity-only payload and a disabled, expired smoke profile. Not production certification packaging. |
+| `deploy/signal/testdata/legacy/` | Unchanged historical scripts, runner recipes, and site profile sources used only by regression tests. Not runtime defaults or release recipes. |
+
+`make signal-manifests` renders runtime resources only. It supplies no source
+script ConfigMap, CertificationProfile, site selectors, or runner registry pin.
+The full-node orchestration still snapshots Node GPU capacity and allocatable
+inventory, fails before requesting the full GPU set when inventory is
+incomplete, and preserves allocated-device and MPI evidence. Its executable
+payload must be supplied separately. Neither the public smoke example nor the
+historical fixtures constitute current hardware qualification.
 
 ## Architecture
 
@@ -42,7 +53,8 @@ approved Node or recurring policy
 The mutable source ConfigMap provides a fast review and hotfix surface.
 Admission copies the selected key to a run-owned immutable ConfigMap and pins
 its digest in the `CertificationRun`. A source update affects only later runs.
-Controller code never contains certification script bodies.
+Controller code never contains certification script bodies. The runtime does
+not fetch private repositories or resolve a release's source or image.
 
 ## External payload inputs
 
@@ -52,6 +64,19 @@ runner image through the existing `CertificationProfile` fields:
 and `spec.parameters`. The source ConfigMap must be readable in the controller's
 `--script-namespace`; the Run snapshot lives in the Run namespace. Private
 checkout and authentication belong in the pipeline, never in runtime jobs.
+
+The packaging owner must provide the selected self-contained script, the
+matching runner image and dependencies, and a profile with reviewed hardware
+guards and explicit approved scope. A pipeline can reference these inputs
+through the existing fields without embedding private source access in Argo
+or adding a pluggable-test SDK. This ownership contract does not imply that
+private assets have already been imported, uploaded, built, or published.
+
+By default the runtime manifest target uses `SIGNAL_NAMESPACE` for both the
+controller and its source-script reads. A separate source namespace requires
+the controller's `--script-namespace` flag and the corresponding source
+ConfigMap read Role/RoleBinding to agree; changing only a ConfigMap namespace
+does not configure the controller.
 
 Admission copies only the selected decoded text `data[key]`, including its
 newline bytes, plus its computed SHA-256. Other keys, `binaryData`, source labels,
@@ -78,8 +103,12 @@ Both MPI pods mount the same immutable Run-owned ConfigMap read-only at
 result-file writes. To retain exact baseline keys, packaging may add separate
 self-contained `gpu-identity-mpi.sh` and `gpu-full-node-mpi.sh` keys with a
 dispatcher followed by the unchanged baseline body; selecting a helper key does
-not implicitly copy the baseline. The identity launcher still runs the existing
-one-rank `/bin/true` check. MPI resource-status measurements, device inventory,
+not implicitly copy the baseline. Adapted keys have their own decoded-byte
+digests and must not be labeled with the original baseline digests. Preserve
+the original decoded launcher/rank argv when extracting YAML folded scalars;
+raw newlines must not split the full-node rank's GPU query.
+The identity launcher still runs the existing one-rank `/bin/true` check.
+MPI resource-status measurements, device inventory,
 node/attempt/script provenance, resource allocation, and foreground cleanup are
 unchanged; MPI roles do not introduce new result files or test IDs.
 
@@ -88,6 +117,12 @@ Already-admitted empty-test-plan Runs always retain inline MPI compatibility,
 even if an opaque legacy parameter happens to use the new name. Their selected
 script still receives no new arguments. The mixed-burn component interface is
 unchanged and does not support `mpi-payload-mode: script`.
+
+The rack sample selects a release ConfigMap placeholder,
+`gpu-full-node-mpi.sh`, and `mpi-payload-mode: script`. Identity-only smoke
+examples explicitly select `legacy-inline`. No new certification tests,
+precision variants, thresholds, durations, or schedules are introduced by this
+split.
 
 ## Per-test execution
 
@@ -105,8 +140,9 @@ Each invocation carries the target Node name and UID, test identity, effective
 parameters, script digest, attempt, execution state, typed verdict and reason,
 and retained measurements. GPU inventory evidence includes UUIDs and PCI
 addresses. MPI evidence retains the observed target-device inventory and
-backend completion status. These are the configured workloads in this
-repository; no additional precision variants or performance floors are implied.
+backend completion status. These are the runtime's recognized built-in test
+boundaries; their payload implementations and release profiles are separately
+owned. No additional precision variants or performance floors are implied.
 
 Full-node GPU-heavy tasks remain ordered. A failed preflight skips full-node
 allocation, and final health still runs after workload failure. Each MPI task
@@ -123,6 +159,26 @@ host work and per-device GPU computation coverage. A zero exit without the
 required measurements is not a pass. A non-main failure fails the group even
 if GPU Burn succeeds. Safety failures or cancellation stop the whole coupled
 workload; interrupted tests remain inconclusive rather than reporting a pass.
+For planned burn Runs, all four nodes invoke the same selected script with
+`gpu-burn`, `cpu-stress`, `memory-integrity`, or `storage-integrity` as its
+component argument. They retain the existing environment and write
+`/results/<component>-verdict`, `-reason`, and `-measurements.txt` alongside
+the group outputs and device inventory.
+
+The payload owns the shared `/work/ready`, per-host-test `.started`,
+`/work/stop`, and `/work/burn-complete` protocol. Host components wait for
+successful preflight; GPU work waits for all three host startup markers.
+Startup and result collection retain their bounded waits. Only validated GPU
+computation coverage marks burn complete; a stop without that marker cannot
+make interrupted host work pass. The GPU-owning node samples Xid, ECC,
+temperature/thermal margin, and power telemetry for the coupled workload;
+missing safety telemetry, material sustained safety violations, missing
+component work, or component failure remain failures. The reviewed payload
+must preserve these semantics, not replace an absent tool with a successful
+placeholder. Admission waiting and retries consume the original remaining Run
+deadline, and Argo bounds execution. Expiry or cancellation does not waive
+foreground cleanup or release reservations while owned work remains.
+
 The four workload containers retain one GPU allocation and the existing total
 request/limit budget of eight CPUs, 16 GiB of memory, and 8 GiB of ephemeral
 storage. ContainerSet requires per-container budgets: GPU/safety receives two
@@ -150,9 +206,11 @@ with the run's immutable evidence instead of depending on pod-log retention.
 - Controller and dashboard images built from `cmd/project-signal-controller`
   and `cmd/project-signal-dashboard`.
 - A reviewed runner image containing Bash, `nvidia-smi`, Open MPI, and the
-  MPI Operator's SSH requirements. `images/project-signal-runner/Containerfile`
-  provides a baseline CUDA runner; publish it by immutable digest and validate
-  it against the target cluster's driver and security policy before use.
+  MPI Operator's SSH requirements for MPI-based profiles. Mixed-burn profiles
+  additionally require their reviewed GPU Burn and host-tool dependencies.
+  Runner recipes and release image selection belong to the packaging owner,
+  not the upstream runtime build. Validate compatibility with the target
+  driver and security policy before use.
 - Exact, verified Node selector values and an explicitly approved Node list.
 
 Project Signal does not install Argo Workflows or MPI Operator. Install and
@@ -168,20 +226,42 @@ Existing single-Node profiles with `participants.count: 1` do not need either
 new field. Do not bypass controller-managed admission or reservations by
 submitting participant lists directly to Argo.
 
-## Render the example
+## Render runtime and opt-in smoke inputs
 
 The defaults use the reserved `example.invalid` registry and cannot pull an
-image. Supply reviewed images explicitly:
+image. Supply reviewed controller and dashboard images explicitly:
 
 ```bash
 make signal-manifests \
   SIGNAL_CONTROLLER_IMAGE=<controller-image@sha256:digest> \
-  SIGNAL_DASHBOARD_IMAGE=<dashboard-image@sha256:digest> \
-  SIGNAL_RUNNER_IMAGE=<runner-image@sha256:digest>
+  SIGNAL_DASHBOARD_IMAGE=<dashboard-image@sha256:digest>
 ```
 
-Generated output is written to `deploy/signal/rendered/` and is intentionally
-gitignored.
+Runtime output is written to `deploy/signal/rendered/` and is intentionally
+gitignored. It retains the CRDs, Namespace, ServiceAccounts, RBAC, controller,
+dashboard, and all four WorkflowTemplates. It does not select a certification
+runner or render source scripts or profiles.
+
+The educational smoke inputs require a separate, explicit command:
+
+```bash
+make signal-example-manifests \
+  SIGNAL_RUNNER_IMAGE=<reviewed-smoke-runner-image@sha256:digest>
+```
+
+This writes only `project-signal-example-scripts` and `gpu-smoke-example`
+to `deploy/signal-examples/rendered/`. The ConfigMap contains only the
+original identity example key. The profile keeps the existing one-GPU
+admission requirement, placeholder hardware guards, deadlines, retry limit,
+and disabled recurring policy with an expired date, and explicitly chooses
+`mpi-payload-mode: legacy-inline`. It is not a canonical payload release or
+an automatic dependency of runtime rendering, builds, or tests.
+
+Set `SIGNAL_NAMESPACE` consistently on both commands to use a non-default
+namespace. Rendering examples alone does not create that namespace or install
+the runtime. Production pipelines instead supply their own release ConfigMap,
+reviewed image reference, and environment profile; upstream no longer has
+site-render or certification-runner build/push targets.
 
 Before applying anything, edit or overlay the example profile values:
 
@@ -194,14 +274,16 @@ Before applying anything, edit or overlay the example profile values:
 Recurring admission is disabled and its expiry is in the past. Enabling it
 without setting a future expiry fails closed.
 
-Validate the rendered files with the tools available for the target cluster:
+Validate runtime files with the tools available for the target cluster.
+Validate any separately selected profile and source ConfigMap as well:
 
 ```bash
 kubectl apply --dry-run=server -f deploy/signal/rendered/crd/
 kubectl apply --dry-run=server -f deploy/signal/rendered/
 ```
 
-Then apply the APIs and resources:
+Then apply the APIs and runtime resources. This alone creates no certification
+profile or source payload:
 
 ```bash
 kubectl apply -f deploy/signal/rendered/crd/
@@ -292,7 +374,11 @@ participants:
   topologyKey: REPLACE_WITH_VERIFIED_RACK_LABEL
 workflow:
   name: project-signal-rack-certification
+script:
+  name: REPLACE_WITH_RELEASE_SCRIPT_CONFIGMAP
+  key: gpu-full-node-mpi.sh
 parameters:
+  mpi-payload-mode: script
   node-workflow-template: project-signal-gpu-full-node-certification
   rack-tests: "[]"
 ```
@@ -527,6 +613,11 @@ and an invalid past expiry. Do not apply or enable it until selectors, runner
 image, product string, GPU count, Node approval, and expiry are verified on the
 target cluster.
 
+Its `project-signal-example-scripts` source is rendered only by
+`make signal-example-manifests`, and its explicit `legacy-inline` mode retains
+the educational MPI readiness check. It does not consume a production
+certification payload.
+
 The sample is one Node, one GPU, and one MPI worker. It is not GB200 NVL72 or
 rack-fabric certification. A grouped workflow composes node tests, not an
 unimplemented multi-node collective. Fabric qualification still requires a
@@ -534,66 +625,51 @@ supported topology-aware backend, gang scheduling, rank mapping, and reviewed
 fabric/collective tests. A requested rack test without an execution adapter is
 rejected explicitly rather than represented by a successful placeholder.
 
-## Dapple B200 full-node profile
+## Historical regression fixtures
 
-`deploy/signal-dapple/00-b200-full-node.yaml.tmpl` defines the reviewed Dapple
-contract for `Dapple_B200_8x180GB` / `NVIDIA-B200` Nodes. Render it separately
-from the portable Signal manifests:
+`testdata/legacy/` preserves the original source artifacts from feature commit
+`98bdf4d0703f98c2c867ed22d561929a79f47996` without modifying their contents:
 
-```bash
-make signal-dapple-manifests
-```
+| Fixture | Purpose |
+| --- | --- |
+| `03-scripts.yaml` | All three original decoded payload keys, including the full-node and mixed-burn Bash behavior regressions. |
+| `images/project-signal-runner/Containerfile` | Historical CUDA/Open MPI/SSH recipe dependency checks. |
+| `images/project-signal-burn-runner/Containerfile` | Historical pinned GPU Burn/CUDA recipe and upstream license-copy checks. |
+| `profiles/00-b200-full-node.yaml`, `profiles/01-b200-burn-canary.yaml` | Historical site settings, inventory guards, diagnostic purpose, durations, and single-attempt checks. |
 
-The profile expects eight GPUs but requires only one GPU for admission and
-preflight. The controller overwrites the reserved
-`observed-gpu-capacity` and `observed-gpu-allocatable` run parameters with the
-Node status observed at admission. A seven-GPU Node therefore produces typed
-`Fail` / `NodeGPUCapacityMismatch` evidence without attempting an unschedulable
-eight-GPU pod. An eight-GPU Node proceeds through the full allocation, parallel
-per-device health query, MPI rank-to-GPU check, and final health stage using the
-pinned Project Signal runner image.
+These are self-contained test fixtures, not current site approvals, deployment
+instructions, canonical release recipes, or a supported production registry.
+Their source labels and image strings describe the historical source only.
+Repository `LICENSE` and `NOTICE`, recipe copyright headers, and the GPU Burn
+upstream license-copy behavior are unchanged.
 
-## Dapple B200 burn canary
+The `.yaml` fixture extension is intentional: the generic renderer recursively
+renders every `.yaml.tmpl` below its root. Historical files may still contain
+their original Go template expressions, but must not be renamed to renderable
+templates under `deploy/signal/`. The opt-in example is a sibling directory
+for the same reason. Regression tests exercise the real recursive renderer
+and require runtime output to contain no certification payload or profile.
 
-`deploy/signal-dapple/01-b200-burn-canary.yaml.tmpl` defines one six-hour
-diagnostic canary for the healthy eight-GPU Node and one separate seven-GPU
-diagnostic for the degraded Node. Both use the immutable
-`project-signal-burn-runner`, which builds GPU Burn from a pinned source commit
-for Blackwell compute capability 10.0.
+The original decoded text, including trailing newline bytes, has these
+SHA-256 digests:
 
-The canary runs GPU Burn at 50 percent device memory alongside bounded CPU,
-memory-integrity, and ephemeral-storage integrity load. It samples each GPU
-once per minute and fails closed on:
+| Original key | Digest |
+| --- | --- |
+| `gpu-identity-example.sh` | `sha256:82f1275c8864938b19f548a5f0411d171627fee4dc4440dba49f1ea26b73606a` |
+| `gpu-full-node.sh` | `sha256:663677b5c13fa8a0c21756e64aed458186601d876b069482528f38961a6183de` |
+| `gpu-burn-canary.sh` | `sha256:9329bb7ca8a5dd7157a33fac94d8833b6c1e27868a6dcf1a7078336a61a118df` |
 
-- new kernel Xid messages;
-- uncorrectable volatile or aggregate ECC growth;
-- exhaustion of the device-reported thermal margin;
-- power draw above 105 percent of the device-reported enforced limit for three
-  consecutive one-minute samples, rejecting sustained material excess without
-  treating normal instantaneous power-cap sampling jitter as hardware failure;
-- early exit or failure of any required workload.
-
-The GPU-owning `main` container is privileged to read the host kernel ring
-buffer for Xid comparison; the host stressor containers are not privileged.
-The group captures preflight, periodic workload measurements, per-test results,
-and health-after evidence. GPU Burn must produce computation measurements for
-every assigned GPU, and logged computation warnings or dead workers fail the
-test even if the executable exits zero. The workflow deadline is six hours and
-30 minutes with no retries.
-
-Burn profiles use `purpose: Diagnostic`. Full certification has higher node
-projection precedence, so a successful seven-GPU diagnostic cannot replace the
-degraded Node's failed/blocked eight-GPU certification.
-
-This is one source-defined canary suite, not the design's complete four-pass
-initial qualification campaign. It does not claim rack-scale NCCL, external
-RDMA traffic, firmware remediation, reboot, or destructive storage endurance
-coverage.
+The smoke example retains the original identity bytes. Separately versioned
+MPI-adapted release keys have different digests. Only the selected release
+key is snapshotted; neither this fixture inventory nor a source key name adds
+SCM provenance to a Run.
 
 ## Non-goals
 
-The repository example does not provide:
+The upstream runtime does not provide:
 
+- executable production payload releases, private-source fetch, or runner image publication;
+- a new pluggable-test SDK or SCM provenance API;
 - proprietary performance floors or fixed B200 thermal/power thresholds;
 - destructive storage endurance, reboot, drain, or remediation;
 - the complete four-pass initial burn-in campaign;
@@ -602,5 +678,3 @@ The repository example does not provide:
 - a scheduler integration that consumes the eligibility labels;
 - dashboard mutation controls, public ingress, or long-term history;
 - automatic installation of Argo Workflows or MPI Operator.
-
-See `designs/certification-controller.md` for the broader design context.

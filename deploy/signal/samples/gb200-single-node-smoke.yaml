@@ -14,7 +14,7 @@ spec:
     requiredResources:
       nvidia.com/gpu: "1"
   script:
-    name: project-signal-scripts
+    name: project-signal-example-scripts
     key: gpu-identity-example.sh
   workflow:
     name: project-signal-gpu-certification
@@ -23,6 +23,7 @@ spec:
     kind: MPIJob
   runnerImage: REPLACE_WITH_REVIEWED_GPU_RUNNER_IMAGE
   parameters:
+    mpi-payload-mode: legacy-inline
     expected-gpu-product-regex: ^REPLACE_WITH_VERIFIED_GB200_NVIDIA_SMI_PRODUCT$
     expected-gpu-count: "REPLACE_WITH_VERIFIED_GPU_COUNT"
   evidencePath: project-signal/gb200-example

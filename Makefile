@@ -99,13 +99,12 @@ PROJECT_SIGNAL_DASHBOARD_BIN=bin/project-signal-dashboard
 PROJECT_SIGNAL_DASHBOARD_CMD=./cmd/project-signal-dashboard
 SIGNAL_DASHBOARD_IMAGE ?= example.invalid/project-signal-dashboard:replace-me
 SIGNAL_NAMESPACE ?= project-signal
-SIGNAL_RUNNER_IMAGE ?= example.invalid/gpu-runner:replace-me
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
-SIGNAL_DAPPLE_MANIFEST_TEMPLATES_DIR := deploy/signal-dapple
-SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR := deploy/signal-dapple/rendered
-SIGNAL_DAPPLE_RUNNER_IMAGE ?= projectsignalpublic.azurecr.io/project-signal-runner@sha256:68a667b87491ed3fd1d56f4f8746bc52526e7b67a7b45456b779103f642922aa
-SIGNAL_DAPPLE_BURN_RUNNER_IMAGE ?= docker.io/kechomicrosoft/project-signal-burn-runner@sha256:a665064c123d613cd10722cd52d4d4a1c5c7af4d8ece20bad9060f1555e5bd2f
+SIGNAL_EXAMPLE_MANIFEST_TEMPLATES_DIR := deploy/signal-examples
+SIGNAL_EXAMPLE_MANIFEST_RENDERED_DIR := deploy/signal-examples/rendered
+# Only the opt-in educational smoke example selects a runner image here.
+SIGNAL_RUNNER_IMAGE ?= example.invalid/gpu-runner:replace-me
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
@@ -245,7 +244,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-dashboard project-signal-dashboard-build signal-manifests signal-dapple-manifests image-project-signal-controller-local image-project-signal-dashboard-local image-project-signal-runner-local project-signal-runner-oci-push metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-dashboard project-signal-dashboard-build signal-manifests signal-example-manifests image-project-signal-controller-local image-project-signal-dashboard-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -304,8 +303,8 @@ help: ## Show this help
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  project-signal-controller        Build Project Signal controller"
-	@echo "  signal-manifests                 Render Project Signal manifests"
-	@echo "  signal-dapple-manifests          Render Dapple B200 Project Signal profile"
+	@echo "  signal-manifests                 Render Project Signal runtime manifests only"
+	@echo "  signal-example-manifests         Render opt-in educational GPU smoke example"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
 	@echo "  unbounded-net-controller         Build net controller"
@@ -328,8 +327,6 @@ help: ## Show this help
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-project-signal-controller-local Build Project Signal controller image"
 	@echo "  image-project-signal-dashboard-local Build Project Signal dashboard image"
-	@echo "  image-project-signal-runner-local Build Project Signal GPU runner image"
-	@echo "  project-signal-runner-oci-push  Build and push Project Signal GPU runner image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
 	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
@@ -1076,18 +1073,6 @@ image-project-signal-dashboard-local: ## Build Project Signal dashboard image lo
 		-f ./images/project-signal-dashboard/Containerfile .
 	$(call trivy-maybe,$(SIGNAL_DASHBOARD_IMAGE))
 
-image-project-signal-runner-local: ## Build Project Signal GPU runner image locally
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t project-signal-runner:$(VERSION_TAG) -t $(SIGNAL_RUNNER_IMAGE) \
-		-f ./images/project-signal-runner/Containerfile .
-	$(call trivy-maybe,$(SIGNAL_RUNNER_IMAGE))
-
-project-signal-runner-oci-push: image-project-signal-runner-local ## Build and push the Project Signal GPU runner image
-	$(CONTAINER_ENGINE) push $(SIGNAL_RUNNER_IMAGE)
-
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
@@ -1160,7 +1145,7 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
-signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
+signal-manifests: ## Render Project Signal runtime only into deploy/signal/rendered
 	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
 	@find $(SIGNAL_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
 	$(GOCMD) run ./hack/cmd/render-manifests \
@@ -1168,21 +1153,20 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--output-dir $(SIGNAL_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(SIGNAL_NAMESPACE) \
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
-		--set DashboardImage=$(SIGNAL_DASHBOARD_IMAGE) \
-		--set RunnerImage=$(SIGNAL_RUNNER_IMAGE)
+		--set DashboardImage=$(SIGNAL_DASHBOARD_IMAGE)
 	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
 	@cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (image: $(SIGNAL_CONTROLLER_IMAGE))"
 
-signal-dapple-manifests: ## Render Dapple B200 Project Signal profile
-	@mkdir -p $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR)
-	@find $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+signal-example-manifests: ## Render only the opt-in educational smoke example
+	@mkdir -p $(SIGNAL_EXAMPLE_MANIFEST_RENDERED_DIR)
+	@find $(SIGNAL_EXAMPLE_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
 	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(SIGNAL_DAPPLE_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR) \
-		--set RunnerImage=$(SIGNAL_DAPPLE_RUNNER_IMAGE) \
-		--set BurnRunnerImage=$(SIGNAL_DAPPLE_BURN_RUNNER_IMAGE)
-	@echo "Rendered Dapple Project Signal manifests into $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR)"
+		--templates-dir $(SIGNAL_EXAMPLE_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(SIGNAL_EXAMPLE_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(SIGNAL_NAMESPACE) \
+		--set RunnerImage=$(SIGNAL_RUNNER_IMAGE)
+	@echo "Rendered opt-in Project Signal smoke example into $(SIGNAL_EXAMPLE_MANIFEST_RENDERED_DIR)"
 
 playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
 	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)

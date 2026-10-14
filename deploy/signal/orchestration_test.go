@@ -662,7 +662,8 @@ func TestExplicitRackSampleIsDisabledAndUsesExistingNodeTests(t *testing.T) {
 				Name string `yaml:"name"`
 			} `yaml:"workflow"`
 			Script struct {
-				Key string `yaml:"key"`
+				Name string `yaml:"name"`
+				Key  string `yaml:"key"`
 			} `yaml:"script"`
 			RunnerImage string            `yaml:"runnerImage"`
 			Parameters  map[string]string `yaml:"parameters"`
@@ -684,7 +685,9 @@ func TestExplicitRackSampleIsDisabledAndUsesExistingNodeTests(t *testing.T) {
 
 	require.Equal(t, "project-signal-rack-certification", profile.Spec.Workflow.Name)
 	require.Equal(t, "project-signal-gpu-full-node-certification", profile.Spec.Parameters["node-workflow-template"])
-	require.Equal(t, "gpu-full-node.sh", profile.Spec.Script.Key)
+	require.Equal(t, "REPLACE_WITH_RELEASE_SCRIPT_CONFIGMAP", profile.Spec.Script.Name)
+	require.Equal(t, "gpu-full-node-mpi.sh", profile.Spec.Script.Key)
+	require.Equal(t, "script", profile.Spec.Parameters["mpi-payload-mode"])
 	require.Equal(t, "[]", profile.Spec.Parameters["rack-tests"])
 	require.Equal(t, "REPLACE_WITH_VERIFIED_GPU_COUNT", profile.Spec.Parameters["expected-gpu-count"])
 	require.True(t, strings.HasPrefix(profile.Spec.RunnerImage, "REPLACE_WITH_"))

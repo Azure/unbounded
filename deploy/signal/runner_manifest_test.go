@@ -15,7 +15,7 @@ import (
 func TestRunnerProvidesWorkflowDependencies(t *testing.T) {
 	t.Parallel()
 
-	content, err := os.ReadFile("../../images/project-signal-runner/Containerfile")
+	content, err := os.ReadFile("testdata/legacy/images/project-signal-runner/Containerfile")
 	require.NoError(t, err)
 
 	containerfile := string(content)
@@ -80,7 +80,7 @@ func TestFullNodeWorkflowGatesEightGPUAllocationOnInventoryPreflight(t *testing.
 func TestDappleFullNodeProfileUsesPinnedRunnerAndSingleAttempt(t *testing.T) {
 	t.Parallel()
 
-	content, err := os.ReadFile("../signal-dapple/00-b200-full-node.yaml.tmpl")
+	content, err := os.ReadFile("testdata/legacy/profiles/00-b200-full-node.yaml")
 	require.NoError(t, err)
 
 	manifest := string(content)
@@ -110,7 +110,7 @@ func TestBurnCanaryUsesPinnedRunnerAndDiagnosticProjection(t *testing.T) {
 		assert.Contains(t, string(workflow), setting)
 	}
 
-	profiles, err := os.ReadFile("../signal-dapple/01-b200-burn-canary.yaml.tmpl")
+	profiles, err := os.ReadFile("testdata/legacy/profiles/01-b200-burn-canary.yaml")
 	require.NoError(t, err)
 
 	manifest := string(profiles)
@@ -133,7 +133,7 @@ func TestBurnCanaryUsesPinnedRunnerAndDiagnosticProjection(t *testing.T) {
 func TestBurnRunnerPinsCUDAAndGPUBurn(t *testing.T) {
 	t.Parallel()
 
-	content, err := os.ReadFile("../../images/project-signal-burn-runner/Containerfile")
+	content, err := os.ReadFile("testdata/legacy/images/project-signal-burn-runner/Containerfile")
 	require.NoError(t, err)
 
 	containerfile := string(content)
@@ -142,9 +142,15 @@ func TestBurnRunnerPinsCUDAAndGPUBurn(t *testing.T) {
 	assert.Contains(t, containerfile, "0d19c94dcb2e9b6858b7586a4c327674cd67113b")
 	assert.Contains(t, containerfile, "make -C /src/gpu-burn COMPUTE=100")
 	assert.Contains(t, containerfile, "compare.fatbin /usr/local/bin/compare.fatbin")
+	assert.Contains(t, containerfile, "COPY --from=builder /src/gpu-burn/LICENSE /usr/share/licenses/gpu-burn/LICENSE")
 	assert.Contains(t, containerfile, "WORKDIR /usr/local/bin")
 
 	makefile, err := os.ReadFile("../../Makefile")
 	require.NoError(t, err)
-	assert.Contains(t, string(makefile), "SIGNAL_DAPPLE_BURN_RUNNER_IMAGE ?= docker.io/kechomicrosoft/project-signal-burn-runner@sha256:a665064c123d613cd10722cd52d4d4a1c5c7af4d8ece20bad9060f1555e5bd2f")
+	assert.NotContains(t, string(makefile), "SIGNAL_DAPPLE_")
+	assert.NotContains(t, string(makefile), "signal-dapple-manifests")
+	assert.NotContains(t, string(makefile), "image-project-signal-runner-local")
+	assert.NotContains(t, string(makefile), "project-signal-runner-oci-push")
+	assert.Contains(t, string(makefile), "signal-example-manifests:")
+	assert.Contains(t, string(makefile), "SIGNAL_RUNNER_IMAGE ?= example.invalid/gpu-runner:replace-me")
 }
