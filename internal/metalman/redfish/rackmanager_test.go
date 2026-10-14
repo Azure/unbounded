@@ -192,7 +192,7 @@ func TestRackManagerDetection(t *testing.T) {
 					assert.Contains(t, []string{"unauthorized", "forbidden", "unavailable", "malformed", "failure"}, tc.name)
 					assert.Equal(t, http.MethodGet, r.Method)
 
-					_, _ = w.Write([]byte(`{"PowerState":"On"}`))
+					_, _ = w.Write([]byte(`{"Id":"normal","PowerState":"On"}`))
 
 					return
 				}
@@ -360,7 +360,7 @@ func TestRackManagerDetectionFallsBackToWorkingPrefixedBMC(t *testing.T) {
 				case "/proxy/redfish/v1/Systems/normal":
 					assert.Equal(t, testToken, r.Header.Get("X-Auth-Token"))
 
-					_, _ = w.Write([]byte(`{"PowerState":"On"}`))
+					_, _ = w.Write([]byte(`{"Id":"normal","PowerState":"On"}`))
 				case "/proxy/redfish/v1/Systems/normal/Actions/ComputerSystem.Reset":
 					assert.Equal(t, testToken, r.Header.Get("X-Auth-Token"))
 					assert.Equal(t, http.MethodPost, r.Method)
@@ -390,18 +390,53 @@ func TestRackManagerDetectionFallsBackToWorkingPrefixedBMC(t *testing.T) {
 	}
 }
 
+func TestValidateFallbackSystemAcceptsResourceIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"idOnly", `{"Id":"normal"}`},
+		{"odataIDOnly", `{"@odata.id":"/redfish/v1/Systems/normal"}`},
+		{"both", `{"Id":"normal","@odata.id":"/redfish/v1/Systems/normal","PowerState":"Off"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "/redfish/v1/Systems/normal", r.URL.Path)
+
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			httpClient := newHTTPClient(tlsServerFingerprint(srv))
+			defer httpClient.CloseIdleConnections()
+
+			session := &bmcSession{httpClient: httpClient, baseURL: srv.URL}
+			require.NoError(t, validateFallbackSystem(t.Context(), session, "normal"))
+		})
+	}
+}
+
 func TestRackManagerDetectionRetriesAfterInvalidFallback(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
+		name             string
+		status           int
+		body             string
+		standardRecovery bool
 	}{
-		{"missing", http.StatusNotFound, ""},
-		{"unavailable", http.StatusServiceUnavailable, ""},
-		{"html", http.StatusOK, "<html>Management proxy</html>"},
-		{"null", http.StatusOK, "null"},
-		{"error", http.StatusOK, `{"error":{"code":"GeneralError"}}`},
-		{"completionFailure", http.StatusOK, completionBody("Failure", "BMC unavailable", false)},
+		{"missing", http.StatusNotFound, "", false},
+		{"unavailable", http.StatusServiceUnavailable, "", false},
+		{"html", http.StatusOK, "<html>Management proxy</html>", false},
+		{"null", http.StatusOK, "null", false},
+		{"emptyObject", http.StatusOK, `{}`, false},
+		{"emptyObjectStandardRecovery", http.StatusOK, `{}`, true},
+		{"emptyIdentity", http.StatusOK, `{"Id":"","@odata.id":" "}`, false},
+		{"invalidIdentityType", http.StatusOK, `{"Id":1}`, false},
+		{"nullIdentity", http.StatusOK, `{"Id":null,"@odata.id":null}`, false},
+		{"powerStateOnly", http.StatusOK, `{"PowerState":"On"}`, false},
+		{"error", http.StatusOK, `{"error":{"code":"GeneralError"}}`, false},
+		{"errorWithIdentity", http.StatusOK, `{"Id":"1","error":{"code":"GeneralError"}}`, false},
+		{"completionFailure", http.StatusOK, completionBody("Failure", "BMC unavailable", false), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
@@ -416,7 +451,7 @@ func TestRackManagerDetectionRetriesAfterInvalidFallback(t *testing.T) {
 				case rackManagerPath:
 					probes.Add(1)
 
-					if !recovered.Load() {
+					if !recovered.Load() || tc.standardRecovery {
 						w.WriteHeader(http.StatusServiceUnavailable)
 
 						return
@@ -432,6 +467,12 @@ func TestRackManagerDetectionRetriesAfterInvalidFallback(t *testing.T) {
 					assert.Equal(t, http.MethodGet, r.Method)
 					assert.Equal(t, testToken, r.Header.Get("X-Auth-Token"))
 					systems.Add(1)
+
+					if recovered.Load() {
+						_, _ = w.Write([]byte(`{"Id":"1","PowerState":"On"}`))
+						return
+					}
+
 					w.WriteHeader(tc.status)
 					_, _ = w.Write([]byte(tc.body))
 				case "/28/redfish/v1/SessionService/Sessions/test":
@@ -451,6 +492,7 @@ func TestRackManagerDetectionRetriesAfterInvalidFallback(t *testing.T) {
 			c, err := Dial(t.Context(), url, fingerprint, "admin", "secret", "1")
 			require.ErrorContains(t, err, "validating standard BMC after inconclusive rack detection")
 			require.Nil(t, c)
+			require.Equal(t, int64(1), probes.Load())
 
 			pool := NewPool()
 			defer pool.Close()
@@ -459,6 +501,7 @@ func TestRackManagerDetectionRetriesAfterInvalidFallback(t *testing.T) {
 			require.ErrorContains(t, err, "validating standard BMC after inconclusive rack detection")
 			require.Nil(t, c)
 			require.Empty(t, pool.clients)
+			require.Equal(t, int64(2), probes.Load())
 			require.Equal(t, int64(2), systems.Load())
 			require.Equal(t, int64(2), closed.Load())
 
@@ -466,15 +509,23 @@ func TestRackManagerDetectionRetriesAfterInvalidFallback(t *testing.T) {
 
 			c, err = pool.Get(t.Context(), url, fingerprint, "admin", "secret", "1")
 			require.NoError(t, err)
-			require.NotNil(t, c.rack)
-			require.Equal(t, "28", c.deviceID)
-			require.True(t, c.SupportsVirtualMedia())
+			require.Equal(t, int64(3), probes.Load())
+
+			if tc.standardRecovery {
+				require.Nil(t, c.rack)
+				require.Equal(t, "1", c.deviceID)
+				require.Equal(t, int64(3), systems.Load())
+			} else {
+				require.NotNil(t, c.rack)
+				require.Equal(t, "28", c.deviceID)
+				require.True(t, c.SupportsVirtualMedia())
+				require.Equal(t, int64(2), systems.Load())
+			}
 
 			cached, err := pool.Get(t.Context(), url, fingerprint, "admin", "secret", "1")
 			require.NoError(t, err)
 			require.Same(t, c, cached)
 			require.Equal(t, int64(3), probes.Load())
-			require.Equal(t, int64(2), systems.Load())
 		})
 	}
 }
@@ -513,7 +564,7 @@ func TestRackManagerDetectionProbeTimeoutFallsBack(t *testing.T) {
 			probes.Add(1)
 			<-r.Context().Done()
 		case "/proxy/redfish/v1/Systems/normal":
-			_, _ = w.Write([]byte(`{"PowerState":"On"}`))
+			_, _ = w.Write([]byte(`{"Id":"normal","PowerState":"On"}`))
 		default:
 			t.Errorf("unexpected request %s", r.URL.Path)
 		}

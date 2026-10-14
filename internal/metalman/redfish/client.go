@@ -839,12 +839,16 @@ func validateFallbackSystem(ctx context.Context, s *bmcSession, deviceID string)
 		return redfishResponseError(http.MethodGet, path, status, data, nil)
 	}
 
-	var system map[string]json.RawMessage
+	var system struct {
+		ID      string          `json:"Id"`
+		ODataID string          `json:"@odata.id"`
+		Error   json.RawMessage `json:"error"`
+	}
 	if err := json.Unmarshal(data, &system); err != nil {
 		return fmt.Errorf("parsing fallback system: %w", err)
 	}
 
-	if system == nil || system["error"] != nil {
+	if system.Error != nil || (strings.TrimSpace(system.ID) == "" && strings.TrimSpace(system.ODataID) == "") {
 		return fmt.Errorf("invalid fallback system response from %s", path)
 	}
 
