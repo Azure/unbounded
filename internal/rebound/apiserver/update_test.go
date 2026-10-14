@@ -139,3 +139,87 @@ func TestUpdateErrors(t *testing.T) {
 		t.Fatalf("validation error: %v", err)
 	}
 }
+
+func TestUpdateNoOpConfirmsAfterValidation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		keepRV bool
+		mutate func(t *testing.T, s *storage, ctx context.Context)
+		check  func(error) bool
+		fresh  bool
+	}{
+		"deleted": {
+			keepRV: true,
+			mutate: func(t *testing.T, s *storage, ctx context.Context) { deleteGrant(t, s, ctx, "first") },
+			check:  apierrors.IsNotFound,
+		},
+		"deleted without resourceVersion": {
+			mutate: func(t *testing.T, s *storage, ctx context.Context) { deleteGrant(t, s, ctx, "first") },
+			check:  apierrors.IsNotFound,
+		},
+		"recreated": {
+			keepRV: true,
+			mutate: func(t *testing.T, s *storage, ctx context.Context) {
+				deleteGrant(t, s, ctx, "first")
+				created(t, s, ctx, "first", "node-a")
+			},
+			check: apierrors.IsConflict,
+		},
+		"recreated without resourceVersion": {
+			mutate: func(t *testing.T, s *storage, ctx context.Context) {
+				deleteGrant(t, s, ctx, "first")
+				created(t, s, ctx, "first", "node-a")
+			},
+			check: apierrors.IsConflict,
+		},
+		"unrelated change": {
+			keepRV: true,
+			mutate: func(t *testing.T, s *storage, ctx context.Context) { created(t, s, ctx, "second", "node-b") },
+			check:  apierrors.IsConflict,
+		},
+		"unrelated change without resourceVersion": {
+			mutate: func(t *testing.T, s *storage, ctx context.Context) { created(t, s, ctx, "second", "node-b") },
+			fresh:  true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _, ctx := fixture(t)
+			g := created(t, s, ctx, "first", "node-a")
+
+			updated := g.DeepCopy()
+			if !tc.keepRV {
+				updated.ResourceVersion = ""
+			}
+
+			obj, _, err := s.Update(ctx, g.Name, rest.DefaultUpdatedObjectInfo(updated), nil,
+				func(context.Context, runtime.Object, runtime.Object) error {
+					tc.mutate(t, s, ctx)
+					return nil
+				}, false, nil)
+
+			if !tc.fresh {
+				if tc.check == nil || !tc.check(err) {
+					t.Fatalf("unexpected result %#v, error %v", obj, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got := obj.(*rebound.NodeGrant)
+			if latest := cached(t, s).ResourceVersion; got.UID != g.UID || got.ResourceVersion != latest || latest == g.ResourceVersion {
+				t.Fatalf("expected fresh grant at %s, got UID %s RV %s", latest, got.UID, got.ResourceVersion)
+			}
+		})
+	}
+}
+
+func deleteGrant(t *testing.T, s *storage, ctx context.Context, name string) {
+	t.Helper()
+
+	if _, _, err := s.Delete(ctx, name, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -328,6 +328,13 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 // looking for a PATCH operation in the OpenAPI document. Without one it falls
 // back to listing CRDs, which most users cannot do. A no-op update also lets
 // `kubectl apply` succeed on a grant that already matches its manifest.
+//
+// A no-op update is confirmed against a ledger read taken after admission, so
+// it reports the state at that read, which is the same guarantee the
+// Kubernetes generic registry gives for no-op updates. If the grant was
+// deleted meanwhile, the update fails with NotFound. If it was replaced, or
+// the ledger moved past a resourceVersion the client required, it fails with
+// a Conflict so the client retries against the latest version.
 func (s *storage) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, _ rest.ValidateObjectFunc,
 	validate rest.ValidateObjectUpdateFunc, _ bool, _ *metav1.UpdateOptions,
 ) (runtime.Object, bool, error) {
@@ -370,7 +377,36 @@ func (s *storage) Update(ctx context.Context, name string, objInfo rest.UpdatedO
 		}
 	}
 
-	return current, false, nil
+	key := types.NamespacedName{Namespace: request.NamespaceValue(ctx), Name: name}
+
+	var (
+		record *ledger.Grant
+		found  bool
+	)
+
+	_, rv, err := s.store.Update(ctx, true, func(l *ledger.Ledger) error {
+		record, found = l.Get(key)
+		return nil
+	})
+	if err != nil {
+		return nil, false, storageError(name, err)
+	}
+
+	if !found {
+		return nil, false, apierrors.NewNotFound(rebound.GroupResource(), name)
+	}
+
+	confirmed := grantObject(record, rv)
+	if confirmed.UID != current.UID {
+		return nil, false, apierrors.NewConflict(rebound.GroupResource(), name, errors.New("UID does not match"))
+	}
+
+	if updated.ResourceVersion != "" && updated.ResourceVersion != confirmed.ResourceVersion {
+		return nil, false, apierrors.NewConflict(rebound.GroupResource(), name,
+			errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+	}
+
+	return confirmed, false, nil
 }
 
 // immutableChanges reports each user-set field that differs between the
