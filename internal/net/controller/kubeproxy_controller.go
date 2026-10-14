@@ -194,6 +194,12 @@ func managedKubeProxyDaemonSetUpdateAffectsReconcile(namespace string, oldObj, n
 		return oldClass != kubeProxyDaemonSetUnrelated || newClass != kubeProxyDaemonSetUnrelated
 	}
 
+	// A relist can report a same-name replacement as an update; generations
+	// are only comparable within one UID.
+	if newClass != kubeProxyDaemonSetUnrelated && oldDS.UID != newDS.UID {
+		return true
+	}
+
 	switch newClass {
 	case kubeProxyDaemonSetManaged:
 		return oldDS.Generation != newDS.Generation ||
