@@ -158,7 +158,7 @@ internal/     Shared internal packages
 
 ## Building from Source
 
-Requires Go 1.26+.
+Requires Go 1.27+.
 
 ```bash
 # Build the kubectl plugin
