@@ -88,6 +88,10 @@ make rebound-manifests
 kubectl apply -f deploy/rebound/rendered/
 ```
 
+Each release also ships these manifests, rendered for that release's image,
+in the `rebound/` directory of the `unbounded-manifests-<version>.tar.gz`
+archive.
+
 Set these Make variables to change the rendered manifests:
 
 | Make variable | Template value | Default |

@@ -93,6 +93,8 @@ REBOUND_MAX_TTL ?= 1h
 REBOUND_MAX_NODES_PER_GRANT ?= 500
 REBOUND_EXCLUDED_NAMESPACES ?= kube-system,unbounded-system
 REBOUND_ADMIN_GROUPS ?= system:masters
+REBOUND_MANIFEST_TEMPLATES_DIR := deploy/rebound
+REBOUND_MANIFEST_RENDERED_DIR  := deploy/rebound/rendered
 
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
@@ -1054,8 +1056,8 @@ rebound-oci-push: rebound-oci ## Build and push the rebound image
 
 rebound-manifests: ## Render rebound manifests into deploy/rebound/rendered
 	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir deploy/rebound \
-		--output-dir deploy/rebound/rendered \
+		--templates-dir $(REBOUND_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(REBOUND_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(UNBOUNDED_NAMESPACE) \
 		--set Image=$(REBOUND_IMAGE) \
 		--set Replicas=$(REBOUND_REPLICAS) \
@@ -1435,7 +1437,7 @@ unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a ver
 # and invite someone to apply it. Operators supply their own credentials.
 release-manifests: NET_APISERVER_URL :=
 release-manifests: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
-release-manifests: machina-manifests machine-ops-manifests token-refresher-manifests net-manifests gantry-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests token-refresher-manifests net-manifests gantry-manifests unbounded-operator-manifests inventory-manifests rebound-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/token-refresher
@@ -1444,6 +1446,7 @@ release-manifests: machina-manifests machine-ops-manifests token-refresher-manif
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/rebound
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
 	@cp -R $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/token-refresher/
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
@@ -1451,6 +1454,7 @@ release-manifests: machina-manifests machine-ops-manifests token-refresher-manif
 	@cp -R $(GANTRY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry/
 	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
 	@cp -R $(INVENTORY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/
+	@cp -R $(REBOUND_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/rebound/
 	@rm -f $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/common/03-secret.yaml
 	@cp LICENSE NOTICE $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
