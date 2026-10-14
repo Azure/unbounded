@@ -1658,6 +1658,13 @@ mod codec {
             let delta = vectors[1]["delta"].as_str().unwrap();
             let cases: Value = serde_json::from_slice(&fixture("delta-rejections.json")).unwrap();
             for case in cases.as_array().unwrap() {
+                // Optional base counter override; content hashes exclude counters,
+                // so the delta's base_hash still matches.
+                let mut base = base.clone();
+                if let Some(version) = case.get("base_membership_version").and_then(Value::as_u64) {
+                    base.membership_version = MembershipVersion(version);
+                }
+                let original = encode_publication(&base).unwrap();
                 let raw = delta.replacen(
                     case["old"].as_str().unwrap(),
                     case["new"].as_str().unwrap(),
@@ -1675,7 +1682,7 @@ mod codec {
                     "{}",
                     case["name"]
                 );
-                assert_eq!(encode_publication(&base).unwrap(), original.as_bytes());
+                assert_eq!(encode_publication(&base).unwrap(), original);
             }
         }
 

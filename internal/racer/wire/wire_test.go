@@ -1416,20 +1416,32 @@ func TestSharedDeltaRejections(t *testing.T) {
 	var cases []struct {
 		Name, Old, New string
 		Code           ErrorCode
+		// BaseMembershipVersion optionally overrides the base counter. Content
+		// hashes exclude counters, so the delta's base_hash still matches.
+		BaseMembershipVersion MembershipVersion `json:"base_membership_version"`
 	}
 	require.NoError(t, json.Unmarshal(fixture(t, "delta-rejections.json"), &cases))
 
 	for _, tc := range cases {
 		t.Run(tc.Name, func(t *testing.T) {
+			base := base
+			if tc.BaseMembershipVersion != 0 {
+				base.MembershipVersion = tc.BaseMembershipVersion
+			}
+
+			original, err := EncodePublication(base)
+			require.NoError(t, err)
+
 			raw := strings.Replace(vectors[1].Delta, tc.Old, tc.New, 1)
 			require.NotEqual(t, vectors[1].Delta, raw)
+
 			got, err := ApplyDelta(base, strings.NewReader(raw))
 			require.ErrorIs(t, err, tc.Code)
 			require.Equal(t, Publication{}, got)
 
 			unchanged, err := EncodePublication(base)
 			require.NoError(t, err)
-			require.Equal(t, vectors[0].Publication, string(unchanged))
+			require.Equal(t, string(original), string(unchanged))
 		})
 	}
 }
