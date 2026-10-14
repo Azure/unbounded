@@ -315,17 +315,17 @@ func unpinnedRace(request racersdk.OriginRequest, err error) error {
 func (o *objectOrigin) headMetadata(head *s3.HeadObjectOutput, object Object) (racersdk.Metadata, error) {
 	if head == nil || head.ContentLength == nil || *head.ContentLength < 0 || aws.ToBool(head.DeleteMarker) ||
 		aws.ToString(head.ContentRange) != "" || (object.VersionID != "" && aws.ToString(head.VersionId) != object.VersionID) {
-		return racersdk.Metadata{}, errInvalidS3Response
+		return racersdk.Metadata{}, errS3Validation
 	}
 
 	// SDK metadata cannot carry Content-Encoding to the reader.
 	if encoding := aws.ToString(head.ContentEncoding); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		return racersdk.Metadata{}, errInvalidS3Response
+		return racersdk.Metadata{}, errS3Validation
 	}
 
 	tag := aws.ToString(head.ETag)
 	if !validS3ETag(tag) {
-		return racersdk.Metadata{}, errInvalidS3Response
+		return racersdk.Metadata{}, errS3Validation
 	}
 
 	metadata := racersdk.Metadata{
@@ -462,12 +462,12 @@ func responseBody(output *s3.GetObjectOutput) io.ReadCloser {
 
 func validateObjectPage(output *s3.GetObjectOutput, head *s3.HeadObjectOutput, metadata racersdk.Metadata, first, last int64) error {
 	if output == nil {
-		return errInvalidS3Response
+		return errS3Validation
 	}
 
 	tag := aws.ToString(output.ETag)
 	if !validS3ETag(tag) {
-		return errInvalidS3Response
+		return errS3Validation
 	}
 
 	if tag != metadata.ETag {
@@ -479,7 +479,7 @@ func validateObjectPage(output *s3.GetObjectOutput, head *s3.HeadObjectOutput, m
 		aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", first, last, metadata.Size) ||
 		aws.ToString(output.ContentType) != aws.ToString(head.ContentType) || aws.ToString(output.VersionId) != aws.ToString(head.VersionId) ||
 		!strings.EqualFold(aws.ToString(output.ContentEncoding), aws.ToString(head.ContentEncoding)) || aws.ToBool(output.DeleteMarker) {
-		return errInvalidS3Response
+		return errS3Validation
 	}
 
 	return nil
@@ -571,6 +571,6 @@ func s3HTTPError(code int) error {
 		return racersdk.ErrUnavailable
 	default:
 		// An upstream 416 contradicts the range resolved from HEAD, not caller input.
-		return errInvalidS3Response
+		return invalidS3Status(code)
 	}
 }

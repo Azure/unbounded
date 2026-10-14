@@ -6,6 +6,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
@@ -33,6 +36,12 @@ func safeDiagnostic(message, fallback string, cause error) error {
 }
 
 func diagnosticCategory(err error, fallback string) string {
+	// A TLS or certificate failure is a configuration error even though the
+	// origin maps it to ErrUnavailable, so check it before the sentinels.
+	if tlsFailure(err) {
+		return "tls"
+	}
+
 	for _, entry := range []struct {
 		cause    error
 		category string
@@ -78,7 +87,25 @@ func diagnosticCategory(err error, fallback string) string {
 		return "dns"
 	}
 
+	if category := object.InvalidResponseCategory(err); category != "" {
+		return category
+	}
+
 	return fallback
+}
+
+func tlsFailure(err error) bool {
+	var (
+		verification *tls.CertificateVerificationError
+		authority    x509.UnknownAuthorityError
+		hostname     x509.HostnameError
+		invalid      x509.CertificateInvalidError
+		header       tls.RecordHeaderError
+		alert        tls.AlertError
+	)
+
+	return errors.As(err, &verification) || errors.As(err, &authority) || errors.As(err, &hostname) ||
+		errors.As(err, &invalid) || errors.As(err, &header) || errors.As(err, &alert)
 }
 
 func logSidecarStartup(address net.Addr) {
