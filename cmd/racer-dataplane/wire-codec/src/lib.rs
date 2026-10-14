@@ -192,7 +192,15 @@ pub mod rest {
     pub enum Error {
         InvalidConfiguration,
 
+        /// The server violated the HTTP or TLS protocol, for example a malformed
+        /// response head, bad chunk framing, or trailing plaintext.
         InvalidRequest,
+
+        /// The caller built a request this client refuses to send, for example a
+        /// route or credential not allowed on the connection, or a path, token,
+        /// or header containing forbidden bytes. Nothing is written to the wire,
+        /// and retrying the same request cannot succeed.
+        InvalidClientRequest,
 
         Unauthorized,
 
@@ -778,7 +786,7 @@ pub mod rest {
             if allowed {
                 Ok(())
             } else {
-                Err(Error::InvalidRequest)
+                Err(Error::InvalidClientRequest)
             }
         }
 
@@ -1042,7 +1050,7 @@ pub mod rest {
             || token.is_some_and(|t| t.bytes().any(|b| b <= 32 || b >= 127))
             || header.is_some_and(|(name, value)| !valid_header(name, value))
         {
-            return Err(Error::InvalidRequest);
+            return Err(Error::InvalidClientRequest);
         }
         // Bound allocation before copying bearer credentials. Reserve once, so a
         // String growth cannot free an allocation still containing a token.
@@ -2353,7 +2361,7 @@ pub mod rest {
                         assert!(
                             matches!(
                                 result,
-                                Err(testing::Error::Transport(Error::InvalidRequest))
+                                Err(testing::Error::Transport(Error::InvalidClientRequest))
                             ),
                             "{mutual}: {path}"
                         );
@@ -2527,7 +2535,7 @@ pub mod rest {
                     testing::request(Method::Get, "invalid", None, 65536),
                     &scope
                 )),
-                Err(testing::Error::Transport(Error::InvalidRequest))
+                Err(testing::Error::Transport(Error::InvalidClientRequest))
             ));
             assert!(transport.idle.borrow().is_none());
             assert_eq!(get().status, 200);
@@ -2811,12 +2819,12 @@ pub mod rest {
             ] {
                 assert_eq!(
                     request_head("controller", method, path, token, 0, base),
-                    Err(Error::InvalidRequest)
+                    Err(Error::InvalidClientRequest)
                 );
             }
             assert_eq!(
                 request_head("controller\r\n", Method::Get, "/", None, 0, None),
-                Err(Error::InvalidRequest)
+                Err(Error::InvalidClientRequest)
             );
             assert_eq!(
                 request_head(
@@ -3045,7 +3053,7 @@ pub mod rest {
                         0,
                         Some((name, value))
                     ),
-                    Err(Error::InvalidRequest)
+                    Err(Error::InvalidClientRequest)
                 );
             }
             for name in [
@@ -3073,7 +3081,7 @@ pub mod rest {
                         0,
                         Some((name, "override"))
                     ),
-                    Err(Error::InvalidRequest)
+                    Err(Error::InvalidClientRequest)
                 );
             }
         }
