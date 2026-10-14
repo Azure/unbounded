@@ -103,6 +103,8 @@ func TestBurnCanaryUsesPinnedRunnerAndDiagnosticProjection(t *testing.T) {
 		`privileged: true`,
 		`"nvidia.com/gpu":"{{` + "`{{workflow.parameters.expected-gpu-count}}`" + `}}"`,
 		`name: burn-duration-seconds`,
+		`name: power-limit-tolerance-percent`,
+		`name: power-limit-consecutive-samples`,
 	} {
 		assert.Contains(t, string(workflow), setting)
 	}
@@ -118,6 +120,8 @@ func TestBurnCanaryUsesPinnedRunnerAndDiagnosticProjection(t *testing.T) {
 		`expected-gpu-count: "8"`,
 		`expected-gpu-count: "7"`,
 		`burn-duration-seconds: "21600"`,
+		`power-limit-tolerance-percent: "5"`,
+		`power-limit-consecutive-samples: "3"`,
 		"deadline: 6h30m",
 		"project-signal-burn-runner",
 	} {

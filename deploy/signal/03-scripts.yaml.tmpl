@@ -221,6 +221,7 @@ data:
     gpu_log=/work/gpu-burn.log
     declare -A baseline_volatile_ecc=()
     declare -A baseline_aggregate_ecc=()
+    declare -A power_limit_excess_samples=()
     worker_pids=()
     cpu_pids=()
 
@@ -255,7 +256,8 @@ data:
 
     capture_telemetry() {
       local mode="$1"
-      local rows row index product temperature margin power_draw power_limit volatile_ecc aggregate_ecc throttle
+      local rows row index product temperature margin power_draw power_limit power_limit_threshold
+      local volatile_ecc aggregate_ecc throttle excess_samples
 
       if ! rows="$(
         nvidia-smi \
@@ -296,8 +298,24 @@ data:
           fail SafetyTelemetryUnavailable "index=${index} row=${row}"
         elif ! awk -v margin="${margin}" 'BEGIN { exit !(margin > 0) }'; then
           fail ThermalLimitReached "index=${index} temperature=${temperature} margin=${margin}"
-        elif ! awk -v draw="${power_draw}" -v limit="${power_limit}" 'BEGIN { exit !(draw <= limit) }'; then
-          fail PowerLimitExceeded "index=${index} draw=${power_draw} limit=${power_limit}"
+        fi
+
+        power_limit_threshold="$(
+          awk -v limit="${power_limit}" -v tolerance="${POWER_LIMIT_TOLERANCE_PERCENT}" \
+            'BEGIN { printf "%.2f", limit * (100 + tolerance) / 100 }'
+        )"
+        if [[ "${mode}" == baseline ]]; then
+          power_limit_excess_samples["${index}"]=0
+        elif awk -v draw="${power_draw}" -v threshold="${power_limit_threshold}" \
+          'BEGIN { exit !(draw > threshold) }'; then
+          excess_samples=$(( ${power_limit_excess_samples["${index}"]:-0} + 1 ))
+          power_limit_excess_samples["${index}"]="${excess_samples}"
+          if (( excess_samples >= POWER_LIMIT_CONSECUTIVE_SAMPLES )); then
+            fail PowerLimitExceeded \
+              "index=${index} draw=${power_draw} limit=${power_limit} threshold=${power_limit_threshold} consecutive_samples=${excess_samples}"
+          fi
+        else
+          power_limit_excess_samples["${index}"]=0
         fi
 
         if [[ "${mode}" == baseline ]]; then
@@ -309,8 +327,9 @@ data:
             "index=${index} volatile=${baseline_volatile_ecc["${index}"]}->${volatile_ecc} aggregate=${baseline_aggregate_ecc["${index}"]}->${aggregate_ecc}"
         fi
 
-        printf 'PROJECT_SIGNAL_MEASUREMENT index=%s product=%s temperature=%s thermal_margin=%s power_draw=%s power_limit=%s volatile_uncorrectable_ecc=%s aggregate_uncorrectable_ecc=%s throttle=%s\n' \
+        printf 'PROJECT_SIGNAL_MEASUREMENT index=%s product=%s temperature=%s thermal_margin=%s power_draw=%s power_limit=%s power_limit_threshold=%s power_excess_samples=%s volatile_uncorrectable_ecc=%s aggregate_uncorrectable_ecc=%s throttle=%s\n' \
           "${index}" "${product// /_}" "${temperature}" "${margin}" "${power_draw}" "${power_limit}" \
+          "${power_limit_threshold}" "${power_limit_excess_samples["${index}"]:-0}" \
           "${volatile_ecc}" "${aggregate_ecc}" "${throttle}"
       done <<<"${rows}"
     }
@@ -339,6 +358,8 @@ data:
         printf 'gpu_burn_commit=%s\n' "${GPU_BURN_COMMIT:-unknown}"
         printf 'duration_seconds=%s sample_interval_seconds=%s\n' \
           "${BURN_DURATION_SECONDS:-unset}" "${SAMPLE_INTERVAL_SECONDS:-unset}"
+        printf 'power_limit_tolerance_percent=%s power_limit_consecutive_samples=%s\n' \
+          "${POWER_LIMIT_TOLERANCE_PERCENT:-unset}" "${POWER_LIMIT_CONSECUTIVE_SAMPLES:-unset}"
         printf '%s\n' "${details}"
         tail -n 200 "${gpu_log}" 2>/dev/null || true
       } > /results/measurements.txt
@@ -355,6 +376,8 @@ data:
     if ! [[ "${EXPECTED_GPU_COUNT:-}" =~ ^[1-9][0-9]*$ &&
             "${BURN_DURATION_SECONDS:-}" =~ ^[1-9][0-9]*$ &&
             "${SAMPLE_INTERVAL_SECONDS:-}" =~ ^[1-9][0-9]*$ &&
+            "${POWER_LIMIT_TOLERANCE_PERCENT:-}" =~ ^[0-9]+$ &&
+            "${POWER_LIMIT_CONSECUTIVE_SAMPLES:-}" =~ ^[1-9][0-9]*$ &&
             "${CPU_WORKERS:-}" =~ ^[1-9][0-9]*$ &&
             "${MEMORY_MIB:-}" =~ ^[1-9][0-9]*$ &&
             "${STORAGE_MIB:-}" =~ ^[1-9][0-9]*$ ]]; then

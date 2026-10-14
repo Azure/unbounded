@@ -34,6 +34,8 @@ spec:
       - name: observed-gpu-allocatable
       - name: burn-duration-seconds
       - name: sample-interval-seconds
+      - name: power-limit-tolerance-percent
+      - name: power-limit-consecutive-samples
       - name: cpu-workers
       - name: memory-mib
       - name: storage-mib
@@ -88,6 +90,10 @@ spec:
             value: "{{`{{workflow.parameters.burn-duration-seconds}}`}}"
           - name: SAMPLE_INTERVAL_SECONDS
             value: "{{`{{workflow.parameters.sample-interval-seconds}}`}}"
+          - name: POWER_LIMIT_TOLERANCE_PERCENT
+            value: "{{`{{workflow.parameters.power-limit-tolerance-percent}}`}}"
+          - name: POWER_LIMIT_CONSECUTIVE_SAMPLES
+            value: "{{`{{workflow.parameters.power-limit-consecutive-samples}}`}}"
           - name: CPU_WORKERS
             value: "{{`{{workflow.parameters.cpu-workers}}`}}"
           - name: MEMORY_MIB

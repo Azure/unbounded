@@ -347,7 +347,9 @@ once per minute and fails closed on:
 - new kernel Xid messages;
 - uncorrectable volatile or aggregate ECC growth;
 - exhaustion of the device-reported thermal margin;
-- power draw above the device-reported enforced limit;
+- power draw above 105 percent of the device-reported enforced limit for three
+  consecutive one-minute samples, rejecting sustained material excess without
+  treating normal instantaneous power-cap sampling jitter as hardware failure;
 - early exit or failure of any required workload.
 
 The pod is privileged only to read the host kernel ring buffer for Xid
