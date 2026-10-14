@@ -754,19 +754,24 @@ pub mod rest {
         }
 
         fn validate_request(&self, method: Method, path: &str, bearer: Option<&str>) -> Result<()> {
-            // Bearer credentials belong only to enrollment, never an established route.
+            // The server owns query grammar (`after=`), so only the route is checked here.
+            let route = path.split_once('?').map_or(path, |(route, _)| route);
+            // A bearer token authenticates enrollment and the keyring fetch on a
+            // connection without a client certificate; the server accepts bearer
+            // GET /v1/keyring there because peer trust roots arrive only in the
+            // keyring bundle. It rejects bearer plus certificate together, and
+            // snapshots always require mutual TLS.
             let allowed = match self.authentication {
                 Authentication::Bootstrap => {
-                    matches!(method, Method::Post)
-                        && path == "/v1/bootstrap"
-                        && bearer.is_some_and(|token| !token.is_empty())
+                    bearer.is_some_and(|token| !token.is_empty())
+                        && match method {
+                            Method::Post => path == "/v1/bootstrap",
+                            Method::Get => route == "/v1/keyring",
+                        }
                 }
                 Authentication::Authenticated(_) => {
                     matches!(method, Method::Get)
-                        && matches!(
-                            path.split_once('?').map_or(path, |(route, _)| route),
-                            "/v1/snapshot" | "/v1/keyring"
-                        )
+                        && matches!(route, "/v1/snapshot" | "/v1/keyring")
                         && bearer.is_none()
                 }
             };
@@ -2297,8 +2302,34 @@ pub mod rest {
                     (Method::Get, "/v1/keyring", None, false, true),
                     (Method::Get, "/v1/keyring?after=1", None, false, true),
                     (Method::Get, "/v1/snapshot", Some("token"), false, false),
-                    (Method::Get, "/v1/keyring", Some("token"), false, false),
+                    (Method::Get, "/v1/keyring", Some("token"), true, false),
+                    (
+                        Method::Get,
+                        "/v1/keyring?after=1",
+                        Some("token"),
+                        true,
+                        false,
+                    ),
                     (Method::Get, "/v1/keyring", Some(""), false, false),
+                    (Method::Post, "/v1/keyring", Some("token"), false, false),
+                    (Method::Get, "/v1/keyring/", Some("token"), false, false),
+                    (Method::Get, "/v1/%6beyring", Some("token"), false, false),
+                    (Method::Get, "//v1/keyring", Some("token"), false, false),
+                    (Method::Get, "/v1/./keyring", Some("token"), false, false),
+                    (
+                        Method::Get,
+                        "https://example.com/v1/keyring",
+                        Some("token"),
+                        false,
+                        false,
+                    ),
+                    (
+                        Method::Get,
+                        "/v1/snapshot?after=1",
+                        Some("token"),
+                        false,
+                        false,
+                    ),
                     (Method::Post, "/v1/snapshot", None, false, false),
                     (Method::Get, "/v1/snapshot/", None, false, false),
                     (Method::Get, "/v1/%73napshot", None, false, false),
