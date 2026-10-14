@@ -1,0 +1,364 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: certificationruns.signal.unbounded-cloud.io
+spec:
+  group: signal.unbounded-cloud.io
+  names:
+    kind: CertificationRun
+    listKind: CertificationRunList
+    plural: certificationruns
+    shortNames:
+    - certrun
+    singular: certificationrun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.profile.name
+      name: Profile
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.verdict
+      name: Verdict
+      type: string
+    - jsonPath: .status.workflow.name
+      name: Workflow
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              backend:
+                properties:
+                  apiVersion:
+                    type: string
+                  kind:
+                    type: string
+                  queue:
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                type: object
+              cancel:
+                type: boolean
+              deadline:
+                type: string
+              evidencePath:
+                type: string
+              maxAttempts:
+                format: int32
+                type: integer
+              parameters:
+                additionalProperties:
+                  type: string
+                type: object
+              participants:
+                items:
+                  properties:
+                    nodeName:
+                      type: string
+                    nodeUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                  required:
+                  - nodeName
+                  - nodeUID
+                  type: object
+                type: array
+              profile:
+                properties:
+                  generation:
+                    format: int64
+                    type: integer
+                  name:
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+              purpose:
+                enum:
+                - FullCertification
+                - QuickCertification
+                - Preflight
+                - TargetedVerification
+                - Diagnostic
+                type: string
+              requestNodeName:
+                type: string
+              runnerImage:
+                type: string
+              script:
+                properties:
+                  configMapName:
+                    type: string
+                  digest:
+                    type: string
+                  key:
+                    type: string
+                required:
+                - configMapName
+                - digest
+                - key
+                type: object
+              stagePlan:
+                items:
+                  properties:
+                    category:
+                      type: string
+                    conditional:
+                      type: boolean
+                    description:
+                      type: string
+                    displayName:
+                      type: string
+                    expectedDuration:
+                      type: string
+                    id:
+                      type: string
+                    required:
+                      type: boolean
+                  required:
+                  - category
+                  - displayName
+                  - id
+                  - required
+                  type: object
+                type: array
+              tolerations:
+                items:
+                  description: |-
+                    The pod this Toleration is attached to tolerates any taint that matches
+                    the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: |-
+                        Effect indicates the taint effect to match. Empty means match all taint effects.
+                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: |-
+                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: |-
+                        Operator represents a key's relationship to the value.
+                        Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                        Exists is equivalent to wildcard for value, so that a pod can
+                        tolerate all taints of a particular category.
+                        Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                      type: string
+                    tolerationSeconds:
+                      description: |-
+                        TolerationSeconds represents the period of time the toleration (which must be
+                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                        it is not set, which means tolerate the taint forever (do not evict). Zero and
+                        negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: |-
+                        Value is the taint value the toleration matches to.
+                        If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                type: array
+              workflow:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - backend
+            - deadline
+            - evidencePath
+            - maxAttempts
+            - participants
+            - profile
+            - requestNodeName
+            - runnerImage
+            - script
+            - workflow
+            type: object
+            x-kubernetes-validations:
+            - message: profile is immutable
+              rule: self.profile == oldSelf.profile
+            - message: participants are immutable
+              rule: self.participants == oldSelf.participants
+            - message: script is immutable
+              rule: self.script == oldSelf.script
+            - message: workflow is immutable
+              rule: self.workflow == oldSelf.workflow
+            - message: backend is immutable
+              rule: self.backend == oldSelf.backend
+            - message: runnerImage is immutable
+              rule: self.runnerImage == oldSelf.runnerImage
+            - message: parameters are immutable
+              rule: has(self.parameters) == has(oldSelf.parameters) && (!has(self.parameters)
+                || self.parameters == oldSelf.parameters)
+            - message: evidencePath is immutable
+              rule: self.evidencePath == oldSelf.evidencePath
+            - message: deadline is immutable
+              rule: self.deadline == oldSelf.deadline
+            - message: maxAttempts is immutable
+              rule: self.maxAttempts == oldSelf.maxAttempts
+            - message: tolerations are immutable
+              rule: has(self.tolerations) == has(oldSelf.tolerations) && (!has(self.tolerations)
+                || self.tolerations == oldSelf.tolerations)
+            - message: requestNodeName is immutable
+              rule: self.requestNodeName == oldSelf.requestNodeName
+            - message: purpose is immutable
+              rule: has(self.purpose) == has(oldSelf.purpose) && (!has(self.purpose)
+                || self.purpose == oldSelf.purpose)
+            - message: stagePlan is immutable
+              rule: has(self.stagePlan) == has(oldSelf.stagePlan) && (!has(self.stagePlan)
+                || self.stagePlan == oldSelf.stagePlan)
+          status:
+            properties:
+              cleanup:
+                properties:
+                  reservationsReleased:
+                    type: boolean
+                  snapshotDeleted:
+                    type: boolean
+                type: object
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              evidence:
+                properties:
+                  digest:
+                    type: string
+                  uri:
+                    type: string
+                type: object
+              executionState:
+                type: string
+              finishedAt:
+                format: date-time
+                type: string
+              phase:
+                type: string
+              reason:
+                type: string
+              startedAt:
+                format: date-time
+                type: string
+              verdict:
+                type: string
+              workflow:
+                properties:
+                  attempt:
+                    format: int32
+                    type: integer
+                  name:
+                    type: string
+                  phase:
+                    type: string
+                  uid:
+                    type: string
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
