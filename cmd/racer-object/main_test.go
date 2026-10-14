@@ -51,7 +51,7 @@ func TestOptionsDefaults(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if o.cache != "racer-object" || o.namespace != "store" || len(o.buckets) != 0 {
+			if o.cache != "racer-object" || o.namespace != "store" || len(o.buckets) != 0 || o.logLevel != "info" {
 				t.Fatalf("unexpected shared defaults: %+v", o)
 			}
 
@@ -150,6 +150,15 @@ func TestCacheFlag(t *testing.T) {
 	}
 }
 
+func TestOptionsLogLevel(t *testing.T) {
+	for _, mode := range []string{"origin", "sidecar"} {
+		o, err := parseOptions([]string{mode, "--namespace=store", "--log-level=debug"}, io.Discard)
+		if err != nil || o.logLevel != "debug" {
+			t.Fatalf("%s: log level %q, err %v", mode, o.logLevel, err)
+		}
+	}
+}
+
 func TestOptionsErrors(t *testing.T) {
 	for _, args := range [][]string{
 		nil,
@@ -168,6 +177,8 @@ func TestOptionsErrors(t *testing.T) {
 		{"sidecar", "--namespace=store", "--region=us-east-1"},
 		{"sidecar", "--namespace=store", "extra"},
 		{"sidecar", "--namespace=store", "--listen=0.0.0.0:8080"},
+		{"origin", "--namespace=store", "--log-level=warn"},
+		{"sidecar", "--namespace=store", "--log-level="},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := parseOptions(args, io.Discard); err == nil {

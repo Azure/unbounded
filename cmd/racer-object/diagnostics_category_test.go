@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/pkg/racersdk"
@@ -45,6 +46,8 @@ func TestDiagnosticCategoryTLS(t *testing.T) {
 }
 
 func TestLogSidecarFailure(t *testing.T) {
+	useTestLogLimiter(t, time.Now)
+
 	output := captureDiagnosticLog(t)
 
 	logSidecarFailure(object.SidecarFailure{

@@ -63,6 +63,7 @@ type options struct {
 	metadataTTL    time.Duration
 	requestTimeout time.Duration
 	listen         string
+	logLevel       string
 }
 
 func main() {
@@ -110,6 +111,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	fs.StringVar(&o.namespace, "namespace", "", "Required stable upstream identity; use the same value in origin and sidecar")
 	fs.Var(&o.buckets, "bucket", "Allowed bucket (repeatable; omitted allows all buckets)")
 
+	fs.StringVar(&o.logLevel, "log-level", logLevelInfo, "Diagnostic log level: info or debug; debug also logs expected outcomes")
+
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
 		fs.StringVar(&o.region, "region", "", "AWS region (defaults to AWS configuration and environment)")
@@ -155,6 +158,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		if _, err := object.NewRequest(o.namespace, bucket, "validation", ""); err != nil {
 			return o, errors.New("invalid --bucket")
 		}
+	}
+
+	if o.logLevel != logLevelInfo && o.logLevel != logLevelDebug {
+		return o, errors.New("--log-level must be info or debug")
 	}
 
 	if o.requestTimeout <= 0 {
@@ -259,6 +266,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if ctx.Err() != nil {
 		return nil
 	}
+
+	diagnosticDebug.Store(o.logLevel == logLevelDebug)
 
 	if o.mode == "origin" {
 		return runOrigin(ctx, o)

@@ -220,13 +220,14 @@ func TestOriginRuntimeDiagnostics(t *testing.T) {
 		t.Fatal("successful origin request changed or logged")
 	}
 
-	cause := fmt.Errorf("%s: %w", diagnosticSecret, racersdk.ErrForbidden)
+	// Forbidden is an expected outcome logged only at debug level.
+	cause := fmt.Errorf("%s: %w", diagnosticSecret, racersdk.ErrUnavailable)
 	origin = diagnoseOrigin(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		return racersdk.Metadata{}, nil, cause
 	})
 
 	_, _, err = origin(context.Background(), racersdk.OriginRequest{})
-	if !errors.Is(err, cause) || !strings.Contains(output.String(), "mode=origin event=request_failed category=forbidden") || strings.Contains(output.String(), diagnosticSecret) {
+	if !errors.Is(err, cause) || !strings.Contains(output.String(), "mode=origin event=request_failed category=unavailable") || strings.Contains(output.String(), diagnosticSecret) {
 		t.Fatal("origin cause lost or diagnostic unsafe")
 	}
 

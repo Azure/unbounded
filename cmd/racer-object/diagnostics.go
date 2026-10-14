@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -161,7 +162,8 @@ func diagnoseOrigin(origin racersdk.Origin) racersdk.Origin {
 
 		metadata, body, err := origin(ctx, request)
 		if err != nil {
-			log.Printf("racer-object: mode=origin event=request_failed category=%s", diagnosticCategory(err, "upstream"))
+			category := diagnosticCategory(err, "upstream")
+			logOutcome("origin", category, "racer-object: mode=origin event=request_failed category="+category)
 		}
 
 		return metadata, body, err
@@ -171,6 +173,7 @@ func diagnoseOrigin(origin racersdk.Origin) racersdk.Origin {
 // logSidecarFailure logs a sidecar 5xx. Only fixed fields are printed: the
 // method is one of GET or HEAD, and the bucket was validated by the sidecar.
 func logSidecarFailure(failure object.SidecarFailure) {
-	log.Printf("racer-object: mode=sidecar event=response_failed method=%s status=%d category=%s bucket=%q",
-		failure.Method, failure.Status, diagnosticCategory(failure.Err, "upstream"), failure.Bucket)
+	category := diagnosticCategory(failure.Err, "upstream")
+	logOutcome("sidecar", category, fmt.Sprintf("racer-object: mode=sidecar event=response_failed method=%s status=%d category=%s bucket=%q",
+		failure.Method, failure.Status, category, failure.Bucket))
 }
