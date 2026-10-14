@@ -388,11 +388,12 @@ func ServePXECmd() *cobra.Command {
 
 func resolveMediaTFTPServer(raw string, serverIP net.IP) (string, error) {
 	if raw != "" {
-		if ip := net.ParseIP(raw); ip == nil || ip.To4() == nil || ip.IsUnspecified() {
+		ip := net.ParseIP(raw)
+		if ip == nil || ip.To4() == nil || ip.IsUnspecified() {
 			return "", fmt.Errorf("--media-tftp-server must be an advertised IPv4 address")
 		}
 
-		return raw, nil
+		return ip.To4().String(), nil
 	}
 
 	if ip := serverIP.To4(); ip != nil && !ip.IsUnspecified() {

@@ -62,9 +62,11 @@ func TestResolveMediaTFTPServer(t *testing.T) {
 		wantErr  bool
 	}{
 		{name: "explicit IPv4", raw: "192.0.2.2", want: "192.0.2.2"},
+		{name: "explicit IPv4-mapped IPv6", raw: "::ffff:192.0.2.2", want: "192.0.2.2"},
 		{name: "explicit overrides server IP", raw: "192.0.2.2", serverIP: net.ParseIP("192.0.2.1"), want: "192.0.2.2"},
 		{name: "explicit with unspecified bind", raw: "192.0.2.2", serverIP: net.IPv4zero, want: "192.0.2.2"},
 		{name: "default IPv4", serverIP: net.ParseIP("192.0.2.1"), want: "192.0.2.1"},
+		{name: "default IPv4-mapped IPv6", serverIP: net.ParseIP("::ffff:192.0.2.1"), want: "192.0.2.1"},
 		{name: "default four-byte IPv4", serverIP: net.ParseIP("192.0.2.1").To4(), want: "192.0.2.1"},
 		{name: "default unspecified IPv4", serverIP: net.IPv4zero},
 		{name: "default nil"},
