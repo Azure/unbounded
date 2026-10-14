@@ -521,8 +521,39 @@ func taintGatewayNode(ctx context.Context, clientset kubernetes.Interface, nodeN
 	return nil
 }
 
+var (
+	gatewayTaintRemovalMaxAttempts  = 5
+	gatewayTaintRemovalInitialDelay = 100 * time.Millisecond
+	gatewayTaintRemovalMaxDelay     = time.Second
+)
+
+// isRetryableGatewayTaintPatchError reports whether a taint removal patch lost
+// a race with another writer. A failed JSON patch test operation is returned as
+// a 422 without object details, whereas admission denials also use 422 by
+// default but name the rejected object and are not retried.
+func isRetryableGatewayTaintPatchError(err error) bool {
+	if apierrors.IsConflict(err) {
+		return true
+	}
+
+	if !apierrors.IsInvalid(err) {
+		return false
+	}
+
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+
+	details := status.Status().Details
+
+	return details == nil || (details.Kind == "" && details.Name == "")
+}
+
 func removeGatewayNodeTaint(ctx context.Context, clientset kubernetes.Interface, nodeName string) error {
-	for {
+	delay := gatewayTaintRemovalInitialDelay
+
+	for attempt := 1; ; attempt++ {
 		node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("get node before removing gateway taint: %w", err)
@@ -558,11 +589,26 @@ func removeGatewayNodeTaint(ctx context.Context, clientset kubernetes.Interface,
 		}
 
 		if _, err := clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
-			if apierrors.IsConflict(err) || apierrors.IsInvalid(err) {
-				continue
+			if !isRetryableGatewayTaintPatchError(err) {
+				return fmt.Errorf("remove gateway taint: %w", err)
 			}
 
-			return fmt.Errorf("remove gateway taint: %w", err)
+			if attempt >= gatewayTaintRemovalMaxAttempts {
+				return fmt.Errorf("remove gateway taint after %d attempts: %w", attempt, err)
+			}
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+
+				return fmt.Errorf("remove gateway taint: %w", errors.Join(err, context.Cause(ctx)))
+			case <-timer.C:
+			}
+
+			delay = min(delay*2, gatewayTaintRemovalMaxDelay)
+
+			continue
 		}
 
 		klog.Infof("Removed gateway taint from node %s", nodeName)
