@@ -1337,3 +1337,95 @@ func TestReaperRequeuesForReleaseDrop(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ledger.ReleaseRetention+time.Second, result.RequeueAfter)
 }
+
+// TestEvictorHandoffDuringDelete changes the node's owner while a delete
+// authorized by the old grant is still pending. The new grant cannot be
+// created until after the delete's deadline, so the pending delete cannot
+// remove a pod the new grant admitted.
+func TestEvictorHandoffDuringDelete(t *testing.T) {
+	old := grant("tenant-a", "g", "n1", time.Hour)
+	old.UID = "a"
+	handoff := grant("tenant-b", "g", "n1", time.Hour)
+	handoff.UID = "b"
+
+	var r *evictor
+
+	deletes := 0
+	funcs := &interceptor.Funcs{Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		deletes++
+
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok, "delete has no deadline")
+
+		pending := time.Until(deadline)
+		require.Positive(t, pending)
+		require.LessOrEqual(t, pending, ledger.HandoffCooldown-handoffMargin)
+
+		// tenant-a releases the node while the delete is in flight.
+		var cm corev1.ConfigMap
+		require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm))
+
+		now := r.clock.Now()
+		l := ledger.Parse(cm.Data)
+		require.True(t, l.Remove(old.Key(), now))
+
+		// tenant-b is refused until well after the delete's deadline.
+		var cooldown *ledger.CooldownError
+		require.ErrorAs(t, l.CheckCooldown(handoff.Nodes, now), &cooldown)
+		require.GreaterOrEqual(t, cooldown.RetryAfter-pending, handoffMargin)
+
+		cm.Data = l.Encode()
+		require.NoError(t, c.Update(ctx, &cm))
+
+		return c.Delete(ctx, obj, opts...)
+	}}
+
+	r, c := newEvictor(t, configMap(t, old), funcs, pod("tenant-b", "p", "n1", testNow))
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}})
+	require.NoError(t, err)
+	require.Equal(t, 1, deletes)
+	require.Empty(t, remaining(t, c))
+}
+
+// TestEvictorSkipsDeleteAfterDeadline checks that a delete is not issued
+// once the deadline set by the ledger read that authorized it has passed.
+func TestEvictorSkipsDeleteAfterDeadline(t *testing.T) {
+	var r *evictor
+
+	meta, deletes := 0, 0
+	funcs := &interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*metav1.PartialObjectMetadata); ok {
+				meta++
+				// The check before the delete is slow.
+				if meta == 3 {
+					fc, ok := r.clock.(*clocktesting.FakeClock)
+					require.True(t, ok)
+					fc.Step(ledger.HandoffCooldown - handoffMargin)
+				}
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			deletes++
+
+			return c.Delete(ctx, obj, opts...)
+		},
+	}
+
+	r, c := newEvictor(t, configMap(t, grant("tenant-a", "g", "n1", time.Hour)), funcs, pod("tenant-b", "p", "n1", testNow))
+
+	res, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}})
+	require.NoError(t, err)
+	require.Equal(t, time.Millisecond, res.RequeueAfter)
+	require.Zero(t, deletes)
+	require.Equal(t, []string{"tenant-b/p"}, remaining(t, c))
+
+	// The next sweep reads the ledger again and deletes the pod.
+	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}})
+	require.NoError(t, err)
+	require.Equal(t, 1, deletes)
+	require.Empty(t, remaining(t, c))
+}

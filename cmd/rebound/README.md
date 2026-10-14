@@ -160,7 +160,9 @@ authorization are also accepted. Run `rebound --help` for the full list.
   leader removes an expired grant late. Pods created after expiry are not deleted
   by that release. If the leader cannot process a release before its record is
   dropped, pod deletions can be missed.
-- The leader checks the ledger right before each pod delete, but the check and the
-  delete are separate API calls. If a node changes hands between them, a pod that
-  the new grant allows can still be deleted. Wait for the old grant's pods to be
-  gone before granting a node to a new namespace if this matters.
+- A node cannot be granted again for 10 seconds after its grant expires or is
+  deleted. Creating a grant on it before then fails with `409 Conflict` and a
+  `retryAfterSeconds` hint. The leader checks the ledger right before each pod
+  delete and gives up on any delete it cannot finish within 6 seconds of that
+  check, so deletes allowed by the old grant are done before the next grant
+  starts. This assumes rebound replica clocks agree to within a few seconds.

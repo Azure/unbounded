@@ -32,6 +32,14 @@ const sweepInterval = 15 * time.Second
 // keeps changing before it gives up and retries with backoff.
 const maxListAttempts = 3
 
+// handoffMargin is how long before ledger.HandoffCooldown ends a delete
+// authorized by a ledger read must be finished. It covers the time a release
+// write takes between the API server reading its clock and the write
+// committing, the time a delete takes to commit after its context ends, and
+// clock skew between rebound replicas. Each delete runs within
+// HandoffCooldown minus this margin of the read that authorized it.
+const handoffMargin = 4 * time.Second
+
 // evictor deletes pods that a grant does not allow on its nodes:
 //
 //   - While a grant is active, pods from other namespaces.
@@ -146,6 +154,23 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		// Within one version, the grant can only change by expiring, so a
 		// metadata read is enough. A new version is read in full and only
 		// stops the sweep if it changed this node's records.
+		//
+		// The read also starts the delete's deadline. A release that the
+		// read did not see commits after checkedAt, and its ReleasedAt is
+		// at most handoffMargin earlier. The API server rejects new grants
+		// on the node for ledger.HandoffCooldown after ReleasedAt, so a
+		// delete that ends by the deadline cannot remove a pod that a new
+		// grant admitted. A grant that expires is released at ExpiresAt,
+		// which is after checkedAt because of the expiry check below.
+		// Clocks of rebound replicas are assumed to agree within the
+		// margin; the controller and API server run in the same binary
+		// but can be on different replicas.
+		//
+		// Deletes for release records get the same deadline, though they
+		// do not need it: they only match pods created before ReleasedAt,
+		// which no later grant admitted.
+		checkedAt := r.clock.Now()
+
 		current, err := r.liveLedgerVersion(ctx)
 		if err != nil {
 			errs = append(errs, err)
@@ -172,16 +197,28 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 			break
 		}
 
+		timeout := checkedAt.Add(ledger.HandoffCooldown - handoffMargin).Sub(r.clock.Now())
+		if timeout <= 0 {
+			superseded = true
+			break
+		}
+
 		ctrl.LoggerFrom(ctx).Info("deleting pod not allowed by node grant", "node", node, "pod", client.ObjectKeyFromObject(pod))
 
 		// The resourceVersion precondition makes the delete fail with a
 		// conflict if the pod changed since it was listed, for example by
 		// finishing. Conflicts are ignored and the next sweep looks again.
-		// Nothing ties this delete to the ledger version checked above, so a
-		// handoff that lands between the two calls can still delete a pod
-		// the new grant allows. The README lists this as a known limit.
-		err = r.client.Delete(ctx, pod, client.GracePeriodSeconds(0),
+		deleteCtx, cancel := context.WithTimeout(ctx, timeout)
+		err = r.client.Delete(deleteCtx, pod, client.GracePeriodSeconds(0),
 			client.Preconditions{UID: &pod.UID, ResourceVersion: &pod.ResourceVersion})
+
+		cancel()
+
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			superseded = true
+			break
+		}
+
 		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 			errs = append(errs, err)
 		}
