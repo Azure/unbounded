@@ -135,6 +135,59 @@ func TestMediaFirstBootFrozenLeaseAndReports(t *testing.T) {
 	}
 }
 
+func TestMediaFirstBootReportStatusPatch(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		eventType   string
+		patchErr    error
+		wantCode    int
+		wantRetry   string
+		wantPatches int
+	}{
+		{name: "success", eventType: "finish", wantCode: http.StatusOK, wantPatches: 1},
+		{name: "patch failure", eventType: "finish", patchErr: fmt.Errorf("status patch unavailable"), wantCode: http.StatusServiceUnavailable, wantRetry: "5", wantPatches: 1},
+		{name: "no condition update", eventType: "unknown", wantCode: http.StatusOK},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _, op := firstBootFixture(t)
+			patches := 0
+			h.Media.Client = interceptor.NewClient(h.Media.Client.(client.WithWatch), interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, c client.Client, subResource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					require.Equal(t, "status", subResource)
+					require.Equal(t, client.ObjectKeyFromObject(op), client.ObjectKeyFromObject(obj))
+
+					patches++
+
+					if tt.patchErr != nil {
+						return tt.patchErr
+					}
+
+					return c.SubResource(subResource).Patch(ctx, obj, patch, opts...)
+				},
+			})
+
+			body := `{"name":"modules-final","event_type":"` + tt.eventType + `","result":"SUCCESS"}`
+			w := firstBootRequest(h, "/cloudinit/log", "192.0.2.20", body)
+			require.Equal(t, tt.wantCode, w.Code, w.Body.String())
+			require.Equal(t, tt.wantRetry, w.Header().Get("Retry-After"))
+			require.Equal(t, tt.wantPatches, patches)
+			require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+
+			cond := apimeta.FindStatusCondition(op.Status.Targets[0].Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+			if tt.patchErr == nil && tt.wantPatches > 0 {
+				require.NotNil(t, cond)
+				require.Equal(t, metav1.ConditionTrue, cond.Status)
+				require.Equal(t, "Succeeded", cond.Reason)
+			} else {
+				require.Nil(t, cond)
+			}
+
+			require.Empty(t, op.Status.Targets[1].Conditions)
+			require.Empty(t, h.StatusRecorder.(*recordingStatusRecorder).conditionEvents())
+		})
+	}
+}
+
 func TestMediaFirstBootAuthorization(t *testing.T) {
 	for _, scenario := range []string{"uid mismatch", "uid mismatch live lease", "site changed", "abandoned", "not written", "no reboot", "ambiguous", "released successor"} {
 		t.Run(scenario, func(t *testing.T) {

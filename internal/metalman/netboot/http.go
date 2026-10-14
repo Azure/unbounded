@@ -384,6 +384,10 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		if owner != nil {
 			if err := h.Media.recordFirstBootCondition(r.Context(), owner, &ev); err != nil {
 				log.Error("recording media cloud-init condition", "operation", owner.op.Name, "err", err)
+				w.Header().Set("Retry-After", "5")
+				http.Error(w, "cannot save media cloud-init condition", http.StatusServiceUnavailable)
+
+				return
 			}
 
 			w.WriteHeader(http.StatusOK)
