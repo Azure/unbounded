@@ -426,6 +426,28 @@ impl CandidatePolicy {
                 .is_some_and(|policy| policy.owns_current(page))
         })
     }
+    pub(crate) fn ownership_pass(self: &Rc<Self>) -> crate::retention::OwnershipPass {
+        let policy = Rc::downgrade(self);
+        Rc::new(move || {
+            let policy = policy.upgrade();
+            let snapshot = policy
+                .as_ref()
+                .and_then(|p| p.published.current().ok().flatten());
+            Rc::new(move |page| {
+                policy
+                    .as_ref()
+                    .zip(snapshot.as_ref())
+                    .is_some_and(|(policy, snapshot)| {
+                        policy.placement.is_owner(
+                            &snapshot.membership,
+                            &page.version.object,
+                            page.number,
+                            &policy.node,
+                        )
+                    })
+            })
+        })
+    }
     /// Retention is a hint from CURRENT publication, not the read's leased route.
     /// This callback is lookup-only: no cold scoring or cache eviction. Missing
     /// and obsolete results contribute no bonus, never a storage pin.
@@ -434,14 +456,14 @@ impl CandidatePolicy {
             .current()
             .ok()
             .flatten()
-            .and_then(|snapshot| {
-                self.placement.cached(
-                    snapshot.membership.clone(),
+            .is_some_and(|snapshot| {
+                self.placement.is_owner(
+                    &snapshot.membership,
                     &page.version.object,
                     page.number,
+                    &self.node,
                 )
             })
-            .is_some_and(|candidates| self.is_candidate(&candidates))
     }
 
     /// Call once per worker service turn, also when no reads are arriving.
@@ -1654,6 +1676,13 @@ pub(crate) struct Permit {
     capacity: flow_control::HedgePermit,
 }
 impl Hedges {
+    pub(crate) fn for_worker(&self, metrics: Metrics) -> Arc<Self> {
+        Arc::new(Self {
+            config: self.config,
+            capacity: self.capacity.clone(),
+            metrics,
+        })
+    }
     pub(crate) fn new(config: HedgeConfig, metrics: Metrics) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
@@ -2497,6 +2526,8 @@ pub(super) mod tests {
             let weak_policy = Rc::downgrade(&policy);
             let callback = policy.ownership_callback();
             retention.set_ownership(callback.clone());
+            let prepare = policy.ownership_pass();
+            retention.set_ownership_pass(prepare.clone());
             let page = crate::model::PageId {
                 version: ObjectVersion {
                     object: object(),
@@ -2507,6 +2538,18 @@ pub(super) mod tests {
             assert!(!callback(&page));
             futures::executor::block_on(policy.refresh_ownership_scoped(&page, &scope())).unwrap();
             assert!(callback(&page));
+            let snapshot = policy.published.current().unwrap().unwrap();
+            let snapshot_refs = Arc::strong_count(&snapshot);
+            let membership_refs = Arc::strong_count(&snapshot.membership);
+            let pinned = prepare();
+            assert_eq!(Arc::strong_count(&snapshot), snapshot_refs + 1);
+            for _ in 0..256 {
+                assert!(pinned(&page));
+            }
+            assert_eq!(Arc::strong_count(&snapshot), snapshot_refs + 1);
+            assert_eq!(Arc::strong_count(&snapshot.membership), membership_refs);
+            drop(pinned);
+            assert_eq!(Arc::strong_count(&snapshot), snapshot_refs);
             assert_eq!(Rc::strong_count(&policy), 1);
             drop(retention);
             assert!(weak_retention.upgrade().is_some());
@@ -2516,6 +2559,7 @@ pub(super) mod tests {
             assert!(weak_memory.upgrade().is_none());
             assert!(weak_retention.upgrade().is_none());
             assert!(!callback(&page));
+            assert!(!prepare()(&page));
         }
     }
     #[test]
@@ -2625,6 +2669,37 @@ pub(super) mod tests {
 
     mod hedging {
         use super::*;
+        #[test]
+        fn worker_handles_share_capacity_but_not_counter_shards() {
+            let metrics = Metrics::for_workers(2).unwrap();
+            let first = Hedges::new(
+                HedgeConfig {
+                    slots: 1,
+                    bytes: DUPLICATE_BYTES,
+                    delay: Duration::from_millis(1),
+                },
+                metrics[0].clone(),
+            )
+            .unwrap();
+            let second = first.for_worker(metrics[1].clone());
+            let permit = second.acquire().unwrap();
+            assert!(matches!(first.acquire(), Err(Error::Overloaded)));
+            first.suppressed();
+            permit.started();
+            permit.won();
+            for event in [
+                Event::PageHedgeStarted,
+                Event::PageHedgeWon,
+                Event::PageHedgeDuplicateBytes,
+            ] {
+                assert_eq!(metrics[0].writer_count(event), 0);
+                assert!(metrics[1].writer_count(event) > 0);
+            }
+            assert_eq!(metrics[0].writer_count(Event::PageHedgeSuppressed), 1);
+            assert_eq!(metrics[1].writer_count(Event::PageHedgeSuppressed), 0);
+            drop(permit);
+            assert!(first.acquire().is_ok());
+        }
         use crate::model::RequestId;
         use crate::read::tests::page;
         use crate::runtime::RequestScope;

@@ -374,6 +374,23 @@ impl Placement {
         (ranking.cursor == membership.members().len()).then(|| ranking.candidates())
     }
 
+    /// Test the first three cached owners without allocating a candidate list.
+    /// Missing, partial, and obsolete rankings return false.
+    pub fn is_owner<M: Member>(
+        &self,
+        membership: &Membership<M>,
+        key: &[u8],
+        matches: impl Fn(usize) -> bool,
+    ) -> bool {
+        let cache = self.cache.borrow();
+        let Some(ranking) = cache.entries.get(&(membership.identity(), slot::<M>(key))) else {
+            return false;
+        };
+        let ranking = ranking.borrow();
+        ranking.cursor == membership.members().len()
+            && ranking.best.iter().take(3).any(|score| matches(score.node))
+    }
+
     /// Refresh one resident key with at most 256 scores and 64 CLOCK visits.
     /// Repeat with the same key until complete. Changing placement or key drops
     /// obsolete partial work. No cache-sized scan or foreground admission pin is
@@ -606,6 +623,29 @@ impl Placement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_owner_matches_top_three_and_rejects_missing_partial_obsolete() {
+        let placement = Placement::new(4);
+        let members = membership(1000);
+        let key = b"owner";
+        assert!(!placement.is_owner(&members, key, |_| true));
+        let mut pending = Box::pin(placement.rank_async(&members, key));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        assert!(!placement.is_owner(&members, key, |_| true));
+        let ranked = futures::executor::block_on(pending).unwrap();
+        for index in 0..members.members().len() {
+            assert_eq!(
+                placement.is_owner(&members, key, |i| i == index),
+                ranked.iter().take(3).any(|i| *i == index)
+            );
+        }
+        assert!(!placement.is_owner(&membership(1001), key, |_| true));
+        let disabled = Placement::new(0);
+        disabled.rank(&members, key).unwrap();
+        assert!(!disabled.is_owner(&members, key, |_| true));
+    }
 
     use std::{num::NonZeroU32, task::Context};
 

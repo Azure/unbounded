@@ -390,6 +390,19 @@ impl Placement {
             .map(|ranked| candidates(membership, ranked))
     }
 
+    pub fn is_owner(
+        &self,
+        membership: &Membership,
+        object: &ObjectId,
+        page: PageNumber,
+        node: &NodeId,
+    ) -> bool {
+        self.inner
+            .is_owner(&membership.inner, &encoded_key(object, page), |index| {
+                &membership.members()[index].node == node
+            })
+    }
+
     /// One bounded resident refresh turn: at most 256 scores and 64 CLOCK visits.
     pub fn refresh(
         &self,

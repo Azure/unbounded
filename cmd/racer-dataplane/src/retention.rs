@@ -63,7 +63,20 @@ impl Drop for Payload {
         gauge.set(gauge.get() - self.bytes);
     }
 }
-type Ownership = Rc<dyn Fn(&PageId) -> bool>;
+pub(crate) type Ownership = Rc<dyn Fn(&PageId) -> bool>;
+pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
+
+pub(crate) struct Scoring<'a> {
+    retention: &'a Retention,
+    ownership: Ownership,
+    now: Instant,
+}
+impl Scoring<'_> {
+    pub(crate) fn score(&self, page: &PageId) -> u8 {
+        self.retention
+            .score_owned_at(page, self.now, (self.ownership)(page))
+    }
+}
 #[derive(Default)]
 struct Counters {
     observations: AtomicU64,
@@ -75,6 +88,7 @@ pub struct Retention {
     state: RefCell<State>,
 
     ownership: RefCell<Ownership>,
+    ownership_pass: RefCell<Option<OwnershipPass>>,
 
     counters: Counters,
 
@@ -107,6 +121,7 @@ impl Retention {
         Ok(Self {
             state: RefCell::new(State { history, heat }),
             ownership: RefCell::new(Rc::new(|_| false)),
+            ownership_pass: RefCell::new(None),
             counters: Counters::default(),
             enabled,
             disk: Cell::new([DiskClassSnapshot::default(); 2]),
@@ -116,6 +131,21 @@ impl Retention {
     }
     pub fn set_ownership(&self, classify: Ownership) {
         *self.ownership.borrow_mut() = classify;
+        *self.ownership_pass.borrow_mut() = None;
+    }
+    pub(crate) fn set_ownership_pass(&self, prepare: OwnershipPass) {
+        *self.ownership_pass.borrow_mut() = Some(prepare);
+    }
+    pub(crate) fn scoring_at(&self, now: Instant) -> Scoring<'_> {
+        let ownership = match self.ownership_pass.borrow().as_ref() {
+            Some(prepare) => prepare(),
+            None => self.ownership.borrow().clone(),
+        };
+        Scoring {
+            retention: self,
+            ownership,
+            now,
+        }
     }
     /// Current cache-only classification; missing/stale ownership hints are false.
     /// Does not insert history, touch heat, or initiate a placement ranking.
@@ -179,6 +209,9 @@ impl Retention {
     }
     fn score_at(&self, page: &PageId, now: Instant) -> u8 {
         let owned = self.is_owned(page);
+        self.score_owned_at(page, now, owned)
+    }
+    fn score_owned_at(&self, page: &PageId, now: Instant, owned: bool) -> u8 {
         let mut state = self.state.borrow_mut();
         let heat = state.heat.score(page, now);
         if self.enabled {
@@ -270,6 +303,46 @@ impl Retention {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
+        let clock = uring_runtime::environment::SimulationClock::new(51);
+        let _environment = clock.environment(0).enter();
+        let policy = Retention::new(4096, 1).unwrap();
+        let owned = Rc::new(Cell::new(true));
+        let calls = Rc::new(Cell::new(0));
+        policy.set_ownership_pass(Rc::new({
+            let owned = owned.clone();
+            let calls = calls.clone();
+            move || {
+                calls.set(calls.get() + 1);
+                let owned = owned.get();
+                Rc::new(move |_| owned)
+            }
+        }));
+        policy.track(&page(0));
+        policy.touch(&page(0));
+        let now = uring_runtime::environment::now();
+        let scoring = policy.scoring_at(now);
+        owned.set(false);
+        for _ in 0..256 {
+            assert_eq!(scoring.score(&page(0)), 2);
+            assert_eq!(scoring.score(&page(1)), 1);
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            policy
+                .scoring_at(now + Duration::from_secs(60))
+                .score(&page(0)),
+            0
+        );
+        assert_eq!(calls.get(), 2);
+        policy.set_ownership(Rc::new(|_| true));
+        assert_eq!(policy.scoring_at(now).score(&page(1)), 1);
+        assert_eq!(calls.get(), 2);
+        let disabled = Retention::configured(4096, 1, PERIOD, false).unwrap();
+        disabled.set_ownership(Rc::new(|_| true));
+        assert_eq!(disabled.scoring_at(now).score(&page(0)), 0);
+    }
     fn page(number: u64) -> PageId {
         PageId {
             version: crate::model::ObjectVersion {

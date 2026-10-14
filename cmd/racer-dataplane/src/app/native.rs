@@ -102,6 +102,9 @@ impl WorkerApplication {
     /// Inventory withdrawal/GID changes invalidate in-progress activation before
     /// it can publish readiness. Existing generations drain on their native owner.
     pub(super) fn refresh_inventory(&mut self) -> Result<()> {
+        if self.devices.is_none() || self.node.inventory.generation() == self.inventory_generation {
+            return Ok(());
+        }
         let snapshot = self.node.inventory.snapshot()?;
         if snapshot.generation != self.inventory_generation {
             self.native_task.take();
@@ -130,6 +133,9 @@ impl WorkerApplication {
     pub(super) fn poll_native(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if self.stopping {
             self.native_task.take();
+            return Ok(());
+        }
+        if self.devices.is_none() {
             return Ok(());
         }
         self.refresh_inventory()?;

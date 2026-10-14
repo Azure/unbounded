@@ -109,12 +109,14 @@ impl<T: Generation> Published<T> {
         let mut retired = Vec::new();
         let mut state = self.state.lock().map_err(|_| Error::Internal)?;
         state.expire(now, &mut retired);
+        if retired.is_empty() {
+            return Ok(state.parts.get(&version).and_then(Weak::upgrade));
+        }
         // Release grace before resolving, so lookup cannot revive a part solely
         // because its expired structural owner is awaiting unlocked destruction.
         drop(state);
         drop(retired);
-        let mut state = self.state.lock().map_err(|_| Error::Internal)?;
-        state.parts.retain(|_, part| part.strong_count() != 0);
+        let state = self.state.lock().map_err(|_| Error::Internal)?;
         Ok(state.parts.get(&version).and_then(Weak::upgrade))
     }
 
@@ -423,5 +425,47 @@ mod tests {
         drop(rescued);
         assert!(cell.resolve(1, Instant::now()).unwrap().is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resolve_expired_weak_entry_is_pruned_on_next_pass() {
+        let cell = Arc::new(Published::new(Retention {
+            old_parts: 1,
+            grace_parts: 1,
+            grace_bytes: 1,
+            grace: Duration::from_secs(1),
+        }));
+        let now = Instant::now();
+        let drops = Arc::new(AtomicUsize::new(0));
+        for version in 1..=2 {
+            cell.publish(
+                Arc::new(Value {
+                    version,
+                    part: Arc::new(Part {
+                        owner: Arc::downgrade(&cell),
+                        drops: drops.clone(),
+                    }),
+                    rescue: None,
+                }),
+                now,
+                |_, _| Ok::<_, Error>(()),
+                || (),
+            )
+            .unwrap();
+        }
+        assert!(cell.resolve(1, now).unwrap().is_some());
+        assert!(cell.resolve(99, now).unwrap().is_none());
+        assert!(
+            cell.resolve(1, now + Duration::from_secs(1))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            cell.resolve(2, now + Duration::from_secs(1))
+                .unwrap()
+                .is_some()
+        );
+        assert!(!cell.state.lock().unwrap().parts.contains_key(&1));
     }
 }

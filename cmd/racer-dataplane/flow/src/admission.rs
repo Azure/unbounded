@@ -105,6 +105,11 @@ pub trait Observer {
     /// Record an admission or outcome event without reentering the owner.
     fn event(&self, event: Event);
 
+    /// Record on the caller's shard. Unsharded observers keep the default behavior.
+    fn event_on(&self, _shard: usize, event: Event) {
+        self.event(event);
+    }
+
     /// Publish the current active count without reentering the owner.
     fn active(&self, active: usize);
 
@@ -162,6 +167,7 @@ pub struct Permit<K: Ord + Clone, O: Observer> {
     generation: u64,
 
     probe: bool,
+    shard: usize,
 }
 
 impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
@@ -214,12 +220,17 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
 
     /// Admit work or one exclusive recovery probe without waiting.
     pub fn acquire(self: &Arc<Self>, key: &K) -> Result<Arc<Permit<K, O>>> {
+        self.acquire_on(key, 0)
+    }
+
+    /// Retain the caller's observer shard through completion.
+    pub fn acquire_on(self: &Arc<Self>, key: &K, shard: usize) -> Result<Arc<Permit<K, O>>> {
         let now = (self.now)();
         // Drop retired keys after the guard on every exit, since Drop may reenter.
         let retired;
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
-            self.observer.event(Event::Rejected);
+            self.observer.event_on(shard, Event::Rejected);
             return Err(Error::Overloaded);
         }
         if !state.peers.contains_key(key) && state.peers.len() == self.config.capacity {
@@ -235,7 +246,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                 })
                 .next();
             if retired.is_none() {
-                self.observer.event(Event::Rejected);
+                self.observer.event_on(shard, Event::Rejected);
                 return Err(Error::Overloaded);
             }
         }
@@ -250,11 +261,11 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         });
         if peer.generation.is_none() || peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now))
         {
-            self.observer.event(Event::CircuitRejected);
+            self.observer.event_on(shard, Event::CircuitRejected);
             return Err(Error::Unavailable);
         }
         if peer.active >= peer.limit {
-            self.observer.event(Event::Rejected);
+            self.observer.event_on(shard, Event::Rejected);
             return Err(Error::Overloaded);
         }
         let probe = peer.retry.is_some();
@@ -266,15 +277,16 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             .expect("admission rejects exhausted generations");
         state.active += 1;
         self.observer.active(state.active);
-        self.observer.event(Event::Accepted);
+        self.observer.event_on(shard, Event::Accepted);
         if probe {
-            self.observer.event(Event::Probe);
+            self.observer.event_on(shard, Event::Probe);
         }
         Ok(Arc::new(Permit {
             owner: self.clone(),
             key: key.clone(),
             generation,
             probe,
+            shard,
         }))
     }
 }
@@ -288,7 +300,9 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         };
         let config = self.owner.config;
         if outcome == Outcome::LocalPressure {
-            self.owner.observer.event(Event::LocalPressure);
+            self.owner
+                .observer
+                .event_on(self.shard, Event::LocalPressure);
             if now.saturating_duration_since(state.updated) >= config.backoff {
                 state.limit = (state.limit / 2).max(1);
                 state.updated = now;
@@ -314,7 +328,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
             Outcome::LocalPressure => Event::LocalPressure,
             Outcome::Neutral => return,
         };
-        self.owner.observer.event(event);
+        self.owner.observer.event_on(self.shard, event);
         if peer.generation != Some(self.generation) {
             return;
         }
@@ -1294,6 +1308,7 @@ mod handoff {
 /// Shared speculative capacity and explicitly polled due-time registrations.
 mod hedge {
     use crate::{Error, Result};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},
@@ -1327,6 +1342,7 @@ mod hedge {
         capacity: usize,
 
         state: Mutex<State>,
+        alarms: AtomicUsize,
     }
 
     /// Owns speculative capacity until both contenders reach their fences.
@@ -1344,6 +1360,7 @@ mod hedge {
                 slots,
                 capacity,
                 state: Mutex::new(State::default()),
+                alarms: AtomicUsize::new(0),
             })
         }
 
@@ -1364,6 +1381,7 @@ mod hedge {
                     wake: None,
                 },
             );
+            self.alarms.store(state.alarms.len(), Ordering::Release);
             Ok(Permit {
                 owner: self.clone(),
                 id,
@@ -1372,6 +1390,9 @@ mod hedge {
 
         /// Wake due registrations outside the shared lock, once per registration.
         pub fn poll(&self, now: Instant) {
+            if self.alarms.load(Ordering::Acquire) == 0 {
+                return;
+            }
             let wakes: Vec<_> = self
                 .state
                 .lock()
@@ -1414,6 +1435,9 @@ mod hedge {
             let alarm = self.owner.state.lock().ok().and_then(|mut state| {
                 let alarm = state.alarms.remove(&self.id)?;
                 state.used -= alarm.cost;
+                self.owner
+                    .alarms
+                    .store(state.alarms.len(), Ordering::Release);
                 Some(alarm)
             });
             drop(alarm);
@@ -1430,6 +1454,26 @@ mod hedge {
             task::{RawWaker, RawWakerVTable, Wake},
             time::Duration,
         };
+
+        #[test]
+        fn empty_poll_skips_lock_and_alarm_count_tracks_capacity() {
+            let owner = Hedges::new(1, 1);
+            let now = Instant::now();
+            let guard = owner.state.lock().unwrap();
+            owner.poll(now);
+            drop(guard);
+            let permit = owner.acquire(1, now).unwrap();
+            assert_eq!(owner.alarms.load(Ordering::Acquire), 1);
+            assert!(matches!(owner.acquire(1, now), Err(Error::Overloaded)));
+            assert_eq!(owner.alarms.load(Ordering::Acquire), 1);
+            owner.poll(now);
+            drop(permit);
+            assert_eq!(owner.alarms.load(Ordering::Acquire), 0);
+            let guard = owner.state.lock().unwrap();
+            owner.poll(now);
+            drop(guard);
+            assert_eq!(Hedges::new(0, 1).alarms.load(Ordering::Acquire), 0);
+        }
 
         /// Count alarm notifications across threads.
         #[derive(Default)]

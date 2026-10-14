@@ -1031,6 +1031,9 @@ pub struct Snapshot {
 }
 
 impl Inventory {
+    pub fn generation(&self) -> u64 {
+        self.0.generation()
+    }
     /// Read the shared physical inventory using Racer's publication types.
     pub fn snapshot(&self) -> Result<Snapshot> {
         Ok(snapshot(self.0.snapshot()?))

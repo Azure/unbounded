@@ -127,6 +127,7 @@ pub struct Subscriptions {
 #[derive(Default)]
 struct State {
     now: u64,
+    next_prune: u64,
 
     entries: HashMap<EntryKey, Entry>,
 
@@ -448,6 +449,10 @@ impl State {
         self.now = self.now.max(now);
         self.fanout
             .expire(self.now, || Error::DeadlineExceeded, &mut self.wake);
+        if self.now < self.next_prune {
+            return;
+        }
+        self.next_prune = self.now.saturating_add(100);
         self.entries.retain(|_, entry| {
             // Retain the spent contract for the signature freshness window after
             // expiry. Replaying it on a fresh socket cannot renew its deadline.
@@ -711,6 +716,33 @@ mod tests {
     }
     fn schedule(s: &Arc<Subscriptions>, sub: Subscription, receiver: &str) -> Result<Selection> {
         s.schedule(sub, MembershipVersion(1), NodeId(receiver.into()), 1000, 1)
+    }
+    #[test]
+    fn prune_gate_keeps_exact_deadlines_and_bounds_retired_contract_delay() {
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        let key = scheduler
+            .admit(
+                subscription(1, 0, 1),
+                MembershipVersion(1),
+                NodeId("a".into()),
+                50,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            scheduler.select(&key, 50, |_| Some(true)),
+            Err(Error::DeadlineExceeded)
+        ));
+        assert_eq!(scheduler.state.lock().unwrap().next_prune, 101);
+        scheduler.prune(60_049);
+        scheduler.prune(60_050);
+        assert_eq!(scheduler.state.lock().unwrap().entries.len(), 1);
+        scheduler.prune(60_148);
+        assert_eq!(scheduler.state.lock().unwrap().entries.len(), 1);
+        scheduler.prune(60_149);
+        assert!(scheduler.state.lock().unwrap().entries.is_empty());
+        scheduler.prune(0);
+        assert_eq!(scheduler.state.lock().unwrap().now, 60_149);
     }
     #[test]
     fn compact_demand_rejects_noncanonical_and_never_expands_pages() {

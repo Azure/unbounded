@@ -556,6 +556,10 @@ impl Fill {
             .writer
             .retention()
             .set_ownership(dependencies.candidates.ownership_callback());
+        dependencies
+            .writer
+            .retention()
+            .set_ownership_pass(dependencies.candidates.ownership_pass());
         Self {
             dependencies,
             metrics: Metrics::default(),

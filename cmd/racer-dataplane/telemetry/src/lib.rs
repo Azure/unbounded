@@ -331,7 +331,7 @@ impl SampleBudget {
 
 /// Fixed metric schemas, cache-line-isolated counters, and shared gauges.
 ///
-/// Counter updates and aggregation saturate; gauge increases wrap. All accesses
+/// Counter updates wrap and aggregation saturates; gauge increases wrap. All accesses
 /// use relaxed atomics: a scrape observes individual series, not an atomic
 /// registry snapshot. No synchronization of application data is implied.
 pub mod metrics {
@@ -449,20 +449,29 @@ pub mod metrics {
                 .collect()
         }
 
-        /// Saturate instead of wrapping a long-lived counter.
+        /// Add with wrapping atomic arithmetic; scrape sums saturate across shards.
         pub fn add(&self, metric: C, amount: u64) {
-            let _ = self.counter(self.shard, metric).fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |old| Some(old.saturating_add(amount)),
-            );
+            self.add_on(self.shard, metric, amount);
+        }
+
+        /// Record on a caller's writer shard in this registry.
+        pub fn add_on(&self, shard: usize, metric: C, amount: u64) {
+            assert!(shard < self.registry.shards, "invalid metrics shard");
+            self.counter(shard, metric)
+                .fetch_add(amount, Ordering::Relaxed);
         }
 
         /// Sum all writer shards, saturating on overflow.
         pub fn count(&self, metric: C) -> u64 {
             (0..self.registry.shards).fold(0u64, |total, shard| {
-                total.saturating_add(self.counter(shard, metric).load(Ordering::Relaxed))
+                total.saturating_add(self.count_on(shard, metric))
             })
+        }
+
+        /// Read one writer shard without aggregation.
+        pub fn count_on(&self, shard: usize, metric: C) -> u64 {
+            assert!(shard < self.registry.shards, "invalid metrics shard");
+            self.counter(shard, metric).load(Ordering::Relaxed)
         }
 
         /// Observe a shared gauge with a relaxed load.
@@ -752,6 +761,22 @@ pub mod metrics {
             TestMetrics::shards(0);
         }
 
+        #[test]
+        fn explicit_writer_updates_only_selected_shard() {
+            let workers = TestMetrics::shards(3);
+            workers[0].add_on(2, Event::A, 7);
+            assert_eq!(workers[0].count_on(0, Event::A), 0);
+            assert_eq!(workers[1].count_on(1, Event::A), 0);
+            assert_eq!(workers[2].count_on(2, Event::A), 7);
+            assert_eq!(workers[0].count(Event::A), 7);
+        }
+
+        #[test]
+        #[should_panic(expected = "invalid metrics shard")]
+        fn explicit_writer_rejects_invalid_shard() {
+            TestMetrics::shards(1)[0].add_on(1, Event::A, 1);
+        }
+
         /// Check actual allocation alignment and clone-to-writer mapping.
         #[test]
         fn fixed_registry_is_aligned_and_clones_keep_their_writer() {
@@ -779,7 +804,7 @@ pub mod metrics {
             assert_eq!(workers[0].count(Event::I), 6);
         }
 
-        /// Distinguish saturating counters, wrapping gauges, and checked leases.
+        /// Distinguish saturating sums, wrapping updates, and checked leases.
         #[test]
         fn saturation_and_gauge_wrapping_and_lease_lifetime() {
             let workers = TestMetrics::shards(2);
@@ -787,10 +812,7 @@ pub mod metrics {
             workers[1].add(Event::A, 2);
             assert_eq!(workers[0].count(Event::A), u64::MAX);
             workers[0].add(Event::A, 9);
-            assert_eq!(
-                workers[0].counter(0, Event::A).load(Ordering::Relaxed),
-                u64::MAX
-            );
+            assert_eq!(workers[0].counter(0, Event::A).load(Ordering::Relaxed), 7);
             workers[0].set(Level::Active, u64::MAX - 1);
             let lease = workers[1].lease(Level::Active).unwrap();
             assert!(workers[0].lease(Level::Active).is_none());

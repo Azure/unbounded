@@ -602,8 +602,9 @@ impl Index {
     /// never changed by retention, so checkpoint traversal remains monotonic.
     fn victim(&self, state: &State) -> Option<PageId> {
         let retention = self.retention();
+        let scoring = retention.scoring_at(uring_runtime::environment::now());
         state.pages.victim_if(64, |page, _| {
-            (!self.is_held(page)).then(|| u64::from(retention.score(page)))
+            (!self.is_held(page)).then(|| u64::from(scoring.score(page)))
         })
     }
     /// Reserve one potential new mapping, optionally evicting a low-value mapping.
@@ -962,9 +963,20 @@ impl Index {
     /// Sum live payload value, not padded disk size. At most 256 mappings are
     /// inspected per segment. Larger segments use a conservative upper bound for
     /// the unseen suffix; this is a preference, never an eviction exemption.
+    #[cfg(test)]
     fn segment_score(&self, segment: SegmentId) -> u64 {
-        let state = self.state.borrow();
         let retention = self.retention();
+        self.segment_score_with(
+            segment,
+            &retention.scoring_at(uring_runtime::environment::now()),
+        )
+    }
+    fn segment_score_with(
+        &self,
+        segment: SegmentId,
+        scoring: &crate::retention::Scoring<'_>,
+    ) -> u64 {
+        let state = self.state.borrow();
         state
             .pages
             .segment_score(segment, 256, crate::model::PAGE_BYTES * 4, |page, entry| {
@@ -972,7 +984,7 @@ impl Index {
                     .metadata
                     .page_length(page)
                     .unwrap_or(crate::model::PAGE_BYTES as u32);
-                u64::from(bytes) * u64::from(retention.score(page))
+                u64::from(bytes) * u64::from(scoring.score(page))
             })
     }
     pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
@@ -1131,13 +1143,16 @@ impl SegmentClock {
     /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
     /// a later poll; ownership and heat cannot prevent eventual reclamation.
     pub fn reclaim_now(&self) -> Result<()> {
+        let now = uring_runtime::environment::now();
+        let retention = self.index.retention();
+        let scoring = retention.scoring_at(now);
         self.clock
             .reclaim_scored(
                 &*self.index,
                 self.free_reserve,
                 self.budget.segment_visits,
                 self.budget.mapping_removals,
-                |segment| self.index.segment_score(segment),
+                |segment| self.index.segment_score_with(segment, &scoring),
             )
             .map_err(Into::into)
     }
@@ -1205,6 +1220,33 @@ mod tests {
     }
     fn index(capacity: usize) -> Index {
         Index::new(WorkerId(0), capacity, crate::test_support::availability())
+    }
+    #[test]
+    fn reclaim_and_index_victim_prepare_one_scoring_pass() {
+        let index = Rc::new(index(8));
+        index.set_page_capacity(4).unwrap();
+        let segments = Rc::new(segments(1024, 2));
+        for i in 0..2 {
+            drop(segments.append(1024).unwrap());
+            for j in 0..2 {
+                let (page, entry) = indexed(descriptor(&format!("{i}-{j}"), 17), i);
+                index.publish(page, entry).unwrap();
+            }
+        }
+        let calls = Rc::new(Cell::new(0));
+        index.retention().set_ownership_pass(Rc::new({
+            let calls = calls.clone();
+            move || {
+                calls.set(calls.get() + 1);
+                Rc::new(|_| true)
+            }
+        }));
+        assert!(index.victim(&index.state.borrow()).is_some());
+        assert_eq!(calls.get(), 1);
+        let clock = SegmentClock::new(index.clone(), segments, 1);
+        clock.reclaim_now().unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(index.snapshot().unwrap().entries.len(), 2);
     }
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         VersionMetadata {

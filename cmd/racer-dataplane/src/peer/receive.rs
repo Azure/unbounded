@@ -49,7 +49,7 @@ impl Config {
 pub(crate) struct Gate {
     config: Config,
 
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
 
     metrics: Metrics,
 }
@@ -73,6 +73,13 @@ pub(crate) struct Permit {
     _charge: Charge<AdmissionPolicy>,
 }
 impl Gate {
+    pub(crate) fn for_worker(&self, metrics: Metrics) -> Arc<Self> {
+        Arc::new(Self {
+            config: self.config,
+            state: self.state.clone(),
+            metrics,
+        })
+    }
     #[cfg(test)]
     pub(crate) fn new(config: Config) -> Result<Arc<Self>> {
         Self::with_metrics(config, Metrics::default())
@@ -81,7 +88,7 @@ impl Gate {
         config.validate()?;
         Ok(Arc::new(Self {
             config,
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
             metrics,
         }))
     }
@@ -259,6 +266,45 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_handles_share_fifo_but_not_counter_shards() {
+        let metrics = Metrics::for_workers(2).unwrap();
+        let first = Gate::with_metrics(
+            Config {
+                active: 1,
+                queued: 1,
+                ..Config::default()
+            },
+            metrics[0].clone(),
+        )
+        .unwrap();
+        let second = first.for_worker(metrics[1].clone());
+        let admission = Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let scope = RequestScope::new(
+            crate::model::RequestId([1; 16]),
+            now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let permit = futures::executor::block_on(second.acquire(&admission, &scope))
+            .unwrap()
+            .unwrap();
+        let ticket = second.enter(&admission, &scope).unwrap().unwrap();
+        assert!(matches!(
+            first.enter(&admission, &scope),
+            Err(Error::Overloaded)
+        ));
+        drop(ticket);
+        assert_eq!(metrics[0].writer_count(Event::PeerReceiveFull), 1);
+        assert_eq!(metrics[1].writer_count(Event::PeerReceiveFull), 0);
+        for event in [Event::PeerReceiveAdmitted, Event::PeerReceiveCancelled] {
+            assert_eq!(metrics[0].writer_count(event), 0);
+            assert_eq!(metrics[1].writer_count(event), 1);
+        }
+        drop(permit);
+        assert_eq!(metrics[0].gauge(Gauge::PeerReceiveActive), 0);
+    }
     use crate::model::RequestId;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Waker;

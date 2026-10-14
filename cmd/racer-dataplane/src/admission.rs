@@ -17,7 +17,7 @@ use flow_control::SharedQuotas;
 use racer_control_wire::CacheId;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::task::Waker;
 
@@ -54,13 +54,13 @@ impl flow_control::Class for ResourceClass {
 pub struct AdmissionPolicy {
     limits: Limits,
 
-    observer: Mutex<Observer>,
+    observer: OnceLock<Observer>,
 }
 impl Clone for AdmissionPolicy {
     fn clone(&self) -> Self {
         Self {
             limits: self.limits.clone(),
-            observer: Mutex::new(self.observer()),
+            observer: self.observer.clone(),
         }
     }
 }
@@ -68,20 +68,49 @@ impl AdmissionPolicy {
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
-            observer: Mutex::default(),
+            observer: OnceLock::new(),
         }
     }
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
     pub fn set_observer(&self, observer: Observer) {
-        *self.observer.lock().unwrap_or_else(|e| e.into_inner()) = observer;
+        assert!(
+            self.observer.set(observer).is_ok(),
+            "observer already installed"
+        );
     }
-    pub fn observer(&self) -> Observer {
+    pub fn observer(&self) -> &Observer {
+        static ABSENT: OnceLock<Observer> = OnceLock::new();
         self.observer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .get()
+            .unwrap_or_else(|| ABSENT.get_or_init(Observer::default))
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+
+    #[test]
+    fn observer_borrows_stable_storage_and_absent_read_does_not_install() {
+        let policy = AdmissionPolicy::new(crate::test_support::cluster::config(false).limits);
+        assert!(std::ptr::eq(policy.observer(), policy.observer()));
+        assert!(policy.observer.get().is_none());
+        policy.set_observer(Observer::default());
+        assert!(std::ptr::eq(
+            policy.observer(),
+            policy.observer.get().unwrap()
+        ));
+        assert!(policy.clone().observer.get().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "observer already installed")]
+    fn observer_rejects_reinstallation() {
+        let policy = AdmissionPolicy::new(crate::test_support::cluster::config(false).limits);
+        policy.set_observer(Observer::default());
+        policy.set_observer(Observer::default());
     }
 }
 

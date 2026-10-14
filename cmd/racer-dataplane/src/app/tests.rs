@@ -3646,12 +3646,46 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
     assert!(matches!(b.acquire(&peer), Err(Error::Overloaded)));
     assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionAccepted), 1);
     assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionRejected), 1);
+    assert_eq!(
+        node.metrics[0].1.writer_count(Event::PeerAdmissionAccepted),
+        1
+    );
+    assert_eq!(
+        node.metrics[1].1.writer_count(Event::PeerAdmissionAccepted),
+        0
+    );
+    assert_eq!(
+        node.metrics[0].1.writer_count(Event::PeerAdmissionRejected),
+        0
+    );
+    assert_eq!(
+        node.metrics[1].1.writer_count(Event::PeerAdmissionRejected),
+        1
+    );
     assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 1);
     assert_eq!(node.metrics[1].1.gauge(Gauge::PeerAdmissionLimit), 2);
     permit.observe(crate::peer::Outcome::PeerFailure);
+    assert_eq!(node.metrics[0].1.writer_count(Event::PeerLinkFailure), 1);
+    assert_eq!(node.metrics[1].1.writer_count(Event::PeerLinkFailure), 0);
     assert!(!b.available(&peer));
     drop(permit);
     assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 0);
+}
+
+#[test]
+fn disabled_rdma_turn_does_not_refresh_inventory() {
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (mut app, _, _) = local_worker(&config, &node, 0);
+    let generation = app.inventory_generation;
+    node.inventory.update(vec![]).unwrap();
+    node.inventory.restore(b"[]").unwrap();
+    assert_ne!(generation, node.inventory.generation());
+    assert!(app.devices.is_none());
+    app.refresh_inventory().unwrap();
+    app.poll_native(&mut Context::from_waker(futures::task::noop_waker_ref()))
+        .unwrap();
+    assert_eq!(app.inventory_generation, generation);
 }
 
 #[test]

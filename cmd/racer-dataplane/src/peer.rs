@@ -130,14 +130,19 @@ const BACKOFF: Duration = Duration::from_millis(250);
 const RECOVERY: Duration = Duration::from_secs(1);
 pub(crate) struct AdaptivePeers {
     inner: Arc<flow_control::Adaptive<NodeId, AdmissionObserver>>,
+    shard: usize,
 }
 pub(crate) use flow_control::AdaptiveOutcome as Outcome;
 pub(crate) type Permit = flow_control::AdaptivePermit<NodeId, AdmissionObserver>;
 pub(crate) struct AdmissionObserver(Metrics);
 impl flow_control::AdaptiveObserver for AdmissionObserver {
     fn event(&self, event: flow_control::AdaptiveEvent) {
+        self.event_on(self.0.writer_shard(), event);
+    }
+    fn event_on(&self, shard: usize, event: flow_control::AdaptiveEvent) {
         use flow_control::AdaptiveEvent as AdmissionEvent;
-        self.0.record(
+        self.0.record_on(
+            shard,
             match event {
                 AdmissionEvent::Rejected => Event::PeerAdmissionRejected,
                 AdmissionEvent::CircuitRejected => Event::PeerCircuitRejected,
@@ -164,6 +169,7 @@ impl AdaptivePeers {
     pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
+            shard: metrics.writer_shard(),
             inner: flow_control::Adaptive::new(
                 flow_control::AdaptiveConfig {
                     total: config.total,
@@ -181,8 +187,14 @@ impl AdaptivePeers {
     pub(crate) fn available(&self, node: &NodeId) -> bool {
         self.inner.available(node)
     }
+    pub(crate) fn for_worker(&self, metrics: &Metrics) -> Arc<Self> {
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            shard: metrics.writer_shard(),
+        })
+    }
     pub(crate) fn acquire(self: &Arc<Self>, node: &NodeId) -> Result<Arc<Permit>> {
-        self.inner.acquire(node).map_err(Into::into)
+        self.inner.acquire_on(node, self.shard).map_err(Into::into)
     }
 }
 

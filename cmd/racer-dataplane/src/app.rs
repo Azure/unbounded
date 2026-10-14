@@ -754,7 +754,7 @@ impl WorkerApplication {
                 crate::read::candidates::Hedges::new(config.page_hedge, node.metrics[0].1.clone())
                     .expect("validated hedge config")
             })
-            .clone();
+            .for_worker(metrics.clone());
         admission
             .policy()
             .set_observer(node.failures.observer(worker));
@@ -850,7 +850,7 @@ impl WorkerApplication {
                 limits.path_cache_bytes.get(),
                 limits.active_path_searches.get(),
             )
-            .with_peer_admission(node.peer_admission.clone()),
+            .with_peer_admission(node.peer_admission.for_worker(&metrics)),
         );
         let placement = Rc::new(Placement::with_memory_budget(
             limits.placement_cache_bytes.get(),
@@ -876,7 +876,9 @@ impl WorkerApplication {
                 config.peer_receive,
                 node.metrics[0].1.clone(),
             )?;
-            node.peer_receive.get_or_init(|| gate).clone()
+            node.peer_receive
+                .get_or_init(|| gate)
+                .for_worker(metrics.clone())
         })
         .with_reclamation(Self::ciphertext_reclaimer(
             admission.clone(),
@@ -895,7 +897,7 @@ impl WorkerApplication {
                 network.clone(),
             )
             .with_metrics(metrics.clone())
-            .with_observer(admission.policy().observer()),
+            .with_observer(admission.policy().observer().clone()),
         );
         let candidates = Rc::new(
             CandidatePolicy::new(
@@ -907,7 +909,7 @@ impl WorkerApplication {
             )
             .with_hedges(hedges)
             .with_attempt_timeout(config.peer_attempt_timeout)
-            .with_observer(admission.policy().observer()),
+            .with_observer(admission.policy().observer().clone()),
         );
         let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
             node.publications.clone(),
@@ -1138,7 +1140,8 @@ impl WorkerApplication {
             admission.clone(),
         ));
         let responses = Rc::new(
-            Responses::new(io.clone(), delivery).with_observer(admission.policy().observer()),
+            Responses::new(io.clone(), delivery)
+                .with_observer(admission.policy().observer().clone()),
         );
         let clients = ClientListeners::new(
             coordinator,
@@ -1394,7 +1397,7 @@ impl WorkerApplication {
         if work_budget == 0 {
             return Ok(());
         }
-        if let Some(hedges) = self.node.hedges.get() {
+        if let Some(hedges) = self.node.hedges.get().filter(|hedges| hedges.enabled()) {
             hedges.poll();
         }
         let budget = work_budget.min(64);

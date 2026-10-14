@@ -3,6 +3,7 @@
 use crate::{Error, PortInfo, Result};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum encoded size of the durable port reservation journal.
 pub const MAX_JOURNAL_BYTES: usize = 64 * 1024;
@@ -38,7 +39,7 @@ pub struct Snapshot {
 
 /// Process-wide port inventory retaining labels across withdrawals and restarts.
 #[derive(Default)]
-pub struct Inventory(Mutex<InventoryState>);
+pub struct Inventory(Mutex<InventoryState>, AtomicU64);
 
 /// Reservations include withdrawn ports so labels are never recycled.
 #[derive(Default)]
@@ -49,6 +50,10 @@ struct InventoryState {
 }
 
 impl Inventory {
+    /// Read the published generation without locking or cloning bindings.
+    pub fn generation(&self) -> u64 {
+        self.1.load(Ordering::Acquire)
+    }
     /// Read the last published snapshot without touching hardware.
     pub fn snapshot(&self) -> Result<Snapshot> {
         Ok(self
@@ -106,6 +111,7 @@ impl Inventory {
             state.snapshot.generation += 1;
             state.snapshot.nics = nics;
         }
+        self.1.store(state.snapshot.generation, Ordering::Release);
         Ok(state.snapshot.clone())
     }
 
@@ -142,6 +148,7 @@ impl Inventory {
         state.assigned = assigned;
         state.snapshot.nics.clear();
         state.snapshot.generation += 1;
+        self.1.store(state.snapshot.generation, Ordering::Release);
         Ok(())
     }
 }
@@ -277,6 +284,27 @@ pub fn inventory_at(mut ports: Vec<PortInfo>, root: &Path) -> Vec<PortInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_is_lock_free_and_tracks_only_published_changes() {
+        let inventory = Inventory::default();
+        assert_eq!(inventory.generation(), 0);
+        let nics = vec![binding("a", 0, None)];
+        assert_eq!(inventory.update(nics.clone()).unwrap().generation, 1);
+        let guard = inventory.0.lock().unwrap();
+        assert_eq!(inventory.generation(), 1);
+        drop(guard);
+        inventory.update(nics).unwrap();
+        assert_eq!(inventory.generation(), 1);
+        assert_eq!(inventory.restore(b"bad"), Err(Error::InvalidRequest));
+        assert_eq!(inventory.generation(), 1);
+        inventory.update(vec![binding("../bad", 0, None)]).unwrap();
+        assert_eq!(inventory.generation(), 2);
+        assert!(inventory.snapshot().unwrap().nics.is_empty());
+        inventory.restore(br#"[["a",1,0]]"#).unwrap();
+        assert_eq!(inventory.generation(), 3);
+        assert_eq!(inventory.snapshot().unwrap().generation, 3);
+    }
 
     /// Construct a physical binding with a distinct GID and known locality.
     fn binding(device: &str, rail: u16, numa_node: Option<usize>) -> Binding {

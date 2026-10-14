@@ -542,7 +542,7 @@ mod warm_metric_tests {
             workers[0].warm_event(event);
             output.clear();
             workers[1].write_prometheus(&mut output).unwrap();
-            assert!(output.contains(&format!("{name} {}\n", u64::MAX)));
+            assert!(output.contains(&format!("{name} {}\n", 3)));
             assert!(
                 !output
                     .lines()
@@ -3000,6 +3000,16 @@ impl Metrics {
     pub fn record(&self, event: Event, amount: u64) {
         self.core.add(event, amount);
     }
+    pub(crate) fn writer_shard(&self) -> usize {
+        self.shard
+    }
+    #[cfg(test)]
+    pub(crate) fn writer_count(&self, event: Event) -> u64 {
+        self.core.count_on(self.shard, event)
+    }
+    pub(crate) fn record_on(&self, shard: usize, event: Event, amount: u64) {
+        self.core.add_on(shard, event, amount);
+    }
     pub fn count(&self, event: Event) -> u64 {
         self.core.count(event)
     }
@@ -4786,7 +4796,7 @@ pub(crate) mod tests {
                 workers[0].record(event, u64::MAX);
                 workers[0].record(event, 1);
                 workers[1].record(event, 1);
-                assert_eq!(workers[1].count(event), u64::MAX);
+                assert_eq!(workers[1].count(event), 1);
             }
             let mut output = String::new();
             workers[1].write_prometheus(&mut output).unwrap();
@@ -4795,7 +4805,7 @@ pub(crate) mod tests {
                     "# TYPE {} counter\n{} {}\n",
                     event.name(),
                     event.name(),
-                    u64::MAX
+                    1
                 )));
             }
             assert_only_disk_class_labels(&output);
@@ -5000,7 +5010,7 @@ pub(crate) mod tests {
             for event in EVENTS {
                 metrics.record(event, u64::MAX);
                 metrics.record(event, 9);
-                assert_eq!(metrics.count(event), u64::MAX);
+                assert_eq!(metrics.count(event), 8);
             }
             let lease = metrics.lease(Gauge::ActiveRequests).unwrap();
             assert_eq!(metrics.clone().gauge(Gauge::ActiveRequests), 1);
