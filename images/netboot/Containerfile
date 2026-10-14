@@ -1,12 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG TARGETARCH
+# INSTALLER_KERNEL picks the installer kernel. The default, ubuntu, runs the
+# Ubuntu generic kernel, which the Ubuntu shim and GRUB verify, so the
+# installer boots with Secure Boot enabled. azurelinux runs the Azure Linux
+# kernel instead. It is published as the netboot-azurelinux image for arm64
+# hosts with the Microsoft MANA NIC, whose driver the arm64 Ubuntu kernel lacks.
+# The Ubuntu shim does not trust that kernel, so it needs Secure Boot turned off.
+ARG INSTALLER_KERNEL=ubuntu
 
-# The amd64 installer runs the Ubuntu generic kernel. The Ubuntu shim and GRUB
-# verify it, so the installer still boots with Secure Boot enabled. Its module
-# set already includes the Microsoft MANA NIC driver.
-FROM docker.io/library/ubuntu:24.04 AS kernel-amd64
+FROM docker.io/library/ubuntu:24.04 AS kernel-ubuntu
 
 RUN apt-get update && \
     ok=false && \
@@ -23,10 +26,7 @@ RUN apt-get update && \
     cp -a /lib/modules /out/modules && \
     rm -rf /var/lib/apt/lists/*
 
-# The arm64 Ubuntu generic kernel lacks the Microsoft MANA NIC driver, so the
-# arm64 installer runs the Azure Linux kernel. The Ubuntu shim does not trust
-# this kernel, so the arm64 installer needs Secure Boot turned off.
-FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS kernel-arm64
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS kernel-azurelinux
 
 RUN tdnf install -y kernel && \
     tdnf clean all && \
@@ -34,7 +34,7 @@ RUN tdnf install -y kernel && \
     cp -a /boot /out/boot && \
     cp -a /usr/lib/modules /out/modules
 
-FROM kernel-${TARGETARCH} AS kernel
+FROM kernel-${INSTALLER_KERNEL} AS kernel
 
 FROM docker.io/library/ubuntu:24.04 AS build
 

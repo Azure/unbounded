@@ -39,6 +39,7 @@ var releaseImageNames = []string{
 	"machine-ops-controller",
 	"metalman",
 	"netboot",
+	"netboot-azurelinux",
 	"orca",
 	"racer-controller",
 	"token-refresher",
