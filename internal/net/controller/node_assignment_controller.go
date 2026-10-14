@@ -183,18 +183,66 @@ func (c *NodeAssignmentController) syncNode(ctx context.Context, nodeName string
 			continue
 		}
 
-		uid := pod.UID
-
-		propagation := metav1.DeletePropagationBackground
-		if err := c.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
-			Preconditions:     &metav1.Preconditions{UID: &uid},
-			PropagationPolicy: &propagation,
-		}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete stale node-agent Pod %s/%s with UID %s: %w", pod.Namespace, pod.Name, pod.UID, err)
+		if err := c.deleteStaleAgentPod(ctx, nodeName, pod); err != nil {
+			return err
 		}
-
-		klog.Infof("Deleted node-agent Pod %s/%s to adopt Node %s assignment change (Site %q -> %q, GatewayPool %q -> %q)", pod.Namespace, pod.Name, nodeName, effectiveSite, desiredSite, effectiveGatewayPool, desiredGatewayPool)
 	}
+
+	return nil
+}
+
+// deleteStaleAgentPod revalidates a cached assignment mismatch against the
+// live Node and Pod before deleting. The Node and Pod informers are separate,
+// so an agent may already have acknowledged a Node update that the cache has
+// not observed.
+func (c *NodeAssignmentController) deleteStaleAgentPod(ctx context.Context, nodeName string, cachedPod *corev1.Pod) error {
+	node, err := c.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("get live Node %s before replacing node-agent Pod: %w", nodeName, err)
+	}
+
+	pod, err := c.clientset.CoreV1().Pods(cachedPod.Namespace).Get(ctx, cachedPod.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("get live node-agent Pod %s/%s: %w", cachedPod.Namespace, cachedPod.Name, err)
+	}
+
+	if pod.UID != cachedPod.UID || pod.DeletionTimestamp != nil || !isTargetNodeAgentPod(pod) {
+		return nil
+	}
+
+	effectiveSite, siteAcknowledged := pod.Annotations[unboundednetv1alpha1.EffectiveSiteAnnotation]
+
+	effectiveGatewayPool, gatewayAcknowledged := pod.Annotations[unboundednetv1alpha1.EffectiveGatewayPoolAnnotation]
+	if !siteAcknowledged || !gatewayAcknowledged {
+		return nil
+	}
+
+	desiredSite := NodeSiteLabel(node)
+
+	desiredGatewayPool := nodeGatewayPoolLabel(node)
+	if effectiveSite == desiredSite && effectiveGatewayPool == desiredGatewayPool {
+		return nil
+	}
+
+	uid, resourceVersion := pod.UID, pod.ResourceVersion
+
+	propagation := metav1.DeletePropagationBackground
+	if err := c.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+		Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+		PropagationPolicy: &propagation,
+	}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete stale node-agent Pod %s/%s with UID %s: %w", pod.Namespace, pod.Name, pod.UID, err)
+	}
+
+	klog.Infof("Deleted node-agent Pod %s/%s to adopt Node %s assignment change (Site %q -> %q, GatewayPool %q -> %q)", pod.Namespace, pod.Name, nodeName, effectiveSite, desiredSite, effectiveGatewayPool, desiredGatewayPool)
 
 	return nil
 }

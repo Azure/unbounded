@@ -184,7 +184,9 @@ spec:
   validationActions: ["Deny"]
 
 ---
-# GatewayPool names are written verbatim into Node label values.
+# GatewayPool names are written verbatim into Node label values. Names are
+# immutable, so only CREATE is checked; existing longer pools can still be
+# updated, drained, and finalized.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -198,7 +200,7 @@ spec:
     resourceRules:
       - apiGroups: ["net.unbounded-cloud.io"]
         apiVersions: ["v1alpha1"]
-        operations: ["CREATE", "UPDATE"]
+        operations: ["CREATE"]
         resources: ["gatewaypools"]
   validations:
     - expression: "object.metadata.name.size() <= 63"

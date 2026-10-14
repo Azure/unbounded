@@ -145,7 +145,7 @@ func TestGatewayPoolNamePolicy(t *testing.T) {
 
 	rule := rules[0].(map[string]any)
 	assertStringSliceField(t, rule, []string{"gatewaypools"}, "resources")
-	assertStringSliceField(t, rule, []string{"CREATE", "UPDATE"}, "operations")
+	assertStringSliceField(t, rule, []string{"CREATE"}, "operations")
 	assertStringSliceField(t, rule, []string{"net.unbounded-cloud.io"}, "apiGroups")
 
 	for _, name := range []string{"pool.raw", strings.Repeat("a", 63), strings.Repeat("a", 64)} {
