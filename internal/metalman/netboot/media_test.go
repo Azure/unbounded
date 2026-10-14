@@ -62,14 +62,19 @@ func firstBootFixture(t *testing.T) (*HTTPServer, *v1alpha3.Machine, *v1alpha3.M
 	return &HTTPServer{Media: p, FileResolver: *p.Resolver, StatusRecorder: &recordingStatusRecorder{}}, m, op
 }
 
-func firstBootRequest(h *HTTPServer, path, ip, body string) *httptest.ResponseRecorder {
+func firstBootRequest(h *HTTPServer, path, ip, body string, forwarded ...string) *httptest.ResponseRecorder {
 	method := http.MethodGet
 	if body != "" {
 		method = http.MethodPost
 	}
 
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
+
 	r.RemoteAddr = ip + ":4321"
+	if len(forwarded) > 0 {
+		r.Header.Set("X-Forwarded-For", forwarded[0])
+	}
+
 	w := httptest.NewRecorder()
 
 	switch path {
@@ -174,7 +179,13 @@ func TestMediaFirstBootAuthorization(t *testing.T) {
 				require.Equal(t, http.StatusNotFound, w.Code)
 			}
 
-			require.Equal(t, http.StatusOK, firstBootRequest(h, "/cloudinit/log", "192.0.2.20", `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`).Code)
+			report := firstBootRequest(h, "/cloudinit/log", "192.0.2.20", `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`)
+			if scenario == "released successor" || scenario == "abandoned" || scenario == "not written" {
+				require.Equal(t, http.StatusOK, report.Code)
+			} else {
+				require.Equal(t, http.StatusNotFound, report.Code)
+			}
+
 			require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
 
 			if scenario == "released successor" {
@@ -203,11 +214,118 @@ func TestMediaFirstBootIgnoresForwardedLease(t *testing.T) {
 
 	w = httptest.NewRecorder()
 	h.handleCloudInitLog(w, r)
-	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, http.StatusNotFound, w.Code)
 	o, claimed, err := h.Media.firstBootOwner(t.Context(), "192.0.2.20")
 	require.NoError(t, err)
 	require.True(t, claimed)
 	require.Empty(t, o.op.Status.Targets[o.index].Conditions)
+}
+
+func TestFirstBootForwardedAuthorization(t *testing.T) {
+	for _, scenario := range []string{
+		"forged live IP", "forged frozen IP", "direct live IP", "direct frozen IP",
+		"direct owner ignores XFF", "changed protocol", "before handoff", "no retained owner",
+		"completed media", "no provider", "PXE", "HTTP", "PXE without provider",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			for _, endpoint := range []struct{ path, body string }{
+				{path: "/cloud-init/meta-data"},
+				{path: "/cloud-init/user-data"},
+				{path: "/cloud-init/vendor-data"},
+				{path: "/cloud-init/network-config"},
+				{path: "/unbounded-agent/install-log", body: "install output"},
+				{path: "/cloudinit/log", body: `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`},
+			} {
+				t.Run(endpoint.path, func(t *testing.T) {
+					h, m, op := firstBootFixture(t)
+					fc := h.Media.Client
+					b := op.Status.Targets[0].BootMedia
+					m.Spec.Netboot().NetbootImage = b.Netboot.NetbootImage
+					m.Spec.Netboot().CloudInit = b.Netboot.CloudInit.DeepCopy()
+					remote, forwarded := "192.0.2.30", "192.0.2.99"
+					want := http.StatusNotFound
+					mediaReport := false
+					legacyReport := false
+
+					switch scenario {
+					case "forged live IP":
+						m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.20"
+						forwarded = "192.0.2.20"
+					case "forged frozen IP":
+						forwarded = "192.0.2.20"
+					case "direct live IP":
+						remote, forwarded = "192.0.2.99", ""
+					case "direct frozen IP":
+						remote, forwarded = "192.0.2.20", ""
+						want, mediaReport = http.StatusOK, true
+					case "direct owner ignores XFF":
+						other := m.DeepCopy()
+						other.Name, other.UID, other.ResourceVersion = "other", "other-uid", ""
+						other.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolPXE
+						other.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.40"
+						require.NoError(t, fc.Create(t.Context(), other))
+
+						remote, forwarded = "192.0.2.20", "192.0.2.40"
+						want, mediaReport = http.StatusOK, true
+					case "changed protocol":
+						m.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolPXE
+					case "before handoff":
+						m.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolPXE
+						b.ImageWritten, b.Released = false, false
+						b.RebootRequestedAt = nil
+					case "completed media":
+						apimeta.SetStatusCondition(&op.Status.Targets[0].Conditions, metav1.Condition{Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue, Reason: "Succeeded"})
+					case "no retained owner":
+						op.Status.Targets[0].BootMedia = nil
+					case "no provider":
+						h.Media = nil
+					case "PXE", "HTTP", "PXE without provider":
+						op.Status.Targets[0].BootMedia = nil
+
+						m.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolPXE
+						if scenario == "HTTP" {
+							m.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolHTTP
+						}
+
+						if scenario == "PXE without provider" {
+							h.Media = nil
+						}
+
+						want, legacyReport = http.StatusOK, true
+					}
+
+					require.NoError(t, fc.Update(t.Context(), m))
+					require.NoError(t, fc.Status().Update(t.Context(), op))
+					before := op.DeepCopy()
+					w := firstBootRequest(h, endpoint.path, remote, endpoint.body, forwarded)
+					require.Equal(t, want, w.Code, w.Body.String())
+					require.NoError(t, fc.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+
+					if mediaReport && endpoint.path == "/cloudinit/log" {
+						require.True(t, apimeta.IsStatusConditionTrue(op.Status.Targets[0].Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
+						require.Empty(t, op.Status.Conditions)
+						require.Empty(t, op.Status.Targets[1].Conditions)
+					} else {
+						require.Equal(t, before.Status, op.Status)
+					}
+
+					if want == http.StatusOK && endpoint.path == "/cloud-init/user-data" {
+						require.Equal(t, "#cloud-config\nhostname: frozen-host\n", w.Body.String())
+					}
+
+					recorder := h.StatusRecorder.(*recordingStatusRecorder)
+					if legacyReport && endpoint.path == "/cloudinit/log" {
+						require.Len(t, recorder.conditionEvents(), 1)
+						require.Equal(t, m.Name, recorder.conditionEvents()[0].machineName)
+						require.Equal(t, []string{m.Name}, recorder.cloudInitDoneEvents())
+					} else {
+						require.Empty(t, recorder.conditionEvents())
+						require.Empty(t, recorder.cloudInitDoneEvents())
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestMediaReleasedHistorySuccessorPrecedence(t *testing.T) {

@@ -363,11 +363,20 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
 	}
 
-	if h.Media != nil {
-		_, owner, err := h.firstBootMachine(r)
+	var node *v1alpha3.Machine
+
+	if h.Media != nil || h.Reader != nil {
+		var owner *mediaOwner
+
+		node, owner, err = h.firstBootMachine(r)
 		if err != nil {
 			log.Warn("cloud-init report has no authorized Machine", "err", err)
-			w.WriteHeader(http.StatusOK)
+
+			if errors.Is(err, errMediaFirstBootUnauthorized) {
+				http.NotFound(w, r)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
 
 			return
 		}
@@ -383,7 +392,7 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	machineName := h.recordCloudInitCondition(r.Context(), log, ip, &ev)
+	machineName := h.recordCloudInitCondition(r.Context(), log, node, &ev)
 	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
 	w.WriteHeader(http.StatusOK)
@@ -402,11 +411,16 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 
 	log := slog.With("ip", ip)
 
-	if h.Media != nil {
+	if h.Media != nil || h.Reader != nil {
 		node, owner, err := h.firstBootMachine(r)
 		if err != nil {
 			log.Warn("install log has no authorized Machine", "err", err)
-			w.WriteHeader(http.StatusOK)
+
+			if errors.Is(err, errMediaFirstBootUnauthorized) {
+				http.NotFound(w, r)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
 
 			return
 		}
@@ -421,19 +435,21 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// Only the direct peer can claim a frozen lease. Keep the existing live-IP
-// lookup when no retained first-boot owner claims that peer.
+var errMediaFirstBootUnauthorized = errors.New("no authorized media first-boot owner")
+
+// Only the direct peer can claim a frozen lease. Live-IP fallback, including
+// forwarding headers, is allowed only for Machines and leases without media owners.
 func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *mediaOwner, error) {
 	if h.Media != nil {
 		remote, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, err)
 		}
 
 		o, claimed, err := h.Media.firstBootOwner(r.Context(), remote)
 		if claimed {
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, err)
 			}
 
 			return o.machine, o, nil
@@ -441,6 +457,15 @@ func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *medi
 	}
 
 	node, err := h.LookupNodeByIP(r.Context(), clientIP(r))
+	if node != nil && node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
+		return nil, nil, errMediaFirstBootUnauthorized
+	}
+
+	if h.Media != nil {
+		if mediaErr := h.Media.rejectFirstBootFallback(r.Context(), node, clientIP(r)); mediaErr != nil {
+			return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, mediaErr)
+		}
+	}
 
 	return node, nil, err
 }
@@ -451,15 +476,8 @@ const cloudInitLastStage = "modules-final"
 
 // recordCloudInitCondition records the CloudInitDone condition for the active
 // MachineOperation targeting the Machine that matches the request source IP.
-func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
-	if h.Reader == nil {
-		return ""
-	}
-
-	node, err := h.LookupNodeByIP(ctx, ip)
-	if err != nil {
-		log.Error("cloud-init condition: looking up Machine", "ip", ip, "err", err)
-
+func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, ev *cloudInitEvent) string {
+	if node == nil {
 		return ""
 	}
 

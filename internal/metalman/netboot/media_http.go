@@ -82,6 +82,47 @@ func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOw
 	return found, found != nil, nil
 }
 
+// Retained media claims block live-IP fallback even after the Machine's IP or
+// protocol changes. Only firstBootOwner can authorize these requests.
+func (p *MediaProvider) rejectFirstBootFallback(ctx context.Context, machine *v1alpha3.Machine, ip string) error {
+	var ops v1alpha3.MachineOperationList
+	if err := p.Client.List(ctx, &ops); err != nil {
+		return err
+	}
+
+	for _, op := range ops.Items {
+		if op.Spec.OperationKind != v1alpha3.OperationHostReplace {
+			continue
+		}
+
+		for _, target := range op.Status.Targets {
+			b := target.BootMedia
+			if b == nil {
+				continue
+			}
+
+			cond := apimeta.FindStatusCondition(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+			reported := cond != nil && (cond.Status == metav1.ConditionTrue || (cond.Status == metav1.ConditionFalse && cond.Reason == "Failed"))
+
+			unconfirmed := !b.Abandoned && !reported && (b.ImageWritten || b.LoaderStartedAt != nil ||
+				(!b.Cleaned && (b.Phase == "PoweringOn" || b.Phase == "Installing" || b.Phase == "Installed")))
+			if b.Released && !unconfirmed {
+				continue
+			}
+
+			if machine != nil && target.MachineRef == machine.Name {
+				return errMediaFirstBootUnauthorized
+			}
+
+			if b.Netboot != nil && len(b.Netboot.DHCPLeases) > 0 && b.Netboot.DHCPLeases[0].IPv4 == ip {
+				return errMediaFirstBootUnauthorized
+			}
+		}
+	}
+
+	return nil
+}
+
 // Record against the authorized target, not a later operation for this Machine.
 func (p *MediaProvider) recordFirstBootCondition(ctx context.Context, o *mediaOwner, ev *cloudInitEvent) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
