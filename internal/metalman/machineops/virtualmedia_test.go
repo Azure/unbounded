@@ -187,6 +187,103 @@ func TestVirtualMediaDurableLifecycleAndRestart(t *testing.T) {
 	require.Empty(t, current.Finalizers)
 }
 
+func TestVirtualMediaForeignSiteReconcileLeavesTargetUntouched(t *testing.T) {
+	for _, sites := range []struct {
+		name       string
+		controller string
+		media      string
+	}{
+		{name: "two sites", controller: "site-a", media: "site-b"},
+		{name: "empty controller site", media: "site-b"},
+		{name: "empty media site", controller: "site-a"},
+	} {
+		for _, state := range []string{"installing", "cleanup pending", "cleaned", "released"} {
+			t.Run(sites.name+"/"+state, func(t *testing.T) {
+				r, d, machine, op := mediaFixture(t)
+				r.Site = sites.controller
+				machine.Labels = map[string]string{siteLabel: sites.media}
+				require.NoError(t, r.Update(t.Context(), machine))
+
+				op.Finalizers = []string{mediaFinalizer}
+				require.NoError(t, r.Update(t.Context(), op))
+				now := r.now()
+				op.Status.Phase = v1alpha3.OperationPhaseInProgress
+
+				op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+					MachineRef: machine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+					Stage: v1alpha3.OperationStageWaitingRepave, StartedAt: &now,
+					Message: "owning controller progress",
+					BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+						ID: "foreign-media", Site: sites.media, MachineUID: machine.UID,
+						Netboot: machine.Spec.Netboot().DeepCopy(), NodeName: machine.Name,
+						Phase: "Installing", PhaseStartedAt: &now,
+						ImageWritten: state != "installing", Cleaned: state == "cleaned" || state == "released",
+						StagedDeleted: state == "released", Released: state == "released",
+					},
+					Conditions: []metav1.Condition{{
+						Type:   v1alpha3.MachineOperationConditionCloudInitDone,
+						Status: metav1.ConditionTrue, Reason: "Succeeded", LastTransitionTime: now,
+					}},
+				}}
+				if state != "installing" {
+					op.Status.Targets[0].BootMedia.RebootRequestedAt = &now
+				}
+
+				require.NoError(t, r.Status().Update(t.Context(), op))
+				require.NoError(t, r.Create(t.Context(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}))
+
+				before := op.Status.Targets[0].DeepCopy()
+
+				current := mediaStep(t, r, op.Name)
+				require.Equal(t, *before, current.Status.Targets[0])
+				require.Contains(t, current.Finalizers, mediaFinalizer)
+				require.Nil(t, d.seen)
+				require.Empty(t, d.calls)
+
+				changes, _ := r.advanceTargets(t.Context(), current, nil)
+				require.Len(t, changes, 1)
+				require.True(t, changes[0].aggregateOnly)
+
+				current.Status.Targets[0] = completeTarget(current.Status.Targets[0], "owner completed", now).target
+				require.NoError(t, r.Status().Update(t.Context(), current))
+				completed := current.Status.Targets[0].DeepCopy()
+
+				require.NoError(t, r.applyTargetChanges(t.Context(), op.Name, changes, false))
+				require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), current))
+				require.Equal(t, *completed, current.Status.Targets[0])
+				require.Nil(t, d.seen)
+				require.Empty(t, d.calls)
+			})
+		}
+	}
+}
+
+func TestVirtualMediaMatchingSiteAdvancesCleanedTarget(t *testing.T) {
+	for _, site := range []string{"site-a", ""} {
+		t.Run("site="+site, func(t *testing.T) {
+			r, _, machine, op := mediaFixture(t)
+			r.Site = site
+			require.NoError(t, r.Create(t.Context(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}))
+			target := v1alpha3.MachineOperationTargetStatus{
+				MachineRef: machine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+					Site: site, Cleaned: true, NodeName: machine.Name, Netboot: machine.Spec.Netboot().DeepCopy(),
+					RebootRequestedAt: ptrTo(r.now()),
+				},
+				Conditions: []metav1.Condition{{
+					Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue, Reason: "Succeeded",
+				}},
+			}
+
+			change := r.advanceTarget(t.Context(), op, target)
+			require.NoError(t, change.err)
+			require.False(t, change.aggregateOnly)
+			require.Equal(t, v1alpha3.OperationPhaseComplete, change.target.Phase)
+			require.NotNil(t, change.target.CompletedAt)
+		})
+	}
+}
+
 func TestVirtualMediaUnsupportedBeforePower(t *testing.T) {
 	r, d, _, op := mediaFixture(t)
 	d.supported = false

@@ -381,6 +381,10 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 }
 
 func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus) targetChange {
+	if target.BootMedia != nil && target.BootMedia.Site != r.Site {
+		return targetChange{aggregateOnly: true}
+	}
+
 	now := r.now()
 	if target.StartedAt == nil {
 		target.StartedAt = &now
