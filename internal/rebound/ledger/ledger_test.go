@@ -4,12 +4,15 @@
 package ledger
 
 import (
+	"maps"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 func testGrant(name string, nodes ...string) *Grant {
@@ -101,6 +104,45 @@ func TestParseRepairs(t *testing.T) {
 	require.Equal(t, valid, Parse(data).Encode())
 }
 
+func TestParseDropsGrantsWithInvalidReleaseKey(t *testing.T) {
+	// ConfigMap keys share the DNS subdomain length limit.
+	maxUID := validation.DNS1123SubdomainMaxLength - len(releaseKeyPrefix)
+
+	valid := testGrant("valid", "node-a")
+	slash := testGrant("slash", "node-b")
+	slash.UID = "bad/uid"
+	long := testGrant("long", "node-c")
+	long.UID = types.UID(strings.Repeat("u", maxUID+1))
+	edge := testGrant("edge", "node-e")
+	edge.UID = types.UID(strings.Repeat("u", maxUID))
+	legacy := testGrant("legacy", "node-d")
+	legacy.UID = ""
+
+	data := map[string]string{}
+
+	for _, g := range []*Grant{valid, slash, long, edge, legacy} {
+		l := New()
+		require.NoError(t, l.Add(g))
+		maps.Copy(data, l.Encode())
+	}
+
+	l := Parse(data)
+	require.Equal(t, []*Grant{edge, legacy, valid}, l.Grants())
+
+	// Removing every grant must leave only keys the API server accepts.
+	removed, _ := l.Reap(valid.ExpiresAt, nil)
+	require.Len(t, removed, 3)
+
+	encoded := l.Encode()
+	require.Len(t, encoded, 2)
+	require.Contains(t, encoded, "_release.valid")
+	require.Contains(t, encoded, releaseKey(edge.UID))
+
+	for k := range encoded {
+		require.Empty(t, validation.IsConfigMapKey(k), k)
+	}
+}
+
 func TestAddAtomic(t *testing.T) {
 	l := New()
 	require.NoError(t, l.Add(testGrant("first", "node-b", "node-a")))
@@ -174,6 +216,8 @@ func TestReleaseRoundTrip(t *testing.T) {
 	data["_release."] = `{"namespace":"tenant","nodes":["node-a"]}`
 	data["_release.badnode"] = `{"namespace":"tenant","nodes":[""]}`
 	data["_release.badns"] = `{"namespace":"Tenant","nodes":["node-a"]}`
+	data["_release.bad/uid"] = `{"namespace":"tenant","nodes":["node-a"]}`
+	data["_release."+strings.Repeat("u", validation.DNS1123SubdomainMaxLength)] = `{"namespace":"tenant","nodes":["node-a"]}`
 	parsed := Parse(data)
 	require.Len(t, parsed.Releases(), 1)
 	require.Equal(t, types.UID("first"), parsed.Releases()[0].UID)

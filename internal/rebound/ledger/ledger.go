@@ -120,10 +120,11 @@ func New() *Ledger {
 	}
 }
 
-// Parse decodes ConfigMap data. It never fails: malformed records and
-// grants that claim a node already claimed by an earlier grant (in key order)
-// are dropped, and node keys are ignored. Comparing Encode() with the input
-// tells the caller whether a repair write is needed.
+// Parse decodes ConfigMap data. It never fails: malformed records, records
+// whose UID does not form a valid release key, and grants that claim a node
+// already claimed by an earlier grant (in key order) are dropped, and node
+// keys are ignored. Comparing Encode() with the input tells the caller whether
+// a repair write is needed.
 func Parse(data map[string]string) *Ledger {
 	l := New()
 
@@ -131,7 +132,7 @@ func Parse(data map[string]string) *Ledger {
 	for k, v := range data {
 		if strings.HasPrefix(k, grantKeyPrefix) {
 			keys = append(keys, k)
-		} else if uid, ok := strings.CutPrefix(k, releaseKeyPrefix); ok && uid != "" {
+		} else if uid, ok := strings.CutPrefix(k, releaseKeyPrefix); ok && validUID(types.UID(uid)) {
 			r := &Release{}
 			if err := json.Unmarshal([]byte(v), r); err == nil && validNames(r.Namespace, r.Nodes) {
 				r.UID = types.UID(uid)
@@ -160,6 +161,11 @@ func Parse(data map[string]string) *Ledger {
 			Selector json.RawMessage `json:"selector"`
 		}{Grant: g}
 		if err := json.Unmarshal([]byte(data[k]), &record); err != nil || !validNames(ns, g.Nodes) {
+			continue
+		}
+
+		// An empty UID is a legacy grant that records no release on removal.
+		if g.UID != "" && !validUID(g.UID) {
 			continue
 		}
 
@@ -193,6 +199,18 @@ func validNames(namespace string, nodes []string) bool {
 	return true
 }
 
+// validUID reports whether uid is non-empty and its release key is a valid
+// ConfigMap key. Removing a grant writes that key, so an invalid UID would
+// make the cleanup write fail and leave the grant in place.
+func validUID(uid types.UID) bool {
+	return uid != "" && len(validation.IsConfigMapKey(releaseKey(uid))) == 0
+}
+
+// releaseKey returns the ConfigMap key for a release record.
+func releaseKey(uid types.UID) string {
+	return releaseKeyPrefix + string(uid)
+}
+
 // Encode returns the ConfigMap data for the ledger.
 func (l *Ledger) Encode() map[string]string {
 	data := make(map[string]string, len(l.grants)+len(l.nodes)+len(l.releases))
@@ -204,7 +222,7 @@ func (l *Ledger) Encode() map[string]string {
 			panic(err)
 		}
 
-		data[releaseKeyPrefix+string(uid)] = string(b)
+		data[releaseKey(uid)] = string(b)
 	}
 
 	for key, g := range l.grants {
