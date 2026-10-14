@@ -16,9 +16,8 @@ type completionMessage struct {
 	Oem map[string]json.RawMessage `json:"Oem"`
 }
 
-// completion checks vendor Oem objects in key order for failures or invalid
-// codes. It reports success only if there is at least one code and every code
-// is Success.
+// completion checks vendor Oem objects in key order. Any code other than
+// Success is an error. It reports whether the message had at least one code.
 func (m completionMessage) completion() (bool, error) {
 	keys := make([]string, 0, len(m.Oem))
 	for key := range m.Oem {
@@ -27,7 +26,7 @@ func (m completionMessage) completion() (bool, error) {
 
 	slices.Sort(keys)
 
-	found, success := false, true
+	found := false
 
 	for _, key := range keys {
 		var fields map[string]json.RawMessage
@@ -59,11 +58,14 @@ func (m completionMessage) completion() (bool, error) {
 			return false, &completionFailure{description: description}
 		}
 
+		if *code != "Success" {
+			return false, fmt.Errorf("unexpected %s completion code %q", key, *code)
+		}
+
 		found = true
-		success = success && *code == "Success"
 	}
 
-	return found && success, nil
+	return found, nil
 }
 
 type completionFailure struct {

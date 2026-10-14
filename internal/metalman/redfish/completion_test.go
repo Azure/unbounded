@@ -24,6 +24,9 @@ func TestCompletionChecksAllVendors(t *testing.T) {
 			{"laterMessage", `"A":{"CompletionCode":"Success"}}},{"Oem":{"Z":{"CompletionCode":"Failure","Description":"later message failed"}`, "later message failed"},
 			{"invalidCode", `"A":{"CompletionCode":"Success"},"Z":{"CompletionCode":4}`, "parsing Z completion code"},
 			{"nullCode", `"A":{"CompletionCode":"Success"},"Z":{"CompletionCode":null}`, "parsing Z completion code"},
+			{"unknownCode", `"A":{"CompletionCode":"Unknown"}`, `unexpected A completion code "Unknown"`},
+			{"emptyCode", `"A":{"CompletionCode":""},"Z":{"CompletionCode":"Success"}`, `unexpected A completion code ""`},
+			{"unknownLaterCode", `"A":{"CompletionCode":"Success"},"Z":{"CompletionCode":"Unknown"}`, `unexpected Z completion code "Unknown"`},
 		} {
 			t.Run(fmt.Sprintf("%s/nested=%t", tc.name, nested), func(t *testing.T) {
 				body := `{"@Message.ExtendedInfo":[{"Oem":{` + tc.oem + `}}]}`
@@ -55,12 +58,10 @@ func TestCompletionErrorEnvelopePolicy(t *testing.T) {
 	}{
 		{"success", `"A":{"CompletionCode":"Success"},"Z":{"CompletionCode":"Success"}`, false},
 		{"noCode", `"A":{}`, true},
-		{"unknownCode", `"A":{"CompletionCode":"Unknown"}`, true},
-		{"emptyFirstCode", `"A":{"CompletionCode":""},"Z":{"CompletionCode":"Success"}`, true},
-		{"unknownLaterCode", `"A":{"CompletionCode":"Success"},"Z":{"CompletionCode":"Unknown"}`, true},
 		{"optionalDescription", `"A":{"CompletionCode":"Success","Description":4}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// An error envelope without a code is only rejected for rack managers.
 			body := `{"error":{"@Message.ExtendedInfo":[{"Oem":{` + tc.oem + `}}]}}`
 			require.NoError(t, checkCompletion([]byte(body)))
 			srv := rackServer(t, func(w http.ResponseWriter, _ *http.Request) {
