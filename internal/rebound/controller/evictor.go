@@ -33,9 +33,12 @@ const sweepInterval = 15 * time.Second
 //
 // Pods are deleted with a zero grace period and PodDisruptionBudgets do not
 // apply: the grant's TTL is the grace period.
+//
+// The ledger and pods are both read live. A cached ledger can lag behind the
+// live pod list, for example still showing a node's previous grant while the
+// pod list already holds pods admitted under its new one.
 type evictor struct {
 	client    client.Client
-	reader    client.Reader
 	apiReader client.Reader
 	namespace string
 	exempt    map[string]bool
@@ -49,7 +52,7 @@ type evictor struct {
 
 func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var cm corev1.ConfigMap
-	if err := r.reader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, &cm); err != nil {
+	if err := r.apiReader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, &cm); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 

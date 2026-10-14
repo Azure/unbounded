@@ -49,7 +49,7 @@ type Options struct {
 // all Nodes and Namespaces, plus ConfigMaps in opts.Namespace. Scope ConfigMaps
 // and Secrets to that namespace using per-object cache options, not a global
 // namespace restriction. These controllers do not read Secrets. The evictor
-// lists pods live, so Pods need not be cached.
+// reads the ledger and lists pods live, so Pods need not be cached.
 func Setup(mgr ctrl.Manager, opts Options) error {
 	if opts.Namespace == "" {
 		opts.Namespace = "unbounded-system"
@@ -97,7 +97,6 @@ func Setup(mgr ctrl.Manager, opts Options) error {
 
 	evictor := &evictor{
 		client:    mgr.GetClient(),
-		reader:    mgr.GetCache(),
 		apiReader: mgr.GetAPIReader(),
 		namespace: opts.Namespace,
 		exempt:    exempt,

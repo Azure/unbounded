@@ -55,7 +55,6 @@ func newEvictor(t *testing.T, cm *corev1.ConfigMap, funcs *interceptor.Funcs, po
 
 	return &evictor{
 		client:    c,
-		reader:    c,
 		apiReader: c,
 		namespace: "system",
 		exempt:    map[string]bool{"system": true, "kube-system": true},
@@ -112,6 +111,35 @@ func TestEvictorActiveGrant(t *testing.T) {
 		"tenant/own", "tenant/before", "kube-system/proxy", "system/agent", "other/elsewhere",
 		"other/mirror", "other/done", "other/failed",
 	}, remaining(t, c))
+}
+
+func TestEvictorReadsLiveLedger(t *testing.T) {
+	// The node moved from tenant-a's grant to tenant-b's grant. The cache still
+	// has the old ledger, but the pod list already has tenant-b's pods.
+	old := grant("tenant-a", "g", "n1", time.Hour)
+	old.UID = "a"
+	current := grant("tenant-b", "g", "n1", time.Hour)
+	current.UID = "b"
+	stale := configMap(t, old)
+
+	r, c := newEvictor(t, configMap(t, current), nil,
+		pod("tenant-a", "p", "n1", testNow),
+		pod("tenant-b", "p", "n1", testNow),
+	)
+	r.client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if cm, ok := obj.(*corev1.ConfigMap); ok {
+				stale.DeepCopyInto(cm)
+				return nil
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"tenant-b/p"}, remaining(t, c))
 }
 
 func TestEvictorRelease(t *testing.T) {
