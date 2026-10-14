@@ -108,7 +108,12 @@ link_disk_ids() {
                 model=$(trim_id "$(cat "$disk/device/model" 2>/dev/null || true)")
                 serial=$(trim_id "$(cat "$disk/device/serial" 2>/dev/null || true)")
                 wwid=$(trim_id "$(cat "$disk/wwid" 2>/dev/null || true)")
-                [ -n "$model" ] && [ -n "$serial" ] && ln -sfn "../../$name" "/dev/disk/by-id/nvme-${model}_${serial}"
+                nsid=$(cat "$disk/nsid" 2>/dev/null || true)
+                nsid=${nsid:-${name##*n}}
+                if [ -n "$model" ] && [ -n "$serial" ]; then
+                    ln -sfn "../../$name" "/dev/disk/by-id/nvme-${model}_${serial}_${nsid}"
+                    [ "$nsid" = 1 ] && ln -sfn "../../$name" "/dev/disk/by-id/nvme-${model}_${serial}"
+                fi
                 [ -n "$wwid" ] && ln -sfn "../../$name" "/dev/disk/by-id/nvme-${wwid}"
                 ;;
             vd*)
