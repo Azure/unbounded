@@ -40,7 +40,8 @@ func fixture(t *testing.T) (*storage, *fake.Clientset, context.Context) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "team-uid"}},
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "other", UID: "other-uid"}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ledger.ConfigMapName, Namespace: "system", ResourceVersion: "1"}},
-		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"kubernetes.io/hostname": "node-a", "pool": "a"}}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b", Labels: map[string]string{"kubernetes.io/hostname": "node-b", "pool": "a"}}},
 	)
 	// The fake tracker does not assign resource versions.
 	rv := 1
@@ -70,7 +71,7 @@ func fixture(t *testing.T) (*storage, *fake.Clientset, context.Context) {
 }
 
 func grant(name string, nodes ...string) *rebound.NodeGrant {
-	return &rebound.NodeGrant{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"team": "blue"}, Annotations: map[string]string{"note": "test"}}, Spec: rebound.NodeGrantSpec{Nodes: nodes}}
+	return &rebound.NodeGrant{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"team": "blue"}, Annotations: map[string]string{"note": "test"}}, Spec: rebound.NodeGrantSpec{NodeSelector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "kubernetes.io/hostname", Operator: metav1.LabelSelectorOpIn, Values: nodes}}}}}
 }
 
 func cached(t *testing.T, s *storage) *corev1.ConfigMap {
@@ -197,10 +198,10 @@ func TestCreateInvalid(t *testing.T) {
 		{"ttl large", func(g *rebound.NodeGrant) { g.Spec.TTL = &metav1.Duration{Duration: 2 * time.Hour} }},
 		{"ttl zero", func(g *rebound.NodeGrant) { g.Spec.TTL = &metav1.Duration{} }},
 		{"ttl negative", func(g *rebound.NodeGrant) { g.Spec.TTL = &metav1.Duration{Duration: -time.Second} }},
-		{"missing node", func(g *rebound.NodeGrant) { g.Spec.Nodes = []string{"missing"} }},
-		{"invalid node", func(g *rebound.NodeGrant) { g.Spec.Nodes = []string{"BAD"} }},
-		{"empty nodes", func(g *rebound.NodeGrant) { g.Spec.Nodes = nil }},
-		{"duplicate nodes", func(g *rebound.NodeGrant) { g.Spec.Nodes = []string{"node-a", "node-a"} }},
+		{"missing node", func(g *rebound.NodeGrant) { g.Spec.NodeSelector = grant("unused", "missing").Spec.NodeSelector }},
+		{"invalid selector", func(g *rebound.NodeGrant) { g.Spec.NodeSelector.MatchExpressions[0].Operator = "Bad" }},
+		{"missing selector", func(g *rebound.NodeGrant) { g.Spec.NodeSelector = nil }},
+		{"empty selector", func(g *rebound.NodeGrant) { g.Spec.NodeSelector = &metav1.LabelSelector{} }},
 		{"invalid name", func(g *rebound.NodeGrant) { g.Name = "has.dot" }},
 		{"empty name", func(g *rebound.NodeGrant) { g.Name = "" }},
 		{"generate name", func(g *rebound.NodeGrant) { g.GenerateName = "prefix-" }},
@@ -342,7 +343,7 @@ func TestGetListDelete(t *testing.T) {
 		}
 	}
 
-	_, err = s.List(ctx, &metainternal.ListOptions{FieldSelector: fields.OneTermEqualSelector("spec.nodes", "node-a")})
+	_, err = s.List(ctx, &metainternal.ListOptions{FieldSelector: fields.OneTermEqualSelector("status.nodes", "node-a")})
 	if !apierrors.IsBadRequest(err) {
 		t.Fatalf("bad selector: %v", err)
 	}

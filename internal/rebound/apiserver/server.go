@@ -63,7 +63,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	o.Authentication.AddFlags(fs)
 	o.Authorization.AddFlags(fs)
 	fs.DurationVar(&o.MaxTTL, "max-ttl", o.MaxTTL, "Maximum and default NodeGrant lifetime.")
-	fs.IntVar(&o.MaxNodesPerGrant, "max-nodes-per-grant", o.MaxNodesPerGrant, "Maximum number of nodes in one NodeGrant.")
+	fs.IntVar(&o.MaxNodesPerGrant, "max-nodes-per-grant", o.MaxNodesPerGrant, "Maximum number of nodes a grant's selector may match.")
 }
 
 // ServerConfig supplies the ledger client and an externally managed serving certificate.

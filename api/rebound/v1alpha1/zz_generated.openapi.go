@@ -83,7 +83,7 @@ func schema_unbounded_api_rebound_v1alpha1_NodeGrant(ref common.ReferenceCallbac
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "NodeGrant reserves a set of nodes for the namespace it is created in. A grant is created atomically: either every listed node is granted or the request fails and nothing changes. Grants are immutable and expire at status.expiresAt.",
+				Description: "NodeGrant reserves a set of nodes for the namespace it is created in. A grant is created atomically: either every matching node is granted or the request fails and nothing changes. Grants are immutable and expire at status.expiresAt.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -182,9 +182,37 @@ func schema_unbounded_api_rebound_v1alpha1_NodeGrantSpec(ref common.ReferenceCal
 				Description: "NodeGrantSpec is the requested grant.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"nodeSelector": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeSelector selects the nodes to grant. It is resolved once at create time. All matching nodes are granted atomically or none are granted.",
+							Ref:         ref(v1.LabelSelector{}.OpenAPIModelName()),
+						},
+					},
+					"ttl": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TTL is how long the grant lasts. It defaults to, and may not exceed, the server's maximum TTL.",
+							Ref:         ref(v1.Duration{}.OpenAPIModelName()),
+						},
+					},
+				},
+				Required: []string{"nodeSelector"},
+			},
+		},
+		Dependencies: []string{
+			v1.Duration{}.OpenAPIModelName(), v1.LabelSelector{}.OpenAPIModelName()},
+	}
+}
+
+func schema_unbounded_api_rebound_v1alpha1_NodeGrantStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "NodeGrantStatus is set by the server.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
 					"nodes": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Nodes is the set of node names to grant. All nodes must exist and be free, or the grant is rejected.",
+							Description: "Nodes is the server-set, sorted list of node names the selector resolved to at create time.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -196,28 +224,6 @@ func schema_unbounded_api_rebound_v1alpha1_NodeGrantSpec(ref common.ReferenceCal
 							},
 						},
 					},
-					"ttl": {
-						SchemaProps: spec.SchemaProps{
-							Description: "TTL is how long the grant lasts. It defaults to, and may not exceed, the server's maximum TTL.",
-							Ref:         ref(v1.Duration{}.OpenAPIModelName()),
-						},
-					},
-				},
-				Required: []string{"nodes"},
-			},
-		},
-		Dependencies: []string{
-			v1.Duration{}.OpenAPIModelName()},
-	}
-}
-
-func schema_unbounded_api_rebound_v1alpha1_NodeGrantStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
-	return common.OpenAPIDefinition{
-		Schema: spec.Schema{
-			SchemaProps: spec.SchemaProps{
-				Description: "NodeGrantStatus is set by the server.",
-				Type:        []string{"object"},
-				Properties: map[string]spec.Schema{
 					"holder": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Holder is the user that created the grant.",

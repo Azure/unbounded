@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -24,6 +25,10 @@ func TestRoundTrip(t *testing.T) {
 	l := New()
 	g := testGrant("first", "node-a", "node-b")
 	g.NamespaceUID = "tenant-uid"
+	g.Selector = &metav1.LabelSelector{
+		MatchLabels:      map[string]string{"pool": "gpu"},
+		MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "zone", Operator: metav1.LabelSelectorOpIn, Values: []string{"a", "b"}}},
+	}
 	require.NoError(t, l.Add(g))
 	data := l.Encode()
 	require.Equal(t, "tenant/first", data["node-a"])
@@ -47,6 +52,17 @@ func TestLegacyNamespaceUID(t *testing.T) {
 	parsed, ok := Parse(data).Get(g.Key())
 	require.True(t, ok)
 	require.Empty(t, parsed.NamespaceUID)
+}
+
+func TestParseInformationalSelector(t *testing.T) {
+	for _, selector := range []string{"", `,"selector":null`, `,"selector":"bad"`, `,"selector":{"matchLabels":42}`, `,"selector":{"matchExpressions":[{"key":"pool","operator":"Bad"}]}`} {
+		t.Run(selector, func(t *testing.T) {
+			l := Parse(map[string]string{"_grant.tenant.first": `{"nodes":["node-a"]` + selector + `}`})
+			require.Len(t, l.Grants(), 1)
+			require.Equal(t, "tenant/first", l.Encode()["node-a"])
+			require.Len(t, Parse(l.Encode()).Grants(), 1)
+		})
+	}
 }
 
 func TestParseRepairs(t *testing.T) {

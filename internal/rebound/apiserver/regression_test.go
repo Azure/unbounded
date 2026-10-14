@@ -211,9 +211,27 @@ func TestCreateNodeLimit(t *testing.T) {
 			s.maxNodesPerGrant = limit
 
 			nodes := make([]string, limit+1)
+			items := make([]corev1.Node, limit+1)
+
 			for i := range nodes {
 				nodes[i] = fmt.Sprintf("node-%d", i)
+				items[i] = corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodes[i], Labels: map[string]string{"kubernetes.io/hostname": nodes[i]}}}
 			}
+
+			calls := 0
+
+			client.PrependReactor("list", "nodes", func(action clienttesting.Action) (bool, runtime.Object, error) {
+				calls++
+				list, ok := action.(clienttesting.ListActionImpl)
+				require.True(t, ok)
+				require.Equal(t, int64(limit)+1, list.GetListOptions().Limit)
+
+				sel, err := metav1.LabelSelectorAsSelector(grant("too-many", nodes...).Spec.NodeSelector)
+				require.NoError(t, err)
+				require.Equal(t, sel.String(), list.GetListOptions().LabelSelector)
+
+				return true, &corev1.NodeList{Items: items}, nil
+			})
 
 			client.ClearActions()
 
@@ -224,8 +242,8 @@ func TestCreateNodeLimit(t *testing.T) {
 			require.Equal(t, int32(422), status.Status().Code)
 			require.Len(t, status.Status().Details.Causes, 1)
 			require.Equal(t, metav1.CauseTypeTooMany, status.Status().Details.Causes[0].Type)
-			require.Equal(t, "spec.nodes", status.Status().Details.Causes[0].Field)
-			require.Empty(t, client.Actions(), "limit must be checked before namespace or ledger access")
+			require.Equal(t, "spec.nodeSelector", status.Status().Details.Causes[0].Field)
+			require.Equal(t, 1, calls)
 			require.Empty(t, cached(t, s).Data)
 		})
 	}
@@ -239,7 +257,7 @@ func TestCreateListsNodesOnce(t *testing.T) {
 
 			nodes := []string{"node-a", "node-b"}
 			if missing {
-				nodes = []string{"missing-a", "node-a", "missing-b"}
+				nodes = []string{"missing-a", "missing-b"}
 				s.maxNodesPerGrant = len(nodes)
 			}
 
@@ -252,14 +270,10 @@ func TestCreateListsNodesOnce(t *testing.T) {
 				require.True(t, ok)
 				require.Equal(t, int32(422), status.Status().Code)
 				causes := status.Status().Details.Causes
-				require.Len(t, causes, 2)
-
-				for i, index := range []int{0, 2} {
-					require.Equal(t, metav1.CauseTypeFieldValueInvalid, causes[i].Type)
-					require.Equal(t, fmt.Sprintf("spec.nodes[%d]", index), causes[i].Field)
-					require.Contains(t, causes[i].Message, nodes[index])
-					require.Contains(t, causes[i].Message, "node does not exist")
-				}
+				require.Len(t, causes, 1)
+				require.Equal(t, metav1.CauseTypeFieldValueInvalid, causes[0].Type)
+				require.Equal(t, "spec.nodeSelector", causes[0].Field)
+				require.Contains(t, causes[0].Message, "matches no nodes")
 			} else {
 				require.NoError(t, err, "a grant at the limit must succeed")
 			}

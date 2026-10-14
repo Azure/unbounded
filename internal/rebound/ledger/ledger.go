@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -47,16 +48,17 @@ const (
 
 // Grant is a stored NodeGrant.
 type Grant struct {
-	Namespace    string            `json:"-"`
-	NamespaceUID types.UID         `json:"namespaceUID,omitempty"`
-	Name         string            `json:"-"`
-	UID          types.UID         `json:"uid"`
-	Nodes        []string          `json:"nodes"`
-	Holder       string            `json:"holder"`
-	CreatedAt    time.Time         `json:"createdAt"`
-	ExpiresAt    time.Time         `json:"expiresAt"`
-	Labels       map[string]string `json:"labels,omitempty"`
-	Annotations  map[string]string `json:"annotations,omitempty"`
+	Namespace    string                `json:"-"`
+	NamespaceUID types.UID             `json:"namespaceUID,omitempty"`
+	Name         string                `json:"-"`
+	UID          types.UID             `json:"uid"`
+	Nodes        []string              `json:"nodes"`
+	Selector     *metav1.LabelSelector `json:"selector,omitempty"`
+	Holder       string                `json:"holder"`
+	CreatedAt    time.Time             `json:"createdAt"`
+	ExpiresAt    time.Time             `json:"expiresAt"`
+	Labels       map[string]string     `json:"labels,omitempty"`
+	Annotations  map[string]string     `json:"annotations,omitempty"`
 }
 
 // Key returns the namespace/name of the grant.
@@ -149,8 +151,17 @@ func Parse(data map[string]string) *Ledger {
 		}
 
 		g := &Grant{}
-		if err := json.Unmarshal([]byte(data[k]), g); err != nil || !validNames(ns, g.Nodes) {
+		// The selector is informational. Bad selector data must not release nodes.
+		record := struct {
+			*Grant
+			Selector json.RawMessage `json:"selector"`
+		}{Grant: g}
+		if err := json.Unmarshal([]byte(data[k]), &record); err != nil || !validNames(ns, g.Nodes) {
 			continue
+		}
+
+		if err := json.Unmarshal(record.Selector, &g.Selector); err != nil {
+			g.Selector = nil
 		}
 
 		g.Namespace, g.Name = ns, name

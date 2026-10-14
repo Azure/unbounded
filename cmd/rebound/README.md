@@ -14,7 +14,9 @@ metadata:
   name: train
   namespace: team-a
 spec:
-  nodes: [gpu-1, gpu-2]
+  nodeSelector:
+    matchLabels:
+      pool: gpu
   ttl: 30m
 ```
 
@@ -24,16 +26,19 @@ kubectl get nodegrants        # or: kubectl get ngr
 kubectl delete ngr train
 ```
 
-- **Atomic:** a grant gets all listed nodes or none. If any node is held by another
+- **Atomic:** a grant gets all matching nodes or none. If any node is held by another
   grant, create fails with `409 Conflict` and names the busy nodes.
 - **TTL:** `spec.ttl` is optional. It defaults to `--max-ttl` (1h) and may not exceed it.
-- **Nodes:** a grant may name at most `--max-nodes-per-grant` nodes (500 by default).
+- **Nodes:** `spec.nodeSelector` is required and must not be empty. It must match
+  at least one node and at most `--max-nodes-per-grant` nodes (500 by default).
+  The selector is resolved once at create time into `status.nodes`. Later label
+  changes do not change the grant.
 - **Immutable:** grants cannot be updated or renewed. Delete and create again, but
   note that deleting a grant deletes its pods (see below).
 - **Metadata:** labels and annotations are stored. Create rejects `generateName`,
   owner references, finalizers, deletion timestamps, and deletion grace periods.
-- **Status:** the server sets `status.holder` (the user who created the grant) and
-  `status.expiresAt`.
+- **Status:** the server sets `status.nodes` (sorted node names), `status.holder`
+  (the user who created the grant), and `status.expiresAt`.
 - **Access:** plain RBAC. The `view` role can read grants. `edit` and `admin` can
   also create and delete them.
 
@@ -114,7 +119,7 @@ in `ExcludedNamespaces`. `AdminGroups` may change rebound node labels and taints
 |---|---|---|
 | `--namespace` | `unbounded-system` | Namespace of the ledger, serving Secret, and leader lease |
 | `--max-ttl` | `1h` | Default and maximum grant TTL |
-| `--max-nodes-per-grant` | `500` | Maximum nodes in one grant |
+| `--max-nodes-per-grant` | `500` | Maximum nodes a grant's selector may match |
 | `--excluded-namespaces` | `kube-system,unbounded-system` | Namespaces whose pods are never deleted |
 | `--leader-elect` | `true` | Run controllers and certificate rotation on one replica |
 | `--secure-port` | `8443` | HTTPS port for the API |
@@ -126,6 +131,7 @@ authorization are also accepted. Run `rebound --help` for the full list.
 
 ## Limits
 
+- A selector must match 1 to `--max-nodes-per-grant` nodes. Empty selectors are rejected.
 - The ledger must fit in one ConfigMap. Writes that increase the grant count are
   limited to 900 KiB of data; cleanup writes may use up to 1000 KiB.
 - Watch history covers the last 100 ledger changes. Older resource versions get `410 Gone`.

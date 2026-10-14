@@ -241,29 +241,20 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		errs = append(errs, field.Forbidden(field.NewPath("metadata", "deletionGracePeriodSeconds"), "not supported by NodeGrant"))
 	}
 
-	if len(g.Spec.Nodes) == 0 {
-		errs = append(errs, field.Required(field.NewPath("spec", "nodes"), "at least one node is required"))
-	}
+	selectorPath := field.NewPath("spec", "nodeSelector")
 
-	if len(g.Spec.Nodes) > s.maxNodesPerGrant {
-		errs = append(errs, field.TooMany(field.NewPath("spec", "nodes"), len(g.Spec.Nodes), s.maxNodesPerGrant))
+	sel, selectorErr := metav1.LabelSelectorAsSelector(g.Spec.NodeSelector)
+	switch {
+	case g.Spec.NodeSelector == nil:
+		errs = append(errs, field.Required(selectorPath, "a node selector is required"))
+	case selectorErr != nil:
+		errs = append(errs, field.Invalid(selectorPath, g.Spec.NodeSelector, selectorErr.Error()))
+	case sel.Empty():
+		errs = append(errs, field.Invalid(selectorPath, g.Spec.NodeSelector, "must not be empty; it would select every node"))
 	}
 
 	if ttl <= 0 || ttl > s.maxTTL {
 		errs = append(errs, field.Invalid(field.NewPath("spec", "ttl"), ttl.String(), "must be positive and no greater than "+s.maxTTL.String()))
-	}
-
-	seen := make(map[string]bool)
-
-	for i, node := range g.Spec.Nodes {
-		path := field.NewPath("spec", "nodes").Index(i)
-		if problems := validation.IsDNS1123Subdomain(node); len(problems) != 0 {
-			errs = append(errs, field.Invalid(path, node, strings.Join(problems, "; ")))
-		} else if seen[node] {
-			errs = append(errs, field.Duplicate(path, node))
-		}
-
-		seen[node] = true
 	}
 
 	if len(errs) != 0 {
@@ -276,7 +267,7 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 	}
 
 	record := &ledger.Grant{
-		Namespace: ns, Name: g.Name, UID: uuid.NewUUID(), Nodes: slices.Clone(g.Spec.Nodes),
+		Namespace: ns, Name: g.Name, UID: uuid.NewUUID(), Selector: g.Spec.NodeSelector.DeepCopy(),
 		Holder: holder, Labels: maps.Clone(g.Labels), Annotations: maps.Clone(g.Annotations),
 	}
 
@@ -300,26 +291,9 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 
 		l.Reap(s.clock.Now(), nil)
 
-		nodes, err := s.store.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		record.Nodes, err = s.resolveNodes(ctx, g.Name, sel)
 		if err != nil {
 			return &mutationError{err}
-		}
-
-		nodeNames := make(map[string]struct{}, len(nodes.Items))
-		for _, node := range nodes.Items {
-			nodeNames[node.Name] = struct{}{}
-		}
-
-		var nodeErrors field.ErrorList
-
-		for i, node := range record.Nodes {
-			if _, exists := nodeNames[node]; !exists {
-				nodeErrors = append(nodeErrors, field.Invalid(field.NewPath("spec", "nodes").Index(i), node, "node does not exist"))
-			}
-		}
-
-		if len(nodeErrors) != 0 {
-			return &mutationError{apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), g.Name, nodeErrors)}
 		}
 
 		now := s.clock.Now().UTC()
@@ -339,6 +313,54 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 	}
 
 	return grantObject(record, rv), nil
+}
+
+func (s *storage) resolveNodes(ctx context.Context, name string, sel labels.Selector) ([]string, error) {
+	options := metav1.ListOptions{LabelSelector: sel.String(), Limit: int64(s.maxNodesPerGrant) + 1}
+
+	var names []string
+
+	path := field.NewPath("spec", "nodeSelector")
+	invalid := func(err *field.Error) error {
+		return apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), name, field.ErrorList{err})
+	}
+
+	for {
+		// One logical list, filtered server-side by this grant's selector, scales
+		// with grant size instead of cluster size. The max+1 limit bounds the
+		// response and detects oversized grants without fetching the rest.
+		// Continue follows the same list snapshot if the server returns a short page.
+		// Resolve inside each ledger mutate attempt: one node snapshot for the
+		// ledger snapshot used by the conflict check, retried on CAS conflict,
+		// rather than N per-node GETs that could each observe a different moment.
+		nodes, err := s.store.Client.CoreV1().Nodes().List(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, node := range nodes.Items {
+			names = append(names, node.Name)
+		}
+
+		if len(names) > s.maxNodesPerGrant {
+			return nil, invalid(field.TooMany(path, len(names), s.maxNodesPerGrant))
+		}
+
+		if nodes.Continue == "" {
+			break
+		}
+
+		options.Continue = nodes.Continue
+		options.Limit = int64(s.maxNodesPerGrant-len(names)) + 1
+	}
+
+	if len(names) == 0 {
+		return nil, invalid(field.Invalid(path, sel.String(), "matches no nodes"))
+	}
+
+	slices.Sort(names)
+
+	return slices.Compact(names), nil
 }
 
 func dryRun(values []string) bool { return slices.Contains(values, metav1.DryRunAll) }
@@ -462,8 +484,8 @@ func grantObject(g *ledger.Grant, rv string) *rebound.NodeGrant {
 			Name: g.Name, Namespace: g.Namespace, UID: g.UID, CreationTimestamp: metav1.NewTime(g.CreatedAt),
 			ResourceVersion: rv, Labels: maps.Clone(g.Labels), Annotations: maps.Clone(g.Annotations),
 		},
-		Spec:   rebound.NodeGrantSpec{Nodes: slices.Clone(g.Nodes), TTL: &metav1.Duration{Duration: g.ExpiresAt.Sub(g.CreatedAt)}},
-		Status: rebound.NodeGrantStatus{Holder: g.Holder, ExpiresAt: metav1.NewTime(g.ExpiresAt)},
+		Spec:   rebound.NodeGrantSpec{NodeSelector: g.Selector.DeepCopy(), TTL: &metav1.Duration{Duration: g.ExpiresAt.Sub(g.CreatedAt)}},
+		Status: rebound.NodeGrantStatus{Nodes: slices.Clone(g.Nodes), Holder: g.Holder, ExpiresAt: metav1.NewTime(g.ExpiresAt)},
 	}
 }
 
@@ -494,7 +516,7 @@ func (s *storage) ConvertToTable(_ context.Context, obj, options runtime.Object)
 
 	for _, g := range items {
 		table.Rows = append(table.Rows, metav1.TableRow{Cells: []interface{}{
-			g.Name, strings.Join(g.Spec.Nodes, ","), g.Status.Holder,
+			g.Name, strings.Join(g.Status.Nodes, ","), g.Status.Holder,
 			g.Status.ExpiresAt.UTC().Format(time.RFC3339), duration.HumanDuration(s.clock.Since(g.CreationTimestamp.Time)),
 		}, Object: runtime.RawExtension{Object: g.DeepCopy()}})
 	}

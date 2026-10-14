@@ -8,7 +8,7 @@ import (
 )
 
 // NodeGrant reserves a set of nodes for the namespace it is created in.
-// A grant is created atomically: either every listed node is granted or
+// A grant is created atomically: either every matching node is granted or
 // the request fails and nothing changes. Grants are immutable and expire
 // at status.expiresAt.
 //
@@ -23,9 +23,9 @@ type NodeGrant struct {
 
 // NodeGrantSpec is the requested grant.
 type NodeGrantSpec struct {
-	// Nodes is the set of node names to grant. All nodes must exist and be
-	// free, or the grant is rejected.
-	Nodes []string `json:"nodes"`
+	// NodeSelector selects the nodes to grant. It is resolved once at create
+	// time. All matching nodes are granted atomically or none are granted.
+	NodeSelector *metav1.LabelSelector `json:"nodeSelector"`
 
 	// TTL is how long the grant lasts. It defaults to, and may not exceed,
 	// the server's maximum TTL.
@@ -35,6 +35,10 @@ type NodeGrantSpec struct {
 
 // NodeGrantStatus is set by the server.
 type NodeGrantStatus struct {
+	// Nodes is the server-set, sorted list of node names the selector resolved
+	// to at create time.
+	Nodes []string `json:"nodes,omitempty"`
+
 	// Holder is the user that created the grant.
 	Holder string `json:"holder,omitempty"`
 
