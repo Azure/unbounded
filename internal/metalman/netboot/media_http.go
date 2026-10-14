@@ -44,7 +44,7 @@ func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOw
 			target := &op.Status.Targets[j]
 
 			b := target.BootMedia
-			if b == nil || b.Netboot == nil || len(b.Netboot.DHCPLeases) == 0 || b.Netboot.DHCPLeases[0].IPv4 != ip || !b.ImageWritten || b.RebootRequestedAt == nil || b.Abandoned {
+			if b == nil || b.Site != p.Site || b.Netboot == nil || len(b.Netboot.DHCPLeases) == 0 || b.Netboot.DHCPLeases[0].IPv4 != ip || !b.ImageWritten || b.RebootRequestedAt == nil || b.Abandoned {
 				continue
 			}
 
@@ -66,8 +66,8 @@ func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOw
 				return nil, true, err
 			}
 
-			if machine.UID != b.MachineUID || !machine.DeletionTimestamp.IsZero() {
-				return nil, true, fmt.Errorf("media machine identity changed")
+			if machine.UID != b.MachineUID || !machine.DeletionTimestamp.IsZero() || machine.Labels["unbounded-cloud.io/site"] != p.Site {
+				return nil, true, fmt.Errorf("media machine identity or site ownership changed")
 			}
 
 			if machine.Spec.Host == nil {
@@ -167,7 +167,7 @@ func (p *MediaProvider) artifactOwner(ctx context.Context, ip string) (*mediaOwn
 
 	for _, op := range ops.Items {
 		for _, target := range op.Status.Targets {
-			if target.BootMedia == nil || target.BootMedia.Netboot == nil || len(target.BootMedia.Netboot.DHCPLeases) == 0 || target.BootMedia.Netboot.DHCPLeases[0].IPv4 != ip {
+			if target.BootMedia == nil || target.BootMedia.Site != p.Site || target.BootMedia.Netboot == nil || len(target.BootMedia.Netboot.DHCPLeases) == 0 || target.BootMedia.Netboot.DHCPLeases[0].IPv4 != ip {
 				continue
 			}
 
@@ -218,7 +218,7 @@ func (p *MediaProvider) nonMediaSuccessor(ctx context.Context, ip string, ops []
 
 	for i := range machines.Items {
 		m := &machines.Items[i]
-		if !m.DeletionTimestamp.IsZero() || m.Spec.Netboot() == nil {
+		if m.Labels["unbounded-cloud.io/site"] != p.Site || !m.DeletionTimestamp.IsZero() || m.Spec.Netboot() == nil {
 			continue
 		}
 

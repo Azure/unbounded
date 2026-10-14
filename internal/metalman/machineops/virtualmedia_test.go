@@ -617,7 +617,7 @@ func TestVirtualMediaRealProviderCallbackAndPartialCleanup(t *testing.T) {
 	m.Spec.Netboot().Image = "test/disk@sha256:" + strings.Repeat("b", 64)
 	m.Spec.Netboot().DHCPLeases = []v1alpha3.DHCPLease{{MAC: "02:11:22:33:44:55", IPv4: "192.0.2.20", SubnetMask: "255.255.255.0", Gateway: "192.0.2.1"}}
 	require.NoError(t, r.Update(t.Context(), m))
-	p := &netboot.MediaProvider{Client: r.Client, CacheDir: cache.CacheDir, TFTPServer: "192.0.2.2", Resolver: &netboot.FileResolver{Cache: cache, Reader: r.Client, ServeURL: "http://192.0.2.2:8080"}}
+	p := &netboot.MediaProvider{Site: r.Site, Client: r.Client, CacheDir: cache.CacheDir, TFTPServer: "192.0.2.2", Resolver: &netboot.FileResolver{Cache: cache, Reader: r.Client, ServeURL: "http://192.0.2.2:8080"}}
 	builds := 0
 	p.Run = func(_ context.Context, command string, args ...string) error {
 		if command == "xorriso" {
@@ -796,7 +796,7 @@ func TestVirtualMediaDeletingLostReadyResponseRetainsCallback(t *testing.T) {
 			require.NoError(t, r.Status().Update(t.Context(), current))
 			require.NoError(t, r.Delete(t.Context(), current))
 			mediaStep(t, r, op.Name)
-			p := &netboot.MediaProvider{Client: r.Client}
+			p := &netboot.MediaProvider{Site: r.Site, Client: r.Client}
 			ready := func() int {
 				req := httptest.NewRequest(http.MethodGet, "/bootmedia/"+current.Status.Targets[0].BootMedia.ID+"/ready", nil)
 				req.RemoteAddr = "192.0.2.20:5678"

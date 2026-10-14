@@ -241,6 +241,7 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			media := &netboot.MediaProvider{
+				Site:     site,
 				Resolver: &resolver, Client: directClient, CacheDir: cacheDir, TFTPServer: mediaTFTPServer,
 			}
 

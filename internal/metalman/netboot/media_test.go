@@ -136,11 +136,14 @@ func TestMediaFirstBootFrozenLeaseAndReports(t *testing.T) {
 }
 
 func TestMediaFirstBootAuthorization(t *testing.T) {
-	for _, scenario := range []string{"uid mismatch", "uid mismatch live lease", "abandoned", "not written", "no reboot", "ambiguous", "released successor"} {
+	for _, scenario := range []string{"uid mismatch", "uid mismatch live lease", "site changed", "abandoned", "not written", "no reboot", "ambiguous", "released successor"} {
 		t.Run(scenario, func(t *testing.T) {
 			h, m, op := firstBootFixture(t)
 
 			switch scenario {
+			case "site changed":
+				m.Labels["unbounded-cloud.io/site"] = "site-b"
+				require.NoError(t, h.Media.Client.Update(t.Context(), m))
 			case "uid mismatch", "uid mismatch live lease":
 				m.UID = "replacement-uid"
 				if scenario == "uid mismatch live lease" {
@@ -401,17 +404,17 @@ func mediaFixture(t *testing.T, arch string) (*MediaProvider, *v1alpha3.Machine,
 		shim:            []byte("unchanged shim " + arch), grub: []byte("unchanged grub " + arch), "grub/grub.cfg.tmpl": tmpl,
 	}))
 	cache.SetDigestForArchitecture(ref, arch, "sha256:"+strings.Repeat("a", 64))
-	m := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "host", UID: "host-uid"}, Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
+	m := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "host", UID: "host-uid", Labels: map[string]string{"unbounded-cloud.io/site": "site-a"}}, Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 		Image: "test/disk@sha256:" + strings.Repeat("b", 64), NetbootImage: ref, Architecture: arch, BootProtocol: "VirtualMedia",
 		DHCPLeases: []v1alpha3.DHCPLease{{MAC: "02:11:22:33:44:55", IPv4: "192.0.2.20", SubnetMask: "255.255.255.0", Gateway: "192.0.2.1"}},
 	}}}}
 	op := &v1alpha3.MachineOperation{ObjectMeta: metav1.ObjectMeta{Name: "replace", UID: "op-uid"}, Spec: v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace}, Status: v1alpha3.MachineOperationStatus{
 		Targets: []v1alpha3.MachineOperationTargetStatus{{MachineRef: m.Name, BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
-			ID: strings.Repeat("c", 32), MachineUID: m.UID, Netboot: m.Spec.Netboot().DeepCopy(), Phase: "Preparing",
+			ID: strings.Repeat("c", 32), Site: "site-a", MachineUID: m.UID, Netboot: m.Spec.Netboot().DeepCopy(), Phase: "Preparing",
 		}}},
 	}}
 	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(op).WithObjects(m, op).Build()
-	p := &MediaProvider{Resolver: &FileResolver{Cache: cache, Reader: fc, ServeURL: "http://192.0.2.2:8080"}, Client: fc, CacheDir: cache.CacheDir, TFTPServer: "192.0.2.2"}
+	p := &MediaProvider{Site: "site-a", Resolver: &FileResolver{Cache: cache, Reader: fc, ServeURL: "http://192.0.2.2:8080"}, Client: fc, CacheDir: cache.CacheDir, TFTPServer: "192.0.2.2"}
 
 	return p, m, op
 }
@@ -495,7 +498,7 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 			require.Contains(t, string(config), "sleep 6\ndone\nhalt\n")
 
 			count := len(calls)
-			restarted := &MediaProvider{Resolver: p.Resolver, Client: p.Client, CacheDir: p.CacheDir, TFTPServer: p.TFTPServer, Run: p.Run}
+			restarted := &MediaProvider{Site: p.Site, Resolver: p.Resolver, Client: p.Client, CacheDir: p.CacheDir, TFTPServer: p.TFTPServer, Run: p.Run}
 			f, err := restarted.OpenISO(t.Context(), source.Name)
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
@@ -608,7 +611,7 @@ func mediaRequest(p *MediaProvider, id, method, action, ip string) *httptest.Res
 
 func TestMediaScopedCallbacks(t *testing.T) {
 	p, _, op := mediaFixture(t, "amd64")
-	op.Status.Targets = append(op.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: "other-host", BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: strings.Repeat("d", 32)}})
+	op.Status.Targets = append(op.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: "other-host", BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: strings.Repeat("d", 32), Site: p.Site}})
 	require.NoError(t, p.Client.Status().Update(t.Context(), op))
 	id := op.Status.Targets[0].BootMedia.ID
 	// Before power-on the host is not expected to boot, so it gets halt.

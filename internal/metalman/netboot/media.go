@@ -42,7 +42,7 @@ var (
 )
 
 // MediaProvider builds operation-owned hybrid ISOs (El Torito plus GPT ESP).
-// Configure Resolver, Client (an uncached API client), CacheDir, and an advertised
+// Configure Site, Resolver, Client (an uncached API client), CacheDir, and an advertised
 // IPv4 TFTPServer.
 // Share this instance through HTTPServer.Media and TFTPServer.Media. The
 // controller must persist BootMedia and digest-pinned Netboot inputs first.
@@ -50,6 +50,8 @@ var (
 // TFTP has no source authentication. HTTP config and callbacks also require the
 // first frozen lease's source IP, without trusting forwarding headers.
 type MediaProvider struct {
+	// Site must match the frozen media site exactly; empty is not a wildcard.
+	Site       string
 	Resolver   *FileResolver
 	Client     client.Client
 	CacheDir   string
@@ -94,7 +96,7 @@ func (p *MediaProvider) callbackOwner(ctx context.Context, id string) (*mediaOwn
 
 		for j := range op.Status.Targets {
 			t := &op.Status.Targets[j]
-			if t.BootMedia == nil || t.BootMedia.ID != id {
+			if t.BootMedia == nil || t.BootMedia.Site != p.Site || t.BootMedia.ID != id {
 				continue
 			}
 
@@ -142,7 +144,7 @@ func (p *MediaProvider) owner(ctx context.Context, id string) (*mediaOwner, erro
 		return nil, err
 	}
 
-	if current.UID != o.status().MachineUID || !current.DeletionTimestamp.IsZero() || (o.status().Site != "" && current.Labels["unbounded-cloud.io/site"] != o.status().Site) {
+	if current.UID != o.status().MachineUID || !current.DeletionTimestamp.IsZero() || current.Labels["unbounded-cloud.io/site"] != p.Site {
 		return nil, fmt.Errorf("media machine identity or site ownership changed")
 	}
 
