@@ -136,4 +136,6 @@ func TestBurnRunnerPinsCUDAAndGPUBurn(t *testing.T) {
 	assert.Contains(t, containerfile, "nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:")
 	assert.Contains(t, containerfile, "0d19c94dcb2e9b6858b7586a4c327674cd67113b")
 	assert.Contains(t, containerfile, "make -C /src/gpu-burn COMPUTE=100")
+	assert.Contains(t, containerfile, "compare.fatbin /usr/local/bin/compare.fatbin")
+	assert.Contains(t, containerfile, "WORKDIR /usr/local/bin")
 }

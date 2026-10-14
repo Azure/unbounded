@@ -40,8 +40,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/gpu-burn/gpu_burn /usr/local/bin/gpu_burn
+COPY --from=builder /src/gpu-burn/compare.fatbin /usr/local/bin/compare.fatbin
 COPY --from=builder /src/gpu-burn/LICENSE /usr/share/licenses/gpu-burn/LICENSE
 
 ENV GPU_BURN_COMMIT=0d19c94dcb2e9b6858b7586a4c327674cd67113b
+
+WORKDIR /usr/local/bin
 
 CMD ["/bin/bash"]

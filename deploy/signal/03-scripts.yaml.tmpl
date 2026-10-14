@@ -342,6 +342,9 @@ data:
         printf '%s\n' "${details}"
         tail -n 200 "${gpu_log}" 2>/dev/null || true
       } > /results/measurements.txt
+      printf 'PROJECT_SIGNAL_GPU_BURN_LOG_BEGIN\n'
+      tail -n 200 "${gpu_log}" 2>/dev/null || true
+      printf 'PROJECT_SIGNAL_GPU_BURN_LOG_END\n'
       printf 'verdict=%s reason=%s\n' "${verdict}" "${reason}" > /dev/termination-log
     }
 
@@ -429,7 +432,7 @@ data:
       fi
 
       if ! kill -0 "${gpu_pid}" 2>/dev/null; then
-        fail GPUBurnExitedEarly
+        fail GPUBurnExitedEarly "$(tail -n 5 "${gpu_log}" 2>/dev/null | tr '\n' ';')"
         break
       elif ! kill -0 "${memory_pid}" 2>/dev/null; then
         fail MemoryIntegrityFailed
