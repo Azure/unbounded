@@ -446,19 +446,7 @@ func serveSidecarWithGrace(ctx context.Context, listener net.Listener, handler h
 		ReadTimeout:       requestTimeout, WriteTimeout: requestTimeout + sidecarWriteGrace, IdleTimeout: 30 * time.Second,
 		MaxHeaderBytes: sidecarMaxHeaderBytes, ErrorLog: log.New(safeHTTPLogWriter{}, "", 0),
 		BaseContext: func(net.Listener) context.Context { return lifetime },
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			defer diagnoseSidecarPanic()
-
-			if sidecarRequestHeaderBytes(r) > sidecarMaxHeaderBytes {
-				object.WriteSidecarHeaderTooLarge(w, r)
-				return
-			}
-
-			requestCtx, done := context.WithTimeout(r.Context(), requestTimeout)
-			defer done()
-
-			handler.ServeHTTP(w, r.WithContext(requestCtx))
-		}),
+		Handler:     sidecarHTTPHandler(handler, requestTimeout),
 	}
 	defer closeResource(server)
 	defer closeResource(listener)
@@ -493,6 +481,37 @@ func serveSidecarWithGrace(ctx context.Context, listener net.Listener, handler h
 
 		return nil
 	}
+}
+
+// sidecarHTTPHandler bounds each request by requestTimeout and keeps the
+// response flush bounded by requestTimeout plus sidecarWriteGrace.
+func sidecarHTTPHandler(handler http.Handler, requestTimeout time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer diagnoseSidecarPanic()
+
+		// Object.WriteTo clears the write deadline when it returns, but
+		// net/http still flushes buffered bytes after the handler. Re-arm
+		// the server's write bound so a stalled reader cannot hold the
+		// connection past the request timeout plus grace.
+		writeDeadline := time.Now().Add(requestTimeout + sidecarWriteGrace)
+		defer rearmSidecarWriteDeadline(w, writeDeadline)
+
+		if sidecarRequestHeaderBytes(r) > sidecarMaxHeaderBytes {
+			object.WriteSidecarHeaderTooLarge(w, r)
+			return
+		}
+
+		requestCtx, done := context.WithTimeout(r.Context(), requestTimeout)
+		defer done()
+
+		handler.ServeHTTP(w, r.WithContext(requestCtx))
+	})
+}
+
+// rearmSidecarWriteDeadline restores the per-request write deadline after the
+// handler returns. Writers without deadline support are left unchanged.
+func rearmSidecarWriteDeadline(w http.ResponseWriter, deadline time.Time) {
+	_ = http.NewResponseController(w).SetWriteDeadline(deadline) //nolint:errcheck // ErrNotSupported or a closed connection leaves nothing to bound.
 }
 
 // net/http allows parser slop above MaxHeaderBytes. Match Racer's parsed-field

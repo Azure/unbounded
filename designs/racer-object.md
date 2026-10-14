@@ -230,7 +230,10 @@ boundary; it does not make every parser error an application XML error.
 
 - `--request-timeout` (default 5m) bounds each request. The write timeout is
   that plus 5s, so the handler's own deadline fires first and the client gets
-  a clean error.
+  a clean error. The SDK clears the write deadline when a streamed GET body
+  finishes, so the sidecar re-arms it to the request start plus that bound
+  after the handler returns. The final net/http flush to a client that has
+  stopped reading therefore still times out.
 - Header read timeout is the smaller of 5s and the request timeout. Header
   size is capped at 32 KiB. Idle connections close after 30s.
 - Shutdown stops accepting connections and lets open requests drain for up
