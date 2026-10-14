@@ -1,14 +1,40 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# The installer runs the Azure Linux kernel. Its module set includes drivers
-# that the Ubuntu generic kernel lacks, such as the Microsoft MANA NIC.
-FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS kernel
+ARG TARGETARCH
 
-ARG INSTALLER_KERNEL=kernel
+# The amd64 installer runs the Ubuntu generic kernel. The Ubuntu shim and GRUB
+# verify it, so the installer still boots with Secure Boot enabled. Its module
+# set already includes the Microsoft MANA NIC driver.
+FROM docker.io/library/ubuntu:24.04 AS kernel-amd64
 
-RUN tdnf install -y "${INSTALLER_KERNEL}" && \
-    tdnf clean all
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends linux-image-generic; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    mkdir -p /out && \
+    cp -a /boot /out/boot && \
+    cp -a /lib/modules /out/modules && \
+    rm -rf /var/lib/apt/lists/*
+
+# The arm64 Ubuntu generic kernel lacks the Microsoft MANA NIC driver, so the
+# arm64 installer runs the Azure Linux kernel. The Ubuntu shim does not trust
+# this kernel, so the arm64 installer needs Secure Boot turned off.
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS kernel-arm64
+
+RUN tdnf install -y kernel && \
+    tdnf clean all && \
+    mkdir -p /out && \
+    cp -a /boot /out/boot && \
+    cp -a /usr/lib/modules /out/modules
+
+FROM kernel-${TARGETARCH} AS kernel
 
 FROM docker.io/library/ubuntu:24.04 AS build
 
@@ -29,8 +55,8 @@ RUN apt-get update && \
 
 # Azure Linux ships xz-compressed modules. Decompress them so that any kmod
 # build in the Ubuntu initrd can load them, then rebuild the module index.
-COPY --from=kernel /usr/lib/modules /usr/lib/modules
-COPY --from=kernel /boot /tmp/kernel-boot
+COPY --from=kernel /out/modules /usr/lib/modules
+COPY --from=kernel /out/boot /tmp/kernel-boot
 RUN KVER=$(ls /lib/modules | head -1) && \
     find "/lib/modules/${KVER}" -name '*.ko.xz' -exec xz -d {} + && \
     depmod "${KVER}"
