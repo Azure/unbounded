@@ -73,6 +73,7 @@ func (o *mediaOwner) status() *v1alpha3.MachineOperationBootMediaStatus {
 
 // callbackOwner uses the frozen lease even after cleanup, failure, or Machine
 // deletion. A running installer must still be able to cross the reboot barrier.
+// Abandonment ends callback authorization when retention expires.
 func (p *MediaProvider) callbackOwner(ctx context.Context, id string) (*mediaOwner, error) {
 	if !mediaIDPattern.MatchString(id) || p.Client == nil {
 		return nil, fmt.Errorf("invalid media capability or missing client")
@@ -95,6 +96,10 @@ func (p *MediaProvider) callbackOwner(ctx context.Context, id string) (*mediaOwn
 			t := &op.Status.Targets[j]
 			if t.BootMedia == nil || t.BootMedia.ID != id {
 				continue
+			}
+
+			if t.BootMedia.Abandoned {
+				return nil, fmt.Errorf("media callback authorization abandoned")
 			}
 
 			if owner != nil {

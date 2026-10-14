@@ -738,6 +738,52 @@ func TestMediaCallbacksOutliveInstallAuthorization(t *testing.T) {
 	}
 }
 
+func TestMediaCallbackAbandonment(t *testing.T) {
+	for _, abandoned := range []bool{false, true} {
+		for _, action := range []string{"complete", "ready", "grub.cfg"} {
+			t.Run(fmt.Sprintf("abandoned=%t/%s", abandoned, action), func(t *testing.T) {
+				p, _, op := mediaFixture(t, "amd64")
+				target := &op.Status.Targets[0]
+				target.Phase = v1alpha3.OperationPhaseFailed
+				b := target.BootMedia
+				b.Abandoned = abandoned
+				b.Cleaned, b.Released = true, true
+				b.ImageWritten = action == "ready"
+
+				require.NoError(t, p.Client.Status().Update(t.Context(), op))
+				before := op.DeepCopy()
+
+				method := http.MethodGet
+				if action == "complete" {
+					method = http.MethodPost
+				}
+
+				w := mediaRequest(p, b.ID, method, action, "192.0.2.20")
+				require.NoError(t, p.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
+
+				if abandoned {
+					require.Equal(t, http.StatusNotFound, w.Code)
+					require.Equal(t, before.Status, op.Status)
+
+					return
+				}
+
+				require.Equal(t, http.StatusOK, w.Code)
+
+				switch action {
+				case "complete":
+					require.True(t, op.Status.Targets[0].BootMedia.ImageWritten)
+				case "ready":
+					require.NotNil(t, op.Status.Targets[0].BootMedia.RebootRequestedAt)
+				case "grub.cfg":
+					require.Equal(t, "halt\n", w.Body.String())
+					require.Equal(t, before.Status, op.Status)
+				}
+			})
+		}
+	}
+}
+
 func TestMediaReadyPersistenceFailure(t *testing.T) {
 	p, _, op := mediaFixture(t, "amd64")
 	op.Status.Targets[0].BootMedia.Cleaned = true
