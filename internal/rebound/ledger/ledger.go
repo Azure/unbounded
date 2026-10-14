@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -127,7 +128,7 @@ func Parse(data map[string]string) *Ledger {
 			keys = append(keys, k)
 		} else if uid, ok := strings.CutPrefix(k, releaseKeyPrefix); ok && uid != "" {
 			r := &Release{}
-			if err := json.Unmarshal([]byte(v), r); err == nil && r.Namespace != "" && len(r.Nodes) > 0 {
+			if err := json.Unmarshal([]byte(v), r); err == nil && validNames(r.Namespace, r.Nodes) {
 				r.UID = types.UID(uid)
 				if r.DropAt.IsZero() {
 					// Older records counted retention from the release time.
@@ -143,12 +144,12 @@ func Parse(data map[string]string) *Ledger {
 
 	for _, k := range keys {
 		ns, name, ok := strings.Cut(strings.TrimPrefix(k, grantKeyPrefix), ".")
-		if !ok || ns == "" || name == "" || strings.Contains(name, ".") {
+		if !ok || len(validation.IsDNS1123Label(name)) != 0 {
 			continue
 		}
 
 		g := &Grant{}
-		if err := json.Unmarshal([]byte(data[k]), g); err != nil || len(g.Nodes) == 0 {
+		if err := json.Unmarshal([]byte(data[k]), g); err != nil || !validNames(ns, g.Nodes) {
 			continue
 		}
 
@@ -159,6 +160,23 @@ func Parse(data map[string]string) *Ledger {
 	}
 
 	return l
+}
+
+// validNames reports whether a decoded record has a valid namespace and at
+// least one valid node name. Node names become ConfigMap keys on Encode, so an
+// invalid one would make every later ledger write fail.
+func validNames(namespace string, nodes []string) bool {
+	if len(validation.IsDNS1123Label(namespace)) != 0 || len(nodes) == 0 {
+		return false
+	}
+
+	for _, n := range nodes {
+		if len(validation.IsDNS1123Subdomain(n)) != 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Encode returns the ConfigMap data for the ledger.

@@ -55,13 +55,19 @@ func TestParseRepairs(t *testing.T) {
 	require.NoError(t, l.Add(g))
 	valid := l.Encode()
 
-	for _, record := range []string{"{", "null", `{"nodes":[]}`, `{"nodes":"bad"}`, `{"nodes":["n"],"expiresAt":"bad"}`} {
+	for _, record := range []string{
+		"{", "null", `{"nodes":[]}`, `{"nodes":"bad"}`, `{"nodes":["n"],"expiresAt":"bad"}`,
+		`{"nodes":[""]}`, `{"nodes":["node-a",""]}`, `{"nodes":["Node_A"]}`, `{"nodes":["_grant.x"]}`,
+	} {
 		t.Run(record, func(t *testing.T) {
 			require.Empty(t, Parse(map[string]string{"_grant.tenant.bad": record}).Encode())
 		})
 	}
 
-	for _, key := range []string{"_grant.tenant.name.with.dots", "_grant..name", "_grant.tenant.", "_grant.tenant", "_grant.."} {
+	for _, key := range []string{
+		"_grant.tenant.name.with.dots", "_grant..name", "_grant.tenant.", "_grant.tenant", "_grant..",
+		"_grant.Tenant.first", "_grant.tenant.First", "_grant.tenant.-first", "_grant.ten_ant.first",
+	} {
 		t.Run(key, func(t *testing.T) {
 			require.Empty(t, Parse(map[string]string{key: valid[GrantKey(g.Key())]}).Encode())
 		})
@@ -150,6 +156,8 @@ func TestReleaseRoundTrip(t *testing.T) {
 	data["_release.bad"] = "{"
 	data["_release.empty"] = `{"namespace":"tenant"}`
 	data["_release."] = `{"namespace":"tenant","nodes":["node-a"]}`
+	data["_release.badnode"] = `{"namespace":"tenant","nodes":[""]}`
+	data["_release.badns"] = `{"namespace":"Tenant","nodes":["node-a"]}`
 	parsed := Parse(data)
 	require.Len(t, parsed.Releases(), 1)
 	require.Equal(t, types.UID("first"), parsed.Releases()[0].UID)
