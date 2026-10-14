@@ -186,6 +186,15 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 				return
 			}
+
+			if ip != remote {
+				if _, claimed, err := h.Media.artifactOwner(r.Context(), ip); claimed {
+					log.Warn("rejected forwarded boot media artifact request", "err", err)
+					http.NotFound(w, r)
+
+					return
+				}
+			}
 		}
 	}
 

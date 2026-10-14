@@ -473,6 +473,83 @@ func TestFirstBootForwardedAuthorization(t *testing.T) {
 	}
 }
 
+func TestMediaArtifactForwardedAuthorization(t *testing.T) {
+	for _, protocol := range []string{v1alpha3.PXEBootProtocolPXE, v1alpha3.PXEBootProtocolHTTP} {
+		for _, scenario := range []string{"retained", "cleanup pending", "active media", "unclaimed", "other site", "successor"} {
+			t.Run(protocol+"/"+scenario, func(t *testing.T) {
+				p, m, old := mediaFixture(t, "amd64")
+				m.Spec.Netboot().BootProtocol = protocol
+				m.Spec.Netboot().NetbootImage = "test/live@sha256:" + strings.Repeat("d", 64)
+				old.Status.Phase = v1alpha3.OperationPhaseComplete
+				media := old.Status.Targets[0].BootMedia
+				media.Cleaned, media.Released = true, true
+				want := http.StatusNotFound
+
+				switch scenario {
+				case "cleanup pending":
+					media.Released = false
+				case "active media":
+					old.Status.Phase = ""
+					media.Cleaned, media.Released = false, false
+				case "unclaimed":
+					m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.40"
+					want = http.StatusOK
+				case "other site":
+					media.Site = "site-b"
+					want = http.StatusOK
+				case "successor":
+					want = http.StatusOK
+				}
+
+				fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(old).WithObjects(m, old).
+					WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+				p.Client, p.Resolver.Reader = fc, fc
+
+				if scenario == "successor" {
+					next := &v1alpha3.MachineOperation{
+						ObjectMeta: metav1.ObjectMeta{Name: "successor", UID: "successor-uid"},
+						Spec: v1alpha3.MachineOperationSpec{
+							OperationKind: v1alpha3.OperationHostReplace, MachineRef: m.Name,
+						},
+						Status: v1alpha3.MachineOperationStatus{Targets: []v1alpha3.MachineOperationTargetStatus{{MachineRef: m.Name}}},
+					}
+					require.NoError(t, fc.Create(t.Context(), next))
+				}
+
+				files := map[string][]byte{
+					"vmlinuz": []byte("live kernel"), "initrd": []byte("live initrd"), "init.cpio": []byte("live init.cpio"),
+					"grub.cfg": []byte("live grub config"), "grub/grub.cfg": []byte("live grub config"),
+					"disk.img.gz": []byte("live disk"),
+				}
+				require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("d", 64), files))
+				require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("b", 64), files))
+				p.Resolver.Cache.SetDigest(m.Spec.Netboot().NetbootImage, "sha256:"+strings.Repeat("d", 64))
+				p.Resolver.Cache.SetDigest(m.Spec.Netboot().Image, "sha256:"+strings.Repeat("b", 64))
+				h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
+
+				for path, content := range files {
+					t.Run(path, func(t *testing.T) {
+						ip := m.Spec.Netboot().DHCPLeases[0].IPv4
+						for _, forwarded := range []string{ip, " " + ip + ", 192.0.2.31"} {
+							w := firstBootRequest(h, "/"+path, "192.0.2.30", "", forwarded)
+							require.Equal(t, want, w.Code, w.Body.String())
+
+							if want == http.StatusOK {
+								require.Equal(t, string(content), w.Body.String())
+							}
+						}
+
+						if scenario != "active media" {
+							w := firstBootRequest(h, "/"+path, ip, "")
+							require.Equal(t, want, w.Code, w.Body.String())
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
 func TestMediaReleasedHistorySuccessorPrecedence(t *testing.T) {
 	for _, protocol := range []string{v1alpha3.PXEBootProtocolPXE, v1alpha3.PXEBootProtocolHTTP} {
 		t.Run(protocol, func(t *testing.T) {
