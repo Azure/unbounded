@@ -287,6 +287,14 @@ func TestEvictorLedgerChangesDuringDelete(t *testing.T) {
 			// Without a grant or release, the node has no pods to delete.
 			after: []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
 		},
+		{
+			name: "ledger deleted during first delete",
+			during: func(ctx context.Context, c client.WithWatch, _ *evictor) error {
+				return c.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "system", Name: ledger.ConfigMapName}})
+			},
+			want:  []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
+			after: []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -327,6 +335,60 @@ func TestEvictorLedgerChangesDuringDelete(t *testing.T) {
 			_, err = r.Reconcile(t.Context(), req)
 			require.NoError(t, err)
 			require.ElementsMatch(t, tt.after, remaining(t, c))
+		})
+	}
+}
+
+func TestEvictorDeleteChecksLedgerMetadata(t *testing.T) {
+	boom := errors.New("boom")
+
+	for name, tc := range map[string]struct {
+		metaErr error
+		// want is the number of pods left after the reconcile.
+		want int
+	}{
+		"unchanged ledger": {},
+		"metadata error":   {metaErr: boom, want: 5},
+	} {
+		t.Run(name, func(t *testing.T) {
+			full, meta := 0, 0
+			funcs := &interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				switch o := obj.(type) {
+				case *corev1.ConfigMap:
+					full++
+				case *metav1.PartialObjectMetadata:
+					require.Equal(t, "ConfigMap", o.Kind)
+
+					meta++
+
+					if tc.metaErr != nil {
+						return tc.metaErr
+					}
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			}}
+
+			var pods []*corev1.Pod
+			for i := range 5 {
+				pods = append(pods, pod("other", "p"+strconv.Itoa(i), "a", testNow))
+			}
+
+			r, c := newEvictor(t, configMap(t, grant("tenant", "g", "a", time.Hour)), funcs, pods...)
+
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+			if tc.metaErr != nil {
+				require.ErrorIs(t, err, tc.metaErr)
+				// The first failed check stops the sweep.
+				require.Equal(t, 1, meta)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, len(pods), meta)
+			}
+
+			// Only the reads around the pod list fetch the full ledger.
+			require.Equal(t, 2, full)
+			require.Len(t, remaining(t, c), tc.want)
 		})
 	}
 }

@@ -140,14 +140,15 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		// An earlier delete can block while the grant expires or the node
 		// moves to another namespace. The UID precondition does not catch
 		// that, so recheck the ledger and leave the rest to a new sweep.
-		// Within one version, the grant can only change by expiring.
-		current, currentActive, _, err := r.ledgerRecords(ctx, node)
+		// Within one version, the grant can only change by expiring, so a
+		// metadata read is enough.
+		current, err := r.liveLedgerVersion(ctx)
 		if err != nil {
 			errs = append(errs, err)
 			break
 		}
 
-		if current != version || (currentActive == nil) != (active == nil) {
+		if current != version || (active != nil && active.Expired(r.clock.Now())) {
 			superseded = true
 			break
 		}
@@ -201,6 +202,19 @@ func (r *evictor) ledgerRecords(ctx context.Context, node string) (string, *ledg
 	}
 
 	return cm.ResourceVersion, g, releases, nil
+}
+
+// liveLedgerVersion reads only the ledger's metadata live and returns its
+// resourceVersion. A missing ledger has version "", as in ledgerRecords.
+func (r *evictor) liveLedgerVersion(ctx context.Context) (string, error) {
+	meta := &metav1.PartialObjectMetadata{}
+	meta.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMap"))
+
+	if err := r.apiReader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, meta); err != nil {
+		return "", client.IgnoreNotFound(err)
+	}
+
+	return meta.ResourceVersion, nil
 }
 
 // nodeRecords returns read-only records from an index rebuilt once per ledger version.
