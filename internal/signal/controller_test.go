@@ -446,6 +446,64 @@ func TestWorkflowParameterFallsBackToEntrypointNodeOutputs(t *testing.T) {
 	}
 }
 
+func TestWorkflowParameterPrioritizesRootBeforeConflictingTaskOutputs(t *testing.T) {
+	t.Parallel()
+
+	const workflowName = "gpu-07-13-dapple-b200-full-node-replacement-a1"
+
+	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": workflowName},
+		"status": map[string]any{
+			"nodes": map[string]any{
+				workflowName: map[string]any{
+					"name":        workflowName,
+					"displayName": workflowName,
+					"type":        "DAG",
+					"phase":       "Succeeded",
+					"outputs": map[string]any{"parameters": []any{
+						map[string]any{"name": "verdict", "value": "Fail"},
+						map[string]any{"name": "reason", "value": "NodeGPUCapacityMismatch"},
+					}},
+				},
+				workflowName + "-preflight": map[string]any{
+					"displayName": "node-health",
+					"phase":       "Succeeded",
+					"outputs": map[string]any{"parameters": []any{
+						map[string]any{"name": "verdict", "value": "Fail"},
+						map[string]any{"name": "reason", "value": "NodeGPUCapacityMismatch"},
+					}},
+				},
+				workflowName + "-workload": map[string]any{
+					"displayName": "workload",
+					"phase":       "Skipped",
+				},
+				workflowName + "-mpi": map[string]any{
+					"displayName": "mpi-backend",
+					"phase":       "Skipped",
+				},
+				workflowName + "-health": map[string]any{
+					"displayName": "health-after-preflight-failure",
+					"phase":       "Succeeded",
+					"outputs": map[string]any{"parameters": []any{
+						map[string]any{"name": "verdict", "value": "Pass"},
+						map[string]any{"name": "reason", "value": "FinalHealthPassed"},
+					}},
+				},
+			},
+		},
+	}}
+
+	for range 100 {
+		if got := workflowParameter(workflow, "verdict"); got != "Fail" {
+			t.Fatalf("verdict = %q", got)
+		}
+
+		if got := workflowParameter(workflow, "reason"); got != "NodeGPUCapacityMismatch" {
+			t.Fatalf("reason = %q", got)
+		}
+	}
+}
+
 func TestTerminalVerdictUsesFailingEntrypointOutputOverLaterHealthPass(t *testing.T) {
 	t.Parallel()
 
@@ -463,15 +521,35 @@ func TestTerminalVerdictUsesFailingEntrypointOutputOverLaterHealthPass(t *testin
 	}
 	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Succeeded", "", "")
 	workflow.Object["status"].(map[string]any)["nodes"] = map[string]any{
-		"root": map[string]any{
+		workflow.GetName(): map[string]any{
+			"name":        workflow.GetName(),
 			"displayName": workflow.GetName(),
+			"type":        "DAG",
+			"phase":       "Succeeded",
 			"outputs": map[string]any{"parameters": []any{
 				map[string]any{"name": "verdict", "value": "Fail"},
 				map[string]any{"name": "reason", "value": "NodeGPUCapacityMismatch"},
 			}},
 		},
-		"health-after": map[string]any{
-			"displayName": "health-after",
+		"preflight": map[string]any{
+			"displayName": "node-health",
+			"phase":       "Succeeded",
+			"outputs": map[string]any{"parameters": []any{
+				map[string]any{"name": "verdict", "value": "Fail"},
+				map[string]any{"name": "reason", "value": "NodeGPUCapacityMismatch"},
+			}},
+		},
+		"workload": map[string]any{
+			"displayName": "workload",
+			"phase":       "Skipped",
+		},
+		"mpi": map[string]any{
+			"displayName": "mpi-backend",
+			"phase":       "Skipped",
+		},
+		"health-after-preflight-failure": map[string]any{
+			"displayName": "health-after-preflight-failure",
+			"phase":       "Succeeded",
 			"outputs": map[string]any{"parameters": []any{
 				map[string]any{"name": "verdict", "value": "Pass"},
 				map[string]any{"name": "reason", "value": "FinalHealthPassed"},

@@ -986,41 +986,64 @@ func workflowParameter(workflow *unstructured.Unstructured, name string) string 
 		return ""
 	}
 
-	fallback := ""
+	if value := workflowNodeParameter(nodes[workflow.GetName()], name); value != "" {
+		return value
+	}
 
-	for key, raw := range nodes {
+	for _, raw := range nodes {
 		node, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
 
-		outputs, ok := node["outputs"].(map[string]any)
+		displayName, hasDisplayName := node["displayName"].(string)
+
+		nodeName, hasNodeName := node["name"].(string)
+		if (hasDisplayName && displayName == workflow.GetName()) ||
+			(hasNodeName && nodeName == workflow.GetName()) {
+			if value := workflowNodeParameter(node, name); value != "" {
+				return value
+			}
+		}
+	}
+
+	fallback := ""
+
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
 
-		parameters, ok := outputs["parameters"].([]any)
-		if ok {
-			if value := parameterValue(parameters, name); value != "" {
-				displayName, hasDisplayName := node["displayName"].(string)
-				nodeName, hasNodeName := node["name"].(string)
-
-				if key == workflow.GetName() ||
-					(hasDisplayName && displayName == workflow.GetName()) ||
-					(hasNodeName && nodeName == workflow.GetName()) {
-					return value
-				}
-
-				if fallback == "" {
-					fallback = value
-				} else if fallback != value {
-					return ""
-				}
+		if value := workflowNodeParameter(node, name); value != "" {
+			if fallback == "" {
+				fallback = value
+			} else if fallback != value {
+				return ""
 			}
 		}
 	}
 
 	return fallback
+}
+
+func workflowNodeParameter(raw any, name string) string {
+	node, ok := raw.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	outputs, ok := node["outputs"].(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	parameters, ok := outputs["parameters"].([]any)
+	if !ok {
+		return ""
+	}
+
+	return parameterValue(parameters, name)
 }
 
 func parameterValue(parameters []any, name string) string {
