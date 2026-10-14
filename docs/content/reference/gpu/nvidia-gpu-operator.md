@@ -94,6 +94,29 @@ All four Nodes were Ready, had `DiskPressure=False`, and advertised four legacy
 `nvidia.com/gpu` resources when the deployment was stopped. No GPU Operator,
 GPUCluster, ComputeDomain, ResourceClaim, or DRA ResourceSlice was installed.
 
+### Current rollout blockers
+
+The latest read-only preflight found all four Nodes Ready, schedulable, and
+advertising four GPUs in the existing Racer domain. That does not make any node
+eligible for this profile:
+
+- `gb2002159d2424`, `gb2002159d2425`, and `gb2002159d2426` are Ubuntu 24.04
+  hosts, not the selected Azure Linux 3 profile. Their Machines also lack the
+  approved `spec.host.netboot` URL, rack slot, MAC address, host image, netboot
+  image, and target-disk inputs needed for an auditable HostReplace.
+- `gb2002159d2427` is Azure Linux 3, but the producer profile is blocked and
+  cannot authorize join.
+- Rack slots 25, 26, and 28 reported healthy. Slot 27 returned HTTP 500 with a
+  power-map failure.
+- Only the slot 28 to `gb2002159d2427` MAC mapping is verified. The other
+  physical mappings and newly observed SSH fingerprints do not have approved
+  baselines.
+
+These are producer/MetalMan preflight blockers, not inputs that the Unbounded
+agent can infer or repair. Do not set the DRA MachineConfiguration or begin
+node lifecycle mutation until the selected image/profile, Machine netboot
+identity, rack mapping, and host authenticity baseline all agree.
+
 ## Selected host profile
 
 The selected image contract is named:
@@ -335,6 +358,9 @@ the Hillsboro ownership decision without a new design review.
 ## Selected rollout runbook
 
 Each phase requires captured evidence and an explicit rollback point.
+Before phase 1, compare the approved Machine netboot identity, rack slot/MAC
+mapping, host image digest, and SSH/attestation baseline. Missing or conflicting
+identity input stops the rollout before cordon, drain, HostReplace, or join.
 
 1. **Build and qualify the image.**
    - In `aks-flex-dev`, add the exact driver, userspace, IMEX package,
