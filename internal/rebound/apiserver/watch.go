@@ -261,7 +261,8 @@ func diff(old, next snapshot) eventBatch {
 }
 
 func (s *storage) observe(obj interface{}, deleted bool) {
-	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+	tombstone, missed := obj.(cache.DeletedFinalStateUnknown)
+	if missed {
 		obj = tombstone.Obj
 	}
 
@@ -307,10 +308,19 @@ func (s *storage) observe(obj interface{}, deleted bool) {
 	}
 
 	s.current = next
-	if len(s.history) == historyLimit {
+
+	switch {
+	case deleted && (missed || old.rv == next.rv):
+		// A missed deletion arrives as a tombstone that carries the last cached
+		// RV, not the deletion revision, so the empty ledger can share an RV
+		// with the populated one. Resuming from that RV would skip the grant
+		// deletions, so drop the history and make every earlier RV relist.
+		// Any deletion that reuses the current RV is treated the same way.
+		s.history = nil
+	case len(s.history) == historyLimit:
 		copy(s.history, s.history[1:])
 		s.history[len(s.history)-1] = batch
-	} else {
+	default:
 		s.history = append(s.history, batch)
 	}
 

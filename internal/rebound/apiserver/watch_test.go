@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	apistorage "k8s.io/apiserver/pkg/storage"
+	"k8s.io/client-go/tools/cache"
 
 	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
 	"github.com/Azure/unbounded/internal/rebound/ledger"
@@ -185,6 +186,57 @@ func TestWatchHistoryBounds(t *testing.T) {
 	// RV 15 falls between observed snapshots, so it cannot be resumed.
 	_, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "15"})
 	require.True(t, apierrors.IsResourceExpired(err), "%v", err)
+}
+
+func TestWatchAfterMissedLedgerDeletion(t *testing.T) {
+	for _, tombstone := range []bool{true, false} {
+		t.Run(fmt.Sprint("tombstone=", tombstone), func(t *testing.T) {
+			s, _, ctx := fixture(t)
+			created(t, s, ctx, "a", "node-a")
+			created(t, s, ctx, "b", "node-b")
+			cm := cached(t, s)
+			require.Equal(t, "3", cm.ResourceVersion)
+
+			live, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "3"})
+			require.NoError(t, err)
+
+			defer live.Stop()
+
+			// An informer that misses the deletion reports the last cached
+			// object, so the deletion carries the populated ledger's RV. A
+			// plain deletion at that RV is just as ambiguous.
+			var obj interface{} = cm.DeepCopy()
+			if tombstone {
+				obj = cache.DeletedFinalStateUnknown{Key: "system/" + ledger.ConfigMapName, Obj: obj}
+			}
+
+			s.observe(obj, true)
+			event(t, live, watch.Deleted, "a", "3")
+			event(t, live, watch.Deleted, "b", "3")
+			require.Empty(t, live.ResultChan())
+
+			for _, rv := range []string{"3", "2"} {
+				_, err = s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: rv})
+				require.True(t, apierrors.IsResourceExpired(err), "RV %q: %v", rv, err)
+			}
+
+			recreated := cm.DeepCopy()
+			recreated.ResourceVersion = "4"
+			s.observe(recreated, false)
+			event(t, live, watch.Added, "a", "3")
+			event(t, live, watch.Added, "b", "4")
+
+			resumed, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "4"})
+			require.NoError(t, err)
+
+			defer resumed.Stop()
+
+			require.Empty(t, resumed.ResultChan())
+
+			_, err = s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "3"})
+			require.True(t, apierrors.IsResourceExpired(err), "%v", err)
+		})
+	}
 }
 
 func TestWatchBetweenSnapshots(t *testing.T) {
