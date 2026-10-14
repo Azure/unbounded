@@ -1260,7 +1260,10 @@ mod codec {
         if roots.iter().collect::<HashSet<_>>().len() != roots.len() {
             return Err(Error::InvalidRequest);
         }
-        let mut keys: Vec<CacheEncryptionKey> = Vec::new();
+        // Reserve up front so a reallocation never leaves unwiped copies of
+        // inline key material behind. `decode` already rejected inputs over
+        // MAX_BUNDLE_BYTES, so this length is bounded by the wire size.
+        let mut keys: Vec<CacheEncryptionKey> = Vec::with_capacity(r.cache_keys.len());
         let mut seen = HashSet::new();
         let mut active = BTreeMap::new();
         for k in r.cache_keys {
