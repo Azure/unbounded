@@ -278,7 +278,8 @@ config. If that does not happen within ten minutes of power-on, Metalman assumes
 the host did not boot the media. It restores `Hdd`, unmounts, deletes the staged
 ISO, and builds a new one under a new name. Then it stages it, powers the host off,
 mounts it, selects `RemoteDrive`, and powers on. A new name is needed because the
-tested firmware can keep a broken drive for an image name, even after a remount. It tries three boots in total, then fails
+tested firmware can keep a broken drive for an image name, even after a remount.
+It tries three boots in total, then fails
 the target. `bootAttempts` counts the retries.
 
 The finalizer also drives cleanup after failure or operation deletion, using saved
@@ -296,7 +297,8 @@ Restore connectivity and let cleanup finish; do not remove the finalizer to bypa
 Tested on one arm64 server behind a rack manager running firmware 1.23.13:
 
 - `RemoteDriveMount.ImageName` finds files staged by `Tftp.Get`. Image names must
-  be shorter than 40 characters, so Metalman uses `ub-<32 hex>.iso`.
+  be shorter than 40 characters, so Metalman uses `ub-<32 hex>.iso` and
+  `up-<32 hex>.iso`.
 - The host sees the mounted image as a removable USB disk, not a CD. Metalman
   builds a hybrid ISO with a GPT EFI system partition so UEFI can boot it.
 - `Tftp.Get` and `RemoteDriveMount` block until done. A mount takes about 20
@@ -305,9 +307,12 @@ Tested on one arm64 server behind a rack manager running firmware 1.23.13:
   directory", which Metalman treats as already deleted.
 - Unmount fails with "Rmedia Support is not enabled" when nothing is mounted,
   for example after a power cycle. Metalman treats this as unmounted.
-- Sometimes the host does not see a usable drive after a mount. Linux saw the
-  disk but reads failed, or the BMC USB devices were missing. Mounting the same
-  name again did not help. Mounting a different name did.
+- After a power cycle that follows a media boot, the first mount of a new name
+  often leaves no usable drive. Linux saw the disk but reads failed, or the BMC
+  USB devices were missing, and UEFI did not find a USB boot device. Mounting the
+  same name again did not help. A second mount of another name always gave a
+  working drive. So Metalman stages the ISO under two names, `up-<id>.iso` and
+  `ub-<id>.iso`, mounts `up-` first and then `ub-`, and deletes both in cleanup.
 - `ForceOff` works even though the system does not list it as an allowed reset.
 - The rack power map shows host power, not slot AC power. The slot power-on
   action also powers on the host.

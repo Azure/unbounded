@@ -28,12 +28,15 @@ type mediaRequest struct {
 
 func TestVirtualMediaRequests(t *testing.T) {
 	want := []mediaRequest{
+		{http.MethodPost, rackTftpPath + "Get", `{"Server":"192.0.2.10","File":"up-0123456789abcdef.iso"}`},
 		{http.MethodPost, rackTftpPath + "Get", `{"Server":"192.0.2.10","File":"ub-0123456789abcdef.iso"}`},
+		{http.MethodPost, "/7" + remoteDrivePath + "Mount", `{"ImageName":"up-0123456789abcdef.iso"}`},
 		{http.MethodPost, "/7" + remoteDrivePath + "Mount", `{"ImageName":"ub-0123456789abcdef.iso"}`},
 		{http.MethodPatch, "/7" + rackSystemPath, `{"Boot":{"BootSourceOverrideMode":"UEFI"}}`},
 		{http.MethodPatch, "/7" + rackSystemPath, `{"Boot":{"BootSourceOverrideTarget":"RemoteDrive"}}`},
 		{http.MethodPatch, "/7" + rackSystemPath, `{"Boot":{"BootSourceOverrideTarget":"Hdd"}}`},
 		{http.MethodPost, "/7" + remoteDrivePath + "Unmount", ""},
+		{http.MethodPost, rackTftpPath + "Delete", `{"File":"up-0123456789abcdef.iso"}`},
 		{http.MethodPost, rackTftpPath + "Delete", `{"File":"ub-0123456789abcdef.iso"}`},
 	}
 
@@ -68,9 +71,27 @@ func TestVirtualMediaRequests(t *testing.T) {
 	require.NoError(t, c.MountVirtualMedia(t.Context(), testMedia))
 	require.NoError(t, c.SetVirtualMediaBoot(t.Context()))
 	require.NoError(t, c.CleanupVirtualMedia(t.Context(), testMedia))
-	require.Equal(t, len(want)-1, seen)
+	require.Equal(t, len(want)-2, seen)
 	require.NoError(t, c.DeleteVirtualMedia(t.Context(), testMedia))
 	require.Equal(t, len(want), seen)
+}
+
+func TestVirtualMediaPrimerMountFailureStops(t *testing.T) {
+	var mounts []string
+
+	srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+
+		mounts = append(mounts, string(body))
+
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(completionBody("Failure", "Image not found: up-0123456789abcdef.iso", true)))
+	})
+	c := dialRack(t, srv, "7")
+
+	require.Error(t, c.MountVirtualMedia(t.Context(), testMedia))
+	require.Equal(t, []string{`{"ImageName":"up-0123456789abcdef.iso"}`}, mounts)
 }
 
 func TestVirtualMediaUnsupported(t *testing.T) {
@@ -405,6 +426,17 @@ func TestVirtualMediaCleanupAndDeleteRetries(t *testing.T) {
 							return
 						}
 
+						if r.URL.Path == rackTftpPath+"Delete" {
+							body, err := io.ReadAll(r.Body)
+							assert.NoError(t, err)
+
+							// The primer file is deleted first and always succeeds here.
+							if strings.Contains(string(body), "up-") {
+								w.WriteHeader(http.StatusNoContent)
+								return
+							}
+						}
+
 						attempts++
 						if attempts == 1 {
 							if lostResponse {
@@ -428,7 +460,7 @@ func TestVirtualMediaCleanupAndDeleteRetries(t *testing.T) {
 
 					if operation == "delete" {
 						invoke = c.DeleteVirtualMedia
-						want = []string{"POST " + rackTftpPath + "Delete"}
+						want = []string{"POST " + rackTftpPath + "Delete", "POST " + rackTftpPath + "Delete"}
 					}
 
 					err := invoke(t.Context(), testMedia)

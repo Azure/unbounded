@@ -48,7 +48,8 @@ func validateVirtualMedia(source bootmedia.Source) error {
 	return nil
 }
 
-// StageVirtualMedia copies an ISO to rack storage without changing host power.
+// StageVirtualMedia copies the ISO to rack storage under its name and its
+// primer name, without changing host power.
 func (c *Client) StageVirtualMedia(ctx context.Context, source bootmedia.Source) error {
 	if !c.SupportsVirtualMedia() {
 		return ErrUnsupported
@@ -61,13 +62,21 @@ func (c *Client) StageVirtualMedia(ctx context.Context, source bootmedia.Source)
 	c.rscm.mu.Lock()
 	defer c.rscm.mu.Unlock()
 
-	_, err := rackRequest(ctx, c.rscm.root, http.MethodPost, rackTftpPath+"Get",
-		map[string]string{"Server": source.Server, "File": source.Name})
+	for _, name := range []string{bootmedia.PrimerName(source.Name), source.Name} {
+		if _, err := rackRequest(ctx, c.rscm.root, http.MethodPost, rackTftpPath+"Get",
+			map[string]string{"Server": source.Server, "File": name}); err != nil {
+			return err
+		}
+	}
 
-	return err
+	return nil
 }
 
 // MountVirtualMedia mounts the staged ISO without changing host power.
+// It mounts the primer name first. On firmware 1.23.13, after a power cycle
+// that follows a media boot, the first mount of a new name often leaves no
+// drive or an unreadable one; the second mount of another name attaches a
+// working drive. Each mount takes about 20 seconds.
 // SystemPowerOn also boots the host, so it must not run before media setup completes.
 // This assumes ImageName resolves a rack TFTP filename. RSCM spec sections 9.8
 // (page 35) and 10.31 (page 62) describe the actions, but do not state that link.
@@ -80,8 +89,14 @@ func (c *Client) MountVirtualMedia(ctx context.Context, source bootmedia.Source)
 		return err
 	}
 
-	return c.rackMutate(ctx, http.MethodPost, remoteDrivePath+"Mount",
-		map[string]string{"ImageName": source.Name}, false)
+	for _, name := range []string{bootmedia.PrimerName(source.Name), source.Name} {
+		if err := c.rackMutate(ctx, http.MethodPost, remoteDrivePath+"Mount",
+			map[string]string{"ImageName": name}, false); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // SetVirtualMediaBoot selects UEFI before selecting the remote drive.
@@ -133,7 +148,7 @@ func (c *Client) CleanupVirtualMedia(ctx context.Context, source bootmedia.Sourc
 	return err
 }
 
-// DeleteVirtualMedia deletes only the staged rack file, independently of the blade.
+// DeleteVirtualMedia deletes only the staged rack files, independently of the blade.
 // Callers must persist boot-safe cleanup before deletion and retain ownership on error.
 // Firmware reports an already-deleted file as Failure with "No such file or directory".
 func (c *Client) DeleteVirtualMedia(ctx context.Context, source bootmedia.Source) error {
@@ -148,13 +163,19 @@ func (c *Client) DeleteVirtualMedia(ctx context.Context, source bootmedia.Source
 	c.rscm.mu.Lock()
 	defer c.rscm.mu.Unlock()
 
-	_, err := rackRequest(ctx, c.rscm.root, http.MethodPost, rackTftpPath+"Delete",
-		map[string]string{"File": source.Name})
+	for _, name := range []string{bootmedia.PrimerName(source.Name), source.Name} {
+		_, err := rackRequest(ctx, c.rscm.root, http.MethodPost, rackTftpPath+"Delete",
+			map[string]string{"File": name})
 
-	var failure *completionFailure
-	if errors.As(err, &failure) && strings.Contains(strings.ToLower(failure.description), "no such file or directory") {
-		return nil
+		var failure *completionFailure
+		if errors.As(err, &failure) && strings.Contains(strings.ToLower(failure.description), "no such file or directory") {
+			continue
+		}
+
+		if err != nil {
+			return err
+		}
 	}
 
-	return err
+	return nil
 }

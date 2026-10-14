@@ -5,6 +5,7 @@ package bootmedia
 
 import (
 	"context"
+	"strings"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -13,6 +14,19 @@ import (
 type Source struct {
 	Name   string
 	Server string
+}
+
+// PrimerName returns a second name for the same ISO, or "" when name has no
+// reserved prefix. Some managers attach a readable drive only after a mount
+// under a different name, so clients may mount this name first. Rack SCM
+// firmware 1.23.13 showed this after power cycles that followed a media boot.
+func PrimerName(name string) string {
+	rest, ok := strings.CutPrefix(name, "ub-")
+	if !ok {
+		return ""
+	}
+
+	return "up-" + rest
 }
 
 // Provider builds immutable, operation-owned media before any power changes.

@@ -179,11 +179,17 @@ func (p *MediaProvider) Release(_ context.Context, id string) error {
 
 // OpenISO authorizes a rack TFTP request before any host source-IP lookup.
 func (p *MediaProvider) OpenISO(ctx context.Context, name string) (*os.File, error) {
-	if !strings.HasPrefix(name, "ub-") || !strings.HasSuffix(name, ".iso") {
+	// The primer name ("up-" prefix) serves the same ISO; see bootmedia.PrimerName.
+	rest, ok := strings.CutPrefix(name, "ub-")
+	if !ok {
+		rest, ok = strings.CutPrefix(name, "up-")
+	}
+
+	if !ok || !strings.HasSuffix(rest, ".iso") {
 		return nil, fmt.Errorf("invalid media filename")
 	}
 
-	id := strings.TrimSuffix(strings.TrimPrefix(name, "ub-"), ".iso")
+	id := strings.TrimSuffix(rest, ".iso")
 
 	p.mu.Lock()
 	defer p.mu.Unlock()

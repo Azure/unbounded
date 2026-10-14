@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/bootmedia"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 )
 
@@ -186,7 +187,12 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 			require.NoError(t, server.readHandler(source.Name, &readerFrom{Writer: &dst}))
 			require.Equal(t, "immutable ISO", dst.String())
 
-			for _, bad := range []string{"/" + source.Name, "../" + source.Name, "ub-unknown.iso", "ub-" + strings.Repeat("d", 32) + ".iso", "ub-" + strings.Repeat("d", 64) + ".iso"} {
+			// The primer name serves the same ISO.
+			var primer strings.Builder
+			require.NoError(t, server.readHandler(bootmedia.PrimerName(source.Name), &readerFrom{Writer: &primer}))
+			require.Equal(t, "immutable ISO", primer.String())
+
+			for _, bad := range []string{"/" + source.Name, "../" + source.Name, "ub-unknown.iso", "ub-" + strings.Repeat("d", 32) + ".iso", "ub-" + strings.Repeat("d", 64) + ".iso", "uq-" + id + ".iso", "up-" + id + ".img"} {
 				_, err := restarted.OpenISO(t.Context(), bad)
 				require.Error(t, err)
 			}
