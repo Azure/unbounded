@@ -51,7 +51,7 @@ The harness shells out to standard CLIs; no extra Go deps. Install:
 - [Docker](https://docs.docker.com/get-docker/) or [Podman](https://podman.io/) (engine running)
 - [kind](https://kind.sigs.k8s.io/) ≥ 0.20
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) ≥ 1.28
-- Go ≥ 1.27 (matching root `go.mod`)
+- Go ≥ 1.27.2 (matching root `go.mod`)
 
 ## Running
 
