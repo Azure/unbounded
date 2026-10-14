@@ -171,6 +171,24 @@ func TestCreateNamespaceErrors(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsTerminatingNamespace(t *testing.T) {
+	s, client, ctx := fixture(t)
+	client.PrependReactor("get", "namespaces", func(clienttesting.Action) (bool, runtime.Object, error) {
+		deleted := metav1.Now()
+
+		return true, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "team-uid", DeletionTimestamp: &deleted}}, nil
+	})
+
+	_, err := s.Create(ctx, grant("test", "node-a"), nil, nil)
+	if !apierrors.IsForbidden(err) {
+		t.Fatalf("expected Forbidden, got %v", err)
+	}
+
+	if len(cached(t, s).Data) != 0 {
+		t.Fatal("terminating namespace changed ledger")
+	}
+}
+
 func TestCreateInvalid(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

@@ -291,6 +291,11 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 			return &mutationError{err}
 		}
 
+		if namespace.DeletionTimestamp != nil {
+			return &mutationError{apierrors.NewForbidden(rebound.GroupResource(), g.Name,
+				fmt.Errorf("namespace %s is terminating", ns))}
+		}
+
 		record.NamespaceUID = namespace.UID
 
 		l.Reap(s.clock.Now(), nil)
