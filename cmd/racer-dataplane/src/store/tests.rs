@@ -2855,10 +2855,10 @@ fn disk_read_reclaims_exact_staging_and_decode_charges_without_flushing_queue() 
     )
     .unwrap()
     .unwrap();
-    assert_eq!(*allocations.borrow(), [disk_bytes + 80]);
+    assert_eq!(*allocations.borrow(), [disk_bytes]);
     assert_eq!(read.ciphertext.bytes(), &[1; 80]);
-    assert_eq!(f.store.writer.discarded_count(), 1);
-    assert_eq!(f.store.writer.queued_count(), 1);
+    assert_eq!(f.store.writer.discarded_count(), 0);
+    assert_eq!(f.store.writer.queued_count(), 2);
     assert!(f.store.writer.copy_only(&last_id).unwrap().is_some());
 }
 
@@ -3000,7 +3000,8 @@ mod records {
                         reservation: admission
                             .reserve(None, ResourceClass::Ciphertext, length + 16)
                             .unwrap(),
-                    },
+                    }
+                    .into(),
                 }),
             },
             metadata: metadata.for_pin(),

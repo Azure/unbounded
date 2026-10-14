@@ -4,7 +4,6 @@
 
 use super::dispatch::WorkerDirectory;
 use super::flight::AcquisitionBudget;
-use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -574,8 +573,6 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
-    pipe_admission: Option<Operation<'static, flow_control::PipeLease<AdmissionPolicy>>>,
-
     prefetch_error: Option<Error>,
 
     selected_ready: Option<PageResult>,
@@ -655,7 +652,6 @@ impl RangeStreams {
         }
         let first = range.first_page();
         Ok(RangeStream {
-            pipe_admission: None,
             prefetch_error: None,
             selected_ready: None,
             selection: None,
@@ -901,7 +897,6 @@ impl RangeStream {
         })
     }
     fn terminate(&mut self) {
-        self.pipe_admission = None;
         self.terminated = true;
         self.next_page = None;
         self.ready.clear();
@@ -909,23 +904,6 @@ impl RangeStream {
         self.subscription = None;
         self.selection = None;
         self.selected_ready = None;
-    }
-
-    // Duplex delivery drops next_slice between polls to process release_page.
-    // Keep the FIFO guard, cancellation registration, and original admission
-    // deadline in the stream instead of in that temporary borrowing future.
-    async fn admit_pipe(
-        &mut self,
-        scope: &RequestScope,
-    ) -> Result<flow_control::PipeLease<AdmissionPolicy>> {
-        let admission = self.pipe_admission.get_or_insert_with(|| {
-            let delivery = self.delivery.clone();
-            let scope = scope.clone();
-            Box::pin(async move { delivery.admit(&scope).await })
-        });
-        let result = poll_fn(|cx| admission.as_mut().poll(cx)).await;
-        self.pipe_admission = None;
-        result
     }
 
     async fn next_ordered_slice(&mut self) -> Result<Option<ReaderLease>> {
@@ -945,8 +923,7 @@ impl RangeStream {
             self.terminated = true;
             return Ok(None);
         }
-        // No delivery pipe is held while waiting for credit or the ordered head.
-        let pipe = self.admit_pipe(&scope).await?;
+        scope.check()?;
         let Some((number, WindowPage::Ready(result))) = self.ready.pop_front() else {
             return Err(Error::StaleFlight);
         };
@@ -955,9 +932,7 @@ impl RangeStream {
         self.subscription.as_mut().unwrap().issued(number)?;
         self.retained.insert(number, result.plaintext.clone());
         let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
-        self.delivery
-            .attach_reserved(result.plaintext, slice, pipe)
-            .map(Some)
+        self.delivery.attach(result.plaintext, slice).map(Some)
     }
     async fn next_subscription_slice(&mut self) -> Result<Option<ReaderLease>> {
         let scope = self.operation_scope();
@@ -968,15 +943,11 @@ impl RangeStream {
                 if let Some(result) = self.selected_ready.as_ref() {
                     let number = result.plaintext.page().number;
                     self.validate(result, number)?;
-                    let pipe = self.admit_pipe(&scope).await?;
                     let result = self.selected_ready.take().ok_or(Error::StaleFlight)?;
                     self.subscription.as_mut().unwrap().issued(number)?;
                     self.retained.insert(number, result.plaintext.clone());
                     let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
-                    return self
-                        .delivery
-                        .attach_reserved(result.plaintext, slice, pipe)
-                        .map(Some);
+                    return self.delivery.attach(result.plaintext, slice).map(Some);
                 }
                 poll_fn(|cx| {
                     cancellation.register(cx.waker());
@@ -1084,11 +1055,7 @@ pub(super) mod tests {
             );
             let streams = RangeStreams::new(
                 directory,
-                Rc::new(Delivery::new(
-                    pipes.clone(),
-                    reactor,
-                    Duration::from_secs(30),
-                )),
+                Rc::new(Delivery::new(reactor, Duration::from_secs(30))),
                 capacity,
             );
             Self {
@@ -1172,7 +1139,8 @@ pub(super) mod tests {
                         reservation: admission
                             .reserve(cache, ResourceClass::Ciphertext, length + 16)
                             .unwrap(),
-                    },
+                    }
+                    .into(),
                 }),
             },
         }
@@ -1365,15 +1333,26 @@ pub(super) mod tests {
                 let wakes = Arc::new(WakeCounter::default());
                 let waker = std::task::Waker::from(wakes.clone());
                 let mut cx = Context::from_waker(&waker);
-                assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+                let mut next = stream.next_slice();
+                let Poll::Ready(Ok(Some(second))) = next.as_mut().poll(&mut cx) else {
+                    panic!("pipe exhaustion must not block page delivery")
+                };
+                assert_eq!(second.slice().page, PageNumber(1));
+                drop(next);
+                stream
+                    .release_page(PageNumber(1), second.slice().length)
+                    .unwrap();
                 let waiting = admission.used(ResourceClass::RequestContext);
                 assert!(
-                    waiting > baseline,
-                    "temporary future must retain FIFO admission"
+                    waiting == baseline,
+                    "direct delivery needs no FIFO pipe admission"
                 );
                 stream.release_page(PageNumber(0), 1).unwrap();
                 for _ in 0..3 {
-                    assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+                    assert!(matches!(
+                        stream.next_slice().as_mut().poll(&mut cx),
+                        Poll::Ready(Ok(None))
+                    ));
                     assert_eq!(admission.used(ResourceClass::RequestContext), waiting);
                 }
                 let before = wakes.count();
@@ -1381,14 +1360,10 @@ pub(super) mod tests {
                     "release" => {
                         drop(held);
                         assert!(
-                            wakes.count() > before,
-                            "pipe release alone must wake later-page delivery"
+                            wakes.count() == before,
+                            "direct delivery does not register a pipe waiter"
                         );
-                        let Poll::Ready(Ok(Some(reader))) =
-                            stream.next_slice().as_mut().poll(&mut cx)
-                        else {
-                            panic!("woken waiter did not progress")
-                        };
+                        let reader = second;
                         assert_eq!(reader.slice().page, PageNumber(1));
                         drop(reader);
                         assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
@@ -1396,15 +1371,16 @@ pub(super) mod tests {
                     }
                     "cancel" => {
                         scope.cancel().unwrap();
-                        assert!(wakes.count() > before);
+                        assert!(wakes.count() == before);
                         assert!(matches!(
                             stream.next_slice().as_mut().poll(&mut cx),
-                            Poll::Ready(Err(Error::Cancelled))
+                            Poll::Ready(Ok(None))
                         ));
-                        assert!(stream.pipe_admission.is_none());
+                        assert!(stream.terminated);
+                        drop(second);
                         drop((stream, held));
                     }
-                    _ => drop((stream, held)),
+                    _ => drop((second, stream, held)),
                 }
                 assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
                 admission.reclaim_buffers();
@@ -1743,7 +1719,6 @@ pub(super) mod tests {
         use crate::admission::ResourceClass;
         use crate::client::Responses;
         use crate::http::Codec;
-        use crate::http::new_pipe_pool;
         use crate::model::RequestId;
         use crate::read::ReadResponse;
         use crate::runtime::Reactor;
@@ -1771,11 +1746,7 @@ pub(super) mod tests {
                     i64::MAX as u64
                 },
             ));
-            let delivery = Rc::new(Delivery::new(
-                Rc::new(new_pipe_pool(admission.clone())),
-                reactor.clone(),
-                Duration::from_secs(30),
-            ));
+            let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(30)));
             let mut metadata = metadata();
             metadata.length = total;
             metadata.version.object.cache = CacheId(crate::test_support::security::CACHE.into());

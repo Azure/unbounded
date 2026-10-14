@@ -97,7 +97,7 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
             if scenario == "full" {
                 // Different geometry prevents the watched owner from consuming a
                 // slot, so its final release exercises full-pool rejection.
-                let buffers: Vec<_> = (0..2)
+                let buffers: Vec<_> = (0..8)
                     .map(|_| {
                         pool.plaintext(
                             admission
@@ -112,7 +112,7 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
             }
             let reservation = admission.reserve(Some(&cache), class, capacity).unwrap();
             let owner: Box<dyn Send> = if ciphertext {
-                // A formerly initialized tail must be wiped even after truncation.
+                // Ciphertext needs no secure wipe, including its truncated tail.
                 let mut bytes = vec![0xa7; capacity];
                 bytes.truncate(capacity - 31);
                 let page = pool
@@ -168,7 +168,11 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
                 assert_eq!(admission.used(class), 0);
             }
             assert!(FREED.load(Ordering::SeqCst), "{ciphertext} {scenario}");
-            assert!(ZEROED.load(Ordering::SeqCst), "{ciphertext} {scenario}");
+            assert_eq!(
+                ZEROED.load(Ordering::SeqCst),
+                !ciphertext,
+                "{ciphertext} {scenario}"
+            );
             if let Some(admission) = admission {
                 admission.reclaim_buffers();
                 assert_eq!(admission.used(class), 0);

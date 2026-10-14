@@ -5,7 +5,6 @@ use crate::client::ReadKind;
 use crate::control::Snapshot;
 use crate::http::Codec;
 use crate::http::Delivery;
-use crate::http::new_pipe_pool;
 use crate::model::ByteRange;
 use crate::peer::PeerNetwork;
 use crate::peer::forwarding::Forwarding;
@@ -64,11 +63,7 @@ mod duplex_release {
             ))
             .unwrap();
             let admission = f.fill.dependencies.admission.clone();
-            let delivery = Rc::new(Delivery::new(
-                Rc::new(new_pipe_pool(admission.clone())),
-                f.reactor.clone(),
-                Duration::from_secs(30),
-            ));
+            let delivery = Rc::new(Delivery::new(f.reactor.clone(), Duration::from_secs(30)));
             let io = Rc::new(crate::http::new_io(
                 f.reactor.clone(),
                 Codec::new(32768),
@@ -139,7 +134,8 @@ mod duplex_release {
             assert_eq!(n, if mode == "short" { 2 } else { 3 });
             assert_eq!(&payload[..n], &b"abc"[..n]);
             assert!(f.reactor.in_flight() > 0);
-            assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+            assert!(admission.used(ResourceClass::Plaintext) >= 3);
             sim.set_max_chunk(usize::MAX).unwrap();
             let mut release = [0; 12];
             release[8..]
@@ -156,7 +152,11 @@ mod duplex_release {
             }
             assert_eq!(
                 admission.used(ResourceClass::Pipe),
-                1,
+                0,
+                "direct sends do not own a pipe"
+            );
+            assert!(
+                admission.used(ResourceClass::Plaintext) >= 3,
                 "release cannot drop CQE owners"
             );
             if mode == "drop" || matches!(mode, "duplicate" | "malformed") {
@@ -249,11 +249,7 @@ mod duplex_release {
         };
         let response = futures::executor::block_on(local.read(request, &scope)).unwrap();
         let admission = f.fill.dependencies.admission.clone();
-        let delivery = Rc::new(Delivery::new(
-            Rc::new(new_pipe_pool(admission.clone())),
-            f.reactor.clone(),
-            Duration::from_secs(30),
-        ));
+        let delivery = Rc::new(Delivery::new(f.reactor.clone(), Duration::from_secs(30)));
         let io = Rc::new(crate::http::new_io(
             f.reactor.clone(),
             Codec::new(32768),
@@ -1088,11 +1084,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
                 panic!("unordered turn after the fixed batch completes")
             };
             drop(selection);
-            let delivery = Delivery::new(
-                Rc::new(new_pipe_pool(f.fill.dependencies.admission.clone())),
-                f.reactor.clone(),
-                Duration::from_secs(30),
-            );
+            let delivery = Delivery::new(f.reactor.clone(), Duration::from_secs(30));
             let (socket, _stalled_client) = std::os::unix::net::UnixStream::pair().unwrap();
             let mut connection =
                 crate::http::from_accepted(socket.into(), &f.fill.dependencies.admission).unwrap();

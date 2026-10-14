@@ -609,7 +609,6 @@ impl Rig {
         ));
         let pipes = Rc::new(new_pipe_pool(admission.clone()));
         let delivery = Rc::new(Delivery::new(
-            pipes.clone(),
             reactor.clone(),
             // This fixture polls real crypto inline rather than on its paired
             // production thread. Debug-build page crypto must not count as a
@@ -1884,8 +1883,12 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     let cancel = std::future::poll_fn(|_| {
         if slow_head.load(Ordering::Acquire) && fast_done.load(Ordering::Acquire) {
             assert!(
-                rig.admission.used(ResourceClass::Pipe) > rig.pipes.idle_count(),
-                "slow reader must retain a delivery lease"
+                rig.admission.used(ResourceClass::Plaintext) >= P as usize,
+                "slow reader must retain its page"
+            );
+            assert_eq!(
+                rig.admission.used(ResourceClass::Pipe),
+                rig.pipes.idle_count()
             );
             slow_scope.cancel().unwrap();
             Poll::Ready(())

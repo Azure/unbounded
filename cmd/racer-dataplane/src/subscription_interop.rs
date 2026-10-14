@@ -205,7 +205,6 @@ impl SubscriptionFixture {
         use control::publication::PublicationTarget;
         use controlplane::Published;
         use http::Delivery;
-        use http::new_pipe_pool;
         use memory::BufferPool;
         use memory::MemoryCache;
         use racer_control_wire::CacheDefinition;
@@ -344,11 +343,7 @@ impl SubscriptionFixture {
                 fill: fill.clone(),
             },
         ));
-        let delivery = Rc::new(Delivery::new(
-            Rc::new(new_pipe_pool(admission.clone())),
-            reactor.clone(),
-            Duration::from_secs(10),
-        ));
+        let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(10)));
         let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
         let coordinator = Rc::new(Coordinator::new(
             snapshots.published.clone(),

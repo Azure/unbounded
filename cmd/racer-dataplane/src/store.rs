@@ -198,25 +198,20 @@ impl StoreReader {
                 }
             };
             let length = entry.location.extent.length();
-            let staging_capacity = staging_capacity(length)?;
-            let decoded_length = entry.metadata.page_length(page)? as usize + 16;
-            let amount = staging_capacity
-                .checked_add(decoded_length)
-                .ok_or(Error::Overloaded)?;
+            let amount = staging_capacity(length)?;
             let mut reserved = reserve(amount);
             if matches!(reserved, Err(Error::Overloaded)) {
                 self.slabs.reclaim_idle();
                 reserved = reserve(amount);
             }
-            let mut decoded_reservation = reserved?;
-            decoded_reservation.validate(ResourceClass::Ciphertext, amount)?;
-            if !self.admission.owns(&decoded_reservation)
-                || decoded_reservation.key() != Some(&page.version.object.cache)
+            let reservation = reserved?;
+            reservation.validate(ResourceClass::Ciphertext, amount)?;
+            if !self.admission.owns(&reservation)
+                || reservation.key() != Some(&page.version.object.cache)
             {
                 return Err(Error::InvalidConfiguration);
             }
-            let staging = decoded_reservation.split(staging_capacity)?;
-            let buffer = self.slabs.allocate(length, staging)?;
+            let buffer = self.slabs.allocate(length, reservation)?;
             let buffer = match self
                 .slabs
                 .read(&self.reactor, entry.location.extent, buffer, lease, scope)
@@ -255,10 +250,10 @@ impl StoreReader {
             }) {
                 return Ok(None);
             }
-            let ciphertext = self.buffers.ciphertext(
-                decoded_reservation,
+            let ciphertext = self.buffers.slab_ciphertext(
+                buffer,
                 decoded.header.envelope,
-                buffer.bytes()?[decoded.ciphertext].to_vec(),
+                decoded.ciphertext,
             )?;
             ciphertext.expected_checksum(decoded.checksum)?;
             self.clock.mark_read(entry.location.segment)?;
@@ -860,7 +855,7 @@ impl StoreWriter {
                 released = released.saturating_add(dirty.staging_bytes());
                 if std::sync::Arc::strong_count(&dirty.page.ciphertext.inner) == 1 {
                     released =
-                        released.saturating_add(dirty.page.ciphertext.inner.reservation.amount());
+                        released.saturating_add(dirty.page.ciphertext.inner.reservation().amount());
                 }
                 removed += 1;
             }

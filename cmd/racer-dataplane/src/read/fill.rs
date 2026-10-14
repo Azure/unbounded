@@ -291,7 +291,7 @@ impl Fill {
         if !self
             .dependencies
             .admission
-            .owns(&copy.ciphertext.inner.reservation)
+            .owns(copy.ciphertext.inner.reservation())
         {
             let reservation = self.observe_reservation(
                 scope,
@@ -301,7 +301,7 @@ impl Fill {
                     self.reserve_with_reclamation(
                         &page.version.object.cache,
                         ResourceClass::Ciphertext,
-                        copy.ciphertext.inner.bytes.capacity(),
+                        copy.ciphertext.inner.capacity(),
                     )
                 },
             )?;

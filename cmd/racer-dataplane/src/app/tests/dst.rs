@@ -1301,7 +1301,8 @@ mod scenarios {
         }
         assert!(harness.coverage.secondary_worker_turns > 0);
         assert!(harness.coverage.relay_turns > 0);
-        assert_eq!(harness.coverage.success, 8);
+        // Direct delivery changes deterministic turn ordering under injected pressure.
+        assert_eq!(harness.coverage.success, if opaque { 8 } else { 9 });
     }
 }
 mod traffic {

@@ -17,7 +17,6 @@ use racer_dataplane::http::Codec;
 use racer_dataplane::http::ConnectionLease;
 use racer_dataplane::http::Delivery;
 use racer_dataplane::http::HttpIo;
-use racer_dataplane::http::new_pipe_pool;
 use racer_dataplane::model::ByteRange;
 use racer_dataplane::model::CacheKey;
 use racer_dataplane::model::ExpiresAt;
@@ -116,11 +115,7 @@ impl Rig {
     fn responses(&self) -> Responses {
         Responses::new(
             self.io.clone(),
-            Rc::new(Delivery::new(
-                Rc::new(new_pipe_pool(self.admission.clone())),
-                self.reactor.clone(),
-                Duration::from_secs(5),
-            )),
+            Rc::new(Delivery::new(self.reactor.clone(), Duration::from_secs(5))),
         )
     }
 }

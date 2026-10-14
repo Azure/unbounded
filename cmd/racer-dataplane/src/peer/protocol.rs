@@ -1358,7 +1358,7 @@ pub(crate) mod tests {
             opaque_page_response(&metadata, &invalid, PageOutcome::Page, &[0; 32], &[]).is_err()
         );
         let mut page = page;
-        Arc::get_mut(&mut page.inner).unwrap().storage.bytes.pop();
+        Arc::get_mut(&mut page.inner).unwrap().bytes.pop();
         assert!(matches!(
             response_head(
                 &PeerResponse::Bootstrap {

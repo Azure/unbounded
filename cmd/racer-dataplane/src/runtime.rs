@@ -311,6 +311,10 @@ impl Deref for Reactor {
     }
 }
 impl Reactor {
+    #[cfg(test)]
+    pub(crate) fn admission(&self) -> &Rc<flow_control::Quotas<AdmissionPolicy>> {
+        &self.admission
+    }
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         let diagnostics = admission.clone();
         Self {

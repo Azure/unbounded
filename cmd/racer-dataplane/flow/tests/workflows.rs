@@ -590,8 +590,8 @@ mod quota_tests {
     #[test]
     fn full_recycler_and_stopped_recycler_do_not_consume_charge() {
         let size = 1 << 20;
-        let quotas = Quotas::new(TestPolicy::new(4 * size, 1));
-        for _ in 0..2 {
+        let quotas = Quotas::new(TestPolicy::new(10 * size, 1));
+        for _ in 0..8 {
             let mut retained = quotas.reserve(None, Resource::Silent, size).unwrap();
             retained.recycle(vec![0xa7; size]);
             assert_eq!(retained.amount(), 0);
@@ -599,8 +599,8 @@ mod quota_tests {
         let mut rejected = quotas.reserve(None, Resource::Silent, size).unwrap();
         rejected.recycle(vec![0xa7; size]);
         assert_eq!(rejected.amount(), size);
-        assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
-        assert_eq!(quotas.used(Resource::Silent), 3 * size);
+        assert_eq!(quotas.retained_buffer_bytes(), 8 * size);
+        assert_eq!(quotas.used(Resource::Silent), 9 * size);
         quotas.stop();
         assert_eq!(quotas.retained_buffer_bytes(), 0);
         assert_eq!(quotas.used(Resource::Silent), size);

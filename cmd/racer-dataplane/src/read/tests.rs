@@ -81,7 +81,8 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
                     reservation: admission
                         .reserve(None, ResourceClass::Ciphertext, 17)
                         .unwrap(),
-                },
+                }
+                .into(),
             }),
         },
     }
@@ -1740,7 +1741,8 @@ mod flight {
                             .admission
                             .reserve(None, ResourceClass::Ciphertext, 19)
                             .unwrap(),
-                    },
+                    }
+                    .into(),
                 }),
             },
         }

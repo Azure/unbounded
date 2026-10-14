@@ -84,22 +84,59 @@ pub(crate) struct CiphertextBytes {
 
     pub envelope: PageEnvelope,
 
-    pub storage: flow_control::ChargedBytes<AdmissionPolicy>,
+    pub storage: CiphertextStorage,
 }
 
-impl std::ops::Deref for CiphertextBytes {
-    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+pub(crate) enum CiphertextStorage {
+    Owned(flow_control::ChargedBytes<AdmissionPolicy>),
+    Slab {
+        buffer: page_alloc::FrozenBuffer<flow_control::Charge<AdmissionPolicy>>,
+        range: std::ops::Range<usize>,
+    },
+}
 
-    /// Keep existing internal byte and reservation views on the shared owner.
-    fn deref(&self) -> &Self::Target {
-        &self.storage
+impl From<flow_control::ChargedBytes<AdmissionPolicy>> for CiphertextStorage {
+    fn from(bytes: flow_control::ChargedBytes<AdmissionPolicy>) -> Self {
+        Self::Owned(bytes)
     }
 }
 
+impl CiphertextBytes {
+    pub(crate) fn reservation(&self) -> &flow_control::Charge<AdmissionPolicy> {
+        match &self.storage {
+            CiphertextStorage::Owned(storage) => &storage.reservation,
+            CiphertextStorage::Slab { buffer, .. } => buffer.charge(),
+        }
+    }
+    pub(crate) fn capacity(&self) -> usize {
+        match &self.storage {
+            CiphertextStorage::Owned(storage) => storage.bytes.capacity(),
+            CiphertextStorage::Slab { buffer, .. } => buffer.capacity(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for CiphertextBytes {
+    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+
+    /// Borrow vector-backed fixtures; frozen slab bytes have no mutable fixture API.
+    fn deref(&self) -> &Self::Target {
+        match &self.storage {
+            CiphertextStorage::Owned(storage) => storage,
+            CiphertextStorage::Slab { .. } => panic!("slab ciphertext is immutable"),
+        }
+    }
+}
+
+#[cfg(test)]
 impl std::ops::DerefMut for CiphertextBytes {
-    /// Exclusive owners can rehome accounting without copying the allocation.
+    /// Allow malformed vector fixtures without exposing mutable production bytes.
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.storage
+        match &mut self.storage {
+            CiphertextStorage::Owned(storage) => storage,
+            CiphertextStorage::Slab { .. } => panic!("slab ciphertext is immutable"),
+        }
     }
 }
 impl BufferPool {
@@ -147,7 +184,37 @@ impl BufferPool {
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope,
-                storage: flow_control::ChargedBytes { bytes, reservation },
+                storage: flow_control::ChargedBytes { bytes, reservation }.into(),
+            }),
+        })
+    }
+    pub(crate) fn slab_ciphertext(
+        &self,
+        buffer: page_alloc::AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+        envelope: PageEnvelope,
+        range: std::ops::Range<usize>,
+    ) -> Result<CiphertextPage> {
+        envelope.validate()?;
+        if buffer.as_slice().get(range.clone()).is_none()
+            || range.len() != envelope.ciphertext_length as usize
+        {
+            return Err(Error::CorruptRecord);
+        }
+        let buffer = buffer.freeze()?;
+        self.validate_reservation(
+            buffer.charge(),
+            ResourceClass::Ciphertext,
+            buffer.capacity(),
+            Some(&envelope.page.version.object.cache),
+        )?;
+        // The read CQE has returned ownership. Freeze exposes no mutable bytes,
+        // and the full padded allocation and charge outlive every ciphertext view.
+        Ok(CiphertextPage {
+            provenance: None,
+            inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
+                envelope,
+                storage: CiphertextStorage::Slab { buffer, range },
             }),
         })
     }
@@ -179,18 +246,18 @@ impl BufferPool {
             cache,
         )?;
         self.validate_reservation(
-            &page.ciphertext.inner.reservation,
+            page.ciphertext.inner.reservation(),
             ResourceClass::Ciphertext,
-            page.ciphertext.inner.bytes.capacity(),
+            page.ciphertext.inner.capacity(),
             cache,
         )
     }
     fn validate_ciphertext(&self, copy: &CiphertextCopy) -> Result<()> {
         copy.validate_metadata()?;
         self.validate_reservation(
-            &copy.ciphertext.inner.reservation,
+            copy.ciphertext.inner.reservation(),
             ResourceClass::Ciphertext,
-            copy.ciphertext.inner.bytes.capacity(),
+            copy.ciphertext.inner.capacity(),
             Some(&copy.metadata.version.object.cache),
         )
     }
@@ -211,12 +278,15 @@ impl CiphertextPage {
         mut self,
         reservation: flow_control::Charge<AdmissionPolicy>,
     ) -> Result<Self> {
-        reservation.validate(ResourceClass::Ciphertext, self.inner.bytes.capacity())?;
+        reservation.validate(ResourceClass::Ciphertext, self.inner.capacity())?;
         if reservation.key() != Some(&self.envelope().page.version.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.reservation = reservation;
+            match &mut inner.storage {
+                CiphertextStorage::Owned(storage) => storage.reservation = reservation,
+                CiphertextStorage::Slab { buffer, .. } => buffer.rebind(reservation)?,
+            }
             return Ok(self);
         }
         let mut bytes = reservation.buffer(self.bytes().len())?;
@@ -225,7 +295,7 @@ impl CiphertextPage {
             inner: Arc::new(CiphertextBytes {
                 checksum: self.inner.checksum.clone(),
                 envelope: self.envelope().clone(),
-                storage: flow_control::ChargedBytes { bytes, reservation },
+                storage: flow_control::ChargedBytes { bytes, reservation }.into(),
             }),
             provenance: self.provenance,
         })
@@ -263,7 +333,10 @@ impl CiphertextPage {
         &self.inner.envelope
     }
     pub fn bytes(&self) -> &[u8] {
-        &self.inner.bytes
+        match &self.inner.storage {
+            CiphertextStorage::Owned(storage) => &storage.bytes,
+            CiphertextStorage::Slab { buffer, range } => &buffer.as_slice()[range.clone()],
+        }
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
@@ -691,7 +764,7 @@ impl MemoryCache {
             }
             released = released
                 .saturating_add(entry.plaintext.inner.reservation.amount())
-                .saturating_add(entry.ciphertext.inner.reservation.amount());
+                .saturating_add(entry.ciphertext.inner.reservation().amount());
             entries.remove(&id);
         }
         self.pool.reclaim_buffers();
@@ -739,7 +812,7 @@ impl MemoryCache {
             }
             released = released.saturating_add(match class {
                 ResourceClass::Plaintext => entry.plaintext.inner.reservation.amount(),
-                _ => entry.ciphertext.inner.reservation.amount(),
+                _ => entry.ciphertext.inner.reservation().amount(),
             });
             entries.remove(&id);
         }
@@ -791,7 +864,7 @@ impl MemoryCache {
                 continue;
             }
             if let Some(entry) = entries.remove(&id) {
-                released += entry.copy.ciphertext.inner.reservation.amount();
+                released += entry.copy.ciphertext.inner.reservation().amount();
             }
         }
         released
@@ -1660,6 +1733,143 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn slab_ciphertext_keeps_pointer_capacity_checksum_and_rehomes() {
+        for shared in [false, true] {
+            let source = admission(8);
+            let target = admission(8);
+            let fixture = bundle(&source, "slab");
+            let envelope = fixture.ciphertext.envelope().clone();
+            let cache = envelope.page.version.object.cache.clone();
+            drop(fixture);
+            let mut buffer = page_alloc::Alignment::new(4096, 4096, 4096)
+                .unwrap()
+                .allocate(
+                    4096,
+                    source
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                        .unwrap(),
+                )
+                .unwrap();
+            buffer.as_mut_slice()[137..156].fill(7);
+            let pointer = buffer.as_slice()[137..].as_ptr();
+            let page = BufferPool::new(source.clone())
+                .slab_ciphertext(buffer, envelope, 137..156)
+                .unwrap();
+            assert_eq!(page.bytes().as_ptr(), pointer);
+            assert_eq!(page.bytes(), &[7; 19]);
+            assert_eq!(page.inner.capacity(), 4096);
+            assert_eq!(source.used(ResourceClass::Ciphertext), 4096);
+            page.expected_checksum(racer_crypto::crc64(&[7; 19]))
+                .unwrap();
+            assert_eq!(page.verify_checksum(), Ok(()));
+            let checksum = page.checksum();
+            let retained = shared.then(|| page.clone());
+            let moved = page
+                .rehome(
+                    target
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
+            assert_eq!(moved.checksum(), checksum);
+            assert_eq!(moved.verify_checksum(), Ok(()));
+            assert!(target.owns(moved.inner.reservation()));
+            assert_eq!(
+                source.used(ResourceClass::Ciphertext),
+                if shared { 4096 } else { 0 }
+            );
+            std::thread::spawn(move || {
+                assert_eq!(moved.bytes(), &[7; 19]);
+                assert_eq!(moved.verify_checksum(), Ok(()));
+                drop(moved);
+            })
+            .join()
+            .unwrap();
+            drop(retained);
+            assert_eq!(source.used(ResourceClass::Ciphertext), 0);
+            assert_eq!(target.used(ResourceClass::Ciphertext), 0);
+        }
+    }
+
+    #[test]
+    fn slab_ciphertext_rejects_bad_ranges_authority_and_checksum() {
+        let source = admission(8);
+        let other = admission(8);
+        let fixture = bundle(&source, "slab");
+        let envelope = fixture.ciphertext.envelope().clone();
+        let cache = envelope.page.version.object.cache.clone();
+        drop(fixture);
+        for range in [
+            0..0,
+            1..19,
+            4090..4109,
+            std::ops::Range { start: 20, end: 1 },
+        ] {
+            let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
+                .unwrap()
+                .allocate(
+                    4096,
+                    source
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                BufferPool::new(source.clone()).slab_ciphertext(buffer, envelope.clone(), range),
+                Err(Error::CorruptRecord)
+            ));
+            assert_eq!(source.used(ResourceClass::Ciphertext), 0);
+        }
+        for class in [ResourceClass::Ciphertext, ResourceClass::Plaintext] {
+            let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
+                .unwrap()
+                .allocate(4096, source.reserve(Some(&cache), class, 4096).unwrap());
+            if matches!(class, ResourceClass::Plaintext) {
+                assert!(matches!(
+                    buffer,
+                    Err(page_alloc::Error::InvalidConfiguration)
+                ));
+                continue;
+            }
+            assert!(matches!(
+                BufferPool::new(other.clone()).slab_ciphertext(
+                    buffer.unwrap(),
+                    envelope.clone(),
+                    0..19
+                ),
+                Err(Error::InvalidConfiguration)
+            ));
+            assert_eq!(source.used(class), 0);
+        }
+        let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
+            .unwrap()
+            .allocate(
+                4096,
+                source
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                    .unwrap(),
+            )
+            .unwrap();
+        let page = BufferPool::new(source.clone())
+            .slab_ciphertext(buffer, envelope, 4077..4096)
+            .unwrap();
+        page.expected_checksum(racer_crypto::crc64(page.bytes()) ^ 1)
+            .unwrap();
+        assert_eq!(page.verify_checksum(), Err(Error::CorruptRecord));
+        assert!(matches!(
+            page.rehome(
+                other
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                    .unwrap()
+            ),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert_eq!(source.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(other.used(ResourceClass::Ciphertext), 0);
+    }
+
+    #[test]
     fn rehome_moves_exclusive_bytes_but_preserves_shared_transport_owners() {
         for shared in [false, true] {
             let source = admission(8);
@@ -1689,7 +1899,7 @@ pub(crate) mod tests {
             if let Some(retained) = &retained {
                 assert_eq!(retained.provenance, Some(provenance));
             }
-            assert!(target.owns(&moved.inner.reservation));
+            assert!(target.owns(moved.inner.reservation()));
             assert_eq!(
                 source.used(ResourceClass::Ciphertext),
                 if shared { 19 } else { 0 }

@@ -155,15 +155,11 @@ impl Policy for AdmissionPolicy {
     fn floor(&self, class: ResourceClass) -> usize {
         match class {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
-            // Disk reads own padded staging and decoded ciphertext together.
-            ResourceClass::Ciphertext => {
-                page_alloc::buffer_capacity(
-                    PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES + 4096,
-                )
-                .expect("bounded page capacity")
-                    + PAGE_BYTES as usize
-                    + 16
-            }
+            // Disk ciphertext retains one padded, size-class-rounded slab allocation.
+            ResourceClass::Ciphertext => page_alloc::buffer_capacity(
+                PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES + 4096,
+            )
+            .expect("bounded page capacity"),
             ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
             _ => 1,
         }
@@ -431,6 +427,22 @@ impl Offer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ciphertext_floor_covers_one_rounded_maximum_disk_extent() {
+        use flow_control::Policy;
+        let policy = AdmissionPolicy::new(crate::test_support::cluster::config(false).limits);
+        assert_eq!(policy.floor(ResourceClass::Ciphertext), 16_842_752);
+        for alignment in [512usize, 4096] {
+            let logical = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
+            let extent = logical.div_ceil(alignment) * alignment;
+            assert!(
+                page_alloc::buffer_capacity(extent).unwrap()
+                    <= policy.floor(ResourceClass::Ciphertext)
+            );
+        }
+        assert_eq!(policy.floor(ResourceClass::Plaintext), PAGE_BYTES as usize);
+    }
 
     #[test]
     fn only_ciphertext_opts_out_of_secure_wiping() {

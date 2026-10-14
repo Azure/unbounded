@@ -6,6 +6,8 @@
 
 pub mod delivery {
     //! Immutable-body delivery, distinct from opaque relay's readiness-driven profile.
+    //! [`send_direct`] delivers page-backed bytes without pipe admission. The separate
+    //! [`send`] engine supports callers that explicitly own a staging pipe.
     //!
     //! [`Owner`] retains immutable backing, the socket-accepted cursor, an independent
     //! staging pipe, and stable owning send views. [`DeliveryPipe`] has a production
@@ -66,7 +68,7 @@ pub mod delivery {
         fn advance(&mut self, count: usize);
 
         /// Return immutable bytes at the accepted cursor and the independent pipe.
-        /// Bytes must cover min(remaining, 64 KiB).
+        /// Bytes must cover min(remaining, 1 MiB) for direct fallback sends.
         fn parts(&mut self) -> (&[u8], &mut Self::Pipe);
 
         /// Stable owning view of `count` bytes at the accepted cursor. Must retain
@@ -95,6 +97,80 @@ pub mod delivery {
         }
     }
 
+    /// Immutable delivery without pipe admission or staging storage.
+    pub trait DirectOwner<C: Context>: 'static {
+        /// Stable backing retained through each runtime completion fence.
+        type View: SendBuffer<Error = C::Error>;
+        /// Bytes not yet accepted by the socket.
+        fn bytes(&self) -> &[u8];
+        /// Advance the accepted cursor after a checked positive completion.
+        fn advance(&mut self, count: usize);
+        /// Own a stable range at the accepted cursor.
+        fn view(&self, count: usize) -> Result<C, Self::View>;
+    }
+
+    /// Send immutable bytes directly, retaining both owners across backpressure.
+    /// No pipe is needed: write plus splice copies just as much as send and adds
+    /// validation and signal-mask syscalls. vmsplice would require backing to live
+    /// beyond splice completion until the socket releases every referenced page.
+    pub async fn send_direct<C, O, H>(
+        reactor: &C::Reactor,
+        mut owner: O,
+        mut connection: ConnectionLease<C>,
+        observer: &H,
+    ) -> Result<C, (O, ConnectionLease<C>)>
+    where
+        C: Context,
+        O: DirectOwner<C>,
+        H: Observer<C>,
+    {
+        let mut stalled_at = uring_runtime::environment::now();
+        let mut budget = 0;
+        let mut calls = 0;
+        while !owner.bytes().is_empty() {
+            let scope = observer.scope(stalled_at)?;
+            let count = owner.bytes().len().min(SEND_BYTES);
+            // try_send uses MSG_NOSIGNAL; no process-wide SIGPIPE disposition or
+            // per-chunk signal mask is required. The synchronous call borrows the
+            // owner; an asynchronous send retains its view and both full owners.
+            let sent = match connection.socket().try_send(&owner.bytes()[..count]) {
+                Ok(sent) => sent,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    yield_once().await;
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let view = owner.view(count)?;
+                    if view.send_bytes()?.len() != count {
+                        return Err(uring_runtime::Error::Io.into());
+                    }
+                    observer.before_send(count, owner.bytes().len());
+                    let completion = reactor
+                        .send(connection.socket(), view, (owner, connection), &scope)
+                        .await?;
+                    (owner, connection) = completion.lease;
+                    observer.after_send(count, completion.bytes)?;
+                    completion.bytes
+                }
+                Err(_) => return Err(uring_runtime::Error::Io.into()),
+            };
+            if sent == 0 || sent > count {
+                return Err(uring_runtime::Error::Io.into());
+            }
+            observer.direct_bytes(sent);
+            owner.advance(sent);
+            stalled_at = uring_runtime::environment::now();
+            budget += sent;
+            calls += 1;
+            if (budget >= TURN_BYTES || calls >= TURN_CALLS) && !owner.bytes().is_empty() {
+                yield_once().await;
+                budget = 0;
+                calls = 0;
+            }
+        }
+        Ok((owner, connection))
+    }
+
     /// Deliver the owner's remaining slice without finishing or consuming HTTP
     /// framing. The caller validates framing/socket first and consumes framing only
     /// after success. Every async send owns the complete (reader, connection) tuple.
@@ -118,7 +194,9 @@ pub mod delivery {
         let mut calls = 0;
         while owner.remaining() != 0 {
             let send_scope = observer.scope(stalled_at)?;
-            let count = owner.remaining().min(CHUNK_BYTES);
+            let count = owner
+                .remaining()
+                .min(if copying { SEND_BYTES } else { CHUNK_BYTES });
             let result = (|| -> io::Result<usize> {
                 let (bytes, pipe) = owner.parts();
                 let bytes = &bytes[..count];
@@ -147,7 +225,7 @@ pub mod delivery {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     let buffer = if copying {
-                        Buffer::View(owner.view(owner.remaining().min(CHUNK_BYTES))?)
+                        Buffer::View(owner.view(owner.remaining().min(SEND_BYTES))?)
                     } else {
                         let (_, pipe) = owner.parts();
                         let count = pipe.buffered();
@@ -204,6 +282,9 @@ pub mod delivery {
 
     /// Maximum immutable slice considered by one delivery operation.
     const CHUNK_BYTES: usize = 64 * 1024;
+
+    /// Bound non-pipe sends independently of kernel pipe capacity.
+    const SEND_BYTES: usize = 1024 * 1024;
 
     /// Accepted bytes allowed before yielding a cooperative turn.
     const TURN_BYTES: usize = 256 * 1024;
@@ -436,6 +517,108 @@ pub mod delivery {
                     range: self.sent..self.sent + count,
                 })
             }
+        }
+
+        impl DirectOwner<Caller> for Reader {
+            type View = View;
+            fn bytes(&self) -> &[u8] {
+                &self.bytes[self.sent..]
+            }
+            fn advance(&mut self, count: usize) {
+                self.sent += count;
+            }
+            fn view(&self, count: usize) -> Result<Caller, View> {
+                <Self as Owner<Caller>>::view(self, count)
+            }
+        }
+
+        #[test]
+        fn direct_delivery_large_chunks_preserve_bytes_without_pipe_calls() {
+            let reactor = Rc::new(Reactor::new(16, ()));
+            let (connection, mut peer, _) = connection();
+            let bytes = Rc::new(vec![91; 16 * 1024 * 1024]);
+            let expected = bytes.len();
+            let reader = std::thread::spawn(move || {
+                let mut received = Vec::new();
+                peer.read_to_end(&mut received).unwrap();
+                assert_eq!(received, vec![91; expected]);
+            });
+            let observer = Observe::default();
+            let owner = Reader {
+                bytes,
+                pipe: Pipe::default(),
+                sent: 0,
+            };
+            let (owner, connection) = drive(
+                &reactor,
+                send_direct(&reactor, owner, connection, &observer),
+            )
+            .unwrap();
+            assert_eq!(owner.sent, expected);
+            assert_eq!(owner.pipe.calls, 0);
+            assert!(owner.pipe.bytes.is_empty());
+            let events = observer.events.borrow();
+            assert!(!events.iter().any(|(name, _)| *name == "drain"));
+            assert!(events.iter().all(|(_, count)| *count <= SEND_BYTES));
+            assert_eq!(expected.div_ceil(SEND_BYTES), 16);
+            drop(connection);
+            reader.join().unwrap();
+        }
+
+        #[test]
+        fn direct_delivery_empty_and_rejected_scope_never_touch_pipe() {
+            for empty in [false, true] {
+                let reactor = Rc::new(Reactor::new(16, ()));
+                let (connection, _peer, slot) = connection();
+                let observer = Observe::default();
+                observer.scope_error.set(true);
+                let owner = Reader {
+                    bytes: Rc::new(vec![1; usize::from(!empty)]),
+                    pipe: Pipe::default(),
+                    sent: 0,
+                };
+                let result = drive(
+                    &reactor,
+                    send_direct(&reactor, owner, connection, &observer),
+                );
+                assert_eq!(result.is_ok(), empty);
+                assert!(observer.events.borrow().is_empty());
+                assert_eq!(observer.times.borrow().len(), usize::from(!empty));
+                drop(result);
+                assert!(slot.upgrade().is_none());
+                assert_eq!(reactor.in_flight(), 0);
+            }
+        }
+
+        #[test]
+        fn direct_abandonment_retains_view_and_connection_until_fence() {
+            let reactor = Rc::new(Reactor::new(16, ()));
+            reactor.init().unwrap();
+            let (connection, _peer, slot) = connection();
+            while connection.socket().try_send(&[0; 8192]).is_ok() {}
+            let bytes = Rc::new(vec![7; SEND_BYTES + 1]);
+            let weak = Rc::downgrade(&bytes);
+            let owner = Reader {
+                bytes,
+                pipe: Pipe::default(),
+                sent: 0,
+            };
+            let observer = Observe::default();
+            let mut work = Box::pin(send_direct(&reactor, owner, connection, &observer));
+            assert!(
+                work.as_mut()
+                    .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(*observer.events.borrow(), [("before", SEND_BYTES)]);
+            assert_eq!(weak.strong_count(), 2);
+            assert_eq!(reactor.in_flight(), 1);
+            drop(work);
+            assert!(slot.upgrade().is_some());
+            assert_eq!(weak.strong_count(), 2);
+            drive(&reactor, reactor.drain()).unwrap();
+            assert!(weak.upgrade().is_none());
+            assert!(slot.upgrade().is_none());
         }
 
         /// Record callback order and inject scope or completion rejection.

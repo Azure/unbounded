@@ -586,7 +586,8 @@ impl PageCryptoEngine {
                         storage: flow_control::ChargedBytes {
                             bytes: std::mem::take(&mut *bytes),
                             reservation: ciphertext,
-                        },
+                        }
+                        .into(),
                     }),
                 };
                 CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
@@ -4210,7 +4211,8 @@ mod tests {
                         reservation: admission
                             .reserve(Some(cache), ResourceClass::Ciphertext, 21)
                             .unwrap(),
-                    },
+                    }
+                    .into(),
                 }),
             };
             let input = CryptoInput::Decrypt {

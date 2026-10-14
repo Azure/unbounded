@@ -653,7 +653,8 @@ mod destination_disconnect {
                         reservation: admission
                             .reserve(None, ResourceClass::Ciphertext, 19)
                             .unwrap(),
-                    },
+                    }
+                    .into(),
                 }),
             },
         }

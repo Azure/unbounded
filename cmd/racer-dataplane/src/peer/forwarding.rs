@@ -785,7 +785,8 @@ mod tests {
                 storage: flow_control::ChargedBytes {
                     bytes: vec![0; length],
                     reservation: request(5).origin.reservation,
-                },
+                }
+                .into(),
             }),
         }
     }

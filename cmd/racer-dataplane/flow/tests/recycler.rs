@@ -102,7 +102,7 @@ fn recycled_spare_capacity_is_initialized_and_checkout_is_exact_and_admitted() {
         .unwrap();
     reservation.recycle(bytes);
     drop(reservation);
-    let reservation = admission
+    let mut reservation = admission
         .reserve(None, Resource::Payload, capacity)
         .unwrap();
     assert!(matches!(
@@ -110,11 +110,15 @@ fn recycled_spare_capacity_is_initialized_and_checkout_is_exact_and_admitted() {
         Err(Error::InvalidInput)
     ));
     let different = reservation.buffer(capacity - 1).unwrap();
-    assert_ne!(different.as_ptr(), pointer);
+    assert_eq!(different.as_ptr(), pointer);
     assert_eq!(different.len(), capacity - 1);
     assert!(different.iter().all(|byte| *byte == 0));
-    drop(different);
+    reservation.recycle(different);
+    drop(reservation);
     assert_eq!(admission.retained_buffer_bytes(), capacity);
+    let reservation = admission
+        .reserve(None, Resource::Payload, capacity)
+        .unwrap();
     let bytes = reservation.buffer(capacity).unwrap();
     assert_eq!(bytes.as_ptr(), pointer);
     assert_eq!(bytes.len(), capacity);

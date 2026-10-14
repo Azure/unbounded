@@ -655,7 +655,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         let responses = crate::client::Responses::new(
             Rc::new(crate::http::client_io(reactor.clone(), admission.clone())),
             Rc::new(crate::http::Delivery::new(
-                Rc::new(crate::http::new_pipe_pool(admission.clone())),
                 reactor.clone(),
                 Duration::from_secs(10),
             )),
@@ -903,7 +902,6 @@ fn metadata_coordinator_with_newer_publication(
     use crate::control::Snapshot;
     use crate::control::publication::PublicationTarget;
     use crate::http::Delivery;
-    use crate::http::new_pipe_pool;
     use crate::memory::MemoryCache;
     use crate::security;
     use crate::security::CryptoClient;
@@ -1027,11 +1025,7 @@ fn metadata_coordinator_with_newer_publication(
             owners: owners.clone(),
         },
     ));
-    let delivery = Rc::new(Delivery::new(
-        Rc::new(new_pipe_pool(admission)),
-        reactor,
-        Duration::from_secs(10),
-    ));
+    let delivery = Rc::new(Delivery::new(reactor, Duration::from_secs(10)));
     let streams = Rc::new(super::range_stream::RangeStreams::new(
         owners.clone(),
         delivery,

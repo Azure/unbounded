@@ -280,18 +280,18 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     assert_eq!(slab.idle_bytes(), 0);
     assert_eq!(slab.reclaim_idle(), 0);
 
-    // Two simultaneous users cannot both return storage to the single idle slot.
+    // Independent buffers remain pooled, including mismatched capacities.
     let overflow = slab.allocate(size, charge(size)).unwrap();
     assert_eq!(live.get(), size * 2);
     drop(reused);
     drop(overflow);
-    assert_eq!(slab.idle_bytes(), size);
-    assert_eq!(live.get(), size);
+    assert_eq!(slab.idle_bytes(), size * 2);
+    assert_eq!(live.get(), size * 2);
     let larger = slab.allocate(size * 2, charge(size * 2)).unwrap();
     assert_eq!(larger.len(), size * 2);
-    assert_eq!(live.get(), size * 2);
+    assert_eq!(live.get(), size * 4);
     drop(larger);
-    assert_eq!(slab.reclaim_idle(), size * 2);
+    assert_eq!(slab.reclaim_idle(), size * 4);
     assert_eq!(slab.reclaim_idle(), 0);
     assert_eq!(live.get(), 0);
 

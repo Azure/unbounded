@@ -758,6 +758,22 @@ impl<C: Charge> fmt::Debug for AlignedBuffer<C> {
 }
 
 impl<C: Charge> AlignedBuffer<C> {
+    /// Freeze completed I/O storage without copying or retaining a worker-local pool.
+    pub fn freeze(mut self) -> Result<FrozenBuffer<C>> {
+        if !self.allocation().retained.is_empty() {
+            return Err(Error::InvalidConfiguration);
+        }
+        // Test-only counters must not keep an Rc alias on the source thread.
+        #[cfg(test)]
+        {
+            self.allocation_mut().wipes = Rc::new(std::cell::Cell::new(0));
+        }
+        Ok(FrozenBuffer {
+            allocation: self.allocation.take().expect("live buffer allocation"),
+            length: self.length,
+        })
+    }
+
     /// Borrow the allocation, which is absent only during drop's ownership transfer.
     fn allocation(&self) -> &Allocation<C> {
         self.allocation.as_ref().expect("live buffer allocation")
@@ -828,6 +844,9 @@ impl<C: Charge> AlignedBuffer<C> {
 impl<C: Charge> Drop for AlignedBuffer<C> {
     /// Zeroize and return storage if possible, otherwise let its owner free it.
     fn drop(&mut self) {
+        if self.allocation.is_none() {
+            return;
+        }
         if let Some(pool) = self.pool.upgrade() {
             if self.allocation().charge.requires_wipe() {
                 self.allocation_mut().wipe();
@@ -853,6 +872,46 @@ impl<C: Charge> Drop for AlignedBuffer<C> {
     }
 }
 
+/// Immutable allocation detached from the worker-local pool after I/O completion.
+pub struct FrozenBuffer<C: Charge> {
+    allocation: Allocation<C>,
+    length: usize,
+}
+
+// SAFETY: freeze rejects retained Rc guards and removes the pool link. The owned
+// allocation has no mutable byte API; only its charge can change exclusively.
+// Moving or sharing it cannot move the bytes or race with I/O or pool access.
+unsafe impl<C: Charge + Send> Send for FrozenBuffer<C> {}
+// SAFETY: shared access exposes only immutable bytes and a Sync charge.
+unsafe impl<C: Charge + Sync> Sync for FrozenBuffer<C> {}
+
+impl<C: Charge> FrozenBuffer<C> {
+    /// Borrow the initialized I/O extent, excluding spare allocation capacity.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: immutable initialized backing remains owned for this borrow.
+        unsafe { std::slice::from_raw_parts(self.allocation.pointer.as_ptr(), self.length) }
+    }
+
+    /// Complete allocation capacity that must remain charged.
+    pub fn capacity(&self) -> usize {
+        self.allocation.layout.size()
+    }
+
+    /// Borrow the allocation's accounting owner.
+    pub fn charge(&self) -> &C {
+        &self.allocation.charge
+    }
+
+    /// Replace accounting only when it covers the complete allocation.
+    pub fn rebind(&mut self, charge: C) -> Result<()> {
+        if !charge.covers(self.capacity()) {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.allocation.charge = charge;
+        Ok(())
+    }
+}
+
 // SAFETY: owned aligned backing is initialized, stable, and live until Drop.
 unsafe impl<C: Charge> IoBuffer for AlignedBuffer<C> {
     type Error = Error;
@@ -873,6 +932,64 @@ unsafe impl<C: Charge> IoBuffer for AlignedBuffer<C> {
 mod buffer_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn freeze_detaches_pool_preserves_pointer_and_rejects_retained_guards() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<FrozenBuffer<()>>();
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let mut buffer = alignment.allocate(4096, ()).unwrap().pooled(&pool);
+        buffer.as_mut_slice().fill(9);
+        let pointer = buffer.as_slice().as_ptr() as usize;
+        let frozen = buffer.freeze().unwrap();
+        assert!(pool.borrow().entries.is_empty());
+        drop(pool);
+        std::thread::spawn(move || {
+            assert_eq!(frozen.as_slice().as_ptr() as usize, pointer);
+            assert_eq!(frozen.as_slice(), &[9; 4096]);
+            assert_eq!(frozen.capacity(), 4096);
+        })
+        .join()
+        .unwrap();
+        let mut buffer = alignment.allocate(4096, ()).unwrap();
+        buffer.retain(Rc::new(()));
+        assert!(matches!(buffer.freeze(), Err(Error::InvalidConfiguration)));
+    }
+
+    #[test]
+    fn frozen_mapping_keeps_full_capacity_and_rebind_rejects_undercharge() {
+        struct Bytes(usize);
+        impl Charge for Bytes {
+            fn covers(&self, bytes: usize) -> bool {
+                self.0 >= bytes
+            }
+            fn requires_wipe(&self) -> bool {
+                false
+            }
+        }
+        let length = 16 * 1024 * 1024 + 65536;
+        let mut buffer = Alignment::new(4096, 4096, 4096)
+            .unwrap()
+            .allocate(length, Bytes(length))
+            .unwrap();
+        buffer.as_mut_slice()[length - 1] = 91;
+        let pointer = buffer.as_slice().as_ptr() as usize;
+        let mut frozen = buffer.freeze().unwrap();
+        assert_eq!(
+            frozen.rebind(Bytes(length - 1)),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(frozen.charge().0, length);
+        frozen.rebind(Bytes(length)).unwrap();
+        std::thread::spawn(move || {
+            assert_eq!(frozen.capacity(), length);
+            assert_eq!(frozen.as_slice().as_ptr() as usize, pointer);
+            assert_eq!(frozen.as_slice()[length - 1], 91);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn size_class_reuse_keeps_mismatches_and_full_capacity_charged() {

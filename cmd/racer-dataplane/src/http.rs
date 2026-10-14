@@ -17,6 +17,7 @@ use http1::MessageHead;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
+#[cfg(test)]
 use std::task::Waker;
 use std::time::Duration;
 use uring_runtime::reactor::SendBuffer;
@@ -35,6 +36,7 @@ pub fn new_pipe_pool(
         waiter_limit,
     )
 }
+#[cfg(test)]
 pub(crate) fn acquire_wait<'a>(
     pool: &'a PipePool<AdmissionPolicy>,
     scope: &'a RequestScope,
@@ -470,17 +472,15 @@ unsafe impl SendBuffer for PageSendRange {
 }
 pub struct Delivery {
     metrics: crate::telemetry::Metrics,
-    context: HttpContext,
+    #[cfg(test)]
     pipes: Rc<PipePool<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     stall_timeout: Duration,
 }
-/// A reader pins an immutable page and a separately admitted pipe for its lifetime.
-/// Each reader has its own staging pipe and socket-accepted cursor.
+/// A reader pins an immutable page and its own socket-accepted cursor, without a pipe.
 pub struct ReaderLease {
     _active: ::telemetry::Lease,
     page: VerifiedPage,
-    pipe: PipeLease<AdmissionPolicy>,
     slice: PageSlice,
     sent: usize,
 }
@@ -496,21 +496,14 @@ impl ReaderLease {
     }
 }
 struct DeliveryOwner(ReaderLease);
-impl http1::delivery::Owner<HttpContext> for DeliveryOwner {
-    type Pipe = PipeLease<AdmissionPolicy>;
+impl http1::delivery::DirectOwner<HttpContext> for DeliveryOwner {
     type View = PageSendRange;
-    fn remaining(&self) -> usize {
-        self.0.remaining()
-    }
     fn advance(&mut self, count: usize) {
         self.0.sent += count;
     }
-    fn parts(&mut self) -> (&[u8], &mut Self::Pipe) {
+    fn bytes(&self) -> &[u8] {
         let start = self.0.slice.offset as usize + self.0.sent;
-        (
-            &self.0.page.bytes()[start..start + self.0.remaining()],
-            &mut self.0.pipe,
-        )
+        &self.0.page.bytes()[start..start + self.0.remaining()]
     }
     fn view(&self, count: usize) -> Result<Self::View> {
         let start = self.0.slice.offset as usize + self.0.sent;
@@ -563,15 +556,11 @@ impl http1::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
     }
 }
 impl Delivery {
-    pub fn new(
-        pipes: Rc<PipePool<AdmissionPolicy>>,
-        reactor: Rc<Reactor>,
-        stall_timeout: Duration,
-    ) -> Self {
+    pub fn new(reactor: Rc<Reactor>, stall_timeout: Duration) -> Self {
         Self {
             metrics: crate::telemetry::Metrics::default(),
-            context: HttpContext(pipes.quotas().clone()),
-            pipes,
+            #[cfg(test)]
+            pipes: Rc::new(new_pipe_pool(reactor.admission().clone())),
             reactor,
             stall_timeout,
         }
@@ -582,27 +571,11 @@ impl Delivery {
     }
     pub fn attach(&self, page: VerifiedPage, slice: PageSlice) -> Result<ReaderLease> {
         validate_slice(&page, slice)?;
-        self.attach_reserved(page, slice, self.pipes.acquire()?)
-    }
-    pub(crate) fn admit<'a>(
-        &'a self,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, PipeLease<AdmissionPolicy>> {
-        acquire_wait(&self.pipes, scope)
-    }
-    pub(crate) fn attach_reserved(
-        &self,
-        page: VerifiedPage,
-        slice: PageSlice,
-        pipe: PipeLease<AdmissionPolicy>,
-    ) -> Result<ReaderLease> {
-        validate_slice(&page, slice)?;
         Ok(ReaderLease {
             _active: self
                 .metrics
                 .lease(crate::telemetry::Gauge::ActiveDeliveries)?,
             page,
-            pipe,
             slice,
             sent: 0,
         })
@@ -660,8 +633,7 @@ impl Delivery {
             let socket = connection.socket();
             socket.validate_socket()?;
             drop(socket);
-            let (_reader, mut connection) = http1::delivery::send(
-                &self.context,
+            let (_reader, mut connection) = http1::delivery::send_direct::<HttpContext, _, _>(
                 self.reactor.as_ref(),
                 DeliveryOwner(reader),
                 connection,
@@ -1022,7 +994,10 @@ pub(crate) mod tests {
             (
                 admission,
                 reactor.clone(),
-                Delivery::new(pool, reactor, stall),
+                Delivery {
+                    pipes: pool,
+                    ..Delivery::new(reactor, stall)
+                },
             )
         }
         fn scope() -> RequestScope {
@@ -1190,7 +1165,7 @@ pub(crate) mod tests {
                 let mut operation = delivery.finish_to(reader, connection, &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(operation.as_mut().poll(&mut cx).is_pending());
-                assert_eq!(weak.strong_count(), 1, "first send owns a pipe drain");
+                assert_eq!(weak.strong_count(), 2, "first send owns an immutable view");
                 let start = Instant::now();
                 while weak.strong_count() == 1 {
                     assert!(start.elapsed() < Duration::from_secs(1));
@@ -1209,20 +1184,14 @@ pub(crate) mod tests {
                 assert_eq!(reactor.in_flight(), 1);
                 assert_eq!(admission.used(ResourceClass::Plaintext), 512 * 1024);
                 assert_eq!(admission.used(ResourceClass::Connection), 1);
-                assert!(matches!(
-                    delivery.pipes.acquire(),
-                    Err(flow_control::Error::Overloaded)
-                ));
+                assert!(delivery.pipes.acquire().is_ok());
                 match failure {
                     "abandon" => {
                         drop(operation);
                         assert_eq!(weak.strong_count(), 2);
                         assert_eq!(admission.used(ResourceClass::Plaintext), 512 * 1024);
                         assert_eq!(admission.used(ResourceClass::Connection), 1);
-                        assert!(matches!(
-                            delivery.pipes.acquire(),
-                            Err(flow_control::Error::Overloaded)
-                        ));
+                        assert!(delivery.pipes.acquire().is_ok());
                         drive(&reactor, reactor.drain()).unwrap();
                     }
                     "drain" => {
@@ -1363,7 +1332,7 @@ pub(crate) mod tests {
                     .metrics
                     .count(crate::telemetry::Event::DeliveryPipeDrain)
                     - drains;
-                assert!(drains > 0 && pending_turns > PAGES);
+                assert!(drains == 0 && pending_turns > PAGES);
                 eprintln!(
                     "delivery_tcp sample={sample} warmup={} bytes={} sender_cpu_ms={:.3} cpu_ns_per_byte={:.4} wall_ms={} pipe_drains={drains} pending_turns={pending_turns}",
                     sample == 0,
@@ -1408,10 +1377,11 @@ pub(crate) mod tests {
             let mut reader = delivery.attach(page, slice(1, 8)).unwrap();
             let (socket, mut peer) = UnixStream::pair().unwrap();
             socket.set_nonblocking(true).unwrap();
-            reader.pipe.try_write(b"12345678").unwrap();
-            reader.sent = reader.pipe.try_splice_to(&socket, 3).unwrap();
+            let mut pipe = delivery.pipes.acquire().unwrap();
+            pipe.try_write(b"12345678").unwrap();
+            reader.sent = pipe.try_splice_to(&socket, 3).unwrap();
             assert_eq!(reader.sent, 3);
-            assert_eq!(reader.pipe.buffered(), 5);
+            assert_eq!(pipe.buffered(), 5);
             // A blocking FD is deliberately unsupported by the splice API, but the
             // send fallback still cannot block and must not resend the accepted prefix.
             socket.set_nonblocking(false).unwrap();
@@ -1443,8 +1413,8 @@ pub(crate) mod tests {
             assert!(weak.upgrade().is_none());
             assert_eq!(
                 admission.used(ResourceClass::Pipe),
-                1,
-                "idle pipe remains admitted"
+                0,
+                "direct delivery needs no pipe"
             );
             assert!(delivery.pipes.acquire().is_ok());
             let mut bytes = Vec::new();
@@ -1591,7 +1561,7 @@ pub(crate) mod tests {
             connection.set_framing(Some(0), Some(3), false);
             let reader = delivery.attach(page.clone(), slice(0, 2)).unwrap();
             let scope = scope();
-            // A writable socket completes through the pipe before the reactor is driven.
+            // A writable socket completes by direct send before the reactor is driven.
             let mut operation = delivery.finish_to(reader, connection, &scope);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             let Poll::Ready(Ok(connection)) = operation.as_mut().poll(&mut cx) else {
@@ -1640,11 +1610,8 @@ pub(crate) mod tests {
             assert_pending(&mut operation);
             assert!(reactor.in_flight() > 0);
             assert!(weak.upgrade().is_some());
-            assert_eq!(admission.used(ResourceClass::Pipe), 1);
-            assert!(matches!(
-                delivery.pipes.acquire(),
-                Err(flow_control::Error::Overloaded)
-            ));
+            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+            assert!(delivery.pipes.acquire().is_ok());
             assert_eq!(admission.used(ResourceClass::Connection), 1);
             scope.cancel().unwrap();
             assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
@@ -1653,7 +1620,7 @@ pub(crate) mod tests {
             assert_eq!(
                 admission.used(ResourceClass::Pipe),
                 1,
-                "idle pipe remains admitted"
+                "the test's quota probe left an idle pipe"
             );
             assert!(delivery.pipes.acquire().is_ok());
             assert_eq!(admission.used(ResourceClass::Connection), 0);
@@ -1702,10 +1669,7 @@ pub(crate) mod tests {
             assert_eq!(reactor.in_flight(), 1);
             drop(operation);
             assert!(weak.upgrade().is_some());
-            assert!(matches!(
-                delivery.pipes.acquire(),
-                Err(flow_control::Error::Overloaded)
-            ));
+            assert!(delivery.pipes.acquire().is_ok());
             assert_eq!(admission.used(ResourceClass::Connection), 1);
             let start = Instant::now();
             while reactor.in_flight() != 0 {
@@ -1734,12 +1698,9 @@ pub(crate) mod tests {
                     Some(operation)
                 };
                 assert!(weak.upgrade().is_some());
-                assert_eq!(admission.used(ResourceClass::Pipe), 1);
+                assert_eq!(admission.used(ResourceClass::Pipe), 0);
                 assert_eq!(admission.used(ResourceClass::Connection), 1);
-                assert!(matches!(
-                    delivery.pipes.acquire(),
-                    Err(flow_control::Error::Overloaded)
-                ));
+                assert!(delivery.pipes.acquire().is_ok());
                 // drain is a completion fence, not a blocking shutdown call. The
                 // driver must keep polling CQEs until the outstanding send is fenced.
                 drive(&reactor, reactor.drain()).unwrap();
@@ -1752,7 +1713,7 @@ pub(crate) mod tests {
                 assert_eq!(
                     admission.used(ResourceClass::Pipe),
                     1,
-                    "idle pipe remains admitted"
+                    "the test's quota probe left an idle pipe"
                 );
                 assert_eq!(admission.used(ResourceClass::Connection), 0);
                 // The reactor's own ring allocation remains admitted until drop.
@@ -1818,8 +1779,8 @@ pub(crate) mod tests {
                 delivery
                     .metrics
                     .count(crate::telemetry::Event::DeliveryPipeDrain),
-                1,
-                "a backpressured page drains its staging pipe only once"
+                0,
+                "a backpressured page sends immutable views without pipe drains"
             );
             assert!(
                 delivery
@@ -1830,8 +1791,8 @@ pub(crate) mod tests {
             assert!(weak.upgrade().is_none());
             assert_eq!(
                 admission.used(ResourceClass::Pipe),
-                1,
-                "idle pipe remains admitted"
+                0,
+                "direct delivery needs no pipe"
             );
             assert!(delivery.pipes.acquire().is_ok());
             assert_eq!(admission.used(ResourceClass::Connection), 1);
@@ -1867,8 +1828,8 @@ pub(crate) mod tests {
                 assert!(weak.upgrade().is_none());
                 assert_eq!(
                     admission.used(ResourceClass::Pipe),
-                    1,
-                    "idle pipe remains admitted"
+                    delivery.pipes.idle_count(),
+                    "only the test's quota probes allocate pipes"
                 );
                 assert!(delivery.pipes.acquire().is_ok());
                 assert_eq!(admission.used(ResourceClass::Connection), 0);
@@ -1887,17 +1848,14 @@ pub(crate) mod tests {
             let operation = delivery.finish_to(reader, connection, &scope);
             assert_eq!(admission.used(ResourceClass::Connection), 1);
             assert!(weak.upgrade().is_some());
-            assert!(matches!(
-                delivery.pipes.acquire(),
-                Err(flow_control::Error::Overloaded)
-            ));
+            assert!(delivery.pipes.acquire().is_ok());
             drop(operation);
             assert_eq!(reactor.in_flight(), 0);
             assert!(weak.upgrade().is_none());
             assert_eq!(
                 admission.used(ResourceClass::Pipe),
                 1,
-                "idle pipe remains admitted"
+                "the test's quota probe left an idle pipe"
             );
             assert!(delivery.pipes.acquire().is_ok());
             assert_eq!(admission.used(ResourceClass::Connection), 0);
@@ -1925,8 +1883,8 @@ pub(crate) mod tests {
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(
                 admission.used(ResourceClass::Pipe),
-                1,
-                "idle pipe remains admitted"
+                0,
+                "direct delivery needs no pipe"
             );
             let mut replacement = delivery.pipes.acquire().unwrap();
             replacement.try_write(&[0xff; 4096]).unwrap();

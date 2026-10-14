@@ -671,11 +671,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
         admission.clone(),
         i64::MAX as u64,
     ));
-    let delivery = Rc::new(Delivery::new(
-        Rc::new(new_pipe_pool(admission.clone())),
-        reactor.clone(),
-        Duration::from_secs(2),
-    ));
+    let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(2)));
     let worker = ReadWorker::new(
         definition(),
         body_metadata(17),
@@ -852,11 +848,7 @@ impl Fixture {
             admission.clone(),
             i64::MAX as u64,
         ));
-        let delivery = Rc::new(Delivery::new(
-            Rc::new(new_pipe_pool(admission.clone())),
-            reactor.clone(),
-            Duration::from_secs(2),
-        ));
+        let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(2)));
         let mut metadata = body_metadata(17);
         metadata.expires_at =
             ExpiresAt::from_system_time(UNIX_EPOCH + Duration::from_millis(1234)).unwrap();
@@ -1353,11 +1345,9 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
         ),
     ] {
         let mut fixture = Fixture::new();
-        let admission = fixture.listeners.admission.clone();
         let failures = crate::telemetry::Failures::default();
         let observer = failures.observer(WorkerId(0));
         let delivery = Rc::new(Delivery::new(
-            Rc::new(new_pipe_pool(admission.clone())),
             fixture.reactor.clone(),
             Duration::from_secs(2),
         ));
@@ -1438,7 +1428,6 @@ fn subscription_retains_delivered_page_until_release_and_rejects_invalid_release
             Responses::new(
                 fixture.listeners.io.clone(),
                 Rc::new(Delivery::new(
-                    pipes.clone(),
                     fixture.reactor.clone(),
                     Duration::from_secs(2),
                 )),
@@ -1524,7 +1513,6 @@ fn body_fixture_with_large_page(
     let admission = fixture.listeners.admission.clone();
     let pipes = Rc::new(new_pipe_pool(admission.clone()));
     let delivery = Rc::new(Delivery::new(
-        pipes.clone(),
         fixture.reactor.clone(),
         Duration::from_secs(2),
     ));
@@ -1696,14 +1684,13 @@ fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
 fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     // Duplex completion frames and the next response head may be in flight
     // together, in addition to listener readiness. Keep reactor headroom
-    // while independently exercising the bounded FIFO pipe queue.
+    // while proving that an exhausted relay pipe quota cannot block delivery.
     let (mut fixture, pipes) = body_fixture(4, false);
     let failures = crate::telemetry::Failures::default();
     fixture.listeners.responses = Rc::new(
         Responses::new(
             fixture.listeners.io.clone(),
             Rc::new(Delivery::new(
-                pipes.clone(),
                 fixture.reactor.clone(),
                 Duration::from_secs(2),
             )),
@@ -1721,9 +1708,8 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     assert_no_head(&mut fourth);
     let mut overflow = start_body(&fixture);
     let output = fixture.receive(&mut overflow, true);
-    assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
-    assert!(output.ends_with(b"\r\n\r\n"));
-    drop(held);
+    assert!(output.starts_with(b"HTTP/1.1 200 "), "{output:?}");
+    assert_eq!(&output[output.len() - 26..output.len() - 21], b"hello");
     for socket in [&mut first, &mut second, &mut third, &mut fourth] {
         let output = fixture.receive(socket, true);
         let mut diagnostics = String::new();
@@ -1734,6 +1720,7 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
         );
         assert_eq!(&output[output.len() - 26..output.len() - 21], b"hello");
     }
+    drop(held);
     assert_only_idle_pipes(&fixture, &pipes);
 }
 
@@ -1742,7 +1729,6 @@ fn actual_uds_first_page_failure_is_complete_503() {
     let (mut fixture, _pipes) = body_fixture(16, true);
     let failures = crate::telemetry::Failures::default();
     let delivery = Rc::new(Delivery::new(
-        _pipes.clone(),
         fixture.reactor.clone(),
         Duration::from_secs(2),
     ));
@@ -3182,18 +3168,13 @@ mod response {
     fn ready_slice_precedes_auxiliary_overload() {
         use crate::admission::AdmissionPolicy;
         use crate::http::Delivery;
-        use crate::http::new_pipe_pool;
         use crate::model::PageNumber;
         use crate::model::PageSlice;
         use crate::runtime::Reactor;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let delivery = Delivery::new(
-            Rc::new(new_pipe_pool(admission.clone())),
-            Rc::new(Reactor::new(admission)),
-            Duration::from_secs(2),
-        );
+        let delivery = Delivery::new(Rc::new(Reactor::new(admission)), Duration::from_secs(2));
         let slice = PageSlice {
             page: PageNumber(0),
             offset: 0,

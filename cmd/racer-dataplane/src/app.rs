@@ -813,7 +813,7 @@ impl WorkerApplication {
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
         let pipes = Rc::new(new_pipe_pool(admission.clone()));
         let delivery = Rc::new(
-            Delivery::new(pipes.clone(), reactor.clone(), config.reader_stall_timeout)
+            Delivery::new(reactor.clone(), config.reader_stall_timeout)
                 .with_metrics(metrics.clone()),
         );
 

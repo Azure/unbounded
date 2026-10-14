@@ -3016,7 +3016,6 @@ impl Fixture {
         use crate::control::Snapshot;
         use crate::control::publication::PublicationTarget;
         use crate::http::Delivery;
-        use crate::http::new_pipe_pool;
         use crate::read::Coordinator;
         use crate::read::metadata::MetadataDependencies;
         use crate::read::metadata::MetadataService;
@@ -3073,11 +3072,7 @@ impl Fixture {
         if let Some(version) = settings.seed {
             metadata.publish_version(version).unwrap();
         }
-        let delivery = Rc::new(Delivery::new(
-            Rc::new(new_pipe_pool(fill.dependencies.admission.clone())),
-            self.reactor.clone(),
-            settings.stall,
-        ));
+        let delivery = Rc::new(Delivery::new(self.reactor.clone(), settings.stall));
         let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, settings.window));
         let local = Rc::new(Coordinator::new(
             snapshots.published.clone(),
@@ -3588,7 +3583,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
                 .fill
                 .dependencies
                 .admission
-                .owns(&result.ciphertext.inner.reservation)
+                .owns(result.ciphertext.inner.reservation())
         );
         assert_eq!(result.ciphertext.bytes(), received.ciphertext.bytes());
         assert_eq!(result.plaintext.bytes()[0], number as u8);
@@ -4576,7 +4571,10 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
     .unwrap()
     .unwrap();
     // Hold an old read across a same-page replacement publication.
-    Arc::get_mut(&mut stale.ciphertext.inner).unwrap().bytes[0] ^= 1;
+    // Corrupt the expected checksum without exposing mutable frozen slab bytes.
+    let checksum = stale.ciphertext.checksum();
+    Arc::get_mut(&mut stale.ciphertext.inner).unwrap().checksum =
+        std::sync::OnceLock::from(checksum ^ 1);
     let writer = &f.fill.dependencies.writer;
     let old = writer.index().lookup(&f.page).unwrap().unwrap().location;
     // Enqueue now deduplicates resident pages. Model the invalidation that
@@ -5166,6 +5164,19 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
         deps.memory.publish_ciphertext(page.clone()).unwrap();
         retained.push(page);
     }
+    // Fill the remaining quota after reclaiming idle buffers: a single slab
+    // allocation now fits where the old staging-plus-copy reservation did not.
+    deps.writer.slabs().reclaim_idle();
+    deps.admission.reclaim_buffers();
+    let pressure = deps
+        .admission
+        .reserve(
+            None,
+            ResourceClass::Ciphertext,
+            deps.admission.limit(ResourceClass::Ciphertext)
+                - deps.admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
     // All copies are live: fail without revoking a reader or starting origin work.
     let mut blocked = read_copy();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -5215,10 +5226,10 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let staging =
         page_alloc::buffer_capacity(expected.len() + crate::store::MAX_HEADER_BYTES).unwrap();
     assert!(
-        diagnostics.contains(&format!("requested: {}", staging + expected.len())),
+        diagnostics.contains(&format!("requested: {staging}")),
         "{diagnostics}"
     );
-    drop((read, copy, busy));
+    drop((read, copy, busy, pressure));
     deps.memory.evict_idle(usize::MAX).unwrap();
     deps.writer.slabs().reclaim_idle();
     deps.admission.reclaim_buffers();
