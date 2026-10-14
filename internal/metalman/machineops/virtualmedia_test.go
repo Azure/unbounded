@@ -112,8 +112,8 @@ func (d *mediaTestDriver) Release(ctx context.Context, _ string) error {
 		return err
 	}
 
-	if !op.Status.Targets[0].BootMedia.Cleaned {
-		return errors.New("release before Cleaned persisted")
+	if b := op.Status.Targets[0].BootMedia; !b.Cleaned && b.Phase != "Replacing" {
+		return errors.New("release before Cleaned or Replacing persisted")
 	}
 
 	return d.effect(ctx, "release")
@@ -741,24 +741,56 @@ func TestVirtualMediaBootRetryWithoutLoaderStart(t *testing.T) {
 	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
 	require.Contains(t, current.Status.Targets[0].Message, "waiting for host to boot")
 
-	// No loader start after the boot timeout: power cycle and mount again.
+	// No loader start after the boot timeout: replace the image under a new
+	// name, then power cycle and mount again.
+	oldID := current.Status.Targets[0].BootMedia.ID
 	resets := slices.Clone(d.calls)
 	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(10 * time.Minute)) }
 	current = mediaStep(t, r, op.Name)
 	b := current.Status.Targets[0].BootMedia
-	require.Equal(t, "PoweringOff", b.Phase)
+	require.Equal(t, "Replacing", b.Phase)
+	require.Equal(t, oldID, b.ID)
 	require.Equal(t, int32(1), b.BootAttempts)
 	require.Equal(t, int32(0), current.Status.Targets[0].Attempts)
 	require.Contains(t, current.Status.Targets[0].Message, "attempt 2")
+	require.Len(t, d.calls, len(resets), "the retry decision must be saved before side effects")
 
-	for range 6 {
+	current = mediaStep(t, r, op.Name)
+	b = current.Status.Targets[0].BootMedia
+	require.Equal(t, "Preparing", b.Phase)
+	require.NotEqual(t, oldID, b.ID)
+	require.Regexp(t, "^[0-9a-f]{32}$", b.ID)
+	require.Empty(t, b.SourceName)
+	require.Equal(t, []string{"cleanup", "delete", "release"}, d.calls[len(resets):])
+
+	for range 8 {
 		current = mediaStep(t, r, op.Name)
 	}
 
-	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
-	require.Contains(t, d.calls[len(resets):], "mount")
-	require.Contains(t, d.calls[len(resets):], string(redfish.ResetOn))
-	require.False(t, current.Status.Targets[0].BootMedia.Cleaned)
+	b = current.Status.Targets[0].BootMedia
+	require.Equal(t, "Installing", b.Phase)
+	require.Equal(t, "ub-"+b.ID+".iso", b.SourceName)
+	require.Equal(t, []string{"cleanup", "delete", "release", "prepare", "stage", string(redfish.ResetForceOff), "mount", "boot", string(redfish.ResetOn)}, d.calls[len(resets):])
+	require.False(t, b.Cleaned)
+}
+
+func TestVirtualMediaReplaceRetriesFailedCleanup(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	current := mediaInstalling(t, r, op.Name)
+	oldID := current.Status.Targets[0].BootMedia.ID
+
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(10 * time.Minute)) }
+	mediaStep(t, r, op.Name)
+
+	d.err = errors.New("bmc unavailable")
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, "Replacing", current.Status.Targets[0].BootMedia.Phase)
+	require.Equal(t, oldID, current.Status.Targets[0].BootMedia.ID)
+
+	d.err = nil
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, "Preparing", current.Status.Targets[0].BootMedia.Phase)
+	require.NotEqual(t, oldID, current.Status.Targets[0].BootMedia.ID)
 }
 
 func TestVirtualMediaBootRetriesAreBounded(t *testing.T) {
@@ -771,7 +803,7 @@ func TestVirtualMediaBootRetriesAreBounded(t *testing.T) {
 		r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(offset)) }
 
 		var current *v1alpha3.MachineOperation
-		for range 7 {
+		for range 10 {
 			current = mediaStep(t, r, op.Name)
 		}
 

@@ -327,6 +327,28 @@ func TestVirtualMediaCleanupAbsence(t *testing.T) {
 	}
 }
 
+func TestVirtualMediaCleanupNothingMounted(t *testing.T) {
+	var unmounts int
+
+	srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/7" + rackSystemPath:
+			w.WriteHeader(http.StatusNoContent)
+		case "/7" + remoteDrivePath + "Unmount":
+			unmounts++
+
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(completionBody("Failure", "Error unmounting remote media redirection: Rmedia Support is not enabled", true)))
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	})
+	c := dialRack(t, srv, "7")
+
+	require.NoError(t, c.CleanupVirtualMedia(t.Context(), testMedia))
+	require.Equal(t, 1, unmounts)
+}
+
 func TestVirtualMediaCanceled(t *testing.T) {
 	srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s", r.URL.Path)

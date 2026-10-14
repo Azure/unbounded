@@ -123,6 +123,13 @@ func (c *Client) CleanupVirtualMedia(ctx context.Context, source bootmedia.Sourc
 		_, err = rackRequest(ctx, c.session, http.MethodPost, remoteDrivePath+"Unmount", nil)
 	}
 
+	// Firmware 1.23.13 reports "Rmedia Support is not enabled" when nothing is
+	// mounted, for example after a power cycle. There is nothing to unmount.
+	var failure *completionFailure
+	if errors.As(err, &failure) && strings.Contains(strings.ToLower(failure.description), "rmedia support is not enabled") {
+		return nil
+	}
+
 	return err
 }
 

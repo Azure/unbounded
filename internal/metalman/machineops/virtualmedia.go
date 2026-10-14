@@ -292,8 +292,11 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 					return failTarget(target, reasonTimedOut, "host did not boot the virtual media", now)
 				}
 
+				// Firmware 1.23.13 can keep a broken virtual drive for an image
+				// name, and mounting the same name again does not fix it. Replace
+				// the staged image with a new name before the next boot.
 				b.BootAttempts++
-				b.Phase = "PoweringOff"
+				b.Phase = "Replacing"
 				b.PhaseStartedAt = &now
 				b.ReadinessStartedAt = nil
 				target.Message = fmt.Sprintf("host did not boot the virtual media; retrying (attempt %d)", b.BootAttempts+1)
@@ -329,14 +332,10 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 			return targetChange{target: target, err: err}
 		}
 
-		// 128 random bits remain an unguessable capability while keeping the
-		// ub-<32 lowercase hex>.iso name below Rack SCM's 40-character limit.
-		var capability [16]byte
-		if _, err := rand.Read(capability[:]); err != nil {
-			return targetChange{target: target, err: fmt.Errorf("generate media capability: %w", err)}
+		id, err := newMediaID()
+		if err != nil {
+			return targetChange{target: target, err: err}
 		}
-
-		id := hex.EncodeToString(capability[:])
 
 		target.BootMedia = &v1alpha3.MachineOperationBootMediaStatus{
 			ID: id, Phase: "Preparing", MachineUID: machine.UID, Netboot: machine.Spec.Netboot().DeepCopy(),
@@ -362,6 +361,27 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 			} else {
 				b.SourceName, b.SourceServer = source.Name, source.Server
 				next = "Staging"
+			}
+		}
+	case "Replacing":
+		// The persisted Replacing phase stops the loader config for this ID,
+		// so no installer can start while the old image is removed.
+		err = vm.CleanupVirtualMedia(ctx, source)
+		if err == nil {
+			err = vm.DeleteVirtualMedia(ctx, source)
+		}
+
+		if err == nil {
+			err = r.BootMedia.Release(ctx, b.ID)
+		}
+
+		if err == nil {
+			var id string
+
+			id, err = newMediaID()
+			if err == nil {
+				b.ID, b.SourceName, b.SourceServer = id, "", ""
+				next = "Preparing"
 			}
 		}
 	case "Staging":
@@ -419,6 +439,17 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 	target.Message = "virtual media: " + b.Phase
 
 	return targetChange{target: target}
+}
+
+// newMediaID returns 128 random bits as an unguessable capability. The
+// ub-<32 lowercase hex>.iso name stays below Rack SCM's 40-character limit.
+func newMediaID() (string, error) {
+	var capability [16]byte
+	if _, err := rand.Read(capability[:]); err != nil {
+		return "", fmt.Errorf("generate media capability: %w", err)
+	}
+
+	return hex.EncodeToString(capability[:]), nil
 }
 
 func (r *Reconciler) mediaProgressExpired(b *v1alpha3.MachineOperationBootMediaStatus, now metav1.Time) bool {
