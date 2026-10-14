@@ -43,8 +43,13 @@
 //!   [`coalesce::flight::update`] or [`coalesce::flight::update_at`], values already
 //!   staged in [`coalesce::flight::Txn`] drop after the owner borrow releases,
 //!   before queued wakes. Callers must stage removed values and collect wakes;
-//!   this does not roll back state changes or finish unvisited hooks. Direct Txn
-//!   users must release the owner borrow before dropping the transaction.
+//!   this does not roll back state changes or finish unvisited hooks. Only these
+//!   update functions create transactions. Wake storage is push-only. Flight state
+//!   exposes callback-owned fields read-only; replacement APIs stage old values.
+//!   Table mutation uses adapter-defined views, not whole-entry mutable references.
+//!   Adapters must keep these views restricted, honor quiescence, and stage values
+//!   returned by low-level methods. An update closure still owns its application
+//!   state; it must not replace or drop the whole owner under its borrow.
 //! - Explicitly staged callbacks may reenter after internal locks and borrows
 //!   are released: quota policy sampling/reporting and key clones/retired key
 //!   drops, circuit backoff, and the key/value/waker callbacks documented by

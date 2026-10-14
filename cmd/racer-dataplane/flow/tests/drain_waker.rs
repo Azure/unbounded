@@ -174,6 +174,170 @@ fn transaction_releases_before_notify_on_return_and_unwind() {
     }
 }
 
+/// Public replacements retire callback owners before waking, even after hook panic.
+#[test]
+fn state_replacements_retire_before_wake_on_return_and_unwind() {
+    use flight::state::{Phase, State, WaiterPolicy};
+
+    struct Policy {
+        due: Instant,
+        _retired: Retired,
+    }
+
+    impl WaiterPolicy for Policy {
+        type Error = ();
+
+        fn check(&self, _: Instant) -> Option<()> {
+            None
+        }
+
+        fn deadline(&self) -> Instant {
+            self.due
+        }
+    }
+
+    for panic in [false, true] {
+        let owner = Rc::new(RefCell::new(
+            State::<Retired, Retired, (), Policy>::default(),
+        ));
+        let released = Rc::new(Cell::new(0));
+        let notified = Rc::new(Cell::new(false));
+        let old_due = Instant::now();
+        let new_due = old_due + std::time::Duration::from_secs(1);
+        let probe = || {
+            Retired(Some(Box::new({
+                let owner = Rc::downgrade(&owner);
+                let released = released.clone();
+                move || {
+                    let owner = owner.upgrade().unwrap();
+                    let state = owner.borrow_mut();
+                    assert!(matches!(state.phase(), Phase::RetryPending));
+                    assert!(state.partial().is_none());
+                    assert!(!state.deadlines().contains_key(&(old_due, 1)));
+                    assert!(state.deadlines().contains_key(&(new_due, 1)));
+                    released.set(released.get() + 1);
+                }
+            })))
+        };
+        flight::update(&owner, |state, txn| {
+            state.replace_phase(Phase::Complete(probe()), txn);
+            state.replace_partial(Some(probe()), txn);
+            assert!(
+                state
+                    .register(
+                        1,
+                        Policy {
+                            due: old_due,
+                            _retired: probe()
+                        },
+                        true,
+                        true
+                    )
+                    .is_ok()
+            );
+            state.register_waker(1, callback_waker(), txn);
+        });
+        ON_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new({
+                let owner = owner.clone();
+                let released = released.clone();
+                move || {
+                    assert!(owner.try_borrow_mut().is_ok());
+                    released.set(released.get() + 1);
+                }
+            }));
+        });
+        ON_WAKE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new({
+                let owner = owner.clone();
+                let released = released.clone();
+                let notified = notified.clone();
+                move || {
+                    assert!(owner.try_borrow_mut().is_ok());
+                    assert_eq!(released.get(), 5);
+                    notified.set(true);
+                }
+            }));
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flight::update(&owner, |state, txn| {
+                // Queue first to prove all retirement still precedes notification.
+                txn.push(callback_waker());
+                state.replace_phase(Phase::RetryPending, txn);
+                state.replace_partial(None, txn);
+                state
+                    .replace_policy(
+                        1,
+                        Policy {
+                            due: new_due,
+                            _retired: Retired(None),
+                        },
+                        txn,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    state.replace_policy(
+                        99,
+                        Policy {
+                            due: new_due,
+                            _retired: probe()
+                        },
+                        txn
+                    ),
+                    Err(flight::Stale)
+                );
+                state.register_waker(1, Waker::noop().clone(), txn);
+                assert_eq!(released.get(), 0);
+                assert!(!notified.get());
+                assert!(!panic, "replacement hook failed");
+            });
+        }));
+        assert_eq!(outcome.is_err(), panic);
+        assert_eq!(released.get(), 5);
+        assert!(notified.get());
+    }
+}
+
+#[test]
+fn waiter_waker_registration_retires_redundant_and_stale_targets() {
+    use flight::state::{State, WaiterPolicy};
+
+    struct Policy;
+    impl WaiterPolicy for Policy {
+        type Error = ();
+        fn check(&self, _: Instant) -> Option<()> {
+            None
+        }
+        fn deadline(&self) -> Instant {
+            Instant::now()
+        }
+    }
+
+    let owner = Rc::new(RefCell::new(State::<(), (), (), Policy>::default()));
+    flight::update(&owner, |state, txn| {
+        assert!(state.register(1, Policy, true, true).is_ok());
+        state.register_waker(1, callback_waker(), txn);
+    });
+    for id in [1, 99] {
+        let dropped = Rc::new(Cell::new(false));
+        ON_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new({
+                let owner = owner.clone();
+                let dropped = dropped.clone();
+                move || {
+                    assert!(owner.borrow_mut().waiters()[&1].waker().is_some());
+                    dropped.set(true);
+                }
+            }));
+        });
+        flight::update(&owner, |state, txn| {
+            state.register_waker(id, callback_waker(), txn);
+            assert!(!dropped.get());
+        });
+        assert!(dropped.get());
+    }
+}
+
 /// Hooks retire application values through the same transaction as table cleanup.
 struct HookEntry {
     retired: Option<Retired>,
@@ -192,6 +356,26 @@ impl Entry for HookEntry {
 
     fn quiescent(&self) -> bool {
         self.retired.is_none()
+    }
+}
+
+struct HookAccess<'a>(&'a mut HookEntry);
+
+impl HookAccess<'_> {
+    fn refresh(&mut self, txn: &mut Txn) {
+        self.0.refresh(txn);
+    }
+
+    fn allow_refresh(&mut self) {
+        self.0.panic = false;
+    }
+}
+
+impl flight::Access for HookEntry {
+    type View<'a> = HookAccess<'a>;
+
+    fn access(&mut self) -> HookAccess<'_> {
+        HookAccess(self)
     }
 }
 
@@ -241,7 +425,7 @@ fn lifecycle_hooks_retire_before_drain_and_survive_hook_unwind() {
             flight::update_at(&owner, now, |table, txn| {
                 txn.push(callback_waker());
                 if stop {
-                    table.stop(txn, |entry, txn| entry.refresh(txn));
+                    table.stop(txn, |mut entry, txn| entry.refresh(txn));
                 } else {
                     txn.sweep(table, 2);
                 }
@@ -255,8 +439,8 @@ fn lifecycle_hooks_retire_before_drain_and_survive_hook_unwind() {
         }
         // Finish any unvisited stop hooks before dropping the owner.
         flight::update_at(&owner, now, |table, txn| {
-            table.stop(txn, |entry, txn| {
-                entry.panic = false;
+            table.stop(txn, |mut entry, txn| {
+                entry.allow_refresh();
                 entry.refresh(txn);
             });
             txn.sweep(table, 2);

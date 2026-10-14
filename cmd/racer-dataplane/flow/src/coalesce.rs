@@ -912,7 +912,25 @@ pub mod flight {
 
     /// Stage owned values and notifications while borrowing a worker-local owner.
     /// Values passed to `retire` drop before wakes, after the owner borrow releases.
-    /// Raw state access still requires the adapter to stage every removed value.
+    /// Only `update` and `update_at` create transactions. Notifications are push-only.
+    /// ```compile_fail,E0624
+    /// use flow_control::coalesce::flight::Txn;
+    /// let txn = Txn::new(std::time::Instant::now());
+    /// ```
+    /// ```compile_fail,E0599
+    /// use flow_control::coalesce::flight::update;
+    /// update(&std::cell::RefCell::new(()), |_, txn| txn.clear());
+    /// ```
+    /// ```compile_fail,E0599
+    /// use flow_control::coalesce::flight::update;
+    /// update(&std::cell::RefCell::new(()), |_, txn| txn.pop());
+    /// ```
+    /// ```compile_fail,E0308
+    /// use flow_control::coalesce::flight::update;
+    /// update(&std::cell::RefCell::new(()), |_, txn| {
+    ///     let _: &mut Vec<std::task::Waker> = txn;
+    /// });
+    /// ```
     pub struct Txn {
         now: Instant,
 
@@ -923,7 +941,7 @@ pub mod flight {
 
     impl Txn {
         /// Use one caller-sampled time for every hook in this transaction.
-        pub fn new(now: Instant) -> Self {
+        fn new(now: Instant) -> Self {
             Self {
                 now,
                 retired: Vec::new(),
@@ -934,6 +952,21 @@ pub mod flight {
         /// Read the fixed time without invoking an application clock callback.
         pub fn now(&self) -> Instant {
             self.now
+        }
+
+        /// Queue an owned wake target without calling it or exposing stored targets.
+        pub fn push(&mut self, waker: Waker) {
+            self.wakes.push(waker);
+        }
+
+        /// Count pending notifications without exposing their ownership.
+        pub fn len(&self) -> usize {
+            self.wakes.len()
+        }
+
+        /// Whether this transaction has no pending notifications.
+        pub fn is_empty(&self) -> bool {
+            self.wakes.is_empty()
         }
 
         /// Transfer an owned, worker-local value for destruction before notification.
@@ -967,22 +1000,6 @@ pub mod flight {
         /// Store a precloned drain target and stage the previous target for release.
         pub fn register_drain<K, E, S>(&mut self, table: &mut Table<K, E, S>, waker: Waker) {
             self.retire(table.register_drain(waker));
-        }
-    }
-
-    impl std::ops::Deref for Txn {
-        type Target = Vec<Waker>;
-
-        /// Access notifications collected by low-level state transitions.
-        fn deref(&self) -> &Self::Target {
-            &self.wakes
-        }
-    }
-
-    impl std::ops::DerefMut for Txn {
-        /// Enqueue notifications without invoking callbacks under the owner borrow.
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.wakes
         }
     }
 
@@ -1067,6 +1084,38 @@ pub mod flight {
 
         /// Report that neither waiters nor retained operations need this entry.
         fn quiescent(&self) -> bool;
+    }
+
+    /// Adapter-defined mutation view. Expose only the operations callers need, not
+    /// `&mut Self` or replaceable resource owners. The adapter owns this contract,
+    /// just as it owns the `Entry` hooks and the truth of `quiescent`.
+    /// A view with private fields can offer mutation without allowing replacement:
+    /// ```compile_fail,E0614
+    /// use flow_control::coalesce::flight::{Access, Entry, Table, Txn};
+    /// mod adapter {
+    ///     use super::*;
+    ///     pub struct Work;
+    ///     pub struct View<'a>(&'a mut Work);
+    ///     impl Entry for Work {
+    ///         fn refresh(&mut self, _: &mut Txn) {}
+    ///         fn quiescent(&self) -> bool { false }
+    ///     }
+    ///     impl Access for Work {
+    ///         type View<'a> = View<'a>;
+    ///         fn access(&mut self) -> View<'_> { View(self) }
+    ///     }
+    /// }
+    /// let mut table = Table::<u32, adapter::Work>::default();
+    /// *table.access(&1).unwrap() = adapter::Work;
+    /// ```
+    pub trait Access: Entry {
+        /// A restricted view whose lifetime cannot outlive the entry borrow.
+        type View<'a>
+        where
+            Self: 'a;
+
+        /// Project the entry without transferring its ownership.
+        fn access(&mut self) -> Self::View<'_>;
     }
 
     /// Owned membership with a synchronized, bounded sweep index.
@@ -1183,7 +1232,7 @@ pub mod flight {
         }
 
         /// Enqueue a pending drain notification at most once.
-        pub fn notify_drain(&mut self, wakes: &mut Vec<Waker>) {
+        pub fn notify_drain(&mut self, wakes: &mut Txn) {
             if let Some(waker) = self.drain_waker.take() {
                 wakes.push(waker);
             }
@@ -1205,10 +1254,22 @@ pub mod flight {
             self.entries.get(key).map(|indexed| &indexed.entry)
         }
 
-        /// Mutate application state without affecting table-owned sweep membership.
-        /// The adapter remains responsible for its own incarnation-fence semantics.
-        pub fn get_mut(&mut self, key: &K) -> Option<&mut E> {
+        /// Internal hooks alone receive the whole entry by mutable reference.
+        fn get_mut(&mut self, key: &K) -> Option<&mut E> {
             self.entries.get_mut(key).map(|indexed| &mut indexed.entry)
+        }
+
+        /// Mutate through the adapter's restricted view, never a raw entry reference.
+        /// ```compile_fail,E0624
+        /// use flow_control::coalesce::flight::Table;
+        /// let mut table = Table::<u32, ()>::default();
+        /// *table.get_mut(&1).unwrap() = ();
+        /// ```
+        pub fn access(&mut self, key: &K) -> Option<E::View<'_>>
+        where
+            E: Access,
+        {
+            self.get_mut(key).map(Access::access)
         }
 
         /// Whether a key currently has an owned entry.
@@ -1271,13 +1332,30 @@ pub mod flight {
         }
     }
 
-    impl<K, E, S> Table<K, E, S> {
+    impl<K, E: Access, S> Table<K, E, S> {
         /// Mark shutdown and visit each entry synchronously. The adapter must reject
         /// admission, choose settlement policy, and drive actual operation completions.
-        pub fn stop(&mut self, txn: &mut Txn, mut stop: impl FnMut(&mut E, &mut Txn)) {
+        /// Stop callbacks receive the same restricted view as lookup:
+        /// ```compile_fail,E0631
+        /// use flow_control::coalesce::flight::{self, Access, Entry, Table, Txn};
+        /// struct Work;
+        /// impl Entry for Work {
+        ///     fn refresh(&mut self, _: &mut Txn) {}
+        ///     fn quiescent(&self) -> bool { false }
+        /// }
+        /// impl Access for Work {
+        ///     type View<'a> = ();
+        ///     fn access(&mut self) {}
+        /// }
+        /// let owner = std::cell::RefCell::new(Table::<u32, Work>::default());
+        /// flight::update(&owner, |table, txn| {
+        ///     table.stop(txn, |entry: &mut Work, _| *entry = Work);
+        /// });
+        /// ```
+        pub fn stop(&mut self, txn: &mut Txn, mut stop: impl FnMut(E::View<'_>, &mut Txn)) {
             self.stopping = true;
             for entry in self.entries.values_mut() {
-                stop(&mut entry.entry, txn);
+                stop(entry.entry.access(), txn);
             }
         }
     }
@@ -1424,9 +1502,9 @@ pub mod flight {
 
     /// Waiter lifecycle and result-independent flight transitions.
     pub mod state {
-        use super::{Cursor, Exhausted, Identity, Stale};
+        use super::{Cursor, Exhausted, Identity, Stale, Txn};
         use std::collections::BTreeMap;
-        use std::ops::{Deref, DerefMut};
+        use std::ops::Deref;
         use std::task::Waker;
         use std::time::Instant;
 
@@ -1445,6 +1523,17 @@ pub mod flight {
         }
 
         /// One attached caller's policy, acquisition eligibility, and notification state.
+        /// Stored wake targets and policy ownership cannot be replaced directly:
+        /// ```compile_fail,E0616
+        /// use flow_control::coalesce::flight::state::{Waiter, WaiterPolicy};
+        /// fn clear<W: WaiterPolicy>(waiter: &mut Waiter<W>) { waiter.waker = None; }
+        /// ```
+        /// ```compile_fail,E0594
+        /// use flow_control::coalesce::flight::state::{Waiter, WaiterPolicy};
+        /// fn replace<W: WaiterPolicy>(waiter: &mut Waiter<W>, policy: W) {
+        ///     **waiter = policy;
+        /// }
+        /// ```
         pub struct Waiter<W: WaiterPolicy> {
             /// Caller-owned policy facts, available through dereferencing as well.
             policy: W,
@@ -1453,16 +1542,16 @@ pub mod flight {
             acquisition: bool,
 
             /// Whether partial publication permits another attempt for this caller.
-            pub complete: bool,
+            complete: bool,
 
             /// Whether this caller has already received its acquisition opportunity.
-            pub issued: bool,
+            issued: bool,
 
             /// Sticky policy or cancellation failure.
-            pub error: Option<W::Error>,
+            error: Option<W::Error>,
 
             /// Latest wake target, taken once when notification is enqueued.
-            pub waker: Option<Waker>,
+            waker: Option<Waker>,
         }
 
         impl<W: WaiterPolicy> Deref for Waiter<W> {
@@ -1474,14 +1563,27 @@ pub mod flight {
             }
         }
 
-        impl<W: WaiterPolicy> DerefMut for Waiter<W> {
-            /// Update caller-owned policy facts without replacing waiter state.
-            fn deref_mut(&mut self) -> &mut W {
-                &mut self.policy
-            }
-        }
-
         impl<W: WaiterPolicy> Waiter<W> {
+            /// Whether partial publication renews this caller's acquisition opportunity.
+            pub fn complete(&self) -> bool {
+                self.complete
+            }
+
+            /// Whether this caller has received its acquisition opportunity.
+            pub fn issued(&self) -> bool {
+                self.issued
+            }
+
+            /// Read the sticky policy or cancellation failure.
+            pub fn error(&self) -> Option<W::Error> {
+                self.error
+            }
+
+            /// Inspect the parked target without transferring ownership.
+            pub fn waker(&self) -> Option<&Waker> {
+                self.waker.as_ref()
+            }
+
             /// Whether an unissued acquisition opportunity remains usable.
             fn eligible(&self) -> bool {
                 self.acquisition && !self.issued && self.error.is_none()
@@ -1539,6 +1641,44 @@ pub mod flight {
 
         /// Worker-local waiter index and transition state driven by an owning adapter.
         /// The adapter supplies actual operation idleness; cancellation is not idleness.
+        /// Callback-owned values are read-only. Use transaction-taking replacement
+        /// methods, or retire values returned by low-level transitions.
+        /// ```compile_fail,E0616
+        /// use flow_control::coalesce::flight::state::{State, Phase, WaiterPolicy};
+        /// fn replace<W: WaiterPolicy>(state: &mut State<(), (), (), W>) {
+        ///     state.phase = Phase::RetryPending;
+        /// }
+        /// ```
+        /// ```compile_fail,E0616
+        /// use flow_control::coalesce::flight::state::{State, WaiterPolicy};
+        /// fn clear<W: WaiterPolicy>(state: &mut State<(), (), (), W>) {
+        ///     state.partial.take();
+        /// }
+        /// ```
+        /// ```compile_fail,E0616
+        /// use flow_control::coalesce::flight::state::{State, WaiterPolicy};
+        /// fn clear<W: WaiterPolicy>(state: &mut State<(), (), (), W>) {
+        ///     state.waiters.clear();
+        /// }
+        /// ```
+        /// ```compile_fail,E0596
+        /// use flow_control::coalesce::flight::state::{State, WaiterPolicy};
+        /// fn clear<W: WaiterPolicy>(state: &mut State<(), (), (), W>) {
+        ///     state.waiters().clear();
+        /// }
+        /// ```
+        /// ```compile_fail,E0594
+        /// use flow_control::coalesce::flight::state::{State, Phase, WaiterPolicy};
+        /// fn replace<W: WaiterPolicy>(state: &mut State<(), (), (), W>) {
+        ///     *state.phase() = Phase::RetryPending;
+        /// }
+        /// ```
+        /// ```compile_fail,E0594
+        /// use flow_control::coalesce::flight::state::{State, WaiterPolicy};
+        /// fn replace<W: WaiterPolicy>(state: &mut State<(), String, (), W>) {
+        ///     *state.partial().unwrap() = String::new();
+        /// }
+        /// ```
         /// ```compile_fail,E0277
         /// use flow_control::coalesce::flight::state::{State, WaiterPolicy};
         /// use std::time::Instant;
@@ -1565,19 +1705,19 @@ pub mod flight {
         /// ```
         pub struct State<C, P, O, W: WaiterPolicy> {
             /// Current acquisition or settlement phase.
-            pub phase: Phase<C, O, W::Error>,
+            phase: Phase<C, O, W::Error>,
 
             /// Current leader's waiter identifier, retained until settlement.
             pub leader: Option<u64>,
 
             /// Attached callers indexed by monotonic waiter identifier.
-            pub waiters: BTreeMap<u64, Waiter<W>>,
+            waiters: BTreeMap<u64, Waiter<W>>,
 
             /// Deadline index used for bounded expiration work.
-            pub deadlines: BTreeMap<(Instant, u64), ()>,
+            deadlines: BTreeMap<(Instant, u64), ()>,
 
             /// Settled intermediate result retained across another acquisition.
-            pub partial: Option<P>,
+            partial: Option<P>,
 
             cursor: Cursor,
 
@@ -1604,6 +1744,70 @@ pub mod flight {
         }
 
         impl<C, P, O, W: WaiterPolicy> State<C, P, O, W> {
+            /// Inspect the current phase without allowing in-place replacement.
+            pub fn phase(&self) -> &Phase<C, O, W::Error> {
+                &self.phase
+            }
+
+            /// Inspect attached callers without exposing mutable policies or wakers.
+            pub fn waiters(&self) -> &BTreeMap<u64, Waiter<W>> {
+                &self.waiters
+            }
+
+            /// Inspect the bounded expiry index.
+            pub fn deadlines(&self) -> &BTreeMap<(Instant, u64), ()> {
+                &self.deadlines
+            }
+
+            /// Inspect the retained intermediate result.
+            pub fn partial(&self) -> Option<&P> {
+                self.partial.as_ref()
+            }
+
+            /// Replace an adapter-selected phase and retire the old value after borrowing.
+            /// The adapter must still honor its operation completion fence.
+            pub fn replace_phase(&mut self, phase: Phase<C, O, W::Error>, txn: &mut Txn)
+            where
+                C: 'static,
+                O: 'static,
+                W::Error: 'static,
+            {
+                txn.retire(std::mem::replace(&mut self.phase, phase));
+            }
+
+            /// Replace or clear an intermediate result without dropping it in place.
+            pub fn replace_partial(&mut self, partial: Option<P>, txn: &mut Txn)
+            where
+                P: 'static,
+            {
+                txn.retire(std::mem::replace(&mut self.partial, partial));
+            }
+
+            /// Store a precloned target, retiring replaced, redundant, or stale targets.
+            pub fn register_waker(&mut self, id: u64, waker: Waker, txn: &mut Txn) {
+                let retired = match self.waiters.get_mut(&id) {
+                    Some(waiter) => store_waker(&mut waiter.waker, waker),
+                    None => Some(waker),
+                };
+                txn.retire(retired);
+            }
+
+            /// Replace policy facts and update their deadline index before retirement.
+            /// A missing caller retires the unused policy and returns `Stale`.
+            pub fn replace_policy(&mut self, id: u64, policy: W, txn: &mut Txn) -> Result<(), Stale>
+            where
+                W: 'static,
+            {
+                let Some(waiter) = self.waiters.get_mut(&id) else {
+                    txn.retire(policy);
+                    return Err(Stale);
+                };
+                self.deadlines.remove(&(waiter.deadline(), id));
+                self.deadlines.insert((policy.deadline(), id), ());
+                txn.retire(std::mem::replace(&mut waiter.policy, policy));
+                Ok(())
+            }
+
             /// Attach a caller using an identifier allocated by the owning table.
             /// Duplicate IDs return the policy without changing the original waiter or deadline.
             #[must_use = "retire rejected policies outside the owner borrow"]
@@ -1679,7 +1883,7 @@ pub mod flight {
             }
 
             /// Enqueue all parked caller notifications without invoking their wakers.
-            pub fn notify(&mut self, wakes: &mut Vec<Waker>) {
+            pub fn notify(&mut self, wakes: &mut Txn) {
                 for waiter in self.waiters.values_mut() {
                     if let Some(waker) = waiter.waker.take() {
                         wakes.push(waker);
@@ -1688,7 +1892,7 @@ pub mod flight {
             }
 
             /// Check one caller in round-robin order without scanning the waiter map.
-            pub fn sweep_waiter(&mut self, now: Instant, wakes: &mut Vec<Waker>) {
+            pub fn sweep_waiter(&mut self, now: Instant, wakes: &mut Txn) {
                 if let Some((id, _)) = self.cursor.next(&self.waiters) {
                     self.refresh_waiter(id, now, wakes);
                 }
@@ -1733,7 +1937,7 @@ pub mod flight {
                 idle: bool,
                 unavailable: W::Error,
                 split: fn(O) -> Published<C, P>,
-                wakes: &mut Vec<Waker>,
+                wakes: &mut Txn,
             ) -> Option<P> {
                 if !idle || !matches!(self.phase, Phase::Draining(_)) {
                     return None;
@@ -1774,11 +1978,7 @@ pub mod flight {
             /// Revoke acquisition immediately, retaining its outcome behind completion.
             /// Stage the old phase with `Txn::retire` before notifications run.
             #[must_use = "stage the retired phase with Txn::retire"]
-            pub fn revoke(
-                &mut self,
-                error: W::Error,
-                wakes: &mut Vec<Waker>,
-            ) -> Phase<C, O, W::Error> {
+            pub fn revoke(&mut self, error: W::Error, wakes: &mut Txn) -> Phase<C, O, W::Error> {
                 if let Some(waiter) = self.leader.and_then(|id| self.waiters.get_mut(&id)) {
                     waiter.error = Some(error);
                 }
@@ -1798,7 +1998,7 @@ pub mod flight {
                 canceled: W::Error,
                 now: Instant,
                 split: fn(O) -> Published<C, P>,
-                wakes: &mut Vec<Waker>,
+                wakes: &mut Txn,
             ) -> Option<P> {
                 if let Some(id) = self.leader {
                     self.refresh_waiter(id, now, wakes);
@@ -1843,7 +2043,7 @@ pub mod flight {
             ///     txn.retire(stopped);
             /// });
             /// ```
-            pub fn stop(&mut self, error: W::Error, wakes: &mut Vec<Waker>) -> Stopped<C, O, W> {
+            pub fn stop(&mut self, error: W::Error, wakes: &mut Txn) -> Stopped<C, O, W> {
                 for waiter in self.waiters.values_mut() {
                     waiter.error = Some(error);
                 }
@@ -1857,7 +2057,7 @@ pub mod flight {
             }
 
             /// Check one caller and enqueue its wake if its policy has failed.
-            fn refresh_waiter(&mut self, id: u64, now: Instant, wakes: &mut Vec<Waker>) {
+            fn refresh_waiter(&mut self, id: u64, now: Instant, wakes: &mut Txn) {
                 let Some(waiter) = self.waiters.get_mut(&id) else {
                     return;
                 };
@@ -1873,7 +2073,7 @@ pub mod flight {
             }
 
             /// Check at most 64 due entries once each, rotating past deferred failures.
-            fn refresh_expired(&mut self, now: Instant, wakes: &mut Vec<Waker>) {
+            fn refresh_expired(&mut self, now: Instant, wakes: &mut Txn) {
                 use std::ops::Bound::{Excluded, Included, Unbounded};
 
                 let end = (now, u64::MAX);
@@ -1986,7 +2186,7 @@ pub mod flight {
             }
 
             /// Refresh with fixed unavailable and cancellation error values.
-            fn refresh(core: &mut Core, idle: bool, wakes: &mut Vec<Waker>) {
+            fn refresh(core: &mut Core, idle: bool, wakes: &mut Txn) {
                 let _ = core.refresh(idle, 9, 8, Instant::now(), split, wakes);
             }
 
@@ -2009,7 +2209,7 @@ pub mod flight {
                     } else {
                         error.set(Some(7));
                     }
-                    let mut wakes = Vec::new();
+                    let mut wakes = Txn::new(Instant::now());
                     refresh(&mut core, false, &mut wakes);
                     assert!(matches!(core.phase, Phase::Draining(Outcome::Retry)));
                     assert_eq!(core.validate_leader(1, true), Err(Stale));
@@ -2040,7 +2240,7 @@ pub mod flight {
                 let mut identity = identity();
                 assert_eq!(core.elect(1, &mut identity, 3), Ok(true));
                 core.waiters.get_mut(&2).unwrap().issued = true;
-                let mut wakes = Vec::new();
+                let mut wakes = Txn::new(Instant::now());
                 drop(core.begin_completion(Outcome::Published(Published::Partial(17))));
                 let _ = core.settle(false, 9, split, &mut wakes);
                 assert!(core.partial.is_none());
@@ -2069,8 +2269,8 @@ pub mod flight {
                 register(&mut core, 2, false, false);
                 let mut identity = identity();
                 assert_eq!(core.elect(1, &mut identity, 1), Ok(true));
-                drop(core.revoke(7, &mut Vec::new()));
-                let _ = core.settle(true, 9, split, &mut Vec::new());
+                drop(core.revoke(7, &mut Txn::new(Instant::now())));
+                let _ = core.settle(true, 9, split, &mut Txn::new(Instant::now()));
                 assert!(matches!(core.phase, Phase::Failed(9)));
                 core.phase = Phase::RetryPending;
                 register(&mut core, 3, true, true);
@@ -2118,7 +2318,7 @@ pub mod flight {
                     };
                     drop(retired);
                 }
-                let mut wakes = Vec::new();
+                let mut wakes = Txn::new(Instant::now());
                 let _ = core.refresh(true, 9, 8, now, split, &mut wakes);
                 assert_eq!(core.deadlines.len(), 1);
                 assert_eq!(wakes.len(), 64);
@@ -2128,9 +2328,7 @@ pub mod flight {
                 assert_eq!(wakes.len(), 65);
                 core.notify(&mut wakes);
                 assert_eq!(wakes.len(), 65);
-                for wake in wakes {
-                    wake.wake();
-                }
+                drop(wakes);
                 assert_eq!(old.0.load(Ordering::Relaxed), 0);
                 assert_eq!(latest.0.load(Ordering::Relaxed), 65);
             }
@@ -2204,7 +2402,7 @@ pub mod flight {
                     )
                     .is_ok()
                 );
-                let mut wakes = Vec::new();
+                let mut wakes = Txn::new(Instant::now());
                 core.refresh_expired(now, &mut wakes);
                 assert_eq!(core.waiters[&1].error, None);
                 assert_eq!(core.waiters[&2].error, Some(7));
@@ -2226,7 +2424,7 @@ pub mod flight {
                 assert_eq!(core.elect(2, &mut identity, 3), Ok(true));
                 core.cancel(2, 6);
                 assert_eq!(core.waiters[&2].error, Some(6));
-                let mut wakes = Vec::new();
+                let mut wakes = Txn::new(Instant::now());
                 drop(core.stop(8, &mut wakes));
                 let _ = core.settle(false, 9, split, &mut wakes);
                 assert!(matches!(core.phase, Phase::Draining(Outcome::Failed(8))));
@@ -2279,6 +2477,22 @@ pub mod flight {
             /// Require both caller detachment and real operation completion.
             fn quiescent(&self) -> bool {
                 self.waiters == 0 && self.operations.is_empty()
+            }
+        }
+
+        struct TestAccess<'a> {
+            identity: &'a mut Identity,
+            canceled: &'a mut bool,
+        }
+
+        impl Access for TestEntry {
+            type View<'a> = TestAccess<'a>;
+
+            fn access(&mut self) -> TestAccess<'_> {
+                TestAccess {
+                    identity: &mut self.identity,
+                    canceled: &mut self.canceled,
+                }
             }
         }
 
@@ -2608,7 +2822,7 @@ pub mod flight {
             assert!(table.values().all(|entry| entry.refreshed == 2));
             table.drain_waker = Some(Waker::noop().clone());
             table.stop(&mut Txn::new(Instant::now()), |entry, _| {
-                entry.canceled = true;
+                *entry.canceled = true;
             });
             let mut wakes = Txn::new(Instant::now());
             table.sweep(99, &mut wakes);
@@ -2701,7 +2915,7 @@ pub mod flight {
             }
             table.stop(&mut Txn::new(Instant::now()), |entry, _| {
                 entry.identity.incarnation = u64::MAX;
-                entry.canceled = true;
+                *entry.canceled = true;
             });
             table.get_mut(&2).unwrap().waiters = 0;
             assert!(table.remove_quiescent(&2).is_some());
@@ -2795,7 +3009,7 @@ pub mod flight {
                 "insert does not require an incarnation allocation"
             );
             table.stop(&mut Txn::new(Instant::now()), |entry, _| {
-                entry.canceled = true
+                *entry.canceled = true
             });
             table.sweep(4, &mut Txn::new(Instant::now()));
             assert!(table.is_empty());

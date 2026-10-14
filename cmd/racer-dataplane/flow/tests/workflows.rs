@@ -1044,7 +1044,7 @@ mod coalesce_tests {
                     CountingPolicy,
                 >::default()));
                 let due = Instant::now();
-                flight::update(&owner, |state, _| {
+                flight::update(&owner, |state, txn| {
                     for id in 1..=if final_waiter { 1 } else { 2 } {
                         assert!(
                             state
@@ -1061,15 +1061,18 @@ mod coalesce_tests {
                                 .is_ok()
                         );
                     }
-                    state.phase = match phase {
-                        0 => Phase::RetryPending,
-                        1 => Phase::Acquiring,
-                        2 => Phase::Draining(Outcome::Retry),
-                        3 => Phase::Complete(7),
-                        _ => Phase::Failed(8),
-                    };
+                    state.replace_phase(
+                        match phase {
+                            0 => Phase::RetryPending,
+                            1 => Phase::Acquiring,
+                            2 => Phase::Draining(Outcome::Retry),
+                            3 => Phase::Complete(7),
+                            _ => Phase::Failed(8),
+                        },
+                        txn,
+                    );
                     state.leader = matches!(phase, 1 | 2).then_some(1);
-                    state.waiters.get_mut(&1).unwrap().waker = Some(cohort_waker());
+                    state.register_waker(1, cohort_waker(), txn);
                 });
                 let called = Rc::new(Cell::new(0));
                 ON_COHORT_DROP.with(|slot| {
@@ -1078,17 +1081,17 @@ mod coalesce_tests {
                         let called = called.clone();
                         move || {
                             flight::update(&owner, |state, txn| {
-                                assert!(!state.waiters.contains_key(&1));
-                                assert!(!state.deadlines.contains_key(&(due, 1)));
-                                assert_eq!(state.waiters.len(), usize::from(!final_waiter));
-                                assert_eq!(state.deadlines.len(), usize::from(!final_waiter));
+                                assert!(!state.waiters().contains_key(&1));
+                                assert!(!state.deadlines().contains_key(&(due, 1)));
+                                assert_eq!(state.waiters().len(), usize::from(!final_waiter));
+                                assert_eq!(state.deadlines().len(), usize::from(!final_waiter));
                                 assert_eq!(state.leader, matches!(phase, 1 | 2).then_some(1));
                                 assert!(match phase {
-                                    0 => matches!(state.phase, Phase::RetryPending),
-                                    1 => matches!(state.phase, Phase::Acquiring),
-                                    2 => matches!(state.phase, Phase::Draining(Outcome::Retry)),
-                                    3 => matches!(state.phase, Phase::Complete(7)),
-                                    _ => matches!(state.phase, Phase::Failed(8)),
+                                    0 => matches!(state.phase(), Phase::RetryPending),
+                                    1 => matches!(state.phase(), Phase::Acquiring),
+                                    2 => matches!(state.phase(), Phase::Draining(Outcome::Retry)),
+                                    3 => matches!(state.phase(), Phase::Complete(7)),
+                                    _ => matches!(state.phase(), Phase::Failed(8)),
                                 });
                                 txn.retire(state.detach(2));
                             });
@@ -1098,17 +1101,17 @@ mod coalesce_tests {
                 });
                 flight::update(&owner, |state, txn| {
                     assert!(state.detach(99).is_none());
-                    assert_eq!(state.waiters.len(), if final_waiter { 1 } else { 2 });
-                    assert_eq!(state.deadlines.len(), state.waiters.len());
+                    assert_eq!(state.waiters().len(), if final_waiter { 1 } else { 2 });
+                    assert_eq!(state.deadlines().len(), state.waiters().len());
                     let retired = state.detach(1);
-                    assert!(retired.as_ref().unwrap().waker.is_some());
+                    assert!(retired.as_ref().unwrap().waker().is_some());
                     assert_eq!(called.get(), 0);
                     txn.retire(retired);
                 });
                 assert_eq!(called.get(), 1);
                 assert!(flight::update(&owner, |state, _| state.detach(1)).is_none());
-                assert!(owner.borrow().waiters.is_empty());
-                assert!(owner.borrow().deadlines.is_empty());
+                assert!(owner.borrow().waiters().is_empty());
+                assert!(owner.borrow().deadlines().is_empty());
                 assert!(ON_COHORT_DROP.with(|slot| slot.borrow().is_none()));
             }
         }
@@ -1149,8 +1152,8 @@ mod coalesce_tests {
                 let called = called.clone();
                 move || {
                     flight::update(&owner, |state, _| {
-                        assert!(state.waiters.is_empty());
-                        assert!(state.deadlines.is_empty());
+                        assert!(state.waiters().is_empty());
+                        assert!(state.deadlines().is_empty());
                         assert!(state.detach(1).is_none());
                     });
                     called.set(true);
@@ -1160,7 +1163,7 @@ mod coalesce_tests {
         flight::update(&owner, |state, txn| {
             assert!(state.register(1, policy, true, true).is_ok());
             let retired = state.detach(1);
-            assert!(retired.as_ref().unwrap().waker.is_none());
+            assert!(retired.as_ref().unwrap().waker().is_none());
             assert!(!called.get());
             txn.retire(retired);
         });
@@ -1224,9 +1227,12 @@ mod coalesce_tests {
                                 return;
                             }
                             flight::update(&owner, |state, _| {
-                                assert!(state.waiters.is_empty());
-                                assert!(state.deadlines.is_empty());
-                                assert!(matches!(state.phase, Phase::Draining(Outcome::Failed(8))));
+                                assert!(state.waiters().is_empty());
+                                assert!(state.deadlines().is_empty());
+                                assert!(matches!(
+                                    state.phase(),
+                                    Phase::Draining(Outcome::Failed(8))
+                                ));
                                 assert!(state.detach(1).is_none());
                             });
                             dropped.set(dropped.get() + 1);
@@ -1234,23 +1240,25 @@ mod coalesce_tests {
                     })),
                 };
                 let wake_count = Arc::new(Count::default());
-                flight::update(&owner, |state, _| {
-                    state.phase = match phase {
-                        0 => Phase::RetryPending,
-                        1 => Phase::Acquiring,
-                        2 => Phase::Draining(Outcome::Retry),
-                        3 => Phase::Draining(Outcome::Failed(7)),
-                        4 => Phase::Draining(Outcome::Published(Published::Complete(probe()))),
-                        5 => Phase::Complete(probe()),
-                        _ => Phase::Failed(7),
-                    };
+                flight::update(&owner, |state, txn| {
+                    state.replace_phase(
+                        match phase {
+                            0 => Phase::RetryPending,
+                            1 => Phase::Acquiring,
+                            2 => Phase::Draining(Outcome::Retry),
+                            3 => Phase::Draining(Outcome::Failed(7)),
+                            4 => Phase::Draining(Outcome::Published(Published::Complete(probe()))),
+                            5 => Phase::Complete(probe()),
+                            _ => Phase::Failed(7),
+                        },
+                        txn,
+                    );
                     state.leader = matches!(phase, 1..=4).then_some(1);
                     for id in 1..=waiter_count {
                         assert!(state.register(id, probe(), true, true).is_ok());
                         // Include a policy with no parked waker.
                         if id == 1 {
-                            state.waiters.get_mut(&id).unwrap().waker =
-                                Some(Waker::from(wake_count.clone()));
+                            state.register_waker(id, Waker::from(wake_count.clone()), txn);
                         }
                     }
                 });
@@ -1262,7 +1270,7 @@ mod coalesce_tests {
                         retired
                             .waiters
                             .values()
-                            .all(|waiter| waiter.error == Some(8) && waiter.waker.is_none())
+                            .all(|waiter| waiter.error() == Some(8) && waiter.waker().is_none())
                     );
                     assert!(match phase {
                         0 => matches!(retired.phase, Phase::RetryPending),
@@ -1290,18 +1298,16 @@ mod coalesce_tests {
                 });
                 flight::update(&owner, |state, wakes| {
                     assert_eq!(state.leader, matches!(phase, 1..=4).then_some(1));
-                    assert!(
-                        state
-                            .settle(false, 9, std::convert::identity, wakes)
-                            .is_none()
-                    );
-                    assert!(matches!(state.phase, Phase::Draining(Outcome::Failed(8))));
-                    assert!(
-                        state
-                            .settle(true, 9, std::convert::identity, wakes)
-                            .is_none()
-                    );
-                    assert!(matches!(state.phase, Phase::Failed(8)));
+                    let retired = state.settle(false, 9, std::convert::identity, wakes);
+                    let unchanged = retired.is_none();
+                    wakes.retire(retired);
+                    assert!(unchanged);
+                    assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
+                    let retired = state.settle(true, 9, std::convert::identity, wakes);
+                    let unchanged = retired.is_none();
+                    wakes.retire(retired);
+                    assert!(unchanged);
+                    assert!(matches!(state.phase(), Phase::Failed(8)));
                     assert!(state.leader.is_none());
                 });
                 assert_eq!(
@@ -1326,18 +1332,21 @@ mod coalesce_tests {
                         let called = called.clone();
                         move || {
                             flight::update(&owner.upgrade().unwrap(), |state, _| {
-                                assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
+                                assert!(matches!(state.phase(), Phase::Draining(Outcome::Retry)));
                             });
                             called.set(true);
                         }
                     })),
                 };
-                flight::update(&owner, |state, _| {
-                    state.phase = if complete {
-                        Phase::Complete(value)
-                    } else {
-                        Phase::Draining(Outcome::Published(Published::Partial(value)))
-                    };
+                flight::update(&owner, |state, txn| {
+                    state.replace_phase(
+                        if complete {
+                            Phase::Complete(value)
+                        } else {
+                            Phase::Draining(Outcome::Published(Published::Partial(value)))
+                        },
+                        txn,
+                    );
                 });
                 flight::update(&owner, |state, txn| {
                     let retired = if revoke {
@@ -1369,28 +1378,31 @@ mod coalesce_tests {
                             flight::update(&owner.upgrade().unwrap(), |state, _| {
                                 assert!(state.leader.is_none());
                                 if complete {
-                                    assert!(matches!(state.phase, Phase::Complete(_)));
-                                    assert!(state.partial.is_none());
+                                    assert!(matches!(state.phase(), Phase::Complete(_)));
+                                    assert!(state.partial().is_none());
                                 } else {
-                                    assert!(matches!(state.phase, Phase::RetryPending));
-                                    assert!(state.partial.is_some());
+                                    assert!(matches!(state.phase(), Phase::RetryPending));
+                                    assert!(state.partial().is_some());
                                 }
                             });
                             called.set(true);
                         }
                     })),
                 };
-                flight::update(&owner, |state, _| {
-                    state.partial = Some(previous);
+                flight::update(&owner, |state, txn| {
+                    state.replace_partial(Some(previous), txn);
                     let value = DropProbe {
                         due: Instant::now(),
                         on_drop: None,
                     };
-                    state.phase = Phase::Draining(Outcome::Published(if complete {
-                        Published::Complete(value)
-                    } else {
-                        Published::Partial(value)
-                    }));
+                    state.replace_phase(
+                        Phase::Draining(Outcome::Published(if complete {
+                            Published::Complete(value)
+                        } else {
+                            Published::Partial(value)
+                        })),
+                        txn,
+                    );
                     state.leader = Some(1);
                 });
                 let settle = |idle| {
@@ -1430,8 +1442,8 @@ mod coalesce_tests {
                 let called = called.clone();
                 move || {
                     flight::update(&owner.upgrade().unwrap(), |(state, operations), _| {
-                        assert!(matches!(state.phase, Phase::Failed(8)));
-                        assert!(state.partial.is_none());
+                        assert!(matches!(state.phase(), Phase::Failed(8)));
+                        assert!(state.partial().is_none());
                         assert!(operations.is_empty());
                     });
                     called.set(true);
@@ -1439,8 +1451,8 @@ mod coalesce_tests {
             })),
         };
         flight::update(&owner, |(state, operations), txn| {
-            state.partial = Some(partial);
-            state.phase = Phase::Acquiring;
+            state.replace_partial(Some(partial), txn);
+            state.replace_phase(Phase::Acquiring, txn);
             state.leader = Some(1);
             operations.insert(1, ()).unwrap();
             let retired = state.stop(8, txn);
@@ -1451,27 +1463,25 @@ mod coalesce_tests {
                 if take {
                     operations.take(1).unwrap();
                 }
-                assert!(
-                    state
-                        .settle(operations.is_empty(), 9, std::convert::identity, wakes)
-                        .is_none()
-                );
-                assert!(matches!(state.phase, Phase::Draining(Outcome::Failed(8))));
-                assert!(state.partial.is_some());
+                let retired = state.settle(operations.is_empty(), 9, std::convert::identity, wakes);
+                let unchanged = retired.is_none();
+                wakes.retire(retired);
+                assert!(unchanged);
+                assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
+                assert!(state.partial().is_some());
                 assert_eq!(state.leader, Some(1));
             });
             assert!(!called.get());
         }
         flight::update(&owner, |(state, operations), wakes| {
             operations.complete(1).unwrap();
-            assert!(
-                state
-                    .settle(operations.is_empty(), 9, std::convert::identity, wakes)
-                    .is_none()
-            );
-            assert!(matches!(state.phase, Phase::Failed(8)));
+            let retired = state.settle(operations.is_empty(), 9, std::convert::identity, wakes);
+            let unchanged = retired.is_none();
+            wakes.retire(retired);
+            assert!(unchanged);
+            assert!(matches!(state.phase(), Phase::Failed(8)));
             assert!(state.leader.is_none());
-            wakes.retire(state.partial.take());
+            state.replace_partial(None, wakes);
             assert!(!called.get());
         });
         assert!(called.get());
@@ -1492,8 +1502,8 @@ mod coalesce_tests {
                 move || {
                     assert!(!called.get());
                     let state = owner.borrow_mut();
-                    assert!(state.waiters.is_empty());
-                    assert!(matches!(state.phase, Phase::Draining(Outcome::Failed(8))));
+                    assert!(state.waiters().is_empty());
+                    assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
                     dropped.set(dropped.get() + 1);
                 }
             })),
@@ -1509,21 +1519,26 @@ mod coalesce_tests {
                     "retired values must drop before notification"
                 );
                 flight::update(&owner, |state, wakes| {
-                    assert!(state.waiters.is_empty());
-                    assert!(state.deadlines.is_empty());
+                    assert!(state.waiters().is_empty());
+                    assert!(state.deadlines().is_empty());
                     assert!(state.detach(1).is_none());
-                    let _ = state.settle(false, 9, std::convert::identity, wakes);
-                    assert!(matches!(state.phase, Phase::Draining(Outcome::Failed(8))));
-                    let _ = state.settle(true, 9, std::convert::identity, wakes);
-                    assert!(matches!(state.phase, Phase::Failed(8)));
+                    let retired = state.settle(false, 9, std::convert::identity, wakes);
+                    wakes.retire(retired);
+                    assert!(matches!(state.phase(), Phase::Draining(Outcome::Failed(8))));
+                    let retired = state.settle(true, 9, std::convert::identity, wakes);
+                    wakes.retire(retired);
+                    assert!(matches!(state.phase(), Phase::Failed(8)));
                 });
                 called.set(true);
             }
         });
         flight::update(&owner, |state, txn| {
             assert!(state.register(1, probe(), true, true).is_ok());
-            state.phase = Phase::Draining(Outcome::Published(Published::Complete(probe())));
-            state.waiters.get_mut(&1).unwrap().waker = Some(waker);
+            state.replace_phase(
+                Phase::Draining(Outcome::Published(Published::Complete(probe()))),
+                txn,
+            );
+            state.register_waker(1, waker, txn);
             let retired = state.stop(8, txn);
             assert!(!called.get());
             assert_eq!(dropped.get(), 0);
@@ -1951,6 +1966,38 @@ mod coalesce_tests {
         }
     }
 
+    struct OwnedAccess<'a>(&'a mut OwnedEntry);
+
+    impl OwnedAccess<'_> {
+        fn insert(
+            &mut self,
+            id: u64,
+            resource: ReentrantResource,
+        ) -> Result<(), ReentrantResource> {
+            self.0.0.insert(id, resource)
+        }
+
+        fn take(&mut self, id: u64) -> Result<ReentrantResource, Stale> {
+            self.0.0.take(id)
+        }
+
+        fn complete(&mut self, id: u64) -> Result<(), Stale> {
+            self.0.0.complete(id)
+        }
+
+        fn len(&self) -> usize {
+            self.0.0.len()
+        }
+    }
+
+    impl flight::Access for OwnedEntry {
+        type View<'a> = OwnedAccess<'a>;
+
+        fn access(&mut self) -> OwnedAccess<'_> {
+            OwnedAccess(self)
+        }
+    }
+
     /// A removable entry can still own application data with a reentrant destructor.
     struct DroppableEntry {
         _resource: ReentrantResource,
@@ -1963,6 +2010,14 @@ mod coalesce_tests {
 
         fn quiescent(&self) -> bool {
             self.quiescent
+        }
+    }
+
+    impl flight::Access for DroppableEntry {
+        type View<'a> = &'a mut bool;
+
+        fn access(&mut self) -> &mut bool {
+            &mut self.quiescent
         }
     }
 
@@ -2011,7 +2066,7 @@ mod coalesce_tests {
             unlocked.set(false);
             flight::update(&table, |table, txn| {
                 assert_eq!(table.len(), 1);
-                table.get_mut(&1).unwrap().quiescent = true;
+                *table.access(&1).unwrap() = true;
                 assert!(txn.remove_quiescent(table, &1));
             });
             assert!(original_dropped.get());
@@ -2077,7 +2132,7 @@ mod coalesce_tests {
             assert!(table.remove_quiescent(&2).is_none());
             assert!(table.remove_quiescent(&1).is_none());
             assert_eq!(table.sweep(1, wakes), 0);
-            table.get_mut(&1).unwrap().quiescent = true;
+            *table.access(&1).unwrap() = true;
             assert_eq!(table.sweep(0, wakes), 0);
             assert_eq!(table.len(), 1);
             let removed = if sweep {
@@ -2122,14 +2177,14 @@ mod coalesce_tests {
             assert_eq!(table.next_waiter_id(), Ok(2));
             let id = table.next_operation_id().unwrap();
             assert!(table.insert(1, OwnedEntry::default()).is_ok());
-            assert!(table.get_mut(&1).unwrap().0.insert(id, resource).is_ok());
-            assert_eq!(table.get_mut(&1).unwrap().0.complete(id), Err(Stale));
+            assert!(table.access(&1).unwrap().insert(id, resource).is_ok());
+            assert_eq!(table.access(&1).unwrap().complete(id), Err(Stale));
             id
         });
         flight::update(&table, |table, wakes| table.stop(wakes, |_, _| {}));
         assert!(table.borrow().is_stopping());
         flight::update(&table, |table, txn| {
-            let operations = &mut table.get_mut(&1).unwrap().0;
+            let mut operations = table.access(&1).unwrap();
             let resource = operations.take(id).unwrap();
             assert!(matches!(operations.take(id), Err(Stale)));
             assert!(matches!(operations.take(id + 1), Err(Stale)));
@@ -2150,7 +2205,7 @@ mod coalesce_tests {
         });
         flight::update(&table, |table, txn| txn.register_drain(table, waker));
         flight::update(&table, |table, wakes| {
-            let operations = &mut table.get_mut(&1).unwrap().0;
+            let mut operations = table.access(&1).unwrap();
             operations.complete(id).unwrap();
             assert_eq!(operations.complete(id), Err(Stale));
             table.sweep(1, wakes)
@@ -2185,22 +2240,27 @@ mod coalesce_tests {
         }
         assert_eq!(state.elect(0, &mut identity, 2), Ok(true));
         error.set(Some(7));
-        let mut wakes = Vec::new();
-        let _ = state.refresh(false, 9, 8, now, std::convert::identity, &mut wakes);
-        assert_eq!(checks.get(), 65);
-        assert_eq!(state.deadlines.len(), 1);
-        assert_eq!(state.waiters[&0].error, Some(7));
-        assert!(state.waiters[&65].error.is_none());
-        assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
-        assert_eq!(state.elect(65, &mut identity, 2), Ok(false));
-        assert_eq!(identity.generation, 1);
+        let owner = RefCell::new(state);
+        flight::update_at(&owner, now, |state, wakes| {
+            let retired = state.refresh(false, 9, 8, now, std::convert::identity, wakes);
+            wakes.retire(retired);
+            assert_eq!(checks.get(), 65);
+            assert_eq!(state.deadlines().len(), 1);
+            assert_eq!(state.waiters()[&0].error(), Some(7));
+            assert!(state.waiters()[&65].error().is_none());
+            assert!(matches!(state.phase(), Phase::Draining(Outcome::Retry)));
+            assert_eq!(state.elect(65, &mut identity, 2), Ok(false));
+            assert_eq!(identity.generation, 1);
 
-        let _ = state.refresh(false, 9, 8, now, std::convert::identity, &mut wakes);
-        assert_eq!(checks.get(), 66);
-        assert!(state.deadlines.is_empty());
-        assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
-        let _ = state.settle(true, 9, std::convert::identity, &mut wakes);
-        assert!(matches!(state.phase, Phase::Failed(9)));
+            let retired = state.refresh(false, 9, 8, now, std::convert::identity, wakes);
+            wakes.retire(retired);
+            assert_eq!(checks.get(), 66);
+            assert!(state.deadlines().is_empty());
+            assert!(matches!(state.phase(), Phase::Draining(Outcome::Retry)));
+            let retired = state.settle(true, 9, std::convert::identity, wakes);
+            wakes.retire(retired);
+            assert!(matches!(state.phase(), Phase::Failed(9)));
+        });
     }
 
     /// Deferred deadlines cannot starve later failures or exceed the refresh quantum.
@@ -2242,31 +2302,31 @@ mod coalesce_tests {
         };
         refresh(now);
         assert_eq!(checks.get(), 64);
-        assert!(owner.borrow().waiters[&64].error.is_none());
+        assert!(owner.borrow().waiters()[&64].error().is_none());
         refresh(now);
         assert_eq!(checks.get(), 128);
-        assert_eq!(owner.borrow().waiters[&64].error, Some(7));
-        assert_eq!(owner.borrow().deadlines.len(), 65);
-        assert!(owner.borrow().waiters[&65].error.is_none());
+        assert_eq!(owner.borrow().waiters()[&64].error(), Some(7));
+        assert_eq!(owner.borrow().deadlines().len(), 65);
+        assert!(owner.borrow().waiters()[&65].error().is_none());
 
         deferred.set(Some(8));
         refresh(now);
         assert_eq!(checks.get(), 192);
-        assert_eq!(owner.borrow().deadlines.len(), 1);
+        assert_eq!(owner.borrow().deadlines().len(), 1);
         assert!(
             owner
                 .borrow()
-                .waiters
+                .waiters()
                 .values()
                 .take(64)
-                .all(|waiter| waiter.error == Some(8))
+                .all(|waiter| waiter.error() == Some(8))
         );
         refresh(now);
         assert_eq!(checks.get(), 192, "future deadlines are not visited");
         refresh(later);
         assert_eq!(checks.get(), 193);
-        assert_eq!(owner.borrow().waiters[&65].error, Some(7));
-        assert!(owner.borrow().deadlines.is_empty());
+        assert_eq!(owner.borrow().waiters()[&65].error(), Some(7));
+        assert!(owner.borrow().deadlines().is_empty());
     }
 
     /// Clock callbacks run before borrowing; expiry uses one snapshot and a fixed budget.
@@ -2321,7 +2381,7 @@ mod coalesce_tests {
         });
         let samples = Cell::new(0);
         let sample = || {
-            flight::update(&owner, |state, _| assert_eq!(state.waiters.len(), 66));
+            flight::update(&owner, |state, _| assert_eq!(state.waiters().len(), 66));
             samples.set(samples.get() + 1);
             clock.get()
         };
@@ -2337,13 +2397,13 @@ mod coalesce_tests {
         assert_eq!(samples.get(), 1);
         assert_eq!(checks.get(), 64);
         assert_eq!(clock.get(), later);
-        assert_eq!(owner.borrow().deadlines.len(), 2);
-        assert!(owner.borrow().waiters[&64].error.is_none());
+        assert_eq!(owner.borrow().deadlines().len(), 2);
+        assert!(owner.borrow().waiters()[&64].error().is_none());
 
         refresh(snapshot);
         assert_eq!(checks.get(), 65);
-        assert_eq!(owner.borrow().deadlines.len(), 1);
-        assert!(owner.borrow().waiters[&65].error.is_none());
+        assert_eq!(owner.borrow().deadlines().len(), 1);
+        assert!(owner.borrow().waiters()[&65].error().is_none());
         refresh(snapshot);
         assert_eq!(checks.get(), 65);
         assert_eq!(samples.get(), 1);
@@ -2352,8 +2412,8 @@ mod coalesce_tests {
         refresh(snapshot);
         assert_eq!(samples.get(), 2);
         assert_eq!(checks.get(), 66);
-        assert!(owner.borrow().deadlines.is_empty());
-        assert_eq!(owner.borrow().waiters[&65].error, Some(7));
+        assert!(owner.borrow().deadlines().is_empty());
+        assert_eq!(owner.borrow().waiters()[&65].error(), Some(7));
         refresh(snapshot);
         assert_eq!(checks.get(), 66);
         assert_eq!(samples.get(), 2);
