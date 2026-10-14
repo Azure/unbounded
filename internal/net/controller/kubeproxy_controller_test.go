@@ -146,11 +146,12 @@ func TestManagedKubeProxyDaemonSetUpdateAffectsReconcile(t *testing.T) {
 
 	managed := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Name:       managedKubeProxyDaemonSetName("site-a"),
+		UID:        "managed",
 		Namespace:  "unbounded-net",
 		Generation: 2,
 	}}
 	provider := &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "kube-proxy", Namespace: "kube-system", Generation: 3},
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-proxy", Namespace: "kube-system", UID: "provider", Generation: 3},
 		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "kube-proxy"}}},
 		}},
@@ -190,6 +191,30 @@ func TestManagedKubeProxyDaemonSetUpdateAffectsReconcile(t *testing.T) {
 			new: func() *appsv1.DaemonSet {
 				ds := managed.DeepCopy()
 				ds.Labels = map[string]string{"drift": "true"}
+
+				return ds
+			}(),
+			want: true,
+		},
+		{
+			name: "managed same-generation replacement",
+			old:  managed,
+			new: func() *appsv1.DaemonSet {
+				ds := managed.DeepCopy()
+				ds.UID = "replacement"
+				ds.Spec.Template.Spec.Containers = []corev1.Container{{Name: "kube-proxy", Image: "stale:1"}}
+
+				return ds
+			}(),
+			want: true,
+		},
+		{
+			name: "provider same-generation replacement",
+			old:  provider,
+			new: func() *appsv1.DaemonSet {
+				ds := provider.DeepCopy()
+				ds.UID = "replacement"
+				ds.Spec.Template.Spec.NodeSelector = map[string]string{"provider": "covered"}
 
 				return ds
 			}(),
