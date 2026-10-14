@@ -210,3 +210,284 @@ data:
 
     # Preflight failures are typed hardware evidence, not workflow errors.
     exit 0
+  gpu-burn-canary.sh: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+
+    verdict=Pass
+    reason=BurnCanaryPassed
+    details=
+    stop_file=/work/stop
+    gpu_log=/work/gpu-burn.log
+    declare -A baseline_volatile_ecc=()
+    declare -A baseline_aggregate_ecc=()
+    worker_pids=()
+    cpu_pids=()
+
+    emit_stage() {
+      local name="$1"
+      local status="$2"
+      local event_reason="${3:-}"
+      local message="${4:-}"
+
+      printf 'PROJECT_SIGNAL_STAGE {"name":"%s","status":"%s","at_epoch":%s,"reason":"%s","message":"%s"}\n' \
+        "${name}" "${status}" "$(date +%s)" "${event_reason}" "${message}"
+    }
+
+    fail() {
+      if [[ "${verdict}" == Pass ]]; then
+        verdict=Fail
+        reason="$1"
+        details="${2:-}"
+      fi
+    }
+
+    trim() {
+      local value="$1"
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      printf '%s' "${value}"
+    }
+
+    xid_count() {
+      dmesg 2>/dev/null | grep -Eic 'NVRM: Xid|Xid \(' || true
+    }
+
+    capture_telemetry() {
+      local mode="$1"
+      local rows row index product temperature margin power_draw power_limit volatile_ecc aggregate_ecc throttle
+
+      if ! rows="$(
+        nvidia-smi \
+          --query-gpu=index,name,temperature.gpu,temperature.gpu.tlimit,power.draw,power.limit,ecc.errors.uncorrected.volatile.total,ecc.errors.uncorrected.aggregate.total,clocks_throttle_reasons.active \
+          --format=csv,noheader,nounits
+      )"; then
+        fail TelemetryQueryFailed "nvidia-smi telemetry query failed"
+
+        return 1
+      fi
+
+      if [[ "$(wc -l <<<"${rows}")" -ne "${EXPECTED_GPU_COUNT}" ]]; then
+        fail RuntimeGPUCountMismatch "expected=${EXPECTED_GPU_COUNT} observed=$(wc -l <<<"${rows}")"
+
+        return 1
+      fi
+
+      while IFS= read -r row; do
+        IFS=',' read -r index product temperature margin power_draw power_limit volatile_ecc aggregate_ecc throttle <<<"${row}"
+        index="$(trim "${index}")"
+        product="$(trim "${product}")"
+        temperature="$(trim "${temperature}")"
+        margin="$(trim "${margin}")"
+        power_draw="$(trim "${power_draw}")"
+        power_limit="$(trim "${power_limit}")"
+        volatile_ecc="$(trim "${volatile_ecc}")"
+        aggregate_ecc="$(trim "${aggregate_ecc}")"
+        throttle="$(trim "${throttle}")"
+
+        if ! grep -Eq "${EXPECTED_GPU_PRODUCT_REGEX}" <<<"${product}"; then
+          fail GPUProductMismatch "index=${index} product=${product}"
+        elif ! [[ "${temperature}" =~ ^[0-9]+([.][0-9]+)?$ &&
+                  "${margin}" =~ ^[0-9]+([.][0-9]+)?$ &&
+                  "${power_draw}" =~ ^[0-9]+([.][0-9]+)?$ &&
+                  "${power_limit}" =~ ^[0-9]+([.][0-9]+)?$ &&
+                  "${volatile_ecc}" =~ ^[0-9]+$ &&
+                  "${aggregate_ecc}" =~ ^[0-9]+$ ]]; then
+          fail SafetyTelemetryUnavailable "index=${index} row=${row}"
+        elif ! awk -v margin="${margin}" 'BEGIN { exit !(margin > 0) }'; then
+          fail ThermalLimitReached "index=${index} temperature=${temperature} margin=${margin}"
+        elif ! awk -v draw="${power_draw}" -v limit="${power_limit}" 'BEGIN { exit !(draw <= limit) }'; then
+          fail PowerLimitExceeded "index=${index} draw=${power_draw} limit=${power_limit}"
+        fi
+
+        if [[ "${mode}" == baseline ]]; then
+          baseline_volatile_ecc["${index}"]="${volatile_ecc}"
+          baseline_aggregate_ecc["${index}"]="${aggregate_ecc}"
+        elif (( volatile_ecc > baseline_volatile_ecc["${index}"] ||
+                aggregate_ecc > baseline_aggregate_ecc["${index}"] )); then
+          fail UncorrectableECCGrowth \
+            "index=${index} volatile=${baseline_volatile_ecc["${index}"]}->${volatile_ecc} aggregate=${baseline_aggregate_ecc["${index}"]}->${aggregate_ecc}"
+        fi
+
+        printf 'PROJECT_SIGNAL_MEASUREMENT index=%s product=%s temperature=%s thermal_margin=%s power_draw=%s power_limit=%s volatile_uncorrectable_ecc=%s aggregate_uncorrectable_ecc=%s throttle=%s\n' \
+          "${index}" "${product// /_}" "${temperature}" "${margin}" "${power_draw}" "${power_limit}" \
+          "${volatile_ecc}" "${aggregate_ecc}" "${throttle}"
+      done <<<"${rows}"
+    }
+
+    stop_workers() {
+      touch "${stop_file}" 2>/dev/null || true
+
+      local pid
+      for pid in "${worker_pids[@]:-}"; do
+        if kill -0 "${pid}" 2>/dev/null; then
+          kill "${pid}" 2>/dev/null || true
+        fi
+      done
+
+      for pid in "${worker_pids[@]:-}"; do
+        wait "${pid}" 2>/dev/null || true
+      done
+    }
+
+    finish() {
+      stop_workers
+      printf '%s' "${verdict}" > /results/verdict
+      printf '%s' "${reason}" > /results/reason
+      {
+        printf 'verdict=%s reason=%s\n' "${verdict}" "${reason}"
+        printf 'gpu_burn_commit=%s\n' "${GPU_BURN_COMMIT:-unknown}"
+        printf 'duration_seconds=%s sample_interval_seconds=%s\n' \
+          "${BURN_DURATION_SECONDS:-unset}" "${SAMPLE_INTERVAL_SECONDS:-unset}"
+        printf '%s\n' "${details}"
+        tail -n 200 "${gpu_log}" 2>/dev/null || true
+      } > /results/measurements.txt
+      printf 'verdict=%s reason=%s\n' "${verdict}" "${reason}" > /dev/termination-log
+    }
+
+    trap finish EXIT
+
+    emit_stage preflight running
+
+    if ! [[ "${EXPECTED_GPU_COUNT:-}" =~ ^[1-9][0-9]*$ &&
+            "${BURN_DURATION_SECONDS:-}" =~ ^[1-9][0-9]*$ &&
+            "${SAMPLE_INTERVAL_SECONDS:-}" =~ ^[1-9][0-9]*$ &&
+            "${CPU_WORKERS:-}" =~ ^[1-9][0-9]*$ &&
+            "${MEMORY_MIB:-}" =~ ^[1-9][0-9]*$ &&
+            "${STORAGE_MIB:-}" =~ ^[1-9][0-9]*$ ]]; then
+      fail BurnConfigurationInvalid "numeric burn parameters are required"
+    elif [[ "${OBSERVED_GPU_CAPACITY:-}" != "${EXPECTED_GPU_COUNT}" ||
+            "${OBSERVED_GPU_ALLOCATABLE:-}" != "${EXPECTED_GPU_COUNT}" ]]; then
+      fail NodeGPUInventoryMismatch \
+        "expected=${EXPECTED_GPU_COUNT} capacity=${OBSERVED_GPU_CAPACITY:-unset} allocatable=${OBSERVED_GPU_ALLOCATABLE:-unset}"
+    elif [[ -z "${EXPECTED_GPU_PRODUCT_REGEX:-}" ]]; then
+      fail ProductGuardNotConfigured
+    elif ! command -v gpu_burn >/dev/null 2>&1 ||
+         ! command -v nvidia-smi >/dev/null 2>&1; then
+      fail BurnToolMissing
+    elif ! dmesg >/dev/null 2>&1; then
+      fail XidTelemetryUnavailable "privileged dmesg access is required"
+    else
+      baseline_xids="$(xid_count)"
+      capture_telemetry baseline || true
+    fi
+
+    if [[ "${verdict}" != Pass ]]; then
+      emit_stage preflight failed "${reason}" "${details}"
+      exit 0
+    fi
+
+    emit_stage preflight passed InventoryAndSafetyTelemetryReady \
+      "gpus=${EXPECTED_GPU_COUNT} baseline_xids=${baseline_xids}"
+    emit_stage workload running BurnCanaryStarted \
+      "duration_seconds=${BURN_DURATION_SECONDS} gpu_memory_percent=50 cpu_workers=${CPU_WORKERS}"
+
+    rm -f "${stop_file}"
+    mkdir -p /work/memory /work/storage
+
+    dd if=/dev/zero of=/work/memory/pattern.bin bs=1M count="${MEMORY_MIB}" status=none
+    memory_hash="$(sha256sum /work/memory/pattern.bin | awk '{print $1}')"
+    (
+      while [[ ! -e "${stop_file}" ]]; do
+        [[ "$(sha256sum /work/memory/pattern.bin | awk '{print $1}')" == "${memory_hash}" ]] || exit 1
+      done
+    ) &
+    memory_pid=$!
+    worker_pids+=("${memory_pid}")
+
+    dd if=/dev/zero of=/work/storage/pattern.bin bs=1M count="${STORAGE_MIB}" oflag=direct conv=fsync status=none
+    storage_hash="$(sha256sum /work/storage/pattern.bin | awk '{print $1}')"
+    (
+      while [[ ! -e "${stop_file}" ]]; do
+        [[ "$(sha256sum /work/storage/pattern.bin | awk '{print $1}')" == "${storage_hash}" ]] || exit 1
+        sleep "${SAMPLE_INTERVAL_SECONDS}"
+      done
+    ) &
+    storage_pid=$!
+    worker_pids+=("${storage_pid}")
+
+    for ((worker = 0; worker < CPU_WORKERS; worker++)); do
+      (
+        while [[ ! -e "${stop_file}" ]]; do
+          dd if=/dev/zero bs=4M count=256 status=none | sha256sum >/dev/null
+        done
+      ) &
+      cpu_pids+=("$!")
+      worker_pids+=("$!")
+    done
+
+    GPU_BURN_COMMIT="${GPU_BURN_COMMIT:-0d19c94dcb2e9b6858b7586a4c327674cd67113b}" \
+      gpu_burn -m 50% -tc "${BURN_DURATION_SECONDS}" >"${gpu_log}" 2>&1 &
+    gpu_pid=$!
+    worker_pids+=("${gpu_pid}")
+
+    end_epoch=$(( $(date +%s) + BURN_DURATION_SECONDS ))
+    while (( $(date +%s) < end_epoch )); do
+      sleep "${SAMPLE_INTERVAL_SECONDS}"
+      if (( $(date +%s) >= end_epoch )); then
+        break
+      fi
+
+      if ! kill -0 "${gpu_pid}" 2>/dev/null; then
+        fail GPUBurnExitedEarly
+        break
+      elif ! kill -0 "${memory_pid}" 2>/dev/null; then
+        fail MemoryIntegrityFailed
+        break
+      elif ! kill -0 "${storage_pid}" 2>/dev/null; then
+        fail StorageIntegrityFailed
+        break
+      fi
+
+      for cpu_pid in "${cpu_pids[@]}"; do
+        if ! kill -0 "${cpu_pid}" 2>/dev/null; then
+          fail HostStressFailed "worker_pid=${cpu_pid}"
+          break
+        fi
+      done
+
+      capture_telemetry sample || true
+      current_xids="$(xid_count)"
+      if (( current_xids > baseline_xids )); then
+        fail NewXidDetected "xids=${baseline_xids}->${current_xids}"
+      fi
+
+      if [[ "${verdict}" != Pass ]]; then
+        break
+      fi
+    done
+
+    if [[ "${verdict}" == Pass ]]; then
+      if ! wait "${gpu_pid}"; then
+        fail GPUBurnFailed
+      fi
+
+      touch "${stop_file}"
+      if ! wait "${memory_pid}"; then
+        fail MemoryIntegrityFailed
+      fi
+      if ! wait "${storage_pid}"; then
+        fail StorageIntegrityFailed
+      fi
+    fi
+
+    if [[ "${verdict}" == Pass ]]; then
+      emit_stage workload passed BurnWorkloadCompleted
+    else
+      emit_stage workload failed "${reason}" "${details}"
+    fi
+
+    emit_stage health-after running
+    capture_telemetry final || true
+    final_xids="$(xid_count)"
+    if (( final_xids > baseline_xids )); then
+      fail NewXidDetected "xids=${baseline_xids}->${final_xids}"
+    fi
+
+    if [[ "${verdict}" == Pass ]]; then
+      emit_stage health-after passed BurnHealthAfterPassed
+    else
+      emit_stage health-after failed "${reason}" "${details}"
+    fi
+
+    exit 0

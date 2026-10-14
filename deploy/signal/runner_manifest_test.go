@@ -90,3 +90,50 @@ func TestDappleFullNodeProfileUsesPinnedRunnerAndSingleAttempt(t *testing.T) {
 	assert.Contains(t, manifest, "project-signal-runner@sha256:")
 	assert.NotContains(t, manifest, "REPLACE_WITH")
 }
+
+func TestBurnCanaryUsesPinnedRunnerAndDiagnosticProjection(t *testing.T) {
+	t.Parallel()
+
+	workflow, err := os.ReadFile("09-burn-workflowtemplate.yaml.tmpl")
+	require.NoError(t, err)
+
+	for _, setting := range []string{
+		"project-signal-gpu-burn-canary",
+		`hostPID: true`,
+		`privileged: true`,
+		`"nvidia.com/gpu":"{{` + "`{{workflow.parameters.expected-gpu-count}}`" + `}}"`,
+		`name: burn-duration-seconds`,
+	} {
+		assert.Contains(t, string(workflow), setting)
+	}
+
+	profiles, err := os.ReadFile("../signal-dapple/01-b200-burn-canary.yaml.tmpl")
+	require.NoError(t, err)
+
+	manifest := string(profiles)
+	for _, setting := range []string{
+		"name: dapple-b200-burn-canary-8gpu",
+		"name: dapple-b200-burn-canary-7gpu-diagnostic",
+		"purpose: Diagnostic",
+		`expected-gpu-count: "8"`,
+		`expected-gpu-count: "7"`,
+		`burn-duration-seconds: "21600"`,
+		"deadline: 6h30m",
+		"project-signal-burn-runner",
+	} {
+		assert.Contains(t, manifest, setting)
+	}
+}
+
+func TestBurnRunnerPinsCUDAAndGPUBurn(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("../../images/project-signal-burn-runner/Containerfile")
+	require.NoError(t, err)
+
+	containerfile := string(content)
+	assert.Contains(t, containerfile, "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:")
+	assert.Contains(t, containerfile, "nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:")
+	assert.Contains(t, containerfile, "0d19c94dcb2e9b6858b7586a4c327674cd67113b")
+	assert.Contains(t, containerfile, "make -C /src/gpu-burn COMPUTE=100")
+}

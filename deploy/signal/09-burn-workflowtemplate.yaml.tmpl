@@ -1,0 +1,124 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-gpu-burn-canary
+  namespace: {{ default "project-signal" .Namespace }}
+spec:
+  serviceAccountName: project-signal-runner
+  entrypoint: certification
+  ttlStrategy:
+    secondsAfterCompletion: 21600
+    secondsAfterSuccess: 21600
+    secondsAfterFailure: 21600
+  podGC:
+    strategy: OnWorkflowCompletion
+    deleteDelayDuration: 2h
+  arguments:
+    parameters:
+      - name: run-name
+      - name: run-uid
+      - name: participants
+      - name: script-configmap
+      - name: script-key
+      - name: script-digest
+      - name: backend-api-version
+      - name: backend-kind
+      - name: queue
+      - name: runner-image
+      - name: tolerations
+        value: >-
+          [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
+      - name: expected-gpu-product-regex
+      - name: expected-gpu-count
+      - name: observed-gpu-capacity
+      - name: observed-gpu-allocatable
+      - name: burn-duration-seconds
+      - name: sample-interval-seconds
+      - name: cpu-workers
+      - name: memory-mib
+      - name: storage-mib
+      - name: attempt
+  volumes:
+    - name: scripts
+      configMap:
+        name: "{{`{{workflow.parameters.script-configmap}}`}}"
+        defaultMode: 0555
+  templates:
+    - name: certification
+      dag:
+        tasks:
+          - name: burn
+            template: burn-canary
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{tasks.burn.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{tasks.burn.outputs.parameters.reason}}`}}"
+
+    - name: burn-canary
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+      hostPID: true
+      podSpecPatch: >-
+        {"tolerations": {{`{{workflow.parameters.tolerations}}`}},
+        "containers":[{"name":"main","resources":{
+        "requests":{"cpu":"8","memory":"16Gi","ephemeral-storage":"8Gi"},
+        "limits":{"cpu":"8","memory":"16Gi","ephemeral-storage":"8Gi",
+        "nvidia.com/gpu":"{{`{{workflow.parameters.expected-gpu-count}}`}}"}}}]}
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
+        securityContext:
+          privileged: true
+          allowPrivilegeEscalation: true
+        env:
+          - name: EXPECTED_GPU_PRODUCT_REGEX
+            value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+          - name: EXPECTED_GPU_COUNT
+            value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+          - name: OBSERVED_GPU_CAPACITY
+            value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
+          - name: OBSERVED_GPU_ALLOCATABLE
+            value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+          - name: BURN_DURATION_SECONDS
+            value: "{{`{{workflow.parameters.burn-duration-seconds}}`}}"
+          - name: SAMPLE_INTERVAL_SECONDS
+            value: "{{`{{workflow.parameters.sample-interval-seconds}}`}}"
+          - name: CPU_WORKERS
+            value: "{{`{{workflow.parameters.cpu-workers}}`}}"
+          - name: MEMORY_MIB
+            value: "{{`{{workflow.parameters.memory-mib}}`}}"
+          - name: STORAGE_MIB
+            value: "{{`{{workflow.parameters.storage-mib}}`}}"
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+          - name: results
+            mountPath: /results
+          - name: work
+            mountPath: /work
+          - name: memory-work
+            mountPath: /work/memory
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: work
+          emptyDir:
+            sizeLimit: 8Gi
+        - name: memory-work
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /results/verdict
+          - name: reason
+            valueFrom:
+              path: /results/reason

@@ -229,7 +229,7 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 		return cleanupFailedAdmission(fmt.Errorf("bind script snapshot to run: %w", err))
 	}
 
-	if err := projectPending(ctx, r.Client, participants, run.Spec.Profile); err != nil {
+	if err := projectPending(ctx, r.Client, participants, run.Spec.Profile, run.Spec.Purpose); err != nil {
 		return cleanupFailedAdmission(fmt.Errorf("project pending certification state: %w", err))
 	}
 

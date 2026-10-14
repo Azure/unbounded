@@ -332,13 +332,45 @@ eight-GPU pod. An eight-GPU Node proceeds through the full allocation, parallel
 per-device health query, MPI rank-to-GPU check, and final health stage using the
 pinned Project Signal runner image.
 
+## Dapple B200 burn canary
+
+`deploy/signal-dapple/01-b200-burn-canary.yaml.tmpl` defines one six-hour
+diagnostic canary for the healthy eight-GPU Node and one separate seven-GPU
+diagnostic for the degraded Node. Both use the immutable
+`project-signal-burn-runner`, which builds GPU Burn from a pinned source commit
+for Blackwell compute capability 10.0.
+
+The canary runs GPU Burn at 50 percent device memory alongside bounded CPU,
+memory-integrity, and ephemeral-storage integrity load. It samples each GPU
+once per minute and fails closed on:
+
+- new kernel Xid messages;
+- uncorrectable volatile or aggregate ECC growth;
+- exhaustion of the device-reported thermal margin;
+- power draw above the device-reported enforced limit;
+- early exit or failure of any required workload.
+
+The pod is privileged only to read the host kernel ring buffer for Xid
+comparison. The script captures preflight, periodic workload measurements, and
+health-after evidence. The workflow deadline is six hours and 30 minutes with
+no retries.
+
+Burn profiles use `purpose: Diagnostic`. Full certification has higher node
+projection precedence, so a successful seven-GPU diagnostic cannot replace the
+degraded Node's failed/blocked eight-GPU certification.
+
+This is one source-defined canary suite, not the design's complete four-pass
+initial qualification campaign. It does not claim rack-scale NCCL, external
+RDMA traffic, firmware remediation, reboot, or destructive storage endurance
+coverage.
+
 ## Non-goals
 
 The repository example does not provide:
 
-- production burn-in scripts or proprietary thresholds;
-- destructive stress, reboot, cordon, drain, or remediation;
-- multi-hour qualification parity;
+- proprietary performance floors or fixed B200 thermal/power thresholds;
+- destructive storage endurance, reboot, drain, or remediation;
+- the complete four-pass initial burn-in campaign;
 - rack-scale or NVL72 certification;
 - an external evidence store;
 - a scheduler integration that consumes the eligibility labels;

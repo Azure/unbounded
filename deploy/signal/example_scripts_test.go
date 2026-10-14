@@ -164,6 +164,70 @@ fi
 	assertFileContents(t, filepath.Join(resultsDir, "reason"), "NodeInventoryHealthy")
 }
 
+func TestBurnCanaryCompletesWithStableSafetyTelemetry(t *testing.T) {
+	t.Parallel()
+
+	script := certificationScript(t, "gpu-burn-canary.sh")
+	tempDir := t.TempDir()
+	resultsDir := filepath.Join(tempDir, "results")
+	workDir := filepath.Join(tempDir, "work")
+
+	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, contents := range map[string]string{
+		"nvidia-smi": `#!/usr/bin/env bash
+printf '%s\n' '0, NVIDIA B200, 31, 57, 450.00, 1000.00, 0, 0, 0x0'
+`,
+		"dmesg": `#!/usr/bin/env bash
+printf '%s\n' 'kernel: healthy'
+`,
+		"gpu_burn": `#!/usr/bin/env bash
+sleep "${@: -1}"
+`,
+	} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte(contents), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	script = strings.ReplaceAll(script, "/results/", resultsDir+"/")
+	script = strings.ReplaceAll(script, "/work/", workDir+"/")
+	script = strings.ReplaceAll(script, "stop_file=/work/stop", "stop_file="+workDir+"/stop")
+	script = strings.ReplaceAll(script, "gpu_log=/work/gpu-burn.log", "gpu_log="+workDir+"/gpu-burn.log")
+
+	cmd := exec.Command("bash", "-c", script)
+
+	cmd.Env = append(
+		os.Environ(),
+		"PATH="+tempDir+":"+os.Getenv("PATH"),
+		"EXPECTED_GPU_PRODUCT_REGEX=^NVIDIA B200$",
+		"EXPECTED_GPU_COUNT=1",
+		"OBSERVED_GPU_CAPACITY=1",
+		"OBSERVED_GPU_ALLOCATABLE=1",
+		"BURN_DURATION_SECONDS=1",
+		"SAMPLE_INTERVAL_SECONDS=1",
+		"CPU_WORKERS=1",
+		"MEMORY_MIB=1",
+		"STORAGE_MIB=1",
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("burn canary returned infrastructure failure: %v: %s", err, output)
+	}
+
+	assertFileContents(t, filepath.Join(resultsDir, "verdict"), "Pass")
+	assertFileContents(t, filepath.Join(resultsDir, "reason"), "BurnCanaryPassed")
+
+	for _, stage := range []string{"preflight", "workload", "health-after"} {
+		if !strings.Contains(string(output), `"name":"`+stage+`"`) {
+			t.Fatalf("missing %s stage evidence: %s", stage, output)
+		}
+	}
+}
+
 func certificationScript(t *testing.T, name string) string {
 	t.Helper()
 

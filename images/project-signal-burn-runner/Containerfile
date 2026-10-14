@@ -1,0 +1,47 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66 AS builder
+
+ARG GPU_BURN_COMMIT=0d19c94dcb2e9b6858b7586a4c327674cd67113b
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone https://github.com/wilicc/gpu-burn.git /src/gpu-burn \
+    && git -C /src/gpu-burn checkout --detach "${GPU_BURN_COMMIT}" \
+    && make -C /src/gpu-burn COMPUTE=100
+
+FROM docker.io/nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867
+
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+ARG GPU_BURN_COMMIT=0d19c94dcb2e9b6858b7586a4c327674cd67113b
+
+LABEL org.opencontainers.image.title="Project Signal burn runner" \
+      org.opencontainers.image.description="Pinned B200 GPU burn and node canary environment for Project Signal" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_TIME}" \
+      org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.licenses="Apache-2.0 AND BSD-2-Clause" \
+      io.project-signal.gpu-burn.commit="${GPU_BURN_COMMIT}"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        coreutils \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/gpu-burn/gpu_burn /usr/local/bin/gpu_burn
+COPY --from=builder /src/gpu-burn/LICENSE /usr/share/licenses/gpu-burn/LICENSE
+
+ENV GPU_BURN_COMMIT=0d19c94dcb2e9b6858b7586a4c327674cd67113b
+
+CMD ["/bin/bash"]

@@ -25,7 +25,13 @@ func TestNodeProjectionTransitionsAndRetainsTerminalSummary(t *testing.T) {
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
 	run := testRun("run-pass")
 
-	if err := projectPending(context.Background(), kube, run.Spec.Participants, run.Spec.Profile); err != nil {
+	if err := projectPending(
+		context.Background(),
+		kube,
+		run.Spec.Participants,
+		run.Spec.Profile,
+		run.Spec.Purpose,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -62,6 +68,61 @@ func TestNodeProjectionTransitionsAndRetainsTerminalSummary(t *testing.T) {
 		got.Annotations[EvidenceDigestAnnotation] != run.Status.Evidence.Digest ||
 		got.Annotations[ScriptDigestAnnotation] != run.Spec.Script.Digest {
 		t.Fatalf("terminal annotations = %v", got.Annotations)
+	}
+}
+
+func TestDiagnosticProjectionCannotOverrideFullCertificationFailure(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	node := readyNode("gpu-0", "A100")
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+
+	full := testRun("full-fail")
+	full.Spec.Purpose = signalv1.PurposeFullCertification
+	full.Status.Phase = signalv1.RunPhaseFailed
+	full.Status.FinishedAt = ptrTime(metav1.NewTime(time.Date(2026, 10, 11, 5, 0, 0, 0, time.UTC)))
+	full.Status.Evidence.Digest = "sha256:full"
+
+	if err := projectTerminal(context.Background(), kube, full); err != nil {
+		t.Fatal(err)
+	}
+
+	diagnostic := testRun("burn-pass")
+	diagnostic.Spec.Purpose = signalv1.PurposeDiagnostic
+	diagnostic.Status.Phase = signalv1.RunPhaseSucceeded
+	diagnostic.Status.FinishedAt = ptrTime(metav1.NewTime(time.Date(2026, 10, 11, 6, 0, 0, 0, time.UTC)))
+	diagnostic.Status.Evidence.Digest = "sha256:burn"
+
+	if err := projectPending(
+		context.Background(),
+		kube,
+		diagnostic.Spec.Participants,
+		diagnostic.Spec.Profile,
+		diagnostic.Spec.Purpose,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := projectTesting(context.Background(), kube, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := projectTerminal(context.Background(), kube, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+
+	var got corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Labels[StateLabel] != "failed" ||
+		got.Labels[EligibilityLabel] != "blocked" ||
+		got.Annotations[LastRunAnnotation] != full.Name ||
+		got.Annotations[EvidenceDigestAnnotation] != "sha256:full" ||
+		got.Annotations[ProjectionPurposeAnnotation] != string(signalv1.PurposeFullCertification) {
+		t.Fatalf("diagnostic overwrote full certification projection: labels=%v annotations=%v", got.Labels, got.Annotations)
 	}
 }
 

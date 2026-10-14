@@ -1,0 +1,143 @@
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: dapple-b200-burn-canary-8gpu
+  annotations:
+    signal.unbounded-cloud.io/scope: "Dapple six-hour B200 burn canary using all eight GPUs"
+spec:
+  participants:
+    count: 1
+    selector:
+      matchLabels:
+        node.kubernetes.io/instance-type: Dapple_B200_8x180GB
+        nvidia.com/gpu.product: NVIDIA-B200
+    requiredResources:
+      nvidia.com/gpu: "8"
+  script:
+    name: project-signal-scripts
+    key: gpu-burn-canary.sh
+  workflow:
+    name: project-signal-gpu-burn-canary
+  backend:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Workflow
+  runnerImage: {{ default "example.invalid/project-signal-burn-runner:replace-me" .BurnRunnerImage }}
+  purpose: Diagnostic
+  stagePlan:
+    - id: preflight
+      displayName: Burn inventory and safety preflight
+      category: health
+      description: Validate all expected B200 GPUs and capture baseline Xid, ECC, temperature, and power telemetry.
+      required: true
+    - id: workload
+      displayName: Six-hour mixed burn canary
+      category: compute
+      description: Run pinned GPU Burn with bounded CPU, memory-integrity, and ephemeral-storage integrity load while sampling safety telemetry.
+      expectedDuration: 6h
+      required: true
+    - id: health-after
+      displayName: Burn health-after snapshot
+      category: health
+      description: Reject new Xids, uncorrectable ECC growth, thermal-limit exhaustion, power-limit violations, or workload failures.
+      required: true
+  parameters:
+    expected-gpu-product-regex: ^NVIDIA B200$
+    expected-gpu-count: "8"
+    burn-duration-seconds: "21600"
+    sample-interval-seconds: "60"
+    cpu-workers: "8"
+    memory-mib: "2048"
+    storage-mib: "2048"
+  evidencePath: project-signal/dapple-b200-burn-canary-8gpu
+  deadline: 6h30m
+  maxAttempts: 1
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  recurring:
+    enabled: false
+    nodeNames:
+      - gpu-07-03
+    minIdleDuration: 15m
+    validFor: 24h
+    expiresAt: "1970-01-01T00:00:00Z"
+    evaluationInterval: 1m
+    failureBackoff: 30m
+    maxConsecutiveFailures: 1
+    maxConcurrent: 1
+    failureDomainLabel: topology.kubernetes.io/zone
+    maxConcurrentPerFailureDomain: 1
+    exclusiveProfiles: []
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: dapple-b200-burn-canary-7gpu-diagnostic
+  annotations:
+    signal.unbounded-cloud.io/scope: "Dapple six-hour diagnostic burn canary using the seven GPUs currently exposed by gpu-07-13"
+spec:
+  participants:
+    count: 1
+    selector:
+      matchLabels:
+        node.kubernetes.io/instance-type: Dapple_B200_8x180GB
+        nvidia.com/gpu.product: NVIDIA-B200
+    requiredResources:
+      nvidia.com/gpu: "7"
+  script:
+    name: project-signal-scripts
+    key: gpu-burn-canary.sh
+  workflow:
+    name: project-signal-gpu-burn-canary
+  backend:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Workflow
+  runnerImage: {{ default "example.invalid/project-signal-burn-runner:replace-me" .BurnRunnerImage }}
+  purpose: Diagnostic
+  stagePlan:
+    - id: preflight
+      displayName: Seven-GPU diagnostic safety preflight
+      category: health
+      description: Validate the seven available B200 GPUs without changing the node's failed eight-GPU FullCertification status.
+      required: true
+    - id: workload
+      displayName: Six-hour seven-GPU diagnostic burn
+      category: compute
+      description: Run the same pinned mixed burn canary across the seven available GPUs with periodic safety telemetry.
+      expectedDuration: 6h
+      required: true
+    - id: health-after
+      displayName: Diagnostic burn health-after snapshot
+      category: health
+      description: Reject new Xids, uncorrectable ECC growth, thermal-limit exhaustion, power-limit violations, or workload failures.
+      required: true
+  parameters:
+    expected-gpu-product-regex: ^NVIDIA B200$
+    expected-gpu-count: "7"
+    burn-duration-seconds: "21600"
+    sample-interval-seconds: "60"
+    cpu-workers: "8"
+    memory-mib: "2048"
+    storage-mib: "2048"
+  evidencePath: project-signal/dapple-b200-burn-canary-7gpu
+  deadline: 6h30m
+  maxAttempts: 1
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  recurring:
+    enabled: false
+    nodeNames:
+      - gpu-07-13
+    minIdleDuration: 15m
+    validFor: 24h
+    expiresAt: "1970-01-01T00:00:00Z"
+    evaluationInterval: 1m
+    failureBackoff: 30m
+    maxConsecutiveFailures: 1
+    maxConcurrent: 1
+    failureDomainLabel: topology.kubernetes.io/zone
+    maxConcurrentPerFailureDomain: 1
+    exclusiveProfiles: []

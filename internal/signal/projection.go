@@ -27,6 +27,7 @@ const (
 
 	ProfileNameAnnotation        = "signal.unbounded-cloud.io/profile-name"
 	ProfileGenerationAnnotation  = "signal.unbounded-cloud.io/profile-generation"
+	ProjectionPurposeAnnotation  = "signal.unbounded-cloud.io/projection-purpose"
 	LastRunAnnotation            = "signal.unbounded-cloud.io/last-run"
 	LastRunAtAnnotation          = "signal.unbounded-cloud.io/last-run-at"
 	LastSuccessfulRunAnnotation  = "signal.unbounded-cloud.io/last-successful-run"
@@ -45,9 +46,17 @@ func projectPending(
 	kube client.Client,
 	participants []signalv1.Participant,
 	profile signalv1.PinnedProfile,
+	purpose signalv1.CertificationPurpose,
 ) error {
+	purpose = effectiveProjectionPurpose(purpose)
+
 	return projectParticipants(ctx, kube, participants, func(node *corev1.Node) error {
+		if !projectionPurposeAllowed(node, purpose) {
+			return nil
+		}
+
 		setProfileProjection(node, profile)
+		node.Annotations[ProjectionPurposeAnnotation] = string(purpose)
 		node.Labels[StateLabel] = "pending"
 		node.Labels[EligibilityLabel] = "blocked"
 
@@ -57,7 +66,13 @@ func projectPending(
 
 func projectTesting(ctx context.Context, kube client.Client, run *signalv1.CertificationRun) error {
 	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+		purpose := effectiveProjectionPurpose(run.Spec.Purpose)
+		if !projectionPurposeAllowed(node, purpose) {
+			return nil
+		}
+
 		setProfileProjection(node, run.Spec.Profile)
+		node.Annotations[ProjectionPurposeAnnotation] = string(purpose)
 		node.Labels[StateLabel] = "testing"
 		node.Labels[EligibilityLabel] = "blocked"
 
@@ -73,11 +88,17 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 	finishedAt := run.Status.FinishedAt.UTC().Format(time.RFC3339)
 
 	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+		purpose := effectiveProjectionPurpose(run.Spec.Purpose)
+		if !projectionPurposeAllowed(node, purpose) {
+			return nil
+		}
+
 		if projectionTimeAfter(node.Annotations[LastRunAtAnnotation], run.Status.FinishedAt.Time) {
 			return nil
 		}
 
 		setProfileProjection(node, run.Spec.Profile)
+		node.Annotations[ProjectionPurposeAnnotation] = string(purpose)
 		node.Annotations[LastRunAnnotation] = boundedAnnotationValue(run.Name)
 		node.Annotations[LastRunAtAnnotation] = finishedAt
 		node.Annotations[EvidenceDigestAnnotation] = boundedAnnotationValue(run.Status.Evidence.Digest)
@@ -102,6 +123,40 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 
 		return nil
 	})
+}
+
+func effectiveProjectionPurpose(purpose signalv1.CertificationPurpose) signalv1.CertificationPurpose {
+	if purpose == "" {
+		return signalv1.PurposeFullCertification
+	}
+
+	return purpose
+}
+
+func projectionPurposeAllowed(node *corev1.Node, incoming signalv1.CertificationPurpose) bool {
+	current := signalv1.CertificationPurpose(node.Annotations[ProjectionPurposeAnnotation])
+	if current == "" && node.Labels[StateLabel] != "" {
+		current = signalv1.PurposeFullCertification
+	}
+
+	return projectionPurposePriority(incoming) >= projectionPurposePriority(current)
+}
+
+func projectionPurposePriority(purpose signalv1.CertificationPurpose) int {
+	switch purpose {
+	case signalv1.PurposeFullCertification:
+		return 100
+	case signalv1.PurposeTargetedVerification:
+		return 80
+	case signalv1.PurposeQuickCertification:
+		return 60
+	case signalv1.PurposePreflight:
+		return 40
+	case signalv1.PurposeDiagnostic:
+		return 20
+	default:
+		return 0
+	}
 }
 
 func projectRecurring(
