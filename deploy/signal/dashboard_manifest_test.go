@@ -53,3 +53,16 @@ func TestControllerCanPublishEventsV1Events(t *testing.T) {
 	manifest := string(content)
 	assert.Contains(t, manifest, `apiGroups: ["events.k8s.io"]`+"\n"+`    resources: ["events"]`+"\n"+`    verbs: ["create", "patch"]`)
 }
+
+func TestControllerCanVerifyMPIBackendsAreGoneBeforeReleasingReservations(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("02-rbac.yaml.tmpl")
+	require.NoError(t, err)
+
+	_, controllerRBAC, found := strings.Cut(string(content), "kind: Role\nmetadata:\n  name: project-signal-controller\n")
+	require.True(t, found)
+
+	controllerRBAC, _, _ = strings.Cut(controllerRBAC, "\n---")
+	assert.Contains(t, controllerRBAC, `apiGroups: ["kubeflow.org"]`+"\n"+`    resources: ["mpijobs"]`+"\n"+`    verbs: ["list"]`)
+}

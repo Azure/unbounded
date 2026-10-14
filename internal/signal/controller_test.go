@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -239,10 +240,11 @@ func TestCancellationWaitsForWorkflowDeletionBeforeReleasingNode(t *testing.T) {
 	node := readyNode(run.Spec.RequestNodeName, "A100")
 	node.Annotations = map[string]string{ReservationLabel: run.Name}
 	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Running", "", "")
+	workflow.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun"))})
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&signalv1.CertificationRun{}).
-		WithObjects(run, node, workflow).
+		WithObjects(run, node, workflow, runSnapshot(run)).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Delete: func(
 				_ context.Context,
@@ -254,7 +256,7 @@ func TestCancellationWaitsForWorkflowDeletionBeforeReleasingNode(t *testing.T) {
 			},
 		}).
 		Build()
-	reconciler := &RunReconciler{Client: kube}
+	reconciler := &RunReconciler{Client: kube, Evidence: &memoryEvidenceStore{}}
 
 	result, err := reconciler.Reconcile(
 		context.Background(),
@@ -404,7 +406,7 @@ func TestStartAttemptRecoversExistingOwnedWorkflow(t *testing.T) {
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&signalv1.CertificationRun{}).
-		WithObjects(run, workflow).
+		WithObjects(run, workflow, runSnapshot(run)).
 		Build()
 	r := &RunReconciler{Client: kube, Evidence: &memoryEvidenceStore{}}
 
@@ -699,7 +701,7 @@ func TestWorkflowFailureRetriesWithoutSwitchingPinnedInputs(t *testing.T) {
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&signalv1.CertificationRun{}).
-		WithObjects(run, workflow).
+		WithObjects(run, workflow, runSnapshot(run)).
 		Build()
 	r := &RunReconciler{Client: kube, Evidence: &memoryEvidenceStore{}}
 
@@ -791,6 +793,10 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 	scheme.AddKnownTypeWithName(workflowGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(workflowGVK.GroupVersion().WithKind("WorkflowList"), &unstructured.UnstructuredList{})
+
+	backend := schema.GroupVersionKind{Group: "kubeflow.org", Version: "v2beta1", Kind: "MPIJob"}
+	scheme.AddKnownTypeWithName(backend, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(backend.GroupVersion().WithKind("MPIJobList"), &unstructured.UnstructuredList{})
 
 	return scheme
 }

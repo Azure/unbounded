@@ -206,13 +206,28 @@ function renderStages(stages) {
   clear(list);
   stages.forEach((stage) => {
     const article = text("article", "", "stage");
-    article.append(text("h3", stage.name), badge(stage.phase));
+    article.append(text("h3", stage.name), badge(stage.verdict || stage.phase));
     const fallback = stage.phase === "Succeeded" ? "Stage completed." :
       stage.phase === "Running" ? "Stage is running." : "Waiting for this stage.";
     article.append(text("p", stage.message || stage.reason || fallback));
     const timing = [stage.duration, stage.expectedDuration ? `expected ${stage.expectedDuration}` : ""].filter(Boolean).join(" · ");
     if (timing) article.append(text("p", timing));
     article.append(text("p", `${stage.category || "orchestration"} · ${stage.source}`, "mono"));
+    if (stage.nodeAlias || stage.executionState || stage.verdict) {
+      article.append(text("p", [
+        stage.nodeAlias,
+        stage.attempt ? `attempt=${stage.attempt}` : "",
+        `execution=${stage.executionState || stage.phase}`,
+        stage.verdict ? `verdict=${stage.verdict}` : "",
+      ].filter(Boolean).join(" · "), "mono"));
+    }
+    const parameters = Object.entries(stage.parameters || {});
+    if (parameters.length) {
+      article.append(text("p", parameters.map(([key, value]) => `${key}=${value}`).join(" · "), "mono"));
+    }
+    if (stage.evidenceURI) {
+      article.append(text("p", `Evidence: ${stage.evidenceURI} · ${stage.evidenceDigest || "digest unavailable"}`, "mono"));
+    }
     list.append(article);
   });
 }

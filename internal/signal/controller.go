@@ -140,6 +140,10 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 		return fmt.Errorf("profile %s stage plan: %w", profile.Name, err)
 	}
 
+	if _, _, err := nodeWorkflow(profile.Spec.Workflow.Name, profile.Spec.Parameters); err != nil {
+		return fmt.Errorf("profile %s execution plan: %w", profile.Name, err)
+	}
+
 	participants, err := r.selectParticipants(ctx, node, &profile)
 	if err != nil {
 		return err
@@ -158,6 +162,28 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 			}
 		}
 	}()
+
+	participantPlan, err := r.snapshotParticipants(ctx, participants, runName)
+	if err != nil {
+		return err
+	}
+
+	parameters := snapshotParameters(profile.Spec.Parameters, node)
+	for _, participant := range participantPlan {
+		if participant.NodeName == node.Name {
+			parameters = participantParameters(parameters, participant)
+		}
+	}
+
+	testPlan, _, err := makeTestPlan(&signalv1.CertificationRunSpec{
+		Workflow:        profile.Spec.Workflow,
+		Participants:    participants,
+		ParticipantPlan: participantPlan,
+		Parameters:      parameters,
+	})
+	if err != nil {
+		return err
+	}
 
 	snapshot, scriptDigest, err := r.createSnapshot(ctx, runName, &profile)
 	if err != nil {
@@ -190,13 +216,15 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 				Generation: profile.Generation,
 			},
 			Participants:    participants,
+			ParticipantPlan: participantPlan,
+			TestPlan:        testPlan,
 			Script:          signalv1.ScriptSnapshot{ConfigMapName: snapshot.Name, Key: profile.Spec.Script.Key, Digest: scriptDigest},
 			Workflow:        profile.Spec.Workflow,
 			Backend:         profile.Spec.Backend,
 			RunnerImage:     profile.Spec.RunnerImage,
 			Purpose:         profile.Spec.Purpose,
 			StagePlan:       append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
-			Parameters:      snapshotParameters(profile.Spec.Parameters, node),
+			Parameters:      parameters,
 			EvidencePath:    strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
 			Deadline:        profile.Spec.Deadline,
 			MaxAttempts:     maxAttempts,
@@ -244,18 +272,7 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 }
 
 func snapshotParameters(parameters map[string]string, node *corev1.Node) map[string]string {
-	snapshot := make(map[string]string, len(parameters)+2)
-	for key, value := range parameters {
-		snapshot[key] = value
-	}
-
-	gpu := corev1.ResourceName("nvidia.com/gpu")
-	capacity := node.Status.Capacity[gpu]
-	allocatable := node.Status.Allocatable[gpu]
-	snapshot[ObservedGPUCapacityParameter] = capacity.String()
-	snapshot[ObservedGPUAllocatableParameter] = allocatable.String()
-
-	return snapshot
+	return participantParameters(parameters, participantSnapshot(node))
 }
 
 func (r *AdmissionReconciler) selectParticipants(
@@ -483,7 +500,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}, workflow); err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.retryOrFinish(ctx, &run, "Error", "WorkflowMissing", "workflow disappeared before terminal status")
+			return r.retryOrFinish(ctx, &run, nil, "Error", "WorkflowMissing", "workflow disappeared before terminal status")
 		}
 
 		return ctrl.Result{}, err
@@ -500,9 +517,18 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, err
 		}
 
-		if run.Status.Phase != signalv1.RunPhaseRunning || run.Status.Workflow.Phase != phase {
+		collection := collectTestResults(&run, workflow, false)
+
+		results := run.Status.TestResults
+		if collection.strict && attemptIndex(&run) < 0 {
+			results = mergeTestResults(results, collection.results, run.Status.Workflow.Attempt)
+		}
+
+		if run.Status.Phase != signalv1.RunPhaseRunning || run.Status.Workflow.Phase != phase ||
+			!reflect.DeepEqual(results, run.Status.TestResults) {
 			before := run.DeepCopy()
 			run.Status.Phase = signalv1.RunPhaseRunning
+			run.Status.TestResults = results
 
 			run.Status.Workflow.Phase = phase
 			if run.Status.StartedAt == nil {
@@ -523,9 +549,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			reason = "workflow completed without a verdict"
 		}
 
-		return r.finish(ctx, &run, "Completed", verdict, reason)
+		return r.finish(ctx, &run, workflow, "Completed", verdict, reason)
 	case "Failed", "Error":
-		return r.retryOrFinish(ctx, &run, phase, "Workflow"+phase, workflowMessage(workflow))
+		return r.retryOrFinish(ctx, &run, workflow, phase, "Workflow"+phase, workflowMessage(workflow))
 	default:
 		return ctrl.Result{}, fmt.Errorf("unsupported Workflow phase %q", phase)
 	}
@@ -559,6 +585,9 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 	before := run.DeepCopy()
 	run.Status.Phase = signalv1.RunPhaseRunning
 	run.Status.ExecutionState = "Running"
+	run.Status.Verdict = ""
+	run.Status.Reason = ""
+	run.Status.Evidence = signalv1.EvidenceStatus{}
 
 	run.Status.Workflow = signalv1.WorkflowStatus{
 		Name:    workflow.GetName(),
@@ -584,6 +613,38 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 }
 
 func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured.Unstructured, error) {
+	testPlan, _, err := effectiveTestPlan(run)
+	if err != nil {
+		return nil, fmt.Errorf("build Workflow test plan: %w", err)
+	}
+
+	if testPlan == nil {
+		testPlan = []signalv1.TestInvocation{}
+	}
+
+	testPlanJSON, err := json.Marshal(testPlan)
+	if err != nil {
+		return nil, fmt.Errorf("encode Workflow test plan: %w", err)
+	}
+
+	participantPlan := run.Spec.ParticipantPlan
+	if len(participantPlan) == 0 {
+		participantPlan = make([]signalv1.ParticipantSnapshot, 0, len(run.Spec.Participants))
+		for _, participant := range run.Spec.Participants {
+			participantPlan = append(participantPlan, signalv1.ParticipantSnapshot{
+				NodeName:               participant.NodeName,
+				NodeUID:                participant.NodeUID,
+				ObservedGPUCapacity:    run.Spec.Parameters[ObservedGPUCapacityParameter],
+				ObservedGPUAllocatable: run.Spec.Parameters[ObservedGPUAllocatableParameter],
+			})
+		}
+	}
+
+	participantPlanJSON, err := json.Marshal(participantPlan)
+	if err != nil {
+		return nil, fmt.Errorf("encode Workflow participant plan: %w", err)
+	}
+
 	participantNames := make([]string, 0, len(run.Spec.Participants))
 	for _, participant := range run.Spec.Participants {
 		participantNames = append(participantNames, participant.NodeName)
@@ -605,6 +666,8 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		map[string]any{"name": "run-name", "value": run.Name},
 		map[string]any{"name": "run-uid", "value": string(run.UID)},
 		map[string]any{"name": "participants", "value": strings.Join(participantNames, ",")},
+		map[string]any{"name": ParticipantPlanParameter, "value": string(participantPlanJSON)},
+		map[string]any{"name": TestPlanParameter, "value": string(testPlanJSON)},
 		map[string]any{"name": "script-configmap", "value": run.Spec.Script.ConfigMapName},
 		map[string]any{"name": "script-key", "value": run.Spec.Script.Key},
 		map[string]any{"name": "script-digest", "value": run.Spec.Script.Digest},
@@ -615,20 +678,6 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
 		map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
 	}
-	reservedParameters := map[string]struct{}{
-		"run-name":            {},
-		"run-uid":             {},
-		"participants":        {},
-		"script-configmap":    {},
-		"script-key":          {},
-		"script-digest":       {},
-		"backend-api-version": {},
-		"backend-kind":        {},
-		"queue":               {},
-		"runner-image":        {},
-		"tolerations":         {},
-		"attempt":             {},
-	}
 
 	parameterNames := make([]string, 0, len(run.Spec.Parameters))
 	for parameterName := range run.Spec.Parameters {
@@ -638,7 +687,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 	sort.Strings(parameterNames)
 
 	for _, parameterName := range parameterNames {
-		if _, reserved := reservedParameters[parameterName]; reserved {
+		if reservedWorkflowParameter(parameterName) {
 			continue
 		}
 
@@ -687,57 +736,77 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 func (r *RunReconciler) retryOrFinish(
 	ctx context.Context,
 	run *signalv1.CertificationRun,
+	workflow *unstructured.Unstructured,
 	executionState string,
 	reason string,
 	message string,
 ) (ctrl.Result, error) {
+	collection := collectTestResults(run, workflow, true)
+	if collection.strict && collection.verdict == "Fail" {
+		return r.finish(ctx, run, workflow, executionState, collection.verdict, collection.reason)
+	}
+
 	if run.Status.Workflow.Attempt < run.Spec.MaxAttempts {
+		verdict := "Inconclusive"
+		attemptReason := reason + ": " + message
+
+		if err := r.preserveAttempt(ctx, run, workflow, executionState, verdict, attemptReason); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if collection.strict {
+			stopped, err := r.ensureWorkflowStopped(ctx, run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
+			if !stopped {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+		}
+
 		return r.startAttempt(ctx, run, run.Status.Workflow.Attempt+1)
 	}
 
-	return r.finish(ctx, run, executionState, "Inconclusive", reason+": "+message)
+	return r.finish(ctx, run, workflow, executionState, "Inconclusive", reason+": "+message)
 }
 
 func (r *RunReconciler) finish(
 	ctx context.Context,
 	run *signalv1.CertificationRun,
+	workflow *unstructured.Unstructured,
 	executionState string,
 	verdict string,
 	reason string,
 ) (ctrl.Result, error) {
-	evidenceRun := run.DeepCopy()
-	if executionState == "Completed" {
-		evidenceRun.Status.Workflow.Phase = "Succeeded"
-	} else {
-		evidenceRun.Status.Workflow.Phase = executionState
+	collection := collectTestResults(run, workflow, true)
+	if collection.strict && (executionState == "Completed" || collection.verdict == "Fail") {
+		verdict, reason = collection.verdict, collection.reason
 	}
 
-	evidence, err := r.evidenceDocument(ctx, evidenceRun, executionState, verdict, reason)
-	if err != nil {
+	if err := r.preserveAttempt(ctx, run, workflow, executionState, verdict, reason); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	uri, digest, err := r.Evidence.Put(ctx, run.Spec.EvidencePath, evidence)
-	if err != nil {
+	if err := r.preserveFinalEvidence(ctx, run, workflow, nil); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	attempt := run.Status.Attempts[attemptIndex(run)]
 	before := run.DeepCopy()
-	run.Status.ExecutionState = executionState
-	run.Status.Verdict = verdict
-	run.Status.Reason = reason
+	run.Status.ExecutionState = attempt.ExecutionState
+	run.Status.Verdict = attempt.Verdict
+	run.Status.Reason = attempt.Reason
 
-	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
 	if executionState == "Completed" {
 		run.Status.Workflow.Phase = "Succeeded"
 	} else {
 		run.Status.Workflow.Phase = executionState
 	}
 
-	now := metav1.NewTime(r.now())
-	run.Status.FinishedAt = &now
+	run.Status.FinishedAt = &attempt.FinishedAt
 
-	switch verdict {
+	switch attempt.Verdict {
 	case "Pass":
 		run.Status.Phase = signalv1.RunPhaseSucceeded
 	case "Fail", "Suspect":
@@ -750,13 +819,15 @@ func (r *RunReconciler) finish(
 		return ctrl.Result{}, err
 	}
 
-	if err := projectTerminal(ctx, r.Client, run); err != nil {
-		return ctrl.Result{}, err
+	if !collection.strict {
+		if err := projectTerminal(ctx, r.Client, run); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if r.Recorder != nil {
 		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationFinished", "FinishCertification",
-			"ExecutionState=%s Verdict=%s Reason=%s", executionState, verdict, reason)
+			"ExecutionState=%s Verdict=%s Reason=%s", attempt.ExecutionState, attempt.Verdict, attempt.Reason)
 	}
 
 	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
@@ -786,40 +857,55 @@ func uniqueTolerations(tolerations []corev1.Toleration) []corev1.Toleration {
 func (r *RunReconciler) evidenceDocument(
 	ctx context.Context,
 	run *signalv1.CertificationRun,
-	executionState string,
-	verdict string,
-	reason string,
+	workflow *unstructured.Unstructured,
+	attempt signalv1.AttemptStatus,
 ) ([]byte, error) {
 	var snapshot corev1.ConfigMap
 	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Script.ConfigMapName}, &snapshot); err != nil {
 		return nil, fmt.Errorf("read script snapshot for evidence: %w", err)
 	}
 
+	nodes, nodesErr := workflowNodes(workflow)
+
 	doc := map[string]any{
-		"apiVersion":     "signal.unbounded-cloud.io/evidence/v1alpha1",
-		"runID":          string(run.UID),
-		"runName":        run.Name,
-		"profile":        run.Spec.Profile,
-		"participants":   run.Spec.Participants,
-		"workflow":       run.Status.Workflow,
-		"backend":        run.Spec.Backend,
-		"runnerImage":    run.Spec.RunnerImage,
-		"purpose":        run.Spec.Purpose,
-		"stagePlan":      run.Spec.StagePlan,
-		"parameters":     run.Spec.Parameters,
-		"scriptSnapshot": run.Spec.Script,
-		"scriptContent":  snapshot.Data[run.Spec.Script.Key],
-		"executionState": executionState,
-		"verdict":        verdict,
-		"reason":         reason,
-		"startedAt":      run.Status.StartedAt,
-		"finishedAt":     r.now().UTC().Format(time.RFC3339Nano),
+		"apiVersion":         "signal.unbounded-cloud.io/evidence/v1alpha1",
+		"runID":              string(run.UID),
+		"runName":            run.Name,
+		"runSpec":            run.Spec,
+		"profile":            run.Spec.Profile,
+		"participants":       run.Spec.Participants,
+		"participantPlan":    run.Spec.ParticipantPlan,
+		"testPlan":           run.Spec.TestPlan,
+		"testResults":        run.Status.TestResults,
+		"attempts":           run.Status.Attempts,
+		"workflow":           run.Status.Workflow,
+		"workflowNodes":      nodes,
+		"workflowNodeStatus": workflowNodeStatus(workflow),
+		"backend":            run.Spec.Backend,
+		"runnerImage":        run.Spec.RunnerImage,
+		"purpose":            run.Spec.Purpose,
+		"stagePlan":          run.Spec.StagePlan,
+		"parameters":         run.Spec.Parameters,
+		"scriptSnapshot":     run.Spec.Script,
+		"scriptContent":      snapshot.Data[run.Spec.Script.Key],
+		"executionState":     attempt.ExecutionState,
+		"verdict":            attempt.Verdict,
+		"reason":             attempt.Reason,
+		"startedAt":          run.Status.StartedAt,
+		"finishedAt":         attempt.FinishedAt.UTC().Format(time.RFC3339Nano),
+	}
+	if nodesErr != nil {
+		doc["workflowNodesError"] = nodesErr.Error()
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
 }
 
 func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
+	if err := r.preserveInterrupted(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	stopped, err := r.ensureWorkflowStopped(ctx, run)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -834,9 +920,9 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	run.Status.ExecutionState = "Interrupted"
 	run.Status.Verdict = "Inconclusive"
 	run.Status.Reason = "canceled by operator"
-	now := metav1.NewTime(r.now())
+	attempt := run.Status.Attempts[attemptIndex(run)]
 
-	run.Status.FinishedAt = &now
+	run.Status.FinishedAt = &attempt.FinishedAt
 	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -845,6 +931,15 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 }
 
 func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
+	ready, err := r.strictCleanupReady(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !ready {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
 	if err := projectTerminal(ctx, r.Client, run); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -892,6 +987,12 @@ func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.Certification
 func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
 	if !containsString(run.Finalizers, RunFinalizer) {
 		return ctrl.Result{}, nil
+	}
+
+	if run.Status.Workflow.Name != "" && run.Status.Evidence.URI == "" {
+		if err := r.preserveInterrupted(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	stopped, err := r.ensureWorkflowStopped(ctx, run)
@@ -977,14 +1078,30 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 	workflow.SetNamespace(run.Namespace)
 	workflow.SetName(run.Status.Workflow.Name)
 
+	if err := r.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.ownedBackendsGone(ctx, run)
+		}
+
+		return false, fmt.Errorf("read Workflow before stopping it: %w", err)
+	}
+
+	if !metav1.IsControlledBy(workflow, run) ||
+		run.Status.Workflow.UID != "" && string(workflow.GetUID()) != run.Status.Workflow.UID {
+		return false, fmt.Errorf("refuse to delete Workflow without matching CertificationRun ownership and UID")
+	}
+
 	propagation := metav1.DeletePropagationForeground
-	if err := r.Delete(ctx, workflow, client.PropagationPolicy(propagation)); err != nil && !apierrors.IsNotFound(err) {
+
+	uid := workflow.GetUID()
+	if err := r.Delete(ctx, workflow, client.PropagationPolicy(propagation), client.Preconditions{UID: &uid}); err != nil &&
+		!apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("delete Workflow before releasing participants: %w", err)
 	}
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return r.ownedBackendsGone(ctx, run)
 		}
 
 		return false, fmt.Errorf("confirm Workflow deletion: %w", err)
@@ -1011,7 +1128,7 @@ func workflowParameter(workflow *unstructured.Unstructured, name string) string 
 		}
 	}
 
-	nodes, _, err := unstructured.NestedMap(workflow.Object, "status", "nodes")
+	nodes, err := workflowNodes(workflow)
 	if err != nil {
 		return ""
 	}

@@ -12,7 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
+	"github.com/Azure/unbounded/internal/signal"
 )
 
 const (
@@ -234,4 +237,148 @@ func stageDuration(stage *StageStatus, now time.Time) string {
 	}
 
 	return end.Sub(*stage.StartedAt).Round(time.Second).String()
+}
+
+func certificationTestStages(
+	run *signalv1.CertificationRun,
+	workflow *unstructured.Unstructured,
+	aliases map[string]string,
+	now time.Time,
+) ([]StageStatus, []string, string) {
+	results := append([]signalv1.TestResult(nil), run.Status.TestResults...)
+	if workflow != nil && !run.Status.Phase.Terminal() {
+		results = append(results, signal.ObserveTestResults(run, workflow)...)
+	}
+
+	currentAttempt := max(run.Status.Workflow.Attempt, 1)
+	attempts := map[int32]bool{currentAttempt: true}
+	byKey := map[string]signalv1.TestResult{}
+	key := func(attempt int32, nodeUID, id string) string {
+		return fmt.Sprintf("%d/%s/%s", attempt, nodeUID, id)
+	}
+
+	for _, result := range results {
+		if result.Attempt <= 0 {
+			continue
+		}
+
+		attempts[result.Attempt] = true
+		byKey[key(result.Attempt, string(result.NodeUID), result.ID)] = result
+	}
+
+	orderedAttempts := make([]int32, 0, len(attempts))
+	for attempt := range attempts {
+		orderedAttempts = append(orderedAttempts, attempt)
+	}
+
+	sort.Slice(orderedAttempts, func(i, j int) bool { return orderedAttempts[i] < orderedAttempts[j] })
+
+	nodes := map[string]WorkflowNode{}
+	for _, node := range extractWorkflowNodes(workflow) {
+		nodes[node.ID] = node
+	}
+
+	stages := make([]StageStatus, 0, len(run.Spec.TestPlan)*len(attempts))
+	issues := []string{}
+	running := []string{}
+
+	for _, attempt := range orderedAttempts {
+		for i, invocation := range run.Spec.TestPlan {
+			alias := firstNonempty(aliases[invocation.NodeName], "approved-node")
+			stage := StageStatus{
+				ID:             fmt.Sprintf("test-%d-a%d", i+1, attempt),
+				Name:           sanitizeDisplay(invocation.ID),
+				Category:       "test",
+				Required:       true,
+				Phase:          "Pending",
+				NodeAlias:      alias,
+				Attempt:        attempt,
+				ExecutionState: "Pending",
+				Parameters:     displayTestParameters(invocation.Parameters),
+				Source:         "CertificationRun immutable test plan",
+			}
+
+			result, found := byKey[key(attempt, string(invocation.NodeUID), invocation.ID)]
+			if found {
+				stage.Phase = firstNonempty(result.ExecutionState, "Unknown")
+				stage.ExecutionState = stage.Phase
+				stage.Reason = sanitizeDisplay(result.Reason)
+
+				stage.Verdict = sanitizeDisplay(result.Verdict)
+				if (stage.Phase == "Pending" || stage.Phase == "Running") &&
+					!run.Status.Phase.Terminal() && attempt == currentAttempt {
+					stage.Verdict = ""
+					stage.Reason = ""
+				}
+
+				stage.EvidenceURI = sanitizeDisplay(result.Evidence.URI)
+				stage.EvidenceDigest = shortDigest(result.Evidence.Digest)
+
+				stage.Source = "CertificationRun retained test result"
+				if workflow != nil && result.Evidence.URI == "" {
+					stage.Source = "Argo per-test execution"
+				}
+
+				nodeID := firstNonempty(result.ContainerNodeID, result.WorkflowNodeID)
+				if node, ok := nodes[nodeID]; ok {
+					stage.StartedAt, stage.FinishedAt = node.StartedAt, node.FinishedAt
+					if stage.FinishedAt == nil && (run.Status.Phase.Terminal() || attempt < currentAttempt) {
+						for _, finishedAttempt := range run.Status.Attempts {
+							if finishedAttempt.Workflow.Attempt == attempt {
+								stage.FinishedAt = optionalTime(finishedAttempt.FinishedAt.Time)
+
+								break
+							}
+						}
+
+						if stage.FinishedAt == nil && run.Status.Phase.Terminal() && attempt == currentAttempt {
+							stage.FinishedAt = optionalTime(metaTime(run.Status.FinishedAt))
+						}
+					}
+
+					if stage.FinishedAt != nil || (!run.Status.Phase.Terminal() && attempt == currentAttempt) {
+						stage.Duration = stageDuration(&stage, now)
+					}
+				}
+			}
+
+			if (!found || stage.Verdict == "") &&
+				(run.Status.Phase.Terminal() || attempt < currentAttempt) {
+				stage.Verdict = "Inconclusive"
+
+				stage.Reason = firstNonempty(stage.Reason, "MissingTestResult")
+				if !found {
+					stage.Phase = "Omitted"
+					stage.ExecutionState = stage.Phase
+				}
+
+				issues = append(issues, fmt.Sprintf("Missing required result for test %q on %s, attempt %d.", invocation.ID, alias, attempt))
+			}
+
+			if stage.Phase == "Running" && !run.Status.Phase.Terminal() && attempt == currentAttempt {
+				running = append(running, stage.ID)
+			}
+
+			stages = append(stages, stage)
+		}
+	}
+
+	return stages, issues, strings.Join(running, ", ")
+}
+
+func displayTestParameters(parameters map[string]string) map[string]string {
+	result := map[string]string{}
+
+	for _, name := range []string{
+		"expected-gpu-product-regex", "expected-gpu-count", "gpu-count", "stage-name",
+		"observed-gpu-capacity", "observed-gpu-allocatable", "burn-duration-seconds",
+		"sample-interval-seconds", "power-limit-tolerance-percent", "power-limit-consecutive-samples",
+		"cpu-workers", "memory-mib", "storage-mib", "node-workflow-template",
+	} {
+		if value, ok := parameters[name]; ok {
+			result[name] = sanitizeDisplay(value)
+		}
+	}
+
+	return result
 }

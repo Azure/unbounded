@@ -33,7 +33,7 @@ approved Node or recurring policy
  immutable per-run ConfigMap + SHA-256 digest
               |
               v
- CertificationRun -> Argo Workflow -> node task -> MPIJob
+ CertificationRun -> Argo Workflow -> node group -> individual tests / MPIJob
               |
               v
  typed execution/verdict/reason -> Node projection -> cleanup
@@ -43,6 +43,53 @@ The mutable source ConfigMap provides a fast review and hotfix surface.
 Admission copies the selected key to a run-owned immutable ConfigMap and pins
 its digest in the `CertificationRun`. A source update affects only later runs.
 Controller code never contains certification script bodies.
+
+## Per-test execution
+
+The included templates expose real test invocations rather than treating a
+successful suite container as a certification pass:
+
+| Node workflow | Individually tracked tests |
+| --- | --- |
+| `project-signal-gpu-certification` | GPU identity and MPI backend readiness. |
+| `project-signal-gpu-full-node-certification` | Inventory preflight, allocated GPU health, MPI rank-to-GPU access, and final health. |
+| `project-signal-gpu-burn-canary` | GPU Burn with continuous safety observation, CPU stress, memory integrity, and ephemeral-storage integrity. |
+
+Each invocation carries the target Node name and UID, test identity, effective
+parameters, script digest, attempt, execution state, typed verdict and reason,
+and retained measurements. GPU inventory evidence includes UUIDs and PCI
+addresses. MPI evidence retains the observed target-device inventory and
+backend completion status. These are the configured workloads in this
+repository; no additional precision variants or performance floors are implied.
+
+Full-node GPU-heavy tasks remain ordered. A failed preflight skips full-node
+allocation, and final health still runs after workload failure. Each MPI task
+has a foreground cleanup hook so its workers release their GPU allocation
+before the node group completes. Workflow cancellation retains the existing
+foreground deletion barrier before reservations are released.
+
+Mixed burn uses an Argo `containerSet`: `main` owns the GPU allocation and runs
+GPU Burn plus the shared safety observer; `cpu-stress`, `memory-integrity`, and
+`storage-integrity` are distinct concurrent Argo container nodes. They share a
+preflight/ready/stop protocol and the original configured burn duration. Each
+test writes its own verdict, reason, and measurements, including completed
+host work and per-device GPU computation coverage. A zero exit without the
+required measurements is not a pass. A non-main failure fails the group even
+if GPU Burn succeeds. Safety failures or cancellation stop the whole coupled
+workload; interrupted tests remain inconclusive rather than reporting a pass.
+The four workload containers retain one GPU allocation and the existing total
+request/limit budget of eight CPUs, 16 GiB of memory, and 8 GiB of ephemeral
+storage. ContainerSet requires per-container budgets: GPU/safety receives two
+CPUs and 8 GiB, CPU stress receives four CPUs and 1 GiB, memory integrity
+receives one CPU and 4 GiB, and storage integrity receives one CPU and 3 GiB.
+The configured worker counts and data sizes are unchanged; the new per-container
+quota distribution still requires validation on the target hardware.
+
+Task execution status and diagnostic verdict are deliberately separate. A task
+may execute successfully and report hardware `Fail`. Missing required tests,
+missing measurements, malformed provenance, skipped coverage, and execution
+errors must not produce a certification `Pass`. Per-test outcomes are retained
+with the run's immutable evidence instead of depending on pod-log retention.
 
 ## Prerequisites
 
@@ -61,8 +108,14 @@ Controller code never contains certification script bodies.
 
 Project Signal does not install Argo Workflows or MPI Operator. Install and
 scope those dependencies according to the target cluster's security model.
-The example API and controller currently reject participant counts greater than
-one because the included WorkflowTemplate has single-Node placement semantics.
+The portable node templates retain single-Node placement. The
+`project-signal-rack-certification` composition template passes each
+participant's snapshotted identity and inventory to those same node templates;
+a comma-separated participant list is never used as a pod hostname.
+**Multi-Node profile admission is not enabled yet.** The API still requires
+`participants.count: 1` while the rack membership contract is pending. The
+composition template is not permission to bypass controller-managed admission
+or reservations by submitting unreserved participant lists directly to Argo.
 
 ## Render the example
 
@@ -136,6 +189,11 @@ immutable declared stage plan, observed script stages, finalization, typed
 hardware verdicts, Argo task nodes, MPIJob conditions, cleanup status, and
 plain-language policy reasons. Profiles may declare `purpose` and an ordered
 `stagePlan`; both are snapshotted onto each admitted run.
+New built-in runs also snapshot `spec.participantPlan` and `spec.testPlan`.
+Their execution plan shows each Node/test/attempt and its typed verdict,
+parameters, and per-attempt evidence reference, using the same result observer
+as the controller. Retained results remain visible after the Workflow and
+task pods expire. Legacy runs without a test plan retain the stage-log view.
 Kubernetes reason and message fields are rendered as text, truncated to a safe
 bound, and GPU UUIDs are redacted. Arbitrary raw pod logs and script bodies are
 never returned by dashboard endpoints.
@@ -195,14 +253,36 @@ executionState=Completed, verdict=Pass|Fail, reason=<diagnostic reason>
 executionState=Error,     verdict=Inconclusive, reason=<workflow reason>
 ```
 
+Those execution states describe the run-level outcome. Individual test results
+retain their actual Argo task/container phase, such as `Running` or `Succeeded`;
+an Argo `Succeeded` phase does not replace the diagnostic verdict.
+
 A diagnostic script writes `/results/verdict` and `/results/reason`, then exits
 successfully so a hardware `Fail` remains a typed result rather than an
 orchestration failure.
 
-Cluster-local evidence is represented by the `CertificationRun` status,
-Workflow and MPIJob status, Events, pod logs, termination messages, and a
-SHA-256 digest of the controller's terminal evidence document. The example does
-not configure an external evidence service or cloud identity.
+Built-in runs use `spec.testPlan` as the required coverage contract.
+`status.testResults` retains distinct `(attempt, nodeUID, id)` results,
+including actual Argo task/container identity, effective parameters, script
+digest, measurements, and a per-attempt evidence reference.
+`status.attempts` retains the aggregate outcome and evidence for every completed
+or interrupted attempt; `status.evidence` points to the final summary.
+New required workflow arguments `participant-plan` and `test-plan` cannot be
+overridden by profile parameters. Existing runs and custom templates without
+an immutable test plan retain the legacy root verdict/reason contract.
+
+Inline Argo node status and base64/gzip `compressedNodes` are supported, with
+decoded node status bounded at 16 MiB. Malformed or oversized status is
+inconclusive. Unhydrated `offloadNodeStatusVersion` is explicitly rejected as
+`WorkflowNodesOffloaded`, even if partial inline nodes exist. The immutable
+evidence preserves the original representation and observation error.
+
+Cluster-local evidence includes the immutable run inputs, individual test
+results and workflow-node provenance, Workflow and MPIJob status, Events, pod
+logs, termination messages, and a SHA-256 digest of the controller's retained
+evidence document. The example does not configure an external evidence service
+or cloud identity. Export any required raw logs before the pod retention window
+closes; retained test measurements are not a replacement for full raw logs.
 
 ## Node metadata contract
 
@@ -309,9 +389,11 @@ image, product string, GPU count, Node approval, and expiry are verified on the
 target cluster.
 
 The sample is one Node, one GPU, and one MPI worker. It is not GB200 NVL72 or
-rack-scale certification. Rack-scale support requires a topology-aware,
-multi-participant backend, complete participant reservation, gang scheduling,
-rank mapping, fabric and collective tests, and per-participant evidence.
+rack-fabric certification. A grouped workflow composes node tests, not an
+unimplemented multi-node collective. Fabric qualification still requires a
+supported topology-aware backend, gang scheduling, rank mapping, and reviewed
+fabric/collective tests. A requested rack test without an execution adapter is
+rejected explicitly rather than represented by a successful placeholder.
 
 ## Dapple B200 full-node profile
 
@@ -352,10 +434,13 @@ once per minute and fails closed on:
   treating normal instantaneous power-cap sampling jitter as hardware failure;
 - early exit or failure of any required workload.
 
-The pod is privileged only to read the host kernel ring buffer for Xid
-comparison. The script captures preflight, periodic workload measurements, and
-health-after evidence. The workflow deadline is six hours and 30 minutes with
-no retries.
+The GPU-owning `main` container is privileged to read the host kernel ring
+buffer for Xid comparison; the host stressor containers are not privileged.
+The group captures preflight, periodic workload measurements, per-test results,
+and health-after evidence. GPU Burn must produce computation measurements for
+every assigned GPU, and logged computation warnings or dead workers fail the
+test even if the executable exits zero. The workflow deadline is six hours and
+30 minutes with no retries.
 
 Burn profiles use `purpose: Diagnostic`. Full certification has higher node
 projection precedence, so a successful seven-GPU diagnostic cannot replace the
@@ -373,7 +458,7 @@ The repository example does not provide:
 - proprietary performance floors or fixed B200 thermal/power thresholds;
 - destructive storage endurance, reboot, drain, or remediation;
 - the complete four-pass initial burn-in campaign;
-- rack-scale or NVL72 certification;
+- rack-fabric or NVL72 collective certification;
 - an external evidence store;
 - a scheduler integration that consumes the eligibility labels;
 - dashboard mutation controls, public ingress, or long-term history;

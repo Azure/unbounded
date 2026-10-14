@@ -27,8 +27,11 @@ data:
     elif ! command -v nvidia-smi >/dev/null 2>&1; then
       verdict=Fail
       reason=NvidiaSMIMissing
+    elif ! product_output="$(nvidia-smi --query-gpu=name --format=csv,noheader)"; then
+      verdict=Fail
+      reason=GPUIdentityQueryFailed
     else
-      mapfile -t products < <(nvidia-smi --query-gpu=name --format=csv,noheader)
+      mapfile -t products <<< "${product_output}"
       details="$(printf '%s\n' "${products[@]}")"
 
       if [[ "${#products[@]}" -ne "${EXPECTED_GPU_COUNT}" ]]; then
@@ -42,12 +45,22 @@ data:
             break
           fi
         done
+
+        if [[ "${verdict}" == Pass ]]; then
+          if ! details="$(nvidia-smi --query-gpu=uuid,pci.bus_id,name --format=csv,noheader)"; then
+            verdict=Fail
+            reason=GPUIdentityQueryFailed
+          elif [[ -z "${details}" ]]; then
+            verdict=Inconclusive
+            reason=GPUMeasurementsMissing
+          fi
+        fi
       fi
     fi
 
     printf '%s' "${verdict}" > /results/verdict
     printf '%s' "${reason}" > /results/reason
-    printf '%s\n' "${details}" > /results/measurements.txt
+    printf 'verdict=%s reason=%s\n%s\n' "${verdict}" "${reason}" "${details}" > /results/measurements.txt
     printf 'verdict=%s reason=%s\n' "${verdict}" "${reason}" > /dev/termination-log
     printf 'PROJECT_SIGNAL_EXAMPLE verdict=%s reason=%s\n%s\n' \
       "${verdict}" "${reason}" "${details}"
@@ -75,7 +88,8 @@ data:
     finish() {
       printf '%s' "${verdict}" > /results/verdict
       printf '%s' "${reason}" > /results/reason
-      printf '%s\n' "${details}" > /results/measurements.txt
+      printf 'stage=%s verdict=%s reason=%s\n%s\n' \
+        "${stage}" "${verdict}" "${reason}" "${details}" > /results/measurements.txt
       printf 'verdict=%s reason=%s stage=%s\n' "${verdict}" "${reason}" "${stage}" > /dev/termination-log
 
       if [[ "${verdict}" == Pass ]]; then
@@ -110,14 +124,25 @@ data:
     }
 
     query_visible_gpus() {
-      mapfile -t products < <(
-        nvidia-smi --query-gpu=name --format=csv,noheader
-      )
-      mapfile -t gpu_rows < <(
+      local product_output gpu_output
+      if ! product_output="$(nvidia-smi --query-gpu=name --format=csv,noheader)" ||
+         ! gpu_output="$(
         nvidia-smi \
-          --query-gpu=index,name,pci.bus_id,pstate,temperature.gpu,driver_version \
+          --query-gpu=index,uuid,name,pci.bus_id,pstate,temperature.gpu,driver_version \
           --format=csv,noheader,nounits
-      )
+      )"; then
+        verdict=Fail
+        reason=GPUQueryFailed
+        details="nvidia-smi returned a nonzero exit status"
+        return 1
+      fi
+      if [[ -z "${product_output}" || -z "${gpu_output}" ]]; then
+        verdict=Inconclusive
+        reason=GPUMeasurementsMissing
+        return 1
+      fi
+      mapfile -t products <<< "${product_output}"
+      mapfile -t gpu_rows <<< "${gpu_output}"
       details="$(printf '%s\n' "${gpu_rows[@]}")"
 
       if [[ "${#products[@]}" -ne "$1" || "${#gpu_rows[@]}" -ne "$1" ]]; then
@@ -169,8 +194,8 @@ data:
         pids=()
         for ((index = 0; index < EXPECTED_GPU_COUNT; index++)); do
           nvidia-smi -i "${index}" \
-            --query-gpu=index,name,pci.bus_id,pstate,temperature.gpu \
-            --format=csv,noheader,nounits &
+            --query-gpu=index,uuid,name,pci.bus_id,pstate,temperature.gpu \
+            --format=csv,noheader,nounits > "/results/gpu-${index}.txt" &
           pids+=("$!")
         done
 
@@ -178,6 +203,16 @@ data:
           if ! wait "${pid}"; then
             verdict=Fail
             reason=ParallelGPUHealthQueryFailed
+          fi
+        done
+        for ((index = 0; index < EXPECTED_GPU_COUNT; index++)); do
+          if [[ ! -s "/results/gpu-${index}.txt" ]]; then
+            if [[ "${verdict}" == Pass ]]; then
+              verdict=Inconclusive
+              reason=GPUMeasurementsMissing
+            fi
+          else
+            details+=$'\n'"device_index=${index} $(<"/results/gpu-${index}.txt")"
           fi
         done
       fi
@@ -204,11 +239,7 @@ data:
 
     finish
 
-    if [[ "${stage}" == workload && "${verdict}" != Pass ]]; then
-      exit 1
-    fi
-
-    # Preflight failures are typed hardware evidence, not workflow errors.
+    # Hardware failures are typed evidence, not workflow infrastructure errors.
     exit 0
   gpu-burn-canary.sh: |
     #!/usr/bin/env bash
@@ -224,6 +255,9 @@ data:
     declare -A power_limit_excess_samples=()
     worker_pids=()
     cpu_pids=()
+    component="${PROJECT_SIGNAL_BURN_COMPONENT:-${1:-standalone}}"
+    gpu_completed=false
+    finished_normally=false
 
     emit_stage() {
       local name="$1"
@@ -251,7 +285,9 @@ data:
     }
 
     xid_count() {
-      dmesg 2>/dev/null | grep -Eic 'NVRM: Xid|Xid \(' || true
+      local messages
+      messages="$(dmesg 2>/dev/null)" || return 1
+      grep -Eic 'NVRM: Xid|Xid \(' <<< "${messages}" || true
     }
 
     capture_telemetry() {
@@ -347,10 +383,215 @@ data:
       for pid in "${worker_pids[@]:-}"; do
         wait "${pid}" 2>/dev/null || true
       done
+      worker_pids=()
+    }
+
+    pause_until_sample() {
+      local until=$((SECONDS + $1))
+      while (( SECONDS < until )) && [[ ! -e "${stop_file}" ]]; do
+        sleep 0.1
+      done
+    }
+
+    burn_log_excerpt() {
+      if [[ -f "${gpu_log}" ]]; then
+        tail -c 8192 "${gpu_log}" | tr '\r' '\n' | tail -n 200
+      fi
+    }
+
+    finish_component() {
+      local exit_code=$?
+      stop_workers
+      if (( exit_code != 0 )) && [[ "${verdict}" == Pass ]]; then
+        verdict=Inconclusive
+        reason=ComponentInterrupted
+      fi
+      {
+        printf 'test=%s verdict=%s reason=%s iterations=%s\n' \
+          "${component}" "${verdict}" "${reason}" "${iterations}"
+        printf 'cpu_workers=%s memory_mib=%s storage_mib=%s\n' \
+          "${CPU_WORKERS:-unset}" "${MEMORY_MIB:-unset}" "${STORAGE_MIB:-unset}"
+        printf '%s\n' "${details}"
+      } > "/results/${component}-measurements.txt"
+      printf '%s' "${reason}" > "/results/${component}-reason"
+      printf '%s' "${verdict}" > "/results/${component}-verdict.tmp"
+      mv "/results/${component}-verdict.tmp" "/results/${component}-verdict"
+      printf 'PROJECT_SIGNAL_TEST id=%s verdict=%s reason=%s iterations=%s\n' \
+        "${component}" "${verdict}" "${reason}" "${iterations}"
+    }
+
+    run_component() {
+      iterations=0
+      reason=ComponentCompleted
+      trap finish_component EXIT
+      trap 'verdict=Inconclusive; reason=Canceled; exit 143' TERM
+      trap 'verdict=Inconclusive; reason=Canceled; exit 130' INT
+
+      while [[ ! -e /work/ready ]]; do
+        if [[ -e "${stop_file}" ]]; then
+          verdict=Inconclusive
+          reason=PreflightFailed
+          exit 0
+        fi
+        sleep 0.1
+      done
+
+      case "${component}" in
+      memory-integrity|storage-integrity)
+        if [[ "${component}" == memory-integrity ]]; then
+          directory=/work/memory
+          size="${MEMORY_MIB}"
+          flags=()
+        else
+          directory=/work/storage
+          size="${STORAGE_MIB}"
+          flags=(oflag=direct conv=fsync)
+        fi
+        if ! mkdir -p "${directory}" ||
+           ! dd if=/dev/zero of="${directory}/pattern.bin" bs=1M count="${size}" "${flags[@]}" status=none ||
+           ! initial_hash="$(sha256sum "${directory}/pattern.bin")"; then
+          fail IntegritySetupFailed "test=${component}"
+          exit 0
+        fi
+        touch "/work/${component}.started"
+        while [[ ! -e "${stop_file}" ]]; do
+          if ! current_hash="$(sha256sum "${directory}/pattern.bin")" ||
+             [[ "${current_hash}" != "${initial_hash}" ]]; then
+            fail IntegrityMismatch "test=${component}"
+            break
+          fi
+          iterations=$((iterations + 1))
+          if [[ "${component}" == storage-integrity ]]; then
+            pause_until_sample "${SAMPLE_INTERVAL_SECONDS}"
+          fi
+        done
+        details="size_mib=${size} sha256=${initial_hash%% *}"
+        ;;
+      cpu-stress)
+        for ((worker = 0; worker < CPU_WORKERS; worker++)); do
+          (
+            count=0
+            while [[ ! -e "${stop_file}" ]]; do
+              if ! dd if=/dev/zero bs=4M count=256 status=none | sha256sum >/dev/null; then
+                exit 1
+              fi
+              count=$((count + 1))
+              printf '%s' "${count}" > "/work/cpu-${worker}.iterations"
+            done
+          ) &
+          worker_pids+=("$!")
+        done
+        touch "/work/${component}.started"
+        while [[ ! -e "${stop_file}" ]]; do
+          for pid in "${worker_pids[@]}"; do
+            if ! kill -0 "${pid}" 2>/dev/null && [[ ! -e "${stop_file}" ]]; then
+              fail HostStressFailed "worker_pid=${pid}"
+              break
+            fi
+          done
+          [[ "${verdict}" == Pass ]] || break
+          sleep 0.1
+        done
+        if [[ "${verdict}" != Pass ]]; then
+          touch "${stop_file}"
+        fi
+        for pid in "${worker_pids[@]}"; do
+          if ! wait "${pid}"; then
+            fail HostStressFailed "worker_pid=${pid}"
+          fi
+        done
+        worker_pids=()
+        for ((worker = 0; worker < CPU_WORKERS; worker++)); do
+          if [[ ! -s "/work/cpu-${worker}.iterations" ]]; then
+            fail HostStressMeasurementsMissing "worker=${worker}"
+          else
+            count="$(<"/work/cpu-${worker}.iterations")"
+            iterations=$((iterations + count))
+          fi
+        done
+        ;;
+      *)
+        fail UnknownBurnComponent "component=${component}"
+        exit 0
+        ;;
+      esac
+
+      if [[ "${verdict}" == Pass ]]; then
+        if [[ ! -e /work/burn-complete ]]; then
+          verdict=Inconclusive
+          reason=GroupInterrupted
+        elif (( iterations == 0 )); then
+          verdict=Inconclusive
+          reason=ComponentMeasurementsMissing
+        fi
+      fi
+      exit 0
+    }
+
+    check_components() {
+      local name result
+      for name in cpu-stress memory-integrity storage-integrity; do
+        if [[ -e "/results/${name}-verdict" ]]; then
+          result="$(<"/results/${name}-reason")"
+          fail HostTestExitedEarly "test=${name} reason=${result}"
+          return 1
+        fi
+      done
+      if [[ -e "${stop_file}" && ! -e /work/burn-complete ]]; then
+        fail HostTestExitedEarly "A concurrent host test stopped the coupled workload"
+        return 1
+      fi
+    }
+
+    collect_component_results() {
+      local name waited
+      for ((waited = 0; waited < 120; waited++)); do
+        if [[ -e /results/cpu-stress-verdict &&
+              -e /results/memory-integrity-verdict &&
+              -e /results/storage-integrity-verdict ]]; then
+          break
+        fi
+        sleep 1
+      done
+      for name in cpu-stress memory-integrity storage-integrity; do
+        if [[ ! -s "/results/${name}-verdict" ]]; then
+          fail ComponentCleanupIncomplete "test=${name}"
+        elif [[ "$(<"/results/${name}-verdict")" != Pass ]]; then
+          fail HostTestFailed "test=${name} reason=$(<"/results/${name}-reason")"
+        fi
+      done
+    }
+
+    validate_gpu_measurements() {
+      if grep -Eq 'WARNING!|DIED!' "${gpu_log}"; then
+        fail GPUBurnComputationFailed "GPU Burn reported a computation error or a dead GPU worker"
+      elif ! tr '\r' '\n' < "${gpu_log}" | awk -v expected="${EXPECTED_GPU_COUNT}" '
+        /proc.d:/ {
+          sub(/^.*proc.d: */, "")
+          sub(/[[:space:]]+errors:.*/, "")
+          count = split($0, devices, /[[:space:]]+-[[:space:]]+/)
+          complete = count == expected
+          for (i = 1; i <= count; i++) {
+            if (devices[i] !~ /^[1-9][0-9]* \([1-9][0-9]* Gflop\/s\)/) complete = 0
+          }
+          if (complete) measured = 1
+        }
+        END { exit !measured }
+      '; then
+        fail GPUBurnMeasurementsMissing "No completed computation measurement for every assigned GPU"
+      fi
     }
 
     finish() {
+      local exit_code=$?
       stop_workers
+      if [[ "${verdict}" == Pass ]] && { (( exit_code != 0 )) || ! "${finished_normally}"; }; then
+        verdict=Inconclusive
+        reason=BurnInterrupted
+      fi
+      if [[ "${component}" == gpu-burn ]]; then
+        collect_component_results
+      fi
       printf '%s' "${verdict}" > /results/verdict
       printf '%s' "${reason}" > /results/reason
       {
@@ -361,15 +602,44 @@ data:
         printf 'power_limit_tolerance_percent=%s power_limit_consecutive_samples=%s\n' \
           "${POWER_LIMIT_TOLERANCE_PERCENT:-unset}" "${POWER_LIMIT_CONSECUTIVE_SAMPLES:-unset}"
         printf '%s\n' "${details}"
-        tail -n 200 "${gpu_log}" 2>/dev/null || true
+        if [[ -f /results/devices.txt ]]; then
+          cat /results/devices.txt
+        fi
+        burn_log_excerpt
       } > /results/measurements.txt
+      if [[ "${component}" == gpu-burn ]]; then
+        gpu_verdict="${verdict}"
+        gpu_reason="${reason}"
+        if [[ "${reason}" == HostTest* || "${reason}" == ComponentCleanupIncomplete ]]; then
+          if "${gpu_completed}"; then
+            gpu_verdict=Pass
+            gpu_reason=GPUBurnCompleted
+          else
+            gpu_verdict=Inconclusive
+            gpu_reason=GroupInterrupted
+          fi
+        fi
+        printf '%s' "${gpu_verdict}" > /results/gpu-burn-verdict
+        printf '%s' "${gpu_reason}" > /results/gpu-burn-reason
+        {
+          printf 'test=gpu-burn verdict=%s reason=%s\n' "${gpu_verdict}" "${gpu_reason}"
+          printf 'group_verdict=%s group_reason=%s\n' "${verdict}" "${reason}"
+          tail -n +2 /results/measurements.txt
+        } > /results/gpu-burn-measurements.txt
+      fi
       printf 'PROJECT_SIGNAL_GPU_BURN_LOG_BEGIN\n'
-      tail -n 200 "${gpu_log}" 2>/dev/null || true
+      burn_log_excerpt
       printf 'PROJECT_SIGNAL_GPU_BURN_LOG_END\n'
       printf 'verdict=%s reason=%s\n' "${verdict}" "${reason}" > /dev/termination-log
     }
 
+    if [[ "${component}" != standalone && "${component}" != gpu-burn ]]; then
+      run_component
+    fi
+
     trap finish EXIT
+    trap 'verdict=Inconclusive; reason=Canceled; exit 143' TERM
+    trap 'verdict=Inconclusive; reason=Canceled; exit 130' INT
 
     emit_stage preflight running
 
@@ -394,8 +664,14 @@ data:
     elif ! dmesg >/dev/null 2>&1; then
       fail XidTelemetryUnavailable "privileged dmesg access is required"
     else
-      baseline_xids="$(xid_count)"
+      if ! baseline_xids="$(xid_count)"; then
+        fail XidTelemetryUnavailable "Cannot capture baseline kernel Xid telemetry"
+      fi
       capture_telemetry baseline || true
+      if [[ "${component}" == gpu-burn ]] &&
+         ! nvidia-smi --query-gpu=index,uuid,pci.bus_id,name --format=csv,noheader > /results/devices.txt; then
+        fail DeviceIdentityUnavailable "Cannot retain assigned GPU identities"
+      fi
     fi
 
     if [[ "${verdict}" != Pass ]]; then
@@ -411,6 +687,25 @@ data:
     rm -f "${stop_file}"
     mkdir -p /work/memory /work/storage
 
+    if [[ "${component}" == gpu-burn ]]; then
+      touch /work/ready
+      for ((waited = 0; waited < 120; waited++)); do
+        if ! check_components; then
+          break
+        fi
+        if [[ -e /work/cpu-stress.started &&
+              -e /work/memory-integrity.started &&
+              -e /work/storage-integrity.started ]]; then
+          break
+        fi
+        sleep 1
+      done
+      if [[ ! -e /work/cpu-stress.started ||
+            ! -e /work/memory-integrity.started ||
+            ! -e /work/storage-integrity.started ]]; then
+        fail HostTestStartupIncomplete "Not all concurrent host tests started"
+      fi
+    else
     dd if=/dev/zero of=/work/memory/pattern.bin bs=1M count="${MEMORY_MIB}" status=none
     memory_hash="$(sha256sum /work/memory/pattern.bin | awk '{print $1}')"
     (
@@ -441,26 +736,40 @@ data:
       cpu_pids+=("$!")
       worker_pids+=("$!")
     done
+    fi
 
-    GPU_BURN_COMMIT="${GPU_BURN_COMMIT:-0d19c94dcb2e9b6858b7586a4c327674cd67113b}" \
-      gpu_burn -m 50% -tc "${BURN_DURATION_SECONDS}" >"${gpu_log}" 2>&1 &
-    gpu_pid=$!
-    worker_pids+=("${gpu_pid}")
+    if [[ "${verdict}" == Pass ]]; then
+      GPU_BURN_COMMIT="${GPU_BURN_COMMIT:-0d19c94dcb2e9b6858b7586a4c327674cd67113b}" \
+        gpu_burn -m 50% -tc "${BURN_DURATION_SECONDS}" >"${gpu_log}" 2>&1 &
+      gpu_pid=$!
+      gpu_worker_index="${#worker_pids[@]}"
+      worker_pids+=("${gpu_pid}")
+    fi
 
     end_epoch=$(( $(date +%s) + BURN_DURATION_SECONDS ))
-    while (( $(date +%s) < end_epoch )); do
-      sleep "${SAMPLE_INTERVAL_SECONDS}"
+    while [[ "${verdict}" == Pass ]] && (( $(date +%s) < end_epoch )); do
+      if [[ "${component}" == gpu-burn ]]; then
+        delay="${SAMPLE_INTERVAL_SECONDS}"
+        remaining=$((end_epoch - $(date +%s)))
+        (( remaining >= delay )) || delay="${remaining}"
+        pause_until_sample "${delay}"
+      else
+        sleep "${SAMPLE_INTERVAL_SECONDS}"
+      fi
       if (( $(date +%s) >= end_epoch )); then
         break
       fi
 
-      if ! kill -0 "${gpu_pid}" 2>/dev/null; then
-        fail GPUBurnExitedEarly "$(tail -n 5 "${gpu_log}" 2>/dev/null | tr '\n' ';')"
+      if [[ "${component}" == gpu-burn ]] && ! check_components; then
         break
-      elif ! kill -0 "${memory_pid}" 2>/dev/null; then
+      fi
+      if ! kill -0 "${gpu_pid}" 2>/dev/null; then
+        fail GPUBurnExitedEarly "$(burn_log_excerpt | tail -n 5 | tr '\n' ';')"
+        break
+      elif [[ "${component}" == standalone ]] && ! kill -0 "${memory_pid}" 2>/dev/null; then
         fail MemoryIntegrityFailed
         break
-      elif ! kill -0 "${storage_pid}" 2>/dev/null; then
+      elif [[ "${component}" == standalone ]] && ! kill -0 "${storage_pid}" 2>/dev/null; then
         fail StorageIntegrityFailed
         break
       fi
@@ -471,9 +780,10 @@ data:
           break
         fi
       done
-
       capture_telemetry sample || true
-      current_xids="$(xid_count)"
+      if ! current_xids="$(xid_count)"; then
+        fail XidTelemetryUnavailable "Kernel Xid telemetry became unavailable during the workload"
+      fi
       if (( current_xids > baseline_xids )); then
         fail NewXidDetected "xids=${baseline_xids}->${current_xids}"
       fi
@@ -483,18 +793,35 @@ data:
       fi
     done
 
+    if [[ "${component}" == gpu-burn ]]; then
+      check_components || true
+    fi
     if [[ "${verdict}" == Pass ]]; then
-      if ! wait "${gpu_pid}"; then
+      gpu_exit=0
+      wait "${gpu_pid}" || gpu_exit=$?
+      unset "worker_pids[${gpu_worker_index}]"
+      if (( gpu_exit != 0 )); then
         fail GPUBurnFailed
+      elif [[ "${component}" == gpu-burn ]]; then
+        validate_gpu_measurements
+        if [[ "${verdict}" == Pass ]]; then
+          gpu_completed=true
+          touch /work/burn-complete
+        fi
       fi
 
       touch "${stop_file}"
-      if ! wait "${memory_pid}"; then
+      if [[ "${component}" == standalone ]] && ! wait "${memory_pid}"; then
         fail MemoryIntegrityFailed
       fi
-      if ! wait "${storage_pid}"; then
+      if [[ "${component}" == standalone ]] && ! wait "${storage_pid}"; then
         fail StorageIntegrityFailed
       fi
+    fi
+
+    if [[ "${component}" == gpu-burn ]]; then
+      stop_workers
+      collect_component_results
     fi
 
     if [[ "${verdict}" == Pass ]]; then
@@ -505,7 +832,9 @@ data:
 
     emit_stage health-after running
     capture_telemetry final || true
-    final_xids="$(xid_count)"
+    if ! final_xids="$(xid_count)"; then
+      fail XidTelemetryUnavailable "Cannot capture final kernel Xid telemetry"
+    fi
     if (( final_xids > baseline_xids )); then
       fail NewXidDetected "xids=${baseline_xids}->${final_xids}"
     fi
@@ -516,4 +845,5 @@ data:
       emit_stage health-after failed "${reason}" "${details}"
     fi
 
+    finished_normally=true
     exit 0

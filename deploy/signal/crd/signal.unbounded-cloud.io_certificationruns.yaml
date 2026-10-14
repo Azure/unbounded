@@ -82,6 +82,28 @@ spec:
                 additionalProperties:
                   type: string
                 type: object
+              participantPlan:
+                items:
+                  properties:
+                    nodeName:
+                      type: string
+                    nodeUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    observedGPUAllocatable:
+                      type: string
+                    observedGPUCapacity:
+                      type: string
+                  required:
+                  - nodeName
+                  - nodeUID
+                  - observedGPUAllocatable
+                  - observedGPUCapacity
+                  type: object
+                type: array
               participants:
                 items:
                   properties:
@@ -171,6 +193,31 @@ spec:
                 x-kubernetes-validations:
                 - message: stagePlan is immutable
                   rule: self == oldSelf
+              testPlan:
+                items:
+                  properties:
+                    containerName:
+                      type: string
+                    id:
+                      type: string
+                    nodeName:
+                      type: string
+                    nodeUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    parameters:
+                      additionalProperties:
+                        type: string
+                      type: object
+                  required:
+                  - id
+                  - nodeName
+                  - nodeUID
+                  type: object
+                type: array
               tolerations:
                 items:
                   description: |-
@@ -254,8 +301,53 @@ spec:
               rule: self.tolerations == oldSelf.tolerations
             - message: requestNodeName is immutable
               rule: self.requestNodeName == oldSelf.requestNodeName
+            - message: participantPlan is immutable
+              rule: has(self.participantPlan) == has(oldSelf.participantPlan) && (!has(self.participantPlan)
+                || self.participantPlan == oldSelf.participantPlan)
+            - message: testPlan is immutable
+              rule: has(self.testPlan) == has(oldSelf.testPlan) && (!has(self.testPlan)
+                || self.testPlan == oldSelf.testPlan)
           status:
             properties:
+              attempts:
+                items:
+                  properties:
+                    evidence:
+                      properties:
+                        digest:
+                          type: string
+                        uri:
+                          type: string
+                      type: object
+                    executionState:
+                      type: string
+                    finishedAt:
+                      format: date-time
+                      type: string
+                    reason:
+                      type: string
+                    verdict:
+                      type: string
+                    workflow:
+                      properties:
+                        attempt:
+                          format: int32
+                          type: integer
+                        name:
+                          type: string
+                        phase:
+                          type: string
+                        uid:
+                          type: string
+                      type: object
+                  required:
+                  - executionState
+                  - finishedAt
+                  - reason
+                  - verdict
+                  - workflow
+                  type: object
+                type: array
               cleanup:
                 properties:
                   reservationsReleased:
@@ -338,6 +430,69 @@ spec:
               startedAt:
                 format: date-time
                 type: string
+              testResults:
+                items:
+                  properties:
+                    attempt:
+                      format: int32
+                      type: integer
+                    containerName:
+                      type: string
+                    containerNodeID:
+                      type: string
+                    evidence:
+                      properties:
+                        digest:
+                          type: string
+                        uri:
+                          type: string
+                      type: object
+                    executionState:
+                      type: string
+                    id:
+                      type: string
+                    measurements:
+                      maxLength: 16384
+                      type: string
+                    nodeName:
+                      type: string
+                    nodeUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    parameters:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    reason:
+                      type: string
+                    scriptDigest:
+                      type: string
+                    taskName:
+                      type: string
+                    verdict:
+                      type: string
+                    workflowName:
+                      type: string
+                    workflowNodeID:
+                      type: string
+                    workflowNodeName:
+                      type: string
+                    workflowUID:
+                      type: string
+                  required:
+                  - attempt
+                  - executionState
+                  - id
+                  - nodeName
+                  - nodeUID
+                  - reason
+                  - scriptDigest
+                  - verdict
+                  type: object
+                type: array
               verdict:
                 type: string
               workflow:

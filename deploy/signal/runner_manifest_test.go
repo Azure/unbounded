@@ -68,9 +68,10 @@ func TestFullNodeWorkflowGatesEightGPUAllocationOnInventoryPreflight(t *testing.
 		`name: observed-gpu-allocatable`,
 		`when: "{{` + "`{{tasks.node-health.outputs.parameters.verdict}}`" + `}} == Pass"`,
 		`when: "{{` + "`{{tasks.node-health.outputs.parameters.verdict}}`" + `}} != Pass"`,
-		`dependencies: [workload]`,
+		`depends: gpu-health.Succeeded`,
+		`(mpi-backend.Succeeded || mpi-backend.Failed || mpi-backend.Errored || mpi-backend.Skipped || mpi-backend.Omitted)`,
 		`"nvidia.com/gpu":"{{` + "`{{inputs.parameters.gpu-count}}`" + `}}"`,
-		`nvidia.com/gpu: "{{` + "`{{workflow.parameters.expected-gpu-count}}`" + `}}"`,
+		`nvidia.com/gpu: "{{` + "`{{inputs.parameters.gpu-count}}`" + `}}"`,
 	} {
 		assert.Contains(t, manifest, setting)
 	}
@@ -101,7 +102,7 @@ func TestBurnCanaryUsesPinnedRunnerAndDiagnosticProjection(t *testing.T) {
 		"project-signal-gpu-burn-canary",
 		`"hostPID":true`,
 		`privileged: true`,
-		`"nvidia.com/gpu":"{{` + "`{{workflow.parameters.expected-gpu-count}}`" + `}}"`,
+		`"nvidia.com/gpu":"{{` + "`{{inputs.parameters.expected-gpu-count}}`" + `}}"`,
 		`name: burn-duration-seconds`,
 		`name: power-limit-tolerance-percent`,
 		`name: power-limit-consecutive-samples`,

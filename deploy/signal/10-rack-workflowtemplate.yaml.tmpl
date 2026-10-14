@@ -1,0 +1,137 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-rack-certification
+  namespace: {{ default "project-signal" .Namespace }}
+spec:
+  serviceAccountName: project-signal-runner
+  entrypoint: rack-tests
+  ttlStrategy:
+    secondsAfterCompletion: 21600
+    secondsAfterSuccess: 21600
+    secondsAfterFailure: 21600
+  podGC:
+    strategy: OnWorkflowCompletion
+    deleteDelayDuration: 2h
+  arguments:
+    parameters:
+      - name: run-name
+      - name: run-uid
+      - name: participants
+      - name: participant-plan
+      - name: test-plan
+      - name: script-configmap
+      - name: script-key
+      - name: script-digest
+      - name: backend-api-version
+      - name: backend-kind
+      - name: queue
+      - name: runner-image
+      - name: tolerations
+        value: >-
+          [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
+      - name: expected-gpu-product-regex
+      - name: expected-gpu-count
+      - name: node-workflow-template
+      - name: rack-tests
+        value: "[]"
+      - name: burn-duration-seconds
+        value: ""
+      - name: sample-interval-seconds
+        value: ""
+      - name: power-limit-tolerance-percent
+        value: ""
+      - name: power-limit-consecutive-samples
+        value: ""
+      - name: cpu-workers
+        value: ""
+      - name: memory-mib
+        value: ""
+      - name: storage-mib
+        value: ""
+      - name: attempt
+  volumes:
+    - name: scripts
+      configMap:
+        name: "{{`{{workflow.parameters.script-configmap}}`}}"
+        defaultMode: 0555
+  templates:
+    - name: rack-tests
+      dag:
+        failFast: false
+        tasks:
+          - name: full-node
+            when: "{{`{{=workflow.parameters['node-workflow-template'] == 'project-signal-gpu-full-node-certification'}}`}}"
+            withParam: "{{`{{workflow.parameters.participant-plan}}`}}"
+            templateRef:
+              name: project-signal-gpu-full-node-certification
+              template: node-tests
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{item.nodeName}}`}}"
+                - name: node-uid
+                  value: "{{`{{item.nodeUID}}`}}"
+                - name: observed-gpu-capacity
+                  value: "{{`{{item.observedGPUCapacity}}`}}"
+                - name: observed-gpu-allocatable
+                  value: "{{`{{item.observedGPUAllocatable}}`}}"
+          - name: identity
+            when: "{{`{{=workflow.parameters['node-workflow-template'] == 'project-signal-gpu-certification'}}`}}"
+            withParam: "{{`{{workflow.parameters.participant-plan}}`}}"
+            templateRef:
+              name: project-signal-gpu-certification
+              template: node-tests
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{item.nodeName}}`}}"
+                - name: node-uid
+                  value: "{{`{{item.nodeUID}}`}}"
+          - name: mixed-burn
+            when: "{{`{{=workflow.parameters['node-workflow-template'] == 'project-signal-gpu-burn-canary'}}`}}"
+            withParam: "{{`{{workflow.parameters.participant-plan}}`}}"
+            templateRef:
+              name: project-signal-gpu-burn-canary
+              template: node-tests
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{item.nodeName}}`}}"
+                - name: node-uid
+                  value: "{{`{{item.nodeUID}}`}}"
+                - name: observed-gpu-capacity
+                  value: "{{`{{item.observedGPUCapacity}}`}}"
+                - name: observed-gpu-allocatable
+                  value: "{{`{{item.observedGPUAllocatable}}`}}"
+          - name: unsupported-rack-test
+            when: "{{`{{=workflow.parameters['rack-tests'] != '[]'}}`}}"
+            template: unsupported-test
+            arguments:
+              parameters:
+                - name: reason
+                  value: UnsupportedRackTest
+          - name: unsupported-node-workflow
+            when: >-
+              {{`{{=workflow.parameters['node-workflow-template'] != 'project-signal-gpu-full-node-certification' &&
+              workflow.parameters['node-workflow-template'] != 'project-signal-gpu-certification' &&
+              workflow.parameters['node-workflow-template'] != 'project-signal-gpu-burn-canary'}}`}}
+            template: unsupported-test
+            arguments:
+              parameters:
+                - name: reason
+                  value: UnsupportedNodeWorkflow
+
+    - name: unsupported-test
+      inputs:
+        parameters:
+          - name: reason
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-c"]
+        args:
+          - 'printf "No supported execution adapter: %s\n" "$REASON" >&2; exit 1'
+        env:
+          - name: REASON
+            value: "{{`{{inputs.parameters.reason}}`}}"

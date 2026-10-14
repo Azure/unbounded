@@ -466,38 +466,62 @@ func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.Certificat
 	}
 
 	workflowNodes := extractWorkflowNodes(workflow)
-	plan, planIssues := declaredStagePlan(run)
-	events := []stageEvent{}
-	logError := ""
 	pod := workflowPod(workflow, snapshot.pods)
 
-	if c.PodLogs != nil {
-		pods := workflowStagePods(workflow, snapshot.pods)
-		if len(pods) > maxStageLogPods {
-			pods = pods[:maxStageLogPods]
-			logError = "Structured stage events were truncated to the bounded pod limit."
-		}
-
-		for i := range pods {
-			content, err := c.PodLogs.ReadPodLog(ctx, c.Namespace, pods[i].Name, "main", maxStageLogLines, maxStageLogBytes)
-			if err != nil {
-				logError = "Structured stage events are temporarily unavailable."
-
-				continue
-			}
-
-			events = append(events, parseStageEvents(content)...)
-		}
-	}
-
-	executionPlan, eventIssues, currentStage := reconcileStagePlan(plan, events, run.Status.Phase.Terminal(), snapshot.refreshed)
-
-	planIssues = append(planIssues, eventIssues...)
-	if logError != "" {
-		planIssues = append(planIssues, logError)
-	}
+	var (
+		executionPlan []StageStatus
+		planIssues    []string
+		currentStage  string
+	)
 
 	argoTask := argoTaskStatus(workflowNodes)
+
+	if len(run.Spec.TestPlan) > 0 {
+		executionPlan, planIssues, currentStage = certificationTestStages(run, workflow, snapshot.aliases, snapshot.refreshed)
+
+		argoTask = StageStatus{
+			ID:             "test-group",
+			Name:           "Per-test certification group",
+			Phase:          firstNonempty(nestedString(workflow, "status", "phase"), string(run.Status.Phase)),
+			ExecutionState: nestedString(workflow, "status", "phase"),
+			Source:         "CertificationRun aggregate verdict and Argo execution",
+		}
+		if run.Status.Phase.Terminal() {
+			argoTask.Verdict = sanitizeDisplay(run.Status.Verdict)
+			argoTask.Reason = sanitizeDisplay(run.Status.Reason)
+		}
+	} else {
+		plan, declaredIssues := declaredStagePlan(run)
+		events := []stageEvent{}
+		logError := ""
+
+		if c.PodLogs != nil {
+			pods := workflowStagePods(workflow, snapshot.pods)
+			if len(pods) > maxStageLogPods {
+				pods = pods[:maxStageLogPods]
+				logError = "Structured stage events were truncated to the bounded pod limit."
+			}
+
+			for i := range pods {
+				content, err := c.PodLogs.ReadPodLog(ctx, c.Namespace, pods[i].Name, "main", maxStageLogLines, maxStageLogBytes)
+				if err != nil {
+					logError = "Structured stage events are temporarily unavailable."
+					continue
+				}
+
+				events = append(events, parseStageEvents(content)...)
+			}
+		}
+
+		var eventIssues []string
+
+		executionPlan, eventIssues, currentStage = reconcileStagePlan(plan, events, run.Status.Phase.Terminal(), snapshot.refreshed)
+
+		planIssues = append(declaredIssues, eventIssues...)
+		if logError != "" {
+			planIssues = append(planIssues, logError)
+		}
+	}
 
 	return RunDetail{
 		RunSummary:    summary,

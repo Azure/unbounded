@@ -113,20 +113,27 @@ type RunDetail struct {
 }
 
 type StageStatus struct {
-	ID               string     `json:"id"`
-	Name             string     `json:"name"`
-	Category         string     `json:"category,omitempty"`
-	Description      string     `json:"description,omitempty"`
-	ExpectedDuration string     `json:"expectedDuration,omitempty"`
-	Required         bool       `json:"required"`
-	Conditional      bool       `json:"conditional,omitempty"`
-	Phase            string     `json:"phase"`
-	Reason           string     `json:"reason,omitempty"`
-	Message          string     `json:"message,omitempty"`
-	StartedAt        *time.Time `json:"startedAt,omitempty"`
-	FinishedAt       *time.Time `json:"finishedAt,omitempty"`
-	Duration         string     `json:"duration,omitempty"`
-	Source           string     `json:"source"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	Category         string            `json:"category,omitempty"`
+	Description      string            `json:"description,omitempty"`
+	ExpectedDuration string            `json:"expectedDuration,omitempty"`
+	Required         bool              `json:"required"`
+	Conditional      bool              `json:"conditional,omitempty"`
+	Phase            string            `json:"phase"`
+	Reason           string            `json:"reason,omitempty"`
+	Message          string            `json:"message,omitempty"`
+	StartedAt        *time.Time        `json:"startedAt,omitempty"`
+	FinishedAt       *time.Time        `json:"finishedAt,omitempty"`
+	Duration         string            `json:"duration,omitempty"`
+	Source           string            `json:"source"`
+	NodeAlias        string            `json:"nodeAlias,omitempty"`
+	ExecutionState   string            `json:"executionState,omitempty"`
+	Verdict          string            `json:"verdict,omitempty"`
+	Attempt          int32             `json:"attempt,omitempty"`
+	Parameters       map[string]string `json:"parameters,omitempty"`
+	EvidenceURI      string            `json:"evidenceURI,omitempty"`
+	EvidenceDigest   string            `json:"evidenceDigest,omitempty"`
 }
 
 type ScriptStatus struct {

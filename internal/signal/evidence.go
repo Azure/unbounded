@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 
@@ -19,8 +20,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const maxEvidenceBytes = 16 * 1024 * 1024
+
 type EvidenceStore interface {
 	Put(context.Context, string, []byte) (string, string, error)
+}
+
+type EvidenceReader interface {
+	Get(context.Context, string) ([]byte, string, string, error)
 }
 
 type KubernetesEvidenceStore struct {
@@ -41,9 +48,9 @@ func NewKubernetesEvidenceStore(kube client.Client, namespace string) (*Kubernet
 }
 
 func (s *KubernetesEvidenceStore) Put(ctx context.Context, path string, data []byte) (string, string, error) {
-	name := strings.TrimSuffix(url.PathEscape(strings.TrimSuffix(path[strings.LastIndex(path, "/")+1:], ".json")), ".json")
-	if name == "" {
-		return "", "", fmt.Errorf("evidence path is required")
+	name, err := evidenceName(path)
+	if err != nil {
+		return "", "", err
 	}
 
 	sum := sha256.Sum256(data)
@@ -89,6 +96,58 @@ func (s *KubernetesEvidenceStore) Put(ctx context.Context, path string, data []b
 	}
 
 	return fmt.Sprintf("kubernetes://%s/configmaps/%s/evidence.json.gz", s.namespace, evidence.Name), digest, nil
+}
+
+func (s *KubernetesEvidenceStore) Get(ctx context.Context, path string) ([]byte, string, string, error) {
+	name, err := evidenceName(path)
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	var evidence corev1.ConfigMap
+	if err := s.kube.Get(ctx, client.ObjectKey{Namespace: s.namespace, Name: name + "-evidence"}, &evidence); err != nil {
+		return nil, "", "", err
+	}
+
+	if evidence.Immutable == nil || !*evidence.Immutable {
+		return nil, "", "", fmt.Errorf("evidence ConfigMap %s is not immutable", evidence.Name)
+	}
+
+	reader, err := gzip.NewReader(bytes.NewReader(evidence.BinaryData["evidence.json.gz"]))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("read evidence compression: %w", err)
+	}
+
+	data, readErr := io.ReadAll(io.LimitReader(reader, maxEvidenceBytes+1))
+	closeErr := reader.Close()
+
+	if readErr != nil {
+		return nil, "", "", fmt.Errorf("read evidence: %w", readErr)
+	}
+
+	if closeErr != nil {
+		return nil, "", "", fmt.Errorf("close evidence reader: %w", closeErr)
+	}
+
+	if len(data) > maxEvidenceBytes {
+		return nil, "", "", fmt.Errorf("evidence exceeds the supported read size")
+	}
+
+	digest := digestString(string(data))
+	if evidence.Annotations["signal.unbounded-cloud.io/evidence-digest"] != digest {
+		return nil, "", "", fmt.Errorf("evidence ConfigMap %s digest does not match its content", evidence.Name)
+	}
+
+	return data, fmt.Sprintf("kubernetes://%s/configmaps/%s/evidence.json.gz", s.namespace, evidence.Name), digest, nil
+}
+
+func evidenceName(path string) (string, error) {
+	name := strings.TrimSuffix(url.PathEscape(strings.TrimSuffix(path[strings.LastIndex(path, "/")+1:], ".json")), ".json")
+	if name == "" {
+		return "", fmt.Errorf("evidence path is required")
+	}
+
+	return name, nil
 }
 
 func compressEvidence(data []byte) ([]byte, error) {

@@ -34,6 +34,21 @@ type Participant struct {
 	NodeUID  types.UID `json:"nodeUID"`
 }
 
+type ParticipantSnapshot struct {
+	NodeName               string    `json:"nodeName"`
+	NodeUID                types.UID `json:"nodeUID"`
+	ObservedGPUCapacity    string    `json:"observedGPUCapacity"`
+	ObservedGPUAllocatable string    `json:"observedGPUAllocatable"`
+}
+
+type TestInvocation struct {
+	ID            string            `json:"id"`
+	NodeName      string            `json:"nodeName"`
+	NodeUID       types.UID         `json:"nodeUID"`
+	ContainerName string            `json:"containerName,omitempty"`
+	Parameters    map[string]string `json:"parameters,omitempty"`
+}
+
 type PinnedProfile struct {
 	Name       string    `json:"name"`
 	UID        types.UID `json:"uid"`
@@ -58,13 +73,17 @@ type ScriptSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.maxAttempts == oldSelf.maxAttempts",message="maxAttempts is immutable"
 // +kubebuilder:validation:XValidation:rule="self.tolerations == oldSelf.tolerations",message="tolerations are immutable"
 // +kubebuilder:validation:XValidation:rule="self.requestNodeName == oldSelf.requestNodeName",message="requestNodeName is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.participantPlan) == has(oldSelf.participantPlan) && (!has(self.participantPlan) || self.participantPlan == oldSelf.participantPlan)",message="participantPlan is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.testPlan) == has(oldSelf.testPlan) && (!has(self.testPlan) || self.testPlan == oldSelf.testPlan)",message="testPlan is immutable"
 type CertificationRunSpec struct {
-	Profile      PinnedProfile     `json:"profile"`
-	Participants []Participant     `json:"participants"`
-	Script       ScriptSnapshot    `json:"script"`
-	Workflow     WorkflowReference `json:"workflow"`
-	Backend      ExecutionBackend  `json:"backend"`
-	RunnerImage  string            `json:"runnerImage"`
+	Profile         PinnedProfile         `json:"profile"`
+	Participants    []Participant         `json:"participants"`
+	ParticipantPlan []ParticipantSnapshot `json:"participantPlan,omitempty"`
+	TestPlan        []TestInvocation      `json:"testPlan,omitempty"`
+	Script          ScriptSnapshot        `json:"script"`
+	Workflow        WorkflowReference     `json:"workflow"`
+	Backend         ExecutionBackend      `json:"backend"`
+	RunnerImage     string                `json:"runnerImage"`
 	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="purpose is immutable"
 	Purpose CertificationPurpose `json:"purpose,omitempty"`
@@ -91,6 +110,34 @@ type EvidenceStatus struct {
 	Digest string `json:"digest,omitempty"`
 }
 
+type TestResult struct {
+	TestInvocation `json:",inline"`
+
+	WorkflowName     string `json:"workflowName,omitempty"`
+	WorkflowUID      string `json:"workflowUID,omitempty"`
+	WorkflowNodeID   string `json:"workflowNodeID,omitempty"`
+	WorkflowNodeName string `json:"workflowNodeName,omitempty"`
+	TaskName         string `json:"taskName,omitempty"`
+	ContainerNodeID  string `json:"containerNodeID,omitempty"`
+	Attempt          int32  `json:"attempt"`
+	ScriptDigest     string `json:"scriptDigest"`
+	ExecutionState   string `json:"executionState"`
+	Verdict          string `json:"verdict"`
+	Reason           string `json:"reason"`
+	// +kubebuilder:validation:MaxLength=16384
+	Measurements string         `json:"measurements,omitempty"`
+	Evidence     EvidenceStatus `json:"evidence,omitempty"`
+}
+
+type AttemptStatus struct {
+	Workflow       WorkflowStatus `json:"workflow"`
+	ExecutionState string         `json:"executionState"`
+	Verdict        string         `json:"verdict"`
+	Reason         string         `json:"reason"`
+	FinishedAt     metav1.Time    `json:"finishedAt"`
+	Evidence       EvidenceStatus `json:"evidence,omitempty"`
+}
+
 type CleanupStatus struct {
 	ReservationsReleased bool `json:"reservationsReleased,omitempty"`
 	SnapshotDeleted      bool `json:"snapshotDeleted,omitempty"`
@@ -103,6 +150,8 @@ type CertificationRunStatus struct {
 	Reason         string             `json:"reason,omitempty"`
 	Workflow       WorkflowStatus     `json:"workflow,omitempty"`
 	Evidence       EvidenceStatus     `json:"evidence,omitempty"`
+	TestResults    []TestResult       `json:"testResults,omitempty"`
+	Attempts       []AttemptStatus    `json:"attempts,omitempty"`
 	Cleanup        CleanupStatus      `json:"cleanup,omitempty"`
 	StartedAt      *metav1.Time       `json:"startedAt,omitempty"`
 	FinishedAt     *metav1.Time       `json:"finishedAt,omitempty"`

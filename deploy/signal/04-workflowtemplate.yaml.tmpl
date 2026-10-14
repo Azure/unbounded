@@ -18,6 +18,8 @@ spec:
       - name: run-name
       - name: run-uid
       - name: participants
+      - name: participant-plan
+      - name: test-plan
       - name: script-configmap
       - name: script-key
       - name: script-digest
@@ -40,25 +42,65 @@ spec:
         defaultMode: 0555
   templates:
     - name: certification
+      steps:
+        - - name: node
+            template: node-tests
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{workflow.parameters.participants}}`}}"
+                - name: node-uid
+                  value: "{{`{{=jsonpath(workflow.parameters['participant-plan'], '$[0].nodeUID')}}`}}"
+
+    - name: node-tests
+      inputs:
+        parameters:
+          - name: node-name
+          - name: node-uid
       dag:
+        failFast: false
         tasks:
           - name: node-health
             template: node-health
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{inputs.parameters.node-name}}`}}"
+                - name: node-uid
+                  value: "{{`{{inputs.parameters.node-uid}}`}}"
           - name: mpi-backend
             dependencies: [node-health]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
             template: mpi-backend
-      outputs:
-        parameters:
-          - name: verdict
-            valueFrom:
-              parameter: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}}"
-          - name: reason
-            valueFrom:
-              parameter: "{{`{{tasks.node-health.outputs.parameters.reason}}`}}"
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{inputs.parameters.node-name}}`}}"
+                - name: node-uid
+                  value: "{{`{{inputs.parameters.node-uid}}`}}"
+                - name: device-inventory
+                  value: "{{`{{tasks.node-health.outputs.parameters.measurements}}`}}"
+            hooks:
+              exit:
+                template: cleanup-mpi
+                arguments:
+                  parameters:
+                    - name: node-name
+                      value: "{{`{{inputs.parameters.node-name}}`}}"
 
     - name: node-health
+      inputs:
+        parameters:
+          - name: node-name
+          - name: node-uid
+          - name: test-id
+            default: gpu-identity
+          - name: expected-gpu-product-regex
+            default: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+          - name: expected-gpu-count
+            default: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
       nodeSelector:
-        kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+        kubernetes.io/hostname: "{{`{{inputs.parameters.node-name}}`}}"
       podSpecPatch: >-
         {"tolerations": {{`{{workflow.parameters.tolerations}}`}}}
       container:
@@ -67,9 +109,9 @@ spec:
         command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
         env:
           - name: EXPECTED_GPU_PRODUCT_REGEX
-            value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+            value: "{{`{{inputs.parameters.expected-gpu-product-regex}}`}}"
           - name: EXPECTED_GPU_COUNT
-            value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+            value: "{{`{{inputs.parameters.expected-gpu-count}}`}}"
         resources:
           limits:
             nvidia.com/gpu: "1"
@@ -84,14 +126,41 @@ spec:
           emptyDir: {}
       outputs:
         parameters:
+          - name: test-id
+            value: "{{`{{inputs.parameters.test-id}}`}}"
+          - name: run-uid
+            value: "{{`{{workflow.parameters.run-uid}}`}}"
+          - name: node-name
+            value: "{{`{{inputs.parameters.node-name}}`}}"
+          - name: node-uid
+            value: "{{`{{inputs.parameters.node-uid}}`}}"
+          - name: attempt
+            value: "{{`{{workflow.parameters.attempt}}`}}"
+          - name: script-digest
+            value: "{{`{{workflow.parameters.script-digest}}`}}"
           - name: verdict
             valueFrom:
               path: /results/verdict
+              default: Inconclusive
           - name: reason
             valueFrom:
               path: /results/reason
+              default: MissingTestResult
+          - name: measurements
+            valueFrom:
+              path: /results/measurements.txt
+              default: ""
 
     - name: mpi-backend
+      inputs:
+        parameters:
+          - name: node-name
+          - name: node-uid
+          - name: test-id
+            default: mpi-backend
+          - name: device-inventory
+          - name: gpu-count
+            default: "1"
       resource:
         action: create
         setOwnerReference: true
@@ -101,7 +170,7 @@ spec:
           apiVersion: kubeflow.org/v2beta1
           kind: MPIJob
           metadata:
-            generateName: project-signal-mpi-
+            name: "{{`{{=sprig.trunc(40, workflow.name)}}`}}-{{`{{=sprig.trunc(12, sprig.sha256sum(inputs.parameters['node-name']))}}`}}"
             labels:
               signal.unbounded-cloud.io/run: "{{`{{workflow.parameters.run-name}}`}}"
           spec:
@@ -136,7 +205,7 @@ spec:
                   spec:
                     restartPolicy: Never
                     nodeSelector:
-                      kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+                      kubernetes.io/hostname: "{{`{{inputs.parameters.node-name}}`}}"
                     tolerations: {{`{{workflow.parameters.tolerations}}`}}
                     containers:
                       - name: worker
@@ -154,3 +223,39 @@ spec:
                         resources:
                           limits:
                             nvidia.com/gpu: "1"
+      outputs:
+        parameters:
+          - name: test-id
+            value: "{{`{{inputs.parameters.test-id}}`}}"
+          - name: run-uid
+            value: "{{`{{workflow.parameters.run-uid}}`}}"
+          - name: node-name
+            value: "{{`{{inputs.parameters.node-name}}`}}"
+          - name: node-uid
+            value: "{{`{{inputs.parameters.node-uid}}`}}"
+          - name: attempt
+            value: "{{`{{workflow.parameters.attempt}}`}}"
+          - name: script-digest
+            value: "{{`{{workflow.parameters.script-digest}}`}}"
+          - name: verdict
+            value: Pass
+          - name: reason
+            value: MPIBackendPassed
+          - name: measurements
+            valueFrom:
+              jsonPath: "{.status}"
+          - name: device-inventory
+            value: "{{`{{inputs.parameters.device-inventory}}`}}"
+
+    - name: cleanup-mpi
+      inputs:
+        parameters:
+          - name: node-name
+      resource:
+        action: delete
+        flags: ["--ignore-not-found=true", "--wait=true", "--cascade=foreground"]
+        manifest: |
+          apiVersion: kubeflow.org/v2beta1
+          kind: MPIJob
+          metadata:
+            name: "{{`{{=sprig.trunc(40, workflow.name)}}`}}-{{`{{=sprig.trunc(12, sprig.sha256sum(inputs.parameters['node-name']))}}`}}"
