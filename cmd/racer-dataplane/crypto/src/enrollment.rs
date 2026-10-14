@@ -267,7 +267,7 @@ impl<H: Host> Enrollment<H> {
     fn saved_identity(
         &self,
         bytes: &[u8],
-    ) -> Result<(EnrollmentResponse, LocalSigningIdentity), Error> {
+    ) -> Result<(PersistedIdentity, EnrollmentResponse, LocalSigningIdentity), Error> {
         let persisted =
             PersistedIdentity::decode(bytes).map_err(|_| Error::UnreadableIdentityRecord)?;
         let response = persisted
@@ -279,7 +279,20 @@ impl<H: Host> Enrollment<H> {
                     Error::CorruptRecord | Error::Wire(_) => Error::UnreadableIdentityRecord,
                     other => other,
                 })?;
-        Ok((response, identity))
+        Ok((persisted, response, identity))
+    }
+
+    /// Check that a reissued response for the committed enrollment certifies the
+    /// committed key for the same cluster and node. Issuers mint a new serial on
+    /// every call, so a re-POST of the same request yields different bytes.
+    fn same_committed_identity(
+        &self,
+        persisted: &PersistedIdentity,
+        identity: &LocalSigningIdentity,
+        response: &EnrollmentResponse,
+    ) -> bool {
+        self.validate(&persisted.pending, response)
+            .is_ok_and(|reissued| reissued.node == identity.node)
     }
 
     fn validate(
@@ -428,8 +441,11 @@ where
         })
     }
 
-    /// Commit a response, or return the usable saved identity for an exact retry.
-    /// A retry does not consume a newer pending request or change saved policy.
+    /// Commit a response, or return the usable saved identity for a retry. A retry
+    /// is either the committed response or a reissue that validates against the
+    /// trust roots and certifies the committed key for the same cluster, node,
+    /// and enrollment. A retry does not consume a newer pending request, rewrite
+    /// identity.json, or change saved policy.
     pub fn accept_response<'a>(
         &'a self,
         response: EnrollmentResponse,
@@ -457,10 +473,14 @@ where
                     // Only a usable identity binds renewal to its existing node.
                     // Unreadable records require explicit repair, as on recovery.
                     match self.saved_identity(&bytes) {
-                        Ok((existing, identity)) if existing.enrollment == response.enrollment => {
+                        Ok((persisted, existing, identity))
+                            if existing.enrollment == response.enrollment =>
+                        {
+                            // Keep the committed record and policy for any retry.
                             if wire::encode_enrollment_response(&existing).map_err(Error::from)?
                                 != wire::encode_enrollment_response(&response)
                                     .map_err(Error::from)?
+                                && !self.same_committed_identity(&persisted, &identity, &response)
                             {
                                 return Err(Error::Unauthorized.into());
                             }
@@ -489,7 +509,7 @@ where
                             }
                             return Ok(identity);
                         }
-                        Ok((existing, _))
+                        Ok((_, existing, _))
                             if existing.cluster != response.cluster
                                 || existing.node != response.node =>
                         {
@@ -550,7 +570,7 @@ where
                 Err(e) => return Err(e),
             };
             match self.saved_identity(&bytes) {
-                Ok((_, identity)) => {
+                Ok((_, _, identity)) => {
                     r.file_sync(dir.clone(), &scope).await?;
                     match secure::read_at(
                         r,
@@ -1739,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_response_retry_is_idempotent_and_preserves_newer_pending() {
+    fn committed_response_retry_and_reissue_are_idempotent_and_preserve_newer_pending() {
         let sim = Simulation::new();
         let _environment = sim.enter();
         let (files, e, scope) = fixture();
@@ -1763,12 +1783,33 @@ mod tests {
                 .unwrap();
             }
             let pending = sim.read_file(Path::new("/private/pending.json")).ok();
-            for case in ["policy", "node", "certificate"] {
+            for case in ["node", "other-node", "certificate", "key", "trust"] {
                 let mut changed = response.clone();
                 match case {
-                    "policy" => changed.block_devices = Some("different".into()),
                     "node" => changed.node = NodeId(CLUSTER.into()),
+                    "other-node" => {
+                        let other = "33333333-3333-4333-8333-333333333333";
+                        changed = issue(&request, &ca, &key, |params| {
+                            params.subject_alt_names = vec![rcgen::SanType::URI(
+                                format!("spiffe://{CLUSTER}/node/{other}")
+                                    .try_into()
+                                    .unwrap(),
+                            )];
+                        });
+                        changed.node = NodeId(other.into());
+                    }
                     "certificate" => changed.certificate_chain = vec![ca.der().to_vec()],
+                    "key" => {
+                        let mut other = e
+                            .request(&e.generate().unwrap(), vec![], NonZeroU32::new(4).unwrap())
+                            .unwrap();
+                        other.enrollment = request.enrollment.clone();
+                        changed = issue(&other, &ca, &key, |_| {});
+                    }
+                    "trust" => {
+                        let (rogue, rogue_key) = identity::test_util::ca();
+                        changed = issue(&request, &rogue, &rogue_key, |_| {});
+                    }
                     _ => unreachable!(),
                 }
                 assert!(
@@ -1780,7 +1821,26 @@ mod tests {
                     sim.read_file(Path::new("/private/pending.json")).ok(),
                     pending
                 );
+                assert_eq!(
+                    sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                    committed
+                );
             }
+            // A re-POST mints a new certificate, and may carry new policy, for
+            // the same key. It recovers the committed identity unchanged.
+            let mut reissued = issue(&request, &ca, &key, |params| {
+                params.serial_number = Some(vec![0x42; 8].into());
+            });
+            reissued.block_devices = Some("different".into());
+            assert_ne!(reissued.certificate_chain, response.certificate_chain);
+            let recovered = drive(&files, e.accept_response(reissued, &scope)).unwrap();
+            assert_eq!(recovered.enrollment, request.enrollment);
+            assert_eq!(recovered.certificate_chain(), response.certificate_chain);
+            assert_eq!(recovered.block_devices(), None);
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                committed
+            );
             let accepted = drive(&files, e.accept_response(response.clone(), &scope)).unwrap();
             assert_eq!(accepted.enrollment, request.enrollment);
             assert_eq!(accepted.certificate_chain(), response.certificate_chain);
