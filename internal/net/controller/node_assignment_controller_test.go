@@ -140,7 +140,7 @@ func TestNodeAssignmentControllerRestartDecisions(t *testing.T) {
 				pod.DeletionTimestamp = &now
 			}
 
-			client := kubefake.NewClientset(pod.DeepCopy())
+			client := kubefake.NewClientset(pod.DeepCopy(), node.DeepCopy())
 			controller := assignmentTestController(t, client, node, pod)
 
 			if err := controller.syncNode(t.Context(), node.Name); err != nil {
@@ -157,16 +157,10 @@ func TestNodeAssignmentControllerRestartDecisions(t *testing.T) {
 			}
 
 			if tt.wantDeleted {
-				action := client.Actions()[0]
-
-				deleteAction, ok := action.(interface{ GetDeleteOptions() metav1.DeleteOptions })
-				if !ok {
-					t.Fatalf("delete action type = %T", action)
-				}
-
-				options := deleteAction.GetDeleteOptions()
-				if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != pod.UID {
-					t.Fatalf("delete preconditions = %#v, want UID %s", options.Preconditions, pod.UID)
+				options := podDeleteOptions(t, client)
+				if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != pod.UID ||
+					options.Preconditions.ResourceVersion == nil {
+					t.Fatalf("delete preconditions = %#v, want UID %s and a resourceVersion", options.Preconditions, pod.UID)
 				}
 			}
 		})
@@ -199,6 +193,107 @@ func TestNodeAssignmentControllerSkipsOldTerminatingPodAndPendingReplacement(t *
 		if _, err := client.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{}); err != nil {
 			t.Fatalf("Pod %s unexpectedly deleted: %v", pod.Name, err)
 		}
+	}
+}
+
+func podDeleteOptions(t *testing.T, client *kubefake.Clientset) metav1.DeleteOptions {
+	t.Helper()
+
+	for _, action := range client.Actions() {
+		if action.GetVerb() != "delete" {
+			continue
+		}
+
+		deleteAction, ok := action.(interface{ GetDeleteOptions() metav1.DeleteOptions })
+		if !ok {
+			t.Fatalf("delete action type = %T", action)
+		}
+
+		return deleteAction.GetDeleteOptions()
+	}
+
+	t.Fatal("no delete action recorded")
+
+	return metav1.DeleteOptions{}
+}
+
+func TestNodeAssignmentControllerRevalidatesStaleNodeCache(t *testing.T) {
+	ack := map[string]string{
+		unboundednetv1alpha1.EffectiveSiteAnnotation:        "site-b",
+		unboundednetv1alpha1.EffectiveGatewayPoolAnnotation: "",
+	}
+	cachedNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   "node-a",
+		Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "site-a"},
+	}}
+	liveNode := cachedNode.DeepCopy()
+	liveNode.Labels[unboundedv1alpha3.MachineSiteLabelKey] = "site-b"
+	pod := assignmentTestPod(true, ack)
+
+	client := kubefake.NewClientset(pod.DeepCopy(), liveNode)
+
+	controller := assignmentTestController(t, client, cachedNode, pod)
+	if err := controller.syncNode(t.Context(), cachedNode.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("Pod acknowledging the live assignment was deleted: %v", err)
+	}
+
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "delete" {
+			t.Fatalf("unexpected delete action: %#v", action)
+		}
+	}
+}
+
+func TestNodeAssignmentControllerRevalidatesStalePodCache(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   "node-a",
+		Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "site-b"},
+	}}
+	cachedPod := assignmentTestPod(true, map[string]string{
+		unboundednetv1alpha1.EffectiveSiteAnnotation:        "site-a",
+		unboundednetv1alpha1.EffectiveGatewayPoolAnnotation: "",
+	})
+	livePod := cachedPod.DeepCopy()
+	livePod.Annotations = map[string]string{
+		unboundednetv1alpha1.EffectiveSiteAnnotation:        "site-b",
+		unboundednetv1alpha1.EffectiveGatewayPoolAnnotation: "",
+	}
+
+	client := kubefake.NewClientset(livePod, node.DeepCopy())
+
+	controller := assignmentTestController(t, client, node, cachedPod)
+	if err := controller.syncNode(t.Context(), node.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.CoreV1().Pods(livePod.Namespace).Get(t.Context(), livePod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("Pod with a current live acknowledgment was deleted: %v", err)
+	}
+}
+
+func TestNodeAssignmentControllerSkipsDeletedLiveNode(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   "node-a",
+		Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "site-b"},
+	}}
+	pod := assignmentTestPod(true, map[string]string{
+		unboundednetv1alpha1.EffectiveSiteAnnotation:        "site-a",
+		unboundednetv1alpha1.EffectiveGatewayPoolAnnotation: "",
+	})
+
+	client := kubefake.NewClientset(pod.DeepCopy())
+
+	controller := assignmentTestController(t, client, node, pod)
+	if err := controller.syncNode(t.Context(), node.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("Pod deleted after its Node was deleted: %v", err)
 	}
 }
 
