@@ -226,6 +226,10 @@ func (c *Client) rackPowerState(ctx context.Context) (PowerState, error) {
 			return "", fmt.Errorf("invalid blade power state %q", result.PowerState)
 		}
 
+		if result.PowerState == PowerOn && r.pending == recoveryResetOn {
+			r.pendingCompleted = true
+		}
+
 		return result.PowerState, nil
 	}
 

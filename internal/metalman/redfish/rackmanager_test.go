@@ -671,6 +671,119 @@ func TestRackManagerRecoveryTwoOutagesOnCachedClient(t *testing.T) {
 	require.Equal(t, int64(2), acCalls.Load())
 }
 
+func TestRackManagerPowerReadCompletesOnlyResetOnRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		op           recoveryOp
+		bladeState   PowerState
+		rackState    PowerState
+		wantState    PowerState
+		wantComplete bool
+	}{
+		{"resetOnBladeOn", recoveryResetOn, PowerOn, PowerOn, PowerOn, true},
+		{"resetOnBladeOff", recoveryResetOn, PowerOff, PowerOn, PowerOff, false},
+		{"resetOnRackOn", recoveryResetOn, "", PowerOn, "", false},
+		{"resetOnRackOff", recoveryResetOn, "", PowerOff, PowerOff, false},
+		{"clearOverrideBladeOn", recoveryClearOverride, PowerOn, PowerOn, PowerOn, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				acCalls    atomic.Int64
+				bladeReady atomic.Bool
+				rackOn     atomic.Bool
+			)
+
+			srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case rackManagerPath + "/SystemPower":
+					state := PowerOff
+					if rackOn.Load() {
+						state = PowerOn
+					}
+
+					_, _ = fmt.Fprintf(w, `{"System Power States":{"7":%q}}`, state)
+				case rackPowerOnPath:
+					assert.Equal(t, http.MethodPost, r.Method)
+					acCalls.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				case "/7" + rackSystemPath:
+					if r.Method == http.MethodGet && bladeReady.Load() {
+						_, _ = fmt.Fprintf(w, `{"PowerState":%q}`, tc.bladeState)
+						return
+					}
+
+					w.WriteHeader(http.StatusServiceUnavailable)
+				case "/7" + rackSystemPath + "/Actions/ComputerSystem.Reset":
+					assert.Equal(t, http.MethodPost, r.Method)
+					w.WriteHeader(http.StatusServiceUnavailable)
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+			})
+			c := dialRack(t, srv, "7")
+			now := time.Unix(100, 0)
+			c.rack.now = func() time.Time { return now }
+			operation := func() error {
+				if tc.op == recoveryClearOverride {
+					return c.DisableBootOverride(t.Context())
+				}
+
+				return c.Reset(t.Context(), ResetOn)
+			}
+			require.ErrorIs(t, operation(), ErrNotReady)
+			require.Equal(t, int64(1), acCalls.Load())
+			require.False(t, c.rack.pendingCompleted)
+
+			deadline := c.rack.deadline
+			now = now.Add(time.Minute)
+
+			bladeReady.Store(tc.bladeState != "")
+			rackOn.Store(tc.rackState == PowerOn)
+
+			for range 2 {
+				state, err := c.PowerState(t.Context())
+				require.Equal(t, tc.wantState, state)
+
+				if tc.wantState == "" {
+					require.ErrorIs(t, err, ErrNotReady)
+				} else {
+					require.NoError(t, err)
+				}
+
+				require.Equal(t, tc.wantComplete, c.rack.pendingCompleted)
+				require.Equal(t, tc.op, c.rack.pending)
+				require.Equal(t, deadline, c.rack.deadline)
+			}
+
+			bladeReady.Store(false)
+			rackOn.Store(false)
+
+			now = deadline.Add(-time.Second)
+
+			require.ErrorIs(t, operation(), ErrNotReady)
+			require.Equal(t, int64(1), acCalls.Load())
+			require.Equal(t, deadline, c.rack.deadline)
+
+			now = deadline.Add(time.Second)
+
+			err := operation()
+			if tc.wantComplete {
+				require.ErrorIs(t, err, ErrNotReady)
+				require.Equal(t, int64(2), acCalls.Load())
+				require.Equal(t, now.Add(rackRecoveryGrace), c.rack.deadline)
+			} else {
+				require.ErrorContains(t, err, "grace expired")
+				require.NotErrorIs(t, err, ErrNotReady)
+				require.Equal(t, int64(1), acCalls.Load())
+				require.Equal(t, deadline, c.rack.deadline)
+			}
+
+			require.Equal(t, tc.op, c.rack.pending)
+			require.False(t, c.rack.pendingCompleted)
+		})
+	}
+}
+
 func TestRackManagerRecoveryOperationsAndConcurrency(t *testing.T) {
 	for _, op := range []string{"boot", "disable", "on", "off", "read"} {
 		t.Run(op, func(t *testing.T) {
