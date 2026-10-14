@@ -38,6 +38,11 @@ func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, er
 
 	_, _, err := r.store.Update(ctx, false, func(l *ledger.Ledger) error {
 		now := r.clock.Now()
+
+		// Releases read here have committed, so confirm any that a lost
+		// follow-up write left unconfirmed.
+		l.Confirm(now)
+
 		keep := make(map[namespaceKey]bool)
 
 		for _, g := range l.Grants() {
@@ -77,6 +82,15 @@ func (r *reaper) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, er
 
 	for _, g := range removed {
 		ctrl.LoggerFrom(ctx).Info("removed node grant", "namespace", g.Namespace, "grant", g.Name, "expiresAt", g.ExpiresAt)
+	}
+
+	// Live removals are written unconfirmed. Now that they have committed,
+	// confirm them to start the handoff cooldown. On failure, the retry
+	// confirms them at the start of its sweep.
+	if len(removed) != 0 {
+		if err := r.store.Confirm(ctx, r.clock); err != nil {
+			return ctrl.Result{}, fmt.Errorf("confirm node grant removals: %w", err)
+		}
 	}
 
 	if next.IsZero() {

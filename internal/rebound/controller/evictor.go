@@ -33,10 +33,10 @@ const sweepInterval = 15 * time.Second
 const maxListAttempts = 3
 
 // handoffMargin is how long before ledger.HandoffCooldown ends a delete
-// authorized by a ledger read must be finished. It covers the time a release
-// write takes between the API server reading its clock and the write
-// committing, the time a delete takes to commit after its context ends, and
-// clock skew between rebound replicas. Each delete runs within
+// authorized by a ledger read must be finished. It covers the time a delete
+// takes to commit after its context ends and clock skew between rebound
+// replicas. Release write latency needs no margin: the cooldown counts from a
+// confirmation time read after the removal committed. Each delete runs within
 // HandoffCooldown minus this margin of the read that authorized it.
 const handoffMargin = 4 * time.Second
 
@@ -155,13 +155,15 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		// metadata read is enough. A new version is read in full and only
 		// stops the sweep if it changed this node's records.
 		//
-		// The read also starts the delete's deadline. A release that the
-		// read did not see commits after checkedAt, and its ReleasedAt is
-		// at most handoffMargin earlier. The API server rejects new grants
-		// on the node for ledger.HandoffCooldown after ReleasedAt, so a
-		// delete that ends by the deadline cannot remove a pod that a new
-		// grant admitted. A grant that expires is released at ExpiresAt,
-		// which is after checkedAt because of the expiry check below.
+		// The read also starts the delete's deadline. A removal that the
+		// read did not see commits after checkedAt, and its release is
+		// confirmed by a write that read it back, so ConfirmedAt is after
+		// checkedAt however slow the removal write was. The API server
+		// rejects new grants on the node while the release is unconfirmed
+		// and for ledger.HandoffCooldown after ConfirmedAt, so a delete
+		// that ends by the deadline cannot remove a pod that a new grant
+		// admitted. A grant that expires is confirmed at ExpiresAt, which
+		// is after checkedAt because of the expiry check below.
 		// Clocks of rebound replicas are assumed to agree within the
 		// margin; the controller and API server run in the same binary
 		// but can be on different replicas.

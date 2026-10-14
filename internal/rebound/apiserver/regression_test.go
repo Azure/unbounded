@@ -483,8 +483,9 @@ func TestWatchResumeWithinInitialEvents(t *testing.T) {
 
 	_, _, err = s.Delete(ctx, "first", nil, nil)
 	require.NoError(t, err)
+	// The release confirmation write follows the delete.
 	cached(t, s)
-	event(t, resumed, watch.Deleted, "first", "4")
+	event(t, resumed, watch.Deleted, "first", "5")
 }
 
 func TestWatchResumeWithinDeletionBatch(t *testing.T) {
@@ -531,10 +532,12 @@ func TestWatchResumeWithinDeletionBatch(t *testing.T) {
 
 			defer resumed.Stop()
 
+			// The release confirmation write follows the deletes, so the
+			// batch ends one version past the removal.
 			event(t, resumed, watch.Deleted, "first", "3")
-			event(t, resumed, watch.Deleted, "second", "4")
+			event(t, resumed, watch.Deleted, "second", "5")
 
-			for i := 5; i < historyLimit+5; i++ {
+			for i := 6; i < historyLimit+6; i++ {
 				cm.ResourceVersion = fmt.Sprint(i)
 				s.observe(cm, false)
 			}

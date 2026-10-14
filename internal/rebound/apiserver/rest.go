@@ -32,6 +32,7 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	apistorage "k8s.io/apiserver/pkg/storage"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 
 	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
@@ -280,7 +281,15 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		Holder: holder, Labels: maps.Clone(g.Labels), Annotations: maps.Clone(g.Annotations),
 	}
 
-	_, rv, err := s.store.Update(ctx, options != nil && dryRun(options.DryRun), func(l *ledger.Ledger) error {
+	dry := options != nil && dryRun(options.DryRun)
+
+	// fenced holds a cooldown error that Create returns after committing
+	// the confirmation of unconfirmed releases it read.
+	var fenced error
+
+	_, rv, err := s.store.Update(ctx, dry, func(l *ledger.Ledger) error {
+		fenced = nil
+
 		namespace, err := s.store.Client.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return &mutationError{apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), g.Name,
@@ -318,11 +327,28 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		// A node whose previous grant just ended may still have pod
 		// deletes in flight that the old grant authorized.
 		if err := l.CheckCooldown(record.Nodes, now); err != nil {
-			return err
+			var cooldown *ledger.CooldownError
+			if dry || !errors.As(err, &cooldown) || !cooldown.Unconfirmed {
+				return err
+			}
+
+			// This read shows the removals committed, so confirm them now.
+			// That way a removal whose follow-up confirmation was lost
+			// does not fence its nodes forever. The cooldown error says to
+			// retry after a full HandoffCooldown from now.
+			l.Confirm(now)
+
+			fenced = err
+
+			return nil
 		}
 
 		return l.Add(record)
 	})
+	if err == nil {
+		err = fenced
+	}
+
 	if err != nil {
 		return nil, storageError(g.Name, err)
 	}
@@ -566,7 +592,7 @@ func validateDelete(ctx context.Context, g *rebound.NodeGrant, validate rest.Val
 func (s *storage) Delete(ctx context.Context, name string, validate rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
 	var deleted *rebound.NodeGrant
 
-	_, rv, err := s.store.Update(ctx, options != nil && dryRun(options.DryRun), func(l *ledger.Ledger) error {
+	_, rv, err := s.store.Update(ctx, deleteDryRun(options), func(l *ledger.Ledger) error {
 		g, ok := l.Get(types.NamespacedName{Namespace: request.NamespaceValue(ctx), Name: name})
 		if !ok {
 			return &mutationError{apierrors.NewNotFound(rebound.GroupResource(), name)}
@@ -585,6 +611,10 @@ func (s *storage) Delete(ctx context.Context, name string, validate rest.Validat
 		return nil, false, storageError(name, err)
 	}
 
+	if !deleteDryRun(options) {
+		s.confirmRemovals(ctx)
+	}
+
 	deleted.ResourceVersion = rv
 
 	return deleted, true, nil
@@ -598,7 +628,7 @@ func (s *storage) DeleteCollection(ctx context.Context, validate rest.ValidateOb
 
 	result := &rebound.NodeGrantList{}
 
-	_, rv, err := s.store.Update(ctx, options != nil && dryRun(options.DryRun), func(l *ledger.Ledger) error {
+	_, rv, err := s.store.Update(ctx, deleteDryRun(options), func(l *ledger.Ledger) error {
 		result.Items = []rebound.NodeGrant{}
 
 		for _, g := range l.Grants() {
@@ -622,12 +652,30 @@ func (s *storage) DeleteCollection(ctx context.Context, validate rest.ValidateOb
 		return nil, storageError("", err)
 	}
 
+	if len(result.Items) != 0 && !deleteDryRun(options) {
+		s.confirmRemovals(ctx)
+	}
+
 	result.ResourceVersion = rv
 	for i := range result.Items {
 		result.Items[i].ResourceVersion = rv
 	}
 
 	return result, nil
+}
+
+func deleteDryRun(options *metav1.DeleteOptions) bool {
+	return options != nil && dryRun(options.DryRun)
+}
+
+// confirmRemovals confirms releases after the write that removed their grants
+// returned, which starts the handoff cooldown. It is best effort: the removal
+// has already succeeded, and an unconfirmed release keeps its nodes fenced
+// until a later Create or reaper sweep confirms it.
+func (s *storage) confirmRemovals(ctx context.Context) {
+	if err := s.store.Confirm(ctx, s.clock); err != nil {
+		klog.FromContext(ctx).Error(err, "Confirm node grant removal; a later create or sweep will confirm it")
+	}
 }
 
 func grantObject(g *ledger.Grant, rv string) *rebound.NodeGrant {

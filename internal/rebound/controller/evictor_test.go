@@ -1110,6 +1110,8 @@ func TestEvictorReleaseIndex(t *testing.T) {
 
 	require.Equal(t, []string{"third/p"}, remaining(t, c))
 
+	// Unconfirmed releases are never dropped, so confirm them first.
+	l.Confirm(testNow)
 	l.Reap(testNow.Add(ledger.ReleaseRetention), nil)
 	g := &ledger.Grant{Namespace: "third", Name: "new", UID: "u4", Nodes: []string{"a"}, CreatedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour)}
 	require.NoError(t, l.Add(g))
@@ -1369,9 +1371,16 @@ func TestEvictorHandoffDuringDelete(t *testing.T) {
 		l := ledger.Parse(cm.Data)
 		require.True(t, l.Remove(old.Key(), now))
 
-		// tenant-b is refused until well after the delete's deadline.
+		// tenant-b is refused until well after the delete's deadline,
+		// both before the removal is confirmed and once it is.
 		var cooldown *ledger.CooldownError
 		require.ErrorAs(t, l.CheckCooldown(handoff.Nodes, now), &cooldown)
+		require.True(t, cooldown.Unconfirmed)
+		require.GreaterOrEqual(t, cooldown.RetryAfter-pending, handoffMargin)
+
+		require.True(t, l.Confirm(now))
+		require.ErrorAs(t, l.CheckCooldown(handoff.Nodes, now), &cooldown)
+		require.False(t, cooldown.Unconfirmed)
 		require.GreaterOrEqual(t, cooldown.RetryAfter-pending, handoffMargin)
 
 		cm.Data = l.Encode()

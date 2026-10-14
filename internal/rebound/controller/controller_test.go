@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -291,10 +292,78 @@ func TestReaperStampsReleaseAfterNamespaceLookup(t *testing.T) {
 	require.Len(t, releases, 1)
 	require.True(t, afterLookup.Equal(releases[0].ReleasedAt), "ReleasedAt %v, want %v", releases[0].ReleasedAt, afterLookup)
 	require.True(t, afterLookup.Add(ledger.ReleaseRetention).Equal(releases[0].DropAt), "DropAt %v", releases[0].DropAt)
+	// The live removal is confirmed by a write after it commits.
+	require.True(t, afterLookup.Equal(releases[0].ConfirmedAt), "ConfirmedAt %v, want %v", releases[0].ConfirmedAt, afterLookup)
 
 	var cooldown *ledger.CooldownError
 	require.ErrorAs(t, l.CheckCooldown([]string{"node"}, clk.Now()), &cooldown)
 	require.Equal(t, ledger.HandoffCooldown, cooldown.RetryAfter)
+}
+
+// TestReaperConfirmsReleases checks that a sweep confirms a release whose
+// follow-up confirmation was lost, so the node is not fenced forever.
+func TestReaperConfirmsReleases(t *testing.T) {
+	g := grant("tenant", "g", "node", time.Hour)
+	g.UID = "grant-uid"
+
+	l := ledger.New()
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), testNow))
+	require.True(t, l.Unconfirmed())
+
+	cm := configMap(t)
+	cm.Data = l.Encode()
+	kube := kubefake.NewClientset(cm)
+	clk := clocktesting.NewFakeClock(testNow.Add(time.Minute))
+	reader := clientBuilder(t).Build()
+	r := &reaper{reader: reader, apiReader: reader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clk}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err)
+
+	after, err := kube.CoreV1().ConfigMaps("system").Get(t.Context(), ledger.ConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	releases := ledger.Parse(after.Data).Releases()
+	require.Len(t, releases, 1)
+	require.True(t, clk.Now().Equal(releases[0].ConfirmedAt), "ConfirmedAt %v", releases[0].ConfirmedAt)
+}
+
+// TestReaperConfirmFailure checks that a failed confirmation after a live
+// removal fails the sweep, so it is retried, and leaves the node fenced.
+func TestReaperConfirmFailure(t *testing.T) {
+	g := grant("missing", "gone", "node", time.Hour)
+	g.UID = "grant-uid"
+	kube := kubefake.NewClientset(configMap(t, g))
+
+	updates := 0
+
+	kube.PrependReactor("update", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		updates++
+		if updates > 1 {
+			return true, nil, apierrors.NewServiceUnavailable("ledger unavailable")
+		}
+
+		return false, nil, nil
+	})
+
+	reader := clientBuilder(t).Build()
+	r := &reaper{reader: reader, apiReader: reader, store: &ledger.Store{Client: kube, Namespace: "system"}, clock: clocktesting.NewFakeClock(testNow)}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{})
+	require.True(t, apierrors.IsServiceUnavailable(err), "%v", err)
+	require.Equal(t, 2, updates)
+
+	after, err := kube.CoreV1().ConfigMaps("system").Get(t.Context(), ledger.ConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	l := ledger.Parse(after.Data)
+	require.Empty(t, l.Grants())
+	require.True(t, l.Unconfirmed())
+
+	var cooldown *ledger.CooldownError
+	require.ErrorAs(t, l.CheckCooldown([]string{"node"}, testNow.Add(time.Hour)), &cooldown)
+	require.True(t, cooldown.Unconfirmed)
 }
 
 func TestReaperMixedNamespaceUIDs(t *testing.T) {

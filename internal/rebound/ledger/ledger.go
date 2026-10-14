@@ -42,12 +42,15 @@ const (
 	// The evictor must act on it within this time.
 	ReleaseRetention = 10 * time.Minute
 
-	// HandoffCooldown is how long a node cannot be granted again after a grant
-	// on it ends. The evictor issues a delete authorized by an active grant
-	// only within HandoffCooldown minus a margin of the ledger read that
-	// authorized it, and cancels it at that point. So a delete authorized by
-	// the old grant has finished before a new grant can admit pods. See
-	// evictor.Reconcile for the margin and the clock assumptions.
+	// HandoffCooldown is how long a node cannot be granted again after the
+	// removal of its grant is confirmed (see Release.ConfirmedAt). The
+	// evictor issues a delete authorized by an active grant only within
+	// HandoffCooldown minus a margin of the ledger read that authorized it,
+	// and cancels it at that point. A read that saw the grant happened
+	// before the removal committed, and so before it was confirmed. So a
+	// delete authorized by the old grant has finished before a new grant can
+	// admit pods. See evictor.Reconcile for the margin and the clock
+	// assumptions.
 	HandoffCooldown = 10 * time.Second
 
 	grantKeyPrefix   = "_grant."
@@ -83,7 +86,16 @@ func (g *Grant) Expired(now time.Time) bool {
 // created while the grant was active are evicted. NamespaceUID is the grant's
 // namespace UID, so pods in a namespace recreated with the same name are not
 // evicted; it is empty for older records and grants. ReleasedAt is the grant's
-// end time; DropAt is when the record can be removed.
+// end time; DropAt is when the record can be removed, though Reap keeps it
+// while it is unconfirmed and until its handoff cooldown ends.
+//
+// ConfirmedAt is a time at or after the removal was durably committed. The
+// handoff cooldown counts from it, because a removal stamped at ReleasedAt
+// can commit much later, and until then the evictor still sees the grant.
+// A grant that expired is gone for the evictor from ExpiresAt whether or not
+// it is still stored, so its release is confirmed at ReleasedAt when written.
+// A live removal is written unconfirmed and confirmed by a later write that
+// read it back. A zero ConfirmedAt fences the node until then.
 type Release struct {
 	UID          types.UID `json:"-"`
 	Namespace    string    `json:"namespace"`
@@ -91,6 +103,7 @@ type Release struct {
 	Nodes        []string  `json:"nodes"`
 	CreatedAt    time.Time `json:"createdAt"`
 	ReleasedAt   time.Time `json:"releasedAt"`
+	ConfirmedAt  time.Time `json:"confirmedAt,omitzero"`
 	DropAt       time.Time `json:"dropAt"`
 }
 
@@ -103,11 +116,13 @@ func (e *ConflictError) Error() string {
 	return fmt.Sprintf("nodes already granted: %s", strings.Join(e.Nodes, ", "))
 }
 
-// CooldownError reports nodes whose previous grant ended less than
-// HandoffCooldown ago.
+// CooldownError reports nodes whose previous grant's removal was confirmed
+// less than HandoffCooldown ago, or is not confirmed yet. Unconfirmed is set
+// in the latter case.
 type CooldownError struct {
-	Nodes      []string
-	RetryAfter time.Duration
+	Nodes       []string
+	RetryAfter  time.Duration
+	Unconfirmed bool
 }
 
 func (e *CooldownError) Error() string {
@@ -342,11 +357,13 @@ func (l *Ledger) Add(g *Grant) error {
 }
 
 // CheckCooldown returns *CooldownError if any of nodes has a release record
-// that ended less than HandoffCooldown before now, and nil otherwise.
+// that is unconfirmed or was confirmed less than HandoffCooldown before now,
+// and nil otherwise. For an unconfirmed release, RetryAfter assumes it is
+// confirmed at now.
 //
-// The cooldown counts from ReleasedAt, which is the grant's expiry for a grant
-// reaped after it expired. That is enough: the evictor treats a grant as gone
-// from its expiry, whether or not it is still in the ledger.
+// The cooldown counts from ConfirmedAt, which is the grant's expiry for a
+// grant reaped after it expired. That is enough: the evictor treats a grant
+// as gone from its expiry, whether or not it is still in the ledger.
 func (l *Ledger) CheckCooldown(nodes []string, now time.Time) error {
 	want := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
@@ -354,13 +371,16 @@ func (l *Ledger) CheckCooldown(nodes []string, now time.Time) error {
 	}
 
 	var (
-		fenced []string
-		until  time.Time
+		fenced      []string
+		until       time.Time
+		unconfirmed bool
 	)
 
 	for _, r := range l.releases {
-		end := r.ReleasedAt.Add(HandoffCooldown)
-		if !now.Before(end) {
+		end := r.ConfirmedAt.Add(HandoffCooldown)
+		if r.ConfirmedAt.IsZero() {
+			end = now.Add(HandoffCooldown)
+		} else if !now.Before(end) {
 			continue
 		}
 
@@ -376,6 +396,10 @@ func (l *Ledger) CheckCooldown(nodes []string, now time.Time) error {
 		if hit && end.After(until) {
 			until = end
 		}
+
+		if hit && r.ConfirmedAt.IsZero() {
+			unconfirmed = true
+		}
 	}
 
 	if len(fenced) == 0 {
@@ -384,7 +408,35 @@ func (l *Ledger) CheckCooldown(nodes []string, now time.Time) error {
 
 	slices.Sort(fenced)
 
-	return &CooldownError{Nodes: slices.Compact(fenced), RetryAfter: until.Sub(now)}
+	return &CooldownError{Nodes: slices.Compact(fenced), RetryAfter: until.Sub(now), Unconfirmed: unconfirmed}
+}
+
+// Confirm sets ConfirmedAt to now on every unconfirmed release. Callers must
+// have read the ledger from a committed ConfigMap, which shows the removals
+// are durable, and must read now after that read. It reports whether any
+// release changed.
+func (l *Ledger) Confirm(now time.Time) bool {
+	changed := false
+
+	for _, r := range l.releases {
+		if r.ConfirmedAt.IsZero() {
+			r.ConfirmedAt = now
+			changed = true
+		}
+	}
+
+	return changed
+}
+
+// Unconfirmed reports whether any release is unconfirmed.
+func (l *Ledger) Unconfirmed() bool {
+	for _, r := range l.releases {
+		if r.ConfirmedAt.IsZero() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Releases returns all release records sorted by UID.
@@ -402,17 +454,19 @@ func (l *Ledger) Releases() []*Release {
 // Remove deletes a grant and records a Release for it. The grant ends at now,
 // or at ExpiresAt if it has already expired, so pods created after expiry are
 // not treated as created during the grant. Release retention starts at now.
-// It reports whether the grant existed.
+// The release of an expired grant is confirmed at ExpiresAt; any other release
+// is left unconfirmed until Confirm runs after the removal commits. It
+// reports whether the grant existed.
 func (l *Ledger) Remove(key types.NamespacedName, now time.Time) bool {
-	releasedAt := now
-	if g, ok := l.grants[key]; ok && g.Expired(now) {
-		releasedAt = g.ExpiresAt
+	g, ok := l.grants[key]
+	if ok && g.Expired(now) {
+		return l.remove(key, g.ExpiresAt, g.ExpiresAt, now)
 	}
 
-	return l.remove(key, releasedAt, now)
+	return l.remove(key, now, time.Time{}, now)
 }
 
-func (l *Ledger) remove(key types.NamespacedName, releasedAt, now time.Time) bool {
+func (l *Ledger) remove(key types.NamespacedName, releasedAt, confirmedAt, now time.Time) bool {
 	g, ok := l.grants[key]
 	if !ok {
 		return false
@@ -423,7 +477,7 @@ func (l *Ledger) remove(key types.NamespacedName, releasedAt, now time.Time) boo
 	if g.UID != "" {
 		l.releases[g.UID] = &Release{
 			UID: g.UID, Namespace: g.Namespace, NamespaceUID: g.NamespaceUID, Nodes: g.Nodes,
-			CreatedAt: g.CreatedAt, ReleasedAt: releasedAt, DropAt: now.Add(ReleaseRetention),
+			CreatedAt: g.CreatedAt, ReleasedAt: releasedAt, ConfirmedAt: confirmedAt, DropAt: now.Add(ReleaseRetention),
 		}
 	}
 
@@ -437,18 +491,20 @@ func (l *Ledger) remove(key types.NamespacedName, releasedAt, now time.Time) boo
 }
 
 // Reap removes grants that are expired at now or for which keep returns
-// false, and drops releases at DropAt. Expired grants end at ExpiresAt;
-// other removals end at now. Release retention starts at now. It returns the
+// false, and drops confirmed releases at DropAt, or at the end of their
+// handoff cooldown if that is later. Unconfirmed releases are kept. Expired grants end at ExpiresAt and
+// their releases are confirmed then; other removals end at now and are left
+// unconfirmed. Release retention starts at now. It returns the
 // removed grants and the next time Reap has work to do (zero if never).
 func (l *Ledger) Reap(now time.Time, keep func(*Grant) bool) (removed []*Grant, next time.Time) {
 	for _, g := range l.Grants() {
 		if g.Expired(now) || (keep != nil && !keep(g)) {
-			releasedAt := now
 			if g.Expired(now) {
-				releasedAt = g.ExpiresAt
+				l.remove(g.Key(), g.ExpiresAt, g.ExpiresAt, now)
+			} else {
+				l.remove(g.Key(), now, time.Time{}, now)
 			}
 
-			l.remove(g.Key(), releasedAt, now)
 			removed = append(removed, g)
 
 			continue
@@ -460,10 +516,21 @@ func (l *Ledger) Reap(now time.Time, keep func(*Grant) bool) (removed []*Grant, 
 	}
 
 	for uid, r := range l.releases {
-		if !now.Before(r.DropAt) {
+		if r.ConfirmedAt.IsZero() {
+			// Keep fencing the nodes until the removal is confirmed.
+			continue
+		}
+
+		dropAt := r.DropAt
+		if end := r.ConfirmedAt.Add(HandoffCooldown); end.After(dropAt) {
+			// The record fences its nodes until the cooldown ends.
+			dropAt = end
+		}
+
+		if !now.Before(dropAt) {
 			delete(l.releases, uid)
-		} else if next.IsZero() || r.DropAt.Before(next) {
-			next = r.DropAt
+		} else if next.IsZero() || dropAt.Before(next) {
+			next = dropAt
 		}
 	}
 

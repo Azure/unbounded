@@ -193,7 +193,7 @@ func TestRemoveExpiredEndsAtExpiry(t *testing.T) {
 	require.True(t, l.Remove(g.Key(), now))
 	require.Equal(t, []*Release{{
 		UID: "first", Namespace: "tenant", Nodes: []string{"node-a"},
-		CreatedAt: g.CreatedAt, ReleasedAt: g.ExpiresAt, DropAt: now.Add(ReleaseRetention),
+		CreatedAt: g.CreatedAt, ReleasedAt: g.ExpiresAt, ConfirmedAt: g.ExpiresAt, DropAt: now.Add(ReleaseRetention),
 	}}, l.Releases())
 }
 
@@ -265,7 +265,12 @@ func TestReleaseParseLegacyRetention(t *testing.T) {
 			require.Len(t, l.Releases(), 1)
 			r := l.Releases()[0]
 			require.Equal(t, r.ReleasedAt.Add(ReleaseRetention), r.DropAt)
-			_, next := l.Reap(r.ReleasedAt, nil)
+			// Older records are unconfirmed and kept until confirmed.
+			_, next := l.Reap(r.DropAt, nil)
+			require.True(t, next.IsZero())
+			require.Len(t, l.Releases(), 1)
+			l.Confirm(r.ReleasedAt)
+			_, next = l.Reap(r.ReleasedAt, nil)
 			require.Equal(t, r.DropAt, next)
 			_, next = l.Reap(r.DropAt, nil)
 			require.True(t, next.IsZero())
@@ -286,7 +291,7 @@ func TestReapLateExpiry(t *testing.T) {
 	require.Empty(t, l.Grants())
 	require.Equal(t, []*Release{{
 		UID: g.UID, Namespace: g.Namespace, Nodes: g.Nodes,
-		CreatedAt: g.CreatedAt, ReleasedAt: g.ExpiresAt, DropAt: dropAt,
+		CreatedAt: g.CreatedAt, ReleasedAt: g.ExpiresAt, ConfirmedAt: g.ExpiresAt, DropAt: dropAt,
 	}}, l.Releases())
 	require.Equal(t, dropAt, next)
 
@@ -326,6 +331,11 @@ func TestReap(t *testing.T) {
 	require.Equal(t, now.Add(-time.Second), l.Releases()[1].ReleasedAt)
 	require.Equal(t, now, l.Releases()[2].ReleasedAt)
 
+	// The live removal of "rejected" is unconfirmed; confirm it as the
+	// reaper would after the removal commits.
+	require.True(t, l.Releases()[2].ConfirmedAt.IsZero())
+	require.True(t, l.Confirm(now))
+
 	for _, r := range l.Releases() {
 		require.Equal(t, now.Add(ReleaseRetention), r.DropAt)
 	}
@@ -359,9 +369,11 @@ func TestCheckCooldown(t *testing.T) {
 	g := testGrant("first", "node-a", "node-b")
 	require.NoError(t, l.Add(g))
 
-	// Removed before expiry: the cooldown counts from the removal.
+	// Removed before expiry: the cooldown counts from the confirmation,
+	// here at the same time as the removal.
 	removed := g.CreatedAt.Add(time.Minute)
 	require.True(t, l.Remove(g.Key(), removed))
+	require.True(t, l.Confirm(removed))
 
 	require.NoError(t, l.CheckCooldown([]string{"node-c"}, removed))
 
@@ -371,6 +383,7 @@ func TestCheckCooldown(t *testing.T) {
 	require.ErrorAs(t, err, &cooldown)
 	require.Equal(t, []string{"node-a", "node-b"}, cooldown.Nodes)
 	require.Equal(t, HandoffCooldown-time.Second, cooldown.RetryAfter)
+	require.False(t, cooldown.Unconfirmed)
 
 	require.NoError(t, l.CheckCooldown([]string{"node-a"}, removed.Add(HandoffCooldown)))
 
@@ -410,6 +423,120 @@ func TestCheckCooldownLatestRelease(t *testing.T) {
 
 	var cooldown *CooldownError
 	require.ErrorAs(t, err, &cooldown)
+	// Neither record is confirmed, so both fence the node for a full
+	// cooldown from now.
 	require.Equal(t, HandoffCooldown, cooldown.RetryAfter)
+	require.True(t, cooldown.Unconfirmed)
 	require.Contains(t, err.Error(), "retry in 10s")
+}
+
+// TestCheckCooldownUnconfirmed checks that a live removal fences its nodes
+// until it is confirmed, however long ago it was stamped, and then for a full
+// HandoffCooldown from the confirmation.
+func TestCheckCooldownUnconfirmed(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	require.NoError(t, l.Add(g))
+
+	removed := g.CreatedAt.Add(time.Minute)
+	require.True(t, l.Remove(g.Key(), removed))
+	require.True(t, l.Releases()[0].ConfirmedAt.IsZero())
+	require.True(t, l.Unconfirmed())
+
+	// The removal write was slow: it is still unconfirmed well after the
+	// cooldown from ReleasedAt would have ended.
+	late := removed.Add(3 * HandoffCooldown)
+
+	var cooldown *CooldownError
+	require.ErrorAs(t, l.CheckCooldown([]string{"node-a"}, late), &cooldown)
+	require.True(t, cooldown.Unconfirmed)
+	require.Equal(t, HandoffCooldown, cooldown.RetryAfter)
+	require.NoError(t, l.CheckCooldown([]string{"node-b"}, late))
+
+	require.True(t, l.Confirm(late))
+	require.False(t, l.Unconfirmed())
+	require.Equal(t, late, l.Releases()[0].ConfirmedAt)
+	require.Equal(t, removed, l.Releases()[0].ReleasedAt)
+
+	// Confirming again keeps the first confirmation.
+	require.False(t, l.Confirm(late.Add(time.Hour)))
+	require.Equal(t, late, l.Releases()[0].ConfirmedAt)
+
+	require.ErrorAs(t, l.CheckCooldown([]string{"node-a"}, late.Add(HandoffCooldown-time.Nanosecond)), &cooldown)
+	require.False(t, cooldown.Unconfirmed)
+	require.Equal(t, time.Nanosecond, cooldown.RetryAfter)
+	require.NoError(t, l.CheckCooldown([]string{"node-a"}, late.Add(HandoffCooldown)))
+}
+
+// TestReapConfirmation checks that Reap confirms releases of expired grants
+// at their expiry and leaves live removals unconfirmed.
+func TestReapConfirmation(t *testing.T) {
+	l := New()
+	expired := testGrant("expired", "node-a")
+	live := testGrant("live", "node-b")
+	live.ExpiresAt = expired.ExpiresAt.Add(time.Hour)
+
+	require.NoError(t, l.Add(expired))
+	require.NoError(t, l.Add(live))
+
+	now := expired.ExpiresAt.Add(time.Minute)
+	removed, _ := l.Reap(now, func(*Grant) bool { return false })
+	require.Len(t, removed, 2)
+
+	byUID := map[types.UID]*Release{}
+	for _, r := range l.Releases() {
+		byUID[r.UID] = r
+	}
+
+	require.Equal(t, expired.ExpiresAt, byUID[expired.UID].ConfirmedAt)
+	require.True(t, byUID[live.UID].ConfirmedAt.IsZero())
+
+	// The expired grant needs no wait beyond its expiry plus the cooldown.
+	require.NoError(t, l.CheckCooldown([]string{"node-a"}, expired.ExpiresAt.Add(HandoffCooldown)))
+	require.Error(t, l.CheckCooldown([]string{"node-b"}, now.Add(time.Hour)))
+}
+
+func TestConfirmedAtRoundTrip(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), g.CreatedAt))
+
+	data := l.Encode()
+	require.NotContains(t, data[releaseKey(g.UID)], "confirmedAt")
+	require.True(t, Parse(data).Releases()[0].ConfirmedAt.IsZero())
+
+	confirmed := g.CreatedAt.Add(time.Second)
+	require.True(t, l.Confirm(confirmed))
+	require.Equal(t, confirmed, Parse(l.Encode()).Releases()[0].ConfirmedAt.UTC())
+}
+
+// TestReapKeepsReleasesUntilCooldownEnds checks that Reap drops a release
+// no earlier than the end of its handoff cooldown, and never while it is
+// unconfirmed, so dropping a record cannot end the fence early.
+func TestReapKeepsReleasesUntilCooldownEnds(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	require.NoError(t, l.Add(g))
+
+	removed := g.CreatedAt
+	require.True(t, l.Remove(g.Key(), removed))
+
+	dropAt := removed.Add(ReleaseRetention)
+	_, next := l.Reap(dropAt.Add(time.Hour), nil)
+	require.True(t, next.IsZero())
+	require.Len(t, l.Releases(), 1)
+
+	// Confirmed just before DropAt: kept until the cooldown ends.
+	confirmed := dropAt.Add(-time.Second)
+	require.True(t, l.Confirm(confirmed))
+
+	_, next = l.Reap(dropAt, nil)
+	require.Len(t, l.Releases(), 1)
+	require.Equal(t, confirmed.Add(HandoffCooldown), next)
+	require.Error(t, l.CheckCooldown([]string{"node-a"}, dropAt))
+
+	_, next = l.Reap(confirmed.Add(HandoffCooldown), nil)
+	require.True(t, next.IsZero())
+	require.Empty(t, l.Releases())
 }

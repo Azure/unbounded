@@ -159,10 +159,16 @@ authorization are also accepted. Run `rebound --help` for the full list.
 - Release records are kept for 10 minutes from when they are written, even if the
   leader removes an expired grant late. Pods created after expiry are not deleted
   by that release. If the leader cannot process a release before its record is
-  dropped, pod deletions can be missed.
-- A node cannot be granted again for 10 seconds after its grant expires or is
-  deleted. Creating a grant on it before then fails with `409 Conflict` and a
+  dropped, pod deletions can be missed. A record is also kept while its removal
+  is unconfirmed and until its handoff cooldown ends.
+- A node cannot be granted again for 10 seconds after its grant expires, or after
+  the removal of a deleted grant is confirmed. The API server confirms a removal
+  with a second ledger write once the removal has been stored; if that write is
+  lost, the next create on the node or the next reaper sweep confirms it. Creating
+  a grant on the node before then fails with `409 Conflict` and a
   `retryAfterSeconds` hint. The leader checks the ledger right before each pod
   delete and gives up on any delete it cannot finish within 6 seconds of that
-  check, so deletes allowed by the old grant are done before the next grant
-  starts. This assumes rebound replica clocks agree to within a few seconds.
+  check. A check that still saw the old grant ran before the removal was stored,
+  so before it was confirmed, however slow the write was. Deletes allowed by the
+  old grant are therefore done before the next grant starts. This assumes rebound
+  replica clocks agree to within a few seconds.

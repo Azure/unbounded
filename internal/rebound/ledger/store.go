@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/clock"
 )
 
 // cleanupMaxSize leaves room for metadata below the ConfigMap's 1 MiB limit.
@@ -99,6 +100,19 @@ func (s *Store) Update(ctx context.Context, dryRun bool, mutate func(*Ledger) er
 	}
 
 	return out, rv, nil
+}
+
+// Confirm confirms unconfirmed releases (see Ledger.Confirm). Call it after
+// an Update that removed grants returns, so the removals are known to have
+// committed. The clock is read inside each attempt, after its ledger read.
+func (s *Store) Confirm(ctx context.Context, c clock.PassiveClock) error {
+	_, _, err := s.Update(ctx, false, func(l *Ledger) error {
+		l.Confirm(c.Now())
+
+		return nil
+	})
+
+	return err
 }
 
 // Get reads the ledger ConfigMap live, or returns an unsaved empty one if it does not

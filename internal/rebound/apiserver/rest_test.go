@@ -673,8 +673,10 @@ func TestWatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The delete is followed by a write that confirms the release, so the
+	// ledger observed here is one version past the removal.
 	cached(t, s)
-	event(t, w, watch.Deleted, "first", "4")
+	event(t, w, watch.Deleted, "first", "5")
 
 	replay, err := s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "2"})
 	if err != nil {
@@ -683,7 +685,7 @@ func TestWatch(t *testing.T) {
 	defer replay.Stop()
 
 	event(t, replay, watch.Added, "second", "3")
-	event(t, replay, watch.Deleted, "first", "4")
+	event(t, replay, watch.Deleted, "first", "5")
 
 	_, err = s.Watch(ctx, &metainternal.ListOptions{ResourceVersion: "unknown"})
 	if !apierrors.IsResourceExpired(err) {
@@ -720,12 +722,12 @@ func TestWatch(t *testing.T) {
 	fc.Step(ledger.HandoffCooldown)
 	created(t, s, ctx, "third", "node-a")
 	cached(t, s)
-	event(t, quiet, watch.Added, "third", "5")
+	event(t, quiet, watch.Added, "third", "6")
 	quiet.Stop()
 
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	canceled, err := s.Watch(cancelCtx, &metainternal.ListOptions{ResourceVersion: "5"})
+	canceled, err := s.Watch(cancelCtx, &metainternal.ListOptions{ResourceVersion: "6"})
 	if err != nil {
 		t.Fatal(err)
 	}
