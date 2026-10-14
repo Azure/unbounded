@@ -91,29 +91,109 @@ func mediaMachine(target v1alpha3.MachineOperationTargetStatus) *v1alpha3.Machin
 	return m
 }
 
-func (r *Reconciler) mediaFinalizer(ctx context.Context, name string, add bool) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (r *Reconciler) mediaFinalizer(ctx context.Context, name string, add bool) (bool, error) {
+	changed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var op v1alpha3.MachineOperation
 		if err := r.reader().Get(ctx, client.ObjectKey{Name: name}, &op); err != nil {
+			if add {
+				return err
+			}
+
 			return client.IgnoreNotFound(err)
 		}
 
-		if slices.Contains(op.Finalizers, mediaFinalizer) == add {
-			return nil
-		}
-
 		if add {
-			if !op.DeletionTimestamp.IsZero() {
-				return fmt.Errorf("operation is being deleted")
+			if !op.DeletionTimestamp.IsZero() || op.Status.IsTerminal() {
+				return fmt.Errorf("operation is being deleted or is terminal")
 			}
 
-			op.Finalizers = append(op.Finalizers, mediaFinalizer)
+			if !slices.Contains(op.Finalizers, mediaFinalizer) {
+				op.Finalizers = append(op.Finalizers, mediaFinalizer)
+			}
 		} else {
+			if !slices.Contains(op.Finalizers, mediaFinalizer) || hasOutstandingMedia(&op) {
+				return nil
+			}
+
+			owned, err := r.canReleaseMediaFinalizer(ctx, &op)
+			if err != nil || !owned {
+				return err
+			}
+
 			op.Finalizers = slices.DeleteFunc(op.Finalizers, func(s string) bool { return s == mediaFinalizer })
 		}
 
-		return r.Update(ctx, &op)
+		// Even an existing finalizer needs a version-checked write before effects.
+		if err := r.Update(ctx, &op); err != nil {
+			return err
+		}
+
+		if add && !slices.Contains(op.Finalizers, mediaFinalizer) {
+			return fmt.Errorf("operation media finalizer was not persisted")
+		}
+
+		changed = true
+
+		return nil
 	})
+
+	return changed, err
+}
+
+func (r *Reconciler) canReleaseMediaFinalizer(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
+	active := !op.Status.IsTerminal() && op.DeletionTimestamp.IsZero()
+	owned, hasMedia := false, false
+
+	for _, target := range op.Status.Targets {
+		if target.BootMedia != nil {
+			hasMedia = true
+			owned = owned || target.BootMedia.Site == r.Site
+		} else if active && !isTerminalTarget(target) {
+			// A target may be between adding the finalizer and saving ownership.
+			return false, nil
+		}
+	}
+
+	if hasMedia {
+		return owned, nil
+	}
+
+	if active {
+		return false, nil
+	}
+
+	// Before BootMedia is saved, targets have no site. Use the selector or
+	// fresh Machine labels. Missing Machines do not prove ownership.
+	if op.Spec.MachineSelector != nil {
+		return r.validateSelectorScope(op.Spec.MachineSelector) == nil, nil
+	}
+
+	names := []string{op.Spec.MachineRef}
+	for _, target := range op.Status.Targets {
+		names = append(names, target.MachineRef)
+	}
+
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+
+		var machine v1alpha3.Machine
+		if err := r.reader().Get(ctx, client.ObjectKey{Name: name}, &machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			return false, err
+		}
+
+		if r.ownsMachine(&machine) {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // Cleanup runs before conflict waits and terminal TTL handling.
@@ -153,7 +233,10 @@ func (r *Reconciler) reconcileMediaCleanup(ctx context.Context, op *v1alpha3.Mac
 	}
 
 	if !changed && slices.Contains(op.Finalizers, mediaFinalizer) && !hasOutstandingMedia(op) {
-		return true, failed, errors.Join(cleanupErr, r.mediaFinalizer(ctx, op.Name, false))
+		removed, err := r.mediaFinalizer(ctx, op.Name, false)
+		if removed || err != nil {
+			return true, failed, errors.Join(cleanupErr, err)
+		}
 	}
 
 	if (changed || hasOutstandingMedia(op)) && (op.Status.IsTerminal() || !op.DeletionTimestamp.IsZero()) {
@@ -358,11 +441,11 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		return failTarget(target, reasonUnsupportedTarget, "BMC does not support virtual media", now)
 	}
 
-	if target.BootMedia == nil {
-		if err := r.mediaFinalizer(ctx, op.Name, true); err != nil {
-			return targetChange{target: target, err: err}
-		}
+	if _, err := r.mediaFinalizer(ctx, op.Name, true); err != nil {
+		return targetChange{target: target, err: err}
+	}
 
+	if target.BootMedia == nil {
 		id, err := newMediaID()
 		if err != nil {
 			return targetChange{target: target, err: err}
