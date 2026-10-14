@@ -876,7 +876,7 @@ pub mod identity {
                 return Err(Error::InvalidConfiguration);
             }
             // Installation admits future and expired anchors; verification filters time.
-            build_root_store(&bundle.peer_trust_roots, None)?;
+            check_roots(&bundle.peer_trust_roots)?;
             let mut hash = Sha256::new();
             hash.update(b"racer/keyring/bundle/v1\0");
             hash.update((bundle.peer_trust_roots.len() as u64).to_be_bytes());
@@ -1269,8 +1269,14 @@ pub mod identity {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
         root_store_with_validity(roots, unix_time()).map(|(store, _)| store)
+    }
+
+    /// Check root structure without filtering by time, as keyring installation does.
+    pub(super) fn check_roots(roots: &[Vec<u8>]) -> Result<()> {
+        build_root_store(roots, None).map(|_| ())
     }
 
     fn root_store_with_validity(

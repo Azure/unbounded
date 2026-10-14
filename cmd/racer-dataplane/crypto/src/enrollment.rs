@@ -186,7 +186,8 @@ impl<H: Host> Enrollment<H> {
         if roots.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        identity::root_store(&roots).map_err(|_| Error::Unauthorized)?;
+        // Match Keyring::install: check structure here and time at verification.
+        identity::check_roots(&roots).map_err(|_| Error::Unauthorized)?;
         *self.roots.borrow_mut() = roots;
         Ok(())
     }
@@ -2349,16 +2350,22 @@ mod tests {
                 // Malformed anchors still reject the whole snapshot.
                 _ => vec![ca.der().to_vec(), bad],
             };
-            assert_eq!(
-                e.set_peer_trust_roots(roots.clone()),
-                Err(if case == "empty" {
-                    Error::InvalidConfiguration
-                } else {
-                    Error::Unauthorized
-                }),
-                "{case}"
-            );
-            assert_eq!(*e.roots.borrow(), good);
+            if matches!(case, "expired" | "future") {
+                // Installation admits time-invalid anchors; verification rejects them.
+                assert_eq!(e.set_peer_trust_roots(roots.clone()), Ok(()), "{case}");
+                assert_eq!(*e.roots.borrow(), roots);
+            } else {
+                assert_eq!(
+                    e.set_peer_trust_roots(roots.clone()),
+                    Err(if case == "empty" {
+                        Error::InvalidConfiguration
+                    } else {
+                        Error::Unauthorized
+                    }),
+                    "{case}"
+                );
+                assert_eq!(*e.roots.borrow(), good);
+            }
             // Exercise legacy invalid snapshots independently of setter rejection.
             *e.roots.borrow_mut() = roots;
             let expected = if case == "empty" {
@@ -2397,6 +2404,40 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn peer_trust_roots_accept_the_same_time_invalid_sets_as_the_keyring() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        let now = uring_runtime::environment::wall_now();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.not_before = (now + Duration::from_secs(300)).into();
+        params.not_after = (now + Duration::from_secs(600)).into();
+        let future = params.clone().self_signed(&key).unwrap().der().to_vec();
+        params.not_before = (now - Duration::from_secs(600)).into();
+        params.not_after = (now - Duration::from_secs(300)).into();
+        let expired = params.self_signed(&key).unwrap().der().to_vec();
+        let roots = vec![expired, ca.der().to_vec(), future];
+        // The keyring installs this exact set without filtering by time.
+        identity::check_roots(&roots).unwrap();
+        e.set_peer_trust_roots(roots.clone()).unwrap();
+        assert_eq!(*e.roots.borrow(), roots);
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let accepted = drive(
+            &files,
+            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        assert_eq!(accepted.node().0, NODE);
+        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_some());
     }
 
     #[test]
