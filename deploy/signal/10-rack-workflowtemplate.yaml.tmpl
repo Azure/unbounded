@@ -27,6 +27,8 @@ spec:
       - name: backend-kind
       - name: queue
       - name: runner-image
+      - name: mpi-payload-mode
+        value: legacy-inline
       - name: tolerations
         value: >-
           [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]

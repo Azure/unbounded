@@ -29,6 +29,8 @@ spec:
       - name: backend-kind
       - name: queue
       - name: runner-image
+      - name: mpi-payload-mode
+        value: legacy-inline
       - name: tolerations
         value: >-
           [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
@@ -242,17 +244,44 @@ spec:
                 template:
                   spec:
                     restartPolicy: Never
+                    volumes:
+                      - name: scripts
+                        configMap:
+                          name: "{{`{{workflow.parameters.script-configmap}}`}}"
+                          defaultMode: 0555
                     containers:
                       - name: launcher
                         image: "{{`{{workflow.parameters.runner-image}}`}}"
                         command: ["/bin/bash", "-lc"]
                         args:
-                          - >-
-                            mpirun --allow-run-as-root -np 1 --bind-to none
-                            --map-by slot -mca plm_rsh_no_tree_spawn 1
-                            -mca plm_rsh_args
-                            "-o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/project-signal-known-hosts"
-                            /bin/true
+                          - |
+                            case "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" in
+                              script)
+                                exec /bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" mpi-launcher "${PROJECT_SIGNAL_MPI_GPU_COUNT}"
+                                ;;
+                              legacy-inline|"")
+                                exec mpirun --allow-run-as-root -np 1 --bind-to none \
+                                  --map-by slot -mca plm_rsh_no_tree_spawn 1 \
+                                  -mca plm_rsh_args \
+                                  "-o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/project-signal-known-hosts" \
+                                  /bin/true
+                                ;;
+                              *)
+                                printf 'UnsupportedMPIPayloadMode: %s\n' "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" >&2
+                                exit 64
+                                ;;
+                            esac
+                        env:
+                          - name: PROJECT_SIGNAL_MPI_PAYLOAD_MODE
+                            value: "{{`{{=workflow.parameters['test-plan'] == '[]' ? 'legacy-inline' : workflow.parameters['mpi-payload-mode']}}`}}"
+                          - name: PROJECT_SIGNAL_SCRIPT_KEY
+                            value: "{{`{{workflow.parameters.script-key}}`}}"
+                          - name: PROJECT_SIGNAL_MPI_GPU_COUNT
+                            value: "{{`{{inputs.parameters.gpu-count}}`}}"
+                        volumeMounts:
+                          - name: scripts
+                            mountPath: /scripts
+                            readOnly: true
               Worker:
                 replicas: 1
                 template:
@@ -261,19 +290,43 @@ spec:
                     nodeSelector:
                       kubernetes.io/hostname: "{{`{{inputs.parameters.node-name}}`}}"
                     tolerations: {{`{{workflow.parameters.tolerations}}`}}
+                    volumes:
+                      - name: scripts
+                        configMap:
+                          name: "{{`{{workflow.parameters.script-configmap}}`}}"
+                          defaultMode: 0555
                     containers:
                       - name: worker
                         image: "{{`{{workflow.parameters.runner-image}}`}}"
-                        command:
-                          - /bin/bash
-                          - -lc
-                          - >-
-                            install -d -m 0700 /run/project-signal-ssh &&
-                            install -m 0600 /root/.ssh/authorized_keys /run/project-signal-ssh/authorized_keys &&
-                            mkdir -p /run/sshd &&
-                            ssh-keygen -A &&
-                            exec /usr/sbin/sshd -D -e
-                            -o AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys
+                        command: ["/bin/bash", "-lc"]
+                        args:
+                          - |
+                            case "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" in
+                              script)
+                                exec /bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" mpi-worker
+                                ;;
+                              legacy-inline|"")
+                                install -d -m 0700 /run/project-signal-ssh &&
+                                install -m 0600 /root/.ssh/authorized_keys /run/project-signal-ssh/authorized_keys &&
+                                mkdir -p /run/sshd &&
+                                ssh-keygen -A &&
+                                exec /usr/sbin/sshd -D -e \
+                                  -o AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys
+                                ;;
+                              *)
+                                printf 'UnsupportedMPIPayloadMode: %s\n' "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" >&2
+                                exit 64
+                                ;;
+                            esac
+                        env:
+                          - name: PROJECT_SIGNAL_MPI_PAYLOAD_MODE
+                            value: "{{`{{=workflow.parameters['test-plan'] == '[]' ? 'legacy-inline' : workflow.parameters['mpi-payload-mode']}}`}}"
+                          - name: PROJECT_SIGNAL_SCRIPT_KEY
+                            value: "{{`{{workflow.parameters.script-key}}`}}"
+                        volumeMounts:
+                          - name: scripts
+                            mountPath: /scripts
+                            readOnly: true
                         resources:
                           limits:
                             nvidia.com/gpu: "1"

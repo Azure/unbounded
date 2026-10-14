@@ -23,6 +23,9 @@ const (
 	BurnCanaryWorkflow            = "project-signal-gpu-burn-canary"
 	RackCertificationWorkflow     = "project-signal-rack-certification"
 	NodeWorkflowTemplateParameter = "node-workflow-template"
+	MPIPayloadModeParameter       = "mpi-payload-mode"
+	MPIPayloadModeLegacy          = "legacy-inline"
+	MPIPayloadModeScript          = "script"
 	ParticipantPlanParameter      = "participant-plan"
 	TestPlanParameter             = "test-plan"
 	MaxTestMeasurementBytes       = 16 * 1024
@@ -53,7 +56,24 @@ func nodeWorkflow(workflow string, parameters map[string]string) (string, bool, 
 		return "", true, err
 	}
 
+	if err := validateMPIPayloadMode(workflow, parameters[MPIPayloadModeParameter]); err != nil {
+		return "", true, err
+	}
+
 	return workflow, true, nil
+}
+
+func validateMPIPayloadMode(workflow, mode string) error {
+	switch mode {
+	case "", MPIPayloadModeLegacy:
+		return nil
+	case MPIPayloadModeScript:
+		if workflow == GPUCertificationWorkflow || workflow == FullNodeCertificationWorkflow {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("UnsupportedMPIPayloadMode: workflow %q does not support %s %q", workflow, MPIPayloadModeParameter, mode)
 }
 
 func supportedNodeWorkflow(workflow string) bool {

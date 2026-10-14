@@ -44,6 +44,51 @@ Admission copies the selected key to a run-owned immutable ConfigMap and pins
 its digest in the `CertificationRun`. A source update affects only later runs.
 Controller code never contains certification script bodies.
 
+## External payload inputs
+
+Pipeline packaging can supply a release-named source ConfigMap and reviewed
+runner image through the existing `CertificationProfile` fields:
+`spec.script.name`, `spec.script.key`, `spec.runnerImage`, `spec.workflow.name`,
+and `spec.parameters`. The source ConfigMap must be readable in the controller's
+`--script-namespace`; the Run snapshot lives in the Run namespace. Private
+checkout and authentication belong in the pipeline, never in runtime jobs.
+
+Admission copies only the selected decoded text `data[key]`, including its
+newline bytes, plus its computed SHA-256. Other keys, `binaryData`, source labels,
+annotations, and SCM metadata are not copied. Keep the selected script
+self-contained or use reviewed dependencies already installed in the image.
+An image reference string is frozen but tags are not resolved; use digest-pinned
+images when packaging releases. WorkflowTemplate names are referenced, not
+content-snapshotted or hashed. Strict test IDs remain coupled to the recognized
+built-in workflow names.
+
+For new identity/full-node payload releases, set
+`spec.parameters.mpi-payload-mode: script`. This existing parameters-map hook
+moves the executable MPI launcher/worker boundary into the selected script:
+
+| Caller | Selected-key invocation | Result contract |
+| --- | --- | --- |
+| Identity or full-node stage | `/bin/bash /scripts/<key>` with the existing stage environment | Existing `/results/verdict`, `/results/reason`, `/results/measurements.txt`. |
+| MPIJob Launcher | `/bin/bash /scripts/<key> mpi-launcher <gpu-count>` | Preserve the existing MPI command and propagate its exit status. |
+| MPIJob Worker | `/bin/bash /scripts/<key> mpi-worker` | Perform the existing SSH initialization and exec the worker service. |
+| Full-node MPI rank, invoked by the payload's launcher | `/bin/bash /scripts/<key> mpi-rank` | Preserve the existing local-rank GPU query and propagate its exit status. |
+
+Both MPI pods mount the same immutable Run-owned ConfigMap read-only at
+`/scripts`. MPI-role dispatch must precede baseline script initialization and
+result-file writes. To retain exact baseline keys, packaging may add separate
+self-contained `gpu-identity-mpi.sh` and `gpu-full-node-mpi.sh` keys with a
+dispatcher followed by the unchanged baseline body; selecting a helper key does
+not implicitly copy the baseline. The identity launcher still runs the existing
+one-rank `/bin/true` check. MPI resource-status measurements, device inventory,
+node/attempt/script provenance, resource allocation, and foreground cleanup are
+unchanged; MPI roles do not introduce new result files or test IDs.
+
+Absent or empty mode retains `legacy-inline`; unsupported values fail closed.
+Already-admitted empty-test-plan Runs always retain inline MPI compatibility,
+even if an opaque legacy parameter happens to use the new name. Their selected
+script still receives no new arguments. The mixed-burn component interface is
+unchanged and does not support `mpi-payload-mode: script`.
+
 ## Per-test execution
 
 For newly admitted built-in runs, the included templates expose real test

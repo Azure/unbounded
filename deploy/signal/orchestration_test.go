@@ -321,6 +321,12 @@ type workflowManifest struct {
 				Command []string `yaml:"command"`
 				Args    []string `yaml:"args"`
 			} `yaml:"container"`
+			Resource struct {
+				Manifest          string `yaml:"manifest"`
+				SuccessCondition  string `yaml:"successCondition"`
+				FailureCondition  string `yaml:"failureCondition"`
+				SetOwnerReference bool   `yaml:"setOwnerReference"`
+			} `yaml:"resource"`
 			ContainerSet struct {
 				Containers []struct {
 					Name         string   `yaml:"name"`
