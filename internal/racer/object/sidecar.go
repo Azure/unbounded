@@ -166,7 +166,7 @@ func (s *sidecar) direct(w http.ResponseWriter, r *http.Request, request racersd
 		return s.report(r, http.StatusBadGateway, ErrMetadataMismatch)
 	}
 
-	return sidecarRead{m, version, offset, length, partial}.writeBody(w, v)
+	return s.writeBody(w, r, sidecarRead{m, version, offset, length, partial}, v)
 }
 
 // sidecarDirectRange returns the read for a GET that does not need the size
@@ -239,14 +239,15 @@ func (s *sidecar) stream(w http.ResponseWriter, r *http.Request, request racersd
 		return s.report(r, http.StatusBadGateway, ErrMetadataMismatch)
 	}
 
-	return read.writeBody(w, v)
+	return s.writeBody(w, r, read, v)
 }
 
-func (read sidecarRead) writeBody(w http.ResponseWriter, v *racersdk.Object) sidecarFailure {
+func (s *sidecar) writeBody(w http.ResponseWriter, r *http.Request, read sidecarRead, v *racersdk.Object) sidecarFailure {
 	// Empty success is not committed until the SDK has validated Complete.
+	// Nothing is written yet, so the failure is reported like any SDK error.
 	if read.length == 0 {
 		if _, err := v.WriteTo(io.Discard); err != nil {
-			return sidecarSDKFailure(err)
+			return s.sdkFailure(r, err)
 		}
 	}
 

@@ -1225,7 +1225,16 @@ func TestSidecarEmptyStreamClosedBeforeCompletion(t *testing.T) {
 
 	w := httptest.NewRecorder()
 
-	failure := (sidecarRead{metadata: m}).writeBody(w, v)
+	var reports []SidecarFailure
+
+	s := &sidecar{onFailure: func(f SidecarFailure) { reports = append(reports, f) }}
+
+	failure := s.writeBody(w, httptest.NewRequest("GET", "/bucket/key", nil), sidecarRead{metadata: m}, v)
+
+	if len(reports) != 1 || reports[0].Status != 503 || reports[0].Bucket != "bucket" || reports[0].Err == nil {
+		t.Fatalf("empty failure reports = %+v", reports)
+	}
+
 	if failure != 503 || len(w.Header()) != 0 || w.Body.Len() != 0 || w.Flushed {
 		t.Fatalf("empty failure committed success: failure=%d headers=%v body=%q", failure, w.Header(), w.Body.String())
 	}
@@ -1283,7 +1292,16 @@ func TestSidecarEmptyStreamPreservesHTTPDeadline(t *testing.T) {
 			deadline := time.Now().Add(time.Minute)
 			w := &sidecarDeadlineWriter{ResponseRecorder: httptest.NewRecorder(), deadline: deadline}
 
-			failure := (sidecarRead{metadata: m}).writeBody(w, v)
+			var reports []SidecarFailure
+
+			s := &sidecar{onFailure: func(f SidecarFailure) { reports = append(reports, f) }}
+
+			failure := s.writeBody(w, httptest.NewRequest("GET", "/bucket/key", nil), sidecarRead{metadata: m}, v)
+
+			if want := map[bool]int{true: 0, false: 1}[outcome == "complete"]; len(reports) != want || want == 1 && reports[0].Status != 503 {
+				t.Fatalf("reports = %+v, want %d", reports, want)
+			}
+
 			if w.changes != 0 || !w.deadline.Equal(deadline) {
 				t.Fatalf("empty validation changed HTTP deadline: changes=%d deadline=%v", w.changes, w.deadline)
 			}
