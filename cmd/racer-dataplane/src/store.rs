@@ -198,8 +198,9 @@ impl StoreReader {
                 }
             };
             let length = entry.location.extent.length();
+            let staging_capacity = staging_capacity(length)?;
             let decoded_length = entry.metadata.page_length(page)? as usize + 16;
-            let amount = length
+            let amount = staging_capacity
                 .checked_add(decoded_length)
                 .ok_or(Error::Overloaded)?;
             let mut reserved = reserve(amount);
@@ -214,7 +215,7 @@ impl StoreReader {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            let staging = decoded_reservation.split(length)?;
+            let staging = decoded_reservation.split(staging_capacity)?;
             let buffer = self.slabs.allocate(length, staging)?;
             let buffer = match self
                 .slabs
@@ -659,11 +660,12 @@ impl StoreWriter {
             self.pending.borrow_mut().remove(&victim);
             self.note_discard(1);
         }
-        // Reserve the exact padded staging bytes before queue acceptance. Thus
+        // Reserve the full staging capacity before queue acceptance. Thus
         // accepted dirty copies never wait for ciphertext holders to release memory.
         let disk_bytes = self.slabs.alignment()?.extent(0, logical)?.length();
-        let staging = reserve_staging(disk_bytes)?;
-        staging.validate(ResourceClass::Ciphertext, disk_bytes)?;
+        let capacity = staging_capacity(disk_bytes)?;
+        let staging = reserve_staging(capacity)?;
+        staging.validate(ResourceClass::Ciphertext, capacity)?;
         if !self.admission.owns(&staging) || staging.key() != Some(&id.version.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
@@ -1219,6 +1221,14 @@ pub const FORMAT_VERSION: u32 = 4;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 pub const MAX_HEADER_BYTES: usize = 16384;
+
+/// Large records share capacity classes while their disk extents stay exact.
+fn staging_capacity(length: usize) -> Result<usize> {
+    if length < 2 * 1024 * 1024 {
+        return Ok(length);
+    }
+    page_alloc::buffer_capacity(length).ok_or(Error::Overloaded)
+}
 const MAGIC: &[u8; 8] = b"RCRPAGE1";
 const HEADER_PREFIX_BYTES: usize = 128;
 const HEADER_DIGEST_BYTES: usize = 32;

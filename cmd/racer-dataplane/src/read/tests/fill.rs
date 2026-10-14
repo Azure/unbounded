@@ -5212,7 +5212,12 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     );
     let mut diagnostics = String::new();
     failures.write(&mut diagnostics).unwrap();
-    assert!(diagnostics.contains("requested: 33554960"), "{diagnostics}");
+    let staging =
+        page_alloc::buffer_capacity(expected.len() + crate::store::MAX_HEADER_BYTES).unwrap();
+    assert!(
+        diagnostics.contains(&format!("requested: {}", staging + expected.len())),
+        "{diagnostics}"
+    );
     drop((read, copy, busy));
     deps.memory.evict_idle(usize::MAX).unwrap();
     deps.writer.slabs().reclaim_idle();

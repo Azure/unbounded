@@ -68,7 +68,7 @@ pub struct Slab<C: Charge> {
 
     writes: Rc<WriteState>,
 
-    idle_buffer: Rc<RefCell<Option<AlignedBuffer<C>>>>,
+    idle_buffer: Rc<RefCell<crate::BufferPool<C>>>,
 }
 
 impl<C: Charge> Slab<C> {
@@ -86,7 +86,7 @@ impl<C: Charge> Slab<C> {
             max_record_bytes,
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
-            idle_buffer: Rc::new(RefCell::new(None)),
+            idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
         }
     }
 
@@ -217,15 +217,15 @@ impl<C: Charge> Slab<C> {
         self.writes.count.get()
     }
 
-    /// Accounted bytes in the single idle buffer slot.
+    /// Accounted backing capacity in the bounded idle free lists.
     pub fn idle_bytes(&self) -> usize {
-        self.idle_buffer.borrow().as_ref().map_or(0, |b| b.len())
+        self.idle_buffer.borrow().bytes()
     }
 
     /// Release only idle memory, returning its size without touching live I/O.
     pub fn reclaim_idle(&self) -> usize {
-        let idle = self.idle_buffer.borrow_mut().take();
-        idle.map_or(0, |b| b.len())
+        let idle = std::mem::take(&mut self.idle_buffer.borrow_mut().entries);
+        idle.iter().map(|b| b.allocation().layout.size()).sum()
     }
 
     /// Wait for accepted writes to release their runtime completion fences.
@@ -617,23 +617,33 @@ impl<C: Charge> Slab<C> {
         })
     }
 
-    /// Reuse one exact-size idle buffer. A size mismatch releases the old idle
-    /// buffer and its charge, even if the replacement allocation fails.
+    /// Reuse charged capacity in the same size class without discarding mismatches.
     pub fn allocate(&self, length: usize, charge: C) -> Result<AlignedBuffer<C>> {
         let alignment = self.alignment()?;
-        if !charge.covers(length) {
+        if length == 0
+            || length > Alignment::MAX_TRANSFER_LENGTH
+            || !length.is_multiple_of(alignment.length())
+            || !charge.covers(length)
+        {
             return Err(Error::InvalidConfiguration);
         }
-        let idle = self.idle_buffer.borrow_mut().take();
-        if let Some(mut buffer) = idle
-            && buffer.len() == length
-        {
+        let idle = self.idle_buffer.borrow_mut().take_for(length, &charge);
+        if let Some(mut buffer) = idle {
             buffer.rebind(charge)?;
+            buffer.length = length;
             return Ok(buffer.pooled(&self.idle_buffer));
         }
-        Ok(alignment
-            .allocate(length, charge)?
-            .pooled(&self.idle_buffer))
+        let capacity = crate::buffer_capacity(length)
+            .filter(|&n| {
+                length >= crate::HUGE_PAGE_BYTES
+                    && n <= Alignment::MAX_TRANSFER_LENGTH
+                    && n.is_multiple_of(alignment.length())
+                    && charge.covers(n)
+            })
+            .unwrap_or(length);
+        let mut buffer = alignment.allocate(capacity, charge)?;
+        buffer.length = length;
+        Ok(buffer.pooled(&self.idle_buffer))
     }
 
     /// Replace file-mode backing for fault tests; device mode is rejected.
@@ -2174,7 +2184,7 @@ mod tests {
         table.recycle(SegmentId(0)).unwrap();
     }
 
-    /// Size mismatch releases idle accounting even when new allocation is invalid.
+    /// Invalid replacement preserves idle accounting until explicit reclamation.
     #[test]
     fn idle_size_mismatch_releases_retained_charge_even_on_invalid_replacement() {
         let directory = Directory::new();
@@ -2194,7 +2204,45 @@ mod tests {
             slab.allocate(0, CountingCharge::new(&used, 0)),
             Err(Error::InvalidConfiguration)
         ));
+        assert_eq!(used.get(), length);
+        assert_eq!(slab.idle_bytes(), length);
+        assert_eq!(slab.reclaim_idle(), length);
         assert_eq!(used.get(), 0);
         assert_eq!(slab.idle_bytes(), 0);
+    }
+
+    #[test]
+    fn slab_reuses_large_capacity_across_exact_io_lengths() {
+        let directory = Directory::new();
+        let slab =
+            Slab::<CountingCharge>::new(directory.0.join("data"), 16 << 20, 8 << 20, 4 << 20);
+        let Some(a) = real_alignment(slab.open_now()) else {
+            return;
+        };
+        let length = a.extent(0, (2 << 20) + 1).unwrap().length();
+        let next = a.extent(0, length + 1).unwrap().length();
+        let capacity = crate::buffer_capacity(length).unwrap();
+        let used = Rc::new(Cell::new(0));
+        let mut first = slab
+            .allocate(length, CountingCharge::new(&used, capacity))
+            .unwrap();
+        let pointer = first.as_slice().as_ptr();
+        first.as_mut_slice().fill(0xa5);
+        drop(first);
+        assert_eq!(slab.idle_bytes(), capacity);
+        let mismatch = slab
+            .allocate(4 << 20, CountingCharge::new(&used, 4 << 20))
+            .unwrap();
+        assert_eq!(slab.idle_bytes(), capacity);
+        let second = slab
+            .allocate(next, CountingCharge::new(&used, capacity))
+            .unwrap();
+        assert_eq!(second.len(), next);
+        assert_eq!(second.as_slice().as_ptr(), pointer);
+        assert!(second.as_slice().iter().all(|&b| b == 0));
+        a.check(Extent::new(0, next).unwrap(), &second).unwrap();
+        drop((second, mismatch));
+        assert_eq!(slab.reclaim_idle(), capacity + (4 << 20));
+        assert_eq!(used.get(), 0);
     }
 }

@@ -43,6 +43,12 @@ impl flow_control::Class for ResourceClass {
     fn index(self) -> usize {
         self as usize
     }
+
+    fn requires_wipe(self) -> bool {
+        // Only Ciphertext backs AEAD output and disk records sent to peers.
+        // Keep every other class conservative, including mixed-use Registered.
+        !matches!(self, Self::Ciphertext)
+    }
 }
 
 pub struct AdmissionPolicy {
@@ -151,7 +157,12 @@ impl Policy for AdmissionPolicy {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
             // Disk reads own padded staging and decoded ciphertext together.
             ResourceClass::Ciphertext => {
-                2 * (PAGE_BYTES as usize + 16) + crate::store::MAX_HEADER_BYTES + 4096
+                page_alloc::buffer_capacity(
+                    PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES + 4096,
+                )
+                .expect("bounded page capacity")
+                    + PAGE_BYTES as usize
+                    + 16
             }
             ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
             _ => 1,
@@ -420,6 +431,29 @@ impl Offer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ciphertext_opts_out_of_secure_wiping() {
+        use flow_control::Class;
+        assert!(!ResourceClass::Ciphertext.requires_wipe());
+        for class in [
+            ResourceClass::Plaintext,
+            ResourceClass::DirtyCiphertext,
+            ResourceClass::Registered,
+            ResourceClass::RequestContext,
+            ResourceClass::Flight,
+            ResourceClass::Waiter,
+            ResourceClass::Connection,
+            ResourceClass::Pipe,
+            ResourceClass::ControlProgress,
+            ResourceClass::Relay,
+            ResourceClass::IngressConnection,
+            ResourceClass::OutboundConnection,
+            ResourceClass::ControlConnection,
+        ] {
+            assert!(class.requires_wipe());
+        }
+    }
 
     #[test]
     fn offer_delivered_after_target_close_releases_socket_and_charges() {

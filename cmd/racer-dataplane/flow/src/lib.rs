@@ -6,8 +6,8 @@
 //! completion reservation bypasses stop and fair-share checks, not aggregate or
 //! key-record limits. Policy can also allow selected classes after stop.
 //!
-//! Recycling wipes the full allocation before retaining at most two buffers of
-//! at least 1 MiB. Pressure retries admission after applicable reclamation; stop
+//! Recycling retains at most eight buffers and 128 MiB, grouped by resource and
+//! size class. Pressure retries admission after applicable reclamation; stop
 //! releases retained buffers. Shared handles never retain the recycler.
 //!
 //! [`ChargedBuffer`] pairs fixed initialized backing with admission. Low-level
@@ -102,6 +102,11 @@ pub trait Class: Copy + Send + Sync + 'static {
 
     /// Return this class's unique index, strictly below `COUNT`.
     fn index(self) -> usize;
+
+    /// Default to secure erasure unless the class contains only public bytes.
+    fn requires_wipe(self) -> bool {
+        true
+    }
 }
 
 /// Application policy. Charges do not retain this value, so suitability and
@@ -263,6 +268,10 @@ impl<P: Policy> page_alloc::Charge for Charge<P> {
     fn covers(&self, bytes: usize) -> bool {
         P::covers(self.class) && self.amount >= bytes
     }
+
+    fn requires_wipe(&self) -> bool {
+        self.class.requires_wipe()
+    }
 }
 
 /// An unkeyed admission and usage handle. It retains no recycler buffers.
@@ -410,28 +419,51 @@ impl<P: Policy> Charge<P> {
         }
         if let Some(pool) = self.buffers.upgrade() {
             let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(index) = pool
-                .iter()
-                .position(|(bytes, _)| bytes.capacity() == length)
-            {
-                let (bytes, old) = pool.swap_remove(index);
+            let index = [true, false].into_iter().find_map(|same_class| {
+                pool.iter().position(|(bytes, old)| {
+                    (!same_class || old.class.index() == self.class.index())
+                        && bytes.capacity() >= length
+                        && bytes.capacity() <= self.amount
+                        // A tag-sized tail can straddle a class boundary. Only
+                        // borrow that neighbor when all capacity is admitted.
+                        && (page_alloc::buffer_capacity(bytes.capacity())
+                            == page_alloc::buffer_capacity(length)
+                            || bytes.capacity() - length < 64 * 1024)
+                })
+            });
+            if let Some(index) = index {
+                let (mut bytes, old) = pool.swap_remove(index);
+                drop(pool);
+                if !old.class.requires_wipe() {
+                    // Public ciphertext was not securely erased at release.
+                    // Preserve the zeroed-checkout contract, including spare bytes.
+                    bytes.resize(bytes.capacity(), 0);
+                    bytes.fill(0);
+                }
                 drop(old);
-                debug_assert_eq!(bytes.len(), length);
+                bytes.truncate(length);
                 return Ok(bytes);
             }
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| Error::Overloaded)?;
-        bytes.resize(length, 0);
+        let capacity = page_alloc::buffer_capacity(length)
+            .filter(|&n| length >= 1024 * 1024 && n <= self.amount)
+            .unwrap_or(length);
+        let mut bytes = zeroed_payload(capacity)?;
+        bytes.truncate(length);
         Ok(bytes)
     }
 
-    /// Wipe before every retention check. At most two >=1MiB buffers retain live
+    /// At most eight >=1MiB buffers within the byte budget retain live
     /// charges; only the final exclusive payload owner may return an allocation.
-    pub fn recycle(&mut self, mut bytes: Vec<u8>) {
-        wipe_payload(&mut bytes);
+    pub fn recycle(&mut self, bytes: Vec<u8>) {
+        let mut pending = RecycleBytes {
+            bytes,
+            secret: self.class.requires_wipe(),
+        };
+        self.try_recycle(&mut pending.bytes);
+    }
+
+    fn try_recycle(&mut self, bytes: &mut Vec<u8>) {
         if self.stopped.load(Ordering::Acquire)
             || bytes.capacity() < 1024 * 1024
             || bytes.capacity() > self.amount
@@ -447,13 +479,21 @@ impl<P: Policy> Charge<P> {
         let Ok(mut pool) = pool.try_lock() else {
             return;
         };
-        if self.stopped.load(Ordering::Acquire) || pool.len() >= 2 {
+        if self.stopped.load(Ordering::Acquire)
+            || pool.len() >= BUFFER_DEPTH
+            || bytes.capacity()
+                > BUFFER_BUDGET
+                    .saturating_sub(pool.iter().map(|(b, _)| b.capacity()).sum::<usize>())
+        {
             return;
         }
-        // SAFETY: wipe_payload initialized the entire capacity above.
-        unsafe { bytes.set_len(bytes.capacity()) };
+        if self.class.requires_wipe() {
+            wipe_payload(bytes);
+            // SAFETY: wipe_payload initialized the entire capacity above.
+            unsafe { bytes.set_len(bytes.capacity()) };
+        }
         let charge = self.transfer(self.amount, Weak::new(), key);
-        pool.push((bytes, charge));
+        pool.push((std::mem::take(bytes), charge));
     }
 
     /// Move admission with a precloned key without touching either usage counter.
@@ -657,10 +697,8 @@ impl<P: Policy> Quotas<P> {
 
     /// Release every idle recycler allocation and its charge.
     pub fn reclaim_buffers(&self) {
-        self.buffers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let removed = std::mem::take(&mut *self.buffers.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(removed);
     }
 
     /// Divide the aggregate ceiling, honoring the clipped per-key floor.
@@ -687,24 +725,79 @@ impl<P: Policy> Quotas<P> {
                 ..
             })
         ) {
-            self.reclaim_buffers_for(key, class);
+            self.reclaim_buffers_for(
+                key,
+                class,
+                amount,
+                result.as_ref().err().and_then(|e| e.rejection),
+            );
             return self.reserve_inner(key, class, amount, mode);
         }
         result
     }
 
-    /// Reclaim only when key records, fairness, or this class can benefit.
-    fn reclaim_buffers_for(&self, key: Option<&P::Key>, class: P::Class) {
+    /// Reclaim only the class causing pressure, stopping once its deficit is met.
+    /// Key-table exhaustion is separate: release one idle key's entries, not all.
+    fn reclaim_buffers_for(
+        &self,
+        key: Option<&P::Key>,
+        class: P::Class,
+        amount: usize,
+        rejection: Option<Rejection<P::Class>>,
+    ) {
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        // Keyed admission can exhaust records or fair shares too. Unkeyed
-        // admission only reclaims when this class has an idle charge.
-        if key.is_some()
-            || buffers
-                .iter()
-                .any(|(_, charge)| charge.class.index() == class.index())
+        let mut removed = Vec::new();
+        if matches!(rejection, Some(Rejection::Keys { .. })) {
+            // Arc cloning cannot invoke application key callbacks under the lock.
+            let victim = buffers.iter().find_map(|(_, charge)| charge.local.clone());
+            if let Some(victim) = victim {
+                let mut i = 0;
+                while i < buffers.len() {
+                    if buffers[i]
+                        .1
+                        .local
+                        .as_ref()
+                        .is_some_and(|local| Arc::ptr_eq(local, &victim))
+                    {
+                        removed.push(buffers.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        } else if let Some(Rejection::Resource {
+            used,
+            limit,
+            key_used,
+            key_limit,
+            ..
+        }) = rejection
         {
-            buffers.clear();
+            let keyed = key_used.zip(key_limit);
+            let (used, limit) = keyed.unwrap_or((used, limit));
+            let mut deficit = used.saturating_add(amount).saturating_sub(limit);
+            // Prefer the requested size class, then other sizes in this resource
+            // class: quota pressure is measured in bytes, not allocation sizes.
+            for exact in [true, false] {
+                let mut i = 0;
+                while i < buffers.len() && deficit != 0 {
+                    let (bytes, charge) = &buffers[i];
+                    if charge.class.index() == class.index()
+                        && (keyed.is_none() || charge.key.as_ref() == key)
+                        && (!exact
+                            || page_alloc::buffer_capacity(bytes.capacity())
+                                == page_alloc::buffer_capacity(amount))
+                    {
+                        deficit = deficit.saturating_sub(charge.amount);
+                        removed.push(buffers.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
         }
+        drop(buffers);
+        drop(removed);
     }
 
     /// Perform one admission attempt and report its rejection before retrying.
@@ -878,7 +971,7 @@ impl<P: Policy> ChargedBuffer<P> {
             .charge
             .as_mut()
             .expect("owned charge")
-            .shrink(length)?;
+            .shrink(buffer.bytes.capacity())?;
         buffer.recycle = true;
         Ok(buffer)
     }
@@ -889,7 +982,6 @@ impl<P: Policy> ChargedBuffer<P> {
     pub fn unpooled(charge: Charge<P>, length: usize) -> Result<Self> {
         let bytes = charge.buffer(length)?;
         // Do not box or resize again while I/O pointers are live.
-        let bytes = bytes.into_boxed_slice().into_vec();
         Ok(Self {
             bytes,
             charge: Some(charge),
@@ -1043,8 +1135,55 @@ enum AdmissionMode {
     Completion,
 }
 
-/// Retained zeroed backing together with the charge that still accounts for it.
+/// Bounded free lists keyed by class and capacity class. Secret backing is zeroed;
+/// public backing is cleared on checkout, including cross-class reuse.
 type Buffers<P> = Mutex<Vec<(Vec<u8>, Charge<P>)>>;
+
+const BUFFER_DEPTH: usize = 8;
+const BUFFER_BUDGET: usize = 128 * 1024 * 1024;
+
+/// Preserve erase-before-free on rejection and on a panicking key callback.
+struct RecycleBytes {
+    bytes: Vec<u8>,
+    secret: bool,
+}
+
+impl Drop for RecycleBytes {
+    fn drop(&mut self) {
+        if self.secret {
+            wipe_payload(&mut self.bytes);
+        }
+    }
+}
+
+/// Fallible initialized byte storage using the same layout as Vec<u8>.
+fn zeroed_payload(length: usize) -> Result<Vec<u8>> {
+    // SAFETY: this callback supplies the exact zeroed global allocation requested.
+    unsafe {
+        zeroed_payload_with(length, |layout| {
+            // SAFETY: checked nonzero layout; the returned Vec owns deallocation.
+            std::alloc::alloc_zeroed(layout)
+        })
+    }
+}
+
+/// Injectable allocator keeps null-failure tests independent of host overcommit.
+/// Safety: callback returns null or a zeroed global allocation with this layout.
+unsafe fn zeroed_payload_with(
+    length: usize,
+    allocate: impl FnOnce(std::alloc::Layout) -> *mut u8,
+) -> Result<Vec<u8>> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = std::alloc::Layout::from_size_align(length, 1).map_err(|_| Error::Overloaded)?;
+    let pointer = std::ptr::NonNull::new(allocate(layout)).ok_or(Error::Overloaded)?;
+    // SAFETY: alloc_zeroed uses the global allocator with nonzero size and align
+    // 1, exactly Vec<u8>'s layout. All length bytes are initialized to zero; length
+    // equals capacity, and this Vec takes sole ownership with matching deallocation.
+    // Null and layout overflow return Overloaded before constructing a Vec.
+    Ok(unsafe { Vec::from_raw_parts(pointer.as_ptr(), length, length) })
+}
 
 /// Worker-local key lookup; charges retain records independently.
 type Keys<K> = RefCell<HashMap<K, Weak<Counters<K>>>>;
@@ -1154,6 +1293,8 @@ impl<K> Retirement<K> {
 
 /// Initialize and wipe the full allocation, including truncated and spare bytes.
 fn wipe_payload(bytes: &mut Vec<u8>) {
+    #[cfg(test)]
+    WIPED_BYTES.with(|total| total.set(total.get() + bytes.capacity()));
     bytes.clear();
     #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
     if bytes.capacity() != 0 {
@@ -1168,10 +1309,178 @@ fn wipe_payload(bytes: &mut Vec<u8>) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static WIPED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Accounting, retirement, reclamation, and cross-thread release contracts.
 #[cfg(test)]
 mod quota_tests {
     use super::*;
+
+    #[test]
+    fn rejected_recycle_erases_secrets_but_public_bytes_take_fast_path() {
+        let size = 1 << 20;
+        for stopped in [false, true] {
+            for class in [Resource::Payload, Resource::Progress] {
+                let quotas = Quotas::new(TestPolicy::new(32 * size, 1));
+                if stopped {
+                    quotas.stop();
+                } else {
+                    for _ in 0..BUFFER_DEPTH {
+                        let mut charge = quotas.reserve(None, class, size).unwrap();
+                        charge.recycle(vec![0xa5; size]);
+                    }
+                }
+                let mut charge = quotas.reserve_completion(None, class, size).unwrap();
+                let before = WIPED_BYTES.with(|total| total.get());
+                charge.recycle(vec![0xa5; size]);
+                let erased = WIPED_BYTES.with(|total| total.get()) - before;
+                assert_eq!(erased, if class.requires_wipe() { size } else { 0 });
+                assert_eq!(charge.amount(), size);
+            }
+        }
+    }
+
+    #[test]
+    fn small_payloads_stay_exact_and_cross_class_reuse_is_zeroed() {
+        let quotas = Quotas::new(TestPolicy::new(16 << 20, 2));
+        let charge = quotas.reserve(None, Resource::Payload, 1 << 20).unwrap();
+        let small = charge.buffer(3).unwrap();
+        assert_eq!(small.len(), 3);
+        assert_eq!(small.capacity(), 3);
+        drop(charge);
+        let size = (1 << 20) + 16;
+        let mut charge = quotas.reserve(None, Resource::Progress, size).unwrap();
+        let mut bytes = charge.buffer(size).unwrap();
+        let pointer = bytes.as_ptr();
+        bytes.fill(0xa5);
+        charge.recycle(bytes);
+        let charge = quotas.reserve(None, Resource::Payload, size).unwrap();
+        let bytes = charge.buffer(size - 16).unwrap();
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert_eq!(bytes.len(), size - 16);
+        assert!(bytes.iter().all(|&b| b == 0));
+        assert_eq!(quotas.used(Resource::Progress), 0);
+        assert_eq!(quotas.used(Resource::Payload), size);
+    }
+
+    #[test]
+    fn zeroed_payload_handles_empty_overflow_and_allocator_failure() {
+        assert!(zeroed_payload(0).unwrap().is_empty());
+        assert_eq!(zeroed_payload(usize::MAX), Err(Error::Overloaded));
+        assert_eq!(
+            unsafe { zeroed_payload_with(16, |_| std::ptr::null_mut()) },
+            Err(Error::Overloaded)
+        );
+        let bytes = zeroed_payload(2 * 1024 * 1024 + 1).unwrap();
+        assert_eq!(bytes.len(), bytes.capacity());
+        assert!(bytes.iter().all(|&b| b == 0));
+        let quotas = Quotas::new(TestPolicy::new(usize::MAX, 1));
+        let charge = quotas.reserve(None, Resource::Payload, usize::MAX).unwrap();
+        assert_eq!(charge.buffer(usize::MAX), Err(Error::Overloaded));
+    }
+
+    #[test]
+    fn recycler_reuses_size_class_without_destroying_mismatches() {
+        let size = (1 << 20) + 123;
+        let capacity = page_alloc::buffer_capacity(size).unwrap();
+        let quotas = Quotas::new(TestPolicy::new(16 << 20, 4));
+        let mut charge = quotas.reserve(None, Resource::Payload, capacity).unwrap();
+        let mut bytes = charge.buffer(size).unwrap();
+        let pointer = bytes.as_ptr();
+        bytes.fill(0xa5);
+        charge.recycle(bytes);
+        let other = quotas.reserve(None, Resource::Payload, 2 << 20).unwrap();
+        let mismatch = other.buffer(2 << 20).unwrap();
+        assert_eq!(quotas.retained_buffer_bytes(), capacity);
+        let charge = quotas.reserve(None, Resource::Payload, capacity).unwrap();
+        let bytes = charge.buffer(size + 17).unwrap();
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert_eq!(bytes.len(), size + 17);
+        assert!(bytes.iter().all(|&b| b == 0));
+        assert_eq!(quotas.retained_buffer_bytes(), 0);
+        drop(mismatch);
+    }
+
+    #[test]
+    fn recycler_depth_and_byte_budget_bound_differing_sizes() {
+        for step in [64 * 1024, 8 * 1024 * 1024] {
+            let quotas = Quotas::new(TestPolicy::new(1024 << 20, 1));
+            for n in 1..=16 {
+                let size = (1 << 20) + n * step;
+                let mut charge = quotas.reserve(None, Resource::Payload, size).unwrap();
+                charge.recycle(zeroed_payload(size).unwrap());
+                assert!(quotas.retained_buffer_bytes() <= BUFFER_BUDGET);
+                assert!(quotas.buffers.lock().unwrap().len() <= BUFFER_DEPTH);
+            }
+            if step == 64 * 1024 {
+                assert_eq!(quotas.buffers.lock().unwrap().len(), BUFFER_DEPTH);
+            }
+        }
+    }
+
+    #[test]
+    fn pressure_reclaims_only_contended_class_key_and_needed_size() {
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(8 * size, 4));
+        let a = "a".to_owned();
+        let b = "b".to_owned();
+        for (key, class, length) in [
+            (&a, Resource::Payload, size),
+            (&a, Resource::Payload, 2 * size),
+            (&b, Resource::Payload, size),
+            (&a, Resource::Other, size),
+        ] {
+            let mut charge = quotas.reserve(Some(key), class, length).unwrap();
+            charge.recycle(zeroed_payload(length).unwrap());
+        }
+        let held = quotas
+            .reserve(Some(&a), Resource::Payload, 2 * size)
+            .unwrap();
+        assert_eq!(quotas.retained_buffer_bytes(), 3 * size);
+        assert_eq!(quotas.used(Resource::Other), size);
+        let charge = quotas.reserve(Some(&b), Resource::Payload, size).unwrap();
+        let bytes = charge.buffer(size).unwrap();
+        assert!(bytes.iter().all(|&b| b == 0));
+        assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
+        drop(held);
+    }
+
+    #[test]
+    fn public_recycle_skips_wipe_but_secret_recycle_erases_full_capacity() {
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(8 * size, 2));
+        for class in [Resource::Payload, Resource::Progress] {
+            let mut charge = quotas.reserve(None, class, size).unwrap();
+            let mut bytes = charge.buffer(size).unwrap();
+            bytes.fill(0xa5);
+            charge.recycle(bytes);
+        }
+        {
+            let pool = quotas.buffers.lock().unwrap();
+            for (bytes, charge) in pool.iter() {
+                let expected = if charge.class.requires_wipe() {
+                    0
+                } else {
+                    0xa5
+                };
+                assert!(bytes.iter().all(|&b| b == expected));
+            }
+        }
+        let charge = quotas.reserve(None, Resource::Progress, size).unwrap();
+        assert!(charge.buffer(size).unwrap().iter().all(|&b| b == 0));
+        quotas.stop();
+        let mut charge = quotas
+            .reserve_completion(None, Resource::Progress, size)
+            .unwrap();
+        let mut bytes = vec![0xa5; size];
+        charge.try_recycle(&mut bytes);
+        assert!(bytes.iter().all(|&b| b == 0xa5));
+        assert_eq!(charge.amount(), size);
+        assert_eq!(quotas.retained_buffer_bytes(), 0);
+    }
 
     /// Exact failures survive counter changes and never cross observation scopes.
     #[test]
@@ -1266,6 +1575,10 @@ mod quota_tests {
         /// Map each fixture class to its stable counter.
         fn index(self) -> usize {
             self as usize
+        }
+
+        fn requires_wipe(self) -> bool {
+            !matches!(self, Self::Progress)
         }
     }
 
@@ -2000,7 +2313,7 @@ mod quota_tests {
         check_quota_key_clone(2);
     }
 
-    /// Idle backing retains two live charges and reports pressure before retry.
+    /// Idle backing retains concurrent charges and reports pressure before retry.
     #[test]
     fn recycler_retains_two_live_charges_and_reports_pressure_before_retry() {
         let size = 1 << 20;
@@ -2017,9 +2330,9 @@ mod quota_tests {
             bytes.truncate(1);
             charge.recycle(bytes);
         }
-        assert_eq!(quotas.buffers.lock().unwrap().len(), 2);
-        assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
-        assert_eq!(quotas.used(Resource::Payload), 2 * size);
+        assert_eq!(quotas.buffers.lock().unwrap().len(), 3);
+        assert_eq!(quotas.retained_buffer_bytes(), 3 * size);
+        assert_eq!(quotas.used(Resource::Payload), 3 * size);
         assert!(
             quotas
                 .buffers
@@ -2034,14 +2347,14 @@ mod quota_tests {
             quotas.reserve(None, Resource::Other, 1),
             Err(Error::Overloaded)
         ));
-        assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
+        assert_eq!(quotas.retained_buffer_bytes(), 3 * size);
         assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 2);
         let charge = quotas.reserve(None, Resource::Payload, 3 * size).unwrap();
         assert_eq!(quotas.retained_buffer_bytes(), 0);
         assert_eq!(quotas.used(Resource::Payload), 3 * size);
         assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 3);
         assert!(
-            matches!(quotas.policy.rejected.lock().unwrap()[2], Rejection::Resource { used, requested, .. } if used == 2 * size && requested == 3 * size)
+            matches!(quotas.policy.rejected.lock().unwrap()[2], Rejection::Resource { used, requested, .. } if used == 3 * size && requested == 3 * size)
         );
         let mut charge = charge;
         charge.recycle(vec![0xa7; 3 * size]);
@@ -2080,7 +2393,7 @@ mod quota_tests {
             type Key = Key;
 
             fn limit(&self, _: Resource) -> usize {
-                4 << 20
+                10 << 20
             }
 
             fn max_keys(&self) -> usize {
@@ -2119,8 +2432,11 @@ mod quota_tests {
                     match action {
                         "stop" => nested.stop(),
                         "fill" => {
-                            let mut extra = nested.reserve(None, Resource::Payload, size).unwrap();
-                            extra.recycle(vec![0xa7; size]);
+                            for _ in 1..BUFFER_DEPTH {
+                                let mut extra =
+                                    nested.reserve(None, Resource::Payload, size).unwrap();
+                                extra.recycle(vec![0xa7; size]);
+                            }
                         }
                         _ => {}
                     }
@@ -2132,7 +2448,7 @@ mod quota_tests {
             assert_eq!(quotas.is_stopped(), action == "stop");
             let retained = match action {
                 "retain" => 3 * size,
-                "fill" => 2 * size,
+                "fill" => BUFFER_DEPTH * size,
                 _ => 0,
             };
             let owned = if action == "retain" { 0 } else { 2 * size };
