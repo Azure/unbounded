@@ -122,30 +122,37 @@ func shouldReconcile(op *v1alpha3.MachineOperation) bool {
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := slog.With("machineOperation", req.Name)
-
 	var op v1alpha3.MachineOperation
 	if err := r.reader().Get(ctx, client.ObjectKey{Name: req.Name}, &op); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if handled, err := r.reconcileMediaCleanup(ctx, &op); handled || err != nil {
-		return ctrl.Result{RequeueAfter: r.pollInterval()}, err
+	handled, failedCleanup, cleanupErr := r.reconcileMediaCleanup(ctx, &op)
+	if handled {
+		return ctrl.Result{RequeueAfter: r.pollInterval()}, cleanupErr
 	}
+
+	result, err := r.reconcileOperation(ctx, &op, failedCleanup)
+
+	return result, errors.Join(cleanupErr, err)
+}
+
+func (r *Reconciler) reconcileOperation(ctx context.Context, op *v1alpha3.MachineOperation, failedCleanup map[string]struct{}) (ctrl.Result, error) {
+	logger := slog.With("machineOperation", op.Name)
 
 	if !op.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
 
 	if op.Status.IsTerminal() {
-		return r.reconcileTerminal(ctx, &op)
+		return r.reconcileTerminal(ctx, op)
 	}
 
 	if !isHostOperation(op.Spec.OperationKind) {
 		return ctrl.Result{}, nil
 	}
 
-	if older, err := r.olderConflictingOperation(ctx, &op); err != nil {
+	if older, err := r.olderConflictingOperation(ctx, op); err != nil {
 		return ctrl.Result{}, err
 	} else if older != "" {
 		message := fmt.Sprintf("waiting for older host operation %s", older)
@@ -157,7 +164,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	if len(op.Status.Targets) == 0 {
-		owned, err := r.snapshotTargets(ctx, &op)
+		owned, err := r.snapshotTargets(ctx, op)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -166,7 +173,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, nil
 		}
 
-		if err := r.reader().Get(ctx, client.ObjectKey{Name: op.Name}, &op); err != nil {
+		if err := r.reader().Get(ctx, client.ObjectKey{Name: op.Name}, op); err != nil {
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
 	}
@@ -176,9 +183,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	restoreHostReplaceTriggerConditions := op.Spec.OperationKind == v1alpha3.OperationHostReplace && hostReplaceTriggerConditionsMissing(&op)
+	restoreHostReplaceTriggerConditions := op.Spec.OperationKind == v1alpha3.OperationHostReplace && hostReplaceTriggerConditionsMissing(op)
 
-	changes, requeueAfter := r.advanceTargets(ctx, &op)
+	changes, requeueAfter := r.advanceTargets(ctx, op, failedCleanup)
 	if len(changes) > 0 || restoreHostReplaceTriggerConditions {
 		if err := r.applyTargetChanges(ctx, op.Name, changes, restoreHostReplaceTriggerConditions); err != nil {
 			return ctrl.Result{}, err
@@ -312,7 +319,7 @@ func (r *Reconciler) validateSelectorScope(selector *metav1.LabelSelector) error
 	return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector must include %s=%s", siteLabel, r.Site)}
 }
 
-func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOperation) ([]targetChange, time.Duration) {
+func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOperation, failedCleanup map[string]struct{}) ([]targetChange, time.Duration) {
 	maxConcurrent := r.maxConcurrentMachines()
 	active := 0
 	selected := make([]v1alpha3.MachineOperationTargetStatus, 0, maxConcurrent)
@@ -320,6 +327,10 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 	for _, target := range op.Status.Targets {
 		if target.Phase == v1alpha3.OperationPhaseInProgress {
 			active++
+
+			if _, failed := failedCleanup[target.MachineRef]; failed {
+				continue
+			}
 
 			selected = append(selected, target)
 		}
@@ -333,6 +344,10 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 
 			if active >= maxConcurrent {
 				break
+			}
+
+			if _, failed := failedCleanup[target.MachineRef]; failed {
+				continue
 			}
 
 			target.Phase = v1alpha3.OperationPhaseInProgress

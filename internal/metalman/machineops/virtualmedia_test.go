@@ -106,14 +106,16 @@ func (d *mediaTestDriver) Prepare(ctx context.Context, _ *v1alpha3.Machine, _ *v
 	return bootmedia.Source{Name: "ub-" + id + ".iso", Server: "10.0.0.1"}, d.effect(ctx, "prepare")
 }
 
-func (d *mediaTestDriver) Release(ctx context.Context, _ string) error {
+func (d *mediaTestDriver) Release(ctx context.Context, id string) error {
 	var op v1alpha3.MachineOperation
 	if err := d.c.Get(ctx, client.ObjectKey{Name: d.opName}, &op); err != nil {
 		return err
 	}
 
-	if b := op.Status.Targets[0].BootMedia; !b.Cleaned && b.Phase != "Replacing" {
-		return errors.New("release before Cleaned or Replacing persisted")
+	for _, target := range op.Status.Targets {
+		if b := target.BootMedia; b != nil && b.ID == id && !b.Cleaned && b.Phase != "Replacing" {
+			return errors.New("release before Cleaned or Replacing persisted")
+		}
 	}
 
 	return d.effect(ctx, "release")
@@ -357,6 +359,98 @@ func TestVirtualMediaCleanupFailureKeepsOwnership(t *testing.T) {
 	d.err = nil
 	current = mediaStep(t, r, op.Name)
 	require.True(t, current.Status.Targets[0].BootMedia.Cleaned)
+}
+
+type mediaTestClients map[string]*mediaTestDriver
+
+func (clients mediaTestClients) ForMachine(ctx context.Context, machine *v1alpha3.Machine) (PowerClient, error) {
+	return clients[machine.Name].ForMachine(ctx, machine)
+}
+
+func TestVirtualMediaCleanupFailureDoesNotBlockOtherTargets(t *testing.T) {
+	for _, action := range []string{"cleanup", "delete"} {
+		t.Run(action, func(t *testing.T) {
+			r, d, m, op := mediaFixture(t)
+			current := mediaInstalling(t, r, op.Name)
+			second := m.DeepCopy()
+			second.Name = "second-machine"
+			second.UID = "second-uid"
+			second.ResourceVersion = ""
+			second.Spec.Netboot().Redfish.URL = "https://second-bmc.example.com"
+			require.NoError(t, r.Create(t.Context(), second))
+
+			current.Spec.MachineRef = ""
+			current.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+			require.NoError(t, r.Update(t.Context(), current))
+			current.Status.Targets[0].BootMedia.ImageWritten = true
+			current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+			healthy := current.Status.Targets[0].DeepCopy()
+			healthy.MachineRef = second.Name
+			healthy.BootMedia.ID = strings.Repeat("b", 32)
+			healthy.BootMedia.MachineUID = second.UID
+			healthy.BootMedia.NodeName = second.Name
+			healthy.BootMedia.Netboot = second.Spec.Netboot().DeepCopy()
+			healthy.BootMedia.SourceName = "ub-" + healthy.BootMedia.ID + ".iso"
+
+			current.Status.Targets = append(current.Status.Targets, *healthy)
+			if action == "delete" {
+				current.Status.Targets[0].BootMedia.Cleaned = true
+				current.Status.Targets[0].BootMedia.CleanedAt = ptrTo(fixedNow())
+			}
+
+			require.NoError(t, r.Status().Update(t.Context(), current))
+			failedTarget := current.Status.Targets[0].DeepCopy()
+			cleanupErr := errors.New("BMC unavailable")
+			d.err = cleanupErr
+			d.calls = nil
+			healthyDriver := &mediaTestDriver{c: r.Client, opName: op.Name, supported: true}
+			r.PowerClients = mediaTestClients{m.Name: d, second.Name: healthyDriver}
+			r.BootMedia = healthyDriver
+
+			for attempt := range 4 {
+				_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+				require.ErrorIs(t, err, cleanupErr, "failed cleanup must be retried")
+				require.ErrorContains(t, err, m.Name)
+				require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), current))
+				require.Equal(t, *failedTarget, current.Status.Targets[0], "failed target must not advance or lose ownership")
+				require.True(t, outstandingMedia(current.Status.Targets[0]))
+				require.Contains(t, current.Finalizers, mediaFinalizer)
+				other := current.Status.Targets[1]
+				require.True(t, other.BootMedia.Cleaned)
+				require.NotNil(t, other.BootMedia.CleanedAt)
+				require.True(t, other.BootMedia.CleanedAt.Equal(ptrTo(fixedNow())))
+
+				if attempt == 0 {
+					require.Equal(t, "waiting for installer reboot handoff", other.Message)
+
+					current.Status.Targets[1].BootMedia.RebootRequestedAt = ptrTo(fixedNow())
+					require.NoError(t, r.Status().Update(t.Context(), current))
+				} else {
+					require.True(t, other.BootMedia.StagedDeleted)
+					require.Equal(t, "Installed", other.BootMedia.Phase)
+					require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, other.Stage)
+				}
+
+				if attempt >= 2 {
+					require.True(t, other.BootMedia.Released)
+				}
+			}
+
+			require.Equal(t, []string{action, action, action, action}, d.calls)
+			require.Equal(t, []string{"cleanup", "delete", "release"}, healthyDriver.calls)
+
+			q := &StatusQueue{Client: r.Client}
+			require.NoError(t, q.flushOperationCondition(t.Context(), second.Name, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", "booted"))
+			require.NoError(t, r.Create(t.Context(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: second.Name}}))
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.ErrorIs(t, err, cleanupErr)
+			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), current))
+			require.Equal(t, v1alpha3.OperationPhaseComplete, current.Status.Targets[1].Phase)
+			require.False(t, outstandingMedia(current.Status.Targets[1]))
+			require.Equal(t, *failedTarget, current.Status.Targets[0])
+			require.Contains(t, current.Finalizers, mediaFinalizer)
+		})
+	}
 }
 
 func TestVirtualMediaPrepareFailureHasNoBMCleanup(t *testing.T) {

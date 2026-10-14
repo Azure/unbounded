@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -114,81 +115,108 @@ func (r *Reconciler) mediaFinalizer(ctx context.Context, name string, add bool) 
 }
 
 // Cleanup runs before conflict waits and terminal TTL handling.
-func (r *Reconciler) reconcileMediaCleanup(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
-	for _, target := range op.Status.Targets {
+func (r *Reconciler) reconcileMediaCleanup(ctx context.Context, op *v1alpha3.MachineOperation) (bool, map[string]struct{}, error) {
+	failed := map[string]struct{}{}
+
+	var (
+		cleanupErr error
+		changed    bool
+	)
+
+	for i, target := range op.Status.Targets {
 		if !outstandingMedia(target) || target.BootMedia.Site != r.Site {
 			continue
 		}
 
-		if target.BootMedia.Released {
-			if !r.mediaRetentionExpired(op, target) {
-				continue
-			}
+		// Keep failed or unsaved cleanup out of the advancement snapshot.
+		target = *target.DeepCopy()
 
-			b := *target.BootMedia
-			b.Abandoned = true
-			target.BootMedia = &b
-
-			return true, r.saveMediaCleanup(ctx, op.Name, target)
+		updated, err := r.cleanupMediaTarget(ctx, op, &target)
+		if err == nil && updated {
+			err = r.saveMediaCleanup(ctx, op.Name, target)
 		}
 
-		if op.DeletionTimestamp.IsZero() && !op.Status.IsTerminal() && !isTerminalTarget(target) && !target.BootMedia.ImageWritten && !target.BootMedia.Cleaned {
+		if err != nil {
+			slog.ErrorContext(ctx, "virtual media cleanup failed", "machineOperation", op.Name, "machine", target.MachineRef, "error", err)
+			failed[target.MachineRef] = struct{}{}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup virtual media for Machine %s: %w", target.MachineRef, err))
+
 			continue
 		}
-		// Do not mutate a cache-owned pointer while cleanup is in flight.
-		b := *target.BootMedia
 
-		target.BootMedia = &b
-		switch {
-		case !b.Cleaned:
-			if err := r.cleanupMedia(ctx, target, false); err != nil {
-				return true, err
-			}
+		if updated {
+			op.Status.Targets[i] = target
+			changed = true
+		}
+	}
 
-			target.BootMedia.Cleaned = true
-			now := r.now()
+	if !changed && slices.Contains(op.Finalizers, mediaFinalizer) && !hasOutstandingMedia(op) {
+		return true, failed, errors.Join(cleanupErr, r.mediaFinalizer(ctx, op.Name, false))
+	}
 
-			target.BootMedia.CleanedAt = &now
-			if b.Phase == "Preparing" {
-				target.BootMedia.StagedDeleted = true
-			}
-		case !b.StagedDeleted:
-			if err := r.cleanupMedia(ctx, target, true); err != nil {
-				return true, err
-			}
+	if (changed || hasOutstandingMedia(op)) && (op.Status.IsTerminal() || !op.DeletionTimestamp.IsZero()) {
+		return true, failed, cleanupErr
+	}
 
-			target.BootMedia.StagedDeleted = true
-		case mediaHandoffPending(&b):
-			if !r.mediaRetentionExpired(op, target) {
-				// Keep ownership while the installer may still be writing or polling.
-				continue
-			}
+	// Preserve the cleanup-only reconcile for single-target operations.
+	return len(op.Status.Targets) == 1 && (changed || cleanupErr != nil), failed, cleanupErr
+}
 
-			target.BootMedia.Abandoned = true
-		default:
-			if r.BootMedia == nil {
-				return true, fmt.Errorf("virtual media provider is not configured")
-			}
-
-			if err := r.BootMedia.Release(ctx, b.ID); err != nil {
-				return true, err
-			}
-
-			target.BootMedia.Released = true
+func (r *Reconciler) cleanupMediaTarget(ctx context.Context, op *v1alpha3.MachineOperation, target *v1alpha3.MachineOperationTargetStatus) (bool, error) {
+	b := target.BootMedia
+	if b.Released {
+		if !r.mediaRetentionExpired(op, *target) {
+			return false, nil
 		}
 
-		return true, r.saveMediaCleanup(ctx, op.Name, target)
-	}
+		b.Abandoned = true
 
-	if slices.Contains(op.Finalizers, mediaFinalizer) && !hasOutstandingMedia(op) {
-		return true, r.mediaFinalizer(ctx, op.Name, false)
-	}
-
-	if hasOutstandingMedia(op) && (op.Status.IsTerminal() || !op.DeletionTimestamp.IsZero()) {
 		return true, nil
 	}
 
-	return false, nil
+	if op.DeletionTimestamp.IsZero() && !op.Status.IsTerminal() && !isTerminalTarget(*target) && !b.ImageWritten && !b.Cleaned {
+		return false, nil
+	}
+
+	switch {
+	case !b.Cleaned:
+		if err := r.cleanupMedia(ctx, *target, false); err != nil {
+			return false, err
+		}
+
+		b.Cleaned = true
+		now := r.now()
+
+		b.CleanedAt = &now
+		if b.Phase == "Preparing" {
+			b.StagedDeleted = true
+		}
+	case !b.StagedDeleted:
+		if err := r.cleanupMedia(ctx, *target, true); err != nil {
+			return false, err
+		}
+
+		b.StagedDeleted = true
+	case mediaHandoffPending(b):
+		if !r.mediaRetentionExpired(op, *target) {
+			// Keep ownership while the installer may still be writing or polling.
+			return false, nil
+		}
+
+		b.Abandoned = true
+	default:
+		if r.BootMedia == nil {
+			return false, fmt.Errorf("virtual media provider is not configured")
+		}
+
+		if err := r.BootMedia.Release(ctx, b.ID); err != nil {
+			return false, err
+		}
+
+		b.Released = true
+	}
+
+	return true, nil
 }
 
 func (r *Reconciler) saveMediaCleanup(ctx context.Context, opName string, target v1alpha3.MachineOperationTargetStatus) error {
