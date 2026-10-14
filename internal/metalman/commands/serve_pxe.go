@@ -315,10 +315,10 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			attestHandler := &attestation.Handler{
-				Clientset:      clientset,
-				ClusterCA:      clusterCA,
-				LookupNodeByIP: resolver.LookupNodeByIP,
-				StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+				Clientset:     clientset,
+				ClusterCA:     clusterCA,
+				LookupMachine: media.LookupAttestationMachine,
+				StatusUpdater: &StatusUpdater{Client: mgr.GetClient()},
 			}
 
 			httpMux := http.NewServeMux()

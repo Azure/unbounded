@@ -23,6 +23,21 @@ import (
 // firstBootOwner authorizes the installed OS after handoff, even when the ISO
 // bytes are released or the operation is terminal. Final reports end this claim.
 func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOwner, bool, error) {
+	o, claimed, err := p.liveFirstBootOwner(ctx, ip)
+	if err != nil || !claimed {
+		return o, claimed, err
+	}
+
+	if o.machine.Spec.Host == nil {
+		o.machine.Spec.Host = &v1alpha3.HostSpec{}
+	}
+
+	o.machine.Spec.Host.Netboot = o.status().Netboot.DeepCopy()
+
+	return o, claimed, nil
+}
+
+func (p *MediaProvider) liveFirstBootOwner(ctx context.Context, ip string) (*mediaOwner, bool, error) {
 	if p.Client == nil {
 		return nil, true, fmt.Errorf("media client unavailable")
 	}
@@ -65,16 +80,40 @@ func (p *MediaProvider) firstBootOwner(ctx context.Context, ip string) (*mediaOw
 				return nil, true, fmt.Errorf("media machine identity or site ownership changed")
 			}
 
-			if machine.Spec.Host == nil {
-				machine.Spec.Host = &v1alpha3.HostSpec{}
-			}
-
-			machine.Spec.Host.Netboot = b.Netboot.DeepCopy()
 			found = &mediaOwner{machine: &machine, op: op, index: j}
 		}
 	}
 
 	return found, found != nil, nil
+}
+
+// LookupAttestationMachine uses direct-peer media ownership before legacy IP lookup.
+// Unlike datasource lookup, it returns the live Machine spec for status updates.
+func (p *MediaProvider) LookupAttestationMachine(r *http.Request) (*v1alpha3.Machine, error) {
+	remote, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, err)
+	}
+
+	o, claimed, err := p.liveFirstBootOwner(r.Context(), remote)
+	if claimed {
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, err)
+		}
+
+		return o.machine, nil
+	}
+
+	node, err := p.Resolver.LookupNodeByIP(r.Context(), clientIP(r))
+	if node != nil && node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
+		return nil, errMediaFirstBootUnauthorized
+	}
+
+	if mediaErr := p.rejectFirstBootFallback(r.Context(), node, clientIP(r)); mediaErr != nil {
+		return nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, mediaErr)
+	}
+
+	return node, err
 }
 
 // mediaFirstBootPending keeps frozen templates available until a final report
