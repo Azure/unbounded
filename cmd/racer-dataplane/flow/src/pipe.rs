@@ -76,7 +76,14 @@ impl<P: Policy> Drop for Waiting<P> {
     fn drop(&mut self) {
         {
             let mut queue = self.queue.borrow_mut();
-            queue.retain(|entry| !Rc::ptr_eq(entry, &self.entry));
+            if queue
+                .front()
+                .is_some_and(|entry| Rc::ptr_eq(entry, &self.entry))
+            {
+                queue.pop_front();
+            } else {
+                queue.retain(|entry| !Rc::ptr_eq(entry, &self.entry));
+            }
             if queue.is_empty() {
                 // Do not retain queue storage after its admission charges leave.
                 *queue = VecDeque::new();
@@ -2106,6 +2113,101 @@ mod tests {
             drop(waiting);
             assert_eq!(pool.waiting.borrow().capacity(), 0);
             assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        }
+    }
+
+    /// Successful heads leave later slots in place unless storage must shrink.
+    #[test]
+    fn queued_success_pops_heads_without_compacting_successors() {
+        const WAITERS: usize = 32;
+        let quotas = admission(1);
+        let pool = PipePool::new(
+            quotas.clone(),
+            ResourceClass::Pipe,
+            ResourceClass::RequestContext,
+            WAITERS,
+        );
+        let held = pool.acquire().unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut waiting: VecDeque<_> = (0..WAITERS).map(|_| acquire_wait(&pool)).collect();
+        for wait in &mut waiting {
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        }
+        drop(held);
+        while let Some(mut wait) = waiting.pop_front() {
+            let next_slot = {
+                let queue = pool.waiting.borrow();
+                (queue.len() > 1 && queue.capacity() <= (queue.len() - 1) * 2)
+                    .then(|| std::ptr::from_ref(&queue[1]))
+            };
+            let Poll::Ready(Ok(lease)) = wait.as_mut().poll(&mut cx) else {
+                panic!("head must acquire the returned pipe");
+            };
+            if let Some(next_slot) = next_slot {
+                let queue = pool.waiting.borrow();
+                assert_eq!(std::ptr::from_ref(queue.front().unwrap()), next_slot);
+            }
+            assert_eq!(pool.waiting.borrow().len(), waiting.len());
+            assert_eq!(
+                quotas.used(ResourceClass::RequestContext),
+                waiting.len() * pool.waiter_bytes()
+            );
+            if let Some(next) = waiting.front_mut() {
+                assert!(next.as_mut().poll(&mut cx).is_pending());
+            }
+            drop(lease);
+        }
+        assert_eq!(pool.waiting.borrow().capacity(), 0);
+        assert!(pool.acquire().is_ok());
+    }
+
+    /// Head, middle, tail, and singleton cancellation preserve the surviving FIFO.
+    #[test]
+    fn canceled_waiter_removes_only_its_slot_and_preserves_progress() {
+        for (count, canceled) in [(1, 0), (5, 0), (5, 2), (5, 4)] {
+            let quotas = admission(1);
+            let pool = new_pool(quotas.clone());
+            let held = pool.acquire().unwrap();
+            let counters: Vec<_> = (0..count)
+                .map(|_| Arc::new(WakeCounter::default()))
+                .collect();
+            let mut waiting: Vec<_> = (0..count).map(|_| acquire_wait(&pool)).collect();
+            for (wait, counter) in waiting.iter_mut().zip(&counters) {
+                let waker = Waker::from(counter.clone());
+                assert!(
+                    wait.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
+            let mut expected = pool.waiting.borrow().clone();
+            expected.remove(canceled);
+            drop(waiting.remove(canceled));
+            {
+                let queue = pool.waiting.borrow();
+                assert_eq!(queue.len(), expected.len());
+                assert!(queue.iter().zip(&expected).all(|(a, b)| Rc::ptr_eq(a, b)));
+            }
+            assert_eq!(
+                quotas.used(ResourceClass::RequestContext),
+                waiting.len() * pool.waiter_bytes()
+            );
+            for (index, counter) in counters.iter().enumerate() {
+                let head = if canceled == 0 { 1 } else { 0 };
+                assert_eq!(counter.count(), usize::from(index == head));
+            }
+            let mut cx = Context::from_waker(Waker::noop());
+            for wait in &mut waiting {
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+            }
+            drop(held);
+            for mut wait in waiting {
+                assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+            }
+            assert!(pool.waiting.borrow().is_empty());
+            assert_eq!(pool.waiting.borrow().capacity(), 0);
+            assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+            assert!(pool.acquire().is_ok());
         }
     }
 
