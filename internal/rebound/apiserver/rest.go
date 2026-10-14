@@ -315,6 +315,19 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 	return grantObject(record, rv), nil
 }
 
+// resolveNodes returns the sorted names of the nodes that sel matches.
+//
+// It runs a single node list, not one GET per node:
+//   - The API server filters by the grant's label selector, so the work scales
+//     with the grant size, not the cluster size.
+//   - Limit is maxNodesPerGrant+1. That bounds the response and is enough to
+//     tell that a grant is too large without reading the remaining nodes.
+//   - Create calls this inside each ledger mutate attempt, so the node set and
+//     the conflict check come from one attempt and are redone together on a
+//     ledger conflict. Per-node GETs would each see a different moment.
+//
+// Continue is only followed when the server returns a short page; it reads
+// the same list snapshot.
 func (s *storage) resolveNodes(ctx context.Context, name string, sel labels.Selector) ([]string, error) {
 	options := metav1.ListOptions{LabelSelector: sel.String(), Limit: int64(s.maxNodesPerGrant) + 1}
 
@@ -326,13 +339,6 @@ func (s *storage) resolveNodes(ctx context.Context, name string, sel labels.Sele
 	}
 
 	for {
-		// One logical list, filtered server-side by this grant's selector, scales
-		// with grant size instead of cluster size. The max+1 limit bounds the
-		// response and detects oversized grants without fetching the rest.
-		// Continue follows the same list snapshot if the server returns a short page.
-		// Resolve inside each ledger mutate attempt: one node snapshot for the
-		// ledger snapshot used by the conflict check, retried on CAS conflict,
-		// rather than N per-node GETs that could each observe a different moment.
 		nodes, err := s.store.Client.CoreV1().Nodes().List(ctx, options)
 		if err != nil {
 			return nil, err
