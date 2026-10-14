@@ -387,6 +387,21 @@ Each phase requires captured evidence and an explicit rollback point.
    - Do not add gb200-2 until its local NVLink fault is repaired.
    - Do not add gb200-1 until a qualified Azure Linux image is applied.
    - Migrate gb200-4 last while preserving MetalMan.
+10. **Capture the PR acceptance evidence.**
+    - Record a simple 10-20 second video only after the qualified producer
+      profile is unblocked, the HostReplace is separately approved, and the
+      host successfully rejoins.
+    - Show the immutable profile/digest being accepted,
+      `NVIDIAIMEXPrepared=True` with reason `HostQualified`, the Node Ready
+      with four GPUs, and either GPU Operator/DRA/ComputeDomain readiness or
+      the exact PR-specific terminal result.
+    - Keep the producer-owned Operator deployment visibly separate from the
+      Unbounded validation step. The video must not imply that PR #913 installs
+      GPU Operator.
+    - Attach the detailed commands, YAML, events, and logs separately. Do not
+      compress diagnostic output into the video.
+    - A blocked or failing run is useful diagnostic evidence, but it does not
+      satisfy this acceptance gate and must not be presented as success.
 
 Rollback reverses test workloads and claims, ComputeDomains, DRA advertisement,
 and Operator operands before restoring the standalone plugin. If host
@@ -406,6 +421,15 @@ resources are healthy and there is no duplicate advertisement.
 - IMEX channel device and CDI injection evidence.
 - NCCL topology and transport logs proving MNNVL.
 - Exact rollback artifacts and post-rollback health.
+- A 10-20 second end-to-end video showing the accepted immutable profile,
+  `HostQualified`, Node Ready with four GPUs, and the terminal DRA result.
+- Separate detailed command output and logs supporting every state shown in
+  the video.
+
+The video and detailed logs are a hard PR completion gate. They can be
+captured only after the producer profile is qualified and the live canary is
+separately authorized; neither the current blocked profile nor a failed
+rejoin satisfies the gate.
 
 ## Non-goals
 
