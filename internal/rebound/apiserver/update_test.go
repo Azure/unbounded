@@ -13,8 +13,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/rest"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
+	"github.com/Azure/unbounded/internal/rebound/ledger"
 )
 
 func TestUpdateAcceptsNoOp(t *testing.T) {
@@ -159,15 +161,13 @@ func TestUpdateNoOpConfirmsAfterValidation(t *testing.T) {
 		"recreated": {
 			keepRV: true,
 			mutate: func(t *testing.T, s *storage, ctx context.Context) {
-				deleteGrant(t, s, ctx, "first")
-				created(t, s, ctx, "first", "node-a")
+				recreate(t, s, ctx, "first", "node-a")
 			},
 			check: apierrors.IsConflict,
 		},
 		"recreated without resourceVersion": {
 			mutate: func(t *testing.T, s *storage, ctx context.Context) {
-				deleteGrant(t, s, ctx, "first")
-				created(t, s, ctx, "first", "node-a")
+				recreate(t, s, ctx, "first", "node-a")
 			},
 			check: apierrors.IsConflict,
 		},
@@ -222,4 +222,20 @@ func deleteGrant(t *testing.T, s *storage, ctx context.Context, name string) {
 	if _, _, err := s.Delete(ctx, name, nil, nil); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// recreate deletes the named grant and creates it again on nodes, stepping the
+// fake clock past the handoff cooldown that the delete starts.
+func recreate(t *testing.T, s *storage, ctx context.Context, name string, nodes ...string) {
+	t.Helper()
+
+	deleteGrant(t, s, ctx, name)
+
+	c, ok := s.clock.(*clocktesting.FakeClock)
+	if !ok {
+		t.Fatal("expected a fake clock")
+	}
+
+	c.Step(ledger.HandoffCooldown)
+	created(t, s, ctx, name, nodes...)
 }
