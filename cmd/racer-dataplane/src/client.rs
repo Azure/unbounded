@@ -148,21 +148,61 @@ async fn handle_read_result(
         responses.send_error(connection, error, scope).await?;
         return Ok(None);
     }
+    let watch_scope = RequestScope::new(scope.request, scope.deadline.0)?;
     let socket = connection.socket();
+    // Keep four slots for duplex sends, receives, and listener progress. Tiny
+    // rings retain the synchronous fallback rather than losing delivery capacity.
+    let watch_room = admission
+        .policy()
+        .limits()
+        .queue_entries
+        .get()
+        .saturating_sub(responses.io.reactor().in_flight())
+        > 4;
+    let mut watch = watch_room.then(|| responses.io.disconnected(&connection, &watch_scope));
+    let mut poll_disconnect = !watch_room;
     let mut send = if matches!(kind, ReadKind::Subscription { .. }) {
         responses.send_subscription(connection, response, scope, observation, timeout)
     } else {
         responses.send_observed(connection, response, scope, observation)
     };
     let result = std::future::poll_fn(|cx| {
-        if socket.peer_disconnected() {
+        // Give delivery first use of queue capacity. A synchronous response
+        // needs no watch, and its I/O must not be rejected by auxiliary polling.
+        if let Poll::Ready(result) = send.as_mut().poll(cx) {
+            return Poll::Ready(result);
+        }
+        if let Some(Poll::Ready(result)) = watch.as_mut().map(|watch| watch.as_mut().poll(cx)) {
+            watch = None;
+            match result {
+                Ok(events)
+                    if events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) as u32 == 0 =>
+                {
+                    // Linux can add RDHUP even to a HUP-only PollAdd. Do not
+                    // cancel a reader or rearm a permanently ready half-close.
+                    poll_disconnect = true;
+                }
+                // The watch is auxiliary. It must neither consume delivery's
+                // queue headroom nor impose the acquisition deadline on a body
+                // that has its own write-stall deadline.
+                Err(Error::Overloaded | Error::DeadlineExceeded) => poll_disconnect = true,
+                _ => {
+                    let _ = scope.cancel();
+                }
+            }
+        }
+        if poll_disconnect && socket.peer_disconnected() {
             let _ = scope.cancel();
         }
-        send.as_mut().poll(cx)
+        Poll::Pending
     })
     .await;
     drop(send);
-    drop(socket);
+    // Fence the watch before returning a reusable connection or releasing its slot.
+    let _ = watch_scope.cancel();
+    if let Some(watch) = watch {
+        let _ = watch.await;
+    }
     match result {
         Ok(connection) => Ok(Some(connection)),
         Err(error) => {

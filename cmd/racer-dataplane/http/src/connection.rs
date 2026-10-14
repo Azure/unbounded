@@ -97,13 +97,17 @@ pub async fn disconnect_fenced<C: Context, T>(
                 _ => (),
             }
         }
-        if socket.peer_read_closed() {
-            failure.get_or_insert(uring_runtime::Error::Cancelled.into());
-        }
         if failure.is_some() {
             cancel_exchange();
         }
-        work.as_mut().poll(cx)
+        let result = work.as_mut().poll(cx);
+        // A FIN may be visible on the socket before its watch CQE is delivered.
+        // Check once at the result boundary, not on every pending work poll.
+        if result.is_ready() && failure.is_none() && socket.peer_read_closed() {
+            failure = Some(uring_runtime::Error::Cancelled.into());
+            cancel_exchange();
+        }
+        result
     })
     .await;
     cancel_watch(&watch_scope);
@@ -2524,6 +2528,59 @@ mod tests {
                 .unwrap(),
             peer,
         )
+    }
+
+    #[test]
+    fn disconnected_watch_exposes_half_close_without_full_close_and_fences_full_close() {
+        let hooks = hooks();
+        let reactor = reactor();
+        let io = HttpIo::new(
+            reactor.clone(),
+            Codec::new(Default::default()),
+            hooks.clone(),
+            1024,
+            1024,
+        );
+        let (connection, peer) = lease(&hooks, Policy::default());
+        let mut watch = io.disconnected(&connection, &TestScope);
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(watch.as_mut().poll(&mut cx).is_pending());
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let events = drive(&reactor, watch).unwrap();
+        assert_eq!(events & libc::POLLHUP as u32, 0);
+        assert_ne!(events & libc::POLLRDHUP as u32, 0);
+        drop(peer);
+        assert_ne!(
+            drive(&reactor, io.disconnected(&connection, &TestScope)).unwrap()
+                & libc::POLLHUP as u32,
+            0
+        );
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    fn disconnected_watch_reports_admission_failure_and_abandonment_retains_slot() {
+        let hooks = hooks();
+        let reactor = reactor();
+        let io = HttpIo::new(
+            reactor.clone(),
+            Codec::new(Default::default()),
+            hooks.clone(),
+            1024,
+            1024,
+        );
+        let (connection, _peer) = lease(&hooks, Policy::default());
+        let mut watch = io.disconnected(&connection, &TestScope);
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(watch.as_mut().poll(&mut cx).is_pending());
+        drop(watch);
+        assert_eq!(reactor.in_flight(), 1);
+        drive(&reactor, reactor.drain()).unwrap();
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(
+            drive(&reactor, io.disconnected(&connection, &TestScope)),
+            Err(Failure::Runtime(uring_runtime::Error::Unavailable))
+        );
     }
 
     /// Signing controls final framing but cannot bypass prevalidation or limits.

@@ -1681,6 +1681,49 @@ fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
 }
 
 #[test]
+fn delivery_watch_cancels_disconnected_body_and_releases_leases() {
+    let (fixture, pipes) = body_fixture_with_large_page(16, false, true);
+    let mut socket = fixture.connect();
+    socket
+        .write_all(&request(
+            "POST",
+            "Range: bytes=0-16777215\r\nConnection: close\r\n",
+        ))
+        .unwrap();
+    let output = fixture.receive(&mut socket, false);
+    assert!(output.starts_with(b"HTTP/1.1 200 "));
+    assert_eq!(fixture.listeners.active_connections(), 1);
+    drop(socket);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.listeners.active_connections() != 0 || fixture.reactor.in_flight() > 1 {
+        assert!(
+            Instant::now() < deadline,
+            "disconnect watch failed to fence delivery"
+        );
+        fixture.pump(16);
+    }
+    assert_only_idle_pipes(&fixture, &pipes);
+}
+
+#[test]
+fn delivery_head_allows_request_write_half_close() {
+    let fixture = Fixture::new();
+    fixture.reconcile(&[definition()]).unwrap();
+    let mut socket = fixture.connect();
+    socket
+        .write_all(&request("HEAD", "Connection: close\r\n"))
+        .unwrap();
+    // Allow acquisition to finish before half-closing the response's input side.
+    for _ in 0..32 {
+        fixture.pump(16);
+    }
+    socket.shutdown(std::net::Shutdown::Write).unwrap();
+    let output = fixture.receive(&mut socket, true);
+    assert!(output.starts_with(b"HTTP/1.1 200 "));
+    assert_eq!(fixture.listeners.active_connections(), 0);
+}
+
+#[test]
 fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     // Duplex completion frames and the next response head may be in flight
     // together, in addition to listener readiness. Keep reactor headroom
@@ -1708,7 +1751,12 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     assert_no_head(&mut fourth);
     let mut overflow = start_body(&fixture);
     let output = fixture.receive(&mut overflow, true);
-    assert!(output.starts_with(b"HTTP/1.1 200 "), "{output:?}");
+    let mut diagnostics = String::new();
+    failures.write(&mut diagnostics).unwrap();
+    assert!(
+        output.starts_with(b"HTTP/1.1 200 "),
+        "{output:?} {diagnostics}"
+    );
     assert_eq!(&output[output.len() - 26..output.len() - 21], b"hello");
     for socket in [&mut first, &mut second, &mut third, &mut fourth] {
         let output = fixture.receive(socket, true);

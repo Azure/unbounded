@@ -54,7 +54,10 @@ use std::{
     path::PathBuf,
     pin::Pin,
     rc::{Rc, Weak},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -141,7 +144,20 @@ pub enum SocketAddress {
 /// Cloneable cross-thread wake endpoint for worker command/crypto producers.
 #[derive(Clone)]
 pub struct ReactorWake {
-    fd: Option<Arc<HostFd>>,
+    fd: Option<Arc<WakeState>>,
+}
+
+struct WakeState {
+    fd: HostFd,
+    owner: std::thread::ThreadId,
+    local: AtomicBool,
+    remote: AtomicBool,
+}
+
+impl AsRawFd for WakeState {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
 }
 
 /// Resources return to the caller only after all applicable completion fences.
@@ -239,20 +255,26 @@ const DROP_WAIT: Duration = Duration::from_millis(100);
 // partial result is never replayed. EAGAIN additionally requires a readiness CQE.
 const DATA_RETRIES: usize = 8;
 
-// Linux UAPI: the only setup flag enabled by init. Unknown flags fail closed.
+// Linux UAPI setup flags. Unknown modes still fail closed for suppression.
 const SETUP_CQSIZE: u32 = 1 << 3;
+const SETUP_SUBMIT_ALL: u32 = 1 << 7;
+const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
+const SETUP_NORMAL: u32 = SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER;
 
 /// Backend state and owners that must survive until both applicable CQEs arrive.
 struct State<S: Scope> {
     ring: Option<IoUring>,
 
-    wake: Option<Arc<HostFd>>,
+    wake: Option<Arc<WakeState>>,
 
     #[cfg(feature = "simulation")]
     simulation: Option<simulation::Driver>,
 
     #[cfg(test)]
     submit_attempts: usize,
+
+    #[cfg(test)]
+    wait_attempts: usize,
 
     #[cfg(test)]
     submit_result: Option<std::io::Result<usize>>,
@@ -400,6 +422,14 @@ impl ReactorWake {
         let Some(fd) = &self.fd else {
             return Ok(());
         };
+        if std::thread::current().id() == fd.owner {
+            // Preserve the next-turn notification without waking our own eventfd.
+            fd.local.store(true, Ordering::Release);
+            return Ok(());
+        }
+        if fd.remote.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         let value = 1u64;
         loop {
             // SAFETY: eventfd consumes this initialized, stack-local u64 synchronously.
@@ -410,7 +440,10 @@ impl ReactorWake {
             match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINTR) => continue,
                 Some(libc::EAGAIN) => return Ok(()), // Already readable.
-                _ => return Err(Error::Io),
+                _ => {
+                    fd.remote.store(false, Ordering::Release);
+                    return Err(Error::Io);
+                }
             }
         }
     }
@@ -715,6 +748,8 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 #[cfg(test)]
                 submit_attempts: 0,
                 #[cfg(test)]
+                wait_attempts: 0,
+                #[cfg(test)]
                 submit_result: None,
                 #[cfg(test)]
                 completions: Default::default(),
@@ -788,16 +823,29 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             state.ring_reservation = Some(ring_reservation);
             return Ok(());
         }
-        let ring = IoUring::builder()
-            .setup_cqsize(cq)
-            .build(sq)
-            .map_err(|_| Error::Io)?;
+        let ring = probe_ring(|flags| {
+            let mut builder = IoUring::builder();
+            builder.setup_cqsize(cq);
+            if flags & SETUP_SUBMIT_ALL != 0 {
+                builder.setup_submit_all();
+            }
+            if flags & SETUP_SINGLE_ISSUER != 0 {
+                builder.setup_single_issuer();
+            }
+            builder.build(sq)
+        })
+        .map_err(|_| Error::Io)?;
         // SAFETY: no borrowed pointers; ownership of the returned descriptor is unique.
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 {
             return Err(Error::Io);
         }
-        state.wake = Some(Arc::new(unsafe { HostFd::from_raw_fd(fd) }));
+        state.wake = Some(Arc::new(WakeState {
+            fd: unsafe { HostFd::from_raw_fd(fd) },
+            owner: std::thread::current().id(),
+            local: AtomicBool::new(false),
+            remote: AtomicBool::new(false),
+        }));
         state.ring_reservation = Some(ring_reservation);
         state.ring = Some(ring);
         Ok(())
@@ -1147,6 +1195,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         &self,
         owned: &mut InFlight<B, L>,
         operation: BufferOperation,
+        policy: IssuePolicy,
     ) -> Result<Submission, S::Error>
     where
         S::Error: From<B::Error>,
@@ -1169,11 +1218,11 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     BufferOperation::Read(offset) => opcode::Read::new(fd, ptr, len)
                         .offset(offset)
                         .build()
-                        .flags(squeue::Flags::ASYNC),
+                        .flags(policy.flags()),
                     BufferOperation::Write(offset) => opcode::Write::new(fd, ptr, len)
                         .offset(offset)
                         .build()
-                        .flags(squeue::Flags::ASYNC),
+                        .flags(policy.flags()),
                     BufferOperation::Recv => opcode::Recv::new(fd, ptr, len).build(),
                     BufferOperation::Send => opcode::Send::new(fd, ptr, len)
                         .flags(libc::MSG_NOSIGNAL)
@@ -1184,6 +1233,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     }
 
     /// Retain exclusive storage and admission through retries and return fenced progress.
+    #[allow(clippy::too_many_arguments)]
     fn buffer_io<'a, B: IoBuffer, L: 'static>(
         &'a self,
         file: Rc<Descriptor>,
@@ -1191,6 +1241,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
         operation: BufferOperation,
+        policy: IssuePolicy,
         capacity: Option<Rc<SubmissionCapacity>>,
     ) -> Operation<'a, Completion<B, L>, S::Error>
     where
@@ -1207,8 +1258,9 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 buffer,
                 lease,
             };
-            // File issue may block on filesystem work; force it off the worker.
-            // Socket opcodes use io_uring's native nonblocking issue/poll path.
+            // Positioned device I/O tries inline nonblocking issue; the kernel
+            // offloads if needed. Cold buffered filesystem callers force ASYNC.
+            // Socket opcodes always keep native nonblocking issue/poll behavior.
             let fd = owned.file.clone();
             let interest = match operation {
                 BufferOperation::Read(_) | BufferOperation::Recv => libc::POLLIN,
@@ -1216,7 +1268,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             } as u32;
             let (owned, bytes) = self
                 .retry_data(owned, fd, scope, capacity, interest, |owned| {
-                    self.buffer_submission(owned, operation)
+                    self.buffer_submission(owned, operation, policy)
                 })
                 .await?;
             Ok(owned.complete(bytes))
@@ -1263,6 +1315,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             lease,
             scope,
             BufferOperation::Read(offset),
+            IssuePolicy::Inline,
             None,
         )
     }
@@ -1285,6 +1338,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             lease,
             scope,
             BufferOperation::Write(offset),
+            IssuePolicy::Inline,
             None,
         )
     }
@@ -1300,7 +1354,15 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     where
         S::Error: From<B::Error>,
     {
-        self.buffer_io(fd, buffer, lease, scope, BufferOperation::Recv, None)
+        self.buffer_io(
+            fd,
+            buffer,
+            lease,
+            scope,
+            BufferOperation::Recv,
+            IssuePolicy::Inline,
+            None,
+        )
     }
 
     /// Receive using prepaid capacity held until the fenced reply is consumed or dropped.
@@ -1314,7 +1376,15 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     where
         S::Error: From<B::Error>,
     {
-        self.buffer_io(fd, buffer, (), scope, BufferOperation::Recv, Some(capacity))
+        self.buffer_io(
+            fd,
+            buffer,
+            (),
+            scope,
+            BufferOperation::Recv,
+            IssuePolicy::Inline,
+            Some(capacity),
+        )
     }
 
     /// Send using prepaid capacity held until the fenced reply is consumed or dropped.
@@ -1328,7 +1398,15 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     where
         S::Error: From<B::Error>,
     {
-        self.buffer_io(fd, buffer, (), scope, BufferOperation::Send, Some(capacity))
+        self.buffer_io(
+            fd,
+            buffer,
+            (),
+            scope,
+            BufferOperation::Send,
+            IssuePolicy::Inline,
+            Some(capacity),
+        )
     }
 
     /// Send owned immutable storage, retaining its lease and suppressing SIGPIPE.
@@ -1705,6 +1783,13 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             state.stopped = true;
             return Err(error);
         }
+        let local = state
+            .wake
+            .as_ref()
+            .is_some_and(|wake| wake.local.swap(false, Ordering::AcqRel));
+        if duration.is_zero() || local {
+            return Ok(());
+        }
         #[cfg(feature = "simulation")]
         if state.simulation.is_some() {
             return Ok(());
@@ -1727,6 +1812,10 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             tv_nsec: duration.as_nanos() as libc::c_long,
         };
         // SAFETY: poll only borrows initialized descriptor/timeout arrays for this call.
+        #[cfg(test)]
+        {
+            state.wait_attempts += 1;
+        }
         let result = unsafe {
             libc::ppoll(
                 fds.as_mut_ptr(),
@@ -1744,6 +1833,15 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             unsafe {
                 libc::read(fds[1].fd, (&mut value as *mut u64).cast(), 8);
             }
+            // Clear after draining, never before: a racing coalesced producer is
+            // covered by the service turn we are about to run. A later producer
+            // writes a fresh token. Zero/local waits leave remote tokens intact.
+            state
+                .wake
+                .as_ref()
+                .unwrap()
+                .remote
+                .store(false, Ordering::Release);
         }
         if fds
             .iter()
@@ -1841,6 +1939,21 @@ enum BufferOperation {
     Write(u64),
     Recv,
     Send,
+}
+
+#[derive(Clone, Copy)]
+enum IssuePolicy {
+    Inline,
+    Offload,
+}
+
+impl IssuePolicy {
+    fn flags(self) -> squeue::Flags {
+        match self {
+            Self::Inline => squeue::Flags::empty(),
+            Self::Offload => squeue::Flags::ASYNC,
+        }
+    }
 }
 
 impl<S: Scope> State<S> {
@@ -1962,11 +2075,23 @@ fn ring_setup_flags(params: &io_uring::Parameters) -> u32 {
     }
 }
 
-/// Skip empty submissions only for the known normal interrupt-driven setup.
+/// Probe setup combinations, keeping the first ring the kernel accepts.
+fn probe_ring<T>(mut build: impl FnMut(u32) -> std::io::Result<T>) -> std::io::Result<T> {
+    for flags in [SETUP_NORMAL, SETUP_CQSIZE | SETUP_SUBMIT_ALL, SETUP_CQSIZE] {
+        match build(flags) {
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) && flags != SETUP_CQSIZE => (),
+            result => return result,
+        }
+    }
+    unreachable!("the baseline setup returns its result")
+}
+
+/// Skip empty submissions only for known interrupt-driven modes.
 fn submission_required(setup_flags: u32, empty: bool, cq_overflow: bool, taskrun: bool) -> bool {
-    // Only the normal interrupt-driven mode is supported for suppression.
-    // SQPOLL, IOPOLL, all task-run modes and future flags retain ring.submit().
-    setup_flags & !SETUP_CQSIZE != 0 || !empty || cq_overflow || taskrun
+    // SINGLE_ISSUER and SUBMIT_ALL do not change completion delivery. Deferred
+    // task work is not enabled: it needs a separate completion/fence audit.
+    // All task-run modes, polling modes, and unknown flags remain fail-closed.
+    setup_flags & !SETUP_NORMAL != 0 || !empty || cq_overflow || taskrun
 }
 
 /// Defer transient submit failures to the next worker turn; report fatal failures.

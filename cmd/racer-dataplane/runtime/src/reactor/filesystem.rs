@@ -138,7 +138,15 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             loop {
                 buffer.end = (probe - out.buffer.end).min(buffer.data.len());
                 let completion = self
-                    .read_at(fd.clone(), out.buffer.end as u64, buffer, (), scope)
+                    .buffer_io(
+                        fd.clone(),
+                        buffer,
+                        (),
+                        scope,
+                        super::BufferOperation::Read(out.buffer.end as u64),
+                        super::IssuePolicy::Offload,
+                        None,
+                    )
                     .await?;
                 let n = completion.bytes;
                 buffer = completion.buffer;
