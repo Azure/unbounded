@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -136,10 +138,20 @@ func TestBootstrapBlockDevicesVectors(t *testing.T) {
 
 func TestSharedControlCharacters(t *testing.T) {
 	var vectors []struct {
-		Name, Text  string
-		DeviceValid bool `json:"device_valid"`
+		Name, Text        string
+		DeviceValid       bool   `json:"device_valid"`
+		EncodedText       string `json:"encoded_text"`
+		BootstrapSHA256   string `json:"bootstrap_sha256"`
+		PublicationSHA256 string `json:"publication_sha256"`
+		ContentHash       string `json:"content_hash"`
+		MembershipHash    string `json:"membership_hash"`
 	}
 	require.NoError(t, json.Unmarshal(fixture(t, "control-characters.json"), &vectors))
+	// Pin exact encoder output: these bytes feed content hashes in Go and Rust.
+	digest := func(b []byte) string {
+		sum := sha256.Sum256(b)
+		return hex.EncodeToString(sum[:])
+	}
 
 	for _, vector := range vectors {
 		t.Run(vector.Name, func(t *testing.T) {
@@ -156,6 +168,14 @@ func TestSharedControlCharacters(t *testing.T) {
 				require.Equal(t, vector.Text, decoded.Members[1].RDMANICs[0].Device)
 				encoded, err := EncodePublication(decoded)
 				require.NoError(t, err)
+				require.Contains(t, string(encoded), `"device":`+vector.EncodedText)
+				require.Equal(t, vector.PublicationSHA256, digest(encoded))
+
+				ch, mh, err := ContentHashes(decoded)
+				require.NoError(t, err)
+				require.Equal(t, vector.ContentHash, ch)
+				require.Equal(t, vector.MembershipHash, mh)
+
 				again, err := DecodePublication(bytes.NewReader(encoded))
 				require.NoError(t, err)
 				require.Equal(t, decoded, again)
@@ -169,6 +189,8 @@ func TestSharedControlCharacters(t *testing.T) {
 			response.BlockDevices = vector.Text
 			encoded, err := EncodeBootstrap(response)
 			require.NoError(t, err)
+			require.Contains(t, string(encoded), `"block_devices":`+vector.EncodedText)
+			require.Equal(t, vector.BootstrapSHA256, digest(encoded))
 			got, err := DecodeBootstrapResponse(bytes.NewReader(encoded))
 			require.NoError(t, err)
 			require.Equal(t, vector.Text, got.BlockDevices)

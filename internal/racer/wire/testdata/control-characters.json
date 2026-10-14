@@ -1,12 +1,12 @@
 [
-  {"name":"nul","text":"a\u0000b","device_valid":false},
-  {"name":"newline","text":"a\nb","device_valid":false},
-  {"name":"carriage return","text":"a\rb","device_valid":false},
-  {"name":"tab","text":"a\tb","device_valid":true},
-  {"name":"backspace","text":"a\bb","device_valid":true},
-  {"name":"form feed","text":"a\fb","device_valid":true},
-  {"name":"unit separator","text":"a\u001fb","device_valid":true},
-  {"name":"delete","text":"a\u007fb","device_valid":true},
-  {"name":"quote and backslash","text":"a\"\\b","device_valid":true},
-  {"name":"line separators","text":"a\u2028\u2029b","device_valid":true}
+  {"name":"nul","text":"a\u0000b","device_valid":false,"encoded_text":"\"a\\u0000b\"","bootstrap_sha256":"c213117618d683e97c06370dcdd19edb384a33e806ebac42499db49f60687cba"},
+  {"name":"newline","text":"a\nb","device_valid":false,"encoded_text":"\"a\\nb\"","bootstrap_sha256":"ca01191c4b3b527c0a72a9dff04ff73fa0c3bfd5f38c5ce2998e14a375131f8c"},
+  {"name":"carriage return","text":"a\rb","device_valid":false,"encoded_text":"\"a\\rb\"","bootstrap_sha256":"15dfb20eb42522fe6af7eee8aa58debc4df2ccb895b631dd45ed7c2422f85821"},
+  {"name":"tab","text":"a\tb","device_valid":true,"encoded_text":"\"a\\tb\"","bootstrap_sha256":"377cd71eaa342b80d3c092deb245e2362247756911f62982f9be480d588c6ce6","publication_sha256":"830615c60b82147d97959adb2e1775475ea5625ac51fccc5c72af38c2539b6f8","content_hash":"64db7a39d879fc9e762c5534d5442f6ab1d67e0a0a91f41a287a71b4d2df5d63","membership_hash":"6b5b1f68493b0ad3b2398b1c6e9ba8c9c9b9134564baf7b12888568e1ed1b2c5"},
+  {"name":"backspace","text":"a\bb","device_valid":true,"encoded_text":"\"a\\bb\"","bootstrap_sha256":"6d577c4b99e870b77828c8ca573cf354e79cc2b8d9a4f46338f62a5d79f05129","publication_sha256":"8e947d8658d4911494690e71d828cc3d0e58e6d5aa91d1fb65072429febd1783","content_hash":"f44ded6da6d5f56c341ae4f23b8684c2838d639296f544254417ae3b64beeda6","membership_hash":"95179be6c66fb02eae847ac666ce0f0f893ab825aa679f783cef2e8e35988fac"},
+  {"name":"form feed","text":"a\fb","device_valid":true,"encoded_text":"\"a\\fb\"","bootstrap_sha256":"54582dcadcf17cef8a56e5de3902d5aa0eb55e10164fc32dbfed751263ca0eac","publication_sha256":"fdfd2facd5b6d9155f4efbe6be991ec2f4a7f647c9a30b855f4aef6d9eb6466f","content_hash":"e28bdc7e92634223c605ada423e0c5c7a5bef19ec9e318af75346d3727d767f4","membership_hash":"b91ea4bbf0a8b4917711477042913a488fd28890163f6ace8dc124cb9b8db921"},
+  {"name":"unit separator","text":"a\u001fb","device_valid":true,"encoded_text":"\"a\\u001fb\"","bootstrap_sha256":"73182ff1843ffbceac537d1e29a36292c22e8cfe59bbae3b1f23eb9cd2cba340","publication_sha256":"0c5dfee9c7fa0c33b6e8e94a208fc307a3620e2008bd456eb700e2fc13c5ec17","content_hash":"03b59697248de6f03c0dce75539fb0a594dbfd6ee46082267b89da5c0d333694","membership_hash":"b2ef77f27ac6297d98440bd5835988dfd681fd0339671e94f48baff46ab0da7c"},
+  {"name":"delete","text":"a\u007fb","device_valid":true,"encoded_text":"\"a\u007fb\"","bootstrap_sha256":"a0d6c7d2a16ea51b0d3bf41c685f302485feb2ae45d2ff9d4a8703d1f826f38f","publication_sha256":"916ff88822df1670fc5c104b0e3ea276e3a4545fe995d455b3a7f8400525bb2f","content_hash":"a5aa7e6bc16973a63426a4372c4aaf8f7855fb25adb5a1fbb21ff1b01133159e","membership_hash":"5460d7d333c1ec1048f1556df5966a98252e3974c5b150ae31e3b971274efd35"},
+  {"name":"quote and backslash","text":"a\"\\b","device_valid":true,"encoded_text":"\"a\\\"\\\\b\"","bootstrap_sha256":"8cead3176e8a0a409225b183adb3cf8c1c9dd48a81de4540831fb00007b11ece","publication_sha256":"509e7750741b883ac4f30191195c64ade999ca2bd42b59bdff86ed64d3ce0100","content_hash":"0246cef6e85b2f38d7c197a52150b440d2c39506d848013314c1df40819e0eb9","membership_hash":"b28a9677b23f33b083cac57948860f7504497c625141b2064cd5ca8f7f1d145c"},
+  {"name":"line separators","text":"a\u2028\u2029b","device_valid":true,"encoded_text":"\"a\\u2028\\u2029b\"","bootstrap_sha256":"dcd6bb4046e0379e0e00039841342d29b472f9348bbff53ee4f19087d2e7ecff","publication_sha256":"ea292fe2b1252efa059cca1549ca6984c6520cb22676c88254f2d36c5bde6bef","content_hash":"864fea3f6c843ca5bc03ad286207b1ce7b5f76a472488cca38a43ef5e0ea0b9e","membership_hash":"ea6e0bfcfa491d1cf877e7f55dc3e066b8307ec1e91d4c170e3e8002e9b5cb97"}
 ]

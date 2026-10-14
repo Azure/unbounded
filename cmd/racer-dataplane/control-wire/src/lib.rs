@@ -1879,8 +1879,11 @@ mod codec {
         fn shared_control_characters() {
             let vectors: Value =
                 serde_json::from_slice(&fixture("control-characters.json")).unwrap();
+            // Pin exact encoder output: these bytes feed content hashes.
+            let digest = |b: &[u8]| format!("{:x}", sha2::Sha256::digest(b));
             for vector in vectors.as_array().unwrap() {
                 let text = vector["text"].as_str().unwrap();
+                let literal = vector["encoded_text"].as_str().unwrap();
                 let p = decode_publication(&fixture("publication.json")).unwrap();
                 let mut p = serde_json::to_value(dto(&p).unwrap()).unwrap();
                 p["members"][1]["rdma_nics"][0]["device"] = text.into();
@@ -1889,6 +1892,22 @@ mod codec {
                     let decoded = decoded.unwrap();
                     assert_eq!(decoded.members[1].rails[0].device, text);
                     let encoded = encode_publication(&decoded).unwrap();
+                    let device = format!("\"device\":{literal}");
+                    assert!(
+                        String::from_utf8_lossy(&encoded).contains(&device),
+                        "{}",
+                        vector["name"]
+                    );
+                    assert_eq!(
+                        digest(&encoded),
+                        vector["publication_sha256"],
+                        "{}",
+                        vector["name"]
+                    );
+                    let (content, membership) = canonical_content(&decoded).unwrap();
+                    assert_eq!(digest(&content), vector["content_hash"]);
+                    assert_eq!(content_hash(&decoded).unwrap(), vector["content_hash"]);
+                    assert_eq!(digest(&membership), vector["membership_hash"]);
                     assert_eq!(
                         decode_publication(&encoded).unwrap().members[1].rails[0].device,
                         text
@@ -1900,6 +1919,18 @@ mod codec {
                     decode_enrollment_response(&fixture("bootstrap-response.json")).unwrap();
                 response.block_devices = Some(text.into());
                 let encoded = encode_enrollment_response(&response).unwrap();
+                let block_devices = format!("\"block_devices\":{literal}");
+                assert!(
+                    String::from_utf8_lossy(&encoded).contains(&block_devices),
+                    "{}",
+                    vector["name"]
+                );
+                assert_eq!(
+                    digest(&encoded),
+                    vector["bootstrap_sha256"],
+                    "{}",
+                    vector["name"]
+                );
                 assert_eq!(
                     decode_enrollment_response(&encoded)
                         .unwrap()
