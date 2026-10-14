@@ -983,6 +983,7 @@ pub(crate) mod tests {
                             .ciphertext(
                                 cipher_charge,
                                 PageEnvelope {
+                                    cipher: crate::model::PageCipher::Xaes256Gcm,
                                     page,
                                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                                     nonce: Nonce([2; 24]),
@@ -1717,6 +1718,7 @@ pub(crate) mod tests {
                     .reserve(Some(cache), ResourceClass::Ciphertext, 19)
                     .unwrap(),
                 PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                     nonce: Nonce([2; 24]),

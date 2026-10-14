@@ -673,6 +673,7 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
                 .reserve(Some(cache), ResourceClass::Ciphertext, 19)
                 .unwrap(),
             PageEnvelope {
+                cipher: crate::model::PageCipher::Xaes256Gcm,
                 page: id,
                 key_id: app
                     .keys

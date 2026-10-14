@@ -3753,6 +3753,7 @@ pub(crate) mod tests {
         }
         pub(super) fn envelope() -> PageEnvelope {
             PageEnvelope {
+                cipher: crate::model::PageCipher::Xaes256Gcm,
                 page: PageId {
                     version: ObjectVersion {
                         object: ObjectId {

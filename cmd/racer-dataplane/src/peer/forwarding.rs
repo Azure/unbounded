@@ -2058,6 +2058,7 @@ mod tests {
         };
         let ciphertext = wire_ciphertext(
             PageEnvelope {
+                cipher: crate::model::PageCipher::Xaes256Gcm,
                 page,
                 key_id: KeyId([6; 16]),
                 nonce: Nonce([7; 24]),
@@ -2195,6 +2196,7 @@ mod tests {
             };
             let ciphertext = wire_ciphertext(
                 PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
                     key_id: KeyId([3; 16]),
                     nonce: Nonce([4; 24]),

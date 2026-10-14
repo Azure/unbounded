@@ -1703,6 +1703,7 @@ mod tests {
                 etag: StrongEtag::parse(b"\"v1\"").unwrap(),
             };
             let envelope = PageEnvelope {
+                cipher: crate::model::PageCipher::Xaes256Gcm,
                 page: PageId {
                     version: version.clone(),
                     number: PageNumber(0),
@@ -2098,6 +2099,7 @@ mod tests {
                 etag: StrongEtag::parse(b"\"provider\"").unwrap(),
             };
             let envelope = PageEnvelope {
+                cipher: crate::model::PageCipher::Xaes256Gcm,
                 page: PageId {
                     version: version.clone(),
                     number: PageNumber(0),

@@ -1234,6 +1234,7 @@ impl Fixture {
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
         };
         let envelope = PageEnvelope {
+            cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: version.clone(),
                 number: PageNumber(0),
@@ -2337,6 +2338,86 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
 }
 
 #[test]
+fn old_format_and_unknown_cipher_records_are_cache_misses() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let page = f.copy(3, 23);
+    let id = page.ciphertext.envelope().page.clone();
+    let request = scope();
+    for old_format in [true, false] {
+        f.enqueue(page.clone()).unwrap();
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
+        let location = f
+            .store
+            .writer
+            .index()
+            .lookup(&id)
+            .unwrap()
+            .unwrap()
+            .location;
+        let staging = f
+            .store
+            .writer
+            .slabs()
+            .allocate(
+                location.extent.length(),
+                f.admission
+                    .reserve(None, ResourceClass::Ciphertext, location.extent.length())
+                    .unwrap(),
+            )
+            .unwrap();
+        let lease = f.store.writer.lease(&location).unwrap();
+        let mut stored = drive(
+            &f.reactor,
+            f.store
+                .writer
+                .slabs()
+                .read(&f.reactor, location.extent, staging, lease, &request),
+        )
+        .unwrap();
+        let bytes = stored.bytes_mut().unwrap();
+        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let cipher_offset = header_len - 36;
+        let digest_end = if old_format {
+            // Rebuild v4: remove the cipher ID, shift digest and ciphertext back.
+            bytes.copy_within(cipher_offset + 4.., cipher_offset);
+            bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
+            bytes[12..16].copy_from_slice(&((header_len - 4) as u32).to_le_bytes());
+            header_len - 36
+        } else {
+            bytes[cipher_offset..cipher_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            header_len - 32
+        };
+        let digest = Sha256::digest(&bytes[..digest_end]);
+        bytes[digest_end..digest_end + 32].copy_from_slice(&digest);
+        assert!(matches!(
+            super::parse(&stored, location.extent),
+            Err(Error::CorruptRecord)
+        ));
+        let lease = f.store.writer.lease(&location).unwrap();
+        let _ = drive(
+            &f.reactor,
+            f.store
+                .writer
+                .slabs()
+                .write(&f.reactor, location.extent, stored, lease, &request),
+        )
+        .unwrap();
+        assert!(
+            drive(&f.reactor, f.store.reader.read(&id, &request))
+                .unwrap()
+                .is_none()
+        );
+        assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+        assert_eq!(
+            f.metrics.count(crate::telemetry::Event::CorruptMiss),
+            u64::from(!old_format)
+        );
+    }
+}
+
+#[test]
 fn stored_payload_and_tag_corruption_fail_mandatory_checksum() {
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -2986,6 +3067,7 @@ mod records {
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
                             version: metadata.version.clone(),
                             number: PageNumber(number),
@@ -3047,12 +3129,18 @@ mod records {
     #[test]
     fn current_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
         let admission = admission();
-        // Normal v4 header is 181 bytes, plus a 16-byte tag. Straddle both units.
+        // Normal v5 header is 185 bytes, plus a 16-byte tag. Straddle both units.
         for (length, number, maximum, geometry, offset) in [
             (1, 0, false, (512, 512, 512), 0),
+            (310, 0, false, (512, 512, 512), 512),
+            (311, 0, false, (512, 512, 512), 1024),
+            (312, 0, false, (512, 512, 512), 512),
             (314, 0, false, (512, 512, 512), 512),
             (315, 0, false, (512, 512, 512), 1024),
             (316, 0, false, (512, 512, 512), 512),
+            (3894, 0, false, (4096, 4096, 4096), 4096),
+            (3895, 0, false, (4096, 4096, 4096), 8192),
+            (3896, 0, false, (4096, 4096, 4096), 4096),
             (3898, 0, false, (4096, 4096, 4096), 4096),
             (3899, 0, false, (4096, 4096, 4096), 8192),
             (3900, 0, false, (4096, 4096, 4096), 4096),
@@ -3076,7 +3164,7 @@ mod records {
             let logical = logical_length(&page).unwrap();
             assert_eq!(
                 logical,
-                128 + 12 + cache.len() + etag.len() + 2 + 32 + length + 16
+                128 + 16 + cache.len() + etag.len() + 2 + 32 + length + 16
             );
             let extent = alignment.extent(offset, logical).unwrap();
             let mut staging = buffer(&admission, alignment, extent.length());
@@ -3227,7 +3315,7 @@ mod records {
             UNIX_EPOCH + std::time::Duration::from_millis(1),
         ] {
             page.metadata.expires_at = ExpiresAt::from_system_time(expiry).unwrap();
-            assert_eq!(logical_length(&page), Ok(200));
+            assert_eq!(logical_length(&page), Ok(204));
             let encoded = encode(
                 &page,
                 Generation(7),
@@ -3452,7 +3540,7 @@ mod records {
         )
         .unwrap();
         let original = encoded.buffer.bytes().unwrap();
-        assert_eq!(&original[8..12], &4u32.to_le_bytes());
+        assert_eq!(&original[8..12], &5u32.to_le_bytes());
         let header_len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
         let crc_offset = 128 + "cache".len() + "\"v1\"".len();
         assert_eq!(

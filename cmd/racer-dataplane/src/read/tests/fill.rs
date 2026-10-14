@@ -1357,6 +1357,7 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
                     )
                     .unwrap(),
                 crate::model::PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: id.clone(),
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                     nonce: crate::model::Nonce([2; 24]),
@@ -2554,6 +2555,7 @@ mod pressure {
                         .reserve(Some(cache), ResourceClass::Ciphertext, 19)
                         .unwrap(),
                     crate::model::PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: id,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                         nonce: crate::model::Nonce([2; 24]),

@@ -1128,6 +1128,7 @@ pub(super) mod tests {
                 inner: Arc::new(CiphertextBytes {
                     checksum: Default::default(),
                     envelope: PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                         nonce: Nonce([2; 24]),

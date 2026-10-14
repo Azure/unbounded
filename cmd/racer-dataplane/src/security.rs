@@ -1,4 +1,4 @@
-//! Vetted XChaCha20-Poly1305 adapter, canonical page AAD, fresh cryptographic nonces.
+//! XAES-256-GCM page adapter, canonical AAD, and fresh cryptographic nonces.
 
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
@@ -182,8 +182,8 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     out.extend_from_slice(value);
     Ok(())
 }
-/// v1: domain, cache(length:u32 BE, bytes), exact object key, quoted ETag
-/// (length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
+/// v2: domain, cipher:u32 BE, cache(length:u32 BE, bytes), exact object key,
+/// quoted ETag(length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     envelope.validate()?;
     if !racer_crypto::identity::canonical_uuid(&envelope.page.version.object.cache.0)
@@ -191,7 +191,8 @@ pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     {
         return Err(Error::CorruptRecord);
     }
-    let mut out = b"racer/page/aead/v1\0".to_vec();
+    let mut out = b"racer/page/aead/v2\0".to_vec();
+    out.extend_from_slice(&(envelope.cipher as u32).to_be_bytes());
     field(&mut out, envelope.page.version.object.cache.0.as_bytes())?;
     out.extend_from_slice(&envelope.page.version.object.key.0);
     field(&mut out, envelope.page.version.etag.as_bytes())?;
@@ -492,6 +493,7 @@ impl PageCryptoEngine {
                 }
                 let length = u32::try_from(raw.len()).map_err(|_| Error::InvalidRequest)?;
                 let envelope = PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: key.id(),
                     nonce: fresh_nonce()?,
@@ -799,7 +801,7 @@ impl CredentialCrypto {
     /// exactly, preserving absent versus present-empty; never normalize headers.
     ///
     /// Select KeyPurpose::OriginCredentials, never a page key. For every encryption
-    /// generate a fresh CSPRNG XChaCha20 nonce internally, independent of attempt IDs,
+    /// generate a fresh CSPRNG 192-bit nonce internally, independent of attempt IDs,
     /// page nonces, and connection challenges. Canonical, versioned credential-domain
     /// AAD binds key ID, object (cache UID + exact key), scope.request, attempt, and
     /// opaque metadata presence/length/bytes. Encrypt the exact Authorization bytes.
@@ -1913,6 +1915,7 @@ mod tests {
             }
             fn envelope(size: usize) -> PageEnvelope {
                 PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page(),
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                     nonce: Nonce([2; 24]),
@@ -3648,6 +3651,7 @@ mod tests {
     }
     fn envelope() -> PageEnvelope {
         PageEnvelope {
+            cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: ObjectVersion {
                     object: ObjectId {
@@ -3665,10 +3669,26 @@ mod tests {
         }
     }
     #[test]
+    fn page_cipher_id_is_authenticated_in_aad() {
+        let descriptor = envelope();
+        let mut aad = page_aad(&descriptor).unwrap();
+        let offset = b"racer/page/aead/v2\0".len();
+        assert_eq!(&aad[offset..offset + 4], &1u32.to_be_bytes());
+        let mut sealed = [0; 21];
+        racer_crypto::seal(&[7; 32], &descriptor.nonce.0, &aad, b"hello", &mut sealed).unwrap();
+        aad[offset + 3] ^= 1;
+        let mut out = [0xa5; 5];
+        assert!(
+            racer_crypto::open(&[7; 32], &descriptor.nonce.0, &aad, &sealed, &mut out).is_err()
+        );
+        assert_eq!(out, [0xa5; 5]);
+    }
+
+    #[test]
     fn page_aad_is_domain_separated_and_binds_every_descriptor_field() {
         let original = envelope();
         let aad = page_aad(&original).unwrap();
-        assert!(aad.starts_with(b"racer/page/aead/v1\0\0\0\0\x24"));
+        assert!(aad.starts_with(b"racer/page/aead/v2\0\0\0\0\x01\0\0\0\x24"));
         let mut bytes = vec![0; 5 + TAG_LEN];
         racer_crypto::seal(&[7; 32], &original.nonce.0, &aad, b"hello", &mut bytes).unwrap();
         for index in 0..8 {
@@ -3713,6 +3733,15 @@ mod tests {
         malformed.ciphertext_length += 1;
         assert!(page_aad(&malformed).is_err());
     }
+    // Retain the historical independent vectors without a production page fallback.
+    fn historical_page_aad(descriptor: &PageEnvelope) -> Vec<u8> {
+        let mut aad = page_aad(descriptor).unwrap();
+        let domain = b"racer/page/aead/v1\0";
+        aad.drain(domain.len()..domain.len() + 4);
+        aad[..domain.len()].copy_from_slice(domain);
+        aad
+    }
+
     #[test]
     fn libsodium_independent_known_answer() {
         // Independently generated with libsodium 1.0.18
@@ -3720,10 +3749,10 @@ mod tests {
         let mut descriptor = envelope();
         descriptor.key_id = KeyId([1; 16]); // Frozen independent AAD vector, not installed.
         let mut bytes = vec![0; 5 + TAG_LEN];
-        racer_crypto::seal(
+        racer_crypto::seal_credentials(
             &[7; 32],
             &[2; 24],
-            &page_aad(&descriptor).unwrap(),
+            &historical_page_aad(&descriptor),
             b"hello",
             &mut bytes,
         )
@@ -3815,10 +3844,10 @@ mod tests {
                 .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
                 .collect();
             let mut encrypted = vec![0; length + 16];
-            racer_crypto::seal(
+            racer_crypto::seal_credentials(
                 &[7; 32],
                 &descriptor.nonce.0,
-                &page_aad(&descriptor).unwrap(),
+                &historical_page_aad(&descriptor),
                 &raw,
                 &mut encrypted,
             )

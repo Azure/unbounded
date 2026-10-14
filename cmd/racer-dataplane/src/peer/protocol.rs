@@ -669,6 +669,7 @@ fn page_fields(
     metadata_fields(head, m)?;
     push(head, "racer-page", e.page.number.0);
     push_binary(head, "racer-page-key", &e.key_id.0);
+    push(head, "racer-page-cipher", e.cipher as u32);
     push_binary(head, "racer-page-nonce", &e.nonce.0);
     push(head, "racer-plaintext-length", e.plaintext_length);
     push(head, "racer-ciphertext-length", e.ciphertext_length);
@@ -849,6 +850,10 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
 pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, PageEnvelope)> {
     let metadata = metadata(head)?;
     let envelope = PageEnvelope {
+        cipher: crate::model::PageCipher::try_from(
+            u32::try_from(number(head, "racer-page-cipher")?).map_err(|_| Error::InvalidRequest)?,
+        )
+        .map_err(|_| Error::InvalidRequest)?,
         page: PageId {
             version: metadata.version.clone(),
             number: PageNumber(number(head, "racer-page")?),
@@ -1141,6 +1146,57 @@ impl SecurityCodec {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn page_cipher_header_is_required_canonical_and_known() {
+        let version = ObjectVersion {
+            object: ObjectId {
+                cache: CacheId("00000000-0000-4000-8000-000000000001".into()),
+                key: CacheKey([0; 32]),
+            },
+            etag: StrongEtag::test_value("v1"),
+        };
+        let metadata = ObjectMetadata {
+            version: version.clone(),
+            content_type: None,
+            length: 1,
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+        };
+        let envelope = PageEnvelope {
+            cipher: crate::model::PageCipher::Xaes256Gcm,
+            page: PageId {
+                version,
+                number: PageNumber(0),
+            },
+            key_id: KeyId([0; 16]),
+            nonce: Nonce([0; 24]),
+            plaintext_length: 1,
+            ciphertext_length: 17,
+        };
+        let head =
+            opaque_page_response(&metadata, &envelope, PageOutcome::Page, &[0; 32], &[]).unwrap();
+        assert_eq!(page_descriptor(&head).unwrap().1, envelope);
+        for value in [
+            None,
+            Some("0"),
+            Some("2"),
+            Some("01"),
+            Some("4294967296"),
+            Some("invalid"),
+        ] {
+            let mut changed =
+                opaque_page_response(&metadata, &envelope, PageOutcome::Page, &[0; 32], &[])
+                    .unwrap();
+            changed.headers.retain(|h| h.name != "racer-page-cipher");
+            if let Some(value) = value {
+                push(&mut changed, "racer-page-cipher", value);
+            }
+            assert!(page_descriptor(&changed).is_err(), "{value:?}");
+        }
+        let mut duplicate = head;
+        push(&mut duplicate, "racer-page-cipher", 1);
+        assert!(page_descriptor(&duplicate).is_err());
+    }
+
     /// Keep ordered wire fields independent of the production response builders.
     #[test]
     fn page_response_headers_preserve_exact_fields_and_order() {
@@ -1160,6 +1216,7 @@ pub(crate) mod tests {
             expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
         let envelope = PageEnvelope {
+            cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),
                 number: PageNumber(0),
@@ -1212,6 +1269,7 @@ pub(crate) mod tests {
         let page_fields = [
             ("racer-page", "0"),
             ("racer-page-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
+            ("racer-page-cipher", "1"),
             ("racer-page-nonce", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             ("racer-plaintext-length", "3"),
             ("racer-ciphertext-length", "19"),
@@ -1408,6 +1466,7 @@ pub(crate) mod tests {
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
                         .unwrap(),
                     PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
                             version: metadata.version.clone(),
                             number: PageNumber(0),

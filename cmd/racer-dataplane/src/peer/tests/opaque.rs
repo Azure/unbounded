@@ -134,6 +134,7 @@ mod materialized_pairing {
                             )
                             .unwrap(),
                         PageEnvelope {
+                            cipher: crate::model::PageCipher::Xaes256Gcm,
                             page: PageId {
                                 version: metadata.version.clone(),
                                 number: PageNumber(number as u64),
@@ -1170,6 +1171,7 @@ impl RelayFixture {
             ),
         };
         let envelope = PageEnvelope {
+            cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),
                 number: PageNumber(0),

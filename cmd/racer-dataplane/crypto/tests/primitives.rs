@@ -138,6 +138,7 @@ fn authenticate_messages_with_a_shared_key() {
 /// Match the published XChaCha20-Poly1305 ciphertext and authentication tag.
 #[test]
 fn xchacha_draft_known_answer() {
+    use racer_crypto::{open_credentials as open, seal_credentials as seal};
     // draft-irtf-cfrg-xchacha-03, Appendix A.1 (AEAD_XCHACHA20_POLY1305).
     // https://www.ietf.org/archive/id/draft-irtf-cfrg-xchacha-03.txt
     let key = array("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
@@ -159,6 +160,67 @@ fn xchacha_draft_known_answer() {
     let mut opened = vec![0xa5; plaintext.len()];
     open(&key, &nonce, &aad, &expected, &mut opened).unwrap();
     assert_eq!(opened, plaintext);
+}
+
+/// Match both published XAES-256-GCM known answers.
+#[test]
+fn xaes_c2sp_known_answers() {
+    // https://c2sp.org/XAES-256-GCM#test-vectors, both CMAC doubling cases.
+    for (key, aad, expected) in [
+        (
+            1,
+            b"".as_slice(),
+            "ce546ef63c9cc60765923609b33a9a1974e96e52daf2fcf7075e2271",
+        ),
+        (
+            3,
+            b"c2sp.org/XAES-256-GCM".as_slice(),
+            "986ec1832593df5443a179437fd083bf3fdb41abd740a21f71eb769d",
+        ),
+    ] {
+        let mut ciphertext = [0; 28];
+        seal(
+            &[key; 32],
+            b"ABCDEFGHIJKLMNOPQRSTUVWX",
+            aad,
+            b"XAES-256-GCM",
+            &mut ciphertext,
+        )
+        .unwrap();
+        assert_eq!(ciphertext.as_slice(), hex(expected));
+        let mut plaintext = [0; 12];
+        open(
+            &[key; 32],
+            b"ABCDEFGHIJKLMNOPQRSTUVWX",
+            aad,
+            &ciphertext,
+            &mut plaintext,
+        )
+        .unwrap();
+        assert_eq!(&plaintext, b"XAES-256-GCM");
+    }
+}
+
+/// Both nonce halves bind the result; old credential ciphertext is not a page.
+#[test]
+fn xaes_all_nonce_bytes_and_cross_cipher_rejection() {
+    let mut ciphertext = [0; 21];
+    seal(&[7; 32], &[2; 24], b"aad", b"hello", &mut ciphertext).unwrap();
+    for i in 0..24 {
+        let mut nonce = [2; 24];
+        nonce[i] ^= 1;
+        let mut out = [0xa5; 5];
+        assert!(open(&[7; 32], &nonce, b"aad", &ciphertext, &mut out).is_err());
+        assert_eq!(out, [0xa5; 5]);
+        let mut changed = [0; 21];
+        seal(&[7; 32], &nonce, b"aad", b"hello", &mut changed).unwrap();
+        assert_ne!(changed, ciphertext);
+    }
+    let mut old = [0; 21];
+    racer_crypto::seal_credentials(&[7; 32], &[2; 24], b"aad", b"hello", &mut old).unwrap();
+    let mut out = [0xa5; 5];
+    assert!(open(&[7; 32], &[2; 24], b"aad", &old, &mut out).is_err());
+    assert_eq!(out, [0xa5; 5]);
 }
 
 /// Round-trip empty and boundary-sized messages and reject their modified tags.
@@ -792,6 +854,38 @@ mod identity_workflows {
                     .is_err(),
                 "case {case}"
             );
+        }
+    }
+
+    /// Page and credential operations enforce bindings without touching failed output.
+    #[test]
+    fn cached_page_derivation_matches_primitives_across_nonce_halves() {
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = keyring(roots);
+        let cache = CacheId(CACHE.into());
+        let page = keys.active(&cache, KeyPurpose::Page).unwrap();
+        for nonce in [
+            [0; 24],
+            *b"abcdefghijklABCDEFGHIJKL",
+            *b"abcdefghijklMNOPQRSTUVWX",
+            *b"mnopqrstuvwxABCDEFGHIJKL",
+        ] {
+            let mut expected = [0; 19];
+            let mut actual = [0; 19];
+            racer_crypto::seal(&[7; 32], &nonce, b"aad", b"abc", &mut expected).unwrap();
+            page.seal_page(&cache, &nonce, b"aad", b"abc", &mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+            let mut out = [42; 3];
+            page.open_page(&cache, page.id(), &nonce, b"aad", &actual, &mut out)
+                .unwrap();
+            assert_eq!(&out, b"abc");
+            actual[18] ^= 1;
+            assert_eq!(
+                page.open_page(&cache, page.id(), &nonce, b"aad", &actual, &mut out),
+                Err(Error::CorruptRecord),
+            );
+            assert_eq!(&out, b"abc");
         }
     }
 

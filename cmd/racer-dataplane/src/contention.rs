@@ -1166,6 +1166,7 @@ mod fidelity {
             .ciphertext(
                 reserved.ciphertext,
                 PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: id,
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                     nonce: Nonce([2; 24]),

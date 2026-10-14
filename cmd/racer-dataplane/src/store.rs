@@ -227,6 +227,17 @@ impl StoreReader {
                 }
                 Err(e) => return Err(e),
             };
+            // A recognized record from another format is a cold cache miss,
+            // not evidence of damaged storage. Never parse its remaining fields.
+            let bytes = buffer.bytes()?;
+            if bytes.get(..8) == Some(MAGIC)
+                && bytes
+                    .get(8..12)
+                    .is_some_and(|version| version != FORMAT_VERSION.to_le_bytes())
+            {
+                self.invalidate(&token)?;
+                return Ok(None);
+            }
             let decoded = match parse(&buffer, entry.location.extent) {
                 Ok(d) => d,
                 Err(_) => {
@@ -1211,8 +1222,8 @@ impl Drop for DirtyCleanup<'_> {
         }
     }
 }
-// Version 4 is the sole format: mandatory CRC-64/XZ plus optional content type.
-pub const FORMAT_VERSION: u32 = 4;
+// Version 5 adds the page cipher ID after the optional content type.
+pub const FORMAT_VERSION: u32 = 5;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 pub const MAX_HEADER_BYTES: usize = 16384;
@@ -1266,7 +1277,7 @@ fn layout(page: &CiphertextCopy, generation: Generation) -> Result<RecordLayout>
         return Err(Error::CorruptRecord);
     }
     let header_bytes = HEADER_PREFIX_BYTES
-        .checked_add(8)
+        .checked_add(12)
         .ok_or(Error::CorruptRecord)?
         .checked_add(cache.len())
         .and_then(|len| len.checked_add(etag.len()))
@@ -1321,6 +1332,7 @@ fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLa
     if let Some(content_type) = &page.metadata.content_type {
         out.extend_from_slice(content_type.as_bytes());
     }
+    out.extend_from_slice(&(envelope.cipher as u32).to_le_bytes());
     debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
     let digest = Sha256::digest(&out);
     out.extend_from_slice(&digest);
@@ -1421,6 +1433,7 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
                 .map_err(|_| Error::CorruptRecord)?,
         )
     };
+    let cipher = crate::model::PageCipher::try_from(r.u32()?)?;
     if !r.0.is_empty() || generation.0 == 0 {
         return Err(Error::CorruptRecord);
     }
@@ -1434,6 +1447,7 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
         length,
     };
     let envelope = PageEnvelope {
+        cipher,
         page: PageId { version, number },
         key_id,
         nonce,

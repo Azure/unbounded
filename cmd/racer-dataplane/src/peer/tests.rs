@@ -271,6 +271,7 @@ mod body_progress {
                         bytes.len(),
                     )?,
                     PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
                         nonce: Nonce([2; 24]),
@@ -642,6 +643,7 @@ mod destination_disconnect {
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
                         nonce: Nonce([0; 24]),
@@ -1785,6 +1787,7 @@ mod subscriptions {
                     )
                     .unwrap(),
                 PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: KeyId([1; 16]),
                     nonce: Nonce([2; 24]),
@@ -2554,6 +2557,7 @@ mod timing {
                         )
                         .unwrap(),
                     crate::model::PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
                         nonce: Nonce([2; 24]),

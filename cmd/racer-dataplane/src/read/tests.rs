@@ -70,6 +70,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
             inner: Arc::new(CiphertextBytes {
                 checksum: Default::default(),
                 envelope: PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
                     key_id: key_id_from_generation(1, 1).unwrap(),
                     nonce: Nonce([0; 24]),
@@ -1729,6 +1730,7 @@ mod flight {
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                         nonce: Nonce([0; 24]),

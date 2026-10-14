@@ -1050,6 +1050,7 @@ mod tests {
                     )
                     .unwrap(),
                 PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: racer_control_wire::KeyId([1; 16]),
                     nonce: Nonce([2; 24]),

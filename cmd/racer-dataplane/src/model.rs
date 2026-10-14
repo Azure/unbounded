@@ -12,13 +12,34 @@ pub fn key_id_from_generation(generation: u64, suffix: u32) -> Result<KeyId> {
     KeyId::from_generation(generation, suffix).map_err(|_| Error::InvalidConfiguration)
 }
 
-/// Application-owned XChaCha20 nonce.
+/// Application-owned 192-bit extended nonce.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nonce(pub [u8; 24]);
+
+/// Page cipher identifiers shared by AAD, disk records, and signed peer headers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PageCipher {
+    /// C2SP XAES-256-GCM with a 192-bit nonce and a 128-bit tag.
+    Xaes256Gcm = 1,
+}
+
+impl TryFrom<u32> for PageCipher {
+    type Error = Error;
+
+    fn try_from(value: u32) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Xaes256Gcm),
+            _ => Err(Error::CorruptRecord),
+        }
+    }
+}
 
 /// Immutable encryption descriptor shared by memory, peers, and storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageEnvelope {
+    pub cipher: PageCipher,
+
     pub page: PageId,
 
     pub key_id: KeyId,
@@ -79,9 +100,18 @@ mod tests {
     }
 
     #[test]
+    fn cipher_id_rejects_unknown_and_obsolete_values() {
+        assert_eq!(PageCipher::try_from(1), Ok(PageCipher::Xaes256Gcm));
+        for value in [0, 2, u32::MAX] {
+            assert_eq!(PageCipher::try_from(value), Err(Error::CorruptRecord));
+        }
+    }
+
+    #[test]
     fn page_bounds_use_total_version_length_and_reject_empty_overflow_and_mismatch() {
         let descriptor = descriptor("v1", PAGE_BYTES + 3);
         let mut envelope = PageEnvelope {
+            cipher: PageCipher::Xaes256Gcm,
             page: PageId {
                 version: descriptor.version.clone(),
                 number: PageNumber(1),
@@ -116,6 +146,7 @@ mod tests {
     #[test]
     fn envelope_enforces_nonempty_bounded_plaintext_and_exact_tag_length() {
         let mut envelope = PageEnvelope {
+            cipher: PageCipher::Xaes256Gcm,
             page: PageId {
                 version: ObjectVersion {
                     object: ObjectId {

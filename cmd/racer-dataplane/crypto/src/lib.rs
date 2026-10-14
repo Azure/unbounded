@@ -30,6 +30,7 @@ use ed25519_dalek::{
     pkcs8::{DecodePrivateKey, EncodePrivateKey},
 };
 use sha2::{Digest, Sha256};
+use xaes_256_gcm::Xaes256Gcm;
 use zeroize::Zeroizing;
 
 /// Opaque failure of a cryptographic operation or input validation.
@@ -45,7 +46,7 @@ pub struct SigningKey(ed25519_dalek::SigningKey);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VerifyingKey(ed25519_dalek::VerifyingKey);
 
-/// Number of authentication-tag bytes appended to XChaCha20-Poly1305 ciphertext.
+/// Number of authentication-tag bytes appended to page or credential ciphertext.
 pub const TAG_LEN: usize = 16;
 
 impl SigningKey {
@@ -112,6 +113,7 @@ impl std::error::Error for Error {}
 /// Seal into exactly `plaintext.len() + TAG_LEN` bytes as ciphertext followed by tag.
 /// The caller must never reuse a nonce with the same key.
 /// No allocation or plaintext staging copy is performed.
+/// Uses XAES-256-GCM as specified at <https://c2sp.org/XAES-256-GCM>.
 pub fn seal(
     key: &[u8; 32],
     nonce: &[u8; 24],
@@ -119,12 +121,25 @@ pub fn seal(
     plaintext: &[u8],
     out: &mut [u8],
 ) -> Result<(), Error> {
+    seal_with(&Xaes256Gcm::new(key.into()), nonce, aad, plaintext, out)
+}
+
+fn seal_with<C>(
+    cipher: &C,
+    nonce: &[u8; 24],
+    aad: &[u8],
+    plaintext: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error>
+where
+    C: AeadInOut<NonceSize = cipher::consts::U24, TagSize = cipher::consts::U16>,
+{
     if plaintext.len().checked_add(TAG_LEN) != Some(out.len()) {
         return Err(Error(()));
     }
     let (ciphertext, tag_out) = out.split_at_mut(plaintext.len());
     let buffer = InOutBuf::new(plaintext, ciphertext).map_err(|_| Error(()))?;
-    let tag = XChaCha20Poly1305::new(key.into())
+    let tag = cipher
         .encrypt_inout_detached(nonce.into(), aad, buffer)
         .map_err(|_| Error(()))?;
     tag_out.copy_from_slice(&tag);
@@ -141,6 +156,19 @@ pub fn open(
     sealed: &[u8],
     out: &mut [u8],
 ) -> Result<(), Error> {
+    open_with(&Xaes256Gcm::new(key.into()), nonce, aad, sealed, out)
+}
+
+fn open_with<C>(
+    cipher: &C,
+    nonce: &[u8; 24],
+    aad: &[u8],
+    sealed: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error>
+where
+    C: AeadInOut<NonceSize = cipher::consts::U24, TagSize = cipher::consts::U16>,
+{
     let length = sealed.len().checked_sub(TAG_LEN).ok_or(Error(()))?;
     if out.len() != length {
         return Err(Error(()));
@@ -150,9 +178,38 @@ pub fn open(
     let buffer = InOutBuf::new(ciphertext, out).map_err(|_| Error(()))?;
     // Upstream detached decryption validates length and authenticates the input
     // before applying the keystream to output. Keep that ordering on upgrades.
-    XChaCha20Poly1305::new(key.into())
+    cipher
         .decrypt_inout_detached(nonce.into(), aad, buffer, &tag)
         .map_err(|_| Error(()))
+}
+
+/// Seal the unchanged XChaCha20-Poly1305 credential format, not the page format.
+/// The caller must never reuse a nonce with the same key.
+pub fn seal_credentials(
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    aad: &[u8],
+    plaintext: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
+    seal_with(
+        &XChaCha20Poly1305::new(key.into()),
+        nonce,
+        aad,
+        plaintext,
+        out,
+    )
+}
+
+/// Open the credential format, leaving output untouched on every error.
+pub fn open_credentials(
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    aad: &[u8],
+    sealed: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
+    open_with(&XChaCha20Poly1305::new(key.into()), nonce, aad, sealed, out)
 }
 
 /// HMAC-SHA256 with a fixed 32-byte key. Domain separation belongs to the caller.
@@ -773,7 +830,21 @@ pub mod identity {
     }
 
     /// Wipes key material when its last admission or completion owner releases it.
-    struct Secret(Zeroizing<[u8; 32]>);
+    struct Secret {
+        material: Zeroizing<[u8; 32]>,
+        // XAES caches the master AES schedule and CMAC K1, not per-nonce GCM keys.
+        page_cipher: crate::Xaes256Gcm,
+    }
+
+    impl Secret {
+        fn new(material: Zeroizing<[u8; 32]>) -> Self {
+            use chacha20poly1305::KeyInit;
+            Self {
+                page_cipher: crate::Xaes256Gcm::new((&*material).into()),
+                material,
+            }
+        }
+    }
 
     impl KeyLease {
         /// Validate purpose before application admission and integrity checks.
@@ -805,14 +876,9 @@ pub mod identity {
             input: &[u8],
             out: &mut [u8],
         ) -> Result<()> {
-            crate::seal(
-                self.bound_material(cache, self.id(), KeyPurpose::Page)?,
-                nonce,
-                aad,
-                input,
-                out,
-            )
-            .map_err(|_| Error::CorruptRecord)
+            self.bound_material(cache, self.id(), KeyPurpose::Page)?;
+            crate::seal_with(&self.secret.page_cipher, nonce, aad, input, out)
+                .map_err(|_| Error::CorruptRecord)
         }
 
         /// Authenticate before writing caller output; an error leaves output untouched.
@@ -827,14 +893,9 @@ pub mod identity {
             input: &[u8],
             out: &mut [u8],
         ) -> Result<()> {
-            crate::open(
-                self.bound_material(cache, id, KeyPurpose::Page)?,
-                nonce,
-                aad,
-                input,
-                out,
-            )
-            .map_err(|_| Error::CorruptRecord)
+            self.bound_material(cache, id, KeyPurpose::Page)?;
+            crate::open_with(&self.secret.page_cipher, nonce, aad, input, out)
+                .map_err(|_| Error::CorruptRecord)
         }
 
         /// Seal credentials using only a credential epoch. Caller owns nonce and AAD.
@@ -846,7 +907,7 @@ pub mod identity {
             input: &[u8],
             out: &mut [u8],
         ) -> Result<()> {
-            crate::seal(
+            crate::seal_credentials(
                 self.bound_material(cache, self.id(), KeyPurpose::OriginCredentials)?,
                 nonce,
                 aad,
@@ -868,7 +929,7 @@ pub mod identity {
             input: &[u8],
             out: &mut [u8],
         ) -> Result<()> {
-            crate::open(
+            crate::open_credentials(
                 self.bound_material(cache, id, KeyPurpose::OriginCredentials)?,
                 nonce,
                 aad,
@@ -933,7 +994,7 @@ pub mod identity {
             if self.reference.purpose != purpose {
                 return Err(Error::MissingKey);
             }
-            Ok(&self.secret.0)
+            Ok(&self.secret.material)
         }
     }
 
@@ -1112,15 +1173,13 @@ pub mod identity {
                         .entries
                         .iter()
                         .find(|e| e.reference == candidate.key)
-                        && *old.secret.0 != *candidate.material
+                        && *old.secret.material != *candidate.material
                     {
                         return Err(Error::InvalidConfiguration);
                     }
-                    if current
-                        .entries
-                        .iter()
-                        .any(|e| e.reference != candidate.key && *e.secret.0 == *candidate.material)
-                    {
+                    if current.entries.iter().any(|e| {
+                        e.reference != candidate.key && *e.secret.material == *candidate.material
+                    }) {
                         return Err(Error::InvalidConfiguration);
                     }
                 }
@@ -1141,7 +1200,7 @@ pub mod identity {
                         reference: candidate.key.clone(),
                         state: candidate.state,
                         secret: retained.map_or_else(
-                            || Arc::new(Secret(candidate.material.clone())),
+                            || Arc::new(Secret::new(candidate.material.clone())),
                             |entry| entry.secret.clone(),
                         ),
                     }
