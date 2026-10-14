@@ -264,6 +264,77 @@ func TestVirtualMediaTerminalConflictAndCallbackMerge(t *testing.T) {
 	require.Contains(t, keys, "machine:media-machine")
 }
 
+func TestVirtualMediaMergeCallbackFields(t *testing.T) {
+	cloudInit := metav1.Condition{
+		Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue,
+		Reason: "Succeeded", LastTransitionTime: fixedNow(),
+	}
+	latest := v1alpha3.MachineOperationTargetStatus{
+		Message: "not callback-owned",
+		BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+			ID: "a", Phase: "Installing", ImageWritten: true, LoaderStartedAt: ptrTo(fixedNow()),
+			RebootRequestedAt: ptrTo(metav1.NewTime(fixedNow().Add(time.Minute))),
+			Cleaned:           true, StagedDeleted: true, Released: true, Abandoned: true,
+		},
+		Conditions: []metav1.Condition{
+			cloudInit,
+			{Type: v1alpha3.MachineOperationConditionBootImageWritten, Status: metav1.ConditionTrue},
+			{Type: v1alpha3.MachineOperationConditionBootLoaderDownloaded, Status: metav1.ConditionTrue},
+		},
+	}
+	updated := v1alpha3.MachineOperationTargetStatus{
+		Message: "controller message",
+		BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+			ID: "a", Phase: "Installed", PhaseStartedAt: ptrTo(fixedNow()), CleanedAt: ptrTo(fixedNow()),
+		},
+		Conditions: []metav1.Condition{{Type: "ControllerCondition", Status: metav1.ConditionTrue}},
+	}
+	want := updated.DeepCopy()
+	want.BootMedia.ImageWritten = true
+	want.BootMedia.LoaderStartedAt = latest.BootMedia.LoaderStartedAt.DeepCopy()
+	want.BootMedia.RebootRequestedAt = latest.BootMedia.RebootRequestedAt.DeepCopy()
+	want.BootMedia.Cleaned = true
+	want.BootMedia.StagedDeleted = true
+	want.BootMedia.Released = true
+	want.BootMedia.Abandoned = true
+	want.Conditions = append(want.Conditions, cloudInit)
+
+	mergeMediaCallbacks(&updated, latest)
+	require.Equal(t, *want, updated)
+	require.NotSame(t, latest.BootMedia.LoaderStartedAt, updated.BootMedia.LoaderStartedAt)
+	require.NotSame(t, latest.BootMedia.RebootRequestedAt, updated.BootMedia.RebootRequestedAt)
+
+	mergeMediaCallbacks(&updated, v1alpha3.MachineOperationTargetStatus{
+		BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: "a"},
+	})
+	require.Equal(t, *want, updated, "missing callback values must not clear saved progress")
+}
+
+func TestVirtualMediaMergeRequiresMatchingMedia(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		updated *v1alpha3.MachineOperationBootMediaStatus
+		latest  *v1alpha3.MachineOperationBootMediaStatus
+	}{
+		{name: "missing updated media", latest: &v1alpha3.MachineOperationBootMediaStatus{ID: "a", ImageWritten: true}},
+		{name: "missing latest media", updated: &v1alpha3.MachineOperationBootMediaStatus{ID: "a"}},
+		{name: "different IDs", updated: &v1alpha3.MachineOperationBootMediaStatus{ID: "a"}, latest: &v1alpha3.MachineOperationBootMediaStatus{ID: "b", ImageWritten: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			updated := v1alpha3.MachineOperationTargetStatus{BootMedia: tt.updated}
+			want := updated.DeepCopy()
+			latest := v1alpha3.MachineOperationTargetStatus{
+				BootMedia: tt.latest,
+				Conditions: []metav1.Condition{{
+					Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue,
+				}},
+			}
+			mergeMediaCallbacks(&updated, latest)
+			require.Equal(t, *want, updated)
+		})
+	}
+}
+
 func TestVirtualMediaCleanupFailureKeepsOwnership(t *testing.T) {
 	r, d, _, op := mediaFixture(t)
 
@@ -545,13 +616,7 @@ func TestVirtualMediaRealProviderCallbackAndPartialCleanup(t *testing.T) {
 
 func TestVirtualMediaLongInstallAndLateHandoff(t *testing.T) {
 	r, d, _, op := mediaFixture(t)
-
-	var current *v1alpha3.MachineOperation
-	for range 10 {
-		current = mediaStep(t, r, op.Name)
-	}
-
-	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+	current := mediaInstalling(t, r, op.Name)
 	current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
 	require.NoError(t, r.Status().Update(t.Context(), current))
 
@@ -594,8 +659,15 @@ func TestVirtualMediaCloudInitDeadlineStartsAtRebootHandoff(t *testing.T) {
 	change = r.advanceMediaInstalled(t.Context(), target, now)
 	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, change.target.Stage)
 	require.Equal(t, &now, change.target.BootMedia.PhaseStartedAt)
+	change.target.Conditions = []metav1.Condition{{
+		Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionFalse,
+		Reason: "Running", LastTransitionTime: metav1.NewTime(now.Add(time.Minute)),
+	}}
+	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(now.Add(cloudInitTimeout-time.Second)))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
 	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(now.Add(cloudInitTimeout)))
 	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
+	require.Equal(t, "TimedOut: waiting for cloud-init timed out", change.target.Message)
 	target.BootMedia.RebootRequestedAt = nil
 	change = r.advanceMediaInstalled(t.Context(), target, metav1.NewTime(fixedNow().Add(time.Hour)))
 	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
@@ -836,12 +908,15 @@ func TestVirtualMediaMergeKeepsLoaderStartOverStaleRetry(t *testing.T) {
 		ID: "a", Phase: "Installing", PhaseStartedAt: ptrTo(fixedNow()), LoaderStartedAt: started,
 	}}
 	updated := v1alpha3.MachineOperationTargetStatus{BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
-		ID: "a", Phase: "PoweringOff", PhaseStartedAt: ptrTo(metav1.NewTime(fixedNow().Add(time.Minute))), BootAttempts: 1,
+		ID: "a", Phase: "Replacing", PhaseStartedAt: ptrTo(metav1.NewTime(fixedNow().Add(time.Minute))), BootAttempts: 1,
 	}}
 	mergeMediaCallbacks(&updated, latest)
 	require.Equal(t, "Installing", updated.BootMedia.Phase)
 	require.Zero(t, updated.BootMedia.BootAttempts)
 	require.Equal(t, started, updated.BootMedia.LoaderStartedAt)
+	require.Equal(t, latest.BootMedia.PhaseStartedAt, updated.BootMedia.PhaseStartedAt)
+	require.Equal(t, latest.BootMedia.ReadinessStartedAt, updated.BootMedia.ReadinessStartedAt)
+	require.Contains(t, updated.Message, "write the boot image")
 
 	// Without a retry decision, only the loader start is merged.
 	updated = v1alpha3.MachineOperationTargetStatus{BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: "a", Phase: "Installing"}}

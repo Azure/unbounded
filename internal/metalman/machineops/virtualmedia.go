@@ -34,11 +34,6 @@ const mediaReadinessGrace = 10 * time.Minute
 // virtual media.
 const mediaMaxBootAttempts = 3
 
-type stagedMediaClient interface {
-	bootmedia.Client
-	DeleteVirtualMedia(context.Context, bootmedia.Source) error
-}
-
 func (r *Reconciler) reader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader
@@ -248,7 +243,7 @@ func (r *Reconciler) cleanupMedia(ctx context.Context, target v1alpha3.MachineOp
 		return err
 	}
 
-	vm, ok := pc.(stagedMediaClient)
+	vm, ok := pc.(bootmedia.Client)
 	if !ok || !vm.SupportsVirtualMedia() {
 		return fmt.Errorf("virtual media cleanup is unsupported")
 	}
@@ -258,11 +253,7 @@ func (r *Reconciler) cleanupMedia(ctx context.Context, target v1alpha3.MachineOp
 		return vm.DeleteVirtualMedia(ctx, bootmedia.Source{Name: b.SourceName, Server: b.SourceServer})
 	}
 
-	if err := vm.CleanupVirtualMedia(ctx, bootmedia.Source{Name: b.SourceName, Server: b.SourceServer}); err != nil {
-		return err
-	}
-
-	return nil
+	return vm.CleanupVirtualMedia(ctx, bootmedia.Source{Name: b.SourceName, Server: b.SourceServer})
 }
 
 func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
@@ -332,7 +323,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		return r.retryMediaTarget(target, err, now)
 	}
 
-	vm, ok := pc.(stagedMediaClient)
+	vm, ok := pc.(bootmedia.Client)
 	if !ok || !vm.SupportsVirtualMedia() {
 		return failTarget(target, reasonUnsupportedTarget, "BMC does not support virtual media", now)
 	}
@@ -512,8 +503,7 @@ func (r *Reconciler) advanceMediaInstalled(ctx context.Context, target v1alpha3.
 	}
 
 	// Virtual media callbacks are per target, never operation-wide.
-	scoped := &v1alpha3.MachineOperation{Status: v1alpha3.MachineOperationStatus{Conditions: target.Conditions}}
-	if change, done := cloudInitReplaceStatus(scoped, target, now); done {
+	if change, done := cloudInitReplaceStatus(target.Conditions, target, now); done {
 		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= cloudInitTimeout {
 			return failTarget(target, reasonTimedOut, "waiting for cloud-init timed out", now)
 		}
@@ -569,10 +559,8 @@ func mergeMediaCallbacks(updated *v1alpha3.MachineOperationTargetStatus, latest 
 		}
 	}
 
-	for _, cond := range latest.Conditions {
-		if cond.Type == v1alpha3.MachineOperationConditionCloudInitDone || cond.Type == v1alpha3.MachineOperationConditionBootImageWritten || cond.Type == v1alpha3.MachineOperationConditionBootLoaderDownloaded {
-			apimeta.SetStatusCondition(&updated.Conditions, cond)
-		}
+	if cond := apimeta.FindStatusCondition(latest.Conditions, v1alpha3.MachineOperationConditionCloudInitDone); cond != nil {
+		apimeta.SetStatusCondition(&updated.Conditions, *cond)
 	}
 }
 
