@@ -88,7 +88,11 @@ disables and masks the host daemon for DRA ownership, and then fails unless all
 of the following are true:
 
 - The host is Ubuntu 24.04 with NVIDIA driver 580 or later.
-- The branch-matched `nvidia-imex-580` host package can be installed, providing
+- The configured NVIDIA repository contains an IMEX package whose full package
+  version matches the active driver. Current driver 580 repositories publish
+  this as `nvidia-imex` (for example,
+  `nvidia-imex=580.178.04-1ubuntu1`); older repositories may use a
+  branch-suffixed name such as `nvidia-imex-580`. The matching package provides
   `/usr/bin/nvidia-imex`, `/usr/bin/nvidia-imex-ctl`, and
   `nvidia-imex.service`.
 - The loaded driver exposes

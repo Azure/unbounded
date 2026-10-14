@@ -76,15 +76,14 @@ func (p *prepareNVIDIAIMEXDRA) Do(ctx context.Context) error {
 		return err
 	}
 
-	pkg := fmt.Sprintf("nvidia-imex-%d", driverMajor)
-	if err := InstallPackages(p.log, pkg).Do(ctx); err != nil {
+	if err := installNVIDIAIMEXPackages(ctx, p.log, pm, nvidia.DriverVersion, driverMajor); err != nil {
 		if !packageWasPresent {
 			if cleanupErr := executil.RunCmd(ctx, p.log, executil.Systemctl(), "unmask", "nvidia-imex.service"); cleanupErr != nil {
 				p.log.Warn("failed to remove temporary NVIDIA IMEX service mask", "error", cleanupErr)
 			}
 		}
 
-		return fmt.Errorf("install NVIDIA IMEX package %s: %w", pkg, err)
+		return err
 	}
 
 	if err := executil.RunCmd(ctx, p.log, executil.Systemctl(), "disable", "--now", "nvidia-imex.service"); err != nil {
@@ -100,6 +99,138 @@ func (p *prepareNVIDIAIMEXDRA) Do(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func installNVIDIAIMEXPackages(
+	ctx context.Context,
+	log *slog.Logger,
+	pm *hostPackageManager,
+	driverVersion string,
+	driverMajor int,
+) error {
+	if len(pm.refreshArgs) > 0 {
+		if err := executil.RunCmd(ctx, log, pm.command, pm.refreshArgs...); err != nil {
+			return fmt.Errorf("%s %s: %w", pm.name, strings.Join(pm.refreshArgs, " "), err)
+		}
+	}
+
+	imexSpec, err := resolveNVIDIAIMEXPackage(ctx, log, driverVersion, driverMajor)
+	if err != nil {
+		return err
+	}
+
+	modprobeSpec, err := resolveMatchingDebianPackage(ctx, log, "nvidia-modprobe", driverVersion)
+	if err != nil {
+		return fmt.Errorf("resolve branch-matched NVIDIA modprobe package: %w", err)
+	}
+
+	specs := []string{imexSpec, modprobeSpec}
+	missing := make([]string, 0, len(specs))
+
+	for _, spec := range specs {
+		name, version, _ := strings.Cut(spec, "=")
+
+		installed, err := executil.OutputCmdAt(
+			ctx,
+			log,
+			slog.LevelDebug,
+			"dpkg-query",
+			"--show",
+			"--showformat=${Version}",
+			name,
+		)
+		if err != nil || strings.TrimSpace(string(installed)) != version {
+			missing = append(missing, spec)
+		}
+	}
+
+	if len(missing) == 0 {
+		return nil
+	}
+
+	args := make([]string, 0, len(pm.installArgs)+len(missing))
+	args = append(args, pm.installArgs...)
+	args = append(args, missing...)
+
+	if err := executil.RunCmd(ctx, log, pm.command, args...); err != nil {
+		return fmt.Errorf("install branch-matched NVIDIA IMEX packages %s: %w", strings.Join(missing, " "), err)
+	}
+
+	return nil
+}
+
+func resolveNVIDIAIMEXPackage(
+	ctx context.Context,
+	log *slog.Logger,
+	driverVersion string,
+	driverMajor int,
+) (string, error) {
+	return resolveNVIDIAIMEXPackageWith(driverVersion, driverMajor, func(name string) (string, error) {
+		return resolveMatchingDebianPackage(ctx, log, name, driverVersion)
+	})
+}
+
+func resolveNVIDIAIMEXPackageWith(
+	driverVersion string,
+	driverMajor int,
+	resolve func(string) (string, error),
+) (string, error) {
+	spec, err := resolve("nvidia-imex")
+	if err == nil {
+		return spec, nil
+	}
+
+	branchPackage := fmt.Sprintf("nvidia-imex-%d", driverMajor)
+
+	spec, branchErr := resolve(branchPackage)
+	if branchErr == nil {
+		return spec, nil
+	}
+
+	return "", fmt.Errorf(
+		"resolve branch-matched NVIDIA IMEX package for driver %s: unversioned package: %v; branch package %s: %w",
+		driverVersion,
+		err,
+		branchPackage,
+		branchErr,
+	)
+}
+
+func resolveMatchingDebianPackage(
+	ctx context.Context,
+	log *slog.Logger,
+	name string,
+	driverVersion string,
+) (string, error) {
+	output, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "apt-cache", "madison", name)
+	if err != nil {
+		return "", fmt.Errorf("query apt versions for %s: %w", name, err)
+	}
+
+	version, err := parseMatchingDebianPackageVersion(string(output), driverVersion)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", name, err)
+	}
+
+	return name + "=" + version, nil
+}
+
+func parseMatchingDebianPackageVersion(output, driverVersion string) (string, error) {
+	prefix := strings.TrimSpace(driverVersion) + "-"
+
+	for line := range strings.Lines(output) {
+		fields := strings.Split(line, "|")
+		if len(fields) < 2 {
+			continue
+		}
+
+		version := strings.TrimSpace(fields[1])
+		if strings.HasPrefix(version, prefix) {
+			return version, nil
+		}
+	}
+
+	return "", fmt.Errorf("no package version matches active NVIDIA driver %s", driverVersion)
 }
 
 func maskNVIDIAIMEXService(ctx context.Context, log *slog.Logger) error {
