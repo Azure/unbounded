@@ -31,11 +31,13 @@ pub enum Error {
     CorruptRecord,
 
     /// Stop enrollment and preserve identity.json. Restore a compatible backup,
-    /// or move it aside in the private directory before explicit re-enrollment.
+    /// or call [`Enrollment::quarantine_identity_record`] before explicit
+    /// re-enrollment.
     UnreadableIdentityRecord,
 
     /// Stop enrollment and preserve pending.json. Restore a compatible backup,
-    /// or move it aside in the private directory before preparing a new request.
+    /// or call [`Enrollment::quarantine_pending_record`] before preparing a new
+    /// request.
     UnreadablePendingRecord,
 
     InvalidConfiguration,
@@ -127,8 +129,19 @@ impl Drop for PrivateJson {
     }
 }
 
+/// Local identity.json format, independent of the wire schema. Records written
+/// before this field existed decode as version 1.
+const IDENTITY_RECORD_VERSION: u32 = 1;
+
+fn identity_record_version_default() -> u32 {
+    1
+}
+
 #[derive(Serialize, Deserialize)]
 struct PersistedIdentity {
+    #[serde(default = "identity_record_version_default")]
+    record_version: u32,
+
     pending: PendingIdentity,
 
     response: String,
@@ -137,7 +150,12 @@ struct PersistedIdentity {
 impl PersistedIdentity {
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?);
-        Self::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
+        let persisted = Self::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)?;
+        // Migrations from older local versions belong here.
+        if persisted.record_version != IDENTITY_RECORD_VERSION {
+            return Err(Error::CorruptRecord);
+        }
+        Ok(persisted)
     }
 
     /// Check the saved key and CSR without requiring a current certificate.
@@ -258,6 +276,7 @@ impl<H: Host> Enrollment<H> {
         )?;
         let identity = self.validate(&pending, response)?;
         let persisted = PersistedIdentity {
+            record_version: IDENTITY_RECORD_VERSION,
             pending,
             response: STANDARD.encode(wire::encode_enrollment_response(response)?),
         };
@@ -603,6 +622,61 @@ where
     }
 }
 
+impl<H: Host> Enrollment<H>
+where
+    <H::Scope as Scope>::Error: From<Error> + From<secure::AccessError>,
+{
+    /// Move an unreadable identity.json aside in the private directory, keeping
+    /// its bytes for inspection. Returns the quarantine name, or `None` when no
+    /// record exists. The next `prepare` and `accept_response` enroll afresh.
+    pub fn quarantine_identity_record<'a>(
+        &'a self,
+        parent: &'a H::Scope,
+    ) -> Operation<'a, Option<String>, <H::Scope as Scope>::Error> {
+        self.quarantine("identity.json", parent)
+    }
+
+    /// Move an unreadable pending.json aside in the private directory, keeping
+    /// its bytes for inspection. Returns the quarantine name, or `None` when no
+    /// record exists. The next `prepare` issues a new request.
+    pub fn quarantine_pending_record<'a>(
+        &'a self,
+        parent: &'a H::Scope,
+    ) -> Operation<'a, Option<String>, <H::Scope as Scope>::Error> {
+        self.quarantine("pending.json", parent)
+    }
+
+    fn quarantine<'a>(
+        &'a self,
+        file: &'static str,
+        parent: &'a H::Scope,
+    ) -> Operation<'a, Option<String>, <H::Scope as Scope>::Error> {
+        Box::pin(async move {
+            let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
+            let r = self.host.reactor();
+            let dir =
+                match secure::directory(r, &self.identity_directory, false, true, &scope).await {
+                    Ok(dir) => dir,
+                    Err(e) if H::is_missing(e) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+            // A random suffix keeps every quarantined copy; rename would replace.
+            let mut suffix = [0; 16];
+            uring_runtime::environment::fill_random(&mut suffix).map_err(|_| Error::Io)?;
+            let target = format!("{file}.quarantine-{:032x}", u128::from_be_bytes(suffix));
+            match secure::rename_synced(r, &dir, file, &target, &scope).await {
+                Ok(()) => Ok(Some(target)),
+                Err(e) if H::is_missing(e) => {
+                    // Fence a possibly canceled earlier rename before reporting absence.
+                    r.file_sync(dir.clone(), &scope).await?;
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+}
+
 impl LocalSigningIdentity {
     pub fn block_devices(&self) -> Option<&str> {
         self.block_devices.as_deref()
@@ -842,6 +916,7 @@ mod tests {
             Err(Error::Io)
         ));
         let persisted = PersistedIdentity {
+            record_version: IDENTITY_RECORD_VERSION,
             pending: record,
             response: "response".into(),
         };
@@ -850,6 +925,7 @@ mod tests {
         assert_eq!(decoded.pending.private_key.0.as_str(), "secret");
         assert_eq!(decoded.response, "response");
         let oversized = PersistedIdentity {
+            record_version: IDENTITY_RECORD_VERSION,
             pending: decode_pending(pending.as_bytes()).unwrap(),
             response: "x".repeat(wire::MAX_ENROLLMENT_BYTES * 3),
         };
@@ -1268,8 +1344,16 @@ mod tests {
                     );
                     assert_eq!(sim.read_file(path).unwrap(), *encoded, "{cluster}: {case}");
                 }
-                sim.rename(path, Path::new("/private/pending.json.unreadable"), 0)
+                let last = sim.read_file(path).unwrap();
+                let moved = drive(&files, e.quarantine_pending_record(&scope))
+                    .unwrap()
                     .unwrap();
+                assert!(moved.starts_with("pending.json.quarantine-"));
+                assert_eq!(
+                    sim.read_file(&Path::new("/private").join(&moved)).unwrap(),
+                    last
+                );
+                assert!(sim.metadata(path).is_err());
                 let repaired = prepare(&files, &e, &scope);
                 assert_eq!(prepare(&files, &e, &scope).enrollment, repaired.enrollment);
             }
@@ -1383,8 +1467,16 @@ mod tests {
                 clock.set_wall_time(before_expiry);
             }
             // Explicit repair preserves the old bytes outside the active record name.
-            sim.rename(path, Path::new("/private/identity.json.unreadable"), 0)
+            let last = sim.read_file(path).unwrap();
+            let moved = drive(&files, e.quarantine_identity_record(&scope))
+                .unwrap()
                 .unwrap();
+            assert!(moved.starts_with("identity.json.quarantine-"));
+            assert_eq!(
+                sim.read_file(&Path::new("/private").join(&moved)).unwrap(),
+                last
+            );
+            assert!(sim.metadata(path).is_err());
             assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
             drive(
                 &files,
@@ -1700,6 +1792,169 @@ mod tests {
             .unwrap();
             assert_eq!(renewed.cluster.0, CLUSTER);
             assert_ne!(renewed.enrollment, first.enrollment);
+        }
+    }
+
+    #[test]
+    fn quarantine_moves_records_aside_durably_and_is_idempotent() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        // No private directory yet.
+        assert_eq!(
+            drive(&files, e.quarantine_identity_record(&scope)).unwrap(),
+            None
+        );
+        assert_eq!(
+            drive(&files, e.quarantine_pending_record(&scope)).unwrap(),
+            None
+        );
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let first = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        drive(
+            &files,
+            e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let identity_path = Path::new("/private/identity.json");
+        let pending_path = Path::new("/private/pending.json");
+        let mut moved = Vec::new();
+        for round in 0..2 {
+            sim.write_file(identity_path, b"not JSON").unwrap();
+            sim.chmod(identity_path, 0o600).unwrap();
+            sim.write_file(pending_path, b"{}").unwrap();
+            sim.chmod(pending_path, 0o600).unwrap();
+            assert!(
+                drive(&files, e.load_identity(&scope))
+                    .is_err_and(|error| error == Error::UnreadableIdentityRecord.into())
+            );
+            let identity = drive(&files, e.quarantine_identity_record(&scope))
+                .unwrap()
+                .unwrap();
+            let pending = drive(&files, e.quarantine_pending_record(&scope))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sim.read_file(&Path::new("/private").join(&identity))
+                    .unwrap(),
+                b"not JSON"
+            );
+            assert_eq!(
+                sim.read_file(&Path::new("/private").join(&pending))
+                    .unwrap(),
+                b"{}"
+            );
+            // Renames and directory syncs survive a crash. Test writes do not,
+            // so check contents before the crash and names after it.
+            sim.disk().crash().unwrap();
+            assert!(sim.metadata(identity_path).is_err(), "{round}");
+            assert!(sim.metadata(pending_path).is_err(), "{round}");
+            assert!(sim.metadata(&Path::new("/private").join(&identity)).is_ok());
+            assert!(sim.metadata(&Path::new("/private").join(&pending)).is_ok());
+            moved.extend([identity, pending]);
+            // Absent records are a successful no-op.
+            assert_eq!(
+                drive(&files, e.quarantine_identity_record(&scope)).unwrap(),
+                None
+            );
+            assert_eq!(
+                drive(&files, e.quarantine_pending_record(&scope)).unwrap(),
+                None
+            );
+        }
+        // Each quarantine keeps a distinct copy.
+        moved.sort();
+        moved.dedup();
+        assert_eq!(moved.len(), 4);
+        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        assert_ne!(request.enrollment, first.enrollment);
+        drive(
+            &files,
+            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_some());
+    }
+
+    #[test]
+    fn quarantine_reports_rename_failure_and_preserves_record() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let path = Path::new("/private/pending.json");
+        let original = sim.read_file(path).unwrap();
+        sim.inject("rename", Fault::Errno(5)).unwrap();
+        assert!(matches!(
+            drive(&files, e.quarantine_pending_record(&scope)),
+            Err(error) if error == uring_runtime::Error::Os(5).into()
+        ));
+        assert_eq!(sim.read_file(path).unwrap(), original);
+    }
+
+    #[test]
+    fn identity_record_version_defaults_for_old_records_and_rejects_others() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        drive(
+            &files,
+            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        let path = Path::new("/private/identity.json");
+        let committed = sim.read_file(path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&committed).unwrap();
+        assert_eq!(value["record_version"], IDENTITY_RECORD_VERSION);
+        for (version, readable) in [
+            (None, true),
+            (Some(0), false),
+            (Some(IDENTITY_RECORD_VERSION + 1), false),
+        ] {
+            match version {
+                None => {
+                    value.as_object_mut().unwrap().remove("record_version");
+                }
+                Some(version) => value["record_version"] = version.into(),
+            }
+            sim.write_file(path, &serde_json::to_vec(&value).unwrap())
+                .unwrap();
+            sim.chmod(path, 0o600).unwrap();
+            let loaded = drive(&files, e.load_identity(&scope));
+            if readable {
+                assert_eq!(loaded.unwrap().unwrap().enrollment, request.enrollment);
+            } else {
+                assert!(
+                    loaded.is_err_and(|error| error == Error::UnreadableIdentityRecord.into()),
+                    "{version:?}"
+                );
+            }
         }
     }
 
@@ -2035,6 +2290,7 @@ mod tests {
 
             // Recovery reaches validate's decoder independently of the CSR check.
             let persisted = PersistedIdentity {
+                record_version: IDENTITY_RECORD_VERSION,
                 pending,
                 response: STANDARD.encode(wire::encode_enrollment_response(&response).unwrap()),
             }
@@ -2217,6 +2473,7 @@ mod tests {
             // Legacy records written by a weaker version also fail closed on load,
             // without deleting the matching pending request during recovery.
             let invalid = PersistedIdentity {
+                record_version: IDENTITY_RECORD_VERSION,
                 pending: decode_pending(&pending).unwrap(),
                 response: STANDARD.encode(wire::encode_enrollment_response(&response).unwrap()),
             };
