@@ -40,12 +40,19 @@ type rackManager struct {
 	powerOnTarget    string
 	mu               sync.Mutex
 	now              func() time.Time
-	attempted        bool
 	deadline         time.Time
 	recoveryError    error
-	pending          string
+	pending          recoveryOp
 	pendingCompleted bool
 }
+
+type recoveryOp int
+
+const (
+	recoveryNone recoveryOp = iota
+	recoveryResetOn
+	recoveryClearOverride
+)
 
 func detectRackManager(ctx context.Context, blade *bmcSession) (*rackManager, error) {
 	u, err := url.Parse(blade.baseURL)
@@ -173,7 +180,7 @@ func rackRequest(ctx context.Context, session *bmcSession, method, path string, 
 		}
 
 		for _, message := range result.Info {
-			if code, _, _, err := message.completion(); err != nil || code != "Success" {
+			if ok, err := message.completion(); err != nil || !ok {
 				return nil, redfishResponseError(method, path, status, data, nil)
 			}
 		}
@@ -276,35 +283,33 @@ func (c *Client) rackBootConfig(ctx context.Context) (BootConfig, error) {
 func (c *Client) rackSetBoot(ctx context.Context, target string) error {
 	// SystemPowerOn also powers on the host. Never use it during boot setup;
 	// only disabling the override may recover power here.
+	op := recoveryNone
+	if target == "None" {
+		op = recoveryClearOverride
+	}
+
 	return c.rackMutate(ctx, http.MethodPatch, rackSystemPath,
-		map[string]any{"Boot": map[string]string{"BootSourceOverrideTarget": target}}, target == "None")
+		map[string]any{"Boot": map[string]string{"BootSourceOverrideTarget": target}}, op)
 }
 
-func (c *Client) rackMutate(ctx context.Context, method, path string, body any, restore bool) error {
+func (c *Client) rackMutate(ctx context.Context, method, path string, body any, op recoveryOp) error {
 	r := c.rack
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return c.rackMutateLocked(ctx, method, path, body, restore)
+	return c.rackMutateLocked(ctx, method, path, body, op)
 }
 
 // rackMutateLocked requires the rack mutex to be held.
-func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body any, restore bool) error {
+func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body any, op recoveryOp) error {
 	r := c.rack
-
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-
-	operation := method + path + string(payload)
 
 	r.rearmCompletedRecovery()
 
 	_, bladeErr := rackRequest(ctx, c.session, method, path, body)
 	if bladeErr == nil {
 		// Keep the fixed wake window even if one command works before reads do.
-		if r.pending == operation {
+		if op != recoveryNone && r.pending == op {
 			r.pendingCompleted = true
 			r.rearmCompletedRecovery()
 		}
@@ -316,7 +321,7 @@ func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body
 		return bladeErr
 	}
 
-	if !restore {
+	if op == recoveryNone {
 		return r.readiness(bladeErr)
 	}
 
@@ -325,10 +330,9 @@ func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body
 		return fmt.Errorf("blade command failed (%v); rack power: %w", bladeErr, err)
 	}
 
-	if state == PowerOff && !r.attempted {
+	if state == PowerOff && r.pending == recoveryNone {
 		// Latch before sending. An ambiguous response must not cause repeated AC writes.
-		r.attempted = true
-		r.pending = operation
+		r.pending = op
 		r.deadline = r.now().Add(rackRecoveryGrace)
 
 		_, err := rackRequest(ctx, r.root, http.MethodPost, r.powerOnTarget,
@@ -348,9 +352,8 @@ func (r *rackManager) rearmCompletedRecovery() {
 		return
 	}
 
-	r.attempted = false
 	r.deadline = time.Time{}
-	r.pending = ""
+	r.pending = recoveryNone
 	r.pendingCompleted = false
 }
 
@@ -364,7 +367,7 @@ func (r *rackManager) readiness(cause error) error {
 		return fmt.Errorf("slot %s: %w: %v", r.slot, ErrNotReady, cause)
 	}
 
-	if r.attempted {
+	if r.pending != recoveryNone {
 		return fmt.Errorf("slot %s AC recovery grace expired: %w", r.slot, cause)
 	}
 

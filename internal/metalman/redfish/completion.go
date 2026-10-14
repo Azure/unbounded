@@ -16,9 +16,10 @@ type completionMessage struct {
 	Oem map[string]json.RawMessage `json:"Oem"`
 }
 
-// completion returns the first CompletionCode found in the vendor Oem
-// objects, in key order. It returns ok false if there is none.
-func (m completionMessage) completion() (code, description string, ok bool, err error) {
+// completion checks vendor Oem objects in key order for failures or invalid
+// codes. It reports success only if there is at least one code and every code
+// is Success.
+func (m completionMessage) completion() (bool, error) {
 	keys := make([]string, 0, len(m.Oem))
 	for key := range m.Oem {
 		keys = append(keys, key)
@@ -26,33 +27,43 @@ func (m completionMessage) completion() (code, description string, ok bool, err 
 
 	slices.Sort(keys)
 
+	found, success := false, true
+
 	for _, key := range keys {
 		var fields map[string]json.RawMessage
 		if json.Unmarshal(m.Oem[key], &fields) != nil {
 			continue
 		}
 
-		raw, found := fields["CompletionCode"]
-		if !found {
+		raw, ok := fields["CompletionCode"]
+		if !ok {
 			continue
 		}
 
+		var code *string
 		if err := json.Unmarshal(raw, &code); err != nil {
-			return "", "", false, fmt.Errorf("parsing %s completion code: %w", key, err)
+			return false, fmt.Errorf("parsing %s completion code: %w", key, err)
 		}
 
-		// The description is optional context. A missing or non-string value
-		// leaves it empty.
-		if raw, found := fields["Description"]; found {
-			if json.Unmarshal(raw, &description) != nil {
+		if code == nil {
+			return false, fmt.Errorf("parsing %s completion code: expected a string", key)
+		}
+
+		if *code == "Failure" {
+			// The description is optional context; ignore missing or non-string values.
+			var description string
+			if json.Unmarshal(fields["Description"], &description) != nil {
 				description = ""
 			}
+
+			return false, &completionFailure{description: description}
 		}
 
-		return code, description, true, nil
+		found = true
+		success = success && *code == "Success"
 	}
 
-	return "", "", false, nil
+	return found && success, nil
 }
 
 type completionFailure struct {
@@ -90,13 +101,8 @@ func checkCompletion(data []byte) error {
 		}
 
 		for _, message := range messages {
-			code, description, ok, err := message.completion()
-			if err != nil {
+			if _, err := message.completion(); err != nil {
 				return err
-			}
-
-			if ok && code == "Failure" {
-				return &completionFailure{description: description}
 			}
 		}
 	}

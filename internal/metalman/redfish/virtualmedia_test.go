@@ -115,16 +115,8 @@ func TestVirtualMediaValidation(t *testing.T) {
 	})
 	c := dialRack(t, srv, "7")
 
-	var invalid []bootmedia.Source
 	for _, name := range []string{"", "other.iso", "ub-.iso", "ub-XYZ.iso", "ub-aa.ISO", "../ub-aa.iso", "/ub-aa.iso", "ub-aa.iso/other", "ub-aa.iso?x", "ub-aa.iso\n", "ub-" + strings.Repeat("a", 33) + ".iso"} {
-		invalid = append(invalid, bootmedia.Source{Name: name, Server: testMedia.Server})
-	}
-
-	for _, server := range []string{"", "tftp.example.com", "http://192.0.2.10", "192.0.2.10:69", "::1", "::ffff:192.0.2.10", "192.0.2.10\n"} {
-		invalid = append(invalid, bootmedia.Source{Name: testMedia.Name, Server: server})
-	}
-
-	for _, source := range invalid {
+		source := bootmedia.Source{Name: name, Server: testMedia.Server}
 		require.Error(t, c.StageVirtualMedia(t.Context(), source), "%+v", source)
 		require.Error(t, c.MountVirtualMedia(t.Context(), source), "%+v", source)
 		require.Error(t, c.CleanupVirtualMedia(t.Context(), source), "%+v", source)
@@ -132,9 +124,33 @@ func TestVirtualMediaValidation(t *testing.T) {
 	}
 
 	for _, length := range []int{1, 32} {
-		require.NoError(t, validateVirtualMedia(bootmedia.Source{
-			Name: "ub-" + strings.Repeat("a", length) + ".iso", Server: testMedia.Server,
-		}))
+		require.NoError(t, validateVirtualMediaName("ub-"+strings.Repeat("a", length)+".iso"))
+	}
+}
+
+func TestVirtualMediaServerValidation(t *testing.T) {
+	for _, server := range []string{"", "tftp.example.com", "http://192.0.2.10", "192.0.2.10:69", "::1", "::ffff:192.0.2.10", "192.0.2.10\n"} {
+		t.Run(server, func(t *testing.T) {
+			var paths []string
+
+			srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+
+				w.WriteHeader(http.StatusNoContent)
+			})
+			c := dialRack(t, srv, "7")
+			source := bootmedia.Source{Name: testMedia.Name, Server: server}
+			require.Error(t, c.StageVirtualMedia(t.Context(), source))
+			require.Empty(t, paths)
+			require.NoError(t, c.MountVirtualMedia(t.Context(), source))
+			require.NoError(t, c.CleanupVirtualMedia(t.Context(), source))
+			require.NoError(t, c.DeleteVirtualMedia(t.Context(), source))
+			require.Equal(t, []string{
+				"/7" + remoteDrivePath + "Mount", "/7" + remoteDrivePath + "Mount",
+				"/7" + rackSystemPath, "/7" + remoteDrivePath + "Unmount",
+				rackTftpPath + "Delete", rackTftpPath + "Delete",
+			}, paths)
+		})
 	}
 }
 
@@ -261,9 +277,8 @@ func TestVirtualMediaRecovery(t *testing.T) {
 			}
 
 			require.Zero(t, restores)
-			require.False(t, c.rack.attempted)
 			require.True(t, c.rack.deadline.IsZero())
-			require.Empty(t, c.rack.pending)
+			require.Equal(t, recoveryNone, c.rack.pending)
 			require.ErrorIs(t, c.Reset(t.Context(), ResetOn), ErrNotReady)
 			deadline := c.rack.deadline
 
@@ -282,48 +297,44 @@ func TestVirtualMediaRecovery(t *testing.T) {
 			ready = true
 
 			require.NoError(t, invoke())
-			require.True(t, c.rack.attempted)
+			require.Equal(t, recoveryResetOn, c.rack.pending)
 			require.NoError(t, c.Reset(t.Context(), ResetOn))
-			require.False(t, c.rack.attempted)
+			require.Equal(t, recoveryNone, c.rack.pending)
 		})
 	}
 }
 
 func TestVirtualMediaCleanupUnavailable(t *testing.T) {
 	for _, failUnmount := range []bool{false, true} {
-		for _, power := range []string{"Off", "On", "invalid"} {
-			t.Run(power+"/unmount="+map[bool]string{true: "true", false: "false"}[failUnmount], func(t *testing.T) {
-				var paths []string
+		t.Run("unmount="+map[bool]string{true: "true", false: "false"}[failUnmount], func(t *testing.T) {
+			var paths []string
 
-				srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
-					paths = append(paths, r.URL.Path)
-					switch r.URL.Path {
-					case "/7" + rackSystemPath:
-						if !failUnmount {
-							w.WriteHeader(http.StatusServiceUnavailable)
-						}
-					case "/7" + remoteDrivePath + "Unmount":
+			srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				switch r.URL.Path {
+				case "/7" + rackSystemPath:
+					if !failUnmount {
 						w.WriteHeader(http.StatusServiceUnavailable)
-					case rackManagerPath + "/SystemPower":
-						_, _ = w.Write([]byte(`{"System Power States":{"7":"` + power + `"}}`))
-					default:
-						t.Errorf("unexpected request %s", r.URL.Path)
 					}
-				})
-				c := dialRack(t, srv, "7")
-
-				err := c.CleanupVirtualMedia(t.Context(), testMedia)
-				require.Error(t, err)
-
-				want := []string{"/7" + rackSystemPath}
-				if failUnmount {
-					want = append(want, "/7"+remoteDrivePath+"Unmount")
+				case "/7" + remoteDrivePath + "Unmount":
+					w.WriteHeader(http.StatusServiceUnavailable)
+				default:
+					t.Errorf("unexpected request %s", r.URL.Path)
 				}
-
-				require.Equal(t, want, paths)
-				require.NotContains(t, paths, rackTftpPath+"Delete")
 			})
-		}
+			c := dialRack(t, srv, "7")
+
+			err := c.CleanupVirtualMedia(t.Context(), testMedia)
+			require.Error(t, err)
+
+			want := []string{"/7" + rackSystemPath}
+			if failUnmount {
+				want = append(want, "/7"+remoteDrivePath+"Unmount")
+			}
+
+			require.Equal(t, want, paths)
+			require.NotContains(t, paths, rackTftpPath+"Delete")
+		})
 	}
 }
 
@@ -412,11 +423,6 @@ func TestVirtualMediaCleanupAndDeleteRetries(t *testing.T) {
 
 					srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
 						paths = append(paths, r.Method+" "+r.URL.Path)
-						if r.URL.Path == rackManagerPath+"/SystemPower" {
-							_, _ = w.Write([]byte(`{"System Power States":{"7":"On"}}`))
-							return
-						}
-
 						if r.Method == http.MethodPatch {
 							body, err := io.ReadAll(r.Body)
 							assert.NoError(t, err)

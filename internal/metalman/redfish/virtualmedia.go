@@ -17,11 +17,6 @@ import (
 
 var _ bootmedia.Client = (*Client)(nil)
 
-var _ interface {
-	bootmedia.Client
-	DeleteVirtualMedia(context.Context, bootmedia.Source) error
-} = (*Client)(nil)
-
 // Tested rack manager firmware requires image names shorter than 40 characters.
 var virtualMediaName = regexp.MustCompile(`^ub-[0-9a-f]{1,32}\.iso$`)
 
@@ -35,14 +30,9 @@ func (c *Client) SupportsVirtualMedia() bool {
 	return c.rack != nil
 }
 
-func validateVirtualMedia(source bootmedia.Source) error {
-	if !virtualMediaName.MatchString(source.Name) {
-		return fmt.Errorf("invalid reserved virtual-media filename %q", source.Name)
-	}
-
-	address, err := netip.ParseAddr(source.Server)
-	if err != nil || !address.Is4() {
-		return fmt.Errorf("virtual-media server must be a literal IPv4 address: %q", source.Server)
+func validateVirtualMediaName(name string) error {
+	if !virtualMediaName.MatchString(name) {
+		return fmt.Errorf("invalid reserved virtual-media filename %q", name)
 	}
 
 	return nil
@@ -55,8 +45,13 @@ func (c *Client) StageVirtualMedia(ctx context.Context, source bootmedia.Source)
 		return ErrUnsupported
 	}
 
-	if err := validateVirtualMedia(source); err != nil {
+	if err := validateVirtualMediaName(source.Name); err != nil {
 		return err
+	}
+
+	address, err := netip.ParseAddr(source.Server)
+	if err != nil || !address.Is4() {
+		return fmt.Errorf("virtual-media server must be a literal IPv4 address: %q", source.Server)
 	}
 
 	c.rack.mu.Lock()
@@ -84,13 +79,13 @@ func (c *Client) MountVirtualMedia(ctx context.Context, source bootmedia.Source)
 		return ErrUnsupported
 	}
 
-	if err := validateVirtualMedia(source); err != nil {
+	if err := validateVirtualMediaName(source.Name); err != nil {
 		return err
 	}
 
 	for _, name := range []string{bootmedia.PrimerName(source.Name), source.Name} {
 		if err := c.rackMutate(ctx, http.MethodPost, remoteDrivePath+"Mount",
-			map[string]string{"ImageName": name}, false); err != nil {
+			map[string]string{"ImageName": name}, recoveryNone); err != nil {
 			return err
 		}
 	}
@@ -108,12 +103,12 @@ func (c *Client) SetVirtualMediaBoot(ctx context.Context) error {
 	defer c.rack.mu.Unlock()
 
 	if err := c.rackMutateLocked(ctx, http.MethodPatch, rackSystemPath,
-		map[string]any{"Boot": map[string]string{"BootSourceOverrideMode": "UEFI"}}, false); err != nil {
+		map[string]any{"Boot": map[string]string{"BootSourceOverrideMode": "UEFI"}}, recoveryNone); err != nil {
 		return err
 	}
 
 	return c.rackMutateLocked(ctx, http.MethodPatch, rackSystemPath,
-		map[string]any{"Boot": map[string]string{"BootSourceOverrideTarget": "RemoteDrive"}}, false)
+		map[string]any{"Boot": map[string]string{"BootSourceOverrideTarget": "RemoteDrive"}}, recoveryNone)
 }
 
 // CleanupVirtualMedia restores disk boot and unmounts without deleting the ISO.
@@ -124,7 +119,7 @@ func (c *Client) CleanupVirtualMedia(ctx context.Context, source bootmedia.Sourc
 		return ErrUnsupported
 	}
 
-	if err := validateVirtualMedia(source); err != nil {
+	if err := validateVirtualMediaName(source.Name); err != nil {
 		return err
 	}
 
@@ -157,7 +152,7 @@ func (c *Client) DeleteVirtualMedia(ctx context.Context, source bootmedia.Source
 		return ErrUnsupported
 	}
 
-	if err := validateVirtualMedia(source); err != nil {
+	if err := validateVirtualMediaName(source.Name); err != nil {
 		return err
 	}
 

@@ -301,7 +301,7 @@ func TestRackManagerHardwareUnavailableRecovery(t *testing.T) {
 				} else {
 					require.NotErrorIs(t, err, ErrNotReady)
 					require.Zero(t, restores.Load())
-					require.False(t, c.rack.attempted)
+					require.Equal(t, recoveryNone, c.rack.pending)
 				}
 			})
 		}
@@ -574,7 +574,7 @@ func TestRackManagerRecoveryBounded(t *testing.T) {
 	require.Equal(t, int64(1), acCalls.Load())
 	bladeReady.Store(true)
 	require.NoError(t, boot())
-	require.False(t, c.rack.attempted)
+	require.Equal(t, recoveryNone, c.rack.pending)
 	bladeReady.Store(false)
 	require.ErrorIs(t, boot(), ErrNotReady)
 	require.Equal(t, int64(2), acCalls.Load())
@@ -766,7 +766,7 @@ func TestRackManagerRecoveryDoesNotHideErrors(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			})
 			c := dialRack(t, srv, "7")
-			c.rack.attempted = true
+			c.rack.pending = recoveryClearOverride
 			c.rack.deadline = time.Now().Add(time.Minute)
 			err := c.DisableBootOverride(t.Context())
 			require.Error(t, err)
@@ -917,7 +917,7 @@ func TestRackManagerReadGraceAndSlotIsolation(t *testing.T) {
 	second.rack.now = func() time.Time { return now }
 
 	require.ErrorIs(t, first.DisableBootOverride(t.Context()), ErrNotReady)
-	require.False(t, second.rack.attempted)
+	require.Equal(t, recoveryNone, second.rack.pending)
 	require.ErrorIs(t, second.Reset(t.Context(), ResetOn), ErrNotReady)
 	rackOn.Store(true)
 
@@ -1048,7 +1048,7 @@ func TestRackManagerPartialAvailabilityKeepsFixedGrace(t *testing.T) {
 			_, err = c.GetBootConfig(t.Context())
 			require.ErrorIs(t, err, ErrNotReady)
 			require.Equal(t, deadline, c.rack.deadline)
-			require.True(t, c.rack.attempted)
+			require.NotEqual(t, recoveryNone, c.rack.pending)
 
 			// Even healthy reads during grace do not rearm repeated AC requests.
 			readsReady.Store(true)
@@ -1077,19 +1077,19 @@ func TestRackManagerPartialAvailabilityKeepsFixedGrace(t *testing.T) {
 			}
 
 			require.NoError(t, c.Reset(t.Context(), ResetForceOff))
-			require.True(t, c.rack.attempted)
+			require.NotEqual(t, recoveryNone, c.rack.pending)
 			bootReady.Store(true)
 			onReady.Store(true)
 			require.NoError(t, operation())
 
 			if initial == "boot" {
-				require.True(t, c.rack.attempted)
+				require.NotEqual(t, recoveryNone, c.rack.pending)
 				now = c.rack.deadline
 
 				require.NoError(t, operation())
 			}
 
-			require.False(t, c.rack.attempted)
+			require.Equal(t, recoveryNone, c.rack.pending)
 		})
 	}
 }
@@ -1109,6 +1109,53 @@ func TestCompletionCheckerConservative(t *testing.T) {
 	}
 
 	require.Error(t, checkCompletion([]byte(`{"@Message.ExtendedInfo":[{"Oem":{"Vendor":{"CompletionCode":"Success"}}},{"Oem":{"Other":{"CompletionCode":"Failure"}}}]}`)))
+}
+
+func TestRackManagerRecoveryRequiresMatchingOperation(t *testing.T) {
+	for _, initial := range []recoveryOp{recoveryResetOn, recoveryClearOverride} {
+		t.Run(fmt.Sprint(initial), func(t *testing.T) {
+			var ready bool
+
+			srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case rackManagerPath + "/SystemPower":
+					_, _ = w.Write([]byte(`{"System Power States":{"7":"Off"}}`))
+				case rackPowerOnPath:
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					if ready {
+						w.WriteHeader(http.StatusNoContent)
+					} else {
+						w.WriteHeader(http.StatusServiceUnavailable)
+					}
+				}
+			})
+			c := dialRack(t, srv, "7")
+			now := time.Unix(100, 0)
+			c.rack.now = func() time.Time { return now }
+			matching := func() error { return c.Reset(t.Context(), ResetOn) }
+
+			other := func() error { return c.DisableBootOverride(t.Context()) }
+			if initial == recoveryClearOverride {
+				matching, other = other, matching
+			}
+
+			require.ErrorIs(t, matching(), ErrNotReady)
+			require.Equal(t, initial, c.rack.pending)
+
+			ready = true
+
+			require.NoError(t, other())
+			require.False(t, c.rack.pendingCompleted)
+			now = c.rack.deadline
+
+			require.NoError(t, other())
+			require.Equal(t, initial, c.rack.pending)
+			require.False(t, c.rack.pendingCompleted)
+			require.NoError(t, matching())
+			require.Equal(t, recoveryNone, c.rack.pending)
+		})
+	}
 }
 
 func TestSessionCreationChecksCompletion(t *testing.T) {

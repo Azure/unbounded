@@ -219,7 +219,12 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 			return ErrUnsupported
 		}
 
-		return c.rackMutate(ctx, http.MethodPost, rackSystemPath+"/Actions/ComputerSystem.Reset", map[string]ResetType{"ResetType": resetType}, resetType == ResetOn)
+		op := recoveryNone
+		if resetType == ResetOn {
+			op = recoveryResetOn
+		}
+
+		return c.rackMutate(ctx, http.MethodPost, rackSystemPath+"/Actions/ComputerSystem.Reset", map[string]ResetType{"ResetType": resetType}, op)
 	}
 
 	path := fmt.Sprintf("/redfish/v1/Systems/%s/Actions/ComputerSystem.Reset", c.deviceID)
