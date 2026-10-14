@@ -300,6 +300,8 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 	run.Spec.Parameters = map[string]string{
 		ObservedGPUCapacityParameter:    "8",
 		ObservedGPUAllocatableParameter: "7",
+		"burn-duration-seconds":         "21600",
+		"sample-interval-seconds":       "60",
 	}
 
 	workflow, err := buildWorkflow(run, 2)
@@ -341,6 +343,10 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	if values["observed-gpu-capacity"] != "8" || values["observed-gpu-allocatable"] != "7" {
 		t.Fatalf("workflow observed inventory = %#v", values)
+	}
+
+	if values["burn-duration-seconds"] != "21600" || values["sample-interval-seconds"] != "60" {
+		t.Fatalf("workflow profile parameters = %#v", values)
 	}
 
 	if values["script-configmap"] != run.Spec.Script.ConfigMapName || values["script-configmap"] == "scripts" {

@@ -601,6 +601,53 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 	}
 
 	name := fmt.Sprintf("%s-a%d", run.Name, attempt)
+	workflowParameters := []any{
+		map[string]any{"name": "run-name", "value": run.Name},
+		map[string]any{"name": "run-uid", "value": string(run.UID)},
+		map[string]any{"name": "participants", "value": strings.Join(participantNames, ",")},
+		map[string]any{"name": "script-configmap", "value": run.Spec.Script.ConfigMapName},
+		map[string]any{"name": "script-key", "value": run.Spec.Script.Key},
+		map[string]any{"name": "script-digest", "value": run.Spec.Script.Digest},
+		map[string]any{"name": "backend-api-version", "value": run.Spec.Backend.APIVersion},
+		map[string]any{"name": "backend-kind", "value": run.Spec.Backend.Kind},
+		map[string]any{"name": "queue", "value": run.Spec.Backend.Queue},
+		map[string]any{"name": "runner-image", "value": run.Spec.RunnerImage},
+		map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
+		map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
+	}
+	reservedParameters := map[string]struct{}{
+		"run-name":            {},
+		"run-uid":             {},
+		"participants":        {},
+		"script-configmap":    {},
+		"script-key":          {},
+		"script-digest":       {},
+		"backend-api-version": {},
+		"backend-kind":        {},
+		"queue":               {},
+		"runner-image":        {},
+		"tolerations":         {},
+		"attempt":             {},
+	}
+
+	parameterNames := make([]string, 0, len(run.Spec.Parameters))
+	for parameterName := range run.Spec.Parameters {
+		parameterNames = append(parameterNames, parameterName)
+	}
+
+	sort.Strings(parameterNames)
+
+	for _, parameterName := range parameterNames {
+		if _, reserved := reservedParameters[parameterName]; reserved {
+			continue
+		}
+
+		workflowParameters = append(workflowParameters, map[string]any{
+			"name":  parameterName,
+			"value": run.Spec.Parameters[parameterName],
+		})
+	}
+
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workflowGVK.GroupVersion().String(),
 		"kind":       workflowGVK.Kind,
@@ -626,24 +673,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 				"name": run.Spec.Workflow.Name,
 			},
 			"arguments": map[string]any{
-				"parameters": []any{
-					map[string]any{"name": "run-name", "value": run.Name},
-					map[string]any{"name": "run-uid", "value": string(run.UID)},
-					map[string]any{"name": "participants", "value": strings.Join(participantNames, ",")},
-					map[string]any{"name": "script-configmap", "value": run.Spec.Script.ConfigMapName},
-					map[string]any{"name": "script-key", "value": run.Spec.Script.Key},
-					map[string]any{"name": "script-digest", "value": run.Spec.Script.Digest},
-					map[string]any{"name": "backend-api-version", "value": run.Spec.Backend.APIVersion},
-					map[string]any{"name": "backend-kind", "value": run.Spec.Backend.Kind},
-					map[string]any{"name": "queue", "value": run.Spec.Backend.Queue},
-					map[string]any{"name": "runner-image", "value": run.Spec.RunnerImage},
-					map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
-					map[string]any{"name": "expected-gpu-product-regex", "value": run.Spec.Parameters["expected-gpu-product-regex"]},
-					map[string]any{"name": "expected-gpu-count", "value": run.Spec.Parameters["expected-gpu-count"]},
-					map[string]any{"name": "observed-gpu-capacity", "value": run.Spec.Parameters[ObservedGPUCapacityParameter]},
-					map[string]any{"name": "observed-gpu-allocatable", "value": run.Spec.Parameters[ObservedGPUAllocatableParameter]},
-					map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
-				},
+				"parameters": workflowParameters,
 			},
 		},
 	}}
