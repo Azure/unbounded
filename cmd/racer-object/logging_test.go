@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go/logging"
+
 	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
@@ -131,5 +133,51 @@ func TestSidecarVersionMismatchIsDebug(t *testing.T) {
 
 	if output.String() != "" {
 		t.Fatalf("version mismatch logged at info: %q", output.String())
+	}
+}
+
+func TestAWSLogger(t *testing.T) {
+	for _, debug := range []bool{false, true} {
+		t.Run(fmt.Sprint(debug), func(t *testing.T) {
+			output := captureDiagnosticLog(t)
+			logger := awsLogger(debug)
+
+			logger.Logf(logging.Warn, "retry %s", "quota\nlevel=forged")
+			logger.Logf(logging.Debug, "checksum skipped")
+			logger.Logf(logging.Classification("OTHER"), "ignored")
+
+			got := output.String()
+			if !strings.Contains(got, `event=aws_sdk level=warn message="retry quota\nlevel=forged"`) {
+				t.Fatalf("warning missing or unquoted: %q", got)
+			}
+
+			if strings.Contains(got, "checksum skipped") != debug || strings.Contains(got, "ignored") {
+				t.Fatalf("debug=%v filtering wrong: %q", debug, got)
+			}
+		})
+	}
+}
+
+func TestAWSLogMode(t *testing.T) {
+	if awsLogMode(false) != 0 {
+		t.Fatal("info level enabled SDK client logs")
+	}
+
+	mode := awsLogMode(true)
+	if !mode.IsRetries() || mode.IsRequest() || mode.IsRequestWithBody() || mode.IsResponse() || mode.IsResponseWithBody() || mode.IsSigning() {
+		t.Fatalf("debug log mode %v exposes requests or signing", mode)
+	}
+}
+
+func TestOriginAWSConfigLogging(t *testing.T) {
+	for _, level := range []string{logLevelInfo, logLevelDebug} {
+		cfg, err := originAWSConfig(t.Context(), options{region: "us-east-1", requestTimeout: time.Second, logLevel: level})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if cfg.Logger == nil || cfg.ClientLogMode != awsLogMode(level == logLevelDebug) {
+			t.Fatalf("%s: logger %v mode %v", level, cfg.Logger, cfg.ClientLogMode)
+		}
 	}
 }

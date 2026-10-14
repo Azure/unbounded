@@ -25,7 +25,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/smithy-go/logging"
 	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/racer/object"
@@ -286,7 +285,8 @@ func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
 
 	load := []func(*config.LoadOptions) error{
 		config.WithHTTPClient(httpClient),
-		config.WithLogger(logging.NewStandardLogger(io.Discard)),
+		config.WithLogger(awsLogger(o.logLevel == logLevelDebug)),
+		config.WithClientLogMode(awsLogMode(o.logLevel == logLevelDebug)),
 		// S3-compatible backends may reject the SDK's default optional checksums.
 		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),

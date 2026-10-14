@@ -9,6 +9,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/smithy-go/logging"
 )
 
 const (
@@ -104,4 +107,38 @@ func (l *logLimiter) allow(key string) (bool, int) {
 	limit.count++
 
 	return true, 0
+}
+
+// awsLogger forwards SDK warnings, and SDK debug lines when debug is set, to
+// the process log (stderr). SDK messages are authored by the SDK; they are
+// quoted so they cannot forge diagnostic fields.
+func awsLogger(debug bool) logging.Logger {
+	return logging.LoggerFunc(func(classification logging.Classification, format string, v ...any) {
+		level := "warn"
+
+		switch classification {
+		case logging.Warn:
+		case logging.Debug:
+			if !debug {
+				return
+			}
+
+			level = "debug"
+		default:
+			return
+		}
+
+		log.Printf("racer-object: mode=origin event=aws_sdk level=%s message=%q", level, fmt.Sprintf(format, v...))
+	})
+}
+
+// awsLogMode enables only retry and deprecation logs in debug mode. Request
+// and response logging is never enabled: it prints headers (including the
+// SigV4 Authorization header), bodies, and signing details.
+func awsLogMode(debug bool) aws.ClientLogMode {
+	if !debug {
+		return 0
+	}
+
+	return aws.LogRetries | aws.LogDeprecatedUsage
 }
