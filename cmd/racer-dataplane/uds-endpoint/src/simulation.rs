@@ -181,6 +181,14 @@ impl Endpoint for BoundSocket {
         if from == to {
             return Err(error(Error::InvalidName));
         }
+        for name in [from, to] {
+            if name != self.layout.canonical() {
+                self.layout.witness(name)?;
+            }
+        }
+        if !self.owns_checked(from)? {
+            return Err(Self::ownership_error());
+        }
         self.sim
             .rename(&self.entry_path(from)?, &self.entry_path(to)?, mode.flags())
     }
@@ -386,6 +394,189 @@ mod tests {
             sim.metadata(Path::new("/sockets/temporary")).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn rename_rejects_invalid_and_excluded_names_before_metadata() {
+        let layout = Layout::new("lock", "canonical", "owned-", |name| {
+            name.starts_with("stage-") || name == "owned-stage-overlap"
+        })
+        .unwrap();
+        for (name, expected) in [
+            ("".into(), Error::InvalidName),
+            (".".into(), Error::InvalidName),
+            ("..".into(), Error::InvalidName),
+            ("/escaped".into(), Error::InvalidName),
+            ("../escaped".into(), Error::InvalidName),
+            ("child/socket".into(), Error::InvalidName),
+            ("a\0b".into(), Error::InvalidName),
+            ("x".repeat(256), Error::InvalidName),
+            ("é".repeat(128), Error::InvalidName),
+            (format!("stage-{}", "x".repeat(244)), Error::InvalidName),
+            ("other-canonical".into(), Error::InvalidLayout),
+            ("temporary".into(), Error::InvalidLayout),
+            ("lock".into(), Error::InvalidLayout),
+            ("owned-stage-next".into(), Error::InvalidLayout),
+            ("stage-overlap".into(), Error::InvalidLayout),
+        ] {
+            for mode in [Rename::NoReplace, Rename::Exchange] {
+                for source in [false, true] {
+                    let sim = Simulation::new();
+                    let directory = PathBuf::from("/sockets");
+                    let socket =
+                        BoundSocket::bind(sim.clone(), directory.clone(), layout, "stage-next")
+                            .unwrap();
+                    if expected == Error::InvalidLayout {
+                        sim.write_file(&directory.join(&name), b"foreign").unwrap();
+                    }
+                    let before = sim.metadata(&directory.join("stage-next")).unwrap();
+                    let foreign_before = sim.metadata(&directory.join(&name)).ok();
+                    sim.inject("metadata", Fault::Errno(libc::EIO)).unwrap();
+                    let (from, to) = if source {
+                        (name.as_str(), "stage-next")
+                    } else {
+                        ("stage-next", name.as_str())
+                    };
+                    let error = socket.rename(from, to, mode).unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                    assert_eq!(
+                        error.get_ref().unwrap().downcast_ref(),
+                        Some(&expected),
+                        "{from:?} -> {to:?}, {mode:?}"
+                    );
+                    assert_eq!(
+                        socket
+                            .owns_checked("stage-next")
+                            .unwrap_err()
+                            .raw_os_error(),
+                        Some(libc::EIO)
+                    );
+                    assert_eq!(sim.metadata(&directory.join("stage-next")).unwrap(), before);
+                    assert_eq!(sim.metadata(&directory.join(&name)).ok(), foreign_before);
+                    if expected == Error::InvalidLayout {
+                        assert_eq!(sim.read_file(&directory.join(&name)).unwrap(), b"foreign");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_rejects_unowned_sources_without_mutation() {
+        for mode in [Rename::NoReplace, Rename::Exchange] {
+            for source in ["missing", "file", "socket", "symlink", "canonical"] {
+                let sim = Simulation::new();
+                let directory = PathBuf::from("/sockets");
+                let socket = bind(sim.clone(), directory.clone(), "temporary").unwrap();
+                let foreign = bind(sim.clone(), directory.clone(), "socket").unwrap();
+                let canonical = bind(sim.clone(), directory.clone(), "canonical").unwrap();
+                sim.write_file(&directory.join("file"), b"foreign").unwrap();
+                sim.symlink(&directory.join("temporary"), &directory.join("symlink"))
+                    .unwrap();
+                let before = sim.metadata(&directory.join(source)).ok();
+                let owned_before = sim.metadata(&directory.join("temporary")).unwrap();
+                let error = socket.rename(source, "temporary", mode).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert_eq!(
+                    error.get_ref().unwrap().downcast_ref(),
+                    Some(&Error::OwnershipChanged),
+                    "{source}, {mode:?}"
+                );
+                assert_eq!(sim.metadata(&directory.join(source)).ok(), before);
+                assert_eq!(
+                    sim.metadata(&directory.join("temporary")).unwrap(),
+                    owned_before
+                );
+                assert_eq!(sim.read_file(&directory.join("file")).unwrap(), b"foreign");
+                assert!(foreign.owns("socket"));
+                assert!(canonical.owns("canonical"));
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_faults_reach_checked_probes_and_rename() {
+        let sim = Simulation::new();
+        let socket = bind(sim.clone(), "/sockets".into(), "temporary").unwrap();
+        let before = sim.metadata(Path::new("/sockets/temporary")).unwrap();
+        for errno in [libc::EACCES, libc::EIO, libc::EMFILE] {
+            sim.inject("metadata", Fault::Errno(errno)).unwrap();
+            assert_eq!(
+                socket.owns_checked("temporary").unwrap_err().raw_os_error(),
+                Some(errno)
+            );
+            sim.inject("metadata", Fault::Errno(errno)).unwrap();
+            assert_eq!(
+                socket
+                    .absent_checked("canonical")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(errno)
+            );
+            sim.inject("metadata", Fault::Errno(errno)).unwrap();
+            assert!(!socket.owns("temporary"));
+            sim.inject("metadata", Fault::Errno(errno)).unwrap();
+            assert!(!socket.absent("canonical"));
+            for mode in [Rename::NoReplace, Rename::Exchange] {
+                sim.inject("metadata", Fault::Errno(errno)).unwrap();
+                assert_eq!(
+                    socket
+                        .rename("temporary", "canonical", mode)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(errno)
+                );
+                assert_eq!(
+                    sim.metadata(Path::new("/sockets/temporary")).unwrap(),
+                    before
+                );
+                assert!(socket.absent_checked("canonical").unwrap());
+                assert_eq!(*socket.basename.borrow(), "temporary");
+            }
+        }
+    }
+
+    #[test]
+    fn rename_and_exchange_accept_owned_canonical_and_temporary_names() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let next = bind(sim.clone(), directory.clone(), "temporary").unwrap();
+        next.rename("temporary", "canonical", Rename::NoReplace)
+            .unwrap();
+        next.set_basename("canonical".into());
+        let previous = bind(sim.clone(), directory.clone(), "temporary").unwrap();
+        assert_eq!(
+            next.rename("canonical", "temporary", Rename::NoReplace)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EEXIST)
+        );
+        for (from, to) in [("canonical", "temporary"), ("temporary", "canonical")] {
+            next.rename(from, to, Rename::Exchange).unwrap();
+            next.set_basename(to.into());
+            previous.set_basename(from.into());
+            assert!(next.owns(to));
+            assert!(previous.owns(from));
+            let client = sim
+                .connect(SocketAddress::Unix(directory.join(to)))
+                .unwrap();
+            let accepted = next.accept().unwrap();
+            drop((client, accepted));
+        }
+        drop(previous);
+        next.rename("canonical", "temporary", Rename::NoReplace)
+            .unwrap();
+        next.set_basename("temporary".into());
+        assert!(next.owns("temporary"));
+        assert!(next.absent("canonical"));
+        drop(next);
+        assert_eq!(
+            sim.metadata(&directory.join("temporary"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(sim.live_handles(), 0);
     }
 
     #[test]

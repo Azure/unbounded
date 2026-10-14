@@ -200,6 +200,16 @@ destination owner before an exchange.
 Publication requires the configured canonical name. To create a canonical socket
 in a fixture, bind a temporary name and publish it. Completed publication returns
 `PublicationCompleted`; journal reservation failure reports `OutOfMemory`.
+Rename checks both names against the layout and requires ownership of the source,
+as on the host. Only canonical and valid temporary names are allowed, not lock or
+witness names. The caller must still check the destination owner before exchange.
+
+`sim.inject("metadata", Fault::Errno(errno))` fails the next named metadata lookup
+in that simulation, including through its clones. Checked ownership and absence
+probes and rename preserve errors other than `NotFound`, which means absence.
+The boolean `owns` and `absent` hooks return false on probe errors; they do not
+provide diagnostics. This hook tests error handling, not host permission
+enforcement or descriptor exhaustion.
 
 The adapter tests inode-checked cleanup, retained directory identity, mode changes,
 and the shared publication journal. Bind returns with mode 0600. The runtime

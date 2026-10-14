@@ -849,8 +849,12 @@ impl Simulation {
     }
 
     /// Returns a named inode's identity and mode without following symlinks.
+    /// Consumes an injected `metadata` errno fault before looking up the path.
     pub fn metadata(&self, path: &Path) -> io::Result<(u64, u16)> {
-        let w = self.0.borrow();
+        let mut w = self.0.borrow_mut();
+        if let Some(Fault::Errno(n)) = w.fault("metadata") {
+            return Err(errno(n));
+        }
         let node = w
             .paths
             .get(&normalize(path)?)
@@ -1181,6 +1185,38 @@ mod tests {
     use crate::reactor::simulation::network::tests::{drive, poll, reactor, scope};
     use crate::reactor::tests::fixtures::{Reactor, RequestScope, ResourceClass};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn metadata_errno_faults_are_one_shot_and_simulation_local() {
+        let sim = Simulation::new();
+        let other = Simulation::new();
+        let path = Path::new("/file");
+        sim.write_file(path, b"data").unwrap();
+        other.write_file(path, b"other").unwrap();
+        let before = sim.metadata(path).unwrap();
+        let other_before = other.metadata(path).unwrap();
+        sim.inject("metadata", Fault::Errno(libc::EACCES)).unwrap();
+        sim.inject("metadata", Fault::Errno(libc::EIO)).unwrap();
+        assert_eq!(other.metadata(path).unwrap(), other_before);
+        assert_eq!(sim.read_file(path).unwrap(), b"data");
+        assert_eq!(
+            sim.clone().metadata(path).unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(
+            sim.metadata(Path::new("/missing"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(sim.metadata(path).unwrap(), before);
+        assert_eq!(
+            sim.metadata(Path::new("/missing"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
 
     #[test]
     fn directory_path_tracks_inode_and_rejects_invalid_handles() {
