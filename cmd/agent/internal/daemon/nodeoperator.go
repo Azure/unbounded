@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
@@ -95,7 +96,8 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		// If the sidecar file is missing, log a warning so operators
 		// know the integrity check was skipped.
 		if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
-			log.Warn("no checksum sidecar found, skipping integrity check",
+			log.Warn(
+				"no checksum sidecar found, skipping integrity check",
 				"config_path", path,
 				"checksum_path", checksumPath,
 			)
@@ -183,6 +185,10 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if !reflect.DeepEqual(applied.NVIDIA, desired.NVIDIA) {
+		return true
+	}
+
 	return false
 }
 
@@ -254,7 +260,8 @@ func (nspawnNodeOperator) RepaveNode(
 	oldMachine := active.Name
 	newMachine := goalstates.AlternateMachine(oldMachine)
 
-	log.Info("starting node repave",
+	log.Info(
+		"starting node repave",
 		"old_machine", oldMachine,
 		"new_machine", newMachine,
 		"old_version", active.Config.Cluster.Version,
@@ -267,12 +274,17 @@ func (nspawnNodeOperator) RepaveNode(
 		return fmt.Errorf("resolve download overrides: %w", err)
 	}
 
+	if err := host.PrepareNVIDIAIMEXDRA(log, &newCfg.AgentConfig).Do(ctx); err != nil {
+		return fmt.Errorf("prepare NVIDIA IMEX DRA host: %w", err)
+	}
+
 	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, downloads)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
 
-	err = phases.Serial(log,
+	err = phases.Serial(
+		log,
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
@@ -287,7 +299,8 @@ func (nspawnNodeOperator) RepaveNode(
 		return err
 	}
 
-	log.Info("node repave completed",
+	log.Info(
+		"node repave completed",
 		"active_machine", newMachine,
 		"version", newCfg.Cluster.Version,
 	)

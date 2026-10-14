@@ -110,9 +110,10 @@ When GPUs are detected on the host, the agent automatically exposes the host
 paths needed by the corresponding Kubernetes device plugin:
 
 - **NVIDIA GPUs.** Bind-mounts GPU device nodes and host driver libraries,
-  including NVIDIA IMEX channel devices used by multi-node GPU and NVLink
-  communication, grants cgroup device permissions, generates a CDI spec, and
-  configures the NVIDIA container runtime. See
+  grants cgroup device permissions, generates a CDI spec, and configures the
+  NVIDIA container runtime. IMEX channel directories and helper binaries are
+  exposed only when `agent.nvidia.imex.mode: DRA` is explicitly configured and
+  its host prerequisites pass. See
   [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
 - **AMD GPUs.** Bind-mounts `/dev/kfd` and DRM device nodes, grants cgroup
   device permissions, and exposes AMD sysfs paths read-only so the AMD

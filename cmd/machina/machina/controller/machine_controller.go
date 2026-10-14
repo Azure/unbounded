@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
@@ -584,6 +585,15 @@ func (r *MachineReconciler) provisionMachine(
 		ProviderLabels: providerLabels,
 		BootstrapToken: bootstrapToken,
 	})
+
+	if machine.Spec.ConfigurationRef != nil {
+		version, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, machine.Spec.ConfigurationRef)
+		if err != nil {
+			return fmt.Errorf("resolve MachineConfiguration for provisioning: %w", err)
+		}
+
+		provision.ApplyMachineConfigurationTemplate(&agentConfig, version.Spec.Template)
+	}
 
 	configJSON, err := json.Marshal(agentConfig)
 	if err != nil {

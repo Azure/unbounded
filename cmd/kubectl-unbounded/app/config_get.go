@@ -118,7 +118,13 @@ func runConfigGetOne(ctx context.Context, c client.WithWatch, name string, out i
 	}
 
 	if mc.Spec.Template.Agent != nil {
-		printConfig(out, "agent-image", mc.Spec.Template.Agent.Image)
+		if mc.Spec.Template.Agent.Image != "" {
+			printConfig(out, "agent-image", mc.Spec.Template.Agent.Image)
+		}
+
+		if mc.Spec.Template.Agent.NVIDIA != nil && mc.Spec.Template.Agent.NVIDIA.IMEX != nil {
+			printConfig(out, "nvidia-imex-mode", string(mc.Spec.Template.Agent.NVIDIA.IMEX.Mode))
+		}
 	}
 
 	fprintln(out)

@@ -270,12 +270,18 @@ func (r *MachineOperationReconciler) operationRequest(
 		Auth:              auth,
 	}
 
-	var format unboundedv1alpha3.ProvisioningFormat
+	var (
+		format                   unboundedv1alpha3.ProvisioningFormat
+		configurationVersionName string
+		configurationTemplate    *unboundedv1alpha3.MachineConfigurationTemplate
+	)
 
 	if target.Input != nil {
 		request.ProviderRef = target.Input.ProviderRef.DeepCopy()
 		request.HostImage = target.Input.HostImage
 		format = target.Input.ProvisioningFormat
+		configurationVersionName = target.Input.ConfigurationVersionName
+		configurationTemplate = target.Input.ConfigurationTemplate.DeepCopy()
 	}
 
 	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace || !includeReplaceUserData {
@@ -293,7 +299,13 @@ func (r *MachineOperationReconciler) operationRequest(
 		}
 	}
 
-	userData, err := r.buildReplaceUserData(ctx, machine, format)
+	userData, err := r.buildReplaceUserData(
+		ctx,
+		machine,
+		format,
+		configurationVersionName,
+		configurationTemplate,
+	)
 	if err != nil {
 		return OperationRequest{}, err
 	}

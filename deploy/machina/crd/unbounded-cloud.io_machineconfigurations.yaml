@@ -169,8 +169,21 @@ spec:
                               type: string
                             type: array
                         type: object
-                    required:
-                    - image
+                      nvidia:
+                        description: NVIDIA configures optional NVIDIA host integration.
+                        properties:
+                          imex:
+                            description: IMEX configures multi-node NVLink IMEX preparation.
+                            properties:
+                              mode:
+                                description: |-
+                                  Mode selects the IMEX lifecycle owner. DRA prepares the node for NVIDIA
+                                  DRA ComputeDomains; an empty value disables IMEX preparation.
+                                enum:
+                                - DRA
+                                type: string
+                            type: object
+                        type: object
                     type: object
                   host:
                     description: Host contains provider-neutral desired host settings.

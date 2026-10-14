@@ -68,6 +68,51 @@ func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 	})
 }
 
+func TestValidateNVIDIAIMEXKubernetesVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, version := range []string{"1.34.2", "v1.34.2", "1.35.0", "2.0.0"} {
+		require.NoError(t, ValidateNVIDIAIMEXKubernetesVersion(version), version)
+	}
+
+	for _, version := range []string{"", "1.34", "1.34.1", "v1.33.9", "invalid"} {
+		require.Error(t, ValidateNVIDIAIMEXKubernetesVersion(version), version)
+	}
+}
+
+func TestResolveKubeletAddsIMEXModeLabelWithoutMutatingConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{CaCertBase64: "Y2E=", ClusterDNS: "10.0.0.10"},
+		Kubelet: config.AgentKubeletConfig{Labels: map[string]string{"env": "test"}},
+		NVIDIA: &config.NVIDIAConfig{
+			IMEX: &config.NVIDIAIMEXConfig{Mode: config.NVIDIAIMEXModeDRA},
+		},
+	}
+
+	got, err := resolveKubelet(cfg)
+	require.NoError(t, err)
+	require.Equal(t, "DRA", got.NodeLabels[config.NVIDIAIMEXModeLabelKey])
+	require.NotContains(t, cfg.Kubelet.Labels, config.NVIDIAIMEXModeLabelKey)
+}
+
+func TestResolveKubeletRemovesUnconfiguredIMEXModeLabel(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{CaCertBase64: "Y2E=", ClusterDNS: "10.0.0.10"},
+		Kubelet: config.AgentKubeletConfig{
+			Labels: map[string]string{config.NVIDIAIMEXModeLabelKey: string(config.NVIDIAIMEXModeDRA)},
+		},
+	}
+
+	got, err := resolveKubelet(cfg)
+	require.NoError(t, err)
+	require.NotContains(t, got.NodeLabels, config.NVIDIAIMEXModeLabelKey)
+	require.Equal(t, string(config.NVIDIAIMEXModeDRA), cfg.Kubelet.Labels[config.NVIDIAIMEXModeLabelKey])
+}
+
 func completeResolvedNVIDIA() NvidiaHost {
 	return NvidiaHost{
 		GPUDevicePaths: []string{"/dev/nvidia0"},

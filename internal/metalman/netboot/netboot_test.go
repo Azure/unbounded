@@ -2060,6 +2060,40 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 	if !strings.Contains(string(resolved.Data), `"MachineName": "node-without-agent"`) {
 		t.Errorf("expected MachineName in rendered template, got %q", resolved.Data)
 	}
+
+	version := int32(1)
+	configurationVersion := &v1alpha3.MachineConfigurationVersion{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: v1alpha3.MachineConfigurationVersionName("gb200", version),
+		},
+		Spec: v1alpha3.MachineConfigurationVersionSpec{
+			Version: version,
+			Template: v1alpha3.MachineConfigurationTemplate{
+				Agent: &v1alpha3.MachineConfigurationAgent{
+					NVIDIA: &v1alpha3.MachineConfigurationNVIDIA{
+						IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
+							Mode: v1alpha3.NVIDIAIMEXModeDRA,
+						},
+					},
+				},
+			},
+		},
+	}
+	require.NoError(t, fc.Create(t.Context(), configurationVersion))
+
+	nodeWithIMEX := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-with-imex"},
+		Spec: v1alpha3.MachineSpec{
+			ConfigurationRef: &v1alpha3.MachineConfigurationRef{
+				Name:    "gb200",
+				Version: &version,
+			},
+		},
+	}
+
+	resolved, err = resolver.ResolveFileByPath(t.Context(), "config", nodeWithIMEX, "ghcr.io/test/image:v1")
+	require.NoError(t, err)
+	require.Contains(t, string(resolved.Data), `"Mode": "DRA"`)
 }
 
 func TestHTTPServer_Start_Shutdown(t *testing.T) {

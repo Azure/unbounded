@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	api "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 type changingVersionClient struct {
@@ -60,6 +61,8 @@ func TestReplacementPairUsesOneVersionSelection(t *testing.T) {
 			require.Equal(t, 1, c.lists)
 			require.Equal(t, "ignition-image", input.HostImage)
 			require.Equal(t, api.ProvisioningFormatIgnition, input.ProvisioningFormat)
+			require.Equal(t, "ignition-image", input.ConfigurationVersionName)
+			require.NotNil(t, input.ConfigurationTemplate)
 		}
 	}
 }
@@ -118,7 +121,8 @@ func TestReplacementSnapshotAndImageOverride(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "other-image", input.HostImage)
 	require.Equal(t, api.ProvisioningFormatCloudInit, input.ProvisioningFormat)
-	require.Equal(t, 1, c.lists, "explicit image must not read template format")
+	require.Equal(t, "cloud-init-image", input.ConfigurationVersionName)
+	require.Equal(t, 2, c.lists, "explicit image still freezes the matching agent configuration version")
 
 	m.Spec.Host.ProvisioningFormat = ""
 	m.Status.ObservedProvisioningFormat = api.ProvisioningFormatIgnition
@@ -186,6 +190,42 @@ func TestMachineFormatOverridesTemplateFormat(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "ignition-image", host.Image)
 	require.Equal(t, api.ProvisioningFormatCloudInit, host.Format, "explicit target declaration overrides template")
+}
+
+func TestBuildReplaceAgentConfigUsesFrozenTemplateAfterMachineEdit(t *testing.T) {
+	t.Parallel()
+
+	scheme := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	machine := newExternalMachine("worker", api.ExternalProviderAzureVM)
+	machine.Spec.Kubernetes = &api.KubernetesSpec{
+		BootstrapTokenRef: &api.LocalObjectReference{Name: "bootstrap-token-test"},
+	}
+	machine.Spec.ConfigurationRef = nil
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte("secret456"),
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &MachineOperationReconciler{Client: kubeClient, ClusterInfo: testClusterInfo()}
+	template := &api.MachineConfigurationTemplate{
+		Agent: &api.MachineConfigurationAgent{
+			NVIDIA: &api.MachineConfigurationNVIDIA{
+				IMEX: &api.MachineConfigurationNVIDIAIMEX{Mode: api.NVIDIAIMEXModeDRA},
+			},
+		},
+	}
+
+	cfg, err := reconciler.buildReplaceAgentConfig(t.Context(), machine, "worker-v1", template)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.NVIDIA)
+	require.NotNil(t, cfg.NVIDIA.IMEX)
+	require.Equal(t, provision.NVIDIAIMEXModeDRA, cfg.NVIDIA.IMEX.Mode)
 }
 
 func TestHostReplaceRefusesUnsupportedFormatBeforeProvider(t *testing.T) {

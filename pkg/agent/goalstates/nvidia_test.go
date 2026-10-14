@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 func TestNVIDIAStateAvailable(t *testing.T) {
@@ -44,6 +46,128 @@ func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	require.NotContains(t, devices, capability)
 	require.NotContains(t, devices, channel)
 	require.NotContains(t, devices, nonChannel)
+}
+
+func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
+	t.Parallel()
+
+	valid := func() NvidiaHost {
+		return NvidiaHost{
+			GPUDevicePaths:           []string{"/dev/nvidia0", "/dev/nvidia-caps"},
+			NvidiaIMEXPath:           "/usr/bin/nvidia-imex",
+			NvidiaIMEXCtlPath:        "/usr/bin/nvidia-imex-ctl",
+			DriverVersion:            "580.178.04",
+			IMEXManagementCapability: true,
+			IMEXDeviceClass:          true,
+			IMEXServiceUnitState:     "masked",
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*NvidiaHost)
+		distro  string
+		wantErr string
+	}{
+		{name: "supported", distro: hostDistroUbuntu2404},
+		{
+			name: "missing binaries",
+			mutate: func(host *NvidiaHost) {
+				host.NvidiaIMEXPath = ""
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "nvidia-imex and nvidia-imex-ctl",
+		},
+		{
+			name: "missing management capability",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXManagementCapability = false
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "fabric-imex-mgmt",
+		},
+		{
+			name: "missing device class",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXDeviceClass = false
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "character-device class",
+		},
+		{
+			name: "missing capability directory",
+			mutate: func(host *NvidiaHost) {
+				host.GPUDevicePaths = []string{"/dev/nvidia0"}
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "/dev/nvidia-caps",
+		},
+		{
+			name: "host service active",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXServiceActive = true
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "service to be inactive",
+		},
+		{
+			name: "host service not masked",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXServiceUnitState = "disabled"
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "service to be masked",
+		},
+		{
+			name: "unsupported driver",
+			mutate: func(host *NvidiaHost) {
+				host.DriverVersion = "570.172.08"
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "driver 580 or later",
+		},
+		{
+			name:    "unsupported OS",
+			distro:  hostDistroAzureLinux3,
+			wantErr: "unsupported on host distribution",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			host := valid()
+			if tt.mutate != nil {
+				tt.mutate(&host)
+			}
+
+			got, err := configureNVIDIAIMEX(host, config.NVIDIAIMEXModeDRA, tt.distro)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, config.NVIDIAIMEXModeDRA, got.IMEXMode)
+			require.Contains(t, got.GPUDevicePaths, "/dev/nvidia-caps-imex-channels")
+		})
+	}
+}
+
+func TestConfigureNVIDIAIMEXDisabledRemovesExposure(t *testing.T) {
+	t.Parallel()
+
+	got, err := configureNVIDIAIMEX(NvidiaHost{
+		GPUDevicePaths:    []string{"/dev/nvidia0", "/dev/nvidia-caps-imex-channels"},
+		NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
+		NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
+	}, "", hostDistroUbuntu2404)
+	require.NoError(t, err)
+	require.NotContains(t, got.GPUDevicePaths, "/dev/nvidia-caps-imex-channels")
+	require.Empty(t, got.NvidiaIMEXPath)
+	require.Empty(t, got.NvidiaIMEXCtlPath)
+	require.Empty(t, got.IMEXMode)
 }
 
 func TestParseNVIDIALibraries(t *testing.T) {

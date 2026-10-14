@@ -106,6 +106,13 @@ func TestBootstrapFingerprintAllowsCredentialAndDownloadRefresh(t *testing.T) {
 
 		cfg.Cluster.Version, cfg.OCIImage, cfg.Kubelet.ApiServer = version, image, endpoint
 	}
+
+	cfg.NVIDIA = &provision.NVIDIAConfig{
+		IMEX: &provision.NVIDIAIMEXConfig{Mode: provision.NVIDIAIMEXModeDRA},
+	}
+	changed, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+	require.NotEqual(t, original.ConfigFingerprint, changed.ConfigFingerprint)
 }
 
 func TestBootstrapFingerprintIgnoresSignedImageQuery(t *testing.T) {

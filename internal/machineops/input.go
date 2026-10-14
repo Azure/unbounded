@@ -124,14 +124,18 @@ func (r *MachineOperationReconciler) resolveOperationTargetInput(
 
 		input.HostImage = host.Image
 		input.ProvisioningFormat = host.Format
+		input.ConfigurationVersionName = host.ConfigurationVersionName
+		input.ConfigurationTemplate = host.ConfigurationTemplate
 	}
 
 	return input, nil
 }
 
 type resolvedReplacementHost struct {
-	Image  string
-	Format unboundedv1alpha3.ProvisioningFormat
+	Image                    string
+	Format                   unboundedv1alpha3.ProvisioningFormat
+	ConfigurationVersionName string
+	ConfigurationTemplate    *unboundedv1alpha3.MachineConfigurationTemplate
 }
 
 // Resolve the pair from one version selection. An unpinned reference can change
@@ -147,7 +151,7 @@ func (r *MachineOperationReconciler) resolveReplacementHost(ctx context.Context,
 	resolved.Spec.Host.Image = strings.TrimSpace(resolved.Spec.Host.Image)
 
 	result.Image = resolved.Spec.Host.Image
-	if result.Image == "" && machine.Spec.ConfigurationRef != nil {
+	if machine.Spec.ConfigurationRef != nil {
 		version, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, machine.Spec.ConfigurationRef)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -157,7 +161,10 @@ func (r *MachineOperationReconciler) resolveReplacementHost(ctx context.Context,
 			return result, err
 		}
 
-		if host := version.Spec.Template.Host; host != nil {
+		result.ConfigurationVersionName = version.Name
+		result.ConfigurationTemplate = version.Spec.Template.DeepCopy()
+
+		if host := version.Spec.Template.Host; host != nil && result.Image == "" {
 			result.Image = strings.TrimSpace(host.Image)
 			if resolved.Spec.Host.ProvisioningFormat == "" {
 				resolved.Spec.Host.ProvisioningFormat = host.ProvisioningFormat

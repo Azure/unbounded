@@ -139,8 +139,11 @@ func (op *fakeNodeOperator) ReconcileHostRoot(_ context.Context, _ *slog.Logger,
 }
 
 func fakeStatusClient(objs ...client.Object) client.Client {
+	scheme := fakeScheme()
+	_ = corev1.AddToScheme(scheme)
+
 	return fake.NewClientBuilder().
-		WithScheme(fakeScheme()).
+		WithScheme(scheme).
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		WithStatusSubresource(&v1alpha3.MachineOperation{}).
 		WithObjects(objs...).
@@ -658,7 +661,8 @@ func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
 
 	active := &ActiveMachine{Name: "kube1", Config: baseConfig()}
 	op := &fakeNodeOperator{active: active}
-	c := fakeStatusClient(machine, mcv)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}
+	c := fakeStatusClient(machine, mcv, node)
 	reconciler := &repaveReconciler{
 		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
 		Client:       c,
@@ -714,7 +718,15 @@ func TestReconcileRepave_NoDriftMarksDesiredConfigurationApplied(t *testing.T) {
 	})
 
 	op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: base}}
-	c := fakeStatusClient(machine, mcv)
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: machine.Name,
+			Labels: map[string]string{
+				provision.NVIDIAIMEXModeLabelKey: string(provision.NVIDIAIMEXModeDRA),
+			},
+		},
+	}
+	c := fakeStatusClient(machine, mcv, node)
 	reconciler := &repaveReconciler{
 		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
 		Client:       c,
@@ -727,6 +739,10 @@ func TestReconcileRepave_NoDriftMarksDesiredConfigurationApplied(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, op.repaveActive)
 	assert.Nil(t, op.repaveConfig)
+
+	var updatedNode corev1.Node
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &updatedNode))
+	assert.NotContains(t, updatedNode.Labels, provision.NVIDIAIMEXModeLabelKey)
 
 	var updated v1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))

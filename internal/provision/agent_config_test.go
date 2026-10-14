@@ -202,6 +202,45 @@ func TestUnboundedAgentConfig_AttestOmittedWhenNil(t *testing.T) {
 	require.Equal(t, "abc123.secret456", decoded.Kubelet.Auth.BootstrapToken)
 }
 
+func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
+	t.Parallel()
+
+	cfg := UnboundedAgentConfig{
+		AgentConfig: AgentConfig{
+			OCIImage: "existing-image",
+			NVIDIA: &NVIDIAConfig{
+				IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+			},
+		},
+	}
+
+	ApplyMachineConfigurationTemplate(&cfg, v1alpha3.MachineConfigurationTemplate{
+		Agent: &v1alpha3.MachineConfigurationAgent{
+			NVIDIA: &v1alpha3.MachineConfigurationNVIDIA{
+				IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
+					Mode: v1alpha3.NVIDIAIMEXModeDRA,
+				},
+			},
+		},
+	})
+
+	require.Equal(t, "existing-image", cfg.OCIImage)
+	require.NotNil(t, cfg.NVIDIA)
+	require.NotNil(t, cfg.NVIDIA.IMEX)
+	require.Equal(t, NVIDIAIMEXModeDRA, cfg.NVIDIA.IMEX.Mode)
+
+	ApplyMachineConfigurationTemplate(&cfg, v1alpha3.MachineConfigurationTemplate{})
+	require.Nil(t, cfg.NVIDIA)
+
+	cfg.NVIDIA = &NVIDIAConfig{
+		IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+	}
+	ApplyMachineConfigurationTemplate(&cfg, v1alpha3.MachineConfigurationTemplate{
+		Agent: &v1alpha3.MachineConfigurationAgent{},
+	})
+	require.Nil(t, cfg.NVIDIA)
+}
+
 func TestBuildAgentConfig(t *testing.T) {
 	t.Parallel()
 

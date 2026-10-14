@@ -67,6 +67,22 @@ func resolveNSpawnConfig(
 		return nil, fmt.Errorf("resolve nvidia host: %w", err)
 	}
 
+	imexMode := config.NVIDIAIMEXMode("")
+	if cfg.NVIDIA != nil && cfg.NVIDIA.IMEX != nil {
+		imexMode = cfg.NVIDIA.IMEX.Mode
+	}
+
+	if imexMode == config.NVIDIAIMEXModeDRA {
+		if err := ValidateNVIDIAIMEXKubernetesVersion(cfg.Cluster.Version); err != nil {
+			return nil, err
+		}
+	}
+
+	nvidia, err = configureNVIDIAIMEX(nvidia, imexMode, detectHostDistro())
+	if err != nil {
+		return nil, fmt.Errorf("resolve nvidia IMEX: %w", err)
+	}
+
 	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
 	if nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
 		return nil, fmt.Errorf("%w for machine %s: fresh host state is incomplete", ErrNVIDIAStateUnavailable, machineName)
@@ -95,6 +111,55 @@ func resolveNSpawnConfig(
 		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
 		AdditionalHostMounts:   additionalHostMounts,
 	}, nil
+}
+
+// ValidateNVIDIAIMEXKubernetesVersion checks the Kubernetes floor required by
+// NVIDIA DRA ComputeDomains before host preparation mutates package or service
+// state.
+func ValidateNVIDIAIMEXKubernetesVersion(value string) error {
+	const (
+		minMajor = 1
+		minMinor = 34
+		minPatch = 2
+	)
+
+	version := strings.TrimPrefix(strings.TrimSpace(value), "v")
+
+	parts := strings.SplitN(version, ".", 4)
+	if len(parts) < 3 {
+		return fmt.Errorf("NVIDIA IMEX DRA mode requires Kubernetes 1.34.2 or later, found %q", value)
+	}
+
+	numbers := make([]int, 3)
+	for i := range numbers {
+		digits := strings.TrimLeftFunc(parts[i], func(r rune) bool {
+			return r < '0' || r > '9'
+		})
+
+		end := 0
+		for end < len(digits) && digits[end] >= '0' && digits[end] <= '9' {
+			end++
+		}
+
+		if end == 0 {
+			return fmt.Errorf("NVIDIA IMEX DRA mode requires Kubernetes 1.34.2 or later, found %q", value)
+		}
+
+		number, err := strconv.Atoi(digits[:end])
+		if err != nil {
+			return fmt.Errorf("NVIDIA IMEX DRA mode requires Kubernetes 1.34.2 or later, found %q", value)
+		}
+
+		numbers[i] = number
+	}
+
+	if numbers[0] < minMajor ||
+		(numbers[0] == minMajor && numbers[1] < minMinor) ||
+		(numbers[0] == minMajor && numbers[1] == minMinor && numbers[2] < minPatch) {
+		return fmt.Errorf("NVIDIA IMEX DRA mode requires Kubernetes 1.34.2 or later, found %q", value)
+	}
+
+	return nil
 }
 
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
@@ -220,9 +285,15 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		return zero, fmt.Errorf("decode CaCertBase64: %w", err)
 	}
 
-	labels := cfg.Kubelet.Labels
-	if labels == nil {
-		labels = make(map[string]string)
+	labels := make(map[string]string, len(cfg.Kubelet.Labels)+1)
+	for key, value := range cfg.Kubelet.Labels {
+		labels[key] = value
+	}
+
+	delete(labels, config.NVIDIAIMEXModeLabelKey)
+
+	if cfg.IMEXDRAEnabled() {
+		labels[config.NVIDIAIMEXModeLabelKey] = string(config.NVIDIAIMEXModeDRA)
 	}
 
 	nodeIP := strings.TrimSpace(cfg.Kubelet.NodeIP)

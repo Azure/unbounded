@@ -179,6 +179,18 @@ type MachineOperationTargetInput struct {
 	// than reselecting intent from a Machine edited during execution.
 	// +optional
 	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
+
+	// ConfigurationVersionName is the exact MachineConfigurationVersion
+	// selected with HostImage for HostReplace. Retries reuse it so host and
+	// agent configuration cannot drift across version publication.
+	// +optional
+	ConfigurationVersionName string `json:"configurationVersionName,omitempty"`
+
+	// ConfigurationTemplate is the immutable versioned agent intent selected
+	// with HostImage. Snapshotting the data keeps HostReplace retries independent
+	// of Machine edits and MachineConfigurationVersion garbage collection.
+	// +optional
+	ConfigurationTemplate *MachineConfigurationTemplate `json:"configurationTemplate,omitempty"`
 }
 
 // ProviderMachineSnapshot identifies the exact provider-owned resource

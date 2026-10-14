@@ -95,6 +95,11 @@ const (
 	// For OnDelete updates this remains True until the operator deletes
 	// the Node and the agent repaves with the desired version.
 	MachineConditionRepavePending = "RepavePending"
+
+	// MachineConditionNVIDIAIMEXPrepared indicates whether the agent prepared
+	// the host and nspawn boundary for the configured NVIDIA IMEX lifecycle.
+	// It does not assert that a DRA ComputeDomain is ready.
+	MachineConditionNVIDIAIMEXPrepared = "NVIDIAIMEXPrepared"
 )
 
 // Annotation keys.

@@ -136,13 +136,42 @@ type MachineConfigurationKubernetes struct {
 type MachineConfigurationAgent struct {
 	// Image is the OCI image reference used for provisioning the
 	// nspawn machine (e.g. "ghcr.io/org/repo:tag").
-	// +kubebuilder:validation:Required
-	Image string `json:"image"`
+	// +optional
+	Image string `json:"image,omitempty"`
 
 	// LocalDNS configures the optional CoreDNS cache for this version.
 	// +optional
 	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+
+	// NVIDIA configures optional NVIDIA host integration.
+	// +optional
+	NVIDIA *MachineConfigurationNVIDIA `json:"nvidia,omitempty"`
 }
+
+// MachineConfigurationNVIDIA configures NVIDIA host integration.
+type MachineConfigurationNVIDIA struct {
+	// IMEX configures multi-node NVLink IMEX preparation.
+	// +optional
+	IMEX *MachineConfigurationNVIDIAIMEX `json:"imex,omitempty"`
+}
+
+// MachineConfigurationNVIDIAIMEX configures NVIDIA IMEX integration.
+type MachineConfigurationNVIDIAIMEX struct {
+	// Mode selects the IMEX lifecycle owner. DRA prepares the node for NVIDIA
+	// DRA ComputeDomains; an empty value disables IMEX preparation.
+	// +optional
+	// +kubebuilder:validation:Enum=DRA
+	Mode NVIDIAIMEXMode `json:"mode,omitempty"`
+}
+
+// NVIDIAIMEXMode identifies the supported NVIDIA IMEX lifecycle owner.
+type NVIDIAIMEXMode string
+
+const (
+	// NVIDIAIMEXModeDRA delegates IMEX daemon and channel lifecycle to NVIDIA
+	// DRA ComputeDomains.
+	NVIDIAIMEXModeDRA NVIDIAIMEXMode = "DRA"
+)
 
 // MachineConfigurationUpdateStrategyType defines how configuration
 // changes are applied to machines.

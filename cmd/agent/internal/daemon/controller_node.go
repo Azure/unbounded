@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,10 +50,30 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		return reconcile.Result{}, err
 	}
 
+	nodeName := desiredConfig.NodeName
+	if nodeName == "" {
+		nodeName = r.machineName
+	}
+
 	if !hasDrift(active.Config, &desiredConfig.AgentConfig) {
 		r.log.Info("repave skipped because no desired configuration drift exists")
 
-		if err := markAppliedConfiguration(ctx, r.Client, r.machineName, appliedRef); err != nil {
+		if err := syncNVIDIAIMEXNodeLabel(
+			ctx,
+			r.Client,
+			nodeName,
+			desiredConfig.IMEXDRAEnabled(),
+		); err != nil {
+			return reconcile.Result{}, fmt.Errorf("synchronize NVIDIA IMEX Node label: %w", err)
+		}
+
+		if err := markAppliedConfiguration(
+			ctx,
+			r.Client,
+			r.machineName,
+			appliedRef,
+			desiredConfig.IMEXDRAEnabled(),
+		); err != nil {
 			return reconcile.Result{}, fmt.Errorf("mark applied configuration: %w", err)
 		}
 
@@ -65,11 +84,61 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		return reconcile.Result{}, fmt.Errorf("update node for repave: %w", err)
 	}
 
-	if err := markAppliedConfiguration(ctx, r.Client, r.machineName, appliedRef); err != nil {
+	if err := syncNVIDIAIMEXNodeLabel(
+		ctx,
+		r.Client,
+		nodeName,
+		desiredConfig.IMEXDRAEnabled(),
+	); err != nil {
+		return reconcile.Result{}, fmt.Errorf("synchronize NVIDIA IMEX Node label: %w", err)
+	}
+
+	if err := markAppliedConfiguration(
+		ctx,
+		r.Client,
+		r.machineName,
+		appliedRef,
+		desiredConfig.IMEXDRAEnabled(),
+	); err != nil {
 		return reconcile.Result{}, fmt.Errorf("mark applied configuration: %w", err)
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func syncNVIDIAIMEXNodeLabel(ctx context.Context, c client.Client, nodeName string, enabled bool) error {
+	if nodeName == "" {
+		return fmt.Errorf("node name is empty")
+	}
+
+	var node corev1.Node
+	if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+		return fmt.Errorf("get Node %s: %w", nodeName, err)
+	}
+
+	if node.Labels == nil {
+		node.Labels = map[string]string{}
+	}
+
+	if enabled {
+		if node.Labels[provision.NVIDIAIMEXModeLabelKey] == string(provision.NVIDIAIMEXModeDRA) {
+			return nil
+		}
+
+		node.Labels[provision.NVIDIAIMEXModeLabelKey] = string(provision.NVIDIAIMEXModeDRA)
+	} else {
+		if _, ok := node.Labels[provision.NVIDIAIMEXModeLabelKey]; !ok {
+			return nil
+		}
+
+		delete(node.Labels, provision.NVIDIAIMEXModeLabelKey)
+	}
+
+	if err := c.Update(ctx, &node); err != nil {
+		return fmt.Errorf("update Node %s: %w", nodeName, err)
+	}
+
+	return nil
 }
 
 func resolveDesiredRepaveConfig(
@@ -93,7 +162,7 @@ func resolveDesiredRepaveConfig(
 			return nil, nil, err
 		}
 
-		applyMachineConfigurationTemplate(&desired, mcv.Spec.Template)
+		provision.ApplyMachineConfigurationTemplate(&desired, mcv.Spec.Template)
 		appliedRef = &v1alpha3.MachineConfigurationRefStatus{
 			Name:        machine.Spec.ConfigurationRef.Name,
 			Version:     mcv.Spec.Version,
@@ -118,6 +187,7 @@ func markAppliedConfiguration(
 	c client.Client,
 	machineName string,
 	appliedRef *v1alpha3.MachineConfigurationRefStatus,
+	imexDRA bool,
 ) error {
 	if appliedRef == nil {
 		return nil
@@ -130,55 +200,31 @@ func markAppliedConfiguration(
 
 	machine.Status.Configuration = appliedRef
 	setRepavePendingCondition(&machine)
+	setNVIDIAIMEXPreparedCondition(&machine, imexDRA)
 
 	return c.Status().Update(ctx, &machine)
+}
+
+func setNVIDIAIMEXPreparedCondition(machine *v1alpha3.Machine, enabled bool) {
+	if !enabled {
+		apimeta.RemoveStatusCondition(&machine.Status.Conditions, v1alpha3.MachineConditionNVIDIAIMEXPrepared)
+
+		return
+	}
+
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineConditionNVIDIAIMEXPrepared,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Prepared",
+		Message:            "host and nspawn are prepared for NVIDIA DRA IMEX; this does not assert ComputeDomain readiness",
+		ObservedGeneration: machine.Generation,
+	})
 }
 
 func configFromApplied(applied *provision.AgentConfig) provision.UnboundedAgentConfig {
 	return provision.UnboundedAgentConfig{
 		AgentConfig: *applied.DeepCopy(),
 	}
-}
-
-func applyMachineConfigurationTemplate(
-	cfg *provision.UnboundedAgentConfig,
-	template v1alpha3.MachineConfigurationTemplate,
-) {
-	if template.Kubernetes != nil {
-		if template.Kubernetes.Version != "" {
-			cfg.Cluster.Version = strings.TrimPrefix(template.Kubernetes.Version, "v")
-		}
-
-		if template.Kubernetes.NodeLabels != nil {
-			cfg.Kubelet.Labels = template.Kubernetes.NodeLabels
-		}
-
-		if template.Kubernetes.RegisterWithTaints != nil {
-			cfg.Kubelet.RegisterWithTaints = taintStrings(template.Kubernetes.RegisterWithTaints)
-		}
-	}
-
-	if template.Agent != nil {
-		cfg.OCIImage = template.Agent.Image
-		if template.Agent.LocalDNS != nil {
-			cfg.LocalDNS = provision.LocalDNSFromSpec(template.Agent.LocalDNS)
-		}
-	}
-}
-
-func taintStrings(taints []corev1.Taint) []string {
-	out := make([]string, 0, len(taints))
-	for _, taint := range taints {
-		value := taint.Key
-		if taint.Value != "" {
-			value += "=" + taint.Value
-		}
-
-		value += ":" + string(taint.Effect)
-		out = append(out, value)
-	}
-
-	return out
 }
 
 func setRepavePendingCondition(machine *v1alpha3.Machine) {

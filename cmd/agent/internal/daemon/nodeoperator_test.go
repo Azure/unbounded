@@ -145,6 +145,16 @@ func Test_hasDrift_GantryExplicitFalseDoesNotDrift(t *testing.T) {
 	assert.False(t, hasDrift(applied, desired))
 }
 
+func Test_hasDrift_NVIDIAIMEXChange(t *testing.T) {
+	applied := baseConfig()
+	desired := baseConfig()
+	desired.NVIDIA = &provision.NVIDIAConfig{
+		IMEX: &provision.NVIDIAIMEXConfig{Mode: provision.NVIDIAIMEXModeDRA},
+	}
+
+	assert.True(t, hasDrift(applied, desired))
+}
+
 // ---------------------------------------------------------------------------
 // Active machine config serialization
 // ---------------------------------------------------------------------------

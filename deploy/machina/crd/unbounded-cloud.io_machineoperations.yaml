@@ -326,6 +326,137 @@ spec:
                       description: Input is the immutable provider input resolved
                         before execution begins.
                       properties:
+                        configurationTemplate:
+                          description: |-
+                            ConfigurationTemplate is the immutable versioned agent intent selected
+                            with HostImage. Snapshotting the data keeps HostReplace retries independent
+                            of Machine edits and MachineConfigurationVersion garbage collection.
+                          properties:
+                            agent:
+                              description: |-
+                                Agent contains settings for the unbounded node agent (e.g. the
+                                OCI image reference for the nspawn machine).
+                              properties:
+                                image:
+                                  description: |-
+                                    Image is the OCI image reference used for provisioning the
+                                    nspawn machine (e.g. "ghcr.io/org/repo:tag").
+                                  type: string
+                                localDNS:
+                                  description: LocalDNS configures the optional CoreDNS
+                                    cache for this version.
+                                  properties:
+                                    clusterListenerIP:
+                                      type: string
+                                    corefileTemplate:
+                                      type: string
+                                    cpuLimitInMilliCores:
+                                      format: int32
+                                      type: integer
+                                    enabled:
+                                      type: boolean
+                                    memoryLimitInMB:
+                                      format: int32
+                                      type: integer
+                                    metricsAddress:
+                                      type: string
+                                    nodeListenerIP:
+                                      type: string
+                                    requiredPlugins:
+                                      items:
+                                        type: string
+                                      type: array
+                                  type: object
+                                nvidia:
+                                  description: NVIDIA configures optional NVIDIA host
+                                    integration.
+                                  properties:
+                                    imex:
+                                      description: IMEX configures multi-node NVLink
+                                        IMEX preparation.
+                                      properties:
+                                        mode:
+                                          description: |-
+                                            Mode selects the IMEX lifecycle owner. DRA prepares the node for NVIDIA
+                                            DRA ComputeDomains; an empty value disables IMEX preparation.
+                                          enum:
+                                          - DRA
+                                          type: string
+                                      type: object
+                                  type: object
+                              type: object
+                            host:
+                              description: Host contains provider-neutral desired
+                                host settings.
+                              properties:
+                                image:
+                                  description: Image is an opaque provider-interpreted
+                                    image identifier.
+                                  type: string
+                                provisioningFormat:
+                                  description: ProvisioningFormat declares the first-boot
+                                    payload understood by Image.
+                                  enum:
+                                  - CloudInit
+                                  - Ignition
+                                  type: string
+                              type: object
+                            kubernetes:
+                              description: |-
+                                Kubernetes contains Kubernetes-specific configuration such as
+                                the target version, node labels, and taints.
+                              properties:
+                                nodeLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: NodeLabels are labels passed to kubelet's
+                                    --node-labels flag.
+                                  type: object
+                                registerWithTaints:
+                                  description: |-
+                                    RegisterWithTaints are taints passed to kubelet's
+                                    --register-with-taints flag.
+                                  items:
+                                    description: |-
+                                      The node this Taint is attached to has the "effect" on
+                                      any pod that does not tolerate the Taint.
+                                    properties:
+                                      effect:
+                                        description: |-
+                                          Required. The effect of the taint on pods
+                                          that do not tolerate the taint.
+                                          Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                                        type: string
+                                      key:
+                                        description: Required. The taint key to be
+                                          applied to a node.
+                                        type: string
+                                      timeAdded:
+                                        description: TimeAdded represents the time
+                                          at which the taint was added.
+                                        format: date-time
+                                        type: string
+                                      value:
+                                        description: The taint value corresponding
+                                          to the taint key.
+                                        type: string
+                                    required:
+                                    - effect
+                                    - key
+                                    type: object
+                                  type: array
+                                version:
+                                  description: Version is the Kubernetes version to
+                                    install (e.g. "v1.34.0").
+                                  type: string
+                              type: object
+                          type: object
+                        configurationVersionName:
+                          description: |-
+                            ConfigurationVersionName is the exact MachineConfigurationVersion
+                            selected with HostImage for HostReplace. Retries reuse it so host and
+                            agent configuration cannot drift across version publication.
+                          type: string
                         hostImage:
                           description: |-
                             HostImage is the resolved provider-interpreted host image for HostReplace.

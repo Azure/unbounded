@@ -16,6 +16,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -78,7 +79,13 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 	return info, nil
 }
 
-func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine, format unboundedv1alpha3.ProvisioningFormat) (string, error) {
+func (r *MachineOperationReconciler) buildReplaceUserData(
+	ctx context.Context,
+	machine *unboundedv1alpha3.Machine,
+	format unboundedv1alpha3.ProvisioningFormat,
+	configurationVersionName string,
+	configurationTemplate *unboundedv1alpha3.MachineConfigurationTemplate,
+) (string, error) {
 	// Validate before provider execution: replacement is destructive and this
 	// controller can generate only cloud-init. The selected format is frozen
 	// with the target image, rather than recomputed from edited desired intent.
@@ -86,7 +93,12 @@ func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, m
 		return "", fmt.Errorf("HostReplace cannot generate %s provisioning data: controller-driven replacement currently emits cloud-init only", format)
 	}
 
-	agentConfig, err := r.buildReplaceAgentConfig(ctx, machine)
+	agentConfig, err := r.buildReplaceAgentConfig(
+		ctx,
+		machine,
+		configurationVersionName,
+		configurationTemplate,
+	)
 	if err != nil {
 		return "", err
 	}
@@ -99,7 +111,12 @@ func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, m
 	return userData, nil
 }
 
-func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context, machine *unboundedv1alpha3.Machine) (provision.UnboundedAgentConfig, error) {
+func (r *MachineOperationReconciler) buildReplaceAgentConfig(
+	ctx context.Context,
+	machine *unboundedv1alpha3.Machine,
+	configurationVersionName string,
+	configurationTemplate *unboundedv1alpha3.MachineConfigurationTemplate,
+) (provision.UnboundedAgentConfig, error) {
 	if machine.Spec.Kubernetes == nil {
 		return provision.UnboundedAgentConfig{}, fmt.Errorf("machine spec.kubernetes is required for HostReplace")
 	}
@@ -119,7 +136,7 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, err
 	}
 
-	return provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
 			APIServer:    clusterInfo.APIServer,
@@ -130,7 +147,31 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		ProviderLabels: clusterInfo.ProviderLabels,
 		BootstrapToken: bootstrapToken,
 		NodeName:       machine.Name,
-	}), nil
+	})
+
+	if configurationTemplate != nil {
+		provision.ApplyMachineConfigurationTemplate(&cfg, *configurationTemplate)
+	} else if configurationVersionName != "" {
+		var version unboundedv1alpha3.MachineConfigurationVersion
+		if err := r.Get(ctx, client.ObjectKey{Name: configurationVersionName}, &version); err != nil {
+			return provision.UnboundedAgentConfig{}, fmt.Errorf(
+				"get frozen MachineConfigurationVersion %s for HostReplace: %w",
+				configurationVersionName,
+				err,
+			)
+		}
+
+		provision.ApplyMachineConfigurationTemplate(&cfg, version.Spec.Template)
+	} else if machine.Spec.ConfigurationRef != nil {
+		version, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, machine.Spec.ConfigurationRef)
+		if err != nil {
+			return provision.UnboundedAgentConfig{}, fmt.Errorf("resolve MachineConfiguration for HostReplace: %w", err)
+		}
+
+		provision.ApplyMachineConfigurationTemplate(&cfg, version.Spec.Template)
+	}
+
+	return cfg, nil
 }
 
 func (r *MachineOperationReconciler) clusterInfo(ctx context.Context) (*ClusterInfo, error) {

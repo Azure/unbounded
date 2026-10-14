@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
@@ -236,6 +237,14 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 				ProviderLabels: f.ProviderLabels,
 				AttestURL:      f.ServeURL,
 			})
+			if node.Spec.ConfigurationRef != nil {
+				version, err := machineconfigs.ResolveVersionFromRef(ctx, f.Reader, node.Spec.ConfigurationRef)
+				if err != nil {
+					return nil, fmt.Errorf("resolve MachineConfiguration for netboot: %w", err)
+				}
+
+				provision.ApplyMachineConfigurationTemplate(&agentConfig, version.Spec.Template)
+			}
 
 			// The MarshalIndent prefix "    " (4 spaces) must match the
 			// indentation level of the {{ .AgentConfigJSON }} placeholder

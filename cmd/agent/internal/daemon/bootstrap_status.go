@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -29,6 +30,7 @@ type BootstrapStatusReporter struct {
 	client  client.Client
 	machine string
 	ready   bool
+	imexDRA bool
 }
 
 // NewBootstrapStatusReporter builds a best-effort Machine status reporter from
@@ -38,6 +40,7 @@ func NewBootstrapStatusReporter(ctx context.Context, log *slog.Logger, cfg *prov
 	reporter := &BootstrapStatusReporter{
 		log:     log,
 		machine: cfg.MachineName,
+		imexDRA: cfg.IMEXDRAEnabled(),
 	}
 
 	if strings.TrimSpace(cfg.Kubelet.Auth.BootstrapToken) == "" {
@@ -71,6 +74,7 @@ func NewBootstrapStatusReporter(ctx context.Context, log *slog.Logger, cfg *prov
 // Running reports that initial bootstrap is in progress.
 func (r *BootstrapStatusReporter) Running(ctx context.Context) {
 	r.set(ctx, metav1.ConditionFalse, "Running", "unbounded-agent bootstrap is running")
+	r.setIMEX(ctx, metav1.ConditionFalse, "Preparing", "NVIDIA IMEX DRA host preparation is in progress")
 }
 
 // Failed reports that initial bootstrap failed.
@@ -80,11 +84,78 @@ func (r *BootstrapStatusReporter) Failed(ctx context.Context, reason string, err
 	}
 
 	r.set(ctx, metav1.ConditionFalse, reason, truncateBootstrapConditionMessage(err.Error()))
+	r.setIMEX(ctx, metav1.ConditionFalse, reason, truncateBootstrapConditionMessage(err.Error()))
 }
 
 // Succeeded reports that initial bootstrap completed successfully.
 func (r *BootstrapStatusReporter) Succeeded(ctx context.Context) {
 	r.set(ctx, metav1.ConditionTrue, "Succeeded", "unbounded-agent bootstrap completed successfully")
+	r.setIMEX(
+		ctx,
+		metav1.ConditionTrue,
+		"Prepared",
+		"host and nspawn are prepared for NVIDIA DRA IMEX; this does not assert ComputeDomain readiness",
+	)
+}
+
+func (r *BootstrapStatusReporter) setIMEX(
+	ctx context.Context,
+	status metav1.ConditionStatus,
+	reason string,
+	message string,
+) {
+	if r == nil || !r.ready {
+		return
+	}
+
+	if !r.imexDRA {
+		r.clearIMEX(ctx)
+
+		return
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine v1alpha3.Machine
+		if err := r.client.Get(ctx, client.ObjectKey{Name: r.machine}, &machine); err != nil {
+			return fmt.Errorf("get Machine %q: %w", r.machine, err)
+		}
+
+		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:               v1alpha3.MachineConditionNVIDIAIMEXPrepared,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: machine.Generation,
+		})
+
+		return r.client.Status().Update(ctx, &machine)
+	})
+	if err != nil {
+		r.log.Warn("failed to update NVIDIAIMEXPrepared condition", "machine", r.machine, "reason", reason, "error", err)
+	}
+}
+
+func (r *BootstrapStatusReporter) clearIMEX(ctx context.Context) {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine v1alpha3.Machine
+		if err := r.client.Get(ctx, client.ObjectKey{Name: r.machine}, &machine); err != nil {
+			return fmt.Errorf("get Machine %q: %w", r.machine, err)
+		}
+
+		conditions := slices.DeleteFunc(machine.Status.Conditions, func(condition metav1.Condition) bool {
+			return condition.Type == v1alpha3.MachineConditionNVIDIAIMEXPrepared
+		})
+		if len(conditions) == len(machine.Status.Conditions) {
+			return nil
+		}
+
+		machine.Status.Conditions = conditions
+
+		return r.client.Status().Update(ctx, &machine)
+	})
+	if err != nil {
+		r.log.Warn("failed to clear NVIDIAIMEXPrepared condition", "machine", r.machine, "error", err)
+	}
 }
 
 func (r *BootstrapStatusReporter) set(ctx context.Context, status metav1.ConditionStatus, reason, message string) {

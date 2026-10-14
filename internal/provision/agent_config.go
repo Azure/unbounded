@@ -8,6 +8,8 @@ import (
 	"maps"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/pkg/agent/config"
@@ -20,12 +22,20 @@ type (
 	AgentKubeletConfig      = config.AgentKubeletConfig
 	ImageCredentialProvider = config.ImageCredentialProvider
 	GantryConfig            = config.GantryConfig
+	NVIDIAConfig            = config.NVIDIAConfig
+	NVIDIAIMEXConfig        = config.NVIDIAIMEXConfig
+	NVIDIAIMEXMode          = config.NVIDIAIMEXMode
 	KubeletAuthInfo         = config.KubeletAuthInfo
 	CRIConfig               = config.CRIConfig
 	ContainerdConfig        = config.ContainerdConfig
 	RuncConfig              = config.RuncConfig
 	CNIConfig               = config.CNIConfig
 	AgentOfflineArtifacts   = config.AgentOfflineArtifacts
+)
+
+const (
+	NVIDIAIMEXModeDRA      = config.NVIDIAIMEXModeDRA
+	NVIDIAIMEXModeLabelKey = config.NVIDIAIMEXModeLabelKey
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -220,6 +230,70 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	}
 
 	return cfg
+}
+
+// ApplyMachineConfigurationTemplate applies versioned configuration fields to
+// an agent config. Empty optional values preserve their existing setting.
+func ApplyMachineConfigurationTemplate(cfg *UnboundedAgentConfig, template v1alpha3.MachineConfigurationTemplate) {
+	cfg.NVIDIA = nil
+
+	if template.Kubernetes != nil {
+		if template.Kubernetes.Version != "" {
+			cfg.Cluster.Version = strings.TrimPrefix(template.Kubernetes.Version, "v")
+		}
+
+		if template.Kubernetes.NodeLabels != nil {
+			cfg.Kubelet.Labels = template.Kubernetes.NodeLabels
+		}
+
+		if template.Kubernetes.RegisterWithTaints != nil {
+			cfg.Kubelet.RegisterWithTaints = taintStrings(template.Kubernetes.RegisterWithTaints)
+		}
+	}
+
+	if template.Agent == nil {
+		return
+	}
+
+	if template.Agent.Image != "" {
+		cfg.OCIImage = template.Agent.Image
+	}
+
+	if template.Agent.LocalDNS != nil {
+		cfg.LocalDNS = LocalDNSFromSpec(template.Agent.LocalDNS)
+	}
+
+	cfg.NVIDIA = NVIDIAConfigFromSpec(template.Agent.NVIDIA)
+}
+
+// NVIDIAConfigFromSpec converts the versioned MachineConfiguration API to the
+// shared agent configuration.
+func NVIDIAConfigFromSpec(spec *v1alpha3.MachineConfigurationNVIDIA) *NVIDIAConfig {
+	if spec == nil {
+		return nil
+	}
+
+	out := &NVIDIAConfig{}
+	if spec.IMEX != nil {
+		out.IMEX = &NVIDIAIMEXConfig{Mode: NVIDIAIMEXMode(spec.IMEX.Mode)}
+	}
+
+	return out
+}
+
+func taintStrings(taints []corev1.Taint) []string {
+	out := make([]string, 0, len(taints))
+	for _, taint := range taints {
+		value := taint.Key
+		if taint.Value != "" {
+			value += "=" + taint.Value
+		}
+
+		value += ":" + string(taint.Effect)
+		out = append(out, value)
+	}
+
+	return out
 }
 
 // LocalDNSFromSpec converts the Machine API LocalDNS settings to agent config.

@@ -25,6 +25,7 @@ func configCreateCommand() *cobra.Command {
 		taints            []string
 		updateStrategy    string
 		priority          int32
+		nvidiaIMEXMode    string
 	)
 
 	cmd := &cobra.Command{
@@ -56,6 +57,7 @@ Example:
 				taints:            taints,
 				updateStrategy:    updateStrategy,
 				priority:          priority,
+				nvidiaIMEXMode:    nvidiaIMEXMode,
 			}, cmd.OutOrStdout())
 		},
 	}
@@ -66,6 +68,7 @@ Example:
 	cmd.Flags().StringSliceVar(&taints, "taints", nil, "Taints as key=value:Effect (comma-separated)")
 	cmd.Flags().StringVar(&updateStrategy, "update-strategy", "OnDelete", "Update strategy: OnDelete or RollingUpdate")
 	cmd.Flags().Int32Var(&priority, "priority", 0, "Priority for machine selector ordering")
+	cmd.Flags().StringVar(&nvidiaIMEXMode, "nvidia-imex-mode", "", "NVIDIA IMEX lifecycle mode: DRA")
 
 	return cmd
 }
@@ -77,6 +80,7 @@ type configCreateOpts struct {
 	taints            []string
 	updateStrategy    string
 	priority          int32
+	nvidiaIMEXMode    string
 }
 
 func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts configCreateOpts, out io.Writer) error {
@@ -117,9 +121,20 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 		mc.Spec.Template.Kubernetes = k8s
 	}
 
-	if opts.agentImage != "" {
+	if opts.nvidiaIMEXMode != "" && opts.nvidiaIMEXMode != string(v1alpha3.NVIDIAIMEXModeDRA) {
+		return fmt.Errorf("invalid NVIDIA IMEX mode %q: supported value is %q", opts.nvidiaIMEXMode, v1alpha3.NVIDIAIMEXModeDRA)
+	}
+
+	if opts.agentImage != "" || opts.nvidiaIMEXMode != "" {
 		mc.Spec.Template.Agent = &v1alpha3.MachineConfigurationAgent{
 			Image: opts.agentImage,
+		}
+		if opts.nvidiaIMEXMode != "" {
+			mc.Spec.Template.Agent.NVIDIA = &v1alpha3.MachineConfigurationNVIDIA{
+				IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
+					Mode: v1alpha3.NVIDIAIMEXMode(opts.nvidiaIMEXMode),
+				},
+			}
 		}
 	}
 
@@ -135,6 +150,10 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 
 	if opts.agentImage != "" {
 		printConfig(out, "agent-image", opts.agentImage)
+	}
+
+	if opts.nvidiaIMEXMode != "" {
+		printConfig(out, "nvidia-imex-mode", opts.nvidiaIMEXMode)
 	}
 
 	if len(opts.nodeLabels) > 0 {

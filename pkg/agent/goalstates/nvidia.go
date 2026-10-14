@@ -6,6 +6,7 @@ package goalstates
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -13,7 +14,11 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 // NVIDIA host discovery and goal state resolution.
@@ -93,6 +98,24 @@ type NvidiaHost struct {
 	// provide versioned library names when a host installation exposes only
 	// unversioned or SONAME aliases through ldconfig.
 	DriverVersion string
+
+	// IMEXMode records the selected IMEX lifecycle owner. Empty means IMEX
+	// preparation and exposure are disabled.
+	IMEXMode config.NVIDIAIMEXMode
+
+	// IMEXManagementCapability reports whether the loaded driver exposes the
+	// fabric IMEX management capability required by nvidia-imex.
+	IMEXManagementCapability bool
+
+	// IMEXDeviceClass reports whether the kernel registered the
+	// nvidia-caps-imex-channels character-device class.
+	IMEXDeviceClass bool
+
+	// IMEXServiceActive is true when the host nvidia-imex service is running.
+	IMEXServiceActive bool
+
+	// IMEXServiceUnitState is the systemd unit-file state, such as masked.
+	IMEXServiceUnitState string
 }
 
 // NvidiaLibMapping maps a host NVIDIA library to its corresponding paths
@@ -136,6 +159,18 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 
 	devices := discoverNVIDIADevices()
 	libraries := resolveNVIDIALibraries(archInfo)
+	imexPath := discoverNVIDIABinary("nvidia-imex")
+	imexCtlPath := discoverNVIDIABinary("nvidia-imex-ctl")
+
+	var (
+		imexServiceActive    bool
+		imexServiceUnitState string
+	)
+
+	if imexPath != "" || imexCtlPath != "" {
+		imexServiceActive = nvidiaIMEXServiceActive()
+		imexServiceUnitState = nvidiaIMEXServiceUnitState()
+	}
 
 	return NvidiaHost{
 		GPUDevicePaths:    devices,
@@ -145,9 +180,15 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		I386LibMappings:   libraries.i386LibMappings,
 		I386LibDirMounts:  libraries.i386LibDirMounts,
 		NvidiaSMIPath:     discoverNVIDIASMI(),
-		NvidiaIMEXPath:    discoverNVIDIABinary("nvidia-imex"),
-		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
+		NvidiaIMEXPath:    imexPath,
+		NvidiaIMEXCtlPath: imexCtlPath,
 		DriverVersion:     libraries.driverVersion,
+		IMEXManagementCapability: pathExists(
+			"/proc/driver/nvidia/capabilities/fabric-imex-mgmt",
+		),
+		IMEXDeviceClass:      procDeviceClassExists("/proc/devices", nvidiaIMEXDirName),
+		IMEXServiceActive:    imexServiceActive,
+		IMEXServiceUnitState: imexServiceUnitState,
 	}, nil
 }
 
@@ -175,6 +216,135 @@ const (
 	driDir            = "/dev/dri"
 	nvidiaDevPrefix   = "nvidia"
 )
+
+func pathExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func procDeviceClassExists(path, name string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+func nvidiaIMEXServiceActive() bool {
+	out, err := nvidiaSystemctlShow("ActiveState")
+	return err == nil && strings.TrimSpace(string(out)) == "active"
+}
+
+func nvidiaIMEXServiceUnitState() string {
+	out, err := nvidiaSystemctlShow("UnitFileState")
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(string(out))
+}
+
+func nvidiaSystemctlShow(property string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return exec.CommandContext(
+		ctx,
+		"systemctl",
+		"show",
+		"nvidia-imex.service",
+		"--property="+property,
+		"--value",
+	).Output()
+}
+
+func configureNVIDIAIMEX(nvidia NvidiaHost, mode config.NVIDIAIMEXMode, hostDistro string) (NvidiaHost, error) {
+	imexDir := filepath.Join(devDir, nvidiaIMEXDirName)
+	nvidia.GPUDevicePaths = slices.DeleteFunc(nvidia.GPUDevicePaths, func(path string) bool {
+		return path == imexDir
+	})
+
+	if mode == "" {
+		nvidia.NvidiaIMEXPath = ""
+		nvidia.NvidiaIMEXCtlPath = ""
+		nvidia.IMEXManagementCapability = false
+		nvidia.IMEXDeviceClass = false
+		nvidia.IMEXServiceActive = false
+		nvidia.IMEXServiceUnitState = ""
+
+		return nvidia, nil
+	}
+
+	if mode != config.NVIDIAIMEXModeDRA {
+		return NvidiaHost{}, fmt.Errorf("unsupported NVIDIA IMEX mode %q", mode)
+	}
+
+	if hostDistro != hostDistroUbuntu2404 {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode is unsupported on host distribution %q", hostDistro)
+	}
+
+	if len(nvidia.GPUDevicePaths) == 0 {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires NVIDIA GPU devices")
+	}
+
+	driverMajor, err := nvidiaDriverMajor(nvidia.DriverVersion)
+	if err != nil {
+		return NvidiaHost{}, err
+	}
+
+	if driverMajor < 580 {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires driver 580 or later, found %q", nvidia.DriverVersion)
+	}
+
+	if nvidia.NvidiaIMEXPath == "" || nvidia.NvidiaIMEXCtlPath == "" {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires nvidia-imex and nvidia-imex-ctl from the branch-matched host package")
+	}
+
+	if !nvidia.IMEXManagementCapability {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires /proc/driver/nvidia/capabilities/fabric-imex-mgmt")
+	}
+
+	if !nvidia.IMEXDeviceClass {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires the nvidia-caps-imex-channels character-device class")
+	}
+
+	if nvidia.IMEXServiceActive {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires the host nvidia-imex service to be inactive")
+	}
+
+	if nvidia.IMEXServiceUnitState != "masked" {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires the host nvidia-imex service to be masked, found %q", nvidia.IMEXServiceUnitState)
+	}
+
+	if !slices.Contains(nvidia.GPUDevicePaths, filepath.Join(devDir, nvidiaCapsDirName)) {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires %s", filepath.Join(devDir, nvidiaCapsDirName))
+	}
+
+	nvidia.IMEXMode = mode
+	nvidia.GPUDevicePaths = append(nvidia.GPUDevicePaths, imexDir)
+	slices.Sort(nvidia.GPUDevicePaths)
+
+	return nvidia, nil
+}
+
+func nvidiaDriverMajor(version string) (int, error) {
+	majorText, _, _ := strings.Cut(strings.TrimSpace(version), ".")
+
+	major, err := strconv.Atoi(majorText)
+	if err != nil {
+		return 0, fmt.Errorf("NVIDIA IMEX DRA mode requires a detectable driver version, found %q", version)
+	}
+
+	return major, nil
+}
 
 // nvidiaArch contains architecture-specific values for NVIDIA library
 // discovery and symlink creation inside the nspawn container.

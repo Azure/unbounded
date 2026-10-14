@@ -18,7 +18,7 @@ import (
 // MachineConfiguration is returned.
 func ResolveVersionFromRef(
 	ctx context.Context,
-	c client.Client,
+	c client.Reader,
 	ref *v1alpha3.MachineConfigurationRef,
 ) (*v1alpha3.MachineConfigurationVersion, error) {
 	if ref.Version != nil {
@@ -39,7 +39,7 @@ func ResolveVersionFromRef(
 // named MachineConfiguration.
 func ResolveLatestVersion(
 	ctx context.Context,
-	c client.Client,
+	c client.Reader,
 	configurationName string,
 ) (*v1alpha3.MachineConfigurationVersion, error) {
 	var list v1alpha3.MachineConfigurationVersionList

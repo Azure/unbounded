@@ -11,16 +11,21 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 func fakeBootstrapStatusClient(objs ...client.Object) client.Client {
+	scheme := fakeScheme()
+	_ = corev1.AddToScheme(scheme)
+
 	return fake.NewClientBuilder().
-		WithScheme(fakeScheme()).
+		WithScheme(scheme).
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		WithObjects(objs...).
 		Build()
@@ -94,6 +99,104 @@ func TestBootstrapStatusReporter_SucceededSetsCondition(t *testing.T) {
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
 	assert.Equal(t, "Succeeded", cond.Reason)
 	assert.Equal(t, "unbounded-agent bootstrap completed successfully", cond.Message)
+}
+
+func TestBootstrapStatusReporter_SucceededSetsIMEXPreparedCondition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cfg := baseConfig()
+	cfg.NVIDIA = &provision.NVIDIAConfig{
+		IMEX: &provision.NVIDIAIMEXConfig{Mode: provision.NVIDIAIMEXModeDRA},
+	}
+	machine := buildMachineCR(cfg)
+	reporter := &BootstrapStatusReporter{
+		log:     discardLogger(),
+		client:  fakeBootstrapStatusClient(&machine),
+		machine: cfg.MachineName,
+		ready:   true,
+		imexDRA: true,
+	}
+
+	reporter.Succeeded(ctx)
+
+	var got v1alpha3.Machine
+	require.NoError(t, reporter.client.Get(ctx, client.ObjectKey{Name: cfg.MachineName}, &got))
+	cond := findMachineCondition(t, got.Status.Conditions, v1alpha3.MachineConditionNVIDIAIMEXPrepared)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, "Prepared", cond.Reason)
+	assert.Contains(t, cond.Message, "does not assert ComputeDomain readiness")
+}
+
+func TestBootstrapStatusReporter_DisabledClearsIMEXPreparedCondition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cfg := baseConfig()
+	machine := buildMachineCR(cfg)
+	machine.Status.Conditions = append(machine.Status.Conditions, metav1.Condition{
+		Type:   v1alpha3.MachineConditionNVIDIAIMEXPrepared,
+		Status: metav1.ConditionTrue,
+		Reason: "Prepared",
+	})
+	reporter := &BootstrapStatusReporter{
+		log:     discardLogger(),
+		client:  fakeBootstrapStatusClient(&machine),
+		machine: cfg.MachineName,
+		ready:   true,
+	}
+
+	reporter.Succeeded(ctx)
+
+	var got v1alpha3.Machine
+	require.NoError(t, reporter.client.Get(ctx, client.ObjectKey{Name: cfg.MachineName}, &got))
+
+	for _, condition := range got.Status.Conditions {
+		assert.NotEqual(t, v1alpha3.MachineConditionNVIDIAIMEXPrepared, condition.Type)
+	}
+}
+
+func TestSetNVIDIAIMEXPreparedCondition(t *testing.T) {
+	t.Parallel()
+
+	machine := v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Generation: 7}}
+	setNVIDIAIMEXPreparedCondition(&machine, true)
+
+	condition := findMachineCondition(t, machine.Status.Conditions, v1alpha3.MachineConditionNVIDIAIMEXPrepared)
+	assert.Equal(t, metav1.ConditionTrue, condition.Status)
+	assert.Equal(t, int64(7), condition.ObservedGeneration)
+	assert.Contains(t, condition.Message, "does not assert ComputeDomain readiness")
+
+	setNVIDIAIMEXPreparedCondition(&machine, false)
+
+	for _, condition := range machine.Status.Conditions {
+		assert.NotEqual(t, v1alpha3.MachineConditionNVIDIAIMEXPrepared, condition.Type)
+	}
+}
+
+func TestSyncNVIDIAIMEXNodeLabel(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gb200",
+			Labels: map[string]string{
+				provision.NVIDIAIMEXModeLabelKey: string(provision.NVIDIAIMEXModeDRA),
+			},
+		},
+	}
+	kubeClient := fakeBootstrapStatusClient(node)
+
+	require.NoError(t, syncNVIDIAIMEXNodeLabel(ctx, kubeClient, node.Name, false))
+
+	var got corev1.Node
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, &got))
+	assert.NotContains(t, got.Labels, provision.NVIDIAIMEXModeLabelKey)
+
+	require.NoError(t, syncNVIDIAIMEXNodeLabel(ctx, kubeClient, node.Name, true))
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, &got))
+	assert.Equal(t, string(provision.NVIDIAIMEXModeDRA), got.Labels[provision.NVIDIAIMEXModeLabelKey])
 }
 
 func findMachineCondition(t *testing.T, conditions []metav1.Condition, conditionType string) metav1.Condition {

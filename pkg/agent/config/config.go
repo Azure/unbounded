@@ -46,6 +46,7 @@ type AgentConfig struct {
 	Kubelet  AgentKubeletConfig   `json:"Kubelet"`
 	CRI      CRIConfig            `json:"CRI"`
 	CNI      CNIConfig            `json:"CNI"`
+	NVIDIA   *NVIDIAConfig        `json:"NVIDIA,omitempty"`
 	Gantry   *GantryConfig        `json:"Gantry,omitempty"`
 	LocalDNS *AgentLocalDNSConfig `json:"LocalDNS,omitempty"`
 
@@ -106,6 +107,38 @@ type GantryConfig struct {
 	// Gantry. This is a breakglass setting for environments that need to own
 	// containerd registry routing independently.
 	Disabled bool `json:"Disabled,omitempty"`
+}
+
+// NVIDIAConfig holds optional NVIDIA host integration settings.
+type NVIDIAConfig struct {
+	// IMEX configures multi-node NVLink IMEX preparation.
+	IMEX *NVIDIAIMEXConfig `json:"IMEX,omitempty"`
+}
+
+// NVIDIAIMEXConfig configures NVIDIA IMEX integration.
+type NVIDIAIMEXConfig struct {
+	// Mode selects the owner of the IMEX daemon and channel lifecycle.
+	// Empty disables IMEX preparation.
+	Mode NVIDIAIMEXMode `json:"Mode,omitempty"`
+}
+
+// NVIDIAIMEXMode identifies the supported IMEX lifecycle owner.
+type NVIDIAIMEXMode string
+
+const (
+	// NVIDIAIMEXModeDRA prepares the host and nspawn boundary for NVIDIA DRA
+	// ComputeDomains, which own IMEX daemon and channel lifecycle.
+	NVIDIAIMEXModeDRA NVIDIAIMEXMode = "DRA"
+
+	// NVIDIAIMEXModeLabelKey reports the configured lifecycle owner. It is not
+	// a readiness label; workloads must still use a ready DRA ComputeDomain.
+	NVIDIAIMEXModeLabelKey = "nvidia.unbounded-cloud.io/imex-mode"
+)
+
+// IMEXDRAEnabled reports whether NVIDIA DRA owns IMEX lifecycle.
+func (a *AgentConfig) IMEXDRAEnabled() bool {
+	return a != nil && a.NVIDIA != nil && a.NVIDIA.IMEX != nil &&
+		a.NVIDIA.IMEX.Mode == NVIDIAIMEXModeDRA
 }
 
 // AdditionalHostMount configures a host path bind mount for the nspawn
@@ -195,6 +228,13 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
+	if a.NVIDIA != nil {
+		out.NVIDIA = &NVIDIAConfig{}
+		if a.NVIDIA.IMEX != nil {
+			out.NVIDIA.IMEX = &NVIDIAIMEXConfig{Mode: a.NVIDIA.IMEX.Mode}
+		}
+	}
+
 	if a.Gantry != nil {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
 	}
@@ -246,6 +286,10 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
+	if err := a.validateNVIDIA(); err != nil {
+		errs = append(errs, err)
+	}
+
 	if err := ValidateProvisioningFormat(a.ProvisioningFormat); err != nil {
 		errs = append(errs, err)
 	}
@@ -263,6 +307,19 @@ func (a *AgentConfig) Validate() error {
 	// static bootstrap credential should validate Kubelet.Auth separately.
 
 	return errors.Join(errs...)
+}
+
+func (a *AgentConfig) validateNVIDIA() error {
+	if a.NVIDIA == nil || a.NVIDIA.IMEX == nil {
+		return nil
+	}
+
+	switch a.NVIDIA.IMEX.Mode {
+	case "", NVIDIAIMEXModeDRA:
+		return nil
+	default:
+		return fmt.Errorf("NVIDIA.IMEX.Mode must be %q or empty", NVIDIAIMEXModeDRA)
+	}
 }
 
 // ValidateAdditionalHostDevices checks that configured host device paths and

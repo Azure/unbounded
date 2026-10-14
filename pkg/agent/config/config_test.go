@@ -276,6 +276,23 @@ func TestAgentConfig_Validate(t *testing.T) {
 			},
 			wantErr: "AdditionalHostMounts[0].Source",
 		},
+		{
+			name: "NVIDIA IMEX DRA",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NVIDIA = &NVIDIAConfig{
+					IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+				}
+			},
+		},
+		{
+			name: "unsupported NVIDIA IMEX mode",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NVIDIA = &NVIDIAConfig{
+					IMEX: &NVIDIAIMEXConfig{Mode: "Legacy"},
+				}
+			},
+			wantErr: "NVIDIA.IMEX.Mode",
+		},
 	}
 
 	for _, tt := range tests {
@@ -346,6 +363,9 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 			Source: "/opt/config",
 		}},
 		Gantry: &GantryConfig{Disabled: true},
+		NVIDIA: &NVIDIAConfig{
+			IMEX: &NVIDIAIMEXConfig{Mode: NVIDIAIMEXModeDRA},
+		},
 	}
 
 	copy := original.DeepCopy()
@@ -366,6 +386,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
 	copy.Gantry.Disabled = false
+	copy.NVIDIA.IMEX.Mode = ""
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
@@ -376,6 +397,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
 	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
 	require.True(t, original.Gantry.Disabled)
+	require.Equal(t, NVIDIAIMEXModeDRA, original.NVIDIA.IMEX.Mode)
 }
 
 func TestAgentKubeletConfigValidate(t *testing.T) {

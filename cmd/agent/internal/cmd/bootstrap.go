@@ -29,6 +29,7 @@ type agentStages struct {
 	log              *slog.Logger
 	cfg              *provision.UnboundedAgentConfig
 	gs               *goalstates.MachineGoalState
+	downloads        *goalstates.DownloadOverrides
 	archives         *goalstates.ContainerImageArchiveStaging
 	reporter         *daemon.BootstrapStatusReporter
 	credentialsReady bool
@@ -69,7 +70,13 @@ func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity,
 		KubernetesVersion string
 		OCIImage          string
 		APIServer         string
-	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer})
+		NVIDIA            *provision.NVIDIAConfig `json:",omitempty"`
+	}{
+		strings.TrimPrefix(cfg.Cluster.Version, "v"),
+		canonicalImageIdentity(cfg.OCIImage),
+		cfg.Kubelet.ApiServer,
+		cfg.NVIDIA,
+	})
 	if err != nil {
 		return bootstrap.Identity{}, err
 	}
@@ -88,11 +95,7 @@ func (s *agentStages) ResolveInputs(ctx context.Context) error {
 	}
 
 	s.archives = archives
-
-	s.gs, err = goalstates.ResolveMachine(s.log, &s.cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
-	if err != nil {
-		return err
-	}
+	s.downloads = downloads
 
 	return nil
 }
@@ -106,11 +109,18 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 		return err
 	}
 
-	if err := phases.Serial(s.log, host.InstallPackages(s.log), phases.Parallel(s.log,
+	if err := phases.Serial(s.log, host.InstallPackages(s.log), host.PrepareNVIDIAIMEXDRA(s.log, &s.cfg.AgentConfig), phases.Parallel(s.log,
 		host.ConfigureOS(s.log), host.ConfigureNFTables(s.log), phases.Serial(s.log, host.DisableDocker(s.log), host.ConfigureDocker(s.log)),
 		host.DisableContainerd(s.log), host.DisableKubelet(s.log), host.DisableSwap(s.log), host.HardenAPT(s.log))).Do(ctx); err != nil {
 		return err
 	}
+
+	gs, err := goalstates.ResolveMachine(s.log, &s.cfg.AgentConfig, goalstates.NSpawnMachineKube1, s.downloads)
+	if err != nil {
+		return err
+	}
+
+	s.gs = gs
 
 	return fsutil.SyncFilesystems("/etc", hostroot.Resolve(), installstate.DefaultDirectory)
 }
