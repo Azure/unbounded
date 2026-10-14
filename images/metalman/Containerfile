@@ -58,6 +58,7 @@ FROM ubuntu:noble
 # Install runtime dependencies
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
+    dosfstools mtools xorriso \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create unbounded directory

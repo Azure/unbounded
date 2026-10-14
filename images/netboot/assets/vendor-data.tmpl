@@ -67,6 +67,14 @@ runcmd:
         else
           echo "could not read ${install_log}: file does not exist"
         fi
+        # Unit logs often explain failures that the agent only reports as an exit status.
+        # Units that restart on failure sit in auto-restart rather than failed.
+        # Console output of nspawn containers is dropped so that hook errors stay visible.
+        for unit in $(systemctl list-units --all --state=failed,auto-restart --plain --no-legend 2>/dev/null | cut -d' ' -f1); do
+          echo
+          echo "last 60 journal lines of failed unit ${unit}:"
+          journalctl -b --no-pager -u "$unit" 2>&1 | grep -v ' systemd-nspawn\[' | tail -n 60
+        done
       } | curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "{{ .ServeURL }}/unbounded-agent/install-log" >/dev/null 2>&1 || true
       exit "$status"
     }

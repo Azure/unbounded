@@ -167,6 +167,41 @@ func (q *StatusQueue) flushOperationCondition(ctx context.Context, machineName, 
 			return err
 		}
 
+		for i := range op.Status.Targets {
+			target := &op.Status.Targets[i]
+			if target.MachineRef != machineName || target.BootMedia == nil {
+				continue
+			}
+			// Image completion must come from the operation-scoped media callback.
+			if conditionType != v1alpha3.MachineOperationConditionCloudInitDone || !target.BootMedia.ImageWritten || !target.BootMedia.Cleaned {
+				return nil
+			}
+
+			if target.BootMedia.RebootRequestedAt == nil {
+				return nil
+			}
+
+			var machine v1alpha3.Machine
+			if err := q.Client.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+
+			if machine.UID != target.BootMedia.MachineUID {
+				return nil
+			}
+
+			if apimeta.IsStatusConditionTrue(target.Conditions, conditionType) {
+				return nil
+			}
+
+			apimeta.SetStatusCondition(&target.Conditions, metav1.Condition{
+				Type: conditionType, Status: status, Reason: reason, Message: message,
+				ObservedGeneration: op.Generation, LastTransitionTime: q.now(),
+			})
+
+			return q.Client.Status().Update(ctx, op)
+		}
+
 		if apimeta.IsStatusConditionTrue(op.Status.Conditions, conditionType) {
 			return nil
 		}
@@ -193,7 +228,9 @@ func (q *StatusQueue) activeOperationForMachine(ctx context.Context, machineName
 	candidates := make([]*v1alpha3.MachineOperation, 0, len(list.Items))
 	for i := range list.Items {
 		op := &list.Items[i]
-		if op.Status.IsTerminal() || op.Spec.OperationKind != v1alpha3.OperationHostReplace || !operationTargetsMachine(op, machineName) {
+
+		retained := operationRetainsMediaForMachine(op, machineName)
+		if op.Spec.OperationKind != v1alpha3.OperationHostReplace || (!retained && (op.Status.IsTerminal() || !operationTargetsMachine(op, machineName))) {
 			continue
 		}
 
@@ -204,9 +241,26 @@ func (q *StatusQueue) activeOperationForMachine(ctx context.Context, machineName
 		return nil, false, nil
 	}
 
-	sort.Slice(candidates, func(i, j int) bool { return operationBefore(candidates[i], candidates[j]) })
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := operationRetainsMediaForMachine(candidates[i], machineName), operationRetainsMediaForMachine(candidates[j], machineName)
+		if a != b {
+			return a
+		}
+
+		return operationBefore(candidates[i], candidates[j])
+	})
 
 	return candidates[0], true, nil
+}
+
+func operationRetainsMediaForMachine(op *v1alpha3.MachineOperation, machineName string) bool {
+	for _, target := range op.Status.Targets {
+		if target.MachineRef == machineName && outstandingMedia(target) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func operationTargetsMachine(op *v1alpha3.MachineOperation, machineName string) bool {

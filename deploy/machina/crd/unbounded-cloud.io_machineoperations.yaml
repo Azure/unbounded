@@ -253,6 +253,279 @@ spec:
                         Polling expected state changes does not increment this field.
                       format: int32
                       type: integer
+                    bootMedia:
+                      description: BootMedia records immutable media ownership and
+                        cleanup progress.
+                      properties:
+                        abandoned:
+                          description: |-
+                            Abandoned ends ownership after the installer never finished its
+                            handoff within the allowed time.
+                          type: boolean
+                        bootAttempts:
+                          description: BootAttempts counts power-on attempts used
+                            to boot the media.
+                          format: int32
+                          type: integer
+                        certFingerprint:
+                          type: string
+                        cleaned:
+                          type: boolean
+                        cleanedAt:
+                          description: CleanedAt starts the bounded wait for installer
+                            reboot handoff.
+                          format: date-time
+                          type: string
+                        id:
+                          type: string
+                        imageWritten:
+                          type: boolean
+                        loaderStartedAt:
+                          description: |-
+                            LoaderStartedAt is set when the bootloader on the media first fetches
+                            its install config. It proves the host booted the media.
+                          format: date-time
+                          type: string
+                        machineUID:
+                          description: |-
+                            UID is a type that holds unique ID values, including UUIDs.  Because we
+                            don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                            intent and helps make sure that UIDs and names do not get conflated.
+                          type: string
+                        netboot:
+                          description: PXESpec defines PXE boot configuration for
+                            a Machine.
+                          properties:
+                            architecture:
+                              default: amd64
+                              description: |-
+                                Architecture is the target CPU architecture for PXE boot artifacts and
+                                machine images.
+                              enum:
+                              - amd64
+                              - arm64
+                              type: string
+                            bootProtocol:
+                              default: PXE
+                              description: |-
+                                BootProtocol selects how metalman should trigger network boot for
+                                repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
+                                HTTP boot with a URL derived from the netboot image metadata.
+                                VirtualMedia mounts an operation-owned bootstrap ISO through Redfish.
+                              enum:
+                              - PXE
+                              - HTTP
+                              - VirtualMedia
+                              type: string
+                            cloudInit:
+                              description: |-
+                                CloudInit contains optional cloud-init customization for PXE-booted
+                                machines.
+                              properties:
+                                userDataConfigMapRef:
+                                  description: |-
+                                    UserDataConfigMapRef references a ConfigMap containing custom
+                                    cloud-init user-data. The referenced key (default "user-data")
+                                    must contain a valid cloud-init configuration (e.g. a
+                                    #cloud-config YAML document).
+                                  properties:
+                                    key:
+                                      default: user-data
+                                      description: Key within the ConfigMap.
+                                      type: string
+                                    name:
+                                      description: Name of the ConfigMap.
+                                      type: string
+                                    namespace:
+                                      description: Namespace of the ConfigMap.
+                                      type: string
+                                  required:
+                                  - name
+                                  - namespace
+                                  type: object
+                              type: object
+                            dhcpLeases:
+                              description: |-
+                                DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+                                uses them as DHCP leases. HTTP boot uses the first entry to configure the
+                                Redfish UEFI HTTP boot client.
+                              items:
+                                description: DHCPLease defines static IPv4 provisioning
+                                  network settings.
+                                properties:
+                                  dns:
+                                    description: DNS is a list of DNS server addresses.
+                                    items:
+                                      type: string
+                                    type: array
+                                  gateway:
+                                    description: Gateway is the default gateway.
+                                    type: string
+                                  ipv4:
+                                    description: IPv4 is the IP address to assign.
+                                    type: string
+                                  mac:
+                                    description: MAC is the MAC address of the network
+                                      interface.
+                                    type: string
+                                  subnetMask:
+                                    description: SubnetMask is the subnet mask for
+                                      the lease.
+                                    type: string
+                                required:
+                                - gateway
+                                - ipv4
+                                - mac
+                                - subnetMask
+                                type: object
+                              type: array
+                            image:
+                              description: |-
+                                Image is an OCI image reference containing the machine disk image.
+                                The image must contain /disk/disk.img.gz.
+                                Example: "ghcr.io/azure/host-ubuntu2404:v1"
+                              type: string
+                            netbootImage:
+                              description: |-
+                                NetbootImage is an OCI image reference containing the PXE boot
+                                artifacts used to install Image. When omitted, metalman uses the
+                                default netboot image that corresponds to its release.
+                              type: string
+                            netbootPullSecretRef:
+                              description: |-
+                                NetbootPullSecretRef references a Docker registry credential Secret used to
+                                pull NetbootImage. It is ignored when NetbootImage is omitted; metalman's
+                                configured default netboot pull secret is used for the default netboot image.
+                                The Secret must be type kubernetes.io/dockerconfigjson or
+                                kubernetes.io/dockercfg.
+                              properties:
+                                name:
+                                  description: Name of the secret.
+                                  minLength: 1
+                                  type: string
+                                namespace:
+                                  description: Namespace of the secret.
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - name
+                              - namespace
+                              type: object
+                            pullSecretRef:
+                              description: |-
+                                PullSecretRef references a Docker registry credential Secret used to pull
+                                Image. The Secret must be type kubernetes.io/dockerconfigjson or
+                                kubernetes.io/dockercfg.
+                              properties:
+                                name:
+                                  description: Name of the secret.
+                                  minLength: 1
+                                  type: string
+                                namespace:
+                                  description: Namespace of the secret.
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - name
+                              - namespace
+                              type: object
+                            redfish:
+                              description: Redfish configures optional Redfish BMC
+                                access.
+                              properties:
+                                deviceID:
+                                  default: "1"
+                                  description: |-
+                                    DeviceID is the Redfish system device ID. Defaults to "1".
+                                    It is ignored when the endpoint exposes a single system selected by its URL.
+                                  type: string
+                                passwordRef:
+                                  description: PasswordRef references a secret containing
+                                    the Redfish password.
+                                  properties:
+                                    key:
+                                      default: ssh-privatekey
+                                      description: Key within the secret.
+                                      type: string
+                                    name:
+                                      description: Name of the secret.
+                                      type: string
+                                    namespace:
+                                      description: Namespace of the secret.
+                                      type: string
+                                  required:
+                                  - name
+                                  - namespace
+                                  type: object
+                                url:
+                                  description: |-
+                                    URL is the Redfish endpoint URL. It may include a per-system path prefix,
+                                    for example https://manager:8080/7. Do not include /redfish/v1.
+                                  type: string
+                                username:
+                                  description: Username is the Redfish username.
+                                  type: string
+                              required:
+                              - passwordRef
+                              - url
+                              - username
+                              type: object
+                            targetDisk:
+                              description: |-
+                                TargetDisk is the block device the installer writes the machine image to.
+                                Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+                                When omitted, the installer chooses a target disk automatically.
+                              type: string
+                          required:
+                          - image
+                          type: object
+                          x-kubernetes-validations:
+                          - message: VirtualMedia requires redfish
+                            rule: '!has(self.bootProtocol) || self.bootProtocol !=
+                              ''VirtualMedia'' || has(self.redfish)'
+                        nodeName:
+                          description: NodeName preserves the expected Node across
+                            Machine edits.
+                          type: string
+                        phase:
+                          type: string
+                        phaseStartedAt:
+                          description: PhaseStartedAt bounds active progress without
+                            spending retry attempts.
+                          format: date-time
+                          type: string
+                        readinessStartedAt:
+                          description: ReadinessStartedAt gives AC recovery one fixed
+                            grace window per phase.
+                          format: date-time
+                          type: string
+                        rebootRequestedAt:
+                          description: RebootRequestedAt is set by the successful
+                            installer ready callback.
+                          format: date-time
+                          type: string
+                        released:
+                          description: Released confirms local media removal after
+                            Cleaned revokes serving.
+                          type: boolean
+                        site:
+                          description: Site preserves controller ownership after the
+                            Machine is deleted.
+                          type: string
+                        sourceName:
+                          type: string
+                        sourceServer:
+                          type: string
+                        stagedDeleted:
+                          description: StagedDeleted confirms rack media deletion
+                            after safe boot is restored.
+                          type: boolean
+                      required:
+                      - id
+                      - machineUID
+                      - netboot
+                      - phase
+                      type: object
                     completedAt:
                       description: CompletedAt is when this target reached a terminal
                         phase.
