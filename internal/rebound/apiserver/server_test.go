@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -371,14 +372,10 @@ func TestServer(t *testing.T) {
 		t.Fatalf("resource: %+v", r)
 	}
 
-	for _, verb := range []string{"get", "list", "watch", "create", "delete", "deletecollection"} {
+	for _, verb := range []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"} {
 		if !slices.Contains(r.Verbs, verb) {
 			t.Fatalf("missing verb %s: %+v", verb, r.Verbs)
 		}
-	}
-
-	if slices.Contains(r.Verbs, "update") || slices.Contains(r.Verbs, "patch") {
-		t.Fatalf("mutable verbs: %v", r.Verbs)
 	}
 
 	path := apiPath + "/namespaces/team/nodegrants"
@@ -413,6 +410,28 @@ func TestServer(t *testing.T) {
 	}
 
 	requestHTTP(http.MethodGet, path+"?fieldSelector=metadata.name%3Dhttp-test", "", nil, http.StatusOK)
+
+	// Patches that change nothing succeed, as `kubectl apply` of an unchanged
+	// manifest needs. Any real change is rejected.
+	patchHTTP := func(contentType, patch string, code int) {
+		t.Helper()
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPatch, base+path+"/http-test", strings.NewReader(patch))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", contentType)
+
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, code, resp.StatusCode, "%s %s: %s", contentType, patch, body)
+	}
+	patchHTTP("application/merge-patch+json", `{"metadata":{"labels":{"team":"blue"}}}`, http.StatusOK)
+	patchHTTP("application/strategic-merge-patch+json", `{"metadata":{"annotations":{"note":"test"}}}`, http.StatusOK)
+	patchHTTP("application/json-patch+json", `[{"op":"replace","path":"/spec/ttl","value":"5m"}]`, http.StatusUnprocessableEntity)
+	patchHTTP("application/merge-patch+json", `{"metadata":{"labels":{"team":"red"}}}`, http.StatusUnprocessableEntity)
 
 	// Clients that prefer protobuf, such as the namespace controller, must fall
 	// back to JSON because NodeGrant has no protobuf encoding. Metadata-only
@@ -482,6 +501,18 @@ func TestServer(t *testing.T) {
 	if len(model.GVK) != 1 || !maps.Equal(model.GVK[0], wantGVK) {
 		t.Fatalf("NodeGrant schema GVK: %+v", model.GVK)
 	}
+
+	// kubectl only trusts the schema for validation when the PATCH operation
+	// on the resource carries the same extension.
+	var openAPIPaths struct {
+		Paths map[string]struct {
+			Patch struct {
+				GVK map[string]string `json:"x-kubernetes-group-version-kind"`
+			} `json:"patch"`
+		} `json:"paths"`
+	}
+	require.NoError(t, json.Unmarshal(data, &openAPIPaths))
+	require.Equal(t, wantGVK, openAPIPaths.Paths[apiPath+"/namespaces/{namespace}/nodegrants/{name}"].Patch.GVK)
 
 	requestHTTP(http.MethodGet, path+"?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan", "", nil, http.StatusBadRequest)
 	denied.Store(true)

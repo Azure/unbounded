@@ -33,8 +33,11 @@ kubectl delete ngr train
   at least one node and at most `--max-nodes-per-grant` nodes (500 by default).
   The selector is resolved once at create time into `status.nodes`. Later label
   changes do not change the grant.
-- **Immutable:** grants cannot be updated or renewed. Delete and create again, but
-  note that deleting a grant deletes its pods (see below).
+- **Immutable:** grants cannot be changed or renewed. Update and patch succeed
+  only when they change nothing, so `kubectl apply` of an unchanged manifest
+  works; any change fails with `422 Invalid`. Server-side apply is not
+  supported. Delete and create again, but note
+  that deleting a grant deletes its pods (see below).
 - **Metadata:** labels and annotations are stored. Create rejects `generateName`,
   owner references, finalizers, deletion timestamps, and deletion grace periods.
 - **Status:** the server sets `status.nodes` (sorted node names), `status.holder`

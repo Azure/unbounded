@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	metainternal "k8s.io/apimachinery/pkg/apis/meta/internalversion"
@@ -313,6 +314,96 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 	}
 
 	return grantObject(record, rv), nil
+}
+
+// Update accepts only requests that change nothing and rejects the rest, so
+// grants stay immutable. It exists because kubectl validates objects by
+// looking for a PATCH operation in the OpenAPI document. Without one it falls
+// back to listing CRDs, which most users cannot do. A no-op update also lets
+// `kubectl apply` succeed on a grant that already matches its manifest.
+func (s *storage) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, _ rest.ValidateObjectFunc,
+	validate rest.ValidateObjectUpdateFunc, _ bool, _ *metav1.UpdateOptions,
+) (runtime.Object, bool, error) {
+	obj, err := s.Get(ctx, name, &metav1.GetOptions{})
+	if err != nil {
+		return nil, false, err
+	}
+
+	current, ok := obj.(*rebound.NodeGrant)
+	if !ok {
+		return nil, false, apierrors.NewInternalError(errors.New("expected NodeGrant"))
+	}
+
+	obj, err = objInfo.UpdatedObject(ctx, current.DeepCopy())
+	if err != nil {
+		return nil, false, err
+	}
+
+	updated, ok := obj.(*rebound.NodeGrant)
+	if !ok {
+		return nil, false, apierrors.NewBadRequest("expected NodeGrant")
+	}
+
+	if updated.ResourceVersion != "" && updated.ResourceVersion != current.ResourceVersion {
+		return nil, false, apierrors.NewConflict(rebound.GroupResource(), name,
+			errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+	}
+
+	if updated.UID != "" && updated.UID != current.UID {
+		return nil, false, apierrors.NewConflict(rebound.GroupResource(), name, errors.New("UID does not match"))
+	}
+
+	if errs := immutableChanges(current, updated); len(errs) != 0 {
+		return nil, false, apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), name, errs)
+	}
+
+	if validate != nil {
+		if err := validate(ctx, current, current); err != nil {
+			return nil, false, err
+		}
+	}
+
+	return current, false, nil
+}
+
+// immutableChanges reports each user-set field that differs between the
+// stored grant and the update. Status and server-set metadata are ignored, as
+// they are on create.
+func immutableChanges(current, updated *rebound.NodeGrant) field.ErrorList {
+	const msg = "NodeGrant is immutable; delete it and create it again"
+
+	var errs field.ErrorList
+
+	meta := field.NewPath("metadata")
+	if updated.Name != current.Name {
+		errs = append(errs, field.Forbidden(meta.Child("name"), msg))
+	}
+
+	if updated.Namespace != "" && updated.Namespace != current.Namespace {
+		errs = append(errs, field.Forbidden(meta.Child("namespace"), msg))
+	}
+
+	if !maps.Equal(updated.Labels, current.Labels) {
+		errs = append(errs, field.Forbidden(meta.Child("labels"), msg))
+	}
+
+	if !maps.Equal(updated.Annotations, current.Annotations) {
+		errs = append(errs, field.Forbidden(meta.Child("annotations"), msg))
+	}
+
+	if len(updated.OwnerReferences) != 0 {
+		errs = append(errs, field.Forbidden(meta.Child("ownerReferences"), "not supported by NodeGrant"))
+	}
+
+	if len(updated.Finalizers) != 0 {
+		errs = append(errs, field.Forbidden(meta.Child("finalizers"), "not supported by NodeGrant"))
+	}
+
+	if !apiequality.Semantic.DeepEqual(updated.Spec, current.Spec) {
+		errs = append(errs, field.Forbidden(field.NewPath("spec"), msg))
+	}
+
+	return errs
 }
 
 // resolveNodes returns the sorted names of the nodes that sel matches.
