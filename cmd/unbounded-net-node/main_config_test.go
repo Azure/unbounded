@@ -26,6 +26,7 @@ func newNodeConfigTestCommand(cfg *config) *cobra.Command {
 	flags.DurationVar(&cfg.STUNRecheckInterval, "stun-recheck-interval", defaultSTUNRecheckInterval, "")
 	flags.StringVar(&cfg.CNIConfDir, "cni-conf-dir", "/etc/cni/net.d", "")
 	flags.StringVar(&cfg.CNIConfFile, "cni-conf-file", "10-unbounded.conflist", "")
+	registerIPAMFlags(flags, cfg)
 	flags.StringVar(&cfg.BridgeName, "bridge-name", "cbr0", "")
 	flags.StringVar(&cfg.WireGuardDir, "wireguard-dir", "/etc/wireguard", "")
 	flags.IntVar(&cfg.WireGuardPort, "wireguard-port", 51820, "")

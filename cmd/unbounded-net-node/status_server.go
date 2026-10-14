@@ -46,11 +46,12 @@ type nodeHealthState struct {
 	statusServer    *nodeStatusServer      // Set once WireGuard state is available
 	informersSynced []cache.InformerSynced // Informer HasSynced funcs for readiness
 
-	nodeName  string
-	siteName  string
-	pubKey    string
-	podCIDRs  []string
-	isGateway bool
+	nodeName          string
+	siteName          string
+	pubKey            string
+	podCIDRs          []string
+	verifiedIPAMCIDRs []string
+	isGateway         bool
 
 	cniManaged            bool
 	cniReady              bool
@@ -183,6 +184,7 @@ func (h *nodeHealthState) setCNIReady(bridgeName string, podCIDRs []string) {
 	h.cniLastLogTime = time.Time{}
 
 	h.podCIDRs = append([]string(nil), podCIDRs...)
+	h.verifiedIPAMCIDRs = append([]string(nil), podCIDRs...)
 	h.mu.Unlock()
 
 	if wasBlocked {

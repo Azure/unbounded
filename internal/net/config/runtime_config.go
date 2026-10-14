@@ -70,6 +70,9 @@ type NodeRuntimeConfig struct {
 	STUNRecheckInterval  string `yaml:"stunRecheckInterval"`
 	CNIConfDir           string `yaml:"cniConfDir"`
 	CNIConfFile          string `yaml:"cniConfFile"`
+	IPAMSocketPath       string `yaml:"ipamSocketPath"`
+	InstallIPAMPlugin    *bool  `yaml:"installIPAMPlugin"`
+	IPAMBinDir           string `yaml:"ipamBinDir"`
 	BridgeName           string `yaml:"bridgeName"`
 	WireGuardDir         string `yaml:"wireGuardDir"`
 	WireGuardPort        *int   `yaml:"wireGuardPort"`

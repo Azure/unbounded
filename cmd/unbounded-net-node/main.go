@@ -28,6 +28,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	configpkg "github.com/Azure/unbounded/internal/net/config"
+	"github.com/Azure/unbounded/internal/net/ipam"
 	"github.com/Azure/unbounded/internal/net/metrics"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 	"github.com/Azure/unbounded/internal/version"
@@ -56,13 +57,8 @@ type PluginConf struct {
 
 // IPAMConfig represents the IPAM configuration
 type IPAMConfig struct {
-	Type   string      `json:"type"`
-	Ranges [][]IPRange `json:"ranges,omitempty"`
-}
-
-// IPRange represents an IP range for IPAM
-type IPRange struct {
-	Subnet string `json:"subnet"`
+	Type       string `json:"type"`
+	SocketPath string `json:"socketPath,omitempty"`
 }
 
 // Caps represents plugin capabilities
@@ -81,6 +77,9 @@ type config struct {
 	STUNRecheckInterval           time.Duration
 	CNIConfDir                    string
 	CNIConfFile                   string
+	IPAMSocketPath                string
+	InstallIPAMPlugin             bool
+	IPAMBinDir                    string
 	BridgeName                    string
 	WireGuardDir                  string
 	WireGuardPort                 int
@@ -264,7 +263,7 @@ networking by writing a CNI configuration file based on the node's podCIDRs.
 
 It watches the node object in Kubernetes and waits for podCIDRs to be assigned
 by the unbounded-net-controller. Once assigned, it writes a CNI configuration
-file that sets up pod networking using the bridge plugin with host-local IPAM.
+file that sets up pod networking using the bridge plugin with unbounded-ipam.
 
 It also generates WireGuard keys for the node and stores them in /etc/wireguard,
 then annotates the node with the public key.`,
@@ -300,6 +299,7 @@ then annotates the node with the public key.`,
 	// CNI configuration flags
 	flags.StringVar(&cfg.CNIConfDir, "cni-conf-dir", "/etc/cni/net.d", "Directory to write CNI configuration")
 	flags.StringVar(&cfg.CNIConfFile, "cni-conf-file", "10-unbounded.conflist", "Name of the CNI configuration file")
+	registerIPAMFlags(flags, cfg)
 	flags.StringVar(&cfg.BridgeName, "bridge-name", "cbr0", "Name of the bridge interface")
 	flags.IntVar(&cfg.MTU, "mtu", 0, "Maximum MTU for tunnel and bridge interfaces (0 automatically derives MTU from each underlay route)")
 
@@ -415,6 +415,22 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 
 	if !flags.Changed("cni-conf-file") && nodeCfg.CNIConfFile != "" {
 		cfg.CNIConfFile = nodeCfg.CNIConfFile
+	}
+
+	if !flags.Changed("ipam-socket-path") && nodeCfg.IPAMSocketPath != "" {
+		cfg.IPAMSocketPath = nodeCfg.IPAMSocketPath
+	}
+
+	if !flags.Changed("install-ipam-plugin") && nodeCfg.InstallIPAMPlugin != nil {
+		cfg.InstallIPAMPlugin = *nodeCfg.InstallIPAMPlugin
+	}
+
+	if !flags.Changed("ipam-bin-dir") && nodeCfg.IPAMBinDir != "" {
+		cfg.IPAMBinDir = nodeCfg.IPAMBinDir
+	}
+
+	if err := validateIPAMConfig(cfg); err != nil {
+		return err
 	}
 
 	if !flags.Changed("bridge-name") && nodeCfg.BridgeName != "" {
@@ -682,6 +698,34 @@ func run(cfg *config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if err := validateIPAMConfig(cfg); err != nil {
+		return err
+	}
+
+	if cfg.InstallIPAMPlugin {
+		if err := installIPAMBinary("/usr/local/bin/unbounded-ipam", cfg.IPAMBinDir); err != nil {
+			return fmt.Errorf("install unbounded-ipam: %w", err)
+		}
+	}
+
+	healthState := &nodeHealthState{nodeName: cfg.NodeName}
+
+	ipamServer, err := ipam.Listen(ctx, cfg.IPAMSocketPath, healthState.getIPAMConfig)
+	if err != nil {
+		return fmt.Errorf("start IPAM server: %w", err)
+	}
+
+	defer func() {
+		if err := ipamServer.Close(); err != nil {
+			klog.Errorf("Stop IPAM server: %v", err)
+		}
+	}()
+
+	go func() {
+		<-ipamServer.Done()
+		cancel()
+	}()
+
 	// Handle shutdown signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -708,7 +752,6 @@ func run(cfg *config) error {
 	// Build Kubernetes client
 	var (
 		restConfig *rest.Config
-		err        error
 	)
 
 	if cfg.KubeconfigPath != "" {
@@ -814,17 +857,14 @@ func run(cfg *config) error {
 	}
 
 	// Create shared health state for health server
-	healthState := &nodeHealthState{
-		nodeName: cfg.NodeName,
-		informersSynced: []cache.InformerSynced{
-			sliceInformer.HasSynced,
-			siteInformer.HasSynced,
-			gatewayPoolInformer.HasSynced,
-			gatewayNodeInformer.HasSynced,
-			sitePeeringInformer.HasSynced,
-			assignmentInformer.HasSynced,
-			poolPeeringInformer.HasSynced,
-		},
+	healthState.informersSynced = []cache.InformerSynced{
+		sliceInformer.HasSynced,
+		siteInformer.HasSynced,
+		gatewayPoolInformer.HasSynced,
+		gatewayNodeInformer.HasSynced,
+		sitePeeringInformer.HasSynced,
+		assignmentInformer.HasSynced,
+		poolPeeringInformer.HasSynced,
 	}
 
 	// Start health server if enabled (readiness should not wait on site membership)
@@ -899,6 +939,12 @@ func run(cfg *config) error {
 
 		nodePodCIDRs = node.Spec.PodCIDRs
 		healthState.setCNIAssignment(nodePodCIDRs)
+
+		if _, err := ipam.ConfigFromCIDRs(nodePodCIDRs); err == nil {
+			healthState.setVerifiedIPAMAssignment(nodePodCIDRs)
+		} else {
+			go acquireDelegatedIPAMAssignment(ctx, clientset, cfg, healthState)
+		}
 	}
 
 	// After CNI is configured (or skipped), watch Site CRD for WireGuard peers
