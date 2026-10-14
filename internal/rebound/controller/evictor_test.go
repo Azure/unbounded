@@ -247,6 +247,90 @@ func TestEvictorLedgerChangesDuringPodList(t *testing.T) {
 	}
 }
 
+func TestEvictorLedgerChangesDuringDelete(t *testing.T) {
+	old := grant("tenant-a", "g", "n1", time.Minute)
+	old.UID = "a"
+	handoff := grant("tenant-b", "g", "n1", time.Hour)
+	handoff.UID = "b"
+
+	tests := []struct {
+		name string
+		// during runs inside the first pod delete, after the delete returns.
+		during func(ctx context.Context, c client.WithWatch, r *evictor) error
+		// want and after are the pods left after the first reconcile
+		// and after the follow-up reconcile.
+		want, after []string
+	}{
+		{
+			name: "handoff during first delete",
+			during: func(ctx context.Context, c client.WithWatch, _ *evictor) error {
+				var cm corev1.ConfigMap
+				if err := c.Get(ctx, types.NamespacedName{Namespace: "system", Name: ledger.ConfigMapName}, &cm); err != nil {
+					return err
+				}
+
+				cm.Data = configMap(t, handoff).Data
+
+				return c.Update(ctx, &cm)
+			},
+			want: []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
+			// tenant-a's pod is now an intruder on tenant-b's node.
+			after: []string{"tenant-b/p", "tenant-b/q"},
+		},
+		{
+			name: "grant expires during first delete",
+			during: func(_ context.Context, _ client.WithWatch, r *evictor) error {
+				r.clock.(*clocktesting.FakeClock).Step(2 * time.Minute)
+				return nil
+			},
+			want: []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
+			// Without a grant or release, the node has no pods to delete.
+			after: []string{"tenant-a/p", "tenant-b/p", "tenant-b/q"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var r *evictor
+
+			deletes := 0
+			funcs := &interceptor.Funcs{Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if err := c.Delete(ctx, obj, opts...); err != nil {
+					return err
+				}
+
+				deletes++
+				if deletes > 1 {
+					return nil
+				}
+
+				return tt.during(ctx, c, r)
+			}}
+
+			// The fake client lists pods sorted by namespace, so the
+			// intruder is deleted before the tenant-b pods are reached.
+			r, c := newEvictor(t, configMap(t, old), funcs,
+				pod("intruder", "p", "n1", testNow),
+				pod("tenant-a", "p", "n1", testNow),
+				pod("tenant-b", "p", "n1", testNow),
+				pod("tenant-b", "q", "n1", testNow),
+			)
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}}
+
+			result, err := r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+			require.Positive(t, result.RequeueAfter)
+			require.Equal(t, 1, deletes)
+			require.ElementsMatch(t, tt.want, remaining(t, c))
+
+			// The follow-up sweep judges the pods against the new ledger.
+			_, err = r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+			require.ElementsMatch(t, tt.after, remaining(t, c))
+		})
+	}
+}
+
 func TestEvictorRelease(t *testing.T) {
 	g := grant("tenant", "g", "a", time.Hour)
 	g.UID = "u1"

@@ -122,6 +122,8 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		return uids[name], nil
 	}
 
+	superseded := false
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 
@@ -135,6 +137,21 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 			continue
 		}
 
+		// An earlier delete can block while the grant expires or the node
+		// moves to another namespace. The UID precondition does not catch
+		// that, so recheck the ledger and leave the rest to a new sweep.
+		// Within one version, the grant can only change by expiring.
+		current, currentActive, _, err := r.ledgerRecords(ctx, node)
+		if err != nil {
+			errs = append(errs, err)
+			break
+		}
+
+		if current != version || (currentActive == nil) != (active == nil) {
+			superseded = true
+			break
+		}
+
 		ctrl.LoggerFrom(ctx).Info("deleting pod not allowed by node grant", "node", node, "pod", client.ObjectKeyFromObject(pod))
 
 		err = r.client.Delete(ctx, pod, client.GracePeriodSeconds(0), client.Preconditions{UID: &pod.UID})
@@ -145,6 +162,10 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 
 	if err := errors.Join(errs...); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if superseded {
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
 	var requeueAfter time.Duration
