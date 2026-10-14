@@ -63,8 +63,9 @@ func sidecarTestOrigin(t *testing.T, data, tag string, calls *atomic.Int32) race
 			return m, nil, nil
 		}
 
-		if r.ETag != m.ETag {
-			t.Error("read was not pinned to Stat metadata")
+		// Direct reads are unpinned; reads after Stat must pin its version.
+		if r.ETag != "" && r.ETag != m.ETag {
+			t.Error("read was pinned to the wrong version")
 		}
 
 		if r.Offset >= m.Size {
@@ -542,7 +543,8 @@ func TestSidecarSDKFailures(t *testing.T) {
 }
 
 func TestSidecarPinnedVersionFailure(t *testing.T) {
-	for _, size := range []int{0, 4} {
+	// Only suffix ranges, and ranges that need clamping, Stat first and pin the read.
+	for _, rangeValue := range []string{"bytes=-2", "bytes=-99"} {
 		for _, tc := range []struct {
 			name, match, none string
 			status            int
@@ -560,8 +562,8 @@ func TestSidecarPinnedVersionFailure(t *testing.T) {
 			{"none wildcard", "", "*", 304},
 			{"none list", "*", `"new", W/"old"`, 304},
 		} {
-			t.Run(fmt.Sprintf("%d/%s", size, tc.name), func(t *testing.T) {
-				m := sidecarTestMetadata(t, size, `"old"`)
+			t.Run(rangeValue+"/"+tc.name, func(t *testing.T) {
+				m := sidecarTestMetadata(t, 4, `"old"`)
 
 				var calls atomic.Int32
 
@@ -577,7 +579,7 @@ func TestSidecarPinnedVersionFailure(t *testing.T) {
 					return racersdk.Metadata{}, nil, fmt.Errorf("private pin: %w", racersdk.ErrVersionMismatch)
 				})
 
-				headers := http.Header{}
+				headers := http.Header{"Range": {rangeValue}}
 				if tc.match != "" {
 					headers.Set("If-Match", tc.match)
 				}
@@ -632,7 +634,18 @@ func TestSidecarRejectsChangedPinnedMetadata(t *testing.T) {
 				return changed, io.NopCloser(strings.NewReader(strings.Repeat("x", int(changed.Size)))), nil
 			})
 
-			w := sidecarTestRequest(h, "GET", "/bucket/key", nil)
+			if field == "empty-size" {
+				// A whole-object GET reads directly, so its headers come from
+				// the read itself and cannot disagree with the body.
+				w := sidecarTestRequest(h, "GET", "/bucket/key", nil)
+				if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") != "0" || calls.Load() != 1 {
+					t.Fatalf("direct read: calls=%d %d %v %q", calls.Load(), w.Code, w.Header(), w.Body.String())
+				}
+
+				return
+			}
+
+			w := sidecarTestRequest(h, "GET", "/bucket/key", http.Header{"Range": {"bytes=-2"}})
 			if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "<Code>BadGateway</Code>") {
 				t.Fatalf("changed metadata committed object: %d %q", w.Code, w.Body.String())
 			}
@@ -944,8 +957,10 @@ func TestSidecarEmptyReadFailure(t *testing.T) {
 
 	var calls atomic.Int32
 
-	h, _ := sidecarTestHandler(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		if calls.Add(1) == 1 {
+	h, _ := sidecarTestHandler(t, func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		calls.Add(1)
+
+		if r.Head {
 			return m, nil, nil
 		}
 
@@ -953,7 +968,7 @@ func TestSidecarEmptyReadFailure(t *testing.T) {
 	})
 
 	w := sidecarTestRequest(h, "GET", "/bucket/key", nil)
-	if calls.Load() < 2 || w.Code != 503 || !strings.Contains(w.Body.String(), "ServiceUnavailable") {
+	if calls.Load() < 1 || w.Code != 503 || !strings.Contains(w.Body.String(), "ServiceUnavailable") {
 		t.Fatalf("empty read failure became success: %d %s", w.Code, w.Body.String())
 	}
 }
@@ -1308,4 +1323,187 @@ func TestSidecarRangeClampsHugeNumbers(t *testing.T) {
 	if n, ok := sidecarRangeNumber(huge); !ok || n != math.MaxInt64 {
 		t.Fatalf("clamp: %d %v", n, ok)
 	}
+}
+
+func TestSidecarDirectReadsSkipStat(t *testing.T) {
+	const data, tag = "0123456789", `"v"`
+
+	client := &sidecarCountingClient{Client: testSDKClient(t, sidecarTestOrigin(t, data, tag, nil))}
+	h := sidecarCountingHandler(t, client)
+
+	for _, tc := range []struct {
+		name, method, rangeValue, match, none, body, contentRange string
+		status, stats                                             int
+	}{
+		{"whole", "GET", "", "", "", data, "", 200, 0},
+		{"open", "GET", "bytes=3-", "", "", "3456789", "bytes 3-9/10", 206, 0},
+		{"open last byte", "GET", "bytes=9-", "", "", "9", "bytes 9-9/10", 206, 0},
+		{"unknown unit", "GET", "items=0-1", "", "", data, "", 200, 0},
+		{"match", "GET", "", tag, "", data, "", 200, 0},
+		{"match open", "GET", "bytes=8-", "*", "", "89", "bytes 8-9/10", 206, 0},
+		{"match fails", "GET", "", `"other"`, "", "", "", 412, 0},
+		{"none matches", "GET", "", "", tag, "", "", 304, 0},
+		{"none matches open", "GET", "bytes=2-", "", "W/" + tag, "", "", 304, 0},
+		{"none differs", "GET", "", "", `"other"`, data, "", 200, 0},
+		{"open at size", "GET", "bytes=10-", "", "", "", "bytes */10", 416, 1},
+		{"open past size", "GET", "bytes=99-", "", "", "", "bytes */10", 416, 1},
+		{"closed", "GET", "bytes=1-2", "", "", "12", "bytes 1-2/10", 206, 0},
+		{"closed to end", "GET", "bytes=1-9", "", "", "123456789", "bytes 1-9/10", 206, 0},
+		{"closed match fails", "GET", "bytes=1-2", `"other"`, "", "", "", 412, 0},
+		{"closed clamped", "GET", "bytes=8-99", "", "", "89", "bytes 8-9/10", 206, 1},
+		{"closed past size", "GET", "bytes=10-12", "", "", "", "bytes */10", 416, 1},
+		{"suffix", "GET", "bytes=-2", "", "", "89", "bytes 8-9/10", 206, 1},
+		{"head", "HEAD", "", "", "", "", "", 200, 1},
+		{"head open", "HEAD", "bytes=3-", "", "", "", "", 200, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client.stats.Store(0)
+
+			headers := http.Header{}
+			if tc.rangeValue != "" {
+				headers.Set("Range", tc.rangeValue)
+			}
+
+			if tc.match != "" {
+				headers.Set("If-Match", tc.match)
+			}
+
+			if tc.none != "" {
+				headers.Set("If-None-Match", tc.none)
+			}
+
+			w := sidecarTestRequest(h, tc.method, "/bucket/key", headers)
+			if w.Code != tc.status || w.Header().Get("Content-Range") != tc.contentRange {
+				t.Fatalf("response: %d %v %q", w.Code, w.Header(), w.Body.String())
+			}
+
+			if tc.status < 300 && w.Body.String() != tc.body {
+				t.Fatalf("body %q want %q", w.Body.String(), tc.body)
+			}
+
+			if tc.status == 304 && (w.Body.Len() != 0 || w.Header().Get("ETag") != tag) {
+				t.Fatalf("304: %v %q", w.Header(), w.Body.String())
+			}
+
+			if tc.status < 300 && w.Header().Get("ETag") != tag {
+				t.Fatalf("missing ETag: %v", w.Header())
+			}
+
+			if got := int(client.stats.Load()); got != tc.stats {
+				t.Fatalf("Stat calls %d want %d", got, tc.stats)
+			}
+		})
+	}
+}
+
+// An unpinned direct read cannot fail its own pin, so a plain GET never
+// returns 412 even when Racer reports a version mismatch.
+func TestSidecarDirectReadVersionMismatchIsNotPrecondition(t *testing.T) {
+	h, _ := sidecarTestHandler(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		return racersdk.Metadata{}, nil, racersdk.ErrVersionMismatch
+	})
+
+	for _, rangeValue := range []string{"", "bytes=2-"} {
+		headers := http.Header{}
+		if rangeValue != "" {
+			headers.Set("Range", rangeValue)
+		}
+
+		if w := sidecarTestRequest(h, "GET", "/bucket/key", headers); w.Code == 412 {
+			t.Fatalf("%q: plain GET returned 412", rangeValue)
+		}
+	}
+}
+
+// Whole-object, open, and in-bounds closed range GETs do not use the SDK's Stat lane, so more
+// concurrent reads than that lane admits (four connections plus a queue of 16)
+// all succeed while every read is held open at once.
+func TestSidecarConcurrentDirectReads(t *testing.T) {
+	const n = 48
+
+	entered := make(chan struct{}, n)
+	release := make(chan struct{})
+	client := &sidecarCountingClient{
+		Client: testSDKClient(t, sidecarTestOrigin(t, "0123456789", `"v"`, nil)),
+		afterGet: func() {
+			entered <- struct{}{}
+
+			<-release
+		},
+	}
+	h := sidecarCountingHandler(t, client)
+
+	codes := make(chan int, n)
+	for i := range n {
+		go func() {
+			headers := http.Header{}
+
+			switch i % 3 {
+			case 1:
+				headers.Set("Range", "bytes=4-")
+			case 2:
+				headers.Set("Range", "bytes=2-5")
+			}
+
+			codes <- sidecarTestRequest(h, "GET", "/bucket/key", headers).Code
+		}()
+	}
+
+	timeout := time.After(30 * time.Second)
+
+	for range n {
+		select {
+		case <-entered:
+		case code := <-codes:
+			close(release)
+			t.Fatalf("request finished early with %d", code)
+		case <-timeout:
+			close(release)
+			t.Fatal("reads were not all in flight")
+		}
+	}
+
+	close(release)
+
+	for range n {
+		if code := <-codes; code != 200 && code != 206 {
+			t.Fatalf("concurrent GET: %d", code)
+		}
+	}
+
+	if client.stats.Load() != 0 {
+		t.Fatalf("Stat calls: %d", client.stats.Load())
+	}
+}
+
+// sidecarCountingClient counts Stat calls and can hold reads after Get.
+type sidecarCountingClient struct {
+	*racersdk.Client
+	stats    atomic.Int32
+	afterGet func()
+}
+
+func (c *sidecarCountingClient) Stat(ctx context.Context, request racersdk.Request) (racersdk.Metadata, error) {
+	c.stats.Add(1)
+	return c.Client.Stat(ctx, request)
+}
+
+func (c *sidecarCountingClient) Get(ctx context.Context, request racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Object, error) {
+	v, err := c.Client.Get(ctx, request, options...)
+	if err == nil && c.afterGet != nil {
+		c.afterGet()
+	}
+
+	return v, err
+}
+
+func sidecarCountingHandler(t *testing.T, client *sidecarCountingClient) http.Handler {
+	t.Helper()
+
+	bound, err := newScope("test", []string{"bucket"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &sidecar{client: client, scope: bound}
 }

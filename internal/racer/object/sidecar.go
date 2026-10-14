@@ -24,8 +24,14 @@ type SidecarConfig struct {
 	Buckets   []string
 }
 
+// sidecarClient is the part of [racersdk.Client] the sidecar uses.
+type sidecarClient interface {
+	Stat(ctx context.Context, request racersdk.Request) (racersdk.Metadata, error)
+	Get(ctx context.Context, request racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Object, error)
+}
+
 type sidecar struct {
-	client *racersdk.Client
+	client sidecarClient
 	scope  scope
 }
 
@@ -82,29 +88,34 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 		return http.StatusBadRequest
 	}
 
+	conditions := sidecarConditions{match, none}
+
+	// A GET that needs no size up front reads directly, so whole-object, open,
+	// and closed range reads never wait in the SDK's small Stat lane.
+	if r.Method == http.MethodGet {
+		if options, ok := sidecarDirectRange(r.Header); ok {
+			return s.direct(w, r, request, version, conditions, options)
+		}
+	}
+
+	return s.statThenRead(w, r, request, version, conditions)
+}
+
+// statThenRead serves HEAD, suffix ranges, and ranges that may need clamping
+// from Stat metadata and pins the read to it.
+func (s *sidecar) statThenRead(w http.ResponseWriter, r *http.Request, request racersdk.Request, version string, conditions sidecarConditions) sidecarFailure {
 	m, err := s.client.Stat(r.Context(), request)
 	if err != nil {
 		return sidecarSDKFailure(err)
 	}
 
-	if match.present && !match.matches(m.ETag, false) {
-		return http.StatusPreconditionFailed
-	}
-
-	if none.present && none.matches(m.ETag, true) {
-		w.Header().Set("ETag", m.ETag)
-		w.WriteHeader(http.StatusNotModified)
-
-		return 0
+	if failure, done := conditions.evaluate(w, m.ETag); done {
+		return failure
 	}
 
 	offset, length, partial, status := sidecarRange(r.Header, uint64(m.Size))
 	if status != 0 {
-		if status == http.StatusRequestedRangeNotSatisfiable {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", m.Size))
-		}
-
-		return sidecarFailure(status)
+		return sidecarRangeFailure(w, status, m.Size)
 	}
 
 	read := sidecarRead{m, version, offset, length, partial}
@@ -116,6 +127,97 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 	}
 
 	return s.stream(w, r, request, read)
+}
+
+// direct reads without Stat and takes every response header from the read's
+// own metadata, which covers every page of the read. The read is unpinned, so
+// client conditions are evaluated against the version Racer actually serves
+// and a plain GET can never fail with 412.
+func (s *sidecar) direct(w http.ResponseWriter, r *http.Request, request racersdk.Request, version string, conditions sidecarConditions, options racersdk.ReadOptions) sidecarFailure {
+	v, err := s.client.Get(r.Context(), request, options)
+	if errors.Is(err, racersdk.ErrRangeNotSatisfiable) {
+		// The SDK does not clamp a range past the end. Stat supplies the size
+		// to clamp it, or to report it in a 416 response.
+		return s.statThenRead(w, r, request, version, conditions)
+	}
+
+	if err != nil {
+		return sidecarSDKFailure(err)
+	}
+
+	defer func() { _ = v.Close() }() //nolint:errcheck // Close releases admission; its error cannot change the response.
+
+	m := v.Metadata()
+	if failure, done := conditions.evaluate(w, m.ETag); done {
+		return failure
+	}
+
+	offset, length, partial, status := sidecarRange(r.Header, uint64(m.Size))
+	if status != 0 {
+		return sidecarRangeFailure(w, status, m.Size)
+	}
+
+	// Racer accepted the requested range, so it must equal the selection.
+	if offset != uint64(options.Offset) || options.Length != 0 && length != uint64(options.Length) {
+		return http.StatusBadGateway
+	}
+
+	return sidecarRead{m, version, offset, length, partial}.writeBody(w, v)
+}
+
+// sidecarDirectRange returns the read for a GET that does not need the size
+// up front: no byte range, or a valid "bytes=N-" or "bytes=N-M" range. Suffix
+// and invalid ranges keep the Stat path and its existing responses.
+func sidecarDirectRange(h http.Header) (racersdk.ReadOptions, bool) {
+	// With an effectively unbounded size, offsets and lengths are exact.
+	offset, length, partial, status := sidecarRange(h, math.MaxInt64)
+	if status != 0 {
+		return racersdk.ReadOptions{}, false
+	}
+
+	if !partial {
+		return racersdk.ReadOptions{}, true
+	}
+
+	_, spec, _ := strings.Cut(strings.Trim(h.Get("Range"), " \t"), "=")
+	switch {
+	case strings.HasPrefix(spec, "-"):
+		return racersdk.ReadOptions{}, false
+	case strings.HasSuffix(spec, "-"):
+		return racersdk.ReadOptions{Offset: int64(offset)}, true
+	}
+
+	return racersdk.ReadOptions{Offset: int64(offset), Length: int64(length)}, true
+}
+
+func sidecarRangeFailure(w http.ResponseWriter, status int, size int64) sidecarFailure {
+	if status == http.StatusRequestedRangeNotSatisfiable {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+	}
+
+	return sidecarFailure(status)
+}
+
+// sidecarConditions holds the parsed If-Match and If-None-Match headers.
+type sidecarConditions struct {
+	match, none sidecarTags
+}
+
+// evaluate applies the conditions to tag. done is true when the response is
+// decided, either a failure or an already written 304.
+func (c sidecarConditions) evaluate(w http.ResponseWriter, tag string) (sidecarFailure, bool) {
+	if c.match.present && !c.match.matches(tag, false) {
+		return http.StatusPreconditionFailed, true
+	}
+
+	if c.none.present && c.none.matches(tag, true) {
+		w.Header().Set("ETag", tag)
+		w.WriteHeader(http.StatusNotModified)
+
+		return 0, true
+	}
+
+	return 0, false
 }
 
 func (s *sidecar) stream(w http.ResponseWriter, r *http.Request, request racersdk.Request, read sidecarRead) sidecarFailure {
