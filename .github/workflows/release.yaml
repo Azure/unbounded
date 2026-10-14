@@ -633,7 +633,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
+        component:
           - name: netboot
             kernel: ubuntu
           - name: netboot-azurelinux
@@ -672,25 +672,25 @@ jobs:
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
             CONTAINER_REGISTRY=${{ env.REGISTRY }}
-            INSTALLER_KERNEL=${{ matrix.kernel }}
-          tags: ${{ env.REGISTRY }}/${{ matrix.name }}:${{ needs.version.outputs.tag }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+            INSTALLER_KERNEL=${{ matrix.component.kernel }}
+          tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.component.name }}
+          cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
 
       - name: Sign container image
         run: |
           cosign sign --yes \
-            "${{ env.REGISTRY }}/${{ matrix.name }}@${{ steps.push.outputs.digest }}"
+            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          image: ${{ env.REGISTRY }}/${{ matrix.name }}@${{ steps.push.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           format: spdx-json
-          artifact-name: sbom-${{ matrix.name }}.spdx.json
-          output-file: sbom-${{ matrix.name }}.spdx.json
+          artifact-name: sbom-${{ matrix.component.name }}.spdx.json
+          output-file: sbom-${{ matrix.component.name }}.spdx.json
           # Defaults to true, and its uploader is neither idempotent nor
           # able to cope with a release that does not exist yet. The next
           # step attaches this with --clobber instead; see the header.
@@ -699,9 +699,9 @@ jobs:
       - name: Attest SBOM to image
         run: |
           cosign attest --yes \
-            --predicate sbom-${{ matrix.name }}.spdx.json \
+            --predicate sbom-${{ matrix.component.name }}.spdx.json \
             --type spdxjson \
-            "${{ env.REGISTRY }}/${{ matrix.name }}@${{ steps.push.outputs.digest }}"
+            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       # After the attestation, not before: the attestation is the
       # authoritative, digest-bound copy, and it should never be blocked by the
@@ -714,7 +714,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh release upload "$TAG" sbom-${{ matrix.name }}.spdx.json --clobber
+          gh release upload "$TAG" sbom-${{ matrix.component.name }}.spdx.json --clobber
 
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest metalman after its default netboot
