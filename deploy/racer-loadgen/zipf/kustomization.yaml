@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../direct
+  - control.yaml
+patches:
+  - path: daemonset-patch.yaml
+images:
+  - name: racer-loadgen
+    newName: ghcr.io/azure/racer-loadgen
+    newTag: ee7aa7d2ab336da93106cc0d7f10874f71fb8207
