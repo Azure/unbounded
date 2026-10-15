@@ -41,7 +41,7 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--volume` | `racer-object` | Racer ClusterCache name. Must match the socket mount paths. |
+| `--cache` | `racer-object` | Racer ClusterCache name. Must match the socket mount paths. |
 | `--namespace` | none, required | Stable identifier for the upstream store. Not a Kubernetes namespace. |
 | `--bucket` | empty | Allowed bucket or Azure container. Repeatable. Empty allows all. |
 | `--debug-listen` | empty | Optional pprof and `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
@@ -153,7 +153,7 @@ Requirements:
   capabilities dropped, `RuntimeDefault` seccomp, and a read-only root filesystem.
 - **Credentials.** Supply upstream credentials to the origin pods only. See
   [Upstream Providers](#upstream-providers).
-- **Arguments.** Set `--volume`, `--namespace`, and `--bucket` to match the
+- **Arguments.** Set `--cache`, `--namespace`, and `--bucket` to match the
   sidecars, plus the provider flags.
 
 The essential parts of the S3 example:
@@ -187,7 +187,7 @@ spec:
           image: ghcr.io/azure/racer-object:vX.Y.Z
           args:
             - origin
-            - --volume=racer-object
+            - --cache=racer-object
             - --namespace=example-store
             - --bucket=example-bucket
             - --region=us-east-1
@@ -233,7 +233,7 @@ Requirements:
 - **Security context.** Run the sidecar container as UID/GID 0, with no privilege
   escalation, all capabilities dropped, and a read-only root filesystem. The
   application containers can run as any user.
-- **Arguments.** Set `--volume`, `--namespace`, and `--bucket` to match the
+- **Arguments.** Set `--cache`, `--namespace`, and `--bucket` to match the
   origin. Add `--api=azure` if the application uses the Azure Blob API.
 - **No credentials.** Do not give the sidecar or the application upstream
   credentials.
@@ -264,7 +264,7 @@ spec:
       image: ghcr.io/azure/racer-object:vX.Y.Z
       args:
         - sidecar
-        - --volume=racer-object
+        - --cache=racer-object
         - --namespace=example-store
         - --bucket=example-bucket
         - --listen=127.0.0.1:8080

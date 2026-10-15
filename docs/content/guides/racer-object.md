@@ -158,7 +158,7 @@ spec:
           image: ghcr.io/azure/racer-object:vX.Y.Z
           args:
             - origin
-            - --volume=racer-object
+            - --cache=racer-object
             - --namespace=example-store
             - --bucket=example-bucket
             - --region=us-east-1
@@ -184,7 +184,7 @@ EOF
 
 | Argument | Set it to |
 |----------|-----------|
-| `--volume` | The ClusterCache name. |
+| `--cache` | The ClusterCache name. |
 | `--namespace` | A stable name for this store. See the warning below. |
 | `--bucket` | Your bucket name. Repeat the flag for more buckets. |
 | `--region` | Your bucket's region. |
@@ -206,7 +206,7 @@ Use the S3 DaemonSet above with these changes:
   ```yaml
   args:
     - origin
-    - --volume=racer-object
+    - --cache=racer-object
     - --provider=azure
     - --namespace=example-azure-store
     - --bucket=example-container
@@ -301,7 +301,7 @@ spec:
       image: ghcr.io/azure/racer-object:vX.Y.Z
       args:
         - sidecar
-        - --volume=racer-object
+        - --cache=racer-object
         - --namespace=example-store
         - --bucket=example-bucket
       securityContext:

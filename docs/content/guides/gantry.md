@@ -350,6 +350,6 @@ metadata:
 Creating any ClusterCache triggers operator-managed Racer installation.
 
 Racer must run on the same nodes as Gantry. Run one Gantry origin owner on every
-eligible node that can supply origin reads for this volume, with consistent
+eligible node that can supply origin reads for this cache, with consistent
 upstream registry configuration. Match placement and tolerations; installing
 Gantry on only the requesting nodes is not sufficient.
