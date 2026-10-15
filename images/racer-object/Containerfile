@@ -1,32 +1,57 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.9-trixie AS builder
+# Build stage
+# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
+# host even when targeting a foreign TARGETPLATFORM.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.2-trixie AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
 WORKDIR /src
+
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+
+COPY ../../ .
+
 ARG TARGETOS
 ARG TARGETARCH
-ARG VERSION=dev
-ARG GIT_COMMIT=unknown
-ARG BUILD_TIME=unknown
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath \
-    -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}" \
-    -o /out/racer-object ./cmd/racer-object
 
-FROM docker.io/library/debian:trixie-slim
 ARG VERSION=dev
-ARG GIT_COMMIT=unknown
-LABEL org.opencontainers.image.title="racer-object" \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${GIT_COMMIT}"
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/racer-object /usr/local/bin/racer-object
-COPY LICENSE NOTICE /usr/share/licenses/racer-object/
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make racer-object-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+
+# Runtime stage
+FROM ubuntu:noble
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /unbounded/bin
+
+COPY --from=builder /src/bin/racer-object /unbounded/bin/racer-object
+COPY LICENSE NOTICE /unbounded/licenses/
+
+ENV PATH="/unbounded/bin:${PATH}"
+
+WORKDIR /unbounded
+
 # Racer's node-local sockets are root-owned with mode 0600.
 USER 0:0
-ENTRYPOINT ["/usr/local/bin/racer-object"]
+
+ENTRYPOINT ["/unbounded/bin/racer-object"]
