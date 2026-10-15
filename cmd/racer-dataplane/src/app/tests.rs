@@ -1866,7 +1866,9 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
                 (&config, &node, &fixture.long_polls, &finished);
             handles.push(threads.spawn(move || {
                 let (mut worker, runtime, mut engine) = local_worker(config, node, id);
-                let startup = scope(Duration::from_secs(3)).unwrap();
+                // Generous budget: this finishes in well under a second alone,
+                // but the full parallel suite can starve it past a tight one.
+                let startup = scope(Duration::from_secs(15)).unwrap();
                 // Force the first publication to wait for the second worker,
                 // then allow local preparation after the next poll is held.
                 if id == 1 {

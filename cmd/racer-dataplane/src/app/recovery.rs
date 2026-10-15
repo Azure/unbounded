@@ -971,7 +971,12 @@ mod tests {
                 .unwrap();
                 assert!(index.snapshot().unwrap().entries.is_empty());
                 assert!(index.snapshot().unwrap().metadata.is_empty());
-                assert_eq!(segments.snapshot(), fresh);
+                // Freeing the occupied slot advances its generation so the
+                // discarded record location can never validate again.
+                let mut expected = fresh;
+                expected[allocated.id.0 as usize].generation =
+                    page_alloc::Generation(allocated.generation.0 + 1);
+                assert_eq!(segments.snapshot(), expected);
             }
         };
         install(candidate(0, guarded), true);
