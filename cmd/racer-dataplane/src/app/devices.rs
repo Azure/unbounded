@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(test)]
 mod loop_test;
@@ -56,27 +57,41 @@ pub fn discover(config: &Config, selector: Option<&str>, workers: usize) -> Opti
         let root = fs::canonicalize(&config.device_directory)?;
         let mut paths = fs::read_dir(root.join("disk/by-id"))?.collect::<io::Result<Vec<_>>>()?;
         paths.sort_by_key(|entry| entry.file_name());
+        let candidates = paths
+            .into_iter()
+            .filter_map(|entry| {
+                let id = entry.file_name().to_str()?.to_owned();
+                regex.is_match(&id).then(|| (id, entry.path()))
+            })
+            .collect();
         let mut seen = HashSet::new();
         let mut devices = Vec::new();
-        for entry in paths {
-            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !regex.is_match(&id) {
-                continue;
-            }
-            // Avoid reopening an alias while the first exclusive claim is held.
-            if fs::metadata(entry.path()).is_ok_and(|m| seen.contains(&m.rdev())) {
-                continue;
-            }
-            match open_device(&root, &entry.path(), &id, config.segment_bytes) {
-                Ok(device) => {
-                    if seen.insert(device.file.metadata()?.rdev()) {
-                        devices.push(device);
+        let mut failure = None;
+        open_with_busy_wait(
+            candidates,
+            config.device_busy_wait,
+            &mut SystemClock(std::time::Instant::now()),
+            |(id, path): &(String, std::path::PathBuf)| {
+                // Avoid reopening an alias while the first exclusive claim is held.
+                if fs::metadata(path).is_ok_and(|m| seen.contains(&m.rdev())) {
+                    return Ok(());
+                }
+                let device = open_device(&root, path, id, config.segment_bytes)?;
+                match device.file.metadata() {
+                    Ok(metadata) => {
+                        if seen.insert(metadata.rdev()) {
+                            devices.push(device);
+                        }
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
                     }
                 }
-                Err(error) => eprintln!("racer-dataplane: skipping block device {id:?}: {error}"),
-            }
+                Ok(())
+            },
+        );
+        if let Some(error) = failure {
+            return Err(error);
         }
         plan(devices, config, workers).map_err(io::Error::other)
     })();
@@ -86,6 +101,114 @@ pub fn discover(config: &Config, selector: Option<&str>, workers: usize) -> Opti
             eprintln!("racer-dataplane: block device discovery failed; using slab files: {error}");
             None
         }
+    }
+}
+
+/// Interval between exclusive-open retries for busy devices.
+const BUSY_POLL: Duration = Duration::from_millis(250);
+
+trait Clock {
+    fn elapsed(&self) -> Duration;
+    fn sleep(&mut self, duration: Duration);
+}
+
+struct SystemClock(std::time::Instant);
+
+impl Clock for SystemClock {
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// Only EBUSY from the exclusive open is treated as transient. A restarted pod
+/// can start while its predecessor still holds the `O_EXCL` claim. Sysfs
+/// holders (`check_device_state`) are stacked dm/md devices, not process
+/// claims, so they remain permanent rejections.
+fn is_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EBUSY)
+}
+
+/// Opens every candidate once in order, then retries only busy candidates
+/// under one shared deadline so devices wait concurrently, not sequentially.
+/// Non-busy errors, and busy errors when `wait` is zero, are skipped
+/// immediately. Returns the candidates still busy at the deadline.
+fn open_with_busy_wait<C: Candidate>(
+    candidates: Vec<C>,
+    wait: Duration,
+    clock: &mut impl Clock,
+    mut open: impl FnMut(&C) -> io::Result<()>,
+) -> Vec<C> {
+    let mut busy = Vec::new();
+    for candidate in candidates {
+        match open(&candidate) {
+            Ok(()) => {}
+            Err(error) if is_busy(&error) && !wait.is_zero() => busy.push(candidate),
+            Err(error) => {
+                eprintln!(
+                    "racer-dataplane: skipping block device {:?}: {error}",
+                    candidate.id()
+                );
+            }
+        }
+    }
+    if busy.is_empty() {
+        return busy;
+    }
+    eprintln!(
+        "racer-dataplane: waiting up to {}s for {} busy block device(s) to be released",
+        wait.as_secs(),
+        busy.len()
+    );
+    let start = clock.elapsed();
+    loop {
+        let waited = clock.elapsed().saturating_sub(start);
+        if waited >= wait {
+            break;
+        }
+        clock.sleep(BUSY_POLL.min(wait - waited));
+        let mut still = Vec::new();
+        for candidate in busy {
+            match open(&candidate) {
+                Ok(()) => {}
+                Err(error) if is_busy(&error) => still.push(candidate),
+                Err(error) => {
+                    eprintln!(
+                        "racer-dataplane: skipping block device {:?}: {error}",
+                        candidate.id()
+                    );
+                }
+            }
+        }
+        busy = still;
+        if busy.is_empty() {
+            eprintln!(
+                "racer-dataplane: busy block devices released after {}ms",
+                clock.elapsed().saturating_sub(start).as_millis()
+            );
+            return busy;
+        }
+    }
+    for candidate in &busy {
+        eprintln!(
+            "racer-dataplane: skipping block device {:?}: still busy after {}s",
+            candidate.id(),
+            wait.as_secs()
+        );
+    }
+    busy
+}
+
+trait Candidate {
+    fn id(&self) -> &str;
+}
+
+impl Candidate for (String, std::path::PathBuf) {
+    fn id(&self) -> &str {
+        &self.0
     }
 }
 
@@ -442,6 +565,137 @@ pub(super) fn recovery_layout_fixture()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeClock(Duration);
+
+    impl Clock for FakeClock {
+        fn elapsed(&self) -> Duration {
+            self.0
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.0 += duration;
+        }
+    }
+
+    fn candidates(ids: &[&str]) -> Vec<(String, std::path::PathBuf)> {
+        ids.iter().map(|id| ((*id).into(), id.into())).collect()
+    }
+
+    fn busy() -> io::Error {
+        io::Error::from_raw_os_error(libc::EBUSY)
+    }
+
+    #[test]
+    fn busy_device_released_within_deadline_is_used() {
+        let mut clock = FakeClock(Duration::from_secs(5));
+        let mut opened = Vec::new();
+        let mut attempts = 0;
+        let left = open_with_busy_wait(
+            candidates(&["a", "b"]),
+            Duration::from_secs(120),
+            &mut clock,
+            |(id, _)| {
+                if id == "a" {
+                    attempts += 1;
+                    if attempts <= 3 {
+                        return Err(busy());
+                    }
+                }
+                opened.push(id.clone());
+                Ok(())
+            },
+        );
+        assert!(left.is_empty());
+        assert_eq!(opened, ["b", "a"]);
+        assert_eq!(attempts, 4);
+        assert_eq!(clock.0, Duration::from_secs(5) + 3 * BUSY_POLL);
+    }
+
+    #[test]
+    fn busy_devices_share_one_deadline_then_fall_back() {
+        let wait = Duration::from_millis(1_100);
+        let mut clock = FakeClock(Duration::ZERO);
+        let mut calls = 0;
+        let left = open_with_busy_wait(candidates(&["a", "b", "c"]), wait, &mut clock, |_| {
+            calls += 1;
+            Err(busy())
+        });
+        assert_eq!(left, candidates(&["a", "b", "c"]));
+        // One shared deadline: total wait does not scale with device count.
+        assert_eq!(clock.0, wait);
+        // Initial pass plus five polls (250 ms x4, then the 100 ms remainder).
+        assert_eq!(calls, 3 * 6);
+        // With no device opened, planning rejects the empty set, so discovery
+        // falls back to slab files.
+        assert!(plan(Vec::new(), &config(), 1).is_err());
+    }
+
+    #[test]
+    fn non_busy_errors_are_not_retried() {
+        let mut clock = FakeClock(Duration::ZERO);
+        let mut calls = 0;
+        let left = open_with_busy_wait(
+            candidates(&["a", "b"]),
+            Duration::from_secs(120),
+            &mut clock,
+            |(id, _)| {
+                calls += 1;
+                if id == "a" {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    Err(io::Error::other("nonzero device guard"))
+                }
+            },
+        );
+        assert!(left.is_empty());
+        assert_eq!(calls, 2);
+        assert_eq!(clock.0, Duration::ZERO);
+    }
+
+    #[test]
+    fn busy_then_permanent_error_stops_retrying() {
+        let mut clock = FakeClock(Duration::ZERO);
+        let mut calls = 0;
+        let left = open_with_busy_wait(
+            candidates(&["a"]),
+            Duration::from_secs(120),
+            &mut clock,
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    Err(busy())
+                } else {
+                    Err(io::Error::other("device is mounted"))
+                }
+            },
+        );
+        assert!(left.is_empty());
+        assert_eq!(calls, 2);
+        assert_eq!(clock.0, BUSY_POLL);
+    }
+
+    #[test]
+    fn zero_wait_disables_busy_retry() {
+        let mut clock = FakeClock(Duration::ZERO);
+        let mut calls = 0;
+        let left = open_with_busy_wait(candidates(&["a"]), Duration::ZERO, &mut clock, |_| {
+            calls += 1;
+            Err(busy())
+        });
+        assert!(left.is_empty());
+        assert_eq!(calls, 1);
+        assert_eq!(clock.0, Duration::ZERO);
+    }
+
+    #[test]
+    fn only_ebusy_is_transient() {
+        assert!(is_busy(&busy()));
+        assert!(!is_busy(&io::Error::from_raw_os_error(libc::EIO)));
+        assert!(!is_busy(&io::Error::other(
+            "read-only device or active holders"
+        )));
+    }
 
     fn config() -> Config {
         crate::test_support::cluster::config(false)
