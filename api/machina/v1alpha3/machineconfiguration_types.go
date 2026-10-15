@@ -156,8 +156,11 @@ type MachineConfigurationNVIDIA struct {
 }
 
 // MachineConfigurationNVIDIAIMEX configures NVIDIA IMEX integration.
-// +kubebuilder:validation:XValidation:rule="!has(self.mode) || (has(self.hostProfile) && has(self.hostProfileVersion) && has(self.hostContractVersion) && has(self.hostArtifactPath) && has(self.hostProfileDigest))",message="mode DRA requires hostProfile, hostProfileVersion, hostContractVersion, hostArtifactPath, and hostProfileDigest"
-// +kubebuilder:validation:XValidation:rule="has(self.mode) || (!has(self.hostProfile) && !has(self.hostProfileVersion) && !has(self.hostContractVersion) && !has(self.hostArtifactPath) && !has(self.hostProfileDigest))",message="host qualification fields require mode DRA"
+// +kubebuilder:validation:XValidation:rule="has(self.mode) == has(self.hostProfile)",message="hostProfile must be set exactly when mode DRA is set"
+// +kubebuilder:validation:XValidation:rule="has(self.mode) == has(self.hostProfileVersion)",message="hostProfileVersion must be set exactly when mode DRA is set"
+// +kubebuilder:validation:XValidation:rule="has(self.mode) == has(self.hostContractVersion)",message="hostContractVersion must be set exactly when mode DRA is set"
+// +kubebuilder:validation:XValidation:rule="has(self.mode) == has(self.hostArtifactPath)",message="hostArtifactPath must be set exactly when mode DRA is set"
+// +kubebuilder:validation:XValidation:rule="has(self.mode) == has(self.hostProfileDigest)",message="hostProfileDigest must be set exactly when mode DRA is set"
 type MachineConfigurationNVIDIAIMEX struct {
 	// Mode selects the IMEX lifecycle owner. DRA exposes a prequalified node to
 	// NVIDIA DRA ComputeDomains; an empty value disables IMEX exposure.

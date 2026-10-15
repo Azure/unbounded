@@ -221,15 +221,21 @@ spec:
                                 type: string
                             type: object
                             x-kubernetes-validations:
-                            - message: mode DRA requires hostProfile, hostProfileVersion,
-                                hostContractVersion, hostArtifactPath, and hostProfileDigest
-                              rule: '!has(self.mode) || (has(self.hostProfile) &&
-                                has(self.hostProfileVersion) && has(self.hostContractVersion)
-                                && has(self.hostArtifactPath) && has(self.hostProfileDigest))'
-                            - message: host qualification fields require mode DRA
-                              rule: has(self.mode) || (!has(self.hostProfile) && !has(self.hostProfileVersion)
-                                && !has(self.hostContractVersion) && !has(self.hostArtifactPath)
-                                && !has(self.hostProfileDigest))
+                            - message: hostProfile must be set exactly when mode DRA
+                                is set
+                              rule: has(self.mode) == has(self.hostProfile)
+                            - message: hostProfileVersion must be set exactly when
+                                mode DRA is set
+                              rule: has(self.mode) == has(self.hostProfileVersion)
+                            - message: hostContractVersion must be set exactly when
+                                mode DRA is set
+                              rule: has(self.mode) == has(self.hostContractVersion)
+                            - message: hostArtifactPath must be set exactly when mode
+                                DRA is set
+                              rule: has(self.mode) == has(self.hostArtifactPath)
+                            - message: hostProfileDigest must be set exactly when
+                                mode DRA is set
+                              rule: has(self.mode) == has(self.hostProfileDigest)
                         type: object
                     type: object
                   host:
