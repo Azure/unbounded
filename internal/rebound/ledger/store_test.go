@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 )
@@ -266,4 +267,62 @@ func TestStoreCreateExceedsGrantLimit(t *testing.T) {
 	after, err := s.Get(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, before.Data, after.Data)
+}
+
+func TestStoreReplacementUsesGrantLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		size    int
+		add     bool
+		wantErr error
+	}{
+		{name: "replacement above grant limit", size: MaxSize, add: true, wantErr: ErrTooLarge},
+		{name: "replacement below grant limit", size: MaxSize - 1024, add: true},
+		{name: "reap only above grant limit", size: MaxSize},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before, g := paddedLedger(t, tt.size)
+			client := fake.NewClientset(before.DeepCopy())
+			s := &Store{Client: client, Namespace: "system"}
+			_, _, err := s.Update(t.Context(), false, func(l *Ledger) error {
+				removed, _ := l.Reap(g.ExpiresAt, nil)
+				require.Len(t, removed, 1)
+
+				if tt.add {
+					// Same grant count as before the write.
+					require.NoError(t, l.Add(testGrant("new", "node-new")))
+				}
+
+				return nil
+			})
+			require.ErrorIs(t, err, tt.wantErr)
+
+			after, err := s.Get(t.Context())
+			require.NoError(t, err)
+
+			if tt.wantErr != nil {
+				require.Empty(t, writeActions(client))
+				require.Equal(t, before.Data, after.Data)
+
+				return
+			}
+
+			require.Len(t, writeActions(client), 1)
+
+			_, exists := Parse(after.Data).Get(g.Key())
+			require.False(t, exists)
+		})
+	}
+}
+
+func TestAddsGrant(t *testing.T) {
+	a, b := testGrant("a", "node-a"), testGrant("b", "node-b")
+	keep := map[types.NamespacedName]*Grant{a.Key(): a}
+	require.False(t, addsGrant(keep, keep))
+	require.False(t, addsGrant(keep, map[types.NamespacedName]*Grant{}))
+	require.True(t, addsGrant(keep, map[types.NamespacedName]*Grant{a.Key(): a, b.Key(): b}))
+	require.True(t, addsGrant(keep, map[types.NamespacedName]*Grant{b.Key(): b}))
+
+	replaced := *a
+	require.True(t, addsGrant(keep, map[types.NamespacedName]*Grant{a.Key(): &replaced}))
 }

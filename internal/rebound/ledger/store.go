@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/clock"
@@ -51,15 +52,17 @@ func (s *Store) Update(ctx context.Context, dryRun bool, mutate func(*Ledger) er
 
 		l := Parse(cm.Data)
 
-		grantCount := len(l.grants)
+		before := maps.Clone(l.grants)
 		if err := mutate(l); err != nil {
 			return err
 		}
 
 		data := l.Encode()
-		// Cleanup can grow release records, so reserve space beyond the grant limit.
+		// Cleanup can grow release records, so reserve space beyond the grant
+		// limit. Any write that adds a grant gets the grant limit, even if it
+		// also removes one, so a replacement cannot use the cleanup reserve.
 		limit := cleanupMaxSize
-		if len(l.grants) > grantCount {
+		if addsGrant(before, l.grants) {
 			limit = MaxSize
 		}
 
@@ -100,6 +103,19 @@ func (s *Store) Update(ctx context.Context, dryRun bool, mutate func(*Ledger) er
 	}
 
 	return out, rv, nil
+}
+
+// addsGrant reports whether after holds a grant record that before did not.
+// Parse creates new records and mutations keep them, so a record that is not
+// the same pointer as before was added or replaced.
+func addsGrant(before, after map[types.NamespacedName]*Grant) bool {
+	for key, g := range after {
+		if before[key] != g {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Confirm confirms unconfirmed releases (see Ledger.Confirm). Call it after

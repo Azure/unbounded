@@ -143,8 +143,8 @@ authorization are also accepted. Run `rebound --help` for the full list.
 ## Limits
 
 - A selector must match 1 to `--max-nodes-per-grant` nodes. Empty selectors are rejected.
-- The ledger must fit in one ConfigMap. Writes that increase the grant count are
-  limited to 900 KiB of data; cleanup writes may use up to 1000 KiB.
+- The ledger must fit in one ConfigMap. Writes that add a grant, including
+  ones that also remove an expired grant, are limited to 900 KiB of data; cleanup writes may use up to 1000 KiB.
 - Watch history covers the last 100 ledger changes. Older resource versions get `410 Gone`.
 - Pod placement enforcement is eventual: the policy reads the ledger through the
   API server's parameter cache. For a short time after a grant is created

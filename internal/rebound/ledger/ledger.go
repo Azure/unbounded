@@ -34,7 +34,7 @@ const (
 	// ConfigMapName is the name of the ledger ConfigMap.
 	ConfigMapName = "rebound-ledger"
 
-	// MaxSize bounds the encoded ledger for writes that increase the grant count.
+	// MaxSize bounds the encoded ledger for writes that add a grant.
 	// Cleanup writes have extra headroom for release records.
 	MaxSize = 900 * 1024
 
