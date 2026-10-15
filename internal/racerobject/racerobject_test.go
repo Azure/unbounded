@@ -1118,6 +1118,8 @@ func TestSidecarReads(t *testing.T) {
 		{"large suffix", "GET", "bytes=-999", "0123456789", "bytes 0-9/10", 206},
 		{"one byte", "GET", "bytes=0-0", "0", "bytes 0-0/10", 206},
 		{"head range", "HEAD", "bytes=2-5", "", "bytes 2-5/10", 206},
+		{"clamped past int64", "GET", "bytes=8-9223372036854775808", "89", "bytes 8-9/10", 206},
+		{"suffix past int64", "GET", "bytes=-18446744073709551615", "0123456789", "bytes 0-9/10", 206},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := calls.Load()
@@ -1323,6 +1325,8 @@ func TestSidecarInvalidRanges(t *testing.T) {
 		{"bytes=0-1-2", 400},
 		{"bytes= 0-1", 400},
 		{"bytes=18446744073709551616-", 400},
+		{"bytes=9223372036854775808-", 416},
+		{"bytes=18446744073709551615-", 416},
 		{"bytes=-bad", 400},
 		{"bytes=-18446744073709551616", 400},
 		{"", 400},
@@ -1342,6 +1346,32 @@ func TestSidecarInvalidRanges(t *testing.T) {
 	w := sidecarTestRequest(h, "GET", "/bucket/key", http.Header{"Range": {"bytes=0-1", "bytes=2-3"}})
 	if w.Code != 400 {
 		t.Fatal("multiple ranges accepted")
+	}
+}
+
+func TestSidecarRangeInt64Bounds(t *testing.T) {
+	const size = math.MaxInt64
+
+	for _, tc := range []struct {
+		value          string
+		offset, length int64
+		status         int
+	}{
+		{"bytes=0-18446744073709551615", 0, size, 0},
+		{"bytes=9223372036854775806-", size - 1, 1, 0},
+		{"bytes=9223372036854775806-18446744073709551615", size - 1, 1, 0},
+		{"bytes=-18446744073709551615", 0, size, 0},
+		{"bytes=-1", size - 1, 1, 0},
+		{"bytes=9223372036854775807-", 0, 0, http.StatusRequestedRangeNotSatisfiable},
+		{"bytes=18446744073709551615-", 0, 0, http.StatusRequestedRangeNotSatisfiable},
+		{"bytes=18446744073709551616-", 0, 0, http.StatusBadRequest},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			offset, length, _, status := sidecarRange(http.Header{"Range": {tc.value}}, size)
+			if offset != tc.offset || length != tc.length || status != tc.status {
+				t.Fatalf("got offset=%d length=%d status=%d", offset, length, status)
+			}
+		})
 	}
 }
 

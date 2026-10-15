@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -529,7 +530,7 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 		rangeHeaders = azureSidecarRangeHeaders(r)
 	}
 
-	offset, length, partial, status := sidecarRange(rangeHeaders, uint64(m.Size))
+	offset, length, partial, status := sidecarRange(rangeHeaders, m.Size)
 	if status != 0 {
 		if status == http.StatusRequestedRangeNotSatisfiable {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", m.Size))
@@ -549,7 +550,7 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 
 func (s *sidecar) stream(w http.ResponseWriter, r *http.Request, request racersdk.Request, read sidecarRead) sidecarFailure {
 	v, err := s.client.Get(r.Context(), request, racersdk.ReadOptions{
-		ETag: read.metadata.ETag, Offset: int64(read.offset), Length: int64(read.length),
+		ETag: read.metadata.ETag, Offset: read.offset, Length: read.length,
 	})
 	if err != nil {
 		return sidecarSDKFailure(err)
@@ -673,7 +674,7 @@ func sidecarVersion(r *http.Request) (string, sidecarFailure) {
 type sidecarRead struct {
 	metadata       racersdk.Metadata
 	version        string
-	offset, length uint64
+	offset, length int64
 	partial        bool
 	api            string
 }
@@ -682,7 +683,7 @@ func (read sidecarRead) writeHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("ETag", read.metadata.ETag)
 	h.Set("Accept-Ranges", "bytes")
-	h.Set("Content-Length", strconv.FormatUint(read.length, 10))
+	h.Set("Content-Length", strconv.FormatInt(read.length, 10))
 
 	contentType := read.metadata.ContentType
 	if contentType == "" {
@@ -857,7 +858,9 @@ func (c sidecarTags) matches(tag string, weak bool) bool {
 	return false
 }
 
-func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bool, status int) {
+// sidecarRange selects one byte range of an object. The SDK rejects negative
+// metadata sizes, so size is never negative here.
+func sidecarRange(h http.Header, size int64) (offset, length int64, partial bool, status int) {
 	values, present := h["Range"]
 	if !present {
 		return 0, size, false, 0
@@ -897,7 +900,7 @@ func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bo
 		return 0, 0, false, http.StatusBadRequest
 	}
 
-	end := uint64(0)
+	end := int64(0)
 	if last != "" {
 		end, ok = sidecarRangeNumber(last)
 		if !ok || end < start {
@@ -917,7 +920,9 @@ func sidecarRange(h http.Header, size uint64) (offset, length uint64, partial bo
 }
 
 // Reject signs and whitespace rather than accepting anything but decimal digits.
-func sidecarRangeNumber(s string) (uint64, bool) {
+// Object sizes are int64, so a position past math.MaxInt64 selects the same
+// bytes as math.MaxInt64 and is clamped to it.
+func sidecarRangeNumber(s string) (int64, bool) {
 	for _, c := range []byte(s) {
 		if c < '0' || c > '9' {
 			return 0, false
@@ -925,6 +930,13 @@ func sidecarRangeNumber(s string) (uint64, bool) {
 	}
 
 	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
 
-	return n, err == nil
+	if n > math.MaxInt64 {
+		return math.MaxInt64, true
+	}
+
+	return int64(n), true
 }
