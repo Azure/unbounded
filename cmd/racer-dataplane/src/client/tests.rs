@@ -972,10 +972,17 @@ impl Fixture {
         self.reactor.poll_budgeted(64).unwrap();
     }
     fn receive(&self, socket: &mut UnixStream, eof: bool) -> Vec<u8> {
+        self.receive_budgeted(socket, eof, 16)
+    }
+    /// Receive while polling at most `budget` listener entries per pump. A
+    /// budget of two reserves one turn for accept and drives one connection
+    /// per pass, so connections that become ready together submit their I/O
+    /// one at a time and the reactor reaps it before the next connection runs.
+    fn receive_budgeted(&self, socket: &mut UnixStream, eof: bool, budget: usize) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut output = Vec::new();
         loop {
-            self.pump(16);
+            self.pump(budget);
             let mut bytes = [0; 8192];
             match socket.read(&mut bytes) {
                 Ok(0) => return output,
@@ -1741,6 +1748,11 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
         .with_observer(failures.observer(crate::model::WorkerId(0))),
     );
     let held = pipes.acquire().unwrap();
+    // Hold the shared page fill so no waiter can complete before the
+    // overflow request is queued. Without this, whether a head arrives during
+    // start_body depends on how fast the origin thread answers.
+    let origin = &fixture.worker.as_ref().unwrap().origin;
+    origin.block(RequestKind::InitialGet);
     let mut first = start_body(&fixture);
     let mut second = start_body(&fixture);
     let mut third = start_body(&fixture);
@@ -1750,7 +1762,10 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     assert_no_head(&mut third);
     assert_no_head(&mut fourth);
     let mut overflow = start_body(&fixture);
-    let output = fixture.receive(&mut overflow, true);
+    origin.release(RequestKind::InitialGet);
+    // Every request becomes ready when the fill lands. Drive one connection
+    // per pass so their response sends cannot together exhaust the 4-entry ring.
+    let output = fixture.receive_budgeted(&mut overflow, true, 2);
     let mut diagnostics = String::new();
     failures.write(&mut diagnostics).unwrap();
     assert!(
@@ -1759,7 +1774,7 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     );
     assert_eq!(&output[output.len() - 26..output.len() - 21], b"hello");
     for socket in [&mut first, &mut second, &mut third, &mut fourth] {
-        let output = fixture.receive(socket, true);
+        let output = fixture.receive_budgeted(socket, true, 2);
         let mut diagnostics = String::new();
         failures.write(&mut diagnostics).unwrap();
         assert!(
