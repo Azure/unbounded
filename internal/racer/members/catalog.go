@@ -14,23 +14,7 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// BuildVolumeCatalog selects Cache volumes without changing their Kubernetes UID.
-func BuildVolumeCatalog(volumes []racerv1.ClusterVolume) ([]wire.CacheDefinition, error) {
-	return BuildCatalog(cacheVolumes(volumes))
-}
-
-func cacheVolumes(volumes []racerv1.ClusterVolume) []racerv1.ClusterCache {
-	caches := make([]racerv1.ClusterCache, 0, len(volumes))
-	for _, volume := range volumes {
-		if volume.Spec.Type == racerv1.ClusterVolumeTypeCache {
-			caches = append(caches, racerv1.ClusterCache{ObjectMeta: volume.ObjectMeta})
-		}
-	}
-
-	return caches
-}
-
-// ReadCatalog accepts either API and rejects collisions across both kinds.
+// ReadCatalog builds the cache catalog from installed ClusterCaches.
 // A missing CRD is allowed; authorization and other read failures are not.
 func ReadCatalog(ctx context.Context, reader client.Reader) ([]wire.CacheDefinition, error) {
 	var caches racerv1.ClusterCacheList
@@ -38,12 +22,7 @@ func ReadCatalog(ctx context.Context, reader client.Reader) ([]wire.CacheDefinit
 		return nil, CatalogReadError{err}
 	}
 
-	var volumes racerv1.ClusterVolumeList
-	if err := reader.List(ctx, &volumes); err != nil && !meta.IsNoMatchError(err) && !apierrors.IsNotFound(err) {
-		return nil, CatalogReadError{err}
-	}
-
-	return BuildCatalog(append(caches.Items, cacheVolumes(volumes.Items)...))
+	return BuildCatalog(caches.Items)
 }
 
 // CatalogReadError distinguishes unavailable observations from invalid catalogs.
