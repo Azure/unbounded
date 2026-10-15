@@ -119,3 +119,13 @@ func TestCollectorMakefileErrors(t *testing.T) {
 		t.Fatal("expected Makefile read error")
 	}
 }
+
+func TestCollectorWithoutPinnedNativeSources(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{"Makefile": "all:\n"})
+
+	entries, err := New().Collect(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("Collect = %v, %v; want no native entries", entries, err)
+	}
+}

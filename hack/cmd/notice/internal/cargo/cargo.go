@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/racer-dataplane.
+// dependencies of the Racer workspace and performance crate.
 package cargo
 
 import (
@@ -13,7 +13,9 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/pelletier/go-toml/v2"
 
@@ -53,12 +55,7 @@ func (c *Collector) Name() string { return "cargo" }
 
 // Precheck implements notice.Collector.
 func (c *Collector) Precheck(root string) error {
-	present, err := cargoFilesPresent(root)
-	if err != nil || !present {
-		return err
-	}
-
-	versions, err := workspaceVersions(root)
+	versions, err := allVersions(root)
 	if err != nil {
 		return err
 	}
@@ -73,7 +70,7 @@ func (c *Collector) Precheck(root string) error {
 	}
 
 	if _, err := os.Stat(filepath.Join(home, "registry", "src")); err != nil {
-		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path %s/Cargo.toml --locked' first (%w)", cratePath, err)
+		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path <crate>/Cargo.toml --locked' for cmd/racer-dataplane and cmd/racer-loadgen/performance first (%w)", err)
 	}
 
 	return nil
@@ -81,12 +78,7 @@ func (c *Collector) Precheck(root string) error {
 
 // Collect implements notice.Collector.
 func (c *Collector) Collect(root string) ([]notice.Entry, error) {
-	present, err := cargoFilesPresent(root)
-	if err != nil || !present {
-		return nil, err
-	}
-
-	versions, err := workspaceVersions(root)
+	versions, err := allVersions(root)
 	if err != nil {
 		return nil, err
 	}
@@ -106,10 +98,14 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 
 // cargoFilesPresent permits an inactive scaffold, but rejects incomplete inputs.
 func cargoFilesPresent(root string) (bool, error) {
+	return crateFilesPresent(root, cratePath)
+}
+
+func crateFilesPresent(root, crateDir string) (bool, error) {
 	missing := make([]string, 0, 2)
 
 	for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
-		path := filepath.Join(root, cratePath, name)
+		path := filepath.Join(root, crateDir, name)
 
 		info, err := os.Lstat(path)
 		if os.IsNotExist(err) {
@@ -138,7 +134,7 @@ func cargoFilesPresent(root string) (bool, error) {
 	}
 
 	if len(missing) != 0 {
-		return false, fmt.Errorf("missing %s", filepath.Join(cratePath, missing[0]))
+		return false, fmt.Errorf("missing %s", filepath.Join(crateDir, missing[0]))
 	}
 
 	return true, nil
@@ -557,11 +553,57 @@ func lockDependency(value string) (string, string) {
 }
 
 func quotedValue(value string) string {
-	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+	parsed, err := parseQuotedValue(value)
+	if err != nil {
 		return ""
 	}
 
-	return value[1 : len(value)-1]
+	return parsed
+}
+
+func parseQuotedValue(value string) (string, error) {
+	if len(value) < 2 || (value[0] != '"' && value[0] != '\'') || value[len(value)-1] != value[0] || !utf8.ValidString(value) {
+		return "", fmt.Errorf("expected a single-line quoted string, got %q", value)
+	}
+
+	body := value[1 : len(value)-1]
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if (ch < 0x20 && ch != '\t') || ch == 0x7f || ch == value[0] {
+			return "", fmt.Errorf("invalid character in quoted string %q", value)
+		}
+
+		if value[0] == '"' && ch == '\\' {
+			i++
+			if i == len(body) || !strings.ContainsRune(`btnfr"\uU`, rune(body[i])) {
+				return "", fmt.Errorf("invalid basic string escape in %q", value)
+			}
+		}
+	}
+
+	if value[0] == '\'' {
+		return body, nil
+	}
+
+	parsed, err := strconv.Unquote(value)
+	if err != nil {
+		return "", fmt.Errorf("invalid basic string %q: %w", value, err)
+	}
+
+	return parsed, nil
+}
+
+func manifestPackageName(data string) (string, error) {
+	var manifest struct{ Package struct{ Name string } }
+	if err := toml.Unmarshal([]byte(data), &manifest); err != nil {
+		return "", err
+	}
+
+	if manifest.Package.Name == "" {
+		return "", fmt.Errorf("missing package name")
+	}
+
+	return manifest.Package.Name, nil
 }
 
 func crateLicense(dir string) string {
