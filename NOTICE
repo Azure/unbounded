@@ -239,35 +239,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.47.1/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.47.3/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.33.6/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.33.9/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.20.6/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.20.9/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.114.0/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.114.3/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.28.2/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.28.5/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -415,9 +415,9 @@ notices:
       - Copyright (c) Intel Corporation
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/google/go-tpm-tools/blob/v0.4.10/LICENSE
+        link: https://github.com/google/go-tpm-tools/blob/v0.4.11/LICENSE
       - name: BSD 2-Clause License
-        link: https://github.com/google/go-tpm-tools/blob/v0.4.10/LICENSE
+        link: https://github.com/google/go-tpm-tools/blob/v0.4.11/LICENSE
   - dependency: github.com/google/licensecheck
     ecosystem: go
     copyright:
@@ -525,9 +525,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.126.1/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.126.2/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.126.1/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.126.2/LICENSE.txt
   - dependency: github.com/pelletier/go-toml/v2
     ecosystem: go
     copyright:
@@ -557,21 +557,21 @@ notices:
       - Copyright 2010 The Go Authors
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/prometheus/client_golang/blob/v1.24.1/LICENSE
+        link: https://github.com/prometheus/client_golang/blob/v1.25.0/LICENSE
   - dependency: github.com/prometheus/client_model
     ecosystem: go
     copyright:
       - Copyright 2012-2015 The Prometheus Authors
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/prometheus/client_model/blob/v0.6.2/LICENSE
+        link: https://github.com/prometheus/client_model/blob/v0.6.3/LICENSE
   - dependency: github.com/prometheus/common
     ecosystem: go
     copyright:
       - Copyright 2015 The Prometheus Authors
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/prometheus/common/blob/v0.70.1/LICENSE
+        link: https://github.com/prometheus/common/blob/v0.72.0/LICENSE
   - dependency: github.com/spf13/cobra
     ecosystem: go
     copyright:
