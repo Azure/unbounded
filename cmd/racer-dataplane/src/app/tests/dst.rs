@@ -1309,8 +1309,11 @@ mod scenarios {
         }
         assert!(harness.coverage.secondary_worker_turns > 0);
         assert!(harness.coverage.relay_turns > 0);
-        // Direct delivery changes deterministic turn ordering under injected pressure.
-        assert_eq!(harness.coverage.success, if opaque { 8 } else { 9 });
+        // Exact deterministic count under injected pressure. Delivery mode and
+        // replica selection change turn ordering, so this pins the default
+        // `spread` selection: legacy `primary` selection lost one more opaque
+        // read (8) to the injected pressure window.
+        assert_eq!(harness.coverage.success, 9, "opaque={opaque}");
     }
 }
 mod traffic {
