@@ -639,7 +639,7 @@ func validateRequiredNVIDIAQualificationFields(data []byte) error {
 	return requireJSONFields(authenticity, "authenticity", []string{"status", "requiredBeforeRelease", "attestation"})
 }
 
-func requiredJSONObject(parent map[string]json.RawMessage, key string, path string) (map[string]json.RawMessage, error) {
+func requiredJSONObject(parent map[string]json.RawMessage, key, path string) (map[string]json.RawMessage, error) {
 	raw, ok := parent[key]
 	if !ok {
 		return nil, fmt.Errorf("required field %q is missing", path)
@@ -671,7 +671,7 @@ func requireJSONFields(object map[string]json.RawMessage, path string, fields []
 	return nil
 }
 
-func requireJSONArray(parent map[string]json.RawMessage, key string, path string) error {
+func requireJSONArray(parent map[string]json.RawMessage, key, path string) error {
 	raw, ok := parent[key]
 	if !ok {
 		return fmt.Errorf("required field %q is missing", path)
@@ -685,7 +685,7 @@ func requireJSONArray(parent map[string]json.RawMessage, key string, path string
 	return nil
 }
 
-func requireJSONNonNull(parent map[string]json.RawMessage, key string, path string) error {
+func requireJSONNonNull(parent map[string]json.RawMessage, key, path string) error {
 	raw, ok := parent[key]
 	if !ok {
 		return fmt.Errorf("required field %q is missing", path)
