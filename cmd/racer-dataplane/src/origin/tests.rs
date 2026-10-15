@@ -1465,7 +1465,8 @@ mod protocol_tests {
             b"application/vnd.oci.image.manifest.v1+json".as_slice(),
             b"",
             b"text",
-            b"text/plain\t",
+            // Edge OWS is trimmed by the wire layer, so use a non-OWS control byte.
+            b"text/plain\x0b",
             b"text/plain, text/html",
             b"text/\xff",
             b"text/plain\r\nx:y",

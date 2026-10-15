@@ -2190,7 +2190,7 @@ pub(crate) mod tests {
                     "duplicate-signature",
                     "leading",
                     "trailing",
-                    "non-ascii",
+                    "control",
                     "newline",
                     "bad-name",
                     "timestamp",
@@ -2209,7 +2209,7 @@ pub(crate) mod tests {
                             let (name, value) = match fault {
                                 "leading" => ("x-fixture-00", b" leading".to_vec()),
                                 "trailing" => ("x-fixture-00", b"trailing\t".to_vec()),
-                                "non-ascii" => ("x-fixture-00", vec![0xff]),
+                                "control" => ("x-fixture-00", vec![0x7f]),
                                 "newline" => ("x-fixture-00", b"x\r\ny".to_vec()),
                                 "timestamp" => ("racer-timestamp", b"01700000000123".to_vec()),
                                 "signer" => ("racer-signer", b"not-a-uuid".to_vec()),
@@ -2429,14 +2429,17 @@ pub(crate) mod tests {
                 decode_nodes(crate::peer::protocol::nodes(&nodes).unwrap().as_bytes()).unwrap(),
                 nodes
             );
-            assert!(
-                decode_nodes(
-                    crate::peer::protocol::nodes(&[nodes[0].clone(), nodes[0].clone()])
-                        .unwrap()
-                        .as_bytes()
-                )
-                .is_err()
+            // Duplicates are rejected at encode time and at decode time.
+            assert_eq!(
+                crate::peer::protocol::nodes(&[nodes[0].clone(), nodes[0].clone()]),
+                Err(Error::InvalidRequest)
             );
+            let mut duplicate = Vec::new();
+            for _ in 0..2 {
+                duplicate.extend_from_slice(&(nodes[0].0.len() as u32).to_be_bytes());
+                duplicate.extend_from_slice(nodes[0].0.as_bytes());
+            }
+            assert!(decode_nodes(binary(&duplicate).as_bytes()).is_err());
             let deadline = Deadline(Instant::now() + Duration::from_secs(30));
             let encoded = encode_deadline(deadline).unwrap();
             let decoded = decode_deadline(encoded).unwrap();

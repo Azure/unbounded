@@ -3392,6 +3392,12 @@ mod adaptive {
             Err(Error::Overloaded)
         ));
         drop(permits);
+        // Retirement ages from release, not from acquisition.
+        assert!(matches!(
+            owner.acquire(&NodeId("new".into())),
+            Err(Error::Overloaded)
+        ));
+        clock.advance(Duration::from_secs(60));
         let _permit = owner.acquire(&NodeId("new".into())).unwrap();
         // The generic test asserts the internal table length. Here verify the
         // configured capacity accepts exactly that many simultaneously live keys.
