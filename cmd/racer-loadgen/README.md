@@ -53,16 +53,16 @@ Recommended DaemonSet split:
 
 1. Replace the old load workload with origin-only loadgen containers using
    `--s3-origin --concurrency=0`. Run a `racer-object origin` container on every
-   eligible Racer origin node, with `--volume=racer-object --namespace=benchmark-v1
+   eligible Racer origin node, with `--cache=racer-object --namespace=benchmark-v1
    --bucket=benchmark --region=us-east-1 --path-style=true
    --endpoint=http://127.0.0.1:8080` when colocated with the synthetic server.
-   Mount the volume's origin socket directory only into racer-object origin.
+   Mount the cache's origin socket directory only into racer-object origin.
    The AWS client still needs credentials: for this unauthenticated fixture,
    supply non-secret placeholder AWS credential environment values and set
    `AWS_EC2_METADATA_DISABLED=true`. Do not use real cloud credentials.
 2. Run another loadgen DaemonSet with a `racer-object sidecar` container:
-   `sidecar --volume=racer-object --namespace=benchmark-v1 --bucket=benchmark
-   --listen=127.0.0.1:8080`. Mount the volume's client socket directory only into
+   `sidecar --cache=racer-object --namespace=benchmark-v1 --bucket=benchmark
+   --listen=127.0.0.1:8080`. Mount the cache's client socket directory only into
    the sidecar. The loadgen container needs no socket mounts or credentials.
    Without `--s3-origin`, S3 loadgen starts only its metrics/probe listener,
    leaving port 8080 free for the sidecar. Do not expose the sidecar with a Service
@@ -129,7 +129,7 @@ point `--target` at that origin instead.
 For the same blobs directly through Racer, without Gantry:
 
 ```sh
-racer-loadgen --backend=uds --volume=racer-loadgen \
+racer-loadgen --backend=uds --cache=racer-loadgen \
   --catalog-blobs=128 --blob-bytes=67108864 \
   --concurrency=8 --seed=benchmark-v1
 ```
@@ -138,7 +138,7 @@ Direct mode uses `pkg/racersdk` against
 `/run/racer/racer-loadgen/client/socket` and serves the synthetic origin at
 `/run/racer/racer-loadgen/origin/socket`. It starts no HTTP registry and ignores
 `--target`, `--namespace`, and `--listen`. Metrics and probes still use
-`--metrics-listen` (default `:9090`). An operational Racer dataplane and volume
+`--metrics-listen` (default `:9090`). An operational Racer dataplane and cache
 configuration are prerequisites; loadgen does not start the dataplane.
 
 Unit tests use `pkg/racersdk/racersdktest.NewClient` with a noncaching local
@@ -146,7 +146,7 @@ daemon and real SDK origin validation over temporary Unix sockets. The helper
 registers cleanup with the test. These tests are not evidence of real Racer
 compatibility or performance.
 
-Use a dedicated volume, not a volume whose origin socket Gantry already owns. The
+Use a dedicated cache, not a cache whose origin socket Gantry already owns. The
 origin directory must be owned by loadgen's UID and must not be group/world
 writable. Existing directory permissions are not changed; missing directories
 are created if permitted. The SDK provides exclusive ownership, stale-socket

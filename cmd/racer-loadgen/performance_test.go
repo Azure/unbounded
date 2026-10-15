@@ -85,7 +85,7 @@ func TestRacerMixedPerformance(t *testing.T) {
 	upstream, err := origin.New(cfg)
 	require.NoError(t, err)
 
-	volume := "gantry"
+	cache := "gantry"
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
@@ -93,7 +93,7 @@ func TestRacerMixedPerformance(t *testing.T) {
 	originCallback := gantryracer.Origin(cfg, upstream)
 
 	go func() {
-		originDone <- racersdk.ServeOrigin(ctx, racersdk.OriginConfig{Cache: volume}, func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		originDone <- racersdk.ServeOrigin(ctx, racersdk.OriginConfig{Cache: cache}, func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 			metadata, body, err := originCallback(ctx, request)
 			if err != nil {
 				t.Logf("origin callback failure key=%v head=%v error=%v", request.Key, request.Head, err)
@@ -112,7 +112,7 @@ func TestRacerMixedPerformance(t *testing.T) {
 		}
 	})
 
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: volume})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: cache})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 

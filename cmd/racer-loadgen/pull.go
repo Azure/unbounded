@@ -29,7 +29,7 @@ import (
 
 type pullOptions struct {
 	Backend           string
-	Volume            string
+	Cache             string
 	Profile           string
 	ZipfExponent      float64
 	Target            string

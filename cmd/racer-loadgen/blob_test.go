@@ -30,10 +30,10 @@ import (
 )
 
 func TestBlobOptions(t *testing.T) {
-	opts, err := parseOptions([]string{"--backend=uds", "--volume=blob-test", "--catalog-blobs=3", "--blob-bytes=123", "--blob-concurrency=7"}, io.Discard)
+	opts, err := parseOptions([]string{"--backend=uds", "--cache=blob-test", "--catalog-blobs=3", "--blob-bytes=123", "--blob-concurrency=7"}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, "uds", opts.pull.Backend)
-	require.Equal(t, "blob-test", opts.pull.Volume)
+	require.Equal(t, "blob-test", opts.pull.Cache)
 	require.Equal(t, 3, opts.catalogBlobs)
 	require.Equal(t, int64(123), opts.blobBytes)
 	require.Equal(t, 7, opts.pull.LayerConcurrency)
@@ -41,7 +41,7 @@ func TestBlobOptions(t *testing.T) {
 	for _, args := range [][]string{
 		{"--backend=other"},
 		{"--backend=uds"},
-		{"--backend=uds", "--volume=../bad"},
+		{"--backend=uds", "--cache=../bad"},
 		{"--catalog-blobs=0"},
 		{fmt.Sprintf("--catalog-blobs=%d", maxCatalogBlobs+1)},
 		{"--catalog-blobs=1", "--blob-bytes=0"},
@@ -59,31 +59,31 @@ func TestBlobOptions(t *testing.T) {
 	}
 }
 
-func TestVolumeFlag(t *testing.T) {
+func TestCacheFlag(t *testing.T) {
 	for _, name := range []string{"custom", "a-b.c0", strings.Repeat("a", 63) + "." + strings.Repeat("b", 18)} {
-		opts, err := parseOptions([]string{"--backend=uds", "--volume=" + name}, io.Discard)
+		opts, err := parseOptions([]string{"--backend=uds", "--cache=" + name}, io.Discard)
 		require.NoError(t, err)
-		require.Equal(t, name, opts.pull.Volume)
+		require.Equal(t, name, opts.pull.Cache)
 	}
 
 	for _, name := range []string{"", "../bad", "Upper", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 19)} {
-		_, err := parseOptions([]string{"--backend=uds", "--volume=" + name}, io.Discard)
+		_, err := parseOptions([]string{"--backend=uds", "--cache=" + name}, io.Discard)
 		require.ErrorIs(t, err, racersdk.ErrInvalidRequest)
-		require.ErrorContains(t, err, "uds requires a valid volume")
-		require.ErrorContains(t, err, "volume name")
+		require.ErrorContains(t, err, "uds requires a valid cache")
+		require.ErrorContains(t, err, "cache name")
 	}
 
 	for _, backend := range []string{"gantry", "uds"} {
-		_, err := parseOptions([]string{"--backend=" + backend, "--volume=custom", "--cache=custom"}, io.Discard)
-		require.ErrorContains(t, err, "flag provided but not defined: -cache")
+		_, err := parseOptions([]string{"--backend=" + backend, "--cache=custom", "--volume=custom"}, io.Discard)
+		require.ErrorContains(t, err, "flag provided but not defined: -volume")
 	}
 
 	var output bytes.Buffer
 
 	_, err := parseOptions([]string{"--help"}, &output)
 	require.ErrorIs(t, err, flag.ErrHelp)
-	require.Contains(t, output.String(), "-volume")
-	require.NotContains(t, output.String(), "-cache")
+	require.Contains(t, output.String(), "-cache")
+	require.NotContains(t, output.String(), "-volume")
 }
 
 func TestBlobCatalogExactDeterministic(t *testing.T) {
@@ -303,7 +303,7 @@ func (b *blobTestBody) Close() error { b.closed.Add(1); return b.closeErr }
 
 func TestSDKAdmissionAndIndependentTarget(t *testing.T) {
 	opts := pullTestOptions("not a URL")
-	opts.Backend, opts.Volume, opts.Concurrency, opts.LayerConcurrency = "uds", "test", 100, 8
+	opts.Backend, opts.Cache, opts.Concurrency, opts.LayerConcurrency = "uds", "test", 100, 8
 	config := sdkClientConfig(opts, opts.Concurrency)
 	require.Equal(t, 800, config.MaxConnections)
 	config = sdkClientConfig(opts, maxLiveConcurrency)
@@ -319,7 +319,7 @@ func TestUDSRunOriginOnlyReadinessAndFailure(t *testing.T) {
 		t.Run(fmt.Sprintf("failure=%v", fail), func(t *testing.T) {
 			opts := loadgenTestOptions(t)
 			loadgenTestAddresses(t, &opts)
-			opts.pull.Backend, opts.pull.Volume, opts.pull.Concurrency = "uds", "test", 0
+			opts.pull.Backend, opts.pull.Cache, opts.pull.Concurrency = "uds", "test", 0
 			opts.catalogBlobs, opts.blobBytes = 2, 100
 			opts.listen = "invalid HTTP listener must not be used"
 

@@ -48,7 +48,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
 	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP), uds (direct Racer SDK), or s3 (HTTP object GET)")
-	f.StringVar(&opts.pull.Volume, "volume", "", "Racer volume name; required for uds, using /run/racer/<volume>/{client,origin}/socket")
+	f.StringVar(&opts.pull.Cache, "cache", "", "Racer cache name (ClusterCache); required for uds, using /run/racer/<cache>/{client,origin}/socket")
 	f.StringVar(&opts.s3.Endpoint, "endpoint", "", "S3 HTTP endpoint: racer-object sidecar or direct synthetic origin (default http://127.0.0.1:8080)")
 	f.StringVar(&opts.s3.Bucket, "bucket", "", "Synthetic S3 bucket (default benchmark; requires backend=s3)")
 	f.IntVar(&opts.s3.Count, "object-count", 0, "Synthetic S3 object count, 1-512 (default 128)")
@@ -105,13 +105,13 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	if opts.pull.Backend == "uds" {
-		if opts.pull.Volume == "" {
-			return opts, fmt.Errorf("uds requires a valid volume: empty volume name: %w", racersdk.ErrInvalidRequest)
+		if opts.pull.Cache == "" {
+			return opts, fmt.Errorf("uds requires a valid cache: empty cache name: %w", racersdk.ErrInvalidRequest)
 		}
 
-		client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: opts.pull.Volume})
+		client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: opts.pull.Cache})
 		if err != nil {
-			return opts, fmt.Errorf("uds requires a valid volume: %w", err)
+			return opts, fmt.Errorf("uds requires a valid cache: %w", err)
 		}
 
 		if err := client.Close(); err != nil {
@@ -333,7 +333,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 				var stopOrigin func()
 
 				stopOrigin, err = startOrigin(ctx, startupCtx, racersdk.OriginConfig{
-					Cache: p.opts.Volume, RecoverStaleSocket: true,
+					Cache: p.opts.Cache, RecoverStaleSocket: true,
 					MaxConcurrentRequests: max(64, limit),
 				}, adapter, probe, func(originErr error) { serveErrors <- originErr; cancel() })
 				if err == nil {
@@ -359,7 +359,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 
 		stopStartup()
 		ready.Store(catalog)
-		slog.Info("origin ready", "backend", p.opts.Backend, "batches", len(p.batches), "repository", opts.image.Repository, "target", opts.pull.Target, "volume", p.opts.Volume, "concurrency", opts.pull.Concurrency)
+		slog.Info("origin ready", "backend", p.opts.Backend, "batches", len(p.batches), "repository", opts.image.Repository, "target", opts.pull.Target, "cache", p.opts.Cache, "concurrency", opts.pull.Concurrency)
 
 		if waitPullDelay(ctx, opts.startDelay) {
 			loadCtx := ctx

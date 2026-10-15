@@ -39,7 +39,7 @@ func configureS3Options(opts *options, seen map[string]bool) error {
 		return nil
 	}
 
-	for _, name := range []string{"target", "namespace", "volume", "repository", "catalog-blobs", "blob-bytes", "catalog-images", "layers", "layer-bytes", "jitter", "blob-concurrency", "layer-concurrency"} {
+	for _, name := range []string{"target", "namespace", "cache", "repository", "catalog-blobs", "blob-bytes", "catalog-images", "layers", "layer-bytes", "jitter", "blob-concurrency", "layer-concurrency"} {
 		if seen[name] {
 			return fmt.Errorf("backend=s3 cannot be combined with %s", name)
 		}

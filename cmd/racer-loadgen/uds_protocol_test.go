@@ -91,7 +91,7 @@ func TestSDKFullReadUnpinnedMetadataValidation(t *testing.T) {
 	}
 
 	opts := pullTestOptions("http://unused")
-	opts.Volume = "test"
+	opts.Cache = "test"
 	config := sdkClientConfig(opts, 64)
 	require.Equal(t, 128, config.MaxConnections, "SDK configuration must preserve configured admission")
 }
