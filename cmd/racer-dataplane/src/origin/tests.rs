@@ -301,9 +301,8 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     let client = remap(client, root).unwrap();
     let mut context = context();
     context.object.cache = snapshot.caches[0].id.clone();
-    let candidates = Placement::new(2)
-        .rank(snapshot.membership.clone(), &context.object, PageNumber(0))
-        .unwrap();
+    let candidates =
+        Placement::new(2).rank(snapshot.membership.clone(), &context.object, PageNumber(0));
     let policy = CandidatePolicy::new(
         candidates.ordered[0].clone(),
         Rc::new(Placement::new(2)),
@@ -969,9 +968,7 @@ fn public_operations_reject_wrong_authority_before_io() {
     );
     let context = context();
     let scope = scope();
-    let candidates = policy
-        .candidates(membership, &context.object, PageNumber(0))
-        .unwrap();
+    let candidates = policy.candidates(membership, &context.object, PageNumber(0));
     let resolution = block_on(policy.resolve(
         candidates,
         &context,

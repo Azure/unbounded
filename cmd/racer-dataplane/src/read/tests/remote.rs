@@ -323,9 +323,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     drop(first);
     drop(cache_only);
     let placement = Rc::new(Placement::new(16));
-    let ranked = placement
-        .rank(membership.clone(), &object, PageNumber(0))
-        .unwrap();
+    let ranked = placement.rank(membership.clone(), &object, PageNumber(0));
     let destination = ranked.ordered[0].clone();
     let source = membership
         .members()

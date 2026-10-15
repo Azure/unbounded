@@ -240,7 +240,6 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
     let placement = Rc::new(Placement::new(16));
     let ordered = placement
         .rank(f.membership.clone(), &f.context.object, f.page.number)
-        .unwrap()
         .ordered;
     let local = rank
         .map(|rank| ordered[rank].clone())
@@ -748,9 +747,7 @@ fn serial_zero_grant_cancel_waits_for_accepted_copy_fence() {
         ),
     ]);
     let policy = f.fill.dependencies.candidates.clone();
-    let candidates = policy
-        .candidates(f.membership.clone(), &f.context.object, f.page.number)
-        .unwrap();
+    let candidates = policy.candidates(f.membership.clone(), &f.context.object, f.page.number);
     let operation = PeerOperation::Page {
         page: f.page.clone(),
         mode: FetchMode::Acquire,
@@ -1431,7 +1428,6 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                 .dependencies
                 .candidates
                 .candidates(latest, &f.context.object, f.page.number)
-                .unwrap()
                 .ordered;
             if secondary_stale {
                 peers.primary_polls.set(40);
@@ -2588,9 +2584,8 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
             )
             .with_replica_selection(selection);
             if i == source {
-                let candidates = policy
-                    .candidates(membership.clone(), &f.context.object, f.page.number)
-                    .unwrap();
+                let candidates =
+                    policy.candidates(membership.clone(), &f.context.object, f.page.number);
                 first_rank = policy
                     .visit_order(&candidates, &f.context.object, f.page.number)
                     .get(0);

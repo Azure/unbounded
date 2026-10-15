@@ -1260,37 +1260,23 @@ fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
     let waker = std::task::Waker::from(count.clone());
     let mut cx = Context::from_waker(&waker);
     let now = uring_runtime::environment::now();
-    worker
-        .observe_placement_maintenance(Ok(Maintenance::Idle), now, &mut cx)
-        .unwrap();
+    worker.observe_placement_maintenance(Maintenance::Idle, now, &mut cx);
     assert_eq!(count.count(), 0);
-    worker
-        .observe_placement_maintenance(Ok(Maintenance::Progress), now, &mut cx)
-        .unwrap();
+    worker.observe_placement_maintenance(Maintenance::Progress, now, &mut cx);
     assert_eq!(count.count(), 1);
-    worker
-        .observe_placement_maintenance(Ok(Maintenance::Blocked), now, &mut cx)
-        .unwrap();
+    worker.observe_placement_maintenance(Maintenance::Blocked, now, &mut cx);
     assert_eq!(worker.placement_retry, now + Duration::from_millis(100));
     assert_eq!(worker.placement_warning, Some(now));
-    worker
-        .observe_placement_maintenance(
-            Err(Error::Overloaded),
-            now + Duration::from_secs(1),
-            &mut cx,
-        )
-        .unwrap();
+    worker.observe_placement_maintenance(
+        Maintenance::Blocked,
+        now + Duration::from_secs(1),
+        &mut cx,
+    );
     assert_eq!(worker.placement_warning, Some(now));
     assert_eq!(count.count(), 1);
     let later = now + Duration::from_secs(60);
-    worker
-        .observe_placement_maintenance(Ok(Maintenance::Blocked), later, &mut cx)
-        .unwrap();
+    worker.observe_placement_maintenance(Maintenance::Blocked, later, &mut cx);
     assert_eq!(worker.placement_warning, Some(later));
-    assert_eq!(
-        worker.observe_placement_maintenance(Err(Error::Internal), later, &mut cx),
-        Err(Error::Internal)
-    );
 }
 
 #[test]

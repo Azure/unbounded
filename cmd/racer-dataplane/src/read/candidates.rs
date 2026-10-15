@@ -532,7 +532,7 @@ impl CandidatePolicy {
         membership: std::sync::Arc<crate::topology::Membership>,
         object: &ObjectId,
         page: PageNumber,
-    ) -> Result<Candidates> {
+    ) -> Candidates {
         self.placement.rank(membership, object, page)
     }
 
@@ -660,7 +660,7 @@ impl CandidatePolicy {
     pub fn maintain(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
-    ) -> Result<crate::topology::Maintenance> {
+    ) -> crate::topology::Maintenance {
         self.placement.maintain(membership)
     }
     pub fn candidates_scoped<'a>(
@@ -1989,21 +1989,17 @@ pub(super) mod tests {
             )),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
-        let result = futures::executor::block_on(
-            policy.resolve_with_budget(
-                policy
-                    .candidates(membership, &context.object, PageNumber(0))
-                    .unwrap(),
-                &context,
-                PeerOperation::Metadata {
-                    object: context.object.clone(),
-                    selector: MetadataSelector::Fresh,
-                    mode: FetchMode::Acquire,
-                },
-                &scope,
-                &mut budget,
-            ),
-        );
+        let result = futures::executor::block_on(policy.resolve_with_budget(
+            policy.candidates(membership, &context.object, PageNumber(0)),
+            &context,
+            PeerOperation::Metadata {
+                object: context.object.clone(),
+                selector: MetadataSelector::Fresh,
+                mode: FetchMode::Acquire,
+            },
+            &scope,
+            &mut budget,
+        ));
         assert!(matches!(result, Err(Error::Unavailable)));
         let routes = peers.0.borrow();
         assert_eq!(
@@ -2208,9 +2204,7 @@ pub(super) mod tests {
             let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
             let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
             for page in 0..64 {
-                let candidates = placement
-                    .rank(membership.clone(), &object(), PageNumber(page))
-                    .unwrap();
+                let candidates = placement.rank(membership.clone(), &object(), PageNumber(page));
                 if candidates.ordered.contains(&requester.node) {
                     continue;
                 }
@@ -2259,9 +2253,7 @@ pub(super) mod tests {
         for requester in membership.members() {
             let policy = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
             for page in 0..3000 {
-                let candidates = placement
-                    .rank(membership.clone(), &object(), PageNumber(page))
-                    .unwrap();
+                let candidates = placement.rank(membership.clone(), &object(), PageNumber(page));
                 if candidates.ordered.contains(&requester.node) {
                     continue;
                 }
@@ -2297,7 +2289,6 @@ pub(super) mod tests {
                 .find(|member| {
                     !placement
                         .rank(membership.clone(), &object(), PageNumber(0))
-                        .unwrap()
                         .ordered
                         .contains(&member.node)
                 })
@@ -2309,7 +2300,7 @@ pub(super) mod tests {
             let (page, candidates, order) = (0..256)
                 .map(PageNumber)
                 .find_map(|page| {
-                    let candidates = placement.rank(membership.clone(), &object(), page).ok()?;
+                    let candidates = placement.rank(membership.clone(), &object(), page);
                     if candidates.ordered.contains(&local) {
                         return None;
                     }
@@ -2444,7 +2435,6 @@ pub(super) mod tests {
         let (membership, placement, context, scope, credentials) = fixture();
         let ordered = placement
             .rank(membership.clone(), &context.object, PageNumber(0))
-            .unwrap()
             .ordered;
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
@@ -2464,9 +2454,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
         );
-        let candidates = policy
-            .candidates(membership, &context.object, PageNumber(0))
-            .unwrap();
+        let candidates = policy.candidates(membership, &context.object, PageNumber(0));
         let mut budget = AcquisitionBudget::new(scope.deadline.0, attempts, 8);
         let result = futures::executor::block_on(policy.resolve_with_budget(
             candidates,
@@ -2504,7 +2492,6 @@ pub(super) mod tests {
         });
         let ordered = placement
             .rank(membership.clone(), &context.object, PageNumber(0))
-            .unwrap()
             .ordered;
         let policy = CandidatePolicy::new(
             ordered[1].clone(),
@@ -2521,21 +2508,17 @@ pub(super) mod tests {
             )),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
-        let result = futures::executor::block_on(
-            policy.resolve_with_budget(
-                policy
-                    .candidates(membership.clone(), &context.object, PageNumber(0))
-                    .unwrap(),
-                &context,
-                PeerOperation::Metadata {
-                    object: context.object.clone(),
-                    selector: MetadataSelector::Fresh,
-                    mode: FetchMode::Acquire,
-                },
-                &scope,
-                &mut budget,
-            ),
-        );
+        let result = futures::executor::block_on(policy.resolve_with_budget(
+            policy.candidates(membership.clone(), &context.object, PageNumber(0)),
+            &context,
+            PeerOperation::Metadata {
+                object: context.object.clone(),
+                selector: MetadataSelector::Fresh,
+                mode: FetchMode::Acquire,
+            },
+            &scope,
+            &mut budget,
+        ));
         assert!(matches!(result, Err(Error::Unauthorized)));
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
@@ -2556,21 +2539,17 @@ pub(super) mod tests {
             )),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
-        let result = futures::executor::block_on(
-            policy.resolve_with_budget(
-                policy
-                    .candidates(membership, &context.object, PageNumber(0))
-                    .unwrap(),
-                &context,
-                PeerOperation::Metadata {
-                    object: context.object.clone(),
-                    selector: MetadataSelector::Fresh,
-                    mode: FetchMode::Acquire,
-                },
-                &scope,
-                &mut budget,
-            ),
-        );
+        let result = futures::executor::block_on(policy.resolve_with_budget(
+            policy.candidates(membership, &context.object, PageNumber(0)),
+            &context,
+            PeerOperation::Metadata {
+                object: context.object.clone(),
+                selector: MetadataSelector::Fresh,
+                mode: FetchMode::Acquire,
+            },
+            &scope,
+            &mut budget,
+        ));
         assert!(matches!(result, Err(Error::Unavailable)));
         assert_eq!(peer.calls.borrow().len(), 3);
         assert!(peer.calls.borrow().iter().all(|(_, copy)| !copy));
@@ -2766,7 +2745,6 @@ pub(super) mod tests {
         };
         let owner = Placement::new(0)
             .rank(members.clone(), &page.version.object, page.number)
-            .unwrap()
             .ordered[0]
             .clone();
         let peers = Rc::new(RecordedPeer {
@@ -2856,7 +2834,6 @@ pub(super) mod tests {
         };
         let owner = Placement::new(0)
             .rank(members.clone(), &object(), page.number)
-            .unwrap()
             .ordered[0]
             .clone();
         let peers = Rc::new(RecordedPeer {
@@ -3038,9 +3015,7 @@ pub(super) mod tests {
     fn noncandidate_acquires_from_candidates_and_never_mints_origin_authority() {
         futures::executor::block_on(async {
             let membership = membership();
-            let candidates = Placement::new(8)
-                .rank(membership.clone(), &object(), PageNumber(0))
-                .unwrap();
+            let candidates = Placement::new(8).rank(membership.clone(), &object(), PageNumber(0));
             let local = membership
                 .members()
                 .iter()
@@ -3078,9 +3053,7 @@ pub(super) mod tests {
     #[test]
     fn peer_auth_failure_is_not_predecessor_miss_evidence() {
         futures::executor::block_on(async {
-            let candidates = Placement::new(8)
-                .rank(membership(), &object(), PageNumber(0))
-                .unwrap();
+            let candidates = Placement::new(8).rank(membership(), &object(), PageNumber(0));
             let peers = Rc::new(RecordedPeer {
                 calls: RefCell::new(vec![]),
                 error: Error::Unauthorized,
@@ -3110,9 +3083,7 @@ pub(super) mod tests {
     #[test]
     fn origin_version_miss_cannot_claim_absence_when_predecessor_was_unreachable() {
         let membership = membership();
-        let ranked = Placement::new(8)
-            .rank(membership.clone(), &object(), PageNumber(0))
-            .unwrap();
+        let ranked = Placement::new(8).rank(membership.clone(), &object(), PageNumber(0));
         let peers = Rc::new(RecordedPeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,

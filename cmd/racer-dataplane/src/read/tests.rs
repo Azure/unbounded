@@ -2229,9 +2229,7 @@ mod timeouts {
                 )
                 .unwrap(),
             );
-            let candidates = placement
-                .rank(membership, &context.object, PageNumber(0))
-                .unwrap();
+            let candidates = placement.rank(membership, &context.object, PageNumber(0));
             let local = rank.map_or_else(
                 || signers[4].node().clone(),
                 |r| candidates.ordered[r].clone(),

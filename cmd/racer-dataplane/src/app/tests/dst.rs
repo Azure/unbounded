@@ -2869,7 +2869,6 @@ impl Harness {
                 object,
                 PageNumber(0),
             )
-            .unwrap()
             .ordered
             .iter()
             .map(|id| {

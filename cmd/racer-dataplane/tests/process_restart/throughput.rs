@@ -948,7 +948,6 @@ fn production_peer_and_failed_neighbor_progress() {
                     },
                     PageNumber(0),
                 )
-                .unwrap()
                 .ordered
         };
         let source = usize::from(rank(0)[0].0 == OTHER);
@@ -1070,16 +1069,14 @@ fn production_remote_bootstrap_one_get_and_empty() {
         control.publication.lock().unwrap().members =
             members.iter().cloned().map(Into::into).collect();
         let membership = Arc::new(Membership::validate(MembershipVersion(1), members).unwrap());
-        let ranked = Placement::new(128)
-            .rank(
-                membership,
-                &ObjectId {
-                    cache: CacheId(profile.caches[0].0.clone()),
-                    key: CacheKey([0; 32]),
-                },
-                PageNumber(0),
-            )
-            .unwrap();
+        let ranked = Placement::new(128).rank(
+            membership,
+            &ObjectId {
+                cache: CacheId(profile.caches[0].0.clone()),
+                key: CacheKey([0; 32]),
+            },
+            PageNumber(0),
+        );
         let receiver = ids
             .iter()
             .position(|id| !ranked.ordered.iter().any(|n| &n.0 == id))

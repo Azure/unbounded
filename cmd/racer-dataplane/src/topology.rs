@@ -381,11 +381,11 @@ impl Placement {
         membership: std::sync::Arc<crate::topology::Membership>,
         object: &ObjectId,
         page: PageNumber,
-    ) -> Result<Candidates> {
+    ) -> Candidates {
         let ranked = self
             .inner
             .rank(&membership.inner, &encoded_key(object, page));
-        Ok(candidates(membership, ranked))
+        candidates(membership, ranked)
     }
 
     /// Cache-only retention hint. Never starts or advances a cold ranking.
@@ -480,8 +480,8 @@ impl Placement {
     pub fn maintain(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
-    ) -> Result<Maintenance> {
-        Ok(self.inner.maintain(&membership.inner))
+    ) -> Maintenance {
+        self.inner.maintain(&membership.inner)
     }
 }
 
@@ -858,7 +858,6 @@ pub(crate) mod tests {
             let placement = Placement::new(1);
             let before = placement
                 .rank(members.clone(), &object(), PageNumber(0))
-                .unwrap()
                 .ordered;
             health
                 .observe(&before[0], LinkOutcome::ProtocolFailure)
@@ -869,10 +868,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 before,
-                placement
-                    .rank(members, &object(), PageNumber(0))
-                    .unwrap()
-                    .ordered
+                placement.rank(members, &object(), PageNumber(0)).ordered
             );
             health.retain_neighbors(&[]);
             assert_eq!(health.tracked_links(), 0);
@@ -1231,9 +1227,7 @@ pub(crate) mod tests {
                 (u64::MAX, 665_200, [2, 1, 3]),
             ] {
                 assert_eq!(slot(&object(), PageNumber(page)), expected_slot);
-                let ranking = placement
-                    .rank(members.clone(), &object(), PageNumber(page))
-                    .unwrap();
+                let ranking = placement.rank(members.clone(), &object(), PageNumber(page));
                 assert_eq!(ranking.ordered, expected_order.map(|i| member(i, 1).node));
             }
         }
@@ -1251,11 +1245,9 @@ pub(crate) mod tests {
             for page in 0..100 {
                 let original = placement
                     .rank(old.clone(), &object(), PageNumber(page))
-                    .unwrap()
                     .ordered;
                 let extended = placement
                     .rank(added.clone(), &object(), PageNumber(page))
-                    .unwrap()
                     .ordered;
                 let survivors: Vec<_> = extended
                     .iter()
@@ -1265,7 +1257,6 @@ pub(crate) mod tests {
                 assert_eq!(&original[..survivors.len()], survivors);
                 let reduced = placement
                     .rank(removed.clone(), &object(), PageNumber(page))
-                    .unwrap()
                     .ordered;
                 let survivors: Vec<_> = original
                     .iter()
@@ -1276,7 +1267,6 @@ pub(crate) mod tests {
                 assert_eq!(
                     placement
                         .rank(old.clone(), &object(), PageNumber(page))
-                        .unwrap()
                         .ordered,
                     original
                 );
@@ -1290,7 +1280,6 @@ pub(crate) mod tests {
                 assert_eq!(
                     placement
                         .rank(membership(count), &object(), PageNumber(0))
-                        .unwrap()
                         .ordered
                         .len(),
                     count.min(3)
@@ -1308,11 +1297,9 @@ pub(crate) mod tests {
                 assert_eq!(
                     placement
                         .rank(original.clone(), &object(), PageNumber(page))
-                        .unwrap()
                         .ordered,
                     placement
                         .rank(changed.clone(), &object(), PageNumber(page))
-                        .unwrap()
                         .ordered
                 );
             }
@@ -1325,9 +1312,7 @@ pub(crate) mod tests {
             let mut old = membership(80);
             for generation in 2..42 {
                 for page in 0..40 {
-                    placement
-                        .rank(old.clone(), &object(), PageNumber(page))
-                        .unwrap();
+                    placement.rank(old.clone(), &object(), PageNumber(page));
                 }
                 let mut members = old.members().to_vec();
                 members.remove(generation as usize % members.len());
@@ -1343,11 +1328,9 @@ pub(crate) mod tests {
                     assert_eq!(
                         placement
                             .rank(next.clone(), &object(), PageNumber(page))
-                            .unwrap()
                             .ordered,
                         oracle
                             .rank(next.clone(), &object(), PageNumber(page))
-                            .unwrap()
                             .ordered,
                         "generation {generation} page {page}"
                     );
@@ -1360,9 +1343,7 @@ pub(crate) mod tests {
         fn endpoint_epoch_reuses_completed_rank_and_returns_current_routing() {
             let placement = Placement::with_memory_budget(RANKING_BYTES);
             let old = membership(100_000);
-            let expected = placement
-                .rank(old.clone(), &object(), PageNumber(0))
-                .unwrap();
+            let expected = placement.rank(old.clone(), &object(), PageNumber(0));
             let mut nodes = old.members().to_vec();
             for node in &mut nodes {
                 node.peer_endpoint = "[::1]:9090".into();
@@ -1381,7 +1362,7 @@ pub(crate) mod tests {
             assert_eq!(scored_members(), before);
             drop(old);
             drop(expected);
-            placement.rank(current, &object(), PageNumber(0)).unwrap();
+            placement.rank(current, &object(), PageNumber(0));
             assert_eq!(scored_members(), before);
         }
 
@@ -1433,11 +1414,9 @@ pub(crate) mod tests {
             assert_eq!(
                 placement
                     .rank(members.clone(), &object(), PageNumber(1))
-                    .unwrap()
                     .ordered,
                 Placement::new(0)
                     .rank(members.clone(), &object(), PageNumber(1))
-                    .unwrap()
                     .ordered
             );
             drop(first);
@@ -1446,24 +1425,17 @@ pub(crate) mod tests {
                 ranked.ordered,
                 placement
                     .rank(members.clone(), &object(), PageNumber(0))
-                    .unwrap()
                     .ordered
             );
-            placement
-                .rank(members.clone(), &object(), PageNumber(1))
-                .unwrap();
+            placement.rank(members.clone(), &object(), PageNumber(1));
             let before = scored_members();
-            placement
-                .rank(members.clone(), &object(), PageNumber(1))
-                .unwrap();
+            placement.rank(members.clone(), &object(), PageNumber(1));
             assert_eq!(scored_members(), before);
             assert_eq!(Arc::strong_count(&members), 2); // caller and returned Candidates only
             let uncached = Placement::new(0);
-            uncached
-                .rank(members.clone(), &object(), PageNumber(0))
-                .unwrap();
+            uncached.rank(members.clone(), &object(), PageNumber(0));
             let before = scored_members();
-            uncached.rank(members, &object(), PageNumber(0)).unwrap();
+            uncached.rank(members, &object(), PageNumber(0));
             assert_eq!(
                 scored_members(),
                 before,

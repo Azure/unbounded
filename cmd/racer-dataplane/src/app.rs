@@ -1435,8 +1435,7 @@ impl WorkerApplication {
             && let Ok(snapshot) = self.snapshots.current()
         {
             let status = self.placement.maintain(&snapshot.membership);
-            let observed = self.observe_placement_maintenance(status, now, cx);
-            stage_result(worker, "placement-maintenance", observed)?;
+            self.observe_placement_maintenance(status, now, cx);
         }
         // Independent of placement.maintain being Idle: recovered residents and
         // changed membership need periodic refresh even without foreground reads.
@@ -1474,14 +1473,14 @@ impl WorkerApplication {
     /// Schedule placement progress or back off pinned capacity with a bounded warning rate.
     fn observe_placement_maintenance(
         &mut self,
-        status: Result<crate::topology::Maintenance>,
+        status: crate::topology::Maintenance,
         now: std::time::Instant,
         cx: &mut Context<'_>,
-    ) -> Result<()> {
+    ) {
         match status {
-            Ok(crate::topology::Maintenance::Progress) => cx.waker().wake_by_ref(),
-            Ok(crate::topology::Maintenance::Idle) => (),
-            Ok(crate::topology::Maintenance::Blocked) | Err(Error::Overloaded) => {
+            crate::topology::Maintenance::Progress => cx.waker().wake_by_ref(),
+            crate::topology::Maintenance::Idle => (),
+            crate::topology::Maintenance::Blocked => {
                 // Foreground requests release pinned rankings. Back off background
                 // work and rate-limit the capacity diagnostic, not request service.
                 self.placement_retry = now + Duration::from_millis(100);
@@ -1496,9 +1495,7 @@ impl WorkerApplication {
                     self.placement_warning = Some(now);
                 }
             }
-            Err(error) => return Err(error),
         }
-        Ok(())
     }
 
     /// Admit a bounded batch of handed-off connections and poll active peer work.
