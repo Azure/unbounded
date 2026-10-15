@@ -1967,7 +1967,7 @@ mod tests {
         }
         #[cfg(feature = "rdma")]
         #[test]
-        #[ignore = "requires real ABI v2 adapter and RACER_RDMA_TEST_DEVICE/PORT/GID for an active type-2B port"]
+        #[ignore = "requires real ABI v1 adapter and RACER_RDMA_TEST_DEVICE/PORT/GID for an active type-2B port"]
         fn native_provider_signed_setup_grant_write_completion_roundtrip() {
             native_roundtrip(false, false, None, false);
         }

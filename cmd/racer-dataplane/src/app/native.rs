@@ -1078,23 +1078,23 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[test]
-    #[ignore = "requires actual ABI v2 libibverbs adapter and zero usable type-2B ports"]
+    #[ignore = "requires actual ABI v1 libibverbs adapter and zero usable type-2B ports"]
     fn configured_native_no_device_activation_keeps_http_available() {
         // Enforce the environment before testing app fallback; missing libraries
         // or a hardware-capable host must not masquerade as no-device coverage.
         unsafe {
             let library = libc::dlopen(
-                c"libracer_rdma.so.1".as_ptr(),
+                c"librdma_verbs.so.1".as_ptr(),
                 libc::RTLD_NOW | libc::RTLD_LOCAL,
             );
             assert!(!library.is_null(), "real native library must load");
-            let abi = libc::dlsym(library, c"racer_rdma_abi".as_ptr());
-            let discover = libc::dlsym(library, c"racer_rdma_discover".as_ptr());
+            let abi = libc::dlsym(library, c"rdma_verbs_abi".as_ptr());
+            let discover = libc::dlsym(library, c"rdma_verbs_discover".as_ptr());
             assert!(!abi.is_null() && !discover.is_null());
             let abi: unsafe extern "C" fn() -> u32 = std::mem::transmute(abi);
             let discover: unsafe extern "C" fn(*mut libc::c_void, u32) -> libc::c_int =
                 std::mem::transmute(discover);
-            assert_eq!(abi(), 2);
+            assert_eq!(abi(), 1);
             assert_eq!(
                 discover(std::ptr::null_mut(), 0),
                 0,
