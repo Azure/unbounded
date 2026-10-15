@@ -98,7 +98,7 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("setup Machine configuration binding controller: %w", err)
 	}
 
-	daemonCSRApprover, err := NewDaemonCSRApprover(mgr.GetClient(), mgr.GetAPIReader(), kubeClient)
+	daemonCSRApprover, err := NewDaemonCSRApprover(mgr.GetClient(), kubeClient)
 	if err != nil {
 		return fmt.Errorf("create daemon CSR approver controller: %w", err)
 	}

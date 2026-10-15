@@ -33,7 +33,6 @@ const (
 
 type daemonCSRClaimChecker struct {
 	client.Client
-	APIReader client.Reader
 }
 
 type multiCSRApprover []daemoncred.CSRApproverEvaluator
@@ -71,10 +70,9 @@ func (a bootstrapGroupApprover) Evaluate(
 
 func NewDaemonCSRApprover(
 	c client.Client,
-	apiReader client.Reader,
 	kubeClient kubernetes.Interface,
 ) (*daemoncred.CSRApproverReconciler, error) {
-	claims := &daemonCSRClaimChecker{Client: c, APIReader: apiReader}
+	claims := &daemonCSRClaimChecker{Client: c}
 
 	approver, err := daemoncred.NewCSRApprover(daemoncred.CSRApproverOptions{
 		BootstrapGroup:     bootstrapGroup,
@@ -126,7 +124,7 @@ func (c *daemonCSRClaimChecker) legacyBootstrapTokenMayClaimNode(
 	}
 
 	var token corev1.Secret
-	if err := c.APIReader.Get(ctx, client.ObjectKey{
+	if err := c.Get(ctx, client.ObjectKey{
 		Namespace: metav1.NamespaceSystem,
 		Name:      bootstrapSecretPref + tokenID,
 	}, &token); err != nil {
@@ -156,7 +154,7 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 	secretName := bootstrapSecretPref + tokenID
 
 	var token corev1.Secret
-	if err := c.APIReader.Get(ctx, client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: secretName}, &token); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: secretName}, &token); err != nil {
 		return false, client.IgnoreNotFound(err)
 	}
 
@@ -170,7 +168,7 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 
 	if machineName := strings.TrimSpace(token.Annotations[unboundedv1alpha3.MachineBootstrapTokenAnnotationKey]); machineName != "" {
 		var machine unboundedv1alpha3.Machine
-		if err := c.APIReader.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+		if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
 			return false, client.IgnoreNotFound(err)
 		}
 
@@ -178,7 +176,7 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 	}
 
 	var machines unboundedv1alpha3.MachineList
-	if err := c.APIReader.List(ctx, &machines); err != nil {
+	if err := c.List(ctx, &machines); err != nil {
 		return false, fmt.Errorf("list Machines for bootstrap claim check: %w", err)
 	}
 
