@@ -8,13 +8,11 @@ package fsutil
 import (
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/google/renameio/v2"
-	"golang.org/x/sys/unix"
 )
 
 // SyncDir persists a directory entry so newly written names survive a crash.
@@ -98,53 +96,6 @@ func InstallFile(source, target string, mode os.FileMode) (err error) {
 	return pending.CloseAtomicallyReplace()
 }
 
-// SyncFilesystems persists every filesystem backing the given paths.
-func SyncFilesystems(paths ...string) error {
-	var files []*os.File
-
-	defer func() {
-		for _, f := range files {
-			_ = f.Close() //nolint:errcheck // Read-only handle; sync errors are returned.
-		}
-	}()
-
-	for _, path := range paths {
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		files = append(files, f)
-	}
-
-	return SyncOpenFilesystems(files, unix.Syncfs)
-}
-
-// SyncOpenFilesystems synchronizes each distinct filesystem once, using open
-// handles that stay valid after teardown removes their paths.
-func SyncOpenFilesystems(files []*os.File, syncfs func(int) error) error {
-	seen := map[uint64]bool{}
-
-	for _, f := range files {
-		var stat unix.Stat_t
-		if err := unix.Fstat(int(f.Fd()), &stat); err != nil {
-			return err
-		}
-
-		if seen[uint64(stat.Dev)] {
-			continue
-		}
-
-		seen[uint64(stat.Dev)] = true
-
-		if err := syncfs(int(f.Fd())); err != nil {
-			return fmt.Errorf("sync %s: %w", f.Name(), err)
-		}
-	}
-
-	return nil
-}
-
 // FileSHA256 returns the SHA-256 digest of the file at path.
 func FileSHA256(path string) ([sha256.Size]byte, error) {
 	var digest [sha256.Size]byte
@@ -163,15 +114,4 @@ func FileSHA256(path string) ([sha256.Size]byte, error) {
 	copy(digest[:], hasher.Sum(nil))
 
 	return digest, nil
-}
-
-// MountedNoexec reports whether the filesystem holding path is mounted without
-// permission to run programs from it, so a binary placed there cannot run.
-func MountedNoexec(path string) (bool, error) {
-	var fs unix.Statfs_t
-	if err := unix.Statfs(path, &fs); err != nil {
-		return false, fmt.Errorf("inspect the filesystem of %s: %w", path, err)
-	}
-
-	return fs.Flags&unix.ST_NOEXEC != 0, nil
 }
