@@ -12,7 +12,7 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-func TestHelloOriginRange4210611697(t *testing.T) {
+func TestHelloOriginRange(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		request racersdk.OriginRequest
