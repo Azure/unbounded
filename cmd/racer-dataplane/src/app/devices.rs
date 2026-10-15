@@ -1071,13 +1071,15 @@ mod tests {
         pub(super) fn new() -> Self {
             use std::os::unix::fs::DirBuilderExt;
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tmp")
-                .join(format!(
-                    "device-test-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ));
+            // The repo tmp/ directory is gitignored, so it is absent on a fresh
+            // checkout (for example in CI). Create it before the per-test leaf.
+            let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
+            fs::create_dir_all(&parent).unwrap();
+            let path = parent.join(format!(
+                "device-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
             Self(fs::canonicalize(path).unwrap())
         }
