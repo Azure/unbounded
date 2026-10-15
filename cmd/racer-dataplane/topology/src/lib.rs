@@ -46,7 +46,7 @@
 //! assert_eq!(a, 0); // Sorted by ID, not by input order.
 //!
 //! let placement = Placement::new(16);
-//! let owners = placement.rank(&members, b"opaque application key")?;
+//! let owners = placement.rank(&members, b"opaque application key");
 //! assert_eq!(owners.len(), 2); // Up to three owners, never repeated.
 //! assert!(owners.contains(&a) && owners.contains(&b));
 //!
