@@ -99,10 +99,10 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
-| `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Each `268435456` (256 MiB) | Independent node-wide plaintext/ciphertext admission budgets |
-| `RACER_DIRTY_BYTES` | `134217728` (128 MiB) | Node-wide dirty-data budget |
-| `RACER_REGISTERED_BYTES` | `134217728` (128 MiB) | Node-wide native RDMA memory budget when enabled |
-| `RACER_REQUEST_CONTEXT_BYTES` | `67108864` (64 MiB) | Node-wide request-context budget |
+| `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
+| `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
+| `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
+| `RACER_REQUEST_CONTEXT_BYTES` | Unset: `33554432` (32 MiB) per final I/O worker | Request-context budget; an explicit value is node-wide |
 | `RACER_METADATA_ENTRIES` | `4096` | Node-wide catalog entries; at most 1,048,576 |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget in file mode; configured value at most 1,048,576; device mode can raise it as described below |
 | `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |

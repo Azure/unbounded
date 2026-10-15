@@ -335,7 +335,7 @@ mod tests {
             .collect();
         assert_eq!(
             values.len(),
-            18 + usize::from(values.contains_key("RACER_MAX_THREADS"))
+            13 + usize::from(values.contains_key("RACER_MAX_THREADS"))
         );
         let mut config = Config::from_lookup(|name| {
             Ok(values
@@ -363,12 +363,17 @@ mod tests {
                 .unwrap_or(crate::config::DEFAULT_MAX_THREADS)
         );
         assert_eq!(config.slab_bytes, 1024 * 1024 * 1024);
-        assert_eq!(
-            config.limits.request_context_bytes.get(),
-            values["RACER_REQUEST_CONTEXT_BYTES"]
-                .parse::<usize>()
-                .unwrap()
-        );
+        // Byte budgets stay unset so the runtime scales them per I/O worker.
+        for key in [
+            "RACER_PLAINTEXT_BYTES",
+            "RACER_CIPHERTEXT_BYTES",
+            "RACER_DIRTY_BYTES",
+            "RACER_REGISTERED_BYTES",
+            "RACER_REQUEST_CONTEXT_BYTES",
+        ] {
+            assert!(!values.contains_key(key), "{key}");
+        }
+        let per_worker = config.limits.clone();
         let mut plan = four_pair_plan(&config);
         config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
@@ -393,16 +398,101 @@ mod tests {
             drop(reservation);
             assert_eq!(admission.used(class), 0);
         }
-        assert_eq!(limits.plaintext_bytes.get(), 256 * 1024 * 1024 / 5);
-        assert_eq!(limits.ciphertext_bytes.get(), 256 * 1024 * 1024 / 5);
-        assert_eq!(limits.dirty_bytes.get(), 128 * 1024 * 1024 / 5);
-        assert_eq!(limits.request_context_bytes.get(), 64 * 1024 * 1024 / 5);
+        assert_eq!(limits.plaintext_bytes, per_worker.plaintext_bytes);
+        assert_eq!(limits.ciphertext_bytes, per_worker.ciphertext_bytes);
+        assert_eq!(limits.dirty_bytes, per_worker.dirty_bytes);
+        assert_eq!(
+            limits.request_context_bytes,
+            per_worker.request_context_bytes
+        );
         assert_eq!(admission.used(ResourceClass::Registered), 0);
         // Reducing thread cap or quotas keeps local groups and re-partitions the
         // node budget. An impossible byte floor must fail rather than deadlock.
         let mut too_small = config.limits.clone();
         too_small.plaintext_bytes = NonZeroUsize::new(3 * page - 1).unwrap();
         assert!(size_workers(&too_small, &mut plan, false).is_err());
+    }
+
+    fn operator_profile_config() -> Config {
+        let manifest = include_str!("../../../../deploy/racer/dataplane-config.yaml.tmpl");
+        let values: std::collections::HashMap<_, _> = manifest
+            .lines()
+            .filter_map(|line| line.trim().split_once(": \""))
+            .filter(|(key, _)| key.starts_with("RACER_"))
+            .map(|(key, value)| (key, value.trim_end_matches('"')))
+            .collect();
+        Config::from_lookup(|name| {
+            Ok(values
+                .get(name)
+                .map(|v| (*v).to_owned())
+                .or_else(|| match name {
+                    "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                    "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                    _ => None,
+                }))
+        })
+        .unwrap()
+    }
+
+    fn core_plan(config: &Config, cores: usize) -> AffinityPlan {
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
+        AffinityPlan::from_topology(
+            config,
+            EffectiveTopology {
+                cpus: (0..cores)
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: None,
+                    })
+                    .collect(),
+                quota: None,
+                nics: vec![],
+            },
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn operator_profile_funds_every_planned_worker_on_large_nodes() {
+        // A Standard_D64ds_v6 plans 21 I/O workers; fixed 256 MiB node-wide
+        // budgets could fund only five and crash-looped startup.
+        for rdma in [false, true] {
+            for cores in [2, 4, 8, 16, 32, 64, 96, 128, 192] {
+                let mut config = operator_profile_config();
+                config.enable_rdma = rdma;
+                let mut plan = core_plan(&config, cores);
+                let planned = plan.pairs.len();
+                assert!(
+                    cores < 64 || planned > 10,
+                    "cores={cores} planned={planned}"
+                );
+                config.scale_limits(planned).unwrap();
+                size_workers(&config.limits, &mut plan, rdma)
+                    .unwrap_or_else(|error| panic!("cores={cores} rdma={rdma}: {error:?}"));
+                assert_eq!(plan.pairs.len(), planned, "cores={cores} rdma={rdma}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_small_node_budget_still_rejects_large_plan() {
+        // Explicit values remain authoritative node-wide budgets, so the old
+        // 256 MiB plaintext value must still fail below the half floor.
+        let mut config = operator_profile_config();
+        config.enable_rdma = false;
+        config.limits.plaintext_bytes = NonZeroUsize::new(256 * 1024 * 1024).unwrap();
+        config.scaled_limits.plaintext_bytes = false;
+        let mut plan = core_plan(&config, 64);
+        assert!(plan.pairs.len() > 10);
+        config.scale_limits(plan.pairs.len()).unwrap();
+        assert_eq!(
+            size_workers(&config.limits, &mut plan, false).unwrap_err(),
+            Error::InvalidConfiguration
+        );
     }
 
     fn four_pair_plan(config: &Config) -> AffinityPlan {

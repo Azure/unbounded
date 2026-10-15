@@ -6,7 +6,7 @@ metadata:
   name: racer-dataplane-config
   namespace: {{ .Namespace | default "unbounded-system" }}
 data:
-  # Defaults match the Rust runtime. Existing administrator data is preserved.
+  # Existing administrator data is preserved.
   # Routing is V5 (radix32) only. RACER_ROUTING_ALGORITHM is not supported.
   # Native RDMA is included in release images. Active MW2B-capable ports are
   # reported at authenticated enrollment; published rdma-nics overrides win.
@@ -44,11 +44,17 @@ data:
   RACER_METADATA_ENTRIES: "4096"
   RACER_DISK_PAGE_ENTRIES: "65536"
   RACER_CHECKPOINT_BYTES: "67108864"
-  RACER_PLAINTEXT_BYTES: "268435456"
-  RACER_CIPHERTEXT_BYTES: "268435456"
-  RACER_DIRTY_BYTES: "134217728"
-  RACER_REGISTERED_BYTES: "134217728"
-  RACER_REQUEST_CONTEXT_BYTES: "67108864"
+  # Byte admission budgets default to per-I/O-worker amounts that are multiplied
+  # by the final I/O worker count, so automatic sizing works on any core count:
+  # plaintext 64 MiB, ciphertext 128 MiB, dirty 160 MiB, request context 32 MiB,
+  # and registered 96 MiB (native RDMA only) per worker. Setting a key below
+  # makes it an authoritative node-wide value that is divided across workers;
+  # startup fails if it cannot fund at least half of the planned I/O workers.
+  # RACER_PLAINTEXT_BYTES: "268435456"
+  # RACER_CIPHERTEXT_BYTES: "268435456"
+  # RACER_DIRTY_BYTES: "134217728"
+  # RACER_REGISTERED_BYTES: "134217728"
+  # RACER_REQUEST_CONTEXT_BYTES: "67108864"
   # HEAD max-age requests warm exact versions; acceptance is not fill completion.
   # TTL starts at admission, including time spent filling. Both seconds limits
   # accept 1..86400. Background credentials stay charged and zeroizing in memory.
