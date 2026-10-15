@@ -1351,6 +1351,8 @@ mod empty_submit_tests {
             BufferOperation::Send,
         ] {
             for policy in [IssuePolicy::Inline, IssuePolicy::Offload] {
+                // Simulation builds also have simulated submissions that must be rejected.
+                #[allow(clippy::infallible_destructuring_match)]
                 let sqe = match reactor
                     .buffer_submission(&mut owned, operation, policy)
                     .unwrap()
