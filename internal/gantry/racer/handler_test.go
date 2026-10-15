@@ -153,7 +153,7 @@ func TestRacerRemoteRejectedCredentialRepositoryChallenge(t *testing.T) {
 
 				callback := Origin(cfg, originB)
 				client := racerFakeClient(t, callback)
-				trap := &racerLegacyTrap{}
+				trap := &racerDirectTrap{}
 				origin := racerRepositoryChallengeOrigin{racerChallengeOrigin{trap, requesterA}, requesterA}
 
 				server := httptest.NewServer(WrapHTTP(mirror.New(cfg, trap, origin, mirror.WithContentBackend(NewHandler(client, origin, nil))).Handler(), 0, nil))
@@ -229,7 +229,7 @@ func TestRacerRepositoryChallengeOnlyOnUnauthorized(t *testing.T) {
 			client := racerFakeClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				return racersdk.Metadata{}, nil, kind
 			})
-			trap := &racerLegacyTrap{}
+			trap := &racerDirectTrap{}
 
 			var probes atomic.Int32
 
@@ -253,41 +253,42 @@ func TestRacerRepositoryChallengeOnlyOnUnauthorized(t *testing.T) {
 	}
 }
 
-// Count before panicking: net/http recovers handler panics, so an accidental
-// legacy call must also fail the test even when a transport error is expected.
-type racerLegacyTrap struct {
+// racerDirectTrap fails on any use of the direct (non-Racer) content store or
+// origin. Count before panicking: net/http recovers handler panics, so an accidental
+// direct call must also fail the test even when a transport error is expected.
+type racerDirectTrap struct {
 	storeCalls  atomic.Int32
 	originCalls atomic.Int32
 	probes      atomic.Int32
 	challenge   string
 }
 
-func (s *racerLegacyTrap) Has(context.Context, digest.Digest) (bool, error) {
+func (s *racerDirectTrap) Has(context.Context, digest.Digest) (bool, error) {
 	s.storeCalls.Add(1)
-	panic("Racer request reached legacy Has")
+	panic("Racer request reached direct Has")
 }
 
-func (s *racerLegacyTrap) Open(context.Context, digest.Digest) (io.ReadCloser, int64, error) {
+func (s *racerDirectTrap) Open(context.Context, digest.Digest) (io.ReadCloser, int64, error) {
 	s.storeCalls.Add(1)
-	panic("Racer request reached legacy Open")
+	panic("Racer request reached direct Open")
 }
 
-func (s *racerLegacyTrap) Writer(context.Context, digest.Digest) (ifaces.ContentWriter, error) {
+func (s *racerDirectTrap) Writer(context.Context, digest.Digest) (ifaces.ContentWriter, error) {
 	s.storeCalls.Add(1)
-	panic("Racer request reached legacy Writer")
+	panic("Racer request reached direct Writer")
 }
 
-func (s *racerLegacyTrap) Pull(context.Context, ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (s *racerDirectTrap) Pull(context.Context, ifaces.OriginRef) (io.ReadCloser, int64, error) {
 	s.originCalls.Add(1)
 	panic("Racer request retried direct origin Pull")
 }
 
-func (s *racerLegacyTrap) Head(context.Context, ifaces.OriginRef) (int64, string, error) {
+func (s *racerDirectTrap) Head(context.Context, ifaces.OriginRef) (int64, string, error) {
 	s.originCalls.Add(1)
 	panic("Racer request reached direct origin Head")
 }
 
-func (s *racerLegacyTrap) AuthenticationChallenge(context.Context, string) (string, bool, error) {
+func (s *racerDirectTrap) AuthenticationChallenge(context.Context, string) (string, bool, error) {
 	s.probes.Add(1)
 	return s.challenge, s.challenge != "", nil
 }
@@ -306,17 +307,17 @@ func racerFakeClient(t *testing.T, origin racersdk.Origin) *racersdk.Client {
 	return racersdktest.NewClient(t, origin)
 }
 
-func racerServer(t *testing.T, cfg *config.Config, client Client, trap *racerLegacyTrap, challengers ...mirror.AuthenticationChallenger) *httptest.Server {
+func racerServer(t *testing.T, cfg *config.Config, client Client, trap *racerDirectTrap, challengers ...mirror.AuthenticationChallenger) *httptest.Server {
 	t.Helper()
 	t.Cleanup(func() {
 		if store, origin := trap.storeCalls.Load(), trap.originCalls.Load(); store != 0 || origin != 0 {
-			t.Errorf("legacy content calls: store=%d origin=%d; want zero", store, origin)
+			t.Errorf("direct content calls: store=%d origin=%d; want zero", store, origin)
 		}
 	})
 
 	var origin ifaces.OriginPuller = trap
 	if len(challengers) != 0 {
-		origin = racerChallengeOrigin{racerLegacyTrap: trap, AuthenticationChallenger: challengers[0]}
+		origin = racerChallengeOrigin{racerDirectTrap: trap, AuthenticationChallenger: challengers[0]}
 	}
 
 	server := httptest.NewServer(WrapHTTP(mirror.New(cfg, trap, origin, mirror.WithContentBackend(NewHandler(client, origin.(authenticationChallenger), nil))).Handler(), 0, nil))
@@ -327,7 +328,7 @@ func racerServer(t *testing.T, cfg *config.Config, client Client, trap *racerLeg
 }
 
 type racerChallengeOrigin struct {
-	*racerLegacyTrap
+	*racerDirectTrap
 	mirror.AuthenticationChallenger
 }
 
@@ -450,7 +451,7 @@ func racerPageOrigin(t *testing.T, d digest.Digest, data []byte) racersdk.Origin
 }
 
 // This upstream is reachable only through gantry/racer.Origin. The separate
-// racerLegacyTrap passed to mirror.New catches direct registry fallback.
+// racerDirectTrap passed to mirror.New catches direct registry fallback.
 type racerRegistry struct {
 	t             *testing.T
 	data          []byte
@@ -554,7 +555,7 @@ func TestRacerGETAndHEAD(t *testing.T) {
 
 					return metadata, body, err
 				})
-				server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+				server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 				resp := racerRequest(t, server, method, tc.route, d, "", "")
 				if resp.StatusCode != http.StatusOK {
@@ -591,7 +592,7 @@ func TestRacerGETAndHEAD(t *testing.T) {
 }
 
 type racerHeaderOrigin struct {
-	*racerLegacyTrap
+	*racerDirectTrap
 	metadata racersdk.Metadata
 }
 
@@ -608,8 +609,8 @@ func TestRacerMirrorPolicyParity(t *testing.T) {
 					d := racerDigest(nil)
 					metadata := racerMetadata(t, d, size)
 					metadata.ContentType = contentType
-					origin := racerHeaderOrigin{racerLegacyTrap: &racerLegacyTrap{}, metadata: metadata}
-					legacy := mirror.New(racerConfig(), fakes.NewCache(), origin)
+					origin := racerHeaderOrigin{racerDirectTrap: &racerDirectTrap{}, metadata: metadata}
+					direct := mirror.New(racerConfig(), fakes.NewCache(), origin)
 
 					route := "blobs"
 					if kind == ifaces.KindManifest {
@@ -617,7 +618,7 @@ func TestRacerMirrorPolicyParity(t *testing.T) {
 					}
 
 					w := httptest.NewRecorder()
-					legacy.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/v2/library/image/"+route+"/"+d.String(), nil))
+					direct.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/v2/library/image/"+route+"/"+d.String(), nil))
 
 					racerResponse := httptest.NewRecorder()
 					client := racerMetadataClient{metadata: metadata}
@@ -629,7 +630,7 @@ func TestRacerMirrorPolicyParity(t *testing.T) {
 						t.Fatalf("mirror HEAD failed: %d", w.Code)
 					}
 
-					// Racer rejects unknown manifest types instead of using the legacy default.
+					// Racer rejects unknown manifest types instead of using the direct-mode default.
 					if kind == ifaces.KindManifest && contentType == "" {
 						if racerResponse.Code != http.StatusBadGateway || racerResponse.Header().Get("Gantry-Mirrored") != "" {
 							t.Fatalf("unknown manifest type accepted: status=%d headers=%v", racerResponse.Code, racerResponse.Header())
@@ -671,7 +672,7 @@ func TestRacerMirrorPolicyParity(t *testing.T) {
 				r := httptest.NewRequest(http.MethodHead, "/v2/library/image/blobs/"+d.String(), nil)
 
 				if backend == "mirror" {
-					origin := racerChallengeOrigin{racerLegacyTrap: &racerLegacyTrap{}, AuthenticationChallenger: probe}
+					origin := racerChallengeOrigin{racerDirectTrap: &racerDirectTrap{}, AuthenticationChallenger: probe}
 					mirror.New(racerConfig(), nil, origin).Handler().ServeHTTP(w, r)
 				} else {
 					NewHandler(nil, probe, nil).racerError(w, r, ifaces.OriginRef{Registry: "registry.example"}, racersdk.ErrUnauthorized)
@@ -728,7 +729,7 @@ func TestRacerResumeAndInvalidRange(t *testing.T) {
 			{"manifests/", "bytes=4-", "", 0, 502},
 			{"blobs/", "bytes=4-", `Basic realm="registry"`, 0, 401},
 		} {
-			trap := &racerLegacyTrap{challenge: tc.challenge}
+			trap := &racerDirectTrap{challenge: tc.challenge}
 			calls := 0
 			d := racerDigest(nil)
 			backend := contentBackendFunc(func(w http.ResponseWriter, _ *http.Request, ref ifaces.OriginRef) {
@@ -753,7 +754,7 @@ func TestRacerResumeAndInvalidRange(t *testing.T) {
 			}
 
 			if w.Code != tc.status || calls != wantCalls || trap.storeCalls.Load() != 0 || trap.originCalls.Load() != 0 {
-				t.Fatalf("status=%d calls=%d legacy=%d/%d", w.Code, calls, trap.storeCalls.Load(), trap.originCalls.Load())
+				t.Fatalf("status=%d calls=%d direct=%d/%d", w.Code, calls, trap.storeCalls.Load(), trap.originCalls.Load())
 			}
 		}
 	})
@@ -775,7 +776,7 @@ func TestRacerResumeAndInvalidRange(t *testing.T) {
 		t.Run(tc.rangeHeader, func(t *testing.T) {
 			d := racerDigest(data)
 			client := racerFakeClient(t, racerPageOrigin(t, d, data))
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 			resp := racerRequest(t, server, http.MethodGet, "blobs", d, tc.rangeHeader, "")
 			if resp.StatusCode != tc.status || resp.Header.Get("Content-Range") != tc.contentRange {
@@ -815,7 +816,7 @@ func TestRacerResumeAcrossPages(t *testing.T) {
 
 		return origin(ctx, req)
 	})
-	server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+	server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 	offset := int(racersdk.PageSize) + 7
 	resp := racerRequest(t, server, http.MethodGet, "blobs", d, fmt.Sprintf("bytes=%d-", offset), "")
 
@@ -873,7 +874,7 @@ func TestRacerSDKRequestTranscript(t *testing.T) {
 			data := tc.data
 			d := racerDigest(data)
 			client := &racerTranscriptClient{Client: racerFakeClient(t, racerPageOrigin(t, d, data)), options: make(chan []racersdk.ReadOptions, 1)}
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 			resp := racerRequest(t, server, tc.method, tc.route, d, tc.rangeHeader, "")
 			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
@@ -937,7 +938,7 @@ func TestRacerRejectsMixedMetadata(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := racerMetadataClient{Client: racerFakeClient(t, racerPageOrigin(t, d, data)), metadata: tc.metadata}
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 			resp := racerRequest(t, server, http.MethodGet, "blobs", d, "bytes=4-", "")
 			if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("Gantry-Mirrored") != "" {
@@ -967,7 +968,7 @@ func TestRacerOptionalContentTypeKeepsSnapshot(t *testing.T) {
 				return actual, body, err
 			})}
 
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 			resp := racerRequest(t, server, http.MethodGet, "blobs", d, "bytes=4-", "")
 			if tc.initial != tc.returned {
@@ -1004,7 +1005,7 @@ func TestRacerContainerdRejectsCorruptAssembly(t *testing.T) {
 				data[0] ^= 0xff
 			}
 
-			server := racerServer(t, racerConfig(), racerFakeClient(t, racerPageOrigin(t, d, data)), &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), racerFakeClient(t, racerPageOrigin(t, d, data)), &racerDirectTrap{})
 
 			var resumes atomic.Int32
 
@@ -1084,7 +1085,7 @@ func TestRacerContainerdRejectsCorruptAssembly(t *testing.T) {
 	}
 }
 
-func TestRacerErrorsNeverUseLegacyContent(t *testing.T) {
+func TestRacerErrorsNeverUseDirectContent(t *testing.T) {
 	for _, tc := range []struct {
 		kind   error
 		status int
@@ -1104,7 +1105,7 @@ func TestRacerErrorsNeverUseLegacyContent(t *testing.T) {
 					calls.Add(1)
 					return racersdk.Metadata{}, nil, fmt.Errorf("%w: private upstream detail", tc.kind)
 				})
-				server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+				server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 				resp := racerRequest(t, server, mode.method, "blobs", racerDigest([]byte("missing")), mode.rangeHeader, "")
 
@@ -1128,7 +1129,7 @@ func TestRacerUnavailableFailsClosed(t *testing.T) {
 		logger := slog.New(slog.NewJSONHandler(&logs, nil))
 		cfg := racerConfig()
 		cfg.RacerEnabled = true
-		trap := &racerLegacyTrap{}
+		trap := &racerDirectTrap{}
 		server := mirror.New(cfg, trap, trap, mirror.WithContentBackend(nil), mirror.WithLogger(logger))
 		w := httptest.NewRecorder()
 		server.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v2/library/image/blobs/"+racerDigest(nil).String(), nil))
@@ -1148,7 +1149,7 @@ func TestRacerUnavailableFailsClosed(t *testing.T) {
 		logger := slog.New(slog.NewJSONHandler(&logs, nil))
 		cfg := racerConfig()
 		cfg.RacerEnabled = true
-		trap := &racerLegacyTrap{}
+		trap := &racerDirectTrap{}
 		server := mirror.New(cfg, trap, trap, mirror.WithContentBackend(NewHandler(nil, trap, logger)))
 		ids := make(map[string]bool)
 
@@ -1178,7 +1179,7 @@ func TestRacerUnavailableFailsClosed(t *testing.T) {
 		}
 
 		if trap.storeCalls.Load() != 0 || trap.originCalls.Load() != 0 {
-			t.Fatal("nil client reached legacy content")
+			t.Fatal("nil client reached direct content")
 		}
 	})
 
@@ -1199,7 +1200,7 @@ func TestRacerUnavailableFailsClosed(t *testing.T) {
 					client = fake
 				}
 
-				server := racerServer(t, cfg, client, &racerLegacyTrap{})
+				server := racerServer(t, cfg, client, &racerDirectTrap{})
 
 				resp := racerRequest(t, server, mode.method, "blobs", racerDigest(nil), mode.rangeHeader, "")
 				if resp.StatusCode != http.StatusServiceUnavailable {
@@ -1238,10 +1239,10 @@ func TestRacerFailureBeforeContentHeaders(t *testing.T) {
 				return metadata, io.NopCloser(bytes.NewReader(data[:available])), nil
 			})
 
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 			if mode == "prefix" || mode == "resume skip" {
-				// Superseded: the mirror no longer peeks or reads a skipped
-				// prefix before committing headers. Truncation aborts the stream.
+				// The mirror never peeks or reads a skipped prefix before
+				// committing headers. Truncation aborts the stream.
 				req := handlerRequest(t, t.Context(), server, http.MethodGet, "blobs", d)
 				req.Header.Set("Range", rangeHeader)
 
@@ -1267,8 +1268,8 @@ func TestRacerFailureBeforeContentHeaders(t *testing.T) {
 			}
 
 			if mode == "HEAD prefix" {
-				// Superseded: HEAD needs metadata only, so a broken body cannot
-				// affect it and is never opened.
+				// HEAD needs metadata only, so a broken body cannot affect it
+				// and is never opened.
 				if resp.Header.Get("Gantry-Mirrored") != "1" {
 					t.Fatal("metadata-only HEAD failed")
 				}
@@ -1304,8 +1305,8 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 			rangeHeader, offset := "", 0
 
 			if failure == "digest mismatch" {
-				// Superseded integrity expectation: the mirror transports bytes;
-				// the consumer verifies the final assembled OCI object.
+				// The mirror transports bytes; the consumer verifies the final
+				// assembled OCI object.
 				data[0] ^= 0xff
 				data[len(data)-1] ^= 0xff
 			}
@@ -1342,7 +1343,7 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 
 				return metadata, io.NopCloser(reader), nil
 			})
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 			resp := racerRequest(t, server, http.MethodGet, "blobs", d, rangeHeader, "")
 
 			wantStatus := http.StatusOK
@@ -1403,7 +1404,7 @@ func TestRacerAuthenticationProbeAndDelegatedCredentials(t *testing.T) {
 
 				return callback(ctx, req)
 			})
-			trap := &racerLegacyTrap{challenge: `Bearer realm="https://registry.example/token",service="registry.example"`}
+			trap := &racerDirectTrap{challenge: `Bearer realm="https://registry.example/token",service="registry.example"`}
 			server := racerServer(t, cfg, client, trap)
 
 			probe := racerRequest(t, server, http.MethodHead, "blobs", d, "", "")
@@ -1524,7 +1525,7 @@ func TestRacerRejectedCredentialPreservesRememberedChallenge(t *testing.T) {
 				calls.Add(1)
 				return callback(ctx, req)
 			})
-			trap := &racerLegacyTrap{}
+			trap := &racerDirectTrap{}
 			server := racerServer(t, cfg, client, trap, upstream)
 
 			method, rangeHeader, status, want := http.MethodGet, "", http.StatusOK, data
@@ -1538,8 +1539,8 @@ func TestRacerRejectedCredentialPreservesRememberedChallenge(t *testing.T) {
 
 			resp := racerRequest(t, server, method, "blobs", d, rangeHeader, "Bearer expired")
 			// HEAD never opens a body; full GET obtains metadata from its
-			// bounded response. Preserve both superseded rejection cases as
-			// proof that the unnecessary request no longer occurs.
+			// bounded response, so neither makes a separate metadata request
+			// that could be rejected.
 			wantStatus, wantChallenge := status, ""
 			if tc.unauthorized {
 				wantStatus, wantChallenge = http.StatusUnauthorized, challenge
@@ -1618,7 +1619,7 @@ func TestRacerRejectedCredentialProbeFailureKeepsUnauthorized(t *testing.T) {
 					return "", true, nil
 				}
 			})
-			trap := &racerLegacyTrap{}
+			trap := &racerDirectTrap{}
 			server := racerServer(t, racerConfig(), client, trap, probe)
 
 			resp := racerRequest(t, server, http.MethodGet, "blobs", racerDigest(nil), "", "Bearer expired")
@@ -1678,7 +1679,7 @@ func TestRacerHEADDuringBulkStream(t *testing.T) {
 
 		return metadata, body, nil
 	})
-	server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+	server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 	bulk := racerRequest(t, server, http.MethodGet, "blobs", d, "", "")
 	defer bulk.Body.Close()
@@ -1725,7 +1726,7 @@ func TestRacerManifestGETWithSaturatedBulkPool(t *testing.T) {
 		defer value.Close()
 	}
 
-	server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+	server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -1781,7 +1782,7 @@ func TestRacerManifestSizeLimitBeforeHeaders(t *testing.T) {
 			data := bytes.Repeat([]byte("x"), size)
 			d := racerDigest(data)
 			client := racerFakeClient(t, racerPageOrigin(t, d, data))
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 			resp := racerRequest(t, server, http.MethodGet, "manifests", d, "", "")
 
 			body := handlerReadBody(t, resp)
@@ -1841,9 +1842,9 @@ func TestRacerStalledDownstreamClosesSDKStream(t *testing.T) {
 }
 
 func TestRacerCancellationClosesStream(t *testing.T) {
-	// "resume skip" is retained as the historical case name. Cancellation now
+	// "range suffix" is retained as the historical case name. Cancellation now
 	// interrupts the requested suffix directly; the mirror never skips bytes.
-	for _, mode := range []string{"before headers", "streaming", "resume skip"} {
+	for _, mode := range []string{"before headers", "streaming", "range suffix"} {
 		t.Run(mode, func(t *testing.T) {
 			data := bytes.Repeat([]byte("x"), 256*1024)
 			d := racerDigest(data)
@@ -1862,14 +1863,14 @@ func TestRacerCancellationClosesStream(t *testing.T) {
 
 				return metadata, body, nil
 			})
-			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
 			req := handlerRequest(t, ctx, server, http.MethodGet, "blobs", d)
 
-			if mode == "resume skip" {
+			if mode == "range suffix" {
 				req.Header.Set("Range", "bytes=131072-")
 			}
 

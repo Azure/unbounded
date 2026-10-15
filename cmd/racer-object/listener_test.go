@@ -155,7 +155,8 @@ func TestSidecarHTTPReaderFrom(t *testing.T) {
 }
 
 // This local benchmark includes fake origin/protocol work and HTTP draining,
-// not a production dataplane. The hidden variant reproduces the old limiter.
+// not a production dataplane. The hidden variant hides ReaderFrom
+// on the connection as a baseline that forces a copy loop.
 func BenchmarkSidecarHTTPReaderFrom(b *testing.B) {
 	for _, hidden := range []bool{true, false} {
 		b.Run(map[bool]string{true: "hidden", false: "preserved"}[hidden], func(b *testing.B) {
