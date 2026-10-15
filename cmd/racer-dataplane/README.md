@@ -125,3 +125,21 @@ Tests cover parser rejection, sequential upload/fetch exchanges, body bounds,
 read-ahead, cancellation fences, and transfer fallback. Transfer fixtures script
 pipe outcomes while checking actual Unix socket bytes. CI checks all targets and
 runs strict Clippy separately for production and all HTTP features.
+
+The `peer-wire` library provides signed peer heads, connection handshakes, ordered
+sessions, and forwarding proofs. Callers supply identities and credential policy.
+
+The `racer-object-wire` library in `object-wire/` provides object keys, metadata,
+ranges, and client/origin HTTP codecs. Its `test-util` feature adds a local origin
+fixture; the library does not authorize requests or authenticate encrypted pages.
+
+Both libraries have opt-in `test-util` helpers. Check production libraries without
+test features, then run each crate's tests separately:
+
+```sh
+for package in peer-wire racer-object-wire; do
+  timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p "$package" --lib --no-default-features -j 2
+  timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p "$package" -j 2 -- --test-threads=1
+  timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p "$package" --all-features -j 2 -- --test-threads=1
+done
+```
