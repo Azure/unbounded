@@ -439,7 +439,7 @@ mod tests {
     }
 
     /// Isolated fixture: no application, storage, network, RDMA, or cluster setup.
-    /// Parent must review the binary and explicitly run this ignored test.
+    /// Run this ignored test explicitly, only with an authorized, verified binary.
     #[test]
     #[ignore = "requires explicitly authorized perf access and a prepared output file"]
     fn native_two_worker_capture() {

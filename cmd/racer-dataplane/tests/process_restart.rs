@@ -660,7 +660,7 @@ fn real_sdk_connection_age_sustained() {
     drop(origins);
 }
 
-// Historical profiles call I/O shard counts "pairs". Preserve their 1/2/4-shard
+// Profiles call I/O shard counts "pairs". Keep their 1/2/4-shard
 // workloads, but budget shared crypto rather than doubling every shard count.
 fn profile_thread_cap(io_shards: usize) -> usize {
     assert!([1, 2, 4].contains(&io_shards));

@@ -100,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn cipher_id_rejects_unknown_and_obsolete_values() {
+    fn cipher_id_accepts_only_known_values() {
         assert_eq!(PageCipher::try_from(1), Ok(PageCipher::Xaes256Gcm));
         for value in [0, 2, u32::MAX] {
             assert_eq!(PageCipher::try_from(value), Err(Error::CorruptRecord));

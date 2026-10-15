@@ -36,7 +36,7 @@ pub struct Session {
 
     pub(super) snapshots: Rc<PublicationTarget>,
 
-    // Keep the concrete generic owner visible; no compatibility driver alias.
+    // Keep the concrete generic owner type visible rather than aliased.
     #[allow(clippy::type_complexity)]
     publications: RefCell<
         Option<Sync<ReactorControlIo, ObservedPublication, PublicationSource, PublicationInstall>>,
