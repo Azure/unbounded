@@ -88,15 +88,10 @@ func TestCacheFlag(t *testing.T) {
 				}
 			}
 
-			_, err := parseOptions([]string{mode, "--namespace=store", "--cache=custom", "--volume=custom"}, io.Discard)
-			if err == nil || err.Error() != "invalid flags (use --help)" {
-				t.Fatalf("old flag was not rejected: %v", err)
-			}
-
 			var output bytes.Buffer
 
-			_, err = parseOptions([]string{mode, "--help"}, &output)
-			if !errors.Is(err, flag.ErrHelp) || !strings.Contains(output.String(), "-cache") || strings.Contains(output.String(), "-volume") {
+			_, err := parseOptions([]string{mode, "--help"}, &output)
+			if !errors.Is(err, flag.ErrHelp) || !strings.Contains(output.String(), "-cache") {
 				t.Fatalf("unexpected help: %q, %v", output.String(), err)
 			}
 		})

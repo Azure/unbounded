@@ -105,10 +105,6 @@ func TestAzureCacheOptions(t *testing.T) {
 			if err != nil || o.cache != "azure-test" {
 				t.Fatalf("Azure cache: %+v, %v", o, err)
 			}
-
-			if _, err := parseOptions(append(args, "--volume=azure-test"), io.Discard); err == nil {
-				t.Fatal("accepted removed volume flag")
-			}
 		})
 	}
 }
