@@ -1280,7 +1280,7 @@ mod tests {
                     .sign(b"still usable")
                     .is_ok()
             );
-            // Legacy records written by a weaker version also fail closed on load,
+            // Persisted records with invalid identities also fail closed on load,
             // without deleting the matching pending request during recovery.
             let invalid = PersistedIdentity {
                 pending: decode_pending(&pending).unwrap(),
@@ -1377,7 +1377,7 @@ mod tests {
                 "{case}"
             );
             assert_eq!(*e.roots.borrow(), good);
-            // Exercise legacy invalid snapshots independently of setter rejection.
+            // Exercise invalid stored snapshots independently of setter rejection.
             *e.roots.borrow_mut() = roots;
             assert!(
                 matches!(drive(&files, e.accept_response(response.clone(), &scope)), Err(error) if error == Error::Unauthorized.into()),

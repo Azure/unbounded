@@ -769,8 +769,8 @@ impl SegmentClock {
     /// Scores are soft preferences, not pins. The callback must itself bound
     /// mapping inspection.
     /// Existing eviction work sorts first so partial removals always make progress.
-    /// Unlike the legacy clock, logical heat is supplied by the caller, so recent
-    /// disk completions do not override value ranking.
+    /// Logical heat is supplied by the caller, so recent disk completions do not
+    /// override value ranking.
     /// For a nonzero reserve, success requires the reserve (capped at the slot
     /// count), but does not guarantee that pending evictions have drained. Busy
     /// means the bounded sweep could not meet the reserve or mutation was blocked.

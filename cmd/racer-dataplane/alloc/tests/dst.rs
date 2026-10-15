@@ -2801,7 +2801,7 @@ fn pending_read_terminal_results_during_write() {
     }
 }
 
-/// Phil's restore regressions and other fixed histories, each run through the
+/// Fixed restore and cancellation histories, each run through the
 /// same runner with both cancellation orders.
 #[test]
 fn regression_traces() {
