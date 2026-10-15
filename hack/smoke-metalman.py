@@ -456,9 +456,10 @@ def write_service_account_kubeconfig(namespace: str, service_account: str, path:
 def start_machina_controller(work_dir: Path) -> None:
     kubeconfig = work_dir / "machina-controller.kubeconfig"
     config = work_dir / "machina-config.yaml"
+    api_endpoint = apiserver_url()
     write_service_account_kubeconfig(METALMAN_NAMESPACE, "machina-controller", kubeconfig)
     config.write_text(
-        "apiServerEndpoint: \"\"\n"
+        f"apiServerEndpoint: {json.dumps(api_endpoint)}\n"
         "metricsAddr: \"127.0.0.1:0\"\n"
         "probeAddr: \"127.0.0.1:0\"\n"
         "enableLeaderElection: false\n"
