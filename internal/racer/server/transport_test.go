@@ -1565,7 +1565,12 @@ func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
 					}
 
 					if err == nil {
-						t.Error("canceled poll succeeded")
+						// The cancellation response can win the race with TLS closure.
+						if response == nil {
+							t.Error("canceled poll returned neither a response nor an error")
+						} else if response.StatusCode != http.StatusServiceUnavailable {
+							t.Errorf("canceled poll returned status %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+						}
 					}
 				}
 			}()
