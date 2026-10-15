@@ -482,7 +482,7 @@ func configureTunnelPeers(
 	}
 
 	for _, gwPeer := range gatewayPeers {
-		if len(gwPeer.InternalIPs) == 0 || len(gwPeer.PodCIDRs) == 0 {
+		if !gatewayPeerReadyForTunnel(gwPeer) {
 			continue
 		}
 
@@ -538,6 +538,23 @@ func configureTunnelPeers(
 		len(meshPeers), len(gatewayPeers), len(bpfEntries), len(routes), ifName)
 
 	return routes, hcPeers, nil
+}
+
+// gatewayPeerReadyForTunnel reports whether a gateway peer can be programmed
+// into the tunnel BPF map. A gateway in a managed Site without a podCIDR is
+// still waiting for CNI setup (it publishes its WireGuard key first), so it
+// stays out of the map. A gateway in a Site with manageCniPlugin=false never
+// gets a podCIDR, so its routed CIDRs are what make it usable.
+func gatewayPeerReadyForTunnel(gwPeer gatewayPeerInfo) bool {
+	if len(gwPeer.InternalIPs) == 0 {
+		return false
+	}
+
+	if len(gwPeer.PodCIDRs) > 0 {
+		return true
+	}
+
+	return gwPeer.UnmanagedCNISite && len(gwPeer.RoutedCidrs) > 0
 }
 
 // addPeerBPFEntries adds LPM trie entries for a set of CIDRs pointing to a
