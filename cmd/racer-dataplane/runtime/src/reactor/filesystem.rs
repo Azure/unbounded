@@ -4,6 +4,7 @@ use super::*;
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
 use zeroize::Zeroize;
 
+pub mod checkpoint;
 pub mod operations;
 
 /// Stable, quota-owning I/O storage with a cursor for partial writes.
@@ -137,7 +138,15 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             loop {
                 buffer.end = (probe - out.buffer.end).min(buffer.data.len());
                 let completion = self
-                    .read_at(fd.clone(), out.buffer.end as u64, buffer, (), scope)
+                    .buffer_io(
+                        fd.clone(),
+                        buffer,
+                        (),
+                        scope,
+                        super::BufferOperation::Read(out.buffer.end as u64),
+                        super::IssuePolicy::Offload,
+                        None,
+                    )
                     .await?;
                 let n = completion.bytes;
                 buffer = completion.buffer;
@@ -220,6 +229,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Operation<'a, libc::statx, S::Error> {
         Box::pin(async move {
             let quota = self.charge(std::mem::size_of::<libc::statx>())?;
+            // SAFETY: statx is a plain C struct of integers for which all-zero bytes are valid.
             let mut stat = SyscallArg::<libc::statx>::new(unsafe { std::mem::zeroed() });
             let sqe = submission!(
                 self,
@@ -597,6 +607,7 @@ pub mod secure {
         check_access(
             stat,
             AccessRequirements {
+                // SAFETY: geteuid has no memory or lifetime preconditions.
                 owner: unsafe { libc::geteuid() },
                 forbidden_mode: 0o077,
                 links: regular.then_some(1),

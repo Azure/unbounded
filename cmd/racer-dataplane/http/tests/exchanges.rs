@@ -1,0 +1,687 @@
+//! Consumer workflows using only public APIs and real, unprivileged socket pairs.
+
+use http1::{
+    Codec, Error, Header, MessageHead, StartLine,
+    connection::{ConnectionLease, Context, Endpoint, HttpIo, OwnedBuffer},
+};
+use std::{
+    future::Future,
+    os::unix::net::UnixStream,
+    rc::Rc,
+    task::{Poll, Waker},
+    time::{Duration, Instant},
+};
+use uring_runtime::{
+    Scope,
+    reactor::{IoBuffer, Reactor, SocketAddress},
+};
+
+/// Keeps HTTP syntax failures distinct from transport failures.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Failure {
+    Http(Error),
+
+    Runtime(uring_runtime::Error),
+}
+
+impl From<Error> for Failure {
+    /// Preserve an HTTP failure for assertions at the caller boundary.
+    fn from(error: Error) -> Self {
+        Self::Http(error)
+    }
+}
+
+impl From<uring_runtime::Error> for Failure {
+    /// Preserve the runtime failure without mapping it to HTTP syntax.
+    fn from(error: uring_runtime::Error) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+/// A live scope for exchanges bounded by the test driver's deadline.
+#[derive(Clone)]
+struct RequestScope;
+
+impl Scope for RequestScope {
+    type Error = Failure;
+
+    /// Allow progress until the surrounding test driver stops polling.
+    fn check(&self) -> Result<(), Failure> {
+        Ok(())
+    }
+}
+
+/// Wraps a socket address in the caller's endpoint policy.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Address(SocketAddress);
+
+impl Endpoint<Failure> for Address {
+    /// Return the endpoint unchanged without name resolution.
+    fn address(&self) -> Result<SocketAddress, Failure> {
+        Ok(self.0.clone())
+    }
+}
+
+/// Supplies permissive resource policy without application dependencies.
+struct Caller;
+
+impl Context for Caller {
+    type Error = Failure;
+
+    type Scope = RequestScope;
+
+    type Budget = ();
+
+    type Reactor = Rc<Reactor<RequestScope, ()>>;
+
+    type Charge = ();
+
+    type Slot = ();
+
+    type Opaque = ();
+
+    type State = ();
+
+    type Endpoint = Address;
+
+    /// Admit the bounded storage used by each exchange fixture.
+    fn charge(&self, _: usize) -> Result<(), Failure> {
+        Ok(())
+    }
+
+    /// Admit an outbound connection without tracking application quotas.
+    fn outbound_slot(&self) -> Result<(), Failure> {
+        Ok(())
+    }
+
+    /// Keep admission open for the lifetime of the fixture.
+    fn stopped(&self) -> bool {
+        false
+    }
+}
+
+/// Build a small reactor and explicit head and body limits.
+fn io() -> HttpIo<Caller> {
+    HttpIo::new(
+        Rc::new(Rc::new(Reactor::new(16, ()))),
+        Codec::new(256),
+        Rc::new(Caller),
+        16,
+        16,
+    )
+}
+
+/// Reserve both ends of a real local stream for HTTP exchanges.
+fn pair() -> (ConnectionLease<Caller>, ConnectionLease<Caller>) {
+    let (client, server) = UnixStream::pair().unwrap();
+    (
+        ConnectionLease::from_reserved(client.into(), (), ()).unwrap(),
+        ConnectionLease::from_reserved(server.into(), (), ()).unwrap(),
+    )
+}
+
+/// Ready completions are drained without recreating or losing a pending accept.
+#[test]
+fn accept_retains_one_future_across_completions_and_preserves_errors() {
+    use futures::{channel::oneshot, stream::FuturesUnordered};
+    use std::cell::Cell;
+    for ready in [false, true] {
+        let polls = Cell::new(0);
+        let (send, mut receive) = oneshot::channel::<Result<u8, Failure>>();
+        let accept = std::future::poll_fn(|cx| {
+            polls.set(polls.get() + 1);
+            std::pin::Pin::new(&mut receive)
+                .poll(cx)
+                .map(|result| result.unwrap())
+        });
+        let mut active = FuturesUnordered::new();
+        let (done, completion) = oneshot::channel::<()>();
+        active.push(completion);
+        let mut operation = Box::pin(http1::connection::next_accepted(
+            accept,
+            &mut active,
+            &RequestScope,
+        ));
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(operation.as_mut().poll(&mut cx).is_pending());
+        let mut send = Some(send);
+        if ready {
+            send.take().unwrap().send(Ok(7)).unwrap();
+        }
+        done.send(()).unwrap();
+        if !ready {
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            send.take().unwrap().send(Ok(7)).unwrap();
+        }
+        assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Ok(7)));
+        drop(operation);
+        assert!(active.is_empty());
+        assert!(polls.get() >= 2);
+    }
+    let mut active = FuturesUnordered::new();
+    active.push(std::future::ready(()));
+    let failure = Failure::Runtime(uring_runtime::Error::Io);
+    assert_eq!(
+        futures::executor::block_on(http1::connection::next_accepted(
+            std::future::ready(Err::<(), _>(failure)),
+            &mut active,
+            &RequestScope,
+        )),
+        Err(failure)
+    );
+    assert!(active.is_empty());
+}
+
+/// Disconnect detection cancels work but still polls it to completion and fences its watch.
+#[test]
+fn disconnect_waits_for_work_cleanup_before_returning_failure() {
+    use std::cell::Cell;
+    let io = io();
+    io.reactor().init().unwrap();
+    let (connection, peer) = pair();
+    drop(peer);
+    let canceled = Cell::new(false);
+    let cleaned = Cell::new(false);
+    let watch_canceled = Cell::new(false);
+    let work = std::future::poll_fn(|cx| {
+        if canceled.get() {
+            if cleaned.replace(true) {
+                Poll::Ready(Ok(7))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        } else {
+            Poll::Pending
+        }
+    });
+    let result = drive(
+        &io,
+        http1::connection::disconnect_fenced(
+            &io,
+            &connection,
+            &RequestScope,
+            || Ok(RequestScope),
+            || canceled.set(true),
+            |_| watch_canceled.set(true),
+            work,
+        ),
+    );
+    assert_eq!(
+        result,
+        Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+    );
+    assert!(canceled.get() && cleaned.get() && watch_canceled.get());
+    assert_eq!(io.reactor().in_flight(), 0);
+}
+
+/// Independent caller scopes exercise cancellation and watch fencing without Racer.
+mod disconnect_scopes {
+    use super::*;
+    use std::cell::Cell;
+    use uring_runtime::environment::Cancellation;
+
+    /// A cancellable caller scope, independent of wall time.
+    #[derive(Clone)]
+    struct CancelScope(Cancellation);
+
+    impl Scope for CancelScope {
+        type Error = Failure;
+
+        fn check(&self) -> Result<(), Failure> {
+            if self.0.is_cancelled() {
+                Err(uring_runtime::Error::Cancelled.into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn cancellation(&self) -> Option<&Cancellation> {
+            Some(&self.0)
+        }
+    }
+
+    /// Permissive resource hooks keep this contract independent of quota policy.
+    struct ScopedCaller;
+
+    impl Context for ScopedCaller {
+        type Error = Failure;
+
+        type Scope = CancelScope;
+
+        type Budget = ();
+
+        type Reactor = Rc<Reactor<CancelScope, ()>>;
+
+        type Charge = ();
+
+        type Slot = ();
+
+        type Opaque = ();
+
+        type State = ();
+
+        type Endpoint = Address;
+
+        fn charge(&self, _: usize) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn outbound_slot(&self) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn stopped(&self) -> bool {
+            false
+        }
+    }
+
+    /// Both success and parent cancellation await the independent readiness fence.
+    #[test]
+    fn success_and_parent_cancel_fence_watch_and_keep_parent_independent() {
+        for cancel in [false, true] {
+            let io = HttpIo::new(
+                Rc::new(Rc::new(Reactor::new(16, ()))),
+                Codec::new(256),
+                Rc::new(ScopedCaller),
+                16,
+                16,
+            );
+            io.reactor().init().unwrap();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+            let parent = CancelScope(Cancellation::new().unwrap());
+            let exchange = CancelScope(Cancellation::new().unwrap());
+            let watch = CancelScope(Cancellation::new().unwrap());
+            let cleanup_turns = Cell::new(0);
+            let work = std::future::poll_fn(|cx| {
+                if cancel && !exchange.0.is_cancelled() {
+                    return Poll::Pending;
+                }
+                cleanup_turns.set(cleanup_turns.get() + 1);
+                if cleanup_turns.get() < 2 {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(7))
+                }
+            });
+            let mut operation = Box::pin(http1::connection::disconnect_fenced(
+                &io,
+                &connection,
+                &parent,
+                || Ok(watch.clone()),
+                || exchange.0.cancel().unwrap(),
+                |scope| scope.0.cancel().unwrap(),
+                work,
+            ));
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            if cancel {
+                parent.0.cancel().unwrap();
+            }
+            let until = Instant::now() + Duration::from_secs(2);
+            let result = loop {
+                if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+                    break result;
+                }
+                assert!(Instant::now() < until, "disconnect fence watchdog");
+                io.reactor().poll_budgeted(32).unwrap();
+            };
+            assert_eq!(
+                result,
+                if cancel {
+                    Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+                } else {
+                    Ok(7)
+                }
+            );
+            assert!(watch.0.is_cancelled());
+            assert_eq!(parent.0.is_cancelled(), cancel);
+            assert_eq!(exchange.0.is_cancelled(), cancel);
+            assert_eq!(cleanup_turns.get(), 2);
+            assert_eq!(io.reactor().in_flight(), 0);
+        }
+    }
+
+    /// Watch-scope allocation failure never polls work or submits readiness I/O.
+    #[test]
+    fn failed_watch_scope_preserves_error_without_polling_work() {
+        let io = HttpIo::new(
+            Rc::new(Rc::new(Reactor::new(16, ()))),
+            Codec::new(256),
+            Rc::new(ScopedCaller),
+            16,
+            16,
+        );
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+        let parent = CancelScope(Cancellation::new().unwrap());
+        let error = Failure::Runtime(uring_runtime::Error::Overloaded);
+        let result = futures::executor::block_on(http1::connection::disconnect_fenced(
+            &io,
+            &connection,
+            &parent,
+            || Err(error),
+            || panic!("must not cancel work"),
+            |_| panic!("no watch exists"),
+            std::future::poll_fn(|_| -> Poll<Result<(), Failure>> { panic!("must not poll work") }),
+        ));
+        assert_eq!(result, Err(error));
+        assert_eq!(io.reactor().in_flight(), 0);
+        assert!(!parent.0.is_cancelled());
+    }
+}
+/// Poll one operation and its reactor under a fixed progress deadline.
+fn drive<T>(io: &HttpIo<Caller>, future: impl Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut cx = std::task::Context::from_waker(Waker::noop());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "HTTP exchange made no progress");
+        io.reactor().poll_budgeted(32).unwrap();
+        std::thread::yield_now();
+    }
+}
+
+/// Construct a fixed-length request or response head.
+fn head(start: StartLine, length: usize) -> MessageHead {
+    MessageHead {
+        start,
+        headers: vec![Header {
+            name: "Content-Length".into(),
+            value: length.to_string().into_bytes(),
+        }],
+    }
+}
+
+/// Construct a request for the shared fixture resource.
+fn request(method: &str, length: usize) -> MessageHead {
+    head(
+        StartLine::Request {
+            method: method.into(),
+            target: "/items".into(),
+        },
+        length,
+    )
+}
+
+/// HEAD representation lengths do not create a response body or prevent reuse.
+#[test]
+fn head_has_no_body_even_with_large_representation_length() {
+    use std::io::{Read, Write};
+    let io = io();
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            peer.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n")
+            .unwrap();
+    });
+    let mut received = drive(
+        &io,
+        io.exchange_head(connection, request("HEAD", 0), &RequestScope),
+    )
+    .unwrap();
+    assert_eq!(received.connection.receive_remaining(), Some(0));
+    received.connection.finish_exchange().unwrap();
+    thread.join().unwrap();
+}
+
+/// Real short sends preserve exactly the requested owned subrange.
+#[test]
+fn real_partial_sends_preserve_owned_subrange() {
+    use std::{io::Read, os::fd::AsRawFd};
+    let io = HttpIo::new(
+        Rc::new(Rc::new(Reactor::new(16, ()))),
+        Codec::new(256),
+        Rc::new(Caller),
+        2 * 1024 * 1024,
+        2 * 1024 * 1024,
+    );
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    let size: libc::c_int = 4096;
+    // SAFETY: setsockopt synchronously reads this correctly sized integer.
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as _,
+            )
+        },
+        0
+    );
+    let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+    let length = 1024 * 1024;
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        let start = received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(received.len() - start, length);
+        assert!(received[start..].iter().all(|b| *b == 91));
+    });
+    let sent = drive(
+        &io,
+        io.send_head(
+            connection,
+            head(StartLine::Response { status: 200 }, length),
+            &RequestScope,
+        ),
+    )
+    .unwrap();
+    let mut bytes = io.buffer(length + 4).unwrap();
+    bytes.bytes_mut().unwrap()[2..length + 2].fill(91);
+    let completed = drive(
+        &io,
+        io.write_body_range(sent.connection, bytes, 2..length + 2, &RequestScope),
+    )
+    .unwrap();
+    assert_eq!(completed.bytes, length);
+    drop(completed);
+    drive(&io, io.reactor().drain()).unwrap();
+    assert_eq!(io.reactor().in_flight(), 0);
+    thread.join().unwrap();
+}
+
+/// Exercise sequential upload and fetch exchanges and server-directed closure.
+#[test]
+fn upload_then_fetch_on_one_connection_and_honor_server_close() {
+    let io = io();
+    let (mut client, mut server) = pair();
+    for (method, body, reply, close) in [
+        ("POST", b"item".as_slice(), b"saved".as_slice(), false),
+        ("GET", b"".as_slice(), b"item".as_slice(), true),
+    ] {
+        client = drive(
+            &io,
+            io.send_head(client, request(method, body.len()), &RequestScope),
+        )
+        .unwrap()
+        .connection;
+        let mut padded = b"__".to_vec();
+        padded.extend_from_slice(body);
+        padded.extend_from_slice(b"__");
+        let sent = drive(
+            &io,
+            io.write_body_range(
+                client,
+                OwnedBuffer::copy_from(&Caller, &padded).unwrap(),
+                2..2 + body.len(),
+                &RequestScope,
+            ),
+        )
+        .unwrap();
+        assert_eq!(sent.bytes, body.len());
+        assert_eq!(sent.buffer.bytes().unwrap(), padded);
+        client = sent.lease;
+
+        let received = drive(
+            &io,
+            io.receive_request_head_limited(server, &RequestScope, 128),
+        )
+        .unwrap();
+        let request = received.value.unwrap();
+        assert!(
+            matches!(request.start, StartLine::Request { method: ref m, ref target }
+            if m == method && target == "/items")
+        );
+        assert_eq!(request.content_length().unwrap(), Some(body.len() as u64));
+        let uploaded = drive(
+            &io,
+            io.collect_body(received.connection, body.len(), &RequestScope),
+        )
+        .unwrap();
+        assert_eq!(uploaded.bytes, body.len());
+        assert_eq!(uploaded.buffer.bytes().unwrap(), body);
+        server = uploaded.lease;
+        assert_eq!(server.receive_remaining(), Some(0));
+        assert_eq!(
+            server.finish_exchange(),
+            Err(Failure::Http(Error::Malformed))
+        );
+
+        let mut response = head(StartLine::Response { status: 200 }, reply.len());
+        if close {
+            response.headers.push(Header {
+                name: "Connection".into(),
+                value: b"close".to_vec(),
+            });
+        }
+        server = drive(&io, io.send_head(server, response, &RequestScope))
+            .unwrap()
+            .connection;
+        server = drive(
+            &io,
+            io.write_body(
+                server,
+                OwnedBuffer::copy_from(&Caller, reply).unwrap(),
+                &RequestScope,
+            ),
+        )
+        .unwrap()
+        .lease;
+        let received = drive(&io, io.receive_head(client, &RequestScope)).unwrap();
+        assert!(matches!(
+            received.value.start,
+            StartLine::Response { status: 200 }
+        ));
+        client = received.connection;
+        assert_eq!(
+            client.finish_exchange(),
+            Err(Failure::Http(Error::Malformed))
+        );
+        let downloaded = drive(&io, io.collect_body(client, reply.len(), &RequestScope)).unwrap();
+        assert_eq!(downloaded.bytes, reply.len());
+        assert_eq!(downloaded.buffer.bytes().unwrap(), reply);
+        client = downloaded.lease;
+        for connection in [&client, &server] {
+            assert_eq!(connection.receive_remaining(), Some(0));
+            assert_eq!(connection.send_remaining(), Some(0));
+            assert_eq!(connection.closing(), close);
+        }
+        client.finish_exchange().unwrap();
+        assert_eq!(client.is_reusable(), !close);
+        if close {
+            server.finish_exchange().unwrap();
+        } else {
+            // Advance the server's owned socket without returning it to a pool.
+            server.next_round().unwrap();
+        }
+        assert!(!server.is_reusable());
+        for connection in [&client, &server] {
+            assert_eq!(connection.receive_remaining(), None);
+            assert_eq!(connection.send_remaining(), None);
+        }
+    }
+    assert_eq!(io.reactor().in_flight(), 0);
+}
+
+/// Reject invalid body operations before submitting transport work.
+#[test]
+fn upload_body_bounds_fail_without_waiting_for_more_peer_traffic() {
+    for case in ["collect cap", "empty read", "oversized write"] {
+        let io = io();
+        let (client, server) = pair();
+        let sent = drive(&io, io.send_head(client, request("POST", 4), &RequestScope)).unwrap();
+        let received = drive(&io, io.receive_head(server, &RequestScope)).unwrap();
+        let mut operation = match case {
+            "collect cap" => io.collect_body(received.connection, 3, &RequestScope),
+            "empty read" => io.read_body(received.connection, io.buffer(0).unwrap(), &RequestScope),
+            _ => io.write_body(
+                sent.connection,
+                OwnedBuffer::copy_from(&Caller, b"extra").unwrap(),
+                &RequestScope,
+            ),
+        };
+        assert!(
+            matches!(
+                operation
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(Failure::Http(Error::Malformed)))
+            ),
+            "{case}"
+        );
+        assert_eq!(io.reactor().in_flight(), 0, "{case} submitted body I/O");
+    }
+}
+
+/// Keep a rejected request writable for an error response but forbid reuse.
+#[test]
+fn response_on_request_only_connection_can_be_rejected_but_never_reused() {
+    let io = io();
+    let (client, server) = pair();
+    let sent = drive(
+        &io,
+        io.send_head(
+            client,
+            head(StartLine::Response { status: 200 }, 0),
+            &RequestScope,
+        ),
+    )
+    .unwrap();
+    let mut rejected = drive(
+        &io,
+        io.receive_request_head_limited(server, &RequestScope, 128),
+    )
+    .unwrap();
+    assert!(matches!(
+        rejected.value,
+        Err(Failure::Http(Error::Malformed))
+    ));
+    assert!(rejected.connection.closing());
+    assert_eq!(rejected.connection.receive_remaining(), None);
+    assert!(rejected.connection.take_read_ahead().is_none());
+    let mut response = drive(
+        &io,
+        io.send_head(
+            rejected.connection,
+            head(StartLine::Response { status: 400 }, 0),
+            &RequestScope,
+        ),
+    )
+    .unwrap();
+    let received = drive(&io, io.receive_head(sent.connection, &RequestScope)).unwrap();
+    assert!(matches!(
+        received.value.start,
+        StartLine::Response { status: 400 }
+    ));
+    assert_eq!(
+        response.connection.finish_exchange(),
+        Err(Failure::Http(Error::Malformed))
+    );
+    assert!(!response.connection.is_reusable());
+    assert_eq!(io.reactor().in_flight(), 0);
+}

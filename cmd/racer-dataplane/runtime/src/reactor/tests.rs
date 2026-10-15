@@ -4,6 +4,67 @@
 use super::*;
 use fixtures::{Admission, Limits, Reactor, RequestScope, ResourceClass};
 
+#[cfg(feature = "simulation")]
+#[test]
+fn gate_callback_sq_id_and_bookkeeping_rejections_allow_reentry() {
+    struct BudgetSwitch(Rc<Cell<bool>>);
+    impl Budget for BudgetSwitch {
+        type Charge = ();
+        fn charge(&self, _: usize) -> Result<()> {
+            if self.0.get() {
+                Err(Error::Overloaded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let sim = simulation::Simulation::new();
+    let _environment = sim.enter();
+    let blocked = Rc::new(Cell::new(false));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let sink = events.clone();
+    let reactor = Rc::new_cyclic(|weak: &Weak<super::Reactor<RequestScope, BudgetSwitch>>| {
+        let weak = weak.clone();
+        super::Reactor::new(2, BudgetSwitch(blocked.clone())).with_rejection_observer(
+            move |_, facts| {
+                let reactor = weak.upgrade().unwrap();
+                assert_eq!(reactor.in_flight(), 0);
+                assert!(reactor.state.try_borrow_mut().is_ok());
+                sink.borrow_mut().push(facts.reason);
+            },
+        )
+    });
+    reactor.init().unwrap();
+    let request = scope();
+    let (fd, _peer) = sim.socket_pair();
+    let fd = Rc::new(fd);
+    blocked.set(true);
+    assert!(matches!(
+        poll(&mut reactor.readiness(fd.clone(), libc::POLLIN as u32, &request)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    blocked.set(false);
+    reactor.state.borrow_mut().next = CANCEL_BIT;
+    assert!(matches!(
+        poll(&mut reactor.readiness(fd.clone(), libc::POLLIN as u32, &request)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    reactor.state.borrow_mut().next = 1;
+    sim.reject_submissions(1).unwrap();
+    assert!(matches!(
+        poll(&mut reactor.readiness(fd, libc::POLLIN as u32, &request)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [
+            RejectionReason::Bookkeeping,
+            RejectionReason::IdExhausted,
+            RejectionReason::SubmissionQueueFull
+        ]
+    ));
+}
+
 pub(super) mod fixtures {
     //! Counting guards and a scoped adapter for raw completion ownership tests.
     use super::*;
@@ -907,7 +968,7 @@ mod empty_submit_tests {
     fn empty_submit_decision_truth_table() {
         // Cover every setup bit independently, including SQPOLL (1), IOPOLL (0),
         // COOP_TASKRUN (8), TASKRUN_FLAG (9), SINGLE_ISSUER (12), DEFER_TASKRUN (13),
-        // and currently unknown bits. Only CQSIZE is allowlisted.
+        // and currently unknown bits. Deferred task work needs its full pairing.
         for flags in std::iter::once(0)
             .chain((0..32).map(|bit| 1u32 << bit))
             .chain((0..32).map(|bit| SETUP_CQSIZE | (1u32 << bit)))
@@ -916,8 +977,7 @@ mod empty_submit_tests {
             for empty in [false, true] {
                 for overflow in [false, true] {
                     for taskrun in [false, true] {
-                        let skip =
-                            matches!(flags, 0 | SETUP_CQSIZE) && empty && !overflow && !taskrun;
+                        let skip = flags & !SETUP_NORMAL == 0 && empty && !overflow && !taskrun;
                         assert_eq!(
                             submission_required(flags, empty, overflow, taskrun),
                             !skip,
@@ -936,8 +996,9 @@ mod empty_submit_tests {
             return;
         };
         assert_eq!(
-            ring_setup_flags(reactor.state.borrow().ring.as_ref().unwrap().params()),
-            SETUP_CQSIZE,
+            ring_setup_flags(reactor.state.borrow().ring.as_ref().unwrap().params())
+                & !SETUP_NORMAL,
+            0,
             "suppression must match the actual builder configuration"
         );
         for _ in 0..3 {
@@ -1041,7 +1102,10 @@ mod empty_submit_tests {
 
         // An eventfd notification must still be consumed while the SQ is empty and
         // the already-submitted receive owns its buffer/lease.
-        reactor.waker().unwrap().wake().unwrap();
+        let wake = reactor.waker().unwrap();
+        std::thread::spawn(move || wake.wake().unwrap())
+            .join()
+            .unwrap();
         reactor.wait(MAX_WAIT).unwrap();
         let mut value = 0u64;
         let wake_fd = reactor.state.borrow().wake.as_ref().unwrap().as_raw_fd();
@@ -1150,6 +1214,164 @@ mod empty_submit_tests {
         assert_eq!(drops.get(), 2);
         reactor.wait(Duration::ZERO).unwrap();
         assert_eq!(reactor.state.borrow().submit_attempts, 2);
+    }
+
+    #[test]
+    fn setup_probe_falls_back_only_on_unsupported_flags() {
+        let candidates = [SETUP_NORMAL, SETUP_CQSIZE | SETUP_SUBMIT_ALL, SETUP_CQSIZE];
+        for accepted in 0..candidates.len() {
+            let mut attempted = Vec::new();
+            let result = probe_ring(|flags| {
+                attempted.push(flags);
+                if flags == candidates[accepted] {
+                    Ok(flags)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                }
+            })
+            .unwrap();
+            assert_eq!(result, candidates[accepted]);
+            assert_eq!(attempted, candidates[..=accepted]);
+        }
+        for errno in [libc::EPERM, libc::ENOMEM, libc::ENOSYS, libc::EINVAL] {
+            let mut attempts = 0;
+            let result = probe_ring::<()>(|_| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(errno));
+            assert_eq!(attempts, if errno == libc::EINVAL { 3 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn deferred_setup_requires_observable_taskwork_and_enters_for_pending_work() {
+        for flags in [SETUP_CQSIZE, SETUP_NORMAL, SETUP_CQSIZE | SETUP_SUBMIT_ALL] {
+            assert!(!submission_required(flags, true, false, false));
+            assert!(submission_required(flags, false, false, false));
+            assert!(submission_required(flags, true, true, false));
+            assert!(submission_required(flags, true, false, true));
+        }
+        // Deferred/task-run setups are not enabled and must not be suppressed.
+        for extra in [1 << 8, 1 << 9, 1 << 13, (1 << 9) | (1 << 13)] {
+            assert!(submission_required(
+                SETUP_NORMAL | extra,
+                true,
+                false,
+                false
+            ));
+        }
+        assert!(submission_required(
+            SETUP_NORMAL | (1 << 31),
+            true,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn zero_wait_and_local_wakes_skip_poll_but_preserve_remote_tokens() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let wake = reactor.waker().unwrap();
+        let endpoint = wake.fd.as_ref().unwrap();
+        let read_token = || {
+            let mut value = 0u64;
+            let result =
+                unsafe { libc::read(endpoint.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
+            (result, value)
+        };
+        for _ in 0..8 {
+            wake.wake().unwrap();
+        }
+        assert_eq!(read_token(), (-1, 0), "owner never writes eventfd");
+        reactor.wait(MAX_WAIT).unwrap();
+        assert_eq!(reactor.state.borrow().wait_attempts, 0);
+        let remote = wake.clone();
+        std::thread::spawn(move || {
+            for _ in 0..64 {
+                remote.wake().unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+        reactor.wait(Duration::ZERO).unwrap();
+        assert_eq!(reactor.state.borrow().wait_attempts, 0);
+        assert_eq!(
+            read_token(),
+            (8, 1),
+            "remote wakes coalesce and zero wait leaves their token"
+        );
+        // Restore the token consumed by the assertion, then let wait drain/reset it.
+        let one = 1u64;
+        assert_eq!(
+            unsafe { libc::write(endpoint.as_raw_fd(), (&one as *const u64).cast(), 8) },
+            8
+        );
+        reactor.wait(MAX_WAIT).unwrap();
+        assert!(!endpoint.remote.load(Ordering::Acquire));
+        assert_eq!(read_token(), (-1, 0));
+        for _ in 0..16 {
+            let remote = wake.clone();
+            std::thread::spawn(move || remote.wake().unwrap())
+                .join()
+                .unwrap();
+            reactor.wait(MAX_WAIT).unwrap();
+            assert_eq!(read_token(), (-1, 0));
+            assert!(!endpoint.remote.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn zero_wait_propagates_submit_failure_before_skipping_poll() {
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+        reactor.state.borrow_mut().submit_result =
+            Some(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        assert_eq!(reactor.wait(Duration::ZERO), Err(Error::Io));
+        let state = reactor.state.borrow();
+        assert!(state.stopped);
+        assert_eq!(state.submit_attempts, 1);
+        assert_eq!(state.wait_attempts, 0);
+    }
+
+    #[test]
+    fn buffer_issue_policy_only_offloads_positioned_file_operations() {
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut owned = InFlight {
+            file: Rc::new(Descriptor::from(socket)),
+            buffer: buffer(b"x"),
+            lease: (),
+        };
+        for operation in [
+            BufferOperation::Read(0),
+            BufferOperation::Write(7),
+            BufferOperation::Recv,
+            BufferOperation::Send,
+        ] {
+            for policy in [IssuePolicy::Inline, IssuePolicy::Offload] {
+                let sqe = match reactor
+                    .buffer_submission(&mut owned, operation, policy)
+                    .unwrap()
+                {
+                    Submission::Real(sqe) => sqe,
+                    #[cfg(feature = "simulation")]
+                    Submission::Sim(_) => panic!("host backend required"),
+                };
+                let flags = if matches!(
+                    operation,
+                    BufferOperation::Read(_) | BufferOperation::Write(_)
+                ) && matches!(policy, IssuePolicy::Offload)
+                {
+                    squeue::Flags::ASYNC.bits()
+                } else {
+                    0
+                };
+                // Entry has no flag getter; Debug exposes the actual SQE flag byte.
+                assert!(format!("{sqe:?}").contains(&format!("flags: {flags},")));
+            }
+        }
     }
 }
 
@@ -1996,6 +2218,7 @@ mod retry_regressions {
                     Lease(drops.clone()),
                     &request,
                     BufferOperation::Send,
+                    IssuePolicy::Inline,
                     capacity,
                 );
                 assert!(poll(&mut operation).is_pending());
@@ -2180,6 +2403,7 @@ mod retry_regressions {
                     Lease(drops.clone()),
                     &request,
                     operation,
+                    IssuePolicy::Inline,
                     None,
                 );
                 // Exercise real simulated file readiness, not an injected CQE.
@@ -2420,6 +2644,7 @@ mod retry_regressions {
             Lease(drops.clone()),
             &request,
             BufferOperation::Send,
+            IssuePolicy::Inline,
             Some(capacity.clone()),
         );
         assert!(poll(&mut operation).is_pending());

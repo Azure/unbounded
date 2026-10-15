@@ -1,14 +1,12 @@
 # Racer Dataplane
 
-Placeholder for the replacement Racer dataplane implementation.
+Racer's node-local read-through cache dataplane and its supporting Rust libraries.
 
-The previous Racer implementation has been removed. The root executable remains
-a placeholder while supporting libraries are introduced as workspace members.
-List only present crates in `Cargo.toml` and regenerate the root `Cargo.lock` when
-adding a member. Keep the root package independent of those libraries until the
-replacement application is introduced.
+The root executable loads environment configuration, assembles the application,
+and runs its lifecycle (`src/main.rs`). Supporting libraries are workspace members
+listed in `Cargo.toml`. Regenerate the root `Cargo.lock` when adding a member.
 
-From the repository root, validate the current partial workspace with:
+From the repository root, validate the workspace with:
 
 ```sh
 timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check

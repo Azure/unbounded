@@ -2,55 +2,76 @@ pub use codec::*;
 pub use definitions::*;
 use std::time::Duration;
 
+/// Current control record schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Enrollment endpoint for a new node identity.
 pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
 
+/// Full or incremental publication endpoint.
 pub const SNAPSHOT_PATH: &str = "/v1/snapshot";
 
+/// Key epoch distribution endpoint.
 pub const KEYRING_PATH: &str = "/v1/keyring";
 
+/// Projected bearer token audience used by control callers.
 pub const TOKEN_AUDIENCE: &str = "racer-control";
 
+/// Maximum encoded enrollment request or response size.
 pub const MAX_ENROLLMENT_BYTES: usize = 64 * 1024;
 
+/// Maximum encoded keyring bundle size.
 pub const MAX_BUNDLE_BYTES: usize = 512 * 1024;
 
+/// Maximum encoded publication size.
 pub const MAX_PUBLICATION_BYTES: usize = 64 * 1024 * 1024;
 
+/// Maximum members accepted in one publication.
 pub const MAX_MEMBERS: usize = 100_000;
 
+/// Recommended long-poll wait interval.
 pub const POLL_WAIT: Duration = Duration::from_secs(30);
 
+/// Lower bound for caller retry backoff.
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
 
+/// Upper bound for caller retry backoff.
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
 
+/// Requested lifetime for an enrolled node certificate.
 pub const CERTIFICATE_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Recommended age at which callers renew node certificates.
 pub const RENEW_AFTER: Duration = Duration::from_secs(16 * 60 * 60);
 
+/// Default member weight for local enrollment requests.
 pub const DEFAULT_SHARES: u32 = 4;
 
+/// Monotonic publication cursor within a cluster.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PublicationSequence(pub u64);
 
+/// Monotonic generation identifying a complete keyring bundle.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BundleGeneration(pub u64);
 
+/// Canonical UUID for response correlation, not a durable receipt ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnrollmentId(pub String);
 
+/// Request a publication newer than an optional accepted cursor.
 pub struct SnapshotRequest {
     pub after: Option<PublicationSequence>,
 }
 
+/// A newer publication or confirmation that the current cursor is unchanged.
 pub enum SnapshotResponse {
     Updated(Publication),
 
     Unchanged,
 }
 
+/// Complete membership and cache configuration at one publication cursor.
 #[derive(Clone)]
 pub struct Publication {
     pub schema_version: u32,
@@ -66,6 +87,7 @@ pub struct Publication {
     pub caches: Vec<CacheDefinition>,
 }
 
+/// The transport supplies the projected bearer token, never a DTO or diagnostic.
 #[derive(Clone)]
 pub struct EnrollmentRequest {
     pub shares: u32,
@@ -81,6 +103,7 @@ pub struct EnrollmentRequest {
     pub csr_der: Vec<u8>,
 }
 
+/// Assigned node identity and certificate chain correlated to an enrollment.
 #[derive(Clone)]
 pub struct EnrollmentResponse {
     pub block_devices: Option<String>,
@@ -96,6 +119,7 @@ pub struct EnrollmentResponse {
     pub certificate_chain: Vec<Vec<u8>>,
 }
 
+/// Immutable use assigned to a cache encryption key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKeyPurpose {
     Page,
@@ -103,6 +127,7 @@ pub enum CacheKeyPurpose {
     OriginCredentials,
 }
 
+/// Whether a key is staged for future use or currently active.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKeyState {
     Prepared,
@@ -110,6 +135,7 @@ pub enum CacheKeyState {
     Active,
 }
 
+/// Cache, epoch ID, and purpose bound to one secret.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheKeyRef {
     pub cache: CacheId,
@@ -119,6 +145,24 @@ pub struct CacheKeyRef {
     pub purpose: CacheKeyPurpose,
 }
 
+/// Deliberately non-Debug; staged key material is wiped on drop.
+///
+/// ```compile_fail
+/// fn diagnostic(key: racer_control_wire::CacheEncryptionKey) {
+///     println!("{key:?}");
+/// }
+/// ```
+/// ```compile_fail
+/// fn expose(key: racer_control_wire::CacheEncryptionKey) -> [u8; 32] {
+///     key.material
+/// }
+/// ```
+/// ```compile_fail
+/// fn transfer_twice(key: racer_control_wire::CacheEncryptionKey) {
+///     let _first = key.into_installation();
+///     let _second = key.into_installation();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct CacheEncryptionKey {
     pub key: CacheKeyRef,
@@ -129,6 +173,7 @@ pub struct CacheEncryptionKey {
 }
 
 impl CacheEncryptionKey {
+    /// Accept secret ownership without exposing a borrowed raw-key accessor.
     pub fn new(
         key: CacheKeyRef,
         state: CacheKeyState,
@@ -141,6 +186,8 @@ impl CacheEncryptionKey {
         }
     }
 
+    /// Consume the wire record when transferring to the identity component's installer.
+    /// Both the source record and returned secret owner wipe their storage on drop.
     pub fn into_installation(self) -> (CacheKeyRef, CacheKeyState, zeroize::Zeroizing<[u8; 32]>) {
         (
             self.key.clone(),
@@ -151,12 +198,99 @@ impl CacheEncryptionKey {
 }
 
 impl Drop for CacheEncryptionKey {
+    /// Wipe the source secret even after transferring a zeroizing copy.
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.material.zeroize();
     }
 }
 
+#[cfg(test)]
+mod shared_metadata_tests {
+    #[test]
+    fn shared_member_metadata_contract_keeps_identity_policy_separate() {
+        for endpoint in ["0.0.0.0:80", "[ff02::1]:80", "192.0.2.1:65535"] {
+            validate_member_metadata(endpoint, "West_1").unwrap();
+        }
+        for (endpoint, site) in [
+            ("host:80", ""),
+            ("127.0.0.1:0", ""),
+            ("[fe80::1%3]:80", ""),
+            ("127.0.0.1:80", "bad/site"),
+        ] {
+            assert_eq!(
+                validate_member_metadata(endpoint, site),
+                Err(Error::InvalidRequest)
+            );
+        }
+        let nic = RailMapping {
+            device: "β\t fabric".into(),
+            port: 1,
+            rail: RailId(7),
+            gid: None,
+            numa_node: Some(u32::MAX as usize),
+        };
+        let mut rails = vec![
+            nic.clone(),
+            RailMapping {
+                port: 2,
+                ..nic.clone()
+            },
+        ];
+        normalize_rails(&mut rails).unwrap();
+        assert_eq!(rails[0].port, 1);
+        assert_eq!(
+            normalize_rails(&mut vec![nic.clone(); 65]),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(
+            normalize_rails(&mut [nic.clone(), nic]),
+            Err(Error::InvalidRequest)
+        );
+        rails[0].device.push('\n');
+        assert_eq!(normalize_rails(&mut rails), Err(Error::InvalidRequest));
+    }
+
+    #[test]
+    fn protocol_failure_status_table_is_exact() {
+        use super::ProtocolFailure::*;
+        for (failure, status) in [
+            (InvalidRequest, 400),
+            (Unauthenticated, 401),
+            (Forbidden, 403),
+            (Conflict, 409),
+            (TooLarge, 413),
+            (UnsupportedVersion, 426),
+            (Overloaded, 429),
+            (Unavailable, 503),
+        ] {
+            assert_eq!(failure.status(), status);
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn consuming_key_transfer_preserves_identity_and_zeroizing_ownership() {
+        let reference = CacheKeyRef {
+            cache: CacheId("11111111-1111-4111-8111-111111111111".into()),
+            id: KeyId::from_generation(1, 7).unwrap(),
+            purpose: CacheKeyPurpose::Page,
+        };
+        let key = CacheEncryptionKey::new(
+            reference.clone(),
+            CacheKeyState::Active,
+            zeroize::Zeroizing::new([0xa7; 32]),
+        );
+        let (actual, state, material): (_, _, zeroize::Zeroizing<[u8; 32]>) =
+            key.into_installation();
+        assert_eq!(actual, reference);
+        assert_eq!(state, CacheKeyState::Active);
+        assert_eq!(*material, [0xa7; 32]);
+        assert_eq!(KeyId::from_generation(0, 7), Err(Error::InvalidRequest));
+    }
+}
+/// Missing keys request retirement; no node certificates or private keys.
 #[derive(Clone)]
 pub struct KeyringBundle {
     pub schema_version: u32,
@@ -170,6 +304,7 @@ pub struct KeyringBundle {
     pub cache_keys: Vec<CacheEncryptionKey>,
 }
 
+/// Stable error codes exchanged with control callers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolFailure {
     InvalidRequest,
@@ -189,15 +324,35 @@ pub enum ProtocolFailure {
     Unavailable,
 }
 
+impl ProtocolFailure {
+    /// Standard HTTP status for the bounded control failure contract.
+    pub const fn status(self) -> u16 {
+        match self {
+            Self::InvalidRequest => 400,
+            Self::Unauthenticated => 401,
+            Self::Forbidden => 403,
+            Self::Conflict => 409,
+            Self::TooLarge => 413,
+            Self::UnsupportedVersion => 426,
+            Self::Overloaded => 429,
+            Self::Unavailable => 503,
+        }
+    }
+}
+
+/// Payload-free control error response.
 pub struct ErrorResponse {
     pub code: ProtocolFailure,
 }
 
+/// Pure identities, records, and syntax validation without runtime policy.
 mod definitions {
     use std::{collections::HashSet, num::NonZeroU32, path::PathBuf};
 
+    /// A validated wire value or a payload-free contract failure.
     pub type Result<T> = std::result::Result<T, Error>;
 
+    /// Payload-free failures. Applications map these into their own error domain.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Error {
         InvalidRequest,
@@ -210,6 +365,7 @@ mod definitions {
     }
 
     impl std::fmt::Display for Error {
+        /// Describe only the error category, never the rejected input.
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{self:?}")
         }
@@ -217,24 +373,31 @@ mod definitions {
 
     impl std::error::Error for Error {}
 
+    /// Cluster UUID binding every control record to its authority.
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct ClusterId(pub String);
 
+    /// Kubernetes ClusterCache UID, not its reusable resource name.
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct CacheId(pub String);
 
+    /// Kubernetes Node UID, not its reusable resource name.
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct NodeId(pub String);
 
+    /// Version of the membership portion of a publication.
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub struct MembershipVersion(pub u64);
 
+    /// Opaque key identity encoding its nonzero creation generation.
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub struct KeyId(pub [u8; 16]);
 
+    /// Logical network rail shared by one or more physical NIC ports.
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     pub struct RailId(pub u16);
 
+    /// Physical NIC port and its optional address and NUMA locality.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct RailMapping {
         pub rail: RailId,
@@ -248,6 +411,7 @@ mod definitions {
         pub numa_node: Option<usize>,
     }
 
+    /// Wire membership record, deliberately not a placement algorithm input trait.
     #[derive(Clone, Debug)]
     pub struct Member {
         pub node: NodeId,
@@ -261,6 +425,7 @@ mod definitions {
         pub site: String,
     }
 
+    /// Named cache and its canonical client and origin Unix sockets.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct CacheDefinition {
         pub id: CacheId,
@@ -273,6 +438,7 @@ mod definitions {
     }
 
     impl KeyId {
+        /// Construct an epoch-bound ID with a controller-selected uniqueness suffix.
         pub fn from_generation(generation: u64, suffix: u32) -> Result<Self> {
             if generation == 0 {
                 return Err(Error::InvalidRequest);
@@ -284,6 +450,7 @@ mod definitions {
             Ok(Self(bytes))
         }
 
+        /// Read the nonzero creation generation of an RKG1 ID, not bundle admission policy.
         pub fn generation(self) -> Option<u64> {
             (self.0[..4] == *b"RKG1")
                 .then(|| u64::from_be_bytes(self.0[4..12].try_into().expect("generation bytes")))
@@ -291,6 +458,7 @@ mod definitions {
         }
     }
 
+    /// Canonical lowercase UUID syntax only; callers choose nil/version policy.
     pub fn valid_uuid(value: &str) -> bool {
         value.len() == 36
             && value.bytes().enumerate().all(|(i, b)| {
@@ -302,6 +470,7 @@ mod definitions {
             })
     }
 
+    /// Accept an absent site or a bounded ASCII site label.
     pub fn valid_site(value: &str) -> bool {
         value.is_empty()
             || (value.len() <= 63
@@ -312,6 +481,7 @@ mod definitions {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
     }
 
+    /// Validate a cache name and derive paths that fit Unix socket address limits.
     pub fn canonical_socket_paths(name: &str) -> Result<(PathBuf, PathBuf)> {
         if name.is_empty()
             || name.len() > 253
@@ -335,6 +505,7 @@ mod definitions {
         Ok((client.into(), origin.into()))
     }
 
+    /// Reject duplicate cache identities and paths that differ from canonical spelling.
     pub fn validate_definitions(definitions: &[CacheDefinition]) -> Result<()> {
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
@@ -353,10 +524,12 @@ mod definitions {
         Ok(())
     }
 
+    /// Syntax boundaries remain independent of application admission policy.
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        /// Key IDs require their magic and epoch, but leave suffix selection to callers.
         #[test]
         fn key_generation_requires_magic_and_nonzero_epoch_but_not_a_suffix_policy() {
             assert_eq!(KeyId::from_generation(0, 0), Err(Error::InvalidRequest));
@@ -375,6 +548,7 @@ mod definitions {
             assert_eq!(KeyId([0; 16]).generation(), None);
         }
 
+        /// UUID spelling rejects aliases while accepting nil and arbitrary versions.
         #[test]
         fn uuid_syntax_rejects_aliases_without_enforcing_version_or_nil_policy() {
             for value in [
@@ -399,6 +573,39 @@ mod definitions {
     }
 }
 
+/// Validate portable endpoint/site metadata, without imposing a node-ID policy.
+/// Reachability is deliberately not part of the wire contract.
+pub fn validate_member_metadata(endpoint: &str, site: &str) -> Result<()> {
+    let address: std::net::SocketAddr = endpoint.parse().map_err(|_| Error::InvalidRequest)?;
+    if address.port() == 0 || endpoint.contains('%') || !valid_site(site) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// Validate physical NIC identities and normalize their canonical wire order.
+/// Rail labels may repeat; physical device/port pairs may not. Device strings
+/// retain the wire's UTF-8 acceptance, with no additional local length bound.
+pub fn normalize_rails(rails: &mut [RailMapping]) -> Result<()> {
+    if rails.len() > 64 {
+        return Err(Error::Overloaded);
+    }
+    let mut physical = std::collections::HashSet::new();
+    for nic in rails.iter() {
+        if nic.device.is_empty()
+            || nic.device.contains(['\0', '\r', '\n'])
+            || nic.port == 0
+            || !physical.insert((&nic.device, nic.port))
+            || nic.numa_node.is_some_and(|n| u32::try_from(n).is_err())
+        {
+            return Err(Error::InvalidRequest);
+        }
+    }
+    rails.sort_unstable_by(|a, b| (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port)));
+    Ok(())
+}
+
+/// Bounded JSON parsing, canonical encoding, and validated wire conversions.
 mod codec {
     use super::*;
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -410,10 +617,13 @@ mod codec {
     use std::collections::HashSet;
     use std::{collections::BTreeMap, fmt, num::NonZeroU32};
 
+    /// Temporary JSON ownership that erases strings on every exit path.
     struct JsonScratch(Value);
 
     impl Drop for JsonScratch {
+        /// Recursively clear secret-bearing JSON before freeing its allocations.
         fn drop(&mut self) {
+            /// Wipe strings nested in arrays or object values.
             fn clear(value: &mut Value) {
                 use zeroize::Zeroize;
                 match value {
@@ -427,11 +637,13 @@ mod codec {
         }
     }
 
+    /// Current nesting depth for duplicate-rejecting JSON deserialization.
     struct Strict(usize);
 
     impl<'de> DeserializeSeed<'de> for Strict {
         type Value = Value;
 
+        /// Dispatch JSON values through this depth-bounded visitor.
         fn deserialize<D: serde::Deserializer<'de>>(
             self,
             d: D,
@@ -443,40 +655,49 @@ mod codec {
     impl<'de> Visitor<'de> for Strict {
         type Value = Value;
 
+        /// Describe the accepted shape without exposing rejected data.
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("bounded JSON")
         }
 
+        /// Preserve a JSON boolean.
         fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<Value, E> {
             Ok(Value::Bool(v))
         }
 
+        /// Preserve an unsigned JSON integer.
         fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Value, E> {
             Ok(v.into())
         }
 
+        /// Preserve a signed JSON integer.
         fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Value, E> {
             Ok(v.into())
         }
 
+        /// Reject nonfinite floating-point numbers.
         fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Value, E> {
             serde_json::Number::from_f64(v)
                 .map(Value::Number)
                 .ok_or_else(|| E::custom("number"))
         }
 
+        /// Copy a borrowed JSON string into the parsed value.
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Value, E> {
             Ok(Value::String(v.into()))
         }
 
+        /// Take ownership of a decoded JSON string.
         fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Value, E> {
             Ok(Value::String(v))
         }
 
+        /// Represent JSON null without allocating.
         fn visit_unit<E: de::Error>(self) -> std::result::Result<Value, E> {
             Ok(Value::Null)
         }
 
+        /// Bound array nesting and clear partial values on rejection.
         fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> std::result::Result<Value, A::Error> {
             if self.0 >= 64 {
                 return Err(de::Error::custom("depth"));
@@ -489,6 +710,7 @@ mod codec {
             Ok(std::mem::take(&mut scratch.0))
         }
 
+        /// Reject duplicate object keys and erase partially decoded values.
         fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> std::result::Result<Value, A::Error> {
             if self.0 >= 64 {
                 return Err(de::Error::custom("depth"));
@@ -592,11 +814,14 @@ mod codec {
         Ok(std::mem::take(&mut v.0))
     }
 
+    /// Decode a typed record after enforcing the shared JSON syntax policy.
     fn decode<T: serde::de::DeserializeOwned>(b: &[u8], limit: usize) -> Result<T> {
         serde_json::from_value(strict_json(b, limit)?).map_err(|_| Error::InvalidRequest)
     }
 
+    /// Encode bounded JSON using the same line-separator escaping as Go.
     fn encode<T: Serialize>(v: &T, limit: usize) -> Result<Vec<u8>> {
+        /// Stop serialization before its output exceeds the caller's byte bound.
         struct Bounded {
             bytes: Vec<u8>,
 
@@ -604,6 +829,7 @@ mod codec {
         }
 
         impl std::io::Write for Bounded {
+            /// Append only bytes that fit in the remaining output budget.
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
                 if b.len() > self.limit - self.bytes.len() {
                     return Err(std::io::ErrorKind::FileTooLarge.into());
@@ -612,6 +838,7 @@ mod codec {
                 Ok(b.len())
             }
 
+            /// Memory-backed output has no pending writes to flush.
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
@@ -633,6 +860,7 @@ mod codec {
         Ok(b)
     }
 
+    /// Require canonical UUID spelling without imposing version policy.
     fn uuid(s: &str) -> Result<()> {
         if valid_uuid(s) {
             Ok(())
@@ -641,6 +869,7 @@ mod codec {
         }
     }
 
+    /// Check the schema version before validating the cluster identity.
     fn header(v: u32, c: &str) -> Result<()> {
         if v != SCHEMA_VERSION {
             return Err(Error::IncompatibleMembership);
@@ -648,6 +877,7 @@ mod codec {
         uuid(c)
     }
 
+    /// Parse a nonzero decimal cursor with no alternative spellings.
     fn counter(s: &str) -> Result<u64> {
         let n = s.parse::<u64>().map_err(|_| Error::InvalidRequest)?;
         if n == 0 || n.to_string() != s {
@@ -656,6 +886,7 @@ mod codec {
         Ok(n)
     }
 
+    /// Decode canonical padded base64 for nonsecret wire bytes.
     fn bytes(s: &str) -> Result<Vec<u8>> {
         let b = STANDARD.decode(s).map_err(|_| Error::InvalidRequest)?;
         if STANDARD.encode(&b) != s {
@@ -664,6 +895,7 @@ mod codec {
         Ok(b)
     }
 
+    /// Decode exactly one canonical key into fixed-size zeroizing storage.
     fn key_material(s: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
         // Decode directly into a zeroizing owner, including partially written error
         // output. Neither decoding nor canonicality checking allocates secret bytes.
@@ -687,6 +919,7 @@ mod codec {
         Ok(decoded)
     }
 
+    /// Require a nonempty list of fully consumed DER certificates.
     fn certificates(v: &[String]) -> Result<Vec<Vec<u8>>> {
         if v.is_empty() {
             return Err(Error::InvalidRequest);
@@ -704,6 +937,7 @@ mod codec {
             .collect()
     }
 
+    /// Exact-name enrollment request representation used by serde.
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Request {
@@ -720,6 +954,7 @@ mod codec {
         csr_der: String,
     }
 
+    /// Decode enrollment syntax, NIC bounds, and a complete certificate request.
     pub fn decode_enrollment_request(b: &[u8]) -> Result<EnrollmentRequest> {
         let r: Request = decode(b, MAX_ENROLLMENT_BYTES)?;
         if r.shares == 0 {
@@ -745,6 +980,7 @@ mod codec {
         })
     }
 
+    /// Encode enrollment only after validating its canonical wire representation.
     pub fn encode_enrollment_request(r: &EnrollmentRequest) -> Result<Vec<u8>> {
         let b = encode(
             &Request {
@@ -761,6 +997,7 @@ mod codec {
         Ok(b)
     }
 
+    /// Exact-name enrollment response with base64 certificate bytes.
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Response {
@@ -782,6 +1019,7 @@ mod codec {
         block_devices: Option<String>,
     }
 
+    /// Decode enrollment correlation and certificate syntax without establishing trust.
     pub fn decode_enrollment_response(b: &[u8]) -> Result<EnrollmentResponse> {
         let r: Response = decode(b, MAX_ENROLLMENT_BYTES)?;
         header(r.schema_version, &r.cluster)?;
@@ -798,6 +1036,7 @@ mod codec {
         })
     }
 
+    /// Encode an enrollment response and enforce the same validation as decoding.
     pub fn encode_enrollment_response(r: &EnrollmentResponse) -> Result<Vec<u8>> {
         let b = encode(
             &Response {
@@ -818,6 +1057,7 @@ mod codec {
         Ok(b)
     }
 
+    /// Physical NIC wire record with absent-but-not-null optional fields.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Rail {
@@ -842,32 +1082,27 @@ mod codec {
         numa_node: Option<u32>,
     }
 
+    /// Accept a present NUMA node only when it is an unsigned integer.
     fn nonnull_optional<'de, D: serde::Deserializer<'de>>(
         d: D,
     ) -> std::result::Result<Option<u32>, D::Error> {
         u32::deserialize(d).map(Some)
     }
 
+    /// Accept a present GID only when it is a string, never explicit null.
     fn nonnull_gid<'de, D: serde::Deserializer<'de>>(
         d: D,
     ) -> std::result::Result<Option<String>, D::Error> {
         String::deserialize(d).map(Some)
     }
 
+    /// Validate physical NIC identities and sort their logical rail mappings.
     fn nics_from_dto(nics: Vec<Rail>) -> Result<Vec<RailMapping>> {
         if nics.len() > 64 {
             return Err(Error::Overloaded);
         }
-        let mut physical = HashSet::new();
         let mut result = Vec::new();
         for nic in nics {
-            if nic.device.is_empty()
-                || nic.device.contains(['\0', '\r', '\n'])
-                || nic.port == 0
-                || !physical.insert((nic.device.clone(), nic.port))
-            {
-                return Err(Error::InvalidRequest);
-            }
             let gid = nic
                 .gid
                 .map(|value| {
@@ -882,10 +1117,11 @@ mod codec {
                 numa_node: nic.numa_node.map(|n| n as usize),
             });
         }
-        result.sort_by(|a, b| (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port)));
+        normalize_rails(&mut result)?;
         Ok(result)
     }
 
+    /// Encode optional NIC fields and sort without mutating caller-owned mappings.
     fn nics_to_dto(nics: &[RailMapping]) -> Result<Vec<Rail>> {
         let mut result = nics
             .iter()
@@ -907,6 +1143,7 @@ mod codec {
         Ok(result)
     }
 
+    /// Membership JSON record before syntax validation and normalization.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct MemberDto {
@@ -921,6 +1158,7 @@ mod codec {
         site: String,
     }
 
+    /// Cache JSON record before canonical socket validation.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Cache {
@@ -933,6 +1171,7 @@ mod codec {
         origin_socket: String,
     }
 
+    /// Full publication with decimal-string cursors for cross-language precision.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PublicationDto {
@@ -949,6 +1188,7 @@ mod codec {
         caches: Vec<Cache>,
     }
 
+    /// Decode and normalize a bounded full publication.
     pub fn decode_publication(b: &[u8]) -> Result<Publication> {
         let value = strict_json(b, MAX_PUBLICATION_BYTES)?;
         if value
@@ -962,6 +1202,7 @@ mod codec {
         publication_from_dto(p)
     }
 
+    /// Validate both decoded wire publications and direct in-process candidates.
     fn publication_from_dto(p: PublicationDto) -> Result<Publication> {
         header(p.schema_version, &p.cluster)?;
         let sequence = PublicationSequence(counter(&p.sequence)?);
@@ -976,11 +1217,7 @@ mod codec {
             if !nodes.insert(m.node.clone()) {
                 return Err(Error::InvalidRequest);
             }
-            let endpoint: std::net::SocketAddr =
-                m.peer_endpoint.parse().map_err(|_| Error::InvalidRequest)?;
-            if endpoint.port() == 0 || m.peer_endpoint.contains('%') || !valid_site(&m.site) {
-                return Err(Error::InvalidRequest);
-            }
+            validate_member_metadata(&m.peer_endpoint, &m.site)?;
             let rails = nics_from_dto(m.rdma_nics)?;
             members.push(Member {
                 node: NodeId(m.node),
@@ -1013,6 +1250,7 @@ mod codec {
         })
     }
 
+    /// Build sorted JSON records without changing the caller's publication.
     fn dto(p: &Publication) -> Result<PublicationDto> {
         let mut members = Vec::new();
         for m in &p.members {
@@ -1054,6 +1292,7 @@ mod codec {
         })
     }
 
+    /// Encode a full publication only when its records and byte size are valid.
     pub fn encode_publication(p: &Publication) -> Result<Vec<u8>> {
         if p.members.len() > MAX_MEMBERS {
             return Err(Error::Overloaded);
@@ -1064,6 +1303,7 @@ mod codec {
         Ok(b)
     }
 
+    /// Validate and normalize a local publication without decoding JSON again.
     pub fn validate_publication(p: &Publication) -> Result<Publication> {
         if p.members.len() > MAX_MEMBERS {
             return Err(Error::Overloaded);
@@ -1074,12 +1314,14 @@ mod codec {
         publication_from_dto(d)
     }
 
+    /// Produce stable content and membership bytes independent of cursor values.
     pub fn canonical_content(p: &Publication) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut d = dto(p)?;
         d.sequence = "1".into();
         d.membership_version = "1".into();
         encode(&d, MAX_PUBLICATION_BYTES)?;
         publication_from_dto(d.clone())?;
+        /// Canonical publication content without changing cursors.
         #[derive(Serialize)]
         struct Content<'a> {
             schema_version: u32,
@@ -1091,6 +1333,7 @@ mod codec {
             caches: &'a [Cache],
         }
 
+        /// Canonical membership bytes exclude both cursors and cache definitions.
         #[derive(Serialize)]
         struct Membership<'a> {
             schema_version: u32,
@@ -1120,6 +1363,7 @@ mod codec {
         ))
     }
 
+    /// Incremental publication bound to exact base and target content hashes.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct DeltaDto {
@@ -1144,12 +1388,15 @@ mod codec {
         caches: Vec<Cache>,
     }
 
+    /// Hash the canonical publication content using lowercase SHA-256 hexadecimal.
     pub fn content_hash(p: &Publication) -> Result<String> {
         use sha2::Digest;
         let (content, _) = canonical_content(p)?;
         Ok(format!("{:x}", sha2::Sha256::digest(content)))
     }
 
+    /// Apply only against the exact authenticated base. Caller requests a full image
+    /// on any delta failure; no partially applied state is ever published.
     pub fn apply_delta(base: &Publication, bytes: &[u8]) -> Result<Publication> {
         let d: DeltaDto = decode(bytes, 4 * 1024 * 1024)?;
         if d.delta_version != 1
@@ -1199,6 +1446,7 @@ mod codec {
         Ok(next)
     }
 
+    /// Complete wire keyring with encoded certificates and zeroizing key fields.
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Bundle {
@@ -1213,6 +1461,7 @@ mod codec {
         cache_keys: Vec<Key>,
     }
 
+    /// One key record whose material is owned even during partial deserialization.
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Key {
@@ -1227,9 +1476,11 @@ mod codec {
         material: EncodedKeyMaterial,
     }
 
+    /// Own encoded secrets immediately, including during partial DTO construction.
     struct EncodedKeyMaterial(zeroize::Zeroizing<String>);
 
     impl Serialize for EncodedKeyMaterial {
+        /// Preserve the existing base64 string representation.
         fn serialize<S: serde::Serializer>(
             &self,
             serializer: S,
@@ -1239,6 +1490,7 @@ mod codec {
     }
 
     impl<'de> Deserialize<'de> for EncodedKeyMaterial {
+        /// Immediately wrap decoded string ownership so later field errors wipe it.
         fn deserialize<D: serde::Deserializer<'de>>(
             deserializer: D,
         ) -> std::result::Result<Self, D::Error> {
@@ -1246,6 +1498,7 @@ mod codec {
         }
     }
 
+    /// Decode a bounded bundle with canonical keys and exactly one active key per group.
     pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
         let scratch = JsonScratch(strict_json(b, MAX_BUNDLE_BYTES)?);
         let r = Bundle::deserialize(&scratch.0).map_err(|_| Error::InvalidRequest)?;
@@ -1311,6 +1564,7 @@ mod codec {
         })
     }
 
+    /// Encode and validate a keyring; returned bytes contain caller-owned secrets.
     pub fn encode_bundle(b: &KeyringBundle) -> Result<Vec<u8>> {
         let raw = Bundle {
             schema_version: b.schema_version,
@@ -1343,9 +1597,11 @@ mod codec {
                 })
                 .collect(),
         };
+        /// Bounded secret output that is erased unless successfully transferred.
         struct BundleOutput(zeroize::Zeroizing<Vec<u8>>);
 
         impl std::io::Write for BundleOutput {
+            /// Refuse bytes beyond the fixed bundle capacity before copying secrets.
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if bytes.len() > MAX_BUNDLE_BYTES - self.0.len() {
                     return Err(std::io::ErrorKind::FileTooLarge.into());
@@ -1354,6 +1610,7 @@ mod codec {
                 Ok(bytes.len())
             }
 
+            /// In-memory serialization has no pending external writes.
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
@@ -1368,7 +1625,9 @@ mod codec {
         Ok(std::mem::take(&mut *encoded.0))
     }
 
+    /// Decode a known control error code without retaining the input payload.
     pub fn decode_error(b: &[u8]) -> Result<ErrorResponse> {
+        /// Exact-name error DTO rejecting any extra response fields.
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Failure {
@@ -1389,7 +1648,9 @@ mod codec {
         Ok(ErrorResponse { code })
     }
 
+    /// Encode the stable snake-case spelling of a control failure.
     pub fn encode_error(response: &ErrorResponse) -> Result<Vec<u8>> {
+        /// Borrow the static wire spelling without allocating another string.
         #[derive(Serialize)]
         struct Failure<'a> {
             code: &'a str,
@@ -1410,17 +1671,20 @@ mod codec {
 
     #[cfg(test)]
     std::thread_local! {
+        /// Count field destruction without observing freed secret storage.
         static MATERIAL_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     #[cfg(test)]
     impl Drop for EncodedKeyMaterial {
+        /// Observe field destruction without examining freed secret bytes.
         fn drop(&mut self) {
             MATERIAL_DROPS.with(|drops| drops.set(drops.get() + 1));
             // The Zeroizing field is dropped immediately after this test observer.
         }
     }
 
+    /// Delta state transitions and replay protection against canonical content.
     #[cfg(test)]
     mod delta_tests {
         use super::*;
@@ -1594,12 +1858,14 @@ mod codec {
         }
     }
 
+    /// Cross-language fixture contracts and boundary-sized wire records.
     #[cfg(test)]
     mod contract_tests {
         use super::*;
         use crate::canonical_socket_paths;
         use sha2::{Digest, Sha256};
 
+        /// Location of Go-owned shared contract fixtures, never regenerated by Rust.
         const ROOT: &str = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../internal/racer/wire/testdata/"
@@ -1642,10 +1908,12 @@ mod codec {
             assert_eq!(b, round_trip("publication.json", &b).unwrap());
         }
 
+        /// Site additions, changes, and removals agree with Go and reject replay.
         #[test]
         fn shared_site_vectors() {
             // Generated by Go's opt-in TestGenerateSharedSiteVectors, never by Rust.
             // JSON strings preserve canonical field ordering for byte-for-byte comparisons.
+            /// One Go-produced site transition with canonical bytes and hashes.
             #[derive(Deserialize)]
             struct SiteVector {
                 name: String,
@@ -1711,6 +1979,12 @@ mod codec {
                         Some(Error::Replay),
                         "Site is bound to the target hash: {name}"
                     );
+                    d["upsert_members"][0]["site"] = "-invalid".into();
+                    assert_eq!(
+                        apply_delta(base, &serde_json::to_vec(&d).unwrap()).err(),
+                        Some(Error::InvalidRequest),
+                        "Invalid site syntax is rejected before the target hash: {name}"
+                    );
                     let mut wrong_base = base.clone();
                     wrong_base.members[0].site = "stale-site".into();
                     assert_eq!(apply_delta(&wrong_base, delta).err(), Some(Error::Replay));
@@ -1726,6 +2000,7 @@ mod codec {
             assert_eq!(vectors[0].membership_hash, vectors[3].membership_hash);
         }
 
+        /// Site spelling, empty values, and type rejection remain hash-visible.
         #[test]
         fn site_wire_defaults_validation_and_hashes() {
             let mut p = decode_publication(&fixture("publication.json")).unwrap();
@@ -1764,6 +2039,7 @@ mod codec {
             }
         }
 
+        /// Enrollment and key bundles retain exact canonical fixture bytes.
         #[test]
         fn shared_bootstrap_and_bundle_vectors() {
             for name in [
@@ -1838,6 +2114,7 @@ mod codec {
             }
         }
 
+        /// NIC limits count physical ports, permit shared rails, and normalize order.
         #[test]
         fn physical_nic_bounds_repeated_rails_and_bootstrap_canonical_order() {
             let mut p = decode_publication(&fixture("publication.json")).unwrap();
@@ -1882,6 +2159,7 @@ mod codec {
             assert_eq!(encode_enrollment_request(&request), Err(Error::Overloaded));
         }
 
+        /// Shared malformed records retain the exact cross-language error categories.
         #[test]
         fn shared_rejection_vectors() {
             let cases: Value = serde_json::from_slice(&fixture("rejections.json")).unwrap();
@@ -1910,6 +2188,7 @@ mod codec {
             }
         }
 
+        /// Retirement is expressed by omission, never by an unsupported key state.
         #[test]
         fn retiring_state_is_rejected_with_active_key_present() {
             let input = String::from_utf8(fixture("bundle.json")).unwrap();
@@ -1921,6 +2200,7 @@ mod codec {
             );
         }
 
+        /// Hashes ignore ordering and cursors but bind cache and endpoint changes.
         #[test]
         fn hash_semantics() {
             let mut p = decode_publication(fixture("publication.json").as_slice()).unwrap();
@@ -1941,6 +2221,7 @@ mod codec {
             assert_ne!(endpoint.1, changed.1);
         }
 
+        /// Locally constructed publications follow the same validation as wire input.
         #[test]
         fn local_publications_share_wire_validation_and_normalization() {
             let original = decode_publication(&fixture("publication.json")).unwrap();
@@ -1990,6 +2271,7 @@ mod codec {
             }
         }
 
+        /// Exact byte limits succeed while malformed or oversized documents fail.
         #[test]
         fn byte_bounds_and_malformed_documents() {
             for (name, max) in [
@@ -2028,6 +2310,7 @@ mod codec {
             );
         }
 
+        /// Socket names, membership counts, and error codes retain strict bounds.
         #[test]
         fn path_member_and_enum_bounds() {
             for name in [
@@ -2072,6 +2355,7 @@ mod codec {
             assert!(decode_error(br#"{"code":"future"}"#.as_slice()).is_err());
         }
 
+        /// The maximum accepted membership round-trips; one additional member fails.
         #[test]
         fn maximum_membership() {
             let mut p = decode_publication(fixture("publication.json").as_slice()).unwrap();
@@ -2100,6 +2384,7 @@ mod codec {
             );
         }
 
+        /// Hash the two canonical byte views independently for fixture comparisons.
         fn content_hashes(p: &Publication) -> Result<(String, String)> {
             let (content, membership) = canonical_content(p)?;
             Ok((
@@ -2108,6 +2393,7 @@ mod codec {
             ))
         }
 
+        /// Read one shared fixture, removing only its optional final newline.
         fn fixture(name: &str) -> Vec<u8> {
             let mut b = std::fs::read(format!("{ROOT}{name}")).unwrap();
             if b.last() == Some(&b'\n') {
@@ -2116,6 +2402,7 @@ mod codec {
             b
         }
 
+        /// Decode and re-encode the record family selected by the fixture name.
         fn round_trip(name: &str, b: &[u8]) -> Result<Vec<u8>> {
             match name {
                 "publication.json" => encode_publication(&decode_publication(b)?),
@@ -2131,6 +2418,7 @@ mod codec {
         }
     }
 
+    /// Codec boundaries and shared vectors, including secret cleanup on failure.
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2378,6 +2666,7 @@ mod codec {
             }
         }
 
+        /// Key syntax and future epochs preserve invalid-request classification.
         #[test]
         fn bundle_key_generation_maps_syntax_and_future_epochs_to_invalid_request() {
             let mut bundle: Value = serde_json::from_str(BUNDLE).unwrap();
@@ -2483,6 +2772,7 @@ mod codec {
             }
         }
 
+        /// Missing or invalid later fields must drop the already-owned secret field.
         #[test]
         fn encoded_material_is_owned_before_key_construction_completes() {
             for suffix in [
@@ -2508,6 +2798,7 @@ mod codec {
             assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 1);
         }
 
+        /// Public bundle decoding preserves error classification after secret parsing.
         #[test]
         fn bundle_rejects_missing_state_and_late_errors_after_material() {
             for replacement in ["", r#""state":false,"#] {
@@ -2522,6 +2813,7 @@ mod codec {
             }
         }
 
+        /// The Go delta fixture applies exactly once and binds changed member content.
         #[test]
         fn go_delta_vector_applies_exactly_and_rejects_tampering() {
             let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rdma_nics":[],"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rdma_nics":[],"site":""}],"caches":[]}"#).unwrap();
@@ -2642,6 +2934,7 @@ mod codec {
             }
         }
 
+        /// Bundles reject ambiguous active keys and unsupported states or purposes.
         #[test]
         fn bundle_rejects_partial_key_epochs() {
             for (old, new) in [

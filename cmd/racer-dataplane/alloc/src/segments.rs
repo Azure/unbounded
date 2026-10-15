@@ -48,6 +48,10 @@ pub struct SegmentSnapshot {
 
     /// Aligned occupied prefix, including record padding.
     pub used_bytes: u64,
+
+    /// Caller-owned checkpoint hints: record offsets and retention deadlines.
+    /// Allocation ignores these; the caller must restore its own eviction vetoes.
+    pub retained_records: Vec<(u64, std::time::SystemTime)>,
 }
 
 /// Unique worker-local lease that prevents reuse until its completion owner drops.
@@ -136,6 +140,8 @@ impl Drop for SegmentLease {
 struct Slot {
     image: SegmentSnapshot,
 
+    usage_group: usize,
+
     leases: Rc<Cell<usize>>,
 }
 
@@ -183,6 +189,8 @@ pub struct Segments {
     free: RefCell<BTreeSet<usize>>,
 
     evicting: Cell<usize>,
+
+    usage: RefCell<Vec<(u64, u64)>>,
 }
 
 impl Segments {
@@ -198,6 +206,7 @@ impl Segments {
             open: Cell::new(None),
             free: RefCell::new(BTreeSet::new()),
             evicting: Cell::new(0),
+            usage: RefCell::new(Vec::new()),
         }
     }
 
@@ -209,6 +218,37 @@ impl Segments {
     /// Configured physical capacity, or zero before configuration.
     pub fn capacity_bytes(&self) -> u64 {
         self.geometry.get().map_or(0, SegmentGeometry::slab_bytes)
+    }
+
+    /// Group consecutive slots for storage metrics. Counts must cover every slot.
+    /// Call at startup; regrouping scans the table once.
+    pub fn configure_usage_groups(&self, counts: &[usize]) -> Result<()> {
+        let mut slots = self.slots.borrow_mut();
+        if !self.is_configured()
+            || counts.is_empty()
+            || counts.contains(&0)
+            || counts.iter().try_fold(0usize, |n, c| n.checked_add(*c)) != Some(slots.len())
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut usage = Vec::with_capacity(counts.len());
+        let mut start = 0;
+        for (group, &count) in counts.iter().enumerate() {
+            let mut used = 0;
+            for slot in &mut slots[start..start + count] {
+                slot.usage_group = group;
+                used += slot.image.used_bytes;
+            }
+            usage.push((count as u64 * self.segment_bytes, used));
+            start += count;
+        }
+        *self.usage.borrow_mut() = usage;
+        Ok(())
+    }
+
+    /// Assigned capacity and reserved bytes per group, without scanning slots.
+    pub fn usage(&self) -> Vec<(u64, u64)> {
+        self.usage.borrow().clone()
     }
 
     /// Build an entirely free table, rejecting geometry above the retained slot limit.
@@ -266,16 +306,19 @@ impl Segments {
         self.geometry.set(Some(geometry));
         *self.slots.borrow_mut() = (0..count)
             .map(|id| Slot {
+                usage_group: 0,
                 image: SegmentSnapshot {
                     id: SegmentId(id as u64),
                     generation: Generation(1),
                     state: SegmentState::Free,
                     used_bytes: 0,
+                    retained_records: Vec::new(),
                 },
                 leases: Rc::new(Cell::new(0)),
             })
             .collect();
         *self.free.borrow_mut() = (0..count).collect();
+        *self.usage.borrow_mut() = vec![(count as u64 * self.segment_bytes, 0)];
         Ok(())
     }
 
@@ -338,6 +381,7 @@ impl Segments {
         let slot = &mut slots[position];
         slot.image.state = SegmentState::Open;
         slot.image.used_bytes = used_bytes;
+        self.usage.borrow_mut()[slot.usage_group].1 += length as u64;
         if slot.image.used_bytes == self.segment_bytes {
             slot.image.state = SegmentState::Sealed;
             self.open.set(None);
@@ -438,6 +482,7 @@ impl Segments {
         );
         slot.image.state = SegmentState::Free;
         self.evicting.set(self.evicting.get() - 1);
+        self.usage.borrow_mut()[slot.usage_group].1 -= slot.image.used_bytes;
         slot.image.used_bytes = 0;
         self.free.borrow_mut().insert(Self::position(id)?);
         Ok(())
@@ -537,7 +582,12 @@ impl Segments {
         self.open.set(None);
         self.free.borrow_mut().clear();
         self.evicting.set(0);
+        let mut usage = self.usage.borrow_mut();
+        for (_, used) in usage.iter_mut() {
+            *used = 0;
+        }
         for ((slot, mut image), generation) in slots.iter_mut().zip(images).zip(generations) {
+            image.retained_records.clear();
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;
             }
@@ -548,6 +598,7 @@ impl Segments {
                 self.evicting.set(self.evicting.get() + 1);
             }
             image.generation = generation;
+            usage[slot.usage_group].1 += image.used_bytes;
             slot.image = image;
         }
         self.restore_epoch.set(epoch);
@@ -658,6 +709,11 @@ impl TableIdentity {
 /// Application-owned mappings; removal must compare current entries first.
 /// Callbacks own metadata and version side effects and must never exceed budget.
 pub trait SegmentEntries {
+    /// Hard retention veto, including index-only removal and eviction in progress.
+    fn can_reclaim(&self, _segment: SegmentId) -> bool {
+        true
+    }
+
     /// Active unpublished writes must not lose publication authority. Read
     /// leases still permit eviction and independently fence physical reuse.
     fn can_evict(&self, _segment: SegmentId) -> bool {
@@ -743,6 +799,9 @@ impl SegmentClock {
             if self.recent.borrow_mut().remove(&id) {
                 continue;
             }
+            if !entries.can_reclaim(id) {
+                continue;
+            }
             if entries.remove_bounded(id, 1) > 1 {
                 return Err(Error::InvalidConfiguration);
             }
@@ -792,7 +851,8 @@ impl SegmentClock {
             if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
                 continue;
             }
-            if state == SegmentState::Sealed && !entries.can_evict(id) {
+            if !entries.can_reclaim(id) || (state == SegmentState::Sealed && !entries.can_evict(id))
+            {
                 continue;
             }
             // Rank before any begin_eviction or index side effects.
@@ -807,6 +867,9 @@ impl SegmentClock {
         let mut entries_left = max_entries;
         for (_, _, _, id) in candidates {
             let state = self.segments.state(id)?;
+            if !entries.can_reclaim(id) {
+                continue;
+            }
             if state == SegmentState::Sealed
                 && (self
                     .segments
@@ -878,9 +941,10 @@ impl SegmentClock {
             if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
                 continue;
             }
-            if state == SegmentState::Sealed
-                && (free.saturating_add(self.segments.evicting.get()) >= target
-                    || !entries.can_evict(id))
+            if !entries.can_reclaim(id)
+                || state == SegmentState::Sealed
+                    && (free.saturating_add(self.segments.evicting.get()) >= target
+                        || !entries.can_evict(id))
             {
                 continue;
             }
@@ -999,6 +1063,65 @@ mod tests {
         assert_eq!(s.free_count(), 0);
         assert!(s.snapshot().is_empty());
         s.configure(1024, 1, a).unwrap();
+    }
+
+    #[test]
+    fn disk_usage_tracks_reservations_recycle_and_restore() {
+        let s = segments(1024, 3);
+        assert_eq!(s.usage(), [(3072, 0)]);
+        s.configure_usage_groups(&[1, 2]).unwrap();
+        assert_eq!(s.usage(), [(1024, 0), (2048, 0)]);
+        let (held, _) = s.append(1024).unwrap();
+        drop(s.append(512).unwrap());
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        let image = s.snapshot();
+        assert!(s.append(513).is_err());
+        assert!(s.restore(image.clone()).is_err());
+        for counts in [vec![], vec![0, 3], vec![2], vec![usize::MAX, 1]] {
+            assert!(s.configure_usage_groups(&counts).is_err());
+            assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        }
+        s.begin_evict(SegmentId(0)).unwrap();
+        assert!(s.recycle(SegmentId(0)).is_err());
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        drop(held);
+        s.recycle(SegmentId(0)).unwrap();
+        assert_eq!(s.usage(), [(1024, 0), (2048, 512)]);
+        // Recycling advanced slot 0, so the older image is a rollback.
+        assert_eq!(s.restore(image.clone()), Err(Error::Stale));
+        assert_eq!(s.usage(), [(1024, 0), (2048, 512)]);
+        let mut image = image;
+        image[0].generation = s.snapshot()[0].generation;
+        s.restore(image.clone()).unwrap();
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        let mut invalid = image;
+        invalid[0].used_bytes = 1025;
+        assert!(s.restore(invalid).is_err());
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        s.configure_usage_groups(&[3]).unwrap();
+        assert_eq!(s.usage(), [(3072, 1536)]);
+        let mut fresh = segments(1024, 3).snapshot();
+        for (image, live) in fresh.iter_mut().zip(s.snapshot()) {
+            image.generation = live.generation;
+        }
+        s.restore(fresh).unwrap();
+        assert_eq!(s.usage(), [(3072, 0)]);
+    }
+
+    #[test]
+    fn disk_usage_counts_assigned_slots_not_unassigned_capacity() {
+        let s = Segments::new(1024);
+        assert!(s.usage().is_empty());
+        assert!(s.configure_usage_groups(&[1]).is_err());
+        s.configure(8192, 2, Alignment::new(512, 512, 512).unwrap())
+            .unwrap();
+        assert_eq!(s.capacity_bytes(), 8192);
+        assert_eq!(s.usage(), [(2048, 0)]);
+        s.configure_usage_groups(&[1, 1]).unwrap();
+        drop(s.append(1024).unwrap());
+        drop(s.append(1024).unwrap());
+        assert!(s.append(512).is_err());
+        assert_eq!(s.usage(), [(1024, 1024), (1024, 1024)]);
     }
 
     /// Malformed append and synthetic saturation cannot consume or seal slots.
@@ -1210,6 +1333,7 @@ mod clock_tests {
         calls: RefCell<Vec<(SegmentId, usize)>>,
 
         evictable: Cell<bool>,
+        hard_veto: Cell<bool>,
     }
 
     impl Entries {
@@ -1219,11 +1343,15 @@ mod clock_tests {
                 counts: RefCell::new(counts),
                 calls: RefCell::new(vec![]),
                 evictable: Cell::new(true),
+                hard_veto: Cell::new(false),
             }
         }
     }
 
     impl SegmentEntries for Entries {
+        fn can_reclaim(&self, _: SegmentId) -> bool {
+            !self.hard_veto.get()
+        }
         /// Allow tests to protect unpublished mappings before eviction begins.
         fn can_evict(&self, _: SegmentId) -> bool {
             self.evictable.get()
@@ -1275,6 +1403,32 @@ mod clock_tests {
         let entries = Entries::new(vec![1]);
         assert_eq!(clock.reclaim_index(&entries, 0, || false), Err(Error::Busy));
         assert!(entries.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn hard_veto_applies_to_already_evicting_and_index_only_sweeps() {
+        let segments = segments(2);
+        drop(segments.append(1024).unwrap());
+        segments.begin_evict(SegmentId(0)).unwrap();
+        let entries = Entries::new(vec![1, 0]);
+        entries.evictable.set(false);
+        entries.hard_veto.set(true);
+        let clock = SegmentClock::new(segments.clone());
+        assert_eq!(
+            clock.reclaim_scored(&entries, 2, 64, 256, |_| 0),
+            Err(Error::Busy)
+        );
+        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
+        assert_eq!(
+            clock.reclaim_index(&entries, 64, || false),
+            Err(Error::Busy)
+        );
+        assert!(entries.calls.borrow().is_empty());
+        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+        entries.evictable.set(true);
+        entries.hard_veto.set(false);
+        clock.reclaim_scored(&entries, 2, 64, 256, |_| 0).unwrap();
+        assert_eq!(segments.free_count(), 2);
     }
 
     /// Index admission can forget open mappings without reclaiming their storage.

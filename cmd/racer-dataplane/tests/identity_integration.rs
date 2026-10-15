@@ -1,0 +1,305 @@
+//! Cross-component ownership: real control decoding, application publication,
+//! immutable identity leases, and completion-retained page crypto work.
+/// Shared integration configuration and enrollment helpers.
+#[path = "support/enrollment.rs"]
+#[allow(dead_code)]
+mod fixture_io;
+
+use racer_control_wire as wire;
+use racer_control_wire::*;
+use racer_crypto::identity::BundleInstaller;
+use racer_dataplane as dataplane;
+use racer_dataplane::admission::AdmissionPolicy;
+use racer_dataplane::admission::ResourceClass;
+use racer_dataplane::error::Error;
+use racer_dataplane::memory::BufferPool;
+use racer_dataplane::model::CacheKey;
+use racer_dataplane::model::ObjectId;
+use racer_dataplane::model::ObjectVersion;
+use racer_dataplane::model::PageId;
+use racer_dataplane::model::PageNumber;
+use racer_dataplane::model::RequestId;
+use racer_dataplane::model::StrongEtag;
+use racer_dataplane::model::WorkerId;
+use racer_dataplane::runtime::RequestScope;
+use racer_dataplane::security;
+use racer_dataplane::security::CryptoClient;
+use racer_dataplane::security::CryptoInput;
+use racer_dataplane::security::CryptoOutput;
+use racer_dataplane::worker::CryptoRuntime;
+
+use racer_crypto::identity::KeyEpochs;
+use racer_crypto::identity::KeyPurpose;
+use racer_crypto::identity::Keyring;
+use racer_dataplane::security::PageCryptoEngine;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use uring_runtime::reactor::IoBuffer;
+
+const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
+const NODE: &str = "22222222-2222-4222-8222-222222222222";
+const CACHE: &str = "33333333-3333-4333-8333-333333333333";
+
+/// Shared worker views observe coherent identity trust across rejected and valid rotations.
+#[test]
+fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() {
+    let cluster = ClusterId(CLUSTER.into());
+    let node = NodeId(NODE.into());
+    let epochs = Arc::new(KeyEpochs::default());
+    let publisher = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
+    let worker = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
+    let foreign = Keyring::new(ClusterId(CACHE.into()), node.clone(), epochs.clone());
+    let other_node = Keyring::new(cluster.clone(), NodeId(CACHE.into()), epochs);
+    assert_eq!(publisher.generation().unwrap(), None);
+    assert!(worker.signing_identity().is_err());
+    assert!(worker.peer_trust_roots().is_err());
+
+    let (ca, ca_key) = racer_crypto::identity::test_util::ca();
+    let (pending, chain) =
+        racer_crypto::identity::test_util::issue(&ca, &ca_key, &cluster, &node, |_| {});
+    let roots = vec![ca.der().to_vec()];
+    let identity = Arc::new(
+        pending
+            .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+            .unwrap(),
+    );
+    let installer = BundleInstaller::new(publisher.clone());
+    let mut bundle = KeyringBundle {
+        schema_version: SCHEMA_VERSION,
+        cluster: cluster.clone(),
+        generation: BundleGeneration(1),
+        peer_trust_roots: roots,
+        cache_keys: vec![record(1, 7)],
+    };
+    install_decoded(&installer, &bundle).unwrap();
+    publisher
+        .install_signing_identity(identity.clone())
+        .unwrap();
+    let held = worker.signing_identity().unwrap();
+    assert!(Arc::ptr_eq(&held, &identity));
+    assert!(foreign.peer_trust_roots().is_err());
+    assert!(foreign.signing_identity().is_err());
+    assert!(other_node.signing_identity().is_err());
+    assert!(
+        other_node
+            .install_signing_identity(identity.clone())
+            .is_err()
+    );
+
+    let certificates = racer_crypto::identity::Certificates::new(cluster, worker.clone());
+    let message = b"shared publication";
+    let signature = held.sign(message).unwrap();
+    assert_eq!(
+        certificates
+            .verify_signed(&chain, &node, message, &signature)
+            .unwrap()
+            .node(),
+        &node,
+    );
+    let original_roots = worker.peer_trust_roots().unwrap();
+    let (replacement, _) = racer_crypto::identity::test_util::ca();
+    bundle.peer_trust_roots = vec![replacement.der().to_vec()];
+    assert!(install_decoded(&installer, &bundle).is_err());
+    assert!(Arc::ptr_eq(
+        &original_roots,
+        &worker.peer_trust_roots().unwrap()
+    ));
+    assert!(Arc::ptr_eq(&held, &worker.signing_identity().unwrap()));
+
+    bundle.generation = BundleGeneration(2);
+    install_decoded(&installer, &bundle).unwrap();
+    assert_eq!(worker.generation().unwrap(), Some(2));
+    assert!(worker.signing_identity().is_err());
+    assert!(publisher.install_signing_identity(identity).is_err());
+    assert!(
+        certificates
+            .verify_signed(&chain, &node, message, &signature)
+            .is_err()
+    );
+    assert_eq!(held.sign(message).unwrap(), signature);
+
+    bundle.generation = BundleGeneration(3);
+    bundle.peer_trust_roots = (*original_roots).clone();
+    install_decoded(&installer, &bundle).unwrap();
+    assert!(Arc::ptr_eq(&held, &worker.signing_identity().unwrap()));
+    certificates
+        .verify_signed(&chain, &node, message, &signature)
+        .unwrap();
+}
+
+fn fixture() -> (Rc<Keyring>, BundleInstaller, KeyringBundle) {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let ca = params.self_signed(&ca_key).unwrap();
+    let keys = Rc::new(Keyring::new(
+        ClusterId(CLUSTER.into()),
+        NodeId(NODE.into()),
+        Arc::new(KeyEpochs::default()),
+    ));
+    let installer = BundleInstaller::new(keys.clone());
+    let bundle = KeyringBundle {
+        schema_version: SCHEMA_VERSION,
+        cluster: ClusterId(CLUSTER.into()),
+        generation: BundleGeneration(1),
+        peer_trust_roots: vec![ca.der().to_vec()],
+        cache_keys: vec![record(1, 7)],
+    };
+    install_decoded(&installer, &bundle).unwrap();
+    (keys, installer, bundle)
+}
+fn record(generation: u64, byte: u8) -> CacheEncryptionKey {
+    CacheEncryptionKey::new(
+        CacheKeyRef {
+            cache: CacheId(CACHE.into()),
+            id: KeyId::from_generation(generation, 1).unwrap(),
+            purpose: CacheKeyPurpose::Page,
+        },
+        CacheKeyState::Active,
+        zeroize::Zeroizing::new([byte; 32]),
+    )
+}
+fn install_decoded(
+    installer: &BundleInstaller,
+    bundle: &KeyringBundle,
+) -> racer_dataplane::error::Result<(BundleGeneration, Vec<Vec<u8>>)> {
+    let encoded = zeroize::Zeroizing::new(wire::encode_bundle(bundle).unwrap());
+    installer
+        .install(wire::decode_bundle(&encoded).unwrap())
+        .map_err(Into::into)
+}
+
+#[test]
+fn real_decode_installer_rotation_retained_lease_and_rejection_are_atomic() {
+    let (keys, installer, mut bundle) = fixture();
+    let cache = CacheId(CACHE.into());
+    let held = keys.active(&cache, KeyPurpose::Page).unwrap();
+    let mut sealed = [0; 19];
+    held.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed)
+        .unwrap();
+    bundle.generation = BundleGeneration(2);
+    bundle.cache_keys = vec![record(2, 9)];
+    install_decoded(&installer, &bundle).unwrap();
+    assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+    assert_eq!(keys.generation().unwrap(), Some(2));
+    assert!(
+        keys.lease(Some(&cache), held.id(), KeyPurpose::Page)
+            .is_err()
+    );
+    let mut opened = [0; 3];
+    held.open_page(&cache, held.id(), &[1; 24], b"aad", &sealed, &mut opened)
+        .unwrap();
+    assert_eq!(&opened, b"abc");
+    let active_id = keys.active(&cache, KeyPurpose::Page).unwrap().id();
+    let roots = keys.peer_trust_roots().unwrap();
+    // This passes wire validation but illegally rebinds an admitted ID.
+    bundle.generation = BundleGeneration(3);
+    bundle.cache_keys = vec![record(2, 10)];
+    let (_, _, foreign) = fixture();
+    bundle.peer_trust_roots = foreign.peer_trust_roots;
+    assert!(matches!(
+        install_decoded(&installer, &bundle),
+        Err(Error::InvalidConfiguration)
+    ));
+    assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+    assert_eq!(keys.generation().unwrap(), Some(2));
+    assert_eq!(
+        keys.active(&cache, KeyPurpose::Page).unwrap().id(),
+        active_id
+    );
+    assert!(Arc::ptr_eq(&roots, &keys.peer_trust_roots().unwrap()));
+    // Direct configuration installation rejects malformed generations in identity,
+    // independently of the wire decoder's InvalidRequest classification.
+    bundle.cache_keys[0].key.id = KeyId([0; 16]);
+    assert_eq!(
+        keys.install(bundle),
+        Err(racer_crypto::identity::Error::InvalidConfiguration)
+    );
+    assert_eq!(
+        racer_dataplane::model::key_id_from_generation(0, 1),
+        Err(Error::InvalidConfiguration)
+    );
+}
+
+#[test]
+fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease() {
+    let (keys, installer, mut bundle) = fixture();
+    let cache = CacheId(CACHE.into());
+    let config = fixture_io::default_config(CLUSTER);
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        config.limits,
+    )));
+    let pool = BufferPool::new(admission.clone());
+    let (io, engine) = security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(8).unwrap());
+    let client = CryptoClient::new(io);
+    let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
+    let mut plaintext = pool
+        .plaintext(
+            admission
+                .reserve(Some(&cache), ResourceClass::Plaintext, 3)
+                .unwrap(),
+            3,
+        )
+        .unwrap();
+    plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
+    let page = PageId {
+        version: ObjectVersion {
+            object: ObjectId {
+                cache: cache.clone(),
+                key: CacheKey([0; 32]),
+            },
+            etag: StrongEtag::parse(b"\"held\"").unwrap(),
+        },
+        number: PageNumber(0),
+    };
+    let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
+    let old_id = lease.id();
+    let scope =
+        RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10)).unwrap();
+    let mut operation = client.execute(
+        CryptoInput::Encrypt {
+            page,
+            plaintext,
+            ciphertext: admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                .unwrap(),
+        },
+        lease,
+        &scope,
+    );
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    assert!(operation.as_mut().poll(&mut cx).is_pending());
+    bundle.generation = BundleGeneration(2);
+    bundle.cache_keys = vec![record(2, 10)];
+    install_decoded(&installer, &bundle).unwrap();
+    assert!(keys.lease(Some(&cache), old_id, KeyPurpose::Page).is_err());
+    uring_runtime::group::Service::poll_budgeted(
+        &mut engine,
+        &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+        8,
+    )
+    .unwrap();
+    client.poll_budgeted(8).unwrap();
+    let std::task::Poll::Ready(Ok(CryptoOutput::Encrypted(verified, ciphertext))) =
+        operation.as_mut().poll(&mut cx)
+    else {
+        panic!("held operation did not complete");
+    };
+    assert_eq!(verified.bytes(), b"abc");
+    assert_eq!(ciphertext.envelope().key_id, old_id);
+    // Public purpose operation, not a private weak-owner escape, checks the bytes.
+    let mut opened = [0; 3];
+    racer_crypto::open(
+        &[7; 32],
+        &ciphertext.envelope().nonce.0,
+        &racer_dataplane::security::page_aad(ciphertext.envelope()).unwrap(),
+        ciphertext.bytes(),
+        &mut opened,
+    )
+    .unwrap();
+    assert_eq!(&opened, b"abc");
+    drop(operation);
+}

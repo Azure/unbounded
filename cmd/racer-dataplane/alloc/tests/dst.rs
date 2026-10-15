@@ -836,6 +836,7 @@ impl GeometryModel {
                 generation: Generation(1),
                 state: SegmentState::Sealed,
                 used_bytes: bytes,
+                retained_records: Vec::new(),
             });
         }
         assert_eq!(segments.snapshot(), expected);
@@ -1333,9 +1334,9 @@ impl<'t, 'w> Phase<'t, 'w> {
                     .err(),
                     Some(Error::InvalidConfiguration)
                 );
-                // A withdrawn charge rejects rebinding after the idle owner was
-                // taken. Idle owners have no return pool, so storage is released.
-                assert_eq!(slab.idle_bytes(), 0);
+                // A charge withdrawn before size-class reuse leaves the idle
+                // owner pooled; the fresh allocation then rejects it as well.
+                assert_eq!(slab.idle_bytes(), idle);
                 let buffer = slab
                     .allocate(
                         PAGE as usize,

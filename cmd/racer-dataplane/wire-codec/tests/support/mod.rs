@@ -14,33 +14,42 @@ use wire_codec::rest::{
     Transport,
 };
 
+/// Fixture errors retain transport categories without an orphan conversion impl.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// A generic transport failure.
     Transport(RestError),
 }
 
 impl Error {
+    /// Socket or filesystem failure in the blocking fixture.
     pub const IO: Self = Self::Transport(RestError::Io);
 
+    /// Scope deadline or unavailable endpoint.
     pub const UNAVAILABLE: Self = Self::Transport(RestError::Unavailable);
 
+    /// The fixture's file byte bound was exceeded.
     pub const OVERLOADED: Self = Self::Transport(RestError::Overloaded);
 }
 
 impl From<RestError> for Error {
+    /// Retain the transport's exact error classification.
     fn from(error: RestError) -> Self {
         Self::Transport(error)
     }
 }
 
+/// Results returned by blocking fixture operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A monotonic deadline used by loopback operations.
 #[derive(Clone)]
 pub struct TestScope(Instant);
 
 impl uring_runtime::Scope for TestScope {
     type Error = Error;
 
+    /// Expire operations after the fixture's absolute deadline.
     fn check(&self) -> Result<()> {
         if Instant::now() >= self.0 {
             Err(Error::UNAVAILABLE)
@@ -51,25 +60,30 @@ impl uring_runtime::Scope for TestScope {
 }
 
 impl Scope for TestScope {
+    /// Return the fixture's absolute deadline.
     fn deadline(&self) -> Instant {
         self.0
     }
 
+    /// Never extend an existing deadline.
     fn narrowed(&self, until: Instant) -> Self {
         Self(self.0.min(until))
     }
 }
 
 impl From<uring_runtime::Error> for Error {
+    /// Preserve the original fixture's runtime-to-I/O error mapping.
     fn from(_: uring_runtime::Error) -> Self {
         Self::IO
     }
 }
 
+/// Give one fixture operation a bounded loopback deadline.
 pub fn scope() -> TestScope {
     TestScope(Instant::now() + Duration::from_secs(10))
 }
 
+/// Blocking poll is confined to loopback tests; no io_uring or Racer dependency.
 pub struct FixtureIo;
 
 impl Io for FixtureIo {
@@ -81,10 +95,12 @@ impl Io for FixtureIo {
 
     type Lease = ();
 
+    /// Loopback fixtures need no admission charge.
     fn lease(&self) -> Result<Option<Rc<()>>> {
         Ok(None)
     }
 
+    /// Read projected trust anew under the configured byte limit.
     fn read_file<'a>(
         &'a self,
         path: &'a std::path::Path,
@@ -105,6 +121,7 @@ impl Io for FixtureIo {
         })
     }
 
+    /// Route fixture names to the loopback server without changing TLS names.
     fn resolve<'a>(
         &'a self,
         _: &'a str,
@@ -114,6 +131,7 @@ impl Io for FixtureIo {
         Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
     }
 
+    /// Poll loopback readiness while enforcing the fixture deadline.
     fn ready<'a>(
         &'a self,
         fd: Rc<Descriptor>,
@@ -142,9 +160,11 @@ impl Io for FixtureIo {
     }
 }
 
+/// Process-unique fixture directory removed on drop.
 pub struct Directory(pub PathBuf);
 
 impl Directory {
+    /// Create a directory inside this worktree's target tree.
     pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -160,11 +180,13 @@ impl Directory {
 }
 
 impl Drop for Directory {
+    /// Clean up trust files, including projected symlinks, after the test.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+/// Generate an in-memory Ed25519 certificate authority.
 pub fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -176,6 +198,7 @@ pub fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
     (params.self_signed(&key).unwrap(), key)
 }
 
+/// Client identity with zeroized private-key storage.
 pub struct TestIdentity {
     chain: Vec<Vec<u8>>,
 
@@ -185,6 +208,7 @@ pub struct TestIdentity {
 }
 
 impl TestIdentity {
+    /// Issue a client-auth certificate from the supplied fixture CA.
     pub fn new(ca: &rcgen::Certificate, ca_key: &rcgen::KeyPair) -> Self {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -206,6 +230,7 @@ impl TestIdentity {
     }
 }
 
+/// Build standard bounded transport configuration for loopback tests.
 pub fn config(url: String, trust_bundle: PathBuf) -> Config {
     Config {
         url,
@@ -215,18 +240,22 @@ pub fn config(url: String, trust_bundle: PathBuf) -> Config {
     }
 }
 
+/// Test-only convenience methods, not additions to the production API.
 pub trait TestTransport {
+    /// Connect with a borrowed fixture identity.
     fn authenticated<'a>(
         &'a self,
         identity: &'a TestIdentity,
         scope: &'a TestScope,
     ) -> Operation<'a, Connection<FixtureIo>, Error>;
 
+    /// Connect without client authentication.
     fn bootstrap<'a>(&'a self, scope: &'a TestScope)
     -> Operation<'a, Connection<FixtureIo>, Error>;
 }
 
 impl TestTransport for Transport<FixtureIo> {
+    /// Connect using the fixture's borrowed client certificate and key.
     fn authenticated<'a>(
         &'a self,
         identity: &'a TestIdentity,
@@ -235,6 +264,7 @@ impl TestTransport for Transport<FixtureIo> {
         self.connect(Some(identity.borrowed()), scope)
     }
 
+    /// Connect without client authentication or pooling.
     fn bootstrap<'a>(
         &'a self,
         scope: &'a TestScope,
@@ -243,6 +273,7 @@ impl TestTransport for Transport<FixtureIo> {
     }
 }
 
+/// Construct a bodyless fixture request with a caller-selected response limit.
 pub fn request<'a>(
     method: Method,
     path: &'a str,
@@ -259,6 +290,8 @@ pub fn request<'a>(
     }
 }
 
+/// Match operator/components/racer/tls.go with fresh in-memory P-256 keys,
+/// distinct CA subjects, unconstrained signing CAs, and server-auth leaves.
 pub struct WeeklyCertificates {
     pub roots: Vec<rcgen::Certificate>,
 
@@ -270,6 +303,7 @@ pub struct WeeklyCertificates {
 }
 
 impl WeeklyCertificates {
+    /// Build four generations retaining at most two compatibility bridges.
     pub fn new() -> Self {
         let day = Duration::from_secs(86400);
         let now = SystemTime::now();
@@ -357,6 +391,7 @@ impl WeeklyCertificates {
     }
 }
 
+/// A join-on-drop server with bounded accept, socket I/O, and request headers.
 pub struct RotationServer {
     port: u16,
 
@@ -368,6 +403,7 @@ pub struct RotationServer {
 }
 
 impl RotationServer {
+    /// Start serving connection identifiers using a replaceable TLS config.
     pub fn new(config: Arc<rustls::ServerConfig>) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -428,10 +464,12 @@ impl RotationServer {
         }
     }
 
+    /// Select certificates for subsequent connections.
     pub fn rotate(&self, config: Arc<rustls::ServerConfig>) {
         *self.config.lock().unwrap() = config;
     }
 
+    /// Attach loopback I/O while retaining the controller DNS name for TLS.
     pub fn transport(&self, trust_bundle: PathBuf) -> Transport<FixtureIo> {
         let transport = Transport::new(config(
             format!("https://racer-controller.custom-system.svc:{}", self.port),
@@ -443,6 +481,7 @@ impl RotationServer {
 }
 
 impl Drop for RotationServer {
+    /// Stop and join the server even when an assertion unwinds.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let result = self.thread.take().unwrap().join();
@@ -452,6 +491,7 @@ impl Drop for RotationServer {
     }
 }
 
+/// Return the serving connection identifier from a bounded public request.
 pub fn rotation_request(
     transport: &Transport<FixtureIo>,
     identity: Option<&TestIdentity>,

@@ -213,7 +213,15 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Result<Buffer, S::Error> {
         while buffer.remaining() != 0 {
             let completion = self
-                .write_at(staged.clone(), *offset, buffer, (), scope)
+                .buffer_io(
+                    staged.clone(),
+                    buffer,
+                    (),
+                    scope,
+                    crate::reactor::BufferOperation::Write(*offset),
+                    crate::reactor::IssuePolicy::Offload,
+                    None,
+                )
                 .await?;
             buffer = completion.buffer;
             buffer.advance(completion.bytes)?;
@@ -487,6 +495,7 @@ mod publication {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: fd is a fresh, valid descriptor from openat that nothing else owns.
         Ok(unsafe { Descriptor::from_raw_fd(fd) })
     }
 

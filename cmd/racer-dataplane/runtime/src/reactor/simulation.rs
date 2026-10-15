@@ -866,12 +866,18 @@ impl Op {
                         std::slice::from_raw_parts_mut(*ptr, len)
                     }),
                     BufferOperation::Recv => {
+                        // SAFETY: recv entries own an exclusive IoBuffer of at least len
+                        // bytes that stays alive through both fences.
                         fd.recv(unsafe { std::slice::from_raw_parts_mut(*ptr, len) })
                     }
                     BufferOperation::Write(offset) => {
+                        // SAFETY: the submitted buffer of at least len bytes stays alive
+                        // through both fences; shared read-only aliases are permitted.
                         fd.file_write(*offset, unsafe { std::slice::from_raw_parts(*ptr, len) })
                     }
                     BufferOperation::Send => {
+                        // SAFETY: the submitted buffer of at least len bytes stays alive
+                        // through both fences; shared read-only aliases are permitted.
                         fd.send(unsafe { std::slice::from_raw_parts(*ptr, len) })
                     }
                 }?;

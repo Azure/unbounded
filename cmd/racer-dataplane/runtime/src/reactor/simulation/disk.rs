@@ -1021,6 +1021,7 @@ impl Handle {
     pub fn stat(&self) -> io::Result<libc::statx> {
         let (node, _) = self.node()?;
         let node = node.borrow();
+        // SAFETY: statx is a plain C struct of integers for which all-zero bytes are valid.
         let mut stat: libc::statx = unsafe { std::mem::zeroed() };
         stat.stx_mask = libc::STATX_BASIC_STATS | libc::STATX_DIOALIGN;
         stat.stx_mode = node.mode;

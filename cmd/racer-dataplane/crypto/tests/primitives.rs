@@ -1,5 +1,8 @@
+//! Public-API workflows, standard vectors, rejection checks, and CRC reference tests.
+
 use racer_crypto::{SigningKey, TAG_LEN, VerifyingKey, crc64, ct_eq, hmac_sha256, open, seal};
 
+/// The identity module keeps its public types and classified errors beside primitives.
 #[test]
 fn identity_module_public_api_preserves_key_and_error_contracts() {
     use racer_control_wire::{CacheId, ClusterId, NodeId};
@@ -46,6 +49,7 @@ fn identity_module_public_api_preserves_key_and_error_contracts() {
     assert!(primitive.is_err());
 }
 
+/// Exchange records in reused slices while preserving surrounding and rejected output.
 #[test]
 fn exchange_records_with_reusable_caller_buffers() {
     let key = random_material();
@@ -100,6 +104,7 @@ fn exchange_records_with_reusable_caller_buffers() {
     }
 }
 
+/// Authenticate shared-key messages and reject modified or truncated transmissions.
 #[test]
 fn authenticate_messages_with_a_shared_key() {
     let sender_key = [0x37; 32];
@@ -130,8 +135,10 @@ fn authenticate_messages_with_a_shared_key() {
     }
 }
 
+/// Match the published XChaCha20-Poly1305 ciphertext and authentication tag.
 #[test]
 fn xchacha_draft_known_answer() {
+    use racer_crypto::{open_credentials as open, seal_credentials as seal};
     // draft-irtf-cfrg-xchacha-03, Appendix A.1 (AEAD_XCHACHA20_POLY1305).
     // https://www.ietf.org/archive/id/draft-irtf-cfrg-xchacha-03.txt
     let key = array("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
@@ -155,6 +162,68 @@ fn xchacha_draft_known_answer() {
     assert_eq!(opened, plaintext);
 }
 
+/// Match both published XAES-256-GCM known answers.
+#[test]
+fn xaes_c2sp_known_answers() {
+    // https://c2sp.org/XAES-256-GCM#test-vectors, both CMAC doubling cases.
+    for (key, aad, expected) in [
+        (
+            1,
+            b"".as_slice(),
+            "ce546ef63c9cc60765923609b33a9a1974e96e52daf2fcf7075e2271",
+        ),
+        (
+            3,
+            b"c2sp.org/XAES-256-GCM".as_slice(),
+            "986ec1832593df5443a179437fd083bf3fdb41abd740a21f71eb769d",
+        ),
+    ] {
+        let mut ciphertext = [0; 28];
+        seal(
+            &[key; 32],
+            b"ABCDEFGHIJKLMNOPQRSTUVWX",
+            aad,
+            b"XAES-256-GCM",
+            &mut ciphertext,
+        )
+        .unwrap();
+        assert_eq!(ciphertext.as_slice(), hex(expected));
+        let mut plaintext = [0; 12];
+        open(
+            &[key; 32],
+            b"ABCDEFGHIJKLMNOPQRSTUVWX",
+            aad,
+            &ciphertext,
+            &mut plaintext,
+        )
+        .unwrap();
+        assert_eq!(&plaintext, b"XAES-256-GCM");
+    }
+}
+
+/// Both nonce halves bind the result; old credential ciphertext is not a page.
+#[test]
+fn xaes_all_nonce_bytes_and_cross_cipher_rejection() {
+    let mut ciphertext = [0; 21];
+    seal(&[7; 32], &[2; 24], b"aad", b"hello", &mut ciphertext).unwrap();
+    for i in 0..24 {
+        let mut nonce = [2; 24];
+        nonce[i] ^= 1;
+        let mut out = [0xa5; 5];
+        assert!(open(&[7; 32], &nonce, b"aad", &ciphertext, &mut out).is_err());
+        assert_eq!(out, [0xa5; 5]);
+        let mut changed = [0; 21];
+        seal(&[7; 32], &nonce, b"aad", b"hello", &mut changed).unwrap();
+        assert_ne!(changed, ciphertext);
+    }
+    let mut old = [0; 21];
+    racer_crypto::seal_credentials(&[7; 32], &[2; 24], b"aad", b"hello", &mut old).unwrap();
+    let mut out = [0xa5; 5];
+    assert!(open(&[7; 32], &[2; 24], b"aad", &old, &mut out).is_err());
+    assert_eq!(out, [0xa5; 5]);
+}
+
+/// Round-trip empty and boundary-sized messages and reject their modified tags.
 #[test]
 fn aead_empty_and_block_boundaries() {
     for length in [0, 1, 15, 16, 17, 63, 64, 65, 255, 256, 257, 4096] {
@@ -178,6 +247,7 @@ fn aead_empty_and_block_boundaries() {
     }
 }
 
+/// Reject changes to ciphertext, tag, key, nonce, or AAD without touching output.
 #[test]
 fn aead_tampering_never_writes_output() {
     let plaintext = b"immutable input and output on authentication failure";
@@ -206,6 +276,7 @@ fn aead_tampering_never_writes_output() {
     }
 }
 
+/// Reject incorrect buffer lengths with an opaque error and unchanged output.
 #[test]
 fn aead_malformed_lengths_never_panic_or_write_output() {
     let key = random_material();
@@ -236,6 +307,7 @@ fn aead_malformed_lengths_never_panic_or_write_output() {
     }
 }
 
+/// Match the first two RFC 4231 HMAC-SHA256 vectors with padded fixed-size keys.
 #[test]
 fn rfc4231_hmac_cases_1_and_2() {
     // https://www.rfc-editor.org/rfc/rfc4231.html#section-4.2 and section 4.3.
@@ -254,6 +326,7 @@ fn rfc4231_hmac_cases_1_and_2() {
     );
 }
 
+/// Compare empty slices, unequal lengths, and a change at every byte position.
 #[test]
 fn equality_handles_empty_unequal_lengths_and_each_differing_byte() {
     assert!(ct_eq(b"", b""));
@@ -273,6 +346,7 @@ fn equality_handles_empty_unequal_lengths_and_each_differing_byte() {
     }
 }
 
+/// Match the first three RFC 8032 signatures and reject changed messages or signatures.
 #[test]
 fn rfc8032_ed25519_vectors_1_through_3() {
     // RFC 8032 section 7.1, TEST 1, TEST 2, TEST 3.
@@ -326,6 +400,7 @@ fn rfc8032_ed25519_vectors_1_through_3() {
     }
 }
 
+/// Reject malformed encodings, noncanonical scalars, weak points, and wrong keys.
 #[test]
 fn ed25519_strict_verification_rejects_malformed_and_weak_signatures() {
     let key = SigningKey::from_seed(&[7; 32]);
@@ -368,6 +443,7 @@ fn ed25519_strict_verification_rejects_malformed_and_weak_signatures() {
     );
 }
 
+/// Restore persisted signing keys and reject invalid or inconsistent PKCS#8 documents.
 #[test]
 fn ed25519_pkcs8_roundtrip_and_malformed_documents() {
     let key = SigningKey::from_seed(&[42; 32]);
@@ -414,6 +490,7 @@ fn ed25519_pkcs8_roundtrip_and_malformed_documents() {
     assert!(SigningKey::from_pkcs8_der(&trailing_bytes).is_err());
 }
 
+/// Compare CRC golden values and varied alignments and lengths with a bitwise oracle.
 #[test]
 fn xz_golden_and_hardware_equivalence() {
     for (input, expected) in [(b"".as_slice(), 0), (b"123456789", 0x995d_c9bb_df19_39fa)] {
@@ -436,6 +513,7 @@ fn xz_golden_and_hardware_equivalence() {
     }
 }
 
+/// Check a full-size page plus tag against the oracle and incremental CRC updates.
 #[test]
 fn sixteen_mib_and_tag_match_independent_reference() {
     let length = 16 * 1024 * 1024 + 16;
@@ -448,6 +526,7 @@ fn sixteen_mib_and_tag_match_independent_reference() {
     assert_eq!(digest.sum64(), crc64(&bytes[1..]));
 }
 
+/// Exercise CRC dispatch on supported x86 hardware, failing on unsupported hosts.
 #[test]
 #[ignore = "requires x86 PCLMULQDQ, SSE2 and SSE4.1; run explicitly on supported hardware"]
 fn pclmul_hardware_path_executes_when_available() {
@@ -463,6 +542,7 @@ fn pclmul_hardware_path_executes_when_available() {
     panic!("x86 hardware verification requires an x86 host");
 }
 
+/// Exercise CRC dispatch on supported AArch64 hardware, failing on unsupported hosts.
 #[test]
 #[ignore = "requires AArch64 PMULL and NEON; run explicitly on supported hardware"]
 fn pmull_hardware_path_executes_when_available() {
@@ -495,10 +575,12 @@ fn hex(bytes: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Decode a hexadecimal vector and require the expected array length.
 fn array<const N: usize>(bytes: &str) -> [u8; N] {
     hex(bytes).try_into().unwrap()
 }
 
+/// Compute an independent bitwise CRC without library tables or folding constants.
 fn reference(bytes: &[u8]) -> u64 {
     let mut crc = u64::MAX;
     for byte in bytes {
@@ -515,6 +597,7 @@ fn reference(bytes: &[u8]) -> u64 {
     !crc
 }
 
+/// Generate reproducible nonuniform bytes for CRC length and alignment checks.
 fn random_bytes(length: usize) -> Vec<u8> {
     let mut state = 0x6a09_e667_f3bc_c909u64;
     (0..length)
@@ -527,6 +610,7 @@ fn random_bytes(length: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Require dispatched and table-based CRC implementations to match the oracle.
 fn assert_equivalent(bytes: &[u8]) {
     let expected = reference(bytes);
     assert_eq!(crc64(bytes), expected, "dispatch, length={}", bytes.len());
@@ -535,6 +619,7 @@ fn assert_equivalent(bytes: &[u8]) {
     assert_eq!(table.sum64(), expected, "table, length={}", bytes.len());
 }
 
+/// Identity workflows exercise the same public boundary used by the dataplane.
 mod identity_workflows {
     use super::random_material;
     use racer_control_wire::{
@@ -553,12 +638,16 @@ mod identity_workflows {
     };
     use zeroize::Zeroizing;
 
+    /// Canonical cluster for certificate and keyring workflows.
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 
+    /// Canonical node authenticated by the test certificates.
     const NODE: &str = "22222222-2222-4222-8222-222222222222";
 
+    /// Canonical cache authorized by the test key epochs.
     const CACHE: &str = "33333333-3333-4333-8333-333333333333";
 
+    /// TLS time follows the current scope and clamps/truncates epoch offsets.
     #[test]
     fn tls_time_uses_current_scoped_wall_clock_clamps_and_truncates() {
         let clock = uring_runtime::environment::SimulationClock::new(71);
@@ -574,6 +663,7 @@ mod identity_workflows {
         }
     }
 
+    /// Issuing for an existing key keeps its bytes and caller-specified dates.
     #[cfg(feature = "test-util")]
     #[test]
     fn existing_key_and_customized_certificate_contract_are_preserved() {
@@ -597,6 +687,7 @@ mod identity_workflows {
             .unwrap();
     }
 
+    /// Recovery, CSR generation, and TLS pairing use the same accepted key.
     #[test]
     fn identity_recovery_csr_tls_and_key_pairing() {
         let (pending, chain, roots) = issued_with(|_| {});
@@ -657,6 +748,7 @@ mod identity_workflows {
         );
     }
 
+    /// Verify canonical node chains and reject malformed or altered signatures.
     #[test]
     fn validates_chain_node_and_strict_signature() {
         let (pending, chain, roots) = issued_with(|_| {});
@@ -832,6 +924,39 @@ mod identity_workflows {
         }
     }
 
+    /// Page and credential operations enforce bindings without touching failed output.
+    #[test]
+    fn cached_page_derivation_matches_primitives_across_nonce_halves() {
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = keyring(roots);
+        let cache = CacheId(CACHE.into());
+        let page = keys.active(&cache, KeyPurpose::Page).unwrap();
+        for nonce in [
+            [0; 24],
+            *b"abcdefghijklABCDEFGHIJKL",
+            *b"abcdefghijklMNOPQRSTUVWX",
+            *b"mnopqrstuvwxABCDEFGHIJKL",
+        ] {
+            let mut expected = [0; 19];
+            let mut actual = [0; 19];
+            racer_crypto::seal(&[7; 32], &nonce, b"aad", b"abc", &mut expected).unwrap();
+            page.seal_page(&cache, &nonce, b"aad", b"abc", &mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+            let mut out = [42; 3];
+            page.open_page(&cache, page.id(), &nonce, b"aad", &actual, &mut out)
+                .unwrap();
+            assert_eq!(&out, b"abc");
+            actual[18] ^= 1;
+            assert_eq!(
+                page.open_page(&cache, page.id(), &nonce, b"aad", &actual, &mut out),
+                Err(Error::CorruptRecord),
+            );
+            assert_eq!(&out, b"abc");
+        }
+    }
+
+    /// Page and credential operations enforce bindings without touching failed output.
     #[test]
     fn borrowed_outputs_enforce_purpose_cache_id_and_retained_epoch() {
         let (_, _, roots) = issued_with(|_| {});
@@ -935,6 +1060,7 @@ mod identity_workflows {
         assert_eq!(&out, b"abc");
     }
 
+    /// Request MAC derivation is domain-separated and enforces the credential epoch.
     #[test]
     fn request_mac_derives_internally_and_rejects_wrong_purpose_or_message() {
         let (_, _, roots) = issued_with(|_| {});
@@ -971,6 +1097,7 @@ mod identity_workflows {
         );
     }
 
+    /// Shuffled groups and prepared keys use the same ordering for all admission paths.
     #[test]
     fn shuffled_epoch_groups_preserve_exact_and_active_admission() {
         let (_, _, roots) = issued_with(|_| {});
@@ -1038,6 +1165,7 @@ mod identity_workflows {
         );
     }
 
+    /// Accepted identities and cached peer keys share conservative validity boundaries.
     #[test]
     fn accepted_chain_validity_is_enforced_at_expiry_and_after_clock_rollback() {
         let clock = uring_runtime::environment::SimulationClock::new(97);
@@ -1085,6 +1213,7 @@ mod identity_workflows {
         );
     }
 
+    /// Install one active key per purpose using only the public bundle interface.
     fn keyring(roots: Vec<Vec<u8>>) -> Keyring {
         let keys = Keyring::new(
             ClusterId(CLUSTER.into()),
@@ -1095,6 +1224,7 @@ mod identity_workflows {
         keys
     }
 
+    /// Construct fresh generation-bound keys with distinct purpose-specific material.
     fn bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
         KeyringBundle {
             schema_version: SCHEMA_VERSION,
@@ -1119,6 +1249,7 @@ mod identity_workflows {
         }
     }
 
+    /// Issue a customizable certificate without enabling production fixture APIs.
     fn issued_with(
         customize: impl FnOnce(&mut rcgen::CertificateParams),
     ) -> (PendingIdentity, Vec<Vec<u8>>, Vec<Vec<u8>>) {
