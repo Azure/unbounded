@@ -160,21 +160,6 @@ impl Config {
 
     /// Read only exact supported names, without enumerating unrelated environment values.
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Result<Option<String>>) -> Result<Self> {
-        // Retired authority overrides and selectors fail closed, even when empty.
-        for name in [
-            "RACER_NODE_UID",
-            "RACER_NODE_ID",
-            "RACER_RAILS",
-            "RACER_ALIGNED_RAILS",
-            "RACER_FABRIC_PORTS",
-            "RACER_FABRIC_PORTS_FILE",
-            "RACER_ROUTING_ALGORITHM",
-            "RACER_CACHED_RANKINGS",
-        ] {
-            if lookup(name)?.is_some() {
-                return Err(Error::InvalidConfiguration);
-            }
-        }
         let mut values = Vec::new();
         for name in ENV_NAMES {
             if let Some(value) = lookup(&format!("RACER_{name}"))? {
@@ -1158,11 +1143,11 @@ mod tests {
                 "invalid",
             ),
             (
-                "RACER_NODE_UID",
+                "RACER_SHARES",
                 std::ffi::OsString::from_vec(vec![0xff]),
                 "invalid",
             ),
-            ("RACER_NODE_UID", "".into(), "invalid"),
+            ("RACER_SHARES", "".into(), "invalid"),
             ("RACER_ALLOW_SMT", "".into(), "invalid"),
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1176,7 +1161,7 @@ mod tests {
                 .env("RACER_MAX_THREADS", "7")
                 .env("racer_max_threads", "9")
                 .env("Racer_ALLOW_SMT", "true")
-                .env("racer_node_uid", "ignored")
+                .env("racer_shares", "ignored")
                 .env(std::ffi::OsString::from_vec(vec![0xff]), "ignored")
                 .env(name, value)
                 .output()
@@ -1232,8 +1217,7 @@ mod tests {
         assert!(match_publication(&[nic], &[]).is_err());
     }
 
-    // Retain the retired loader safety tests under their historical names. The
-    // contract now lives in authenticated wire NICs, not a second local parser.
+    // RDMA NIC configuration arrives only through authenticated enrollment wire NICs.
     fn nic_request(nics: &str) -> Vec<u8> {
         String::from_utf8(
             include_bytes!("../../../internal/racer/wire/testdata/bootstrap-request.json").to_vec(),
@@ -1243,7 +1227,7 @@ mod tests {
         .into_bytes()
     }
     #[test]
-    fn fabric_ports_reject_malformed_ambiguous_or_unsafe_configuration() {
+    fn enrollment_nics_reject_malformed_ambiguous_or_unsafe_entries() {
         assert!(
             racer_control_wire::decode_enrollment_request(&nic_request(
                 r#"[{"device":"a","port":1,"rail":0}]"#
@@ -1258,7 +1242,7 @@ mod tests {
             r#"[{"device":"a","port":1,"rail":0,"gid":""}]"#,
             r#"[{"device":"a","port":1,"rail":0,"gid":null}]"#,
             r#"[{"device":"a","port":1,"port":2,"rail":0}]"#,
-            r#"[{"device":"a","port":1,"rail":0,"fabric":"old"}]"#,
+            r#"[{"device":"a","port":1,"rail":0,"unknown":true}]"#,
             r#"[{"device":"a","port":1,"rail":0},{"device":"a","port":1,"rail":1}]"#,
         ] {
             assert!(
@@ -1268,7 +1252,7 @@ mod tests {
         }
     }
     #[test]
-    fn projected_fabric_configuration_is_bounded_and_errors_fail_closed() {
+    fn enrollment_nics_and_request_size_are_bounded() {
         let entries: Vec<_> = (0..65)
             .map(|i| format!(r#"{{"device":"d{i}","port":1,"rail":0}}"#))
             .collect();
@@ -1314,33 +1298,6 @@ mod tests {
             .is_err()
         );
         assert!(parse(&[("RACER_ENABLE_RDMA", "true")]).unwrap().enable_rdma);
-    }
-
-    #[test]
-    fn obsolete_nic_authority_configuration_fails_even_when_disabled() {
-        for key in [
-            "RACER_FABRIC_PORTS",
-            "RACER_FABRIC_PORTS_FILE",
-            "RACER_RAILS",
-            "RACER_ALIGNED_RAILS",
-        ] {
-            for value in [
-                "",
-                "[]",
-                "anything",
-                "/missing",
-                "not-json",
-                "/etc/racer/native/ports.json",
-                r#"[{"fabric":"production-a","device":"mlx5_0","port":1,"gid":"fe800000000000000000000000001234"}]"#,
-            ] {
-                for rdma in ["auto", "false", "true"] {
-                    assert!(matches!(
-                        parse(&[(key, value), ("RACER_ENABLE_RDMA", rdma)]),
-                        Err(Error::InvalidConfiguration)
-                    ));
-                }
-            }
-        }
     }
 
     #[test]
@@ -1817,14 +1774,6 @@ mod tests {
     }
 
     #[test]
-    fn routing_algorithm_selector_is_rejected() {
-        assert!(parse(&[]).is_ok());
-        for value in ["", "1", "2", "3", "4", "5", "6", "03", " 3", "3 ", "auto"] {
-            assert!(parse(&[("RACER_ROUTING_ALGORITHM", value)]).is_err());
-        }
-    }
-
-    #[test]
     fn topology_cache_dimensions_are_independent_and_bounded() {
         let defaults = parse(&[]).unwrap();
         assert_eq!(
@@ -1854,8 +1803,6 @@ mod tests {
             ("RACER_ACTIVE_PATH_SEARCHES", "65"),
             ("RACER_CACHED_PATHS", "0"),
             ("RACER_CACHED_PATHS", "1048577"),
-            ("RACER_CACHED_RANKINGS", ""),
-            ("RACER_CACHED_RANKINGS", "1"),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
         }
@@ -2055,15 +2002,7 @@ mod tests {
         ] {
             assert!(parse(&[("RACER_CLUSTER_ID", value)]).is_err(), "{value}");
         }
-        for name in [
-            "RACER_NODE_UID",
-            "RACER_NODE_ID",
-            "RACER_SHARES",
-            "RACER_RAILS",
-            "RACER_ALIGNED_RAILS",
-        ] {
-            assert!(parse(&[(name, "")]).is_err(), "{name}");
-        }
+        assert!(parse(&[("RACER_SHARES", "")]).is_err());
         let mut config = parse(&[]).unwrap();
         config.node = NodeId("node-name".into());
         assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
