@@ -323,7 +323,12 @@ impl ControlHandlers {
             })
             .unwrap_or(0);
         let mut body = vec![0; length];
-        stream.read_exact(&mut body).unwrap();
+        // A client may abandon a request mid-body, for example when a test
+        // drops a control task with a renewal in flight. That is not a fixture
+        // failure, and panicking here would also tear down the accept loop.
+        if stream.read_exact(&mut body).is_err() {
+            return;
+        }
         let response = if head.starts_with("GET /v1/keyring") {
             self.keyring.respond(&head, &stream)
         } else if head.starts_with("POST ") {
@@ -532,11 +537,15 @@ fn serve_control(
         if let Some(alert) = alerts.lock().unwrap().pop_front() {
             // Read the complete ClientHello before sending Go's fatal
             // pre-handshake alert, avoiding a reset from unread TCP data.
+            // A client that abandons its handshake still consumes the alert.
             let mut header = [0; 5];
-            socket.read_exact(&mut header).unwrap();
+            if socket.read_exact(&mut header).is_err() {
+                continue;
+            }
             let mut hello = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
-            socket.read_exact(&mut hello).unwrap();
-            socket.write_all(&[21, 3, 3, 0, 2, 2, alert]).unwrap();
+            if socket.read_exact(&mut hello).is_ok() {
+                let _ = socket.write_all(&[21, 3, 3, 0, 2, 2, alert]);
+            }
             continue;
         }
         let (tls, endpoints) = (tls.clone(), endpoints.clone());
@@ -563,6 +572,45 @@ impl Drop for ControlFixture {
         }
         std::fs::remove_dir_all(&self.directory).unwrap();
     }
+}
+
+/// A request abandoned mid-body must not kill the fixture's accept loop.
+#[test]
+fn control_fixture_survives_request_abandoned_mid_body() {
+    let mut fixture = ControlFixture::new();
+    let address = fixture
+        .config
+        .as_ref()
+        .unwrap()
+        .control_endpoint
+        .trim_start_matches("https://")
+        .to_owned();
+    let mut roots = rustls::RootCertStore::empty();
+    for root in &fixture.bundle.lock().unwrap().peer_trust_roots {
+        roots.add(root.clone().into()).unwrap();
+    }
+    let client = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    );
+    let socket = std::net::TcpStream::connect(&address).unwrap();
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let mut stream =
+        rustls::StreamOwned::new(rustls::ClientConnection::new(client, name).unwrap(), socket);
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nContent-Length: 4096\r\n\r\npartial")
+        .unwrap();
+    stream.flush().unwrap();
+    // Close without close_notify, as a dropped in-flight request does.
+    drop(stream);
+    let accepted = fixture.enrollments.load(Ordering::Acquire);
+    fixture.bootstrap_node(1, Duration::from_secs(15));
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), accepted + 1);
 }
 
 pub(super) fn local_worker(
@@ -2043,7 +2091,14 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
         runtime.reactor.poll_budgeted(64).unwrap();
         engine.poll_budgeted(&mut cx, 64).unwrap();
         runtime.crypto.poll_budgeted(64).unwrap();
-        assert!(progress.as_mut().poll(&mut cx).is_pending());
+        if let std::task::Poll::Ready(result) = progress.as_mut().poll(&mut cx) {
+            panic!(
+                "control progress completed early: {result:?}, failures={}, held_renewals={}, renewal_error={:?}",
+                fixture.publication_failures.load(Ordering::Acquire),
+                fixture.held_renewals.load(Ordering::Acquire),
+                control.renewal_error(),
+            );
+        }
         if control.membership_diagnostic().unwrap().pending_sequence == 2 {
             fixture.poll_status.store(503, Ordering::Release);
         }
