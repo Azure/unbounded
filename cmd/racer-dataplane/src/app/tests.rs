@@ -567,10 +567,18 @@ fn serve_control(
 impl Drop for ControlFixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(server) = self.server.take() {
-            server.join().unwrap();
+        let server = self.server.take().map(thread::JoinHandle::join);
+        let removed = std::fs::remove_dir_all(&self.directory);
+        // Panicking again while unwinding aborts the whole test binary and
+        // hides every other result, so only surface teardown errors when the
+        // test itself has not already failed.
+        if thread::panicking() {
+            return;
         }
-        std::fs::remove_dir_all(&self.directory).unwrap();
+        if let Some(Err(panic)) = server {
+            std::panic::resume_unwind(panic);
+        }
+        removed.unwrap();
     }
 }
 
