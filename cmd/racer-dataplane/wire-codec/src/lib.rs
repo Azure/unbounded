@@ -1356,7 +1356,7 @@ pub mod rest {
                 retry = Some(retry_delay(h.value)?);
             }
             if h.name.eq_ignore_ascii_case("connection") {
-                // Defer invalid UTF-8 until after framing validation, as before.
+                // Defer invalid UTF-8 until after framing validation.
                 if let Ok(value) = std::str::from_utf8(h.value) {
                     close |= value
                         .split(',')
@@ -1386,8 +1386,8 @@ pub mod rest {
         if size > bound {
             return Err(Error::Overloaded);
         }
-        // The old request path required UTF-8 even in ignored headers. Keep that
-        // acceptance rule after size/framing checks, without reparsing Connection.
+        // Every header, including ignored ones, must be valid UTF-8. Check this
+        // after size/framing checks, without reparsing Connection.
         std::str::from_utf8(&bytes[..length]).map_err(|_| Error::InvalidRequest)?;
         Ok(Some(ResponseHead {
             status,

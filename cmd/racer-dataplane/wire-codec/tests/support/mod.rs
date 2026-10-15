@@ -296,7 +296,7 @@ pub fn request<'a>(
     }
 }
 
-/// Match operator/components/racer/tls.go with fresh in-memory P-256 keys,
+/// Match internal/operator/components/racer/tls.go with fresh in-memory P-256 keys,
 /// distinct CA subjects, unconstrained signing CAs, and server-auth leaves.
 pub struct WeeklyCertificates {
     pub roots: Vec<rcgen::Certificate>,
