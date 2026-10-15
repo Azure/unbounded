@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer embeds tracked Racer templates. Operator manifests are
-// rendered in memory, independently of ignored standalone output in rendered/.
+// Package racer embeds the controller-only Racer templates applied by the
+// operator. Manifests are rendered in memory with template defaults.
 package racer
 
 import (
@@ -17,12 +17,16 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
-//go:embed *.yaml.tmpl
+// Dataplane workloads and their bootstrap inputs are not operator-managed, so
+// their templates are deliberately excluded.
+//
+//go:embed config.yaml.tmpl controller.yaml.tmpl controller-pdb.yaml.tmpl node-restriction.yaml.tmpl rbac.yaml.tmpl
 var sources embed.FS
 
-// Manifests exposes flat *.yaml names, matching the standalone
-// renderer. Images default to the binary version; the operator replaces them
-// with its configured registry and tag before applying resources.
+// Manifests exposes the embedded templates as rendered flat *.yaml names. It
+// contains no dataplane workloads or generated CRDs. The controller image
+// defaults to the binary version; the operator replaces it with its configured
+// registry and tag before applying resources.
 var Manifests fs.FS = manifestFS{}
 
 type manifestFS struct{}
@@ -63,7 +67,6 @@ func (manifestFS) Open(name string) (fs.File, error) {
 	var rendered bytes.Buffer
 	if err := tmpl.Execute(&rendered, map[string]string{
 		"ControllerImage": "ghcr.io/azure/racer-controller:" + version.Version,
-		"DataplaneImage":  "ghcr.io/azure/racer-dataplane:" + version.Version,
 	}); err != nil {
 		return nil, err
 	}

@@ -6,20 +6,12 @@ metadata:
   name: racer-controller
   namespace: {{ .Namespace | default "unbounded-system" }}
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: racer-dataplane
-  namespace: {{ .Namespace | default "unbounded-system" }}
-automountServiceAccountToken: false
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: racer-controller
 rules:
-  # Install node-restriction.yaml and its binding before this ClusterRoleBinding.
-  # RBAC cannot limit patches to the enrollment and recovery annotations.
+  # Admission restricts Node patches to three enrollment/recovery annotations.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
@@ -52,11 +44,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "serviceaccounts"]
     verbs: ["get", "list", "watch"]
-  # Create cannot be restricted by resourceNames. The fail-closed admission
-  # policy must be installed before enabling this RoleBinding or any workload.
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["create"]
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames: [{{ .CredentialsSecretName | default "racer-credentials" | quote }}]
@@ -67,6 +54,7 @@ rules:
     resourceNames: [{{ .InstallationConfigMapName | default "racer-installation" | quote }}, {{ .VersionConfigMapName | default "racer-version" | quote }}]
     # Each cache uses its own matching metadata.name field selector.
     verbs: ["get", "list", "watch", "update", "patch"]
+  # External workload identity checks only; no workload writes.
   - apiGroups: ["apps"]
     resources: ["daemonsets"]
     verbs: ["get", "list", "watch"]
