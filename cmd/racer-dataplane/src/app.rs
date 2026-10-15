@@ -75,6 +75,7 @@ use crate::store::checkpoint::ShardImage;
 use crate::telemetry::Gauge;
 use crate::telemetry::Health;
 use crate::telemetry::Resources;
+#[cfg(test)]
 use crate::telemetry::State;
 use crate::telemetry::Telemetry;
 use crate::topology::LinkHealth;
@@ -2134,17 +2135,11 @@ impl Observations {
                 .min()
                 .flatten(),
         };
-        self.health.observe(resources)?;
-        if matches!(
-            self.health.state()?,
-            State::Starting | State::Ready | State::Degraded
-        ) {
-            self.health.transition(if resources.usable_at(now) {
-                State::Ready
-            } else {
-                State::Degraded
-            })?;
-        }
+        // Judge usability at the aggregation instant under the health lock. A
+        // separate check and Ready transition re-reads the clock, so a peer's
+        // observation expiring in between failed the transition and, through
+        // observe_health, terminated the process with a bare Unavailable.
+        self.health.settle(resources, now)?;
         Ok(())
     }
 

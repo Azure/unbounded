@@ -970,6 +970,30 @@ pub mod health {
             status.lifecycle = state;
             Ok(())
         }
+
+        /// Replace the observation and, while Starting, Ready, or Degraded,
+        /// settle on Ready or Degraded from that same observation under one lock.
+        /// Draining and Stopped are kept. Unlike a separate `observe` and
+        /// `transition(Ready)`, usability cannot change between check and commit.
+        pub fn settle(
+            &self,
+            resources: R,
+            usable: impl FnOnce(&R) -> bool,
+        ) -> Result<State, Unavailable> {
+            let mut status = self.0.lock().map_err(|_| Unavailable)?;
+            status.resources = resources;
+            if matches!(
+                status.lifecycle,
+                State::Starting | State::Ready | State::Degraded
+            ) {
+                status.lifecycle = if usable(&status.resources) {
+                    State::Ready
+                } else {
+                    State::Degraded
+                };
+            }
+            Ok(status.lifecycle)
+        }
     }
 
     impl Probe {
@@ -1092,6 +1116,32 @@ pub mod health {
                 health.transition(State::Stopped, |_| true),
                 Err(Unavailable)
             );
+            assert_eq!(health.settle((), |_| true), Err(Unavailable));
+        }
+
+        /// Settling judges the stored observation once, so it never fails on a
+        /// usability change and keeps the absorbing drain and stop states.
+        #[test]
+        fn settle_commits_ready_or_degraded_and_keeps_terminal_states() {
+            let health = Health::<bool>::default();
+            assert_eq!(health.settle(false, |usable| *usable), Ok(State::Degraded));
+            assert_eq!(health.settle(true, |usable| *usable), Ok(State::Ready));
+            assert_eq!(health.settle(false, |usable| *usable), Ok(State::Degraded));
+            assert_eq!(health.settle(true, |usable| *usable), Ok(State::Ready));
+            health.transition(State::Draining, |_| true).unwrap();
+            assert_eq!(
+                health.settle(true, |_| panic!("draining is not settled")),
+                Ok(State::Draining)
+            );
+            assert_eq!(
+                health.state_at(Instant::now(), |r, _| *r),
+                Ok(State::Draining)
+            );
+            health.transition(State::Stopped, |_| true).unwrap();
+            assert_eq!(health.settle(true, |_| true), Ok(State::Stopped));
+            // The observation is still recorded for diagnostics after stop.
+            assert_eq!(health.settle(false, |_| true), Ok(State::Stopped));
+            assert!(!health.0.lock().unwrap().resources);
         }
 
         /// Probe selection returns exact caller-owned text and response kinds.

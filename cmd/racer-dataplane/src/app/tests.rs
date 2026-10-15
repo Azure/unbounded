@@ -4412,6 +4412,126 @@ mod lifecycle {
         observations.record(WorkerId(1), resources, 2).unwrap();
         assert_eq!(observations.health.state(), Ok(State::Draining));
     }
+
+    /// Concurrent worker observations must never surface a readiness race as a
+    /// fatal error: one worker can store an unusable aggregate between another
+    /// worker's usability check and its Ready transition.
+    #[test]
+    fn concurrent_observations_never_fail_readiness_transition() {
+        let observations = Arc::new(Observations::default());
+        let now = uring_runtime::environment::now();
+        let usable = Resources {
+            workers_usable: true,
+            storage_usable: true,
+            listeners_usable: true,
+            membership_usable: true,
+            admission_usable: true,
+            credentials_valid_until: Some(now + Duration::from_secs(600)),
+            observed_until: Some(now + Duration::from_secs(600)),
+        };
+        let unusable = Resources {
+            storage_usable: false,
+            ..usable
+        };
+        let results = thread::scope(|threads| {
+            let handles: Vec<_> = (0..2u16)
+                .map(|worker| {
+                    let observations = observations.clone();
+                    threads.spawn(move || {
+                        for turn in 0..20_000 {
+                            let resources = if worker == 1 && turn % 2 == 1 {
+                                unusable
+                            } else {
+                                usable
+                            };
+                            observations.record(WorkerId(worker), resources, 2)?;
+                        }
+                        Ok::<(), Error>(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results, vec![Ok(()), Ok(())]);
+        observations.record(WorkerId(1), usable, 2).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Ready));
+        observations.record(WorkerId(1), unusable, 2).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Degraded));
+    }
+
+    /// A worker observation can expire between the aggregate usability check and
+    /// the Ready transition, which re-evaluates usability at a later instant.
+    /// That clock race must settle as Degraded, never fail the worker loop.
+    #[test]
+    fn observation_expiring_during_readiness_transition_is_not_an_error() {
+        let observations = Observations::default();
+        let now = uring_runtime::environment::now();
+        let usable = Resources {
+            workers_usable: true,
+            storage_usable: true,
+            listeners_usable: true,
+            membership_usable: true,
+            admission_usable: true,
+            credentials_valid_until: Some(now + Duration::from_secs(600)),
+            observed_until: Some(now + Duration::from_secs(600)),
+        };
+        observations.record(WorkerId(0), usable, 2).unwrap();
+        for turn in 0..200_000u32 {
+            // Sweep a stale peer's expiry across the few microseconds the next
+            // observation spends between its usability check and transition.
+            let until =
+                uring_runtime::environment::now() + Duration::from_nanos(u64::from(turn % 4_000));
+            observations
+                .record(
+                    WorkerId(1),
+                    Resources {
+                        observed_until: Some(until),
+                        ..usable
+                    },
+                    2,
+                )
+                .unwrap_or_else(|error| panic!("turn {turn}: {error:?}"));
+            observations
+                .record(WorkerId(0), usable, 2)
+                .unwrap_or_else(|error| panic!("turn {turn}: {error:?}"));
+        }
+        let expired = Resources {
+            observed_until: Some(uring_runtime::environment::now()),
+            ..usable
+        };
+        observations.record(WorkerId(1), expired, 2).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Degraded));
+        observations.record(WorkerId(1), usable, 2).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Ready));
+    }
+
+    /// A worker that observes after another worker began draining keeps the
+    /// absorbing lifecycle and reports success rather than a fatal error.
+    #[test]
+    fn observation_after_drain_is_not_an_error() {
+        let observations = Observations::default();
+        let now = uring_runtime::environment::now();
+        let resources = Resources {
+            workers_usable: true,
+            storage_usable: true,
+            listeners_usable: true,
+            membership_usable: true,
+            admission_usable: true,
+            credentials_valid_until: Some(now + Duration::from_secs(600)),
+            observed_until: Some(now + Duration::from_secs(600)),
+        };
+        observations.record(WorkerId(0), resources, 1).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Ready));
+        observations.health.transition(State::Draining).unwrap();
+        observations.record(WorkerId(0), resources, 1).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Draining));
+        observations.health.transition(State::Stopped).unwrap();
+        observations.record(WorkerId(0), resources, 1).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Stopped));
+    }
 }
 
 mod dst;

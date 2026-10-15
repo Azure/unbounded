@@ -851,6 +851,13 @@ impl Health {
             })
             .map_err(|_| Error::Unavailable)
     }
+    /// Store an observation and settle Ready or Degraded atomically. Usability
+    /// is judged at `now`, the instant the observation was aggregated.
+    pub fn settle(&self, resources: Resources, now: Instant) -> Result<State> {
+        self.0
+            .settle(resources, |resources| resources.usable_at(now))
+            .map_err(|_| Error::Unavailable)
+    }
 }
 
 // Opt-in HTTP send fingerprints, never authentication or payload scans on I/O.
