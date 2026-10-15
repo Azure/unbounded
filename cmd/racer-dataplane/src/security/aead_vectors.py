@@ -21,10 +21,11 @@ def main():
     cache = b"33333333-3333-4333-8333-333333333333"
     nonce = bytes([2]) * 24
     key = bytes([7]) * 32
-    for length in [1, 15, 16, 17, 63, 64, 65, 255, 256, 257, 16777215, 16777216]:
-        plaintext = (bytes((i * 31 + 7) % 256 for i in range(256))
-                     * ((length + 255) // 256))[:length]
-        aad = (b"racer/page/aead/v1\0" + struct.pack(">I", len(cache)) + cache
+
+    def seal(plaintext):
+        length = len(plaintext)
+        aad = (b"racer/page/aead/v1\0" + struct.pack(">I", 1)
+               + struct.pack(">I", len(cache)) + cache
                + bytes([3]) * 32 + struct.pack(">I", 4) + b'"v1"'
                + struct.pack(">Q", 7) + bytes([1]) * 16 + nonce
                + struct.pack(">II", length, length + 16))
@@ -33,7 +34,13 @@ def main():
         assert encrypt(output, ctypes.byref(output_length), plaintext, length,
                        aad, len(aad), None, nonce, key) == 0
         assert output_length.value == length + 16
-        print(f'({length}, "{hashlib.sha256(output.raw).hexdigest()}"),')
+        return output.raw
+
+    print("// hello:", ", ".join(f"0x{b:02x}" for b in seal(b"hello")))
+    for length in [1, 15, 16, 17, 63, 64, 65, 255, 256, 257, 16777215, 16777216]:
+        plaintext = (bytes((i * 31 + 7) % 256 for i in range(256))
+                     * ((length + 255) // 256))[:length]
+        print(f'({length}, "{hashlib.sha256(seal(plaintext)).hexdigest()}"),')
 
 
 if __name__ == "__main__":

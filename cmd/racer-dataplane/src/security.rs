@@ -182,7 +182,7 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     out.extend_from_slice(value);
     Ok(())
 }
-/// v2: domain, cipher:u32 BE, cache(length:u32 BE, bytes), exact object key,
+/// Layout: domain, cipher:u32 BE, cache(length:u32 BE, bytes), exact object key,
 /// quoted ETag(length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     envelope.validate()?;
@@ -191,7 +191,7 @@ pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     {
         return Err(Error::CorruptRecord);
     }
-    let mut out = b"racer/page/aead/v2\0".to_vec();
+    let mut out = b"racer/page/aead/v1\0".to_vec();
     out.extend_from_slice(&(envelope.cipher as u32).to_be_bytes());
     field(&mut out, envelope.page.version.object.cache.0.as_bytes())?;
     out.extend_from_slice(&envelope.page.version.object.key.0);
@@ -3677,7 +3677,7 @@ mod tests {
     fn page_cipher_id_is_authenticated_in_aad() {
         let descriptor = envelope();
         let mut aad = page_aad(&descriptor).unwrap();
-        let offset = b"racer/page/aead/v2\0".len();
+        let offset = b"racer/page/aead/v1\0".len();
         assert_eq!(&aad[offset..offset + 4], &1u32.to_be_bytes());
         let mut sealed = [0; 21];
         racer_crypto::seal(&[7; 32], &descriptor.nonce.0, &aad, b"hello", &mut sealed).unwrap();
@@ -3693,7 +3693,7 @@ mod tests {
     fn page_aad_is_domain_separated_and_binds_every_descriptor_field() {
         let original = envelope();
         let aad = page_aad(&original).unwrap();
-        assert!(aad.starts_with(b"racer/page/aead/v2\0\0\0\0\x01\0\0\0\x24"));
+        assert!(aad.starts_with(b"racer/page/aead/v1\0\0\0\0\x01\0\0\0\x24"));
         let mut bytes = vec![0; 5 + TAG_LEN];
         racer_crypto::seal(&[7; 32], &original.nonce.0, &aad, b"hello", &mut bytes).unwrap();
         for index in 0..8 {
@@ -3738,26 +3738,18 @@ mod tests {
         malformed.ciphertext_length += 1;
         assert!(page_aad(&malformed).is_err());
     }
-    // Retain the historical independent vectors without a production page fallback.
-    fn historical_page_aad(descriptor: &PageEnvelope) -> Vec<u8> {
-        let mut aad = page_aad(descriptor).unwrap();
-        let domain = b"racer/page/aead/v1\0";
-        aad.drain(domain.len()..domain.len() + 4);
-        aad[..domain.len()].copy_from_slice(domain);
-        aad
-    }
-
     #[test]
     fn libsodium_independent_known_answer() {
         // Independently generated with libsodium 1.0.18
         // crypto_aead_xchacha20poly1305_ietf_encrypt, not this Rust implementation.
+        // Reproduce with aead_vectors.py.
         let mut descriptor = envelope();
-        descriptor.key_id = KeyId([1; 16]); // Frozen independent AAD vector, not installed.
+        descriptor.key_id = KeyId([1; 16]); // Fixed key ID from aead_vectors.py, not installed.
         let mut bytes = vec![0; 5 + TAG_LEN];
         racer_crypto::seal_credentials(
             &[7; 32],
             &[2; 24],
-            &historical_page_aad(&descriptor),
+            &page_aad(&descriptor).unwrap(),
             b"hello",
             &mut bytes,
         )
@@ -3765,8 +3757,8 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                0xb2, 0xd4, 0x6c, 0x90, 0xe7, 0x29, 0x99, 0x95, 0x55, 0x73, 0x9c, 0xaf, 0x01, 0xa6,
-                0xa9, 0x89, 0xcf, 0xfb, 0x34, 0xc3, 0x6f
+                0xb2, 0xd4, 0x6c, 0x90, 0xe7, 0x98, 0x16, 0x03, 0x48, 0xb3, 0x6e, 0x1a, 0x89, 0xf2,
+                0xb4, 0xdc, 0x7d, 0x49, 0x17, 0x13, 0x15
             ]
         );
     }
@@ -3785,51 +3777,51 @@ mod tests {
         let vectors = [
             (
                 1,
-                "e458e0dc619b62fd62ccfd6b0a64edd478d17dcbe2a90ae5cf5a1236c7e66b42",
+                "e61324a8db298fa724eebace826484a4fe1741f3822483fcc041f7678cdd63e6",
             ),
             (
                 15,
-                "305a5c76814aa3a7fa7ffd6013674c1569d48050214fd99046b62835558522f7",
+                "7518184c786851a15dd1c5bb1611d4969323097202f2f8ba2751fc4f4d0da920",
             ),
             (
                 16,
-                "fd224886bdc4dce663d1cfe23f152b82bf92ec4c3585e459284172817366bfe8",
+                "754db504aac0a9bf1937dbb234302a2ff17e45a5405bd1f01eabbf7e3602bfee",
             ),
             (
                 17,
-                "e8a89e5c8b5672afa89102a03e8333065071e9223c08f9829b0211862ed827fb",
+                "c847ecb579fee8b6438137ceb0e1d38fc86142a1261b6c130b9a3c21536aaaf3",
             ),
             (
                 63,
-                "5732225fec76e8bbe0af47bfd2b89dc4d6b10c76a038ef57cf3dd3f9b26cd0f3",
+                "5fcaa5d16d48a9682b2b67c0f7e8a92c78b46d5faba8055be2374f62a6a22d8b",
             ),
             (
                 64,
-                "9a74018a50d140c758cbac254d2400f54268efef40ee729109a65b2430a60541",
+                "bbb570f99a4ade3980a969c74357172d935c577e6a2a9a7aa3337b2472a331f6",
             ),
             (
                 65,
-                "581818d82f394c7c27cd07dcfecf8aaa7281291a0a8ba27226c07a5b8b94b1ff",
+                "27a4d9f672a859747e37434a6603cb514c1ea9434a4cea4783188df16d6c214b",
             ),
             (
                 255,
-                "34061699d97d185ebef4b17f329ee4a94b8e667cd9f0ea86952f76a12337ab35",
+                "7518946a4afcb1d1d1f3ef67d1f5868a69bf43898319fb8e52e49cfeb675b7cf",
             ),
             (
                 256,
-                "3691e12ccc85a3ee991d554984da2d1fbcc99f928994986838eea83e5def0b36",
+                "ec9cf529f452314760ffcb2d7f28070e2423f4e483638a7ad1543bf7ab0ea379",
             ),
             (
                 257,
-                "d31b2dcd6ee4646e35b0347efe0ff9c277240b821dce4813e1b6e2222a908646",
+                "98a258d3b9dcb5cee06085e2294b0094a915c5df6bd19850e22e754480bc646e",
             ),
             (
                 16777215,
-                "19eb6c4a424b572bc65b6200a72e29c0fcfbedfc74ad522ba021cc150f1606d6",
+                "f87d981e91a2843f17f5f08ab03d595ec8e43a462f70b69e2d71db0026a3d472",
             ),
             (
                 16777216,
-                "b8a08e70bf42b3eb50de6a5e9f852c9a664bfa8a4a497aa2a393f5ccc8ad74e0",
+                "8b8ec02ea8cf51a61703c064e988f7a15837f26753ff31d5dc44b808eb4e6fcc",
             ),
         ];
         let keys = crate::test_support::security::keys();
@@ -3841,7 +3833,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for (sequence, (length, expected)) in vectors.into_iter().enumerate() {
             let mut descriptor = envelope();
-            descriptor.key_id = KeyId([1; 16]); // Frozen independent AAD vector.
+            descriptor.key_id = KeyId([1; 16]); // Fixed key ID from aead_vectors.py.
             descriptor.plaintext_length = length as u32;
             descriptor.ciphertext_length = length as u32 + 16;
             let cache = &descriptor.page.version.object.cache;
@@ -3852,7 +3844,7 @@ mod tests {
             racer_crypto::seal_credentials(
                 &[7; 32],
                 &descriptor.nonce.0,
-                &historical_page_aad(&descriptor),
+                &page_aad(&descriptor).unwrap(),
                 &raw,
                 &mut encrypted,
             )
@@ -3862,8 +3854,8 @@ mod tests {
                 expected,
                 "length={length}"
             );
-            // Exercise the engine with an installable current key ID, while
-            // retaining the independent historical AAD known-answer assertion.
+            // Exercise the engine with an installable key ID
+            // after checking the independent known-answer digest above.
             descriptor.key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();
             racer_crypto::seal(
                 &[7; 32],
