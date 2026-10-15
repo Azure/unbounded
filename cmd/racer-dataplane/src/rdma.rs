@@ -1803,8 +1803,8 @@ pub(crate) mod tests {
             let c = &mixed.nodes[2];
             assert_eq!(select(&mixed, &page(0)).unwrap(), TransportPlan::Http);
             for (from, to, expected) in [
-                (a, b, TransportPlan::Rdma { rail: RailId(2) }),
-                (b, a, TransportPlan::Rdma { rail: RailId(2) }),
+                (a, b, TransportPlan::Rdma { rail: RailId(7) }),
+                (b, a, TransportPlan::Rdma { rail: RailId(7) }),
                 (b, c, TransportPlan::Http),
                 (c, b, TransportPlan::Http),
             ] {
