@@ -734,8 +734,7 @@ func admitCatalog(ctx context.Context, cfg Config, catalog []wire.CacheDefinitio
 	}
 
 	if existing > capacity {
-		// An older controller or changed policy can have overcommitted durable
-		// state. Never silently evict its keys or shorten retirement to make room.
+		// A changed policy can leave durable state overcommitted. Never silently evict its keys or shorten retirement to make room.
 		return nil, fmt.Errorf("admitted catalog exceeds rotation capacity %d: %w", capacity, wire.TooLarge)
 	}
 
