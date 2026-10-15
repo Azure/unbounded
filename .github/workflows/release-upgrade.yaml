@@ -893,11 +893,14 @@ jobs:
     #                          main only, so there was nothing to run
     #
     # A FAILED gate matches neither and publishes nothing, which is the property
-    # worth protecting. `skipped` is compared explicitly rather than testing for
-    # "not success", which would let a failure through.
+    # worth protecting. resolve must also have succeeded: when the upstream
+    # release build fails, resolve is skipped and its empty from_main output
+    # must not look like a release-branch cut. `skipped` is compared explicitly
+    # rather than testing for "not success", which would let a failure through.
     if: >
       !cancelled() &&
       github.repository == 'Azure/unbounded' &&
+      needs.resolve.result == 'success' &&
       inputs.force_publish != true &&
       inputs.force_publish != 'true' &&
       (
