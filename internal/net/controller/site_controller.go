@@ -1012,7 +1012,7 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 	// Get current site label
 	currentSite := getNodeSiteLabel(node)
 	needsLabel := !nodeSiteLabelsCurrent(node, siteName)
-	needsCIDRs := !hasAssignedPodCIDRs
+	needsCIDRs := !hasAssignedPodCIDRs && sitePodCIDRsManaged(sites, siteName)
 
 	// If node needs both label and CIDRs, do them in a single combined patch
 	if needsLabel && needsCIDRs && siteName != "" {
@@ -2581,6 +2581,19 @@ func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, no
 	}
 
 	return sc.allocateAndPatchNodePodCIDRsLocked(ctx, node.Name, state, siteName)
+}
+
+// sitePodCIDRsManaged reports whether the controller assigns node pod CIDRs
+// for siteName. Sites with manageCniPlugin=false use their pod CIDRs only for
+// inter-site routing; their nodes get the site label but no pod CIDR.
+func sitePodCIDRsManaged(sites []unboundedv1alpha3.Site, siteName string) bool {
+	for i := range sites {
+		if sites[i].Name == siteName {
+			return sites[i].Spec.ManageCniPlugin == nil || *sites[i].Spec.ManageCniPlugin
+		}
+	}
+
+	return true
 }
 
 func (sc *SiteController) validateSiteSnapshot(sites []unboundedv1alpha3.Site) error {

@@ -1158,6 +1158,70 @@ func TestAssignPodCIDRsAllowedWithLease(t *testing.T) {
 	}
 }
 
+// TestSyncNodeSkipsPodCIDRsForUnmanagedSite covers a new node joining a Site
+// with manageCniPlugin=false: it gets the site label but no pod CIDR.
+func TestSyncNodeSkipsPodCIDRsForUnmanagedSite(t *testing.T) {
+	managed, unmanaged := true, false
+
+	cases := map[string]struct {
+		manageCniPlugin *bool
+		wantPodCIDR     bool
+	}{
+		"default":   {nil, true},
+		"managed":   {&managed, true},
+		"unmanaged": {&unmanaged, false},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newPodCIDRTestHarness(t, liveNodeWithRV("2"))
+			h.sites[0].Spec.NodeCidrs = []string{"10.0.0.0/16"}
+			h.sites[0].Spec.ManageCniPlugin = tc.manageCniPlugin
+			h.sc.sitesCache = h.sites
+
+			node := h.cached.DeepCopy()
+			node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.5"}}
+
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			if err := indexer.Add(node); err != nil {
+				t.Fatal(err)
+			}
+
+			h.sc.nodeLister = corev1listers.NewNodeLister(indexer)
+
+			if err := h.sc.syncNode(t.Context(), node.Name); err != nil {
+				t.Fatalf("syncNode: %v", err)
+			}
+
+			if len(h.patches) != 1 {
+				t.Fatalf("expected one patch, got %d", len(h.patches))
+			}
+
+			patch := decodePatch(t, h.patches[0])
+
+			labels, ok := patch["metadata"]["labels"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("patch missing labels: %s", h.patches[0])
+			}
+
+			for _, key := range siteLabelKeys() {
+				if labels[key] != "site-a" {
+					t.Fatalf("label %s = %v, want site-a", key, labels[key])
+				}
+			}
+
+			_, hasPodCIDR := patch["spec"]["podCIDR"]
+			if hasPodCIDR != tc.wantPodCIDR {
+				t.Fatalf("patch sets podCIDR = %v, want %v: %s", hasPodCIDR, tc.wantPodCIDR, h.patches[0])
+			}
+
+			if got := h.state.allocator.IsAllocated("10.244.0.0/24"); got != tc.wantPodCIDR {
+				t.Fatalf("allocator reserved CIDR = %v, want %v", got, tc.wantPodCIDR)
+			}
+		})
+	}
+}
+
 func TestGetSiteForNodeDoesNotAllocateRegardlessOfLease(t *testing.T) {
 	// Admission now resolves sites without allocating, regardless of the fence.
 	cases := map[string]time.Time{
