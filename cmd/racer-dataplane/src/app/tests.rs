@@ -3600,12 +3600,14 @@ fn assembly_applies_configured_client_request_timeout() {
         app.clients.poll_budgeted(&mut cx, 64).unwrap();
         assert_eq!(app.clients.active_connections(), 1);
         clock.advance(Duration::from_millis(2));
-        for _ in 0..64 {
+        // The expired receive closes only after the kernel posts its cancellation
+        // CQE. That can trail submission by any number of nonblocking polls when
+        // the host is loaded, so bound the wait by real time, not a poll count.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.clients.active_connections() != 0 && std::time::Instant::now() < deadline {
             runtime.reactor.poll_budgeted(64).unwrap();
             app.clients.poll_budgeted(&mut cx, 64).unwrap();
-            if app.clients.active_connections() == 0 {
-                break;
-            }
+            std::thread::yield_now();
         }
         assert_eq!(app.clients.active_connections(), 0);
         let mut byte = [0];
