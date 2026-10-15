@@ -7,7 +7,58 @@ description: "All flags, environment variables, ConfigMap settings, and tuning g
 This document describes all configuration options for unbounded-net components.
 For a conceptual introduction, see [Networking Concepts]({{< relref "concepts/networking" >}}).
 
+## Supported Kubernetes baseline
+
+Unbounded requires Kubernetes **1.34 or newer**, with the control plane and
+worker versions following Kubernetes' supported version-skew policy. Earlier
+Kubernetes releases and upgrades from pre-release Unbounded resource layouts
+are not supported.
+
+The controller publishes a `discovery.k8s.io/v1` EndpointSlice for its
+selectorless Service. Operator activation requires that slice to identify a
+ready Pod by `targetRef`, including its UID, belonging to the controller
+Deployment. A missing reference or a v1 Endpoints object alone cannot activate
+webhook or aggregated API registrations.
+Kubernetes 1.34's
+[APIService availability controller](https://github.com/kubernetes/kubernetes/blob/v1.34.0/staging/src/k8s.io/kube-aggregator/pkg/controllers/status/remote/remote_available_controller.go)
+reads EndpointSlices directly; there is no need for an Endpoints compatibility
+object on the supported baseline.
+
+The baseline also includes authenticated service-account identity metadata:
+`authentication.kubernetes.io/pod-name`, `pod-uid`, `node-name`, and `node-uid`
+in TokenReview `status.user.extra` for scheduled Pod-bound tokens carrying
+those identities. Kubernetes' `ServiceAccountTokenPodNodeInfo` feature is GA
+and locked enabled since 1.32, so it does not require an optional feature gate
+on 1.34. Node UID is optional upstream if unavailable when the token is issued;
+clients requiring all identities must reject an incomplete token rather than
+infer missing values. Secret-based service-account tokens are not a substitute
+for projected Pod-bound tokens.
+
+Verified against Kubernetes v1.34.0 source:
+[feature gates](https://github.com/kubernetes/kubernetes/blob/v1.34.0/pkg/features/kube_features.go),
+[bound token claims and validation](https://github.com/kubernetes/kubernetes/blob/v1.34.0/pkg/serviceaccount/claims.go),
+and [authenticated user extras](https://github.com/kubernetes/kubernetes/blob/v1.34.0/staging/src/k8s.io/apiserver/pkg/authentication/serviceaccount/util.go).
+This is a source-level compatibility check, not a live-cluster certification.
+
+Use matching current controller, node agent, and CLI versions. The CLI consumes
+the summary response (`nodeSummaries`), not older full-node overview responses.
+Namespace discovery checks the current kubeconfig namespace and
+`unbounded-system`; use `--namespace` for a custom installation. Installation
+does not reserve historical namespace names or configure a migration reaper.
+
 ## Runtime Configuration
+
+Unknown YAML fields are rejected. The old gateway `enablePolicyRouting` mode
+and per-subsystem shutdown flags are removed. Use
+`node.removeConfigurationOnShutdown` (or `--remove-configuration-on-shutdown`)
+for deliberate shutdown cleanup. Current route-table selection and
+tunnel-to-tunnel `UNBOUNDED-FORWARD` rules are retained.
+
+Status uploads require an explicit envelope (JSON mode/type or protobuf).
+Bare top-level full-status JSON and empty publication acknowledgments are no
+longer accepted. Full publication mode and its revision-based deltas remain
+supported. Configured status URLs are used as supplied, without rewriting old
+API group names.
 
 Both the controller and node agent load runtime settings from a shared YAML
 file mounted from the `unbounded-net-config` ConfigMap.
@@ -31,7 +82,7 @@ requires restarting the affected controller or node-agent pods.
 | `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
 
 The cache lifetime starts when actual details arrive, not on summary updates or
-reads. Continuous legacy full publications refresh it; on-demand duplicate or
+reads. Continuous full-mode publications refresh it; on-demand duplicate or
 late replies do not. The request timeout covers all delivery attempts together.
 
 Requests are coalesced per node, but simultaneous requests for different nodes
@@ -307,7 +358,7 @@ the full protocol selection algorithm.
 | `--status-push-enabled` | `true` | Push status to controller. |
 | `--status-push-interval` | `10s` | Push interval. |
 | `--status-ws-enabled` | `true` | Enable WebSocket transport. |
-| `--status-ws-apiserver-mode` | `fallback` | Direct controller endpoints first; `fallback` permits API server relay, `never` disables it, and `preferred` is a compatibility alias for `fallback`. |
+| `--status-ws-apiserver-mode` | `fallback` | Direct controller endpoints first; `fallback` permits API server relay and `never` disables it. Other values are rejected. |
 | `--status-critical-interval` | `1s` | Max critical-delta publish frequency. |
 | `--status-stats-interval` | `15s` | Max statistics-delta publish frequency. |
 

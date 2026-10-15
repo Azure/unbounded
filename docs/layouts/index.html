@@ -125,9 +125,9 @@
         {type:'blank'},
         {type:'cmd', text:'kubectl get machines'},
         {type:'header', text:'NAME          HOST          PHASE   K8S VERSION   AGE'},
-        {type:'output', text:'gpu-node-1    10.0.50.12    Ready   v1.32.3       5m'},
-        {type:'output', text:'cw-a100-01    10.1.20.5     Ready   v1.32.3       2m'},
-        {type:'output', text:'nb-h100-01    10.2.10.8     Ready   v1.32.3       45s'}
+        {type:'output', text:'gpu-node-1    10.0.50.12    Ready   v1.34.0       5m'},
+        {type:'output', text:'cw-a100-01    10.1.20.5     Ready   v1.34.0       2m'},
+        {type:'output', text:'nb-h100-01    10.2.10.8     Ready   v1.34.0       45s'}
       ],
       // Slide 1: Connect sites
       [
@@ -147,25 +147,25 @@
         {type:'comment', text:'# Soft-reboot a machine'},
         {type:'cmd', text:'kubectl unbounded machine soft-reboot gpu-node-1'},
         {type:'output', text:'  --> Soft-rebooting Machine gpu-node-1...'},
-        {type:'output', text:'  operation         gpu-node-1-softreboot-1776734492'},
-        {type:'output', text:'  --> Operation SoftReboot: completed'},
+        {type:'output', text:'  operation         gpu-node-1-reboot-1776734492'},
+        {type:'output', text:'  --> Operation NodeReboot: completed'},
         {type:'output', text:'  ready'},
         {type:'blank'},
         {type:'comment', text:'# Upgrade Kubernetes by patching the Machine CR'},
         {type:'cmd', text:'kubectl patch machine gpu-node-1 --type merge \\'},
-        {type:'cmd-cont', text:'    -p \'{"spec":{"kubernetesVersion":"v1.33.0"}}\''},
+        {type:'cmd-cont', text:'    -p \'{"spec":{"kubernetes":{"version":"v1.34.1"}}}\''},
         {type:'output', text:'machine.unbounded-cloud.io/gpu-node-1 patched'},
         {type:'blank'},
         {type:'cmd', text:'kubectl get machines'},
         {type:'header', text:'NAME          HOST          PHASE      K8S VERSION   AGE'},
-        {type:'output', text:'gpu-node-1    10.0.50.12    Updating   v1.33.0       5h'},
-        {type:'output', text:'gpu-node-2    10.0.50.13    Ready      v1.32.3       4h'},
+        {type:'output', text:'gpu-node-1    10.0.50.12    Updating   v1.34.1       5h'},
+        {type:'output', text:'gpu-node-2    10.0.50.13    Ready      v1.34.0       4h'},
         {type:'blank'},
         {type:'comment', text:'# Agent detects drift and blue/green swaps the node'},
         {type:'cmd', text:'kubectl get machines'},
         {type:'header', text:'NAME          HOST          PHASE   K8S VERSION   AGE'},
-        {type:'output', text:'gpu-node-1    10.0.50.12    Ready   v1.33.0       5h'},
-        {type:'output', text:'gpu-node-2    10.0.50.13    Ready   v1.32.3       4h'}
+        {type:'output', text:'gpu-node-1    10.0.50.12    Ready   v1.34.1       5h'},
+        {type:'output', text:'gpu-node-2    10.0.50.13    Ready   v1.34.0       4h'}
       ]
     ];
 

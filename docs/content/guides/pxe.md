@@ -52,7 +52,7 @@ scoping is inherent to the per-site component):
 | `--cache-dir` | `~/.unbounded/metalman/cache` | Local cache for downloaded images |
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
-| `--default-netboot-image` | release-matched `netboot` image | PXE boot environment used when `spec.pxe.netbootImage` is omitted |
+| `--default-netboot-image` | release-matched `netboot` image | PXE boot environment used when `spec.host.netboot.netbootImage` is omitted |
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
 
@@ -60,15 +60,15 @@ When `--dhcp-interface` is set, metalman binds to the interface for broadcast DH
 
 Metalman uses a machine image and a netboot image for each PXE repave.
 
-- `spec.pxe.image` is the machine image. It contains `/disk/disk.img.gz`, a
+- `spec.host.netboot.image` is the machine image. It contains `/disk/disk.img.gz`, a
   gzip-compressed raw disk image written to the target disk.
-- `spec.pxe.architecture` selects the target architecture (`amd64` or `arm64`)
+- `spec.host.netboot.architecture` selects the target architecture (`amd64` or `arm64`)
   used when pulling machine and netboot image platform manifests. It defaults
   to `amd64`.
-- `spec.pxe.netbootImage` is the reusable PXE boot environment. It contains
+- `spec.host.netboot.netbootImage` is the reusable PXE boot environment. It contains
   bootloaders, kernel, initrd, templates, metadata, and `unbounded-agent`. If
   omitted, Metalman uses the release-matched `--default-netboot-image`.
-- `spec.pxe.bootProtocol` selects the network boot trigger. `PXE` is the
+- `spec.host.netboot.bootProtocol` selects the network boot trigger. `PXE` is the
   default and uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP
   boot and requires a Redfish block.
 
@@ -93,7 +93,7 @@ See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Ma
 
 ## Machine CRD
 
-A Machine represents a single bare-metal host. The `spec.pxe` section ties together the machine image, optional netboot image override, network config, and BMC credentials:
+A Machine represents a single bare-metal host. The `spec.host.netboot` section ties together the machine image, optional netboot image override, network config, and BMC credentials:
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -103,28 +103,29 @@ metadata:
   labels:
     unbounded-cloud.io/site: rack-a
 spec:
-  pxe:
-    image: ghcr.io/azure/host-ubuntu2404:v1
-    architecture: amd64
-    # Optional. Defaults to PXE. Set to HTTP for Redfish UEFI HTTP boot.
-    bootProtocol: PXE
-    # Optional. Omit to use Metalman's default netboot image.
-    netbootImage: ghcr.io/azure/netboot:v1
-    # Optional. Recommended on hosts with multiple disks.
-    targetDisk: /dev/disk/by-id/example-os-disk
-    dhcpLeases:
-    - ipv4: "10.10.0.50"
-      mac: "aa:bb:cc:dd:ee:ff"
-      subnetMask: "255.255.255.0"
-      gateway: "10.10.0.1"
-      dns: ["8.8.8.8"]
-    redfish:
-      url: "https://bmc-01.example.com"
-      username: admin
-      passwordRef:
-        name: bmc-passwords
-        namespace: unbounded-system
-        key: bmc-01
+  host:
+    netboot:
+      image: ghcr.io/azure/host-ubuntu2404:v1
+      architecture: amd64
+      # Optional. Defaults to PXE. Set to HTTP for Redfish UEFI HTTP boot.
+      bootProtocol: PXE
+      # Optional. Omit to use Metalman's default netboot image.
+      netbootImage: ghcr.io/azure/netboot:v1
+      # Optional. Recommended on hosts with multiple disks.
+      targetDisk: /dev/disk/by-id/example-os-disk
+      dhcpLeases:
+      - ipv4: "10.10.0.50"
+        mac: "aa:bb:cc:dd:ee:ff"
+        subnetMask: "255.255.255.0"
+        gateway: "10.10.0.1"
+        dns: ["8.8.8.8"]
+      redfish:
+        url: "https://bmc-01.example.com"
+        username: admin
+        passwordRef:
+          name: bmc-passwords
+          namespace: unbounded-system
+          key: bmc-01
 ```
 
 Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
@@ -162,18 +163,19 @@ kind: Machine
 metadata:
   name: server-01
 spec:
-  pxe:
-    image: ghcr.io/azure/host-ubuntu2404:v1
-    dhcpLeases:
-    - ipv4: "10.10.0.50"
-      mac: "aa:bb:cc:dd:ee:ff"
-      subnetMask: "255.255.255.0"
-      gateway: "10.10.0.1"
-      dns: ["8.8.8.8"]
-    cloudInit:
-      userDataConfigMapRef:
-        name: my-cloud-init
-        namespace: unbounded-system
+  host:
+    netboot:
+      image: ghcr.io/azure/host-ubuntu2404:v1
+      dhcpLeases:
+      - ipv4: "10.10.0.50"
+        mac: "aa:bb:cc:dd:ee:ff"
+        subnetMask: "255.255.255.0"
+        gateway: "10.10.0.1"
+        dns: ["8.8.8.8"]
+      cloudInit:
+        userDataConfigMapRef:
+          name: my-cloud-init
+          namespace: unbounded-system
 ```
 
 The `key` field defaults to `user-data` but can be overridden to select a different key from the ConfigMap. Both `data` and `binaryData` entries are supported.
@@ -189,7 +191,7 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
    - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP and DNS from kernel cmdline.
    - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. The default netboot image also serves the selected lease as NoCloud `network-config`.
    - Downloads the gzip-compressed raw disk image from the machine image over HTTP (retries up to 120 times).
-   - Writes the image to `spec.pxe.targetDisk` when set, otherwise to an automatically selected block device.
+   - Writes the image to `spec.host.netboot.targetDisk` when set, otherwise to an automatically selected block device.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.
    - Calls `/pxe/disable` on metalman to signal completion, then reboots.
 5. **First boot.** cloud-init downloads the `unbounded-agent` binary from metalman and runs `unbounded-agent start`.

@@ -21,17 +21,17 @@
   <!-- Left column: Machine spec fields                   -->
   <!-- ═══════════════════════════════════════════════════ -->
 
-  <!-- Machine.spec.pxe.image -->
+  <!-- Machine.spec.host.netboot.image -->
   <rect x="20" y="45" width="285" height="26" rx="5" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
-  <text x="30" y="63" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.pxe.image</text>
+  <text x="30" y="63" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.host.netboot.image</text>
 
   <!-- Machine.spec.ssh.privateKeyRef -->
   <rect x="20" y="82" width="285" height="26" rx="5" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
   <text x="30" y="100" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.ssh.privateKeyRef</text>
 
-  <!-- Machine.spec.pxe.redfish.passwordRef -->
+  <!-- Machine.spec.host.netboot.redfish.passwordRef -->
   <rect x="20" y="119" width="285" height="26" rx="5" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
-  <text x="30" y="137" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.pxe.redfish.passwordRef</text>
+  <text x="30" y="137" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.host.netboot.redfish.passwordRef</text>
 
   <!-- Machine.spec.kubernetes.bootstrapTokenRef -->
   <rect x="20" y="156" width="285" height="26" rx="5" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>

@@ -55,7 +55,16 @@ For a deeper dive, see the [Project Overview](https://unbounded-cloud.io/concept
 | **[machina](https://unbounded-cloud.io/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://unbounded-cloud.io/guides/ssh/), [CRD Reference](https://unbounded-cloud.io/reference/machina-crd/) |
 | **[metalman](https://unbounded-cloud.io/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://unbounded-cloud.io/guides/pxe/), [Bare Metal Concepts](https://unbounded-cloud.io/concepts/bare-metal/) |
 | **[unbounded-net](https://unbounded-cloud.io/concepts/networking/)** | CNI plugin and multi-site networking system maintained in this repository for cross-site pod connectivity. | [Networking Concepts](https://unbounded-cloud.io/concepts/networking/) |
+| **[Racer](https://unbounded-cloud.io/concepts/racer/)** | Distributed object cache requested through a cluster-scoped `ClusterCache` (`ccache`). Not a PVC or durable storage. | [racer-object Guide](https://unbounded-cloud.io/guides/racer-object/), [API and SDK Reference](https://unbounded-cloud.io/reference/racer/) |
 | **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://unbounded-cloud.io/reference/cli/) |
+
+Racer can use dedicated raw cache devices selected by the Node annotation
+`racer.unbounded-cloud.io/block-devices`, with slab files as the fallback.
+**Selected devices are overwritten without a filesystem-signature check.**
+See the [raw-device setup and safety warnings](https://unbounded-cloud.io/reference/racer/#raw-device-storage)
+before enabling it. Annotation changes require a dataplane restart. Checkpoint
+v3 rejects older checkpoints; upgrades from older formats and incompatible storage
+layout changes start with a cold cache, not migrated cached data.
 
 ## Quick Start
 

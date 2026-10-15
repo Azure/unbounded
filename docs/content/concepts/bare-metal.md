@@ -33,7 +33,7 @@ The boot flow in detail:
 
 3. **HTTP Artifacts** -- The bootloader fetches the kernel, initramfs, and
    configuration files from metalman's HTTP server. These are sourced from
-   the Machine's `spec.pxe.netbootImage`, or from Metalman's default netboot
+   the Machine's `spec.host.netboot.netbootImage`, or from Metalman's default netboot
    image when that field is omitted.
 
 4. **Kernel Boot** -- The machine boots into the downloaded kernel and
@@ -67,8 +67,8 @@ metalman supports two DHCP modes depending on your network topology:
 
 Metalman uses two OCI images during PXE provisioning:
 
-- The machine image, referenced by `spec.pxe.image`, contains `/disk/disk.img.gz`.
-- The netboot image, referenced by `spec.pxe.netbootImage` or by Metalman's
+- The machine image, referenced by `spec.host.netboot.image`, contains `/disk/disk.img.gz`.
+- The netboot image, referenced by `spec.host.netboot.netbootImage` or by Metalman's
   default, contains the reusable PXE boot environment.
 
 Netboot images are built `FROM scratch` and contain all files needed for PXE
@@ -89,24 +89,24 @@ Machine and netboot images are pulled and cached locally by the OCI reconciler.
 
 For PXE-provisioned machines, the `Machine` resource includes:
 
-- **`spec.pxe.image`** -- OCI machine image reference containing `/disk/disk.img.gz`
+- **`spec.host.netboot.image`** -- OCI machine image reference containing `/disk/disk.img.gz`
   (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`).
-- **`spec.pxe.architecture`** -- Optional target CPU architecture for PXE boot
+- **`spec.host.netboot.architecture`** -- Optional target CPU architecture for PXE boot
   artifacts and machine images. Defaults to `amd64`; allowed values are `amd64`
   and `arm64`.
-- **`spec.pxe.netbootImage`** -- Optional OCI netboot image reference containing
+- **`spec.host.netboot.netbootImage`** -- Optional OCI netboot image reference containing
   PXE boot artifacts. When omitted, Metalman uses its configured default
   `netboot` image.
-- **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and IP
+- **`spec.host.netboot.dhcpLeases`** -- NIC specifications: MAC address and IP
   assignment for each interface. During install, the default netboot template
   passes the matching lease MAC to the initrd so it can select the provisioning
   NIC without relying on names such as `eth0`.
-- **`spec.pxe.targetDisk`** -- Optional block device path for the disk that
+- **`spec.host.netboot.targetDisk`** -- Optional block device path for the disk that
   receives the machine image. Set this on hosts with multiple disks; when
   omitted, the installer selects a disk automatically.
-- **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
+- **`spec.host.netboot.redfish`** -- Optional BMC connection details (endpoint, username,
   password secret) for remote power management.
-- **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a
+- **`spec.host.netboot.cloudInit`** -- Optional cloud-init customization. References a
   ConfigMap containing user-data that is merged with the vendor-data managed by
   Unbounded.
 

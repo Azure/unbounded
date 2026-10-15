@@ -18,8 +18,9 @@ operations only.
 For cloud VMs, run `machine-ops-controller` scoped to the Machine's site and
 provider, for example `--site=remote --provider=AzureVM`. A scoped controller
 only executes operations whose target Machine has the matching
-`unbounded-cloud.io/site` label and `spec.provider`; other controllers ignore
-the operation.
+`unbounded-cloud.io/site` label and host provider: `spec.host.azure` selects
+`AzureVM`, while `spec.host.external.provider` selects an external provider.
+Other controllers ignore the operation.
 
 ## Provider Requirements
 

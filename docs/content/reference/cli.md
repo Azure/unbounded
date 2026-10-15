@@ -426,16 +426,18 @@ Common flags:
 
 ---
 
-### Legacy Machine Operation Commands
+### Additional Machine Operation Commands
 
-The older counter-backed commands remain available for compatibility:
+These commands also create and wait for `MachineOperation` resources:
 
 | Command | Mechanism |
 |---------|-----------|
-| `kubectl unbounded machine reboot NAME` | Patches `Machine.spec.operations.rebootCounter`. |
-| `kubectl unbounded machine repave NAME` | Patches `Machine.spec.operations.repaveCounter` and `rebootCounter`. |
+| `kubectl unbounded machine reboot NAME` | Creates `HostReboot`; requires Redfish configuration. |
+| `kubectl unbounded machine repave NAME` | Creates `HostReplace`; destructively replaces the host. |
 
-These commands do not create `MachineOperation` resources.
+Both accept `--ttl` to control completed-operation cleanup. They do not patch
+operation counters. Prefer `machine replace` when you want an explicit
+confirmation prompt before host replacement; `repave` does not prompt.
 
 ---
 

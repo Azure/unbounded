@@ -60,9 +60,9 @@
   <!-- ═══════════════════════════════════════════════════ -->
 
   <text x="460" y="45" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.ssh.privateKeyRef</text>
-  <text x="460" y="95" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.pxe.redfish.passwordRef</text>
+  <text x="460" y="95" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.host.netboot.redfish.passwordRef</text>
   <text x="460" y="145" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.kubernetes.bootstrapTokenRef</text>
-  <text x="460" y="195" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.pxe.image</text>
+  <text x="460" y="195" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.host.netboot.image</text>
 
   <!-- ═══════════════════════════════════════════════════ -->
   <!-- Arrows: resource ◄── spec field                    -->
