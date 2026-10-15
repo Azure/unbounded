@@ -192,7 +192,15 @@ pub mod rest {
     pub enum Error {
         InvalidConfiguration,
 
+        /// The server violated the HTTP or TLS protocol, for example a malformed
+        /// response head, bad chunk framing, or trailing plaintext.
         InvalidRequest,
+
+        /// The caller built a request this client refuses to send, for example a
+        /// route or credential not allowed on the connection, or a path, token,
+        /// or header containing forbidden bytes. Nothing is written to the wire,
+        /// and retrying the same request cannot succeed.
+        InvalidClientRequest,
 
         Unauthorized,
 
@@ -537,10 +545,11 @@ pub mod rest {
             epoch: [u8; 32],
             scope: &I::Scope,
         ) -> Option<Connection<I>> {
+            let identity = identity?;
+            scope.check().ok()?;
             let mut idle = self.idle.borrow_mut();
-            let connection = idle.take()?;
+            let mut connection = idle.take()?;
             if let Authentication::Authenticated(auth) = &connection.authentication
-                && let Some(identity) = identity
                 && auth.epoch == epoch
                 && auth.expires == identity.expires
                 && auth.owner.upgrade().is_some()
@@ -548,6 +557,7 @@ pub mod rest {
                 && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
                     < Duration::from_secs(20)
                 && connection.check(scope).is_ok()
+                && connection.idle_healthy()
             {
                 Some(connection)
             } else {
@@ -705,6 +715,25 @@ pub mod rest {
     }
 
     impl<I: Io + ?Sized> Connection<I> {
+        fn idle_healthy(&mut self) -> bool {
+            // Read only what is ready. Bound work even if the peer keeps sending tickets.
+            for _ in 0..16 {
+                let Ok(state) = self.tls.process_new_packets() else {
+                    return false;
+                };
+                if state.peer_has_closed() || state.plaintext_bytes_to_read() != 0 {
+                    return false;
+                }
+                match self.tls.read_tls(&mut self.socket.stream) {
+                    Ok(0) => return false,
+                    Ok(_) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+                    Err(_) => return false,
+                }
+            }
+            false
+        }
+
         pub fn request<'a>(
             mut self,
             request: Request<'a>,
@@ -719,6 +748,7 @@ pub mod rest {
                     body,
                     limit,
                 } = request;
+                self.validate_request(method, path, token)?;
                 let request = request_head(&self.host, method, path, token, body.len(), header)?;
                 self.send(request.as_bytes(), body, scope).await?;
                 let completed = self.receive_response(limit, scope).await?;
@@ -729,6 +759,35 @@ pub mod rest {
                     retry_after: completed.head.retry_after,
                 })
             })
+        }
+
+        fn validate_request(&self, method: Method, path: &str, bearer: Option<&str>) -> Result<()> {
+            // The server owns query grammar (`after=`), so only the route is checked here.
+            let route = path.split_once('?').map_or(path, |(route, _)| route);
+            // A bearer token authenticates enrollment and the keyring fetch on a
+            // connection without a client certificate; the server accepts bearer
+            // GET /v1/keyring there because peer trust roots arrive only in the
+            // keyring bundle. It rejects bearer plus certificate together, and
+            // snapshots always require mutual TLS.
+            let allowed = match self.authentication {
+                Authentication::Bootstrap => {
+                    bearer.is_some_and(|token| !token.is_empty())
+                        && match method {
+                            Method::Post => path == "/v1/bootstrap",
+                            Method::Get => route == "/v1/keyring",
+                        }
+                }
+                Authentication::Authenticated(_) => {
+                    matches!(method, Method::Get)
+                        && matches!(route, "/v1/snapshot" | "/v1/keyring")
+                        && bearer.is_none()
+                }
+            };
+            if allowed {
+                Ok(())
+            } else {
+                Err(Error::InvalidClientRequest)
+            }
         }
 
         fn within_max_age(&self) -> bool {
@@ -991,7 +1050,7 @@ pub mod rest {
             || token.is_some_and(|t| t.bytes().any(|b| b <= 32 || b >= 127))
             || header.is_some_and(|(name, value)| !valid_header(name, value))
         {
-            return Err(Error::InvalidRequest);
+            return Err(Error::InvalidClientRequest);
         }
         // Bound allocation before copying bearer credentials. Reserve once, so a
         // String growth cannot free an allocation still containing a token.
@@ -1097,18 +1156,23 @@ pub mod rest {
         .map_err(|_| Error::Unauthorized)?
         .with_root_certificates(roots);
         let mut config = if let Some(identity) = identity {
-            builder
-                .with_client_auth_cert(
-                    identity
-                        .certificate_chain
-                        .iter()
-                        .cloned()
-                        .map(rustls::pki_types::CertificateDer::from)
-                        .collect(),
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key.to_vec())
-                        .into(),
-                )
-                .map_err(|_| Error::Unauthorized)?
+            // Borrow DER: rustls's owned private-key wrapper does not wipe on drop.
+            let private = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key).into();
+            let key = rustls::crypto::ring::sign::any_supported_type(&private)
+                .map_err(|_| Error::Unauthorized)?;
+            let certified = rustls::sign::CertifiedKey::new(
+                identity
+                    .certificate_chain
+                    .iter()
+                    .cloned()
+                    .map(rustls::pki_types::CertificateDer::from)
+                    .collect(),
+                key,
+            );
+            certified.keys_match().map_err(|_| Error::Unauthorized)?;
+            builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                certified,
+            )))
         } else {
             builder.with_no_client_auth()
         };
@@ -1915,9 +1979,14 @@ pub mod rest {
             }
         }
 
-        fn request_at_yield(cancel: bool) {
-            use std::{net::TcpListener, task::Context};
-
+        fn connected_pair() -> (
+            Transport<CancelIo>,
+            Connection<CancelIo>,
+            TcpStream,
+            rustls::ServerConnection,
+            CancelScope,
+            testing::Directory,
+        ) {
             let (ca, ca_key) = testing::ca();
             let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
             let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
@@ -1939,7 +2008,7 @@ pub mod rest {
             let directory = testing::Directory::new();
             let trust = directory.0.join("ca.crt");
             std::fs::write(&trust, ca.pem()).unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             listener.set_nonblocking(true).unwrap();
             let server = std::thread::spawn(move || {
@@ -1977,7 +2046,7 @@ pub mod rest {
             while connection.tls.wants_write() {
                 futures::executor::block_on(connection.step(&scope)).unwrap();
             }
-            let (mut socket, mut tls) = server.join().unwrap();
+            let (socket, mut tls) = server.join().unwrap();
             socket.set_nonblocking(true).unwrap();
             assert_eq!(
                 socket.peek(&mut [0; 1]).unwrap_err().kind(),
@@ -1988,8 +2057,14 @@ pub mod rest {
                 std::io::ErrorKind::WouldBlock
             );
             socket.set_nonblocking(false).unwrap();
+            (transport, connection, socket, tls, scope, directory)
+        }
+
+        fn request_at_yield(cancel: bool) {
+            use std::task::Context;
+            let (_transport, connection, mut socket, mut tls, scope, _directory) = connected_pair();
             let mut request = connection.request(
-                testing::request(Method::Post, "/cancel-test", Some("test-token"), 1024),
+                testing::request(Method::Post, "/v1/bootstrap", Some("test-token"), 1024),
                 &scope,
             );
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2023,7 +2098,7 @@ pub mod rest {
                     }
                 }
                 let head = String::from_utf8(head).unwrap();
-                assert!(head.starts_with("POST /cancel-test HTTP/1.1\r\n"));
+                assert!(head.starts_with("POST /v1/bootstrap HTTP/1.1\r\n"));
                 assert!(head.contains("\r\nAuthorization: Bearer test-token\r\n"));
                 tls.writer()
                     .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -2043,6 +2118,98 @@ pub mod rest {
         #[test]
         fn active_scope_after_tls_yield_sends_request() {
             request_at_yield(false);
+        }
+
+        #[test]
+        fn checkout_probes_idle_tls_before_reuse() {
+            for event in [
+                "healthy",
+                "key-update",
+                "close-notify",
+                "eof",
+                "plaintext",
+                "invalid-tls",
+            ] {
+                let (transport, mut connection, mut socket, mut tls, scope, _directory) =
+                    connected_pair();
+                let (ca, key) = testing::ca();
+                let identity = TestIdentity::new(&ca, &key);
+                let epoch = [1; 32];
+                connection.authentication = transport
+                    .authentication(
+                        Some(identity.borrowed()),
+                        epoch,
+                        Rc::downgrade(&transport.owner.borrow()),
+                    )
+                    .unwrap();
+                let fd = connection.socket.fd.clone();
+                *transport.idle.borrow_mut() = Some(connection);
+                match event {
+                    "healthy" | "eof" => (),
+                    "key-update" => tls.refresh_traffic_keys().unwrap(),
+                    "close-notify" => tls.send_close_notify(),
+                    "plaintext" => tls.writer().write_all(b"unsolicited response").unwrap(),
+                    "invalid-tls" => socket.write_all(b"not a TLS record").unwrap(),
+                    _ => unreachable!(),
+                }
+                while tls.wants_write() {
+                    tls.write_tls(&mut socket).unwrap();
+                }
+                if event == "eof" {
+                    socket.shutdown(std::net::Shutdown::Both).unwrap();
+                }
+                if event != "healthy" {
+                    futures::executor::block_on(transport.io().unwrap().ready(
+                        fd.clone(),
+                        true,
+                        false,
+                        None,
+                        &scope,
+                    ))
+                    .unwrap();
+                }
+                let checked = transport.checkout(Some(identity.borrowed()), epoch, &scope);
+                assert_eq!(
+                    checked.is_some(),
+                    matches!(event, "healthy" | "key-update"),
+                    "{event}"
+                );
+                if let Some(connection) = checked {
+                    assert!(Rc::ptr_eq(&connection.socket.fd, &fd));
+                }
+                assert!(transport.idle.borrow().is_none());
+            }
+        }
+
+        #[test]
+        fn bootstrap_and_canceled_checkout_preserve_healthy_idle_connection() {
+            let (transport, mut connection, _socket, _tls, scope, _directory) = connected_pair();
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            let epoch = [1; 32];
+            connection.authentication = transport
+                .authentication(
+                    Some(identity.borrowed()),
+                    epoch,
+                    Rc::downgrade(&transport.owner.borrow()),
+                )
+                .unwrap();
+            let fd = connection.socket.fd.clone();
+            *transport.idle.borrow_mut() = Some(connection);
+            assert!(transport.checkout(None, [0; 32], &scope).is_none());
+            assert!(transport.idle.borrow().is_some());
+            scope.cancelled.set(true);
+            assert!(
+                transport
+                    .checkout(Some(identity.borrowed()), epoch, &scope)
+                    .is_none()
+            );
+            assert!(transport.idle.borrow().is_some());
+            scope.cancelled.set(false);
+            let connection = transport
+                .checkout(Some(identity.borrowed()), epoch, &scope)
+                .unwrap();
+            assert!(Rc::ptr_eq(&connection.socket.fd, &fd));
         }
 
         fn authenticated(connection: &mut Connection<FixtureIo>) -> &mut Authenticated<FixtureIo> {
@@ -2114,6 +2281,97 @@ pub mod rest {
         }
 
         #[test]
+        fn requests_enforce_connection_credentials_and_routes() {
+            use testing::{RotationServer, WeeklyCertificates};
+            let certs = WeeklyCertificates::new();
+            let d = testing::Directory::new();
+            let trust = d.0.join("trust.pem");
+            std::fs::write(&trust, certs.roots[0].pem()).unwrap();
+            let server = RotationServer::new(certs.servers[0].clone());
+            let transport = server.transport(trust);
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            for mutual in [false, true] {
+                for (method, path, bearer, bootstrap_ok, authenticated_ok) in [
+                    (Method::Post, "/v1/bootstrap", Some("token"), true, false),
+                    (Method::Post, "/v1/bootstrap", None, false, false),
+                    (Method::Post, "/v1/bootstrap", Some(""), false, false),
+                    (Method::Get, "/v1/bootstrap", Some("token"), false, false),
+                    (
+                        Method::Post,
+                        "/v1/bootstrap?x=1",
+                        Some("token"),
+                        false,
+                        false,
+                    ),
+                    (Method::Post, "/v1/bootstrap/", Some("token"), false, false),
+                    (Method::Get, "/v1/snapshot", None, false, true),
+                    (Method::Get, "/v1/snapshot?after=1", None, false, true),
+                    (Method::Get, "/v1/keyring", None, false, true),
+                    (Method::Get, "/v1/keyring?after=1", None, false, true),
+                    (Method::Get, "/v1/snapshot", Some("token"), false, false),
+                    (Method::Get, "/v1/keyring", Some("token"), true, false),
+                    (
+                        Method::Get,
+                        "/v1/keyring?after=1",
+                        Some("token"),
+                        true,
+                        false,
+                    ),
+                    (Method::Get, "/v1/keyring", Some(""), false, false),
+                    (Method::Post, "/v1/keyring", Some("token"), false, false),
+                    (Method::Get, "/v1/keyring/", Some("token"), false, false),
+                    (Method::Get, "/v1/%6beyring", Some("token"), false, false),
+                    (Method::Get, "//v1/keyring", Some("token"), false, false),
+                    (Method::Get, "/v1/./keyring", Some("token"), false, false),
+                    (
+                        Method::Get,
+                        "https://example.com/v1/keyring",
+                        Some("token"),
+                        false,
+                        false,
+                    ),
+                    (
+                        Method::Get,
+                        "/v1/snapshot?after=1",
+                        Some("token"),
+                        false,
+                        false,
+                    ),
+                    (Method::Post, "/v1/snapshot", None, false, false),
+                    (Method::Get, "/v1/snapshot/", None, false, false),
+                    (Method::Get, "/v1/%73napshot", None, false, false),
+                    (Method::Get, "/unknown", None, false, false),
+                ] {
+                    let scope = testing::scope();
+                    let connection = futures::executor::block_on(
+                        transport.connect(mutual.then(|| identity.borrowed()), &scope),
+                    )
+                    .unwrap();
+                    let result = futures::executor::block_on(
+                        connection.request(testing::request(method, path, bearer, 1024), &scope),
+                    );
+                    if if mutual {
+                        authenticated_ok
+                    } else {
+                        bootstrap_ok
+                    } {
+                        assert_eq!(result.unwrap().status, 200, "{mutual}: {path}");
+                    } else {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(testing::Error::Transport(Error::InvalidClientRequest))
+                            ),
+                            "{mutual}: {path}"
+                        );
+                    }
+                    transport.close_idle();
+                }
+            }
+        }
+
+        #[test]
         fn bootstrap_never_carries_authenticated_pool_state() {
             use testing::{RotationServer, WeeklyCertificates, rotation_request};
             let certs = WeeklyCertificates::new();
@@ -2129,7 +2387,7 @@ pub mod rest {
                 Authentication::Bootstrap
             ));
             let first = futures::executor::block_on(connection.request(
-                testing::request(Method::Get, "/snapshot", None, 1024),
+                testing::request(Method::Post, "/v1/bootstrap", Some("test-token"), 1024),
                 &scope,
             ))
             .unwrap();
@@ -2144,7 +2402,7 @@ pub mod rest {
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = TestIdentity::new(&ca, &key);
-            let response = || ("/snapshot".to_owned(), 200, b"{}".to_vec());
+            let response = || ("/v1/snapshot".to_owned(), 200, b"{}".to_vec());
             let (endpoint, server) = scripted_server(
                 &d,
                 &ca,
@@ -2158,7 +2416,7 @@ pub mod rest {
             let scope = testing::scope();
             let complete = |connection: Connection<FixtureIo>| {
                 futures::executor::block_on(connection.request(
-                    testing::request(Method::Get, "/snapshot", None, 1024),
+                    testing::request(Method::Get, "/v1/snapshot", None, 1024),
                     &scope,
                 ))
                 .unwrap()
@@ -2188,7 +2446,7 @@ pub mod rest {
             let identity = TestIdentity::new(&ca, &key);
             let response = |status| {
                 (
-                    "/snapshot".to_owned(),
+                    "/v1/snapshot".to_owned(),
                     status,
                     if status == 204 {
                         vec![]
@@ -2223,7 +2481,7 @@ pub mod rest {
                         .await
                         .unwrap()
                         .request(
-                            testing::request(Method::Get, "/snapshot", None, 65536),
+                            testing::request(Method::Get, "/v1/snapshot", None, 65536),
                             &scope,
                         )
                         .await
@@ -2253,7 +2511,7 @@ pub mod rest {
             );
             authenticated(&mut connection).expires = expiry;
             let result = futures::executor::block_on(connection.request(
-                testing::request(Method::Get, "/snapshot", None, 65536),
+                testing::request(Method::Get, "/v1/snapshot", None, 65536),
                 &scope,
             ))
             .unwrap();
@@ -2277,7 +2535,7 @@ pub mod rest {
                     testing::request(Method::Get, "invalid", None, 65536),
                     &scope
                 )),
-                Err(testing::Error::Transport(Error::InvalidRequest))
+                Err(testing::Error::Transport(Error::InvalidClientRequest))
             ));
             assert!(transport.idle.borrow().is_none());
             assert_eq!(get().status, 200);
@@ -2285,7 +2543,7 @@ pub mod rest {
                 futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
             assert!(matches!(
                 futures::executor::block_on(connection.request(
-                    testing::request(Method::Get, "/snapshot", None, 65536),
+                    testing::request(Method::Get, "/v1/snapshot", None, 65536),
                     &scope
                 )),
                 Err(testing::Error::Transport(Error::Io))
@@ -2297,12 +2555,54 @@ pub mod rest {
         }
 
         #[test]
+        fn tls_config_validates_borrowed_client_key() {
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            let unrelated = TestIdentity::new(&ca, &key);
+            let trust = ca.pem();
+            let config = tls_config(trust.as_bytes(), Some(identity.borrowed())).unwrap();
+            assert!(config.client_auth_cert_resolver.has_certs());
+            assert!(
+                !tls_config(trust.as_bytes(), None)
+                    .unwrap()
+                    .client_auth_cert_resolver
+                    .has_certs()
+            );
+            for private_key in [
+                b"".as_slice(),
+                b"invalid DER",
+                unrelated.borrowed().private_key,
+            ] {
+                assert!(matches!(
+                    tls_config(
+                        trust.as_bytes(),
+                        Some(Identity {
+                            private_key,
+                            ..identity.borrowed()
+                        })
+                    ),
+                    Err(Error::Unauthorized)
+                ));
+            }
+            assert!(matches!(
+                tls_config(
+                    trust.as_bytes(),
+                    Some(Identity {
+                        certificate_chain: &[],
+                        ..identity.borrowed()
+                    })
+                ),
+                Err(Error::Unauthorized)
+            ));
+        }
+
+        #[test]
         fn pooled_connections_validate_client_key_before_reuse() {
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = TestIdentity::new(&ca, &key);
             let unrelated = TestIdentity::new(&ca, &key);
-            let response = || ("/snapshot".to_owned(), 200, b"{}".to_vec());
+            let response = || ("/v1/snapshot".to_owned(), 200, b"{}".to_vec());
             let (endpoint, server) =
                 scripted_server(&d, &ca, &key, vec![vec![response(), response()]]);
             let transport = Transport::new(endpoint);
@@ -2331,7 +2631,7 @@ pub mod rest {
                         .await
                         .unwrap()
                         .request(
-                            testing::request(Method::Get, "/snapshot", None, 1024),
+                            testing::request(Method::Get, "/v1/snapshot", None, 1024),
                             &scope,
                         )
                         .await
@@ -2359,7 +2659,7 @@ pub mod rest {
                 &d,
                 &ca,
                 &key,
-                vec![vec![("/snapshot".to_owned(), 200, b"{}".to_vec())]],
+                vec![vec![("/v1/snapshot".to_owned(), 200, b"{}".to_vec())]],
             );
             let transport = Transport::new(endpoint);
             transport.attach_io(Rc::new(FixtureIo));
@@ -2367,7 +2667,7 @@ pub mod rest {
             let connection =
                 futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
             futures::executor::block_on(connection.request(
-                testing::request(Method::Get, "/snapshot", None, 1024),
+                testing::request(Method::Get, "/v1/snapshot", None, 1024),
                 &scope,
             ))
             .unwrap();
@@ -2519,12 +2819,12 @@ pub mod rest {
             ] {
                 assert_eq!(
                     request_head("controller", method, path, token, 0, base),
-                    Err(Error::InvalidRequest)
+                    Err(Error::InvalidClientRequest)
                 );
             }
             assert_eq!(
                 request_head("controller\r\n", Method::Get, "/", None, 0, None),
-                Err(Error::InvalidRequest)
+                Err(Error::InvalidClientRequest)
             );
             assert_eq!(
                 request_head(
@@ -2753,7 +3053,7 @@ pub mod rest {
                         0,
                         Some((name, value))
                     ),
-                    Err(Error::InvalidRequest)
+                    Err(Error::InvalidClientRequest)
                 );
             }
             for name in [
@@ -2781,7 +3081,7 @@ pub mod rest {
                         0,
                         Some((name, "override"))
                     ),
-                    Err(Error::InvalidRequest)
+                    Err(Error::InvalidClientRequest)
                 );
             }
         }

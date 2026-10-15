@@ -759,6 +759,24 @@ pub mod secure {
             .await
     }
 
+    /// Rename one child to another name in the same pinned directory, then sync
+    /// the directory. A missing source fails without the sync; callers that treat
+    /// absence as success should sync the directory themselves to fence any
+    /// earlier canceled rename. The caller owns choosing a target name that does
+    /// not collide, since rename replaces an existing target.
+    pub async fn rename_synced<S: Scope, B: Budget>(
+        r: &Reactor<S, B>,
+        dir: &Rc<Descriptor>,
+        from: &str,
+        to: &str,
+        scope: &S,
+    ) -> Result<(), S::Error> {
+        let from = component(from.as_ref(), 4096)?;
+        let to = component(to.as_ref(), 4096)?;
+        r.file_rename(dir.clone(), from, to, scope).await?;
+        r.file_sync(dir.clone(), scope).await
+    }
+
     /// Validate byte length and embedded NULs without normalizing the path.
     pub fn path_name(path: &OsStr, limit: usize) -> Result<CString> {
         validate_path(path, limit)?;

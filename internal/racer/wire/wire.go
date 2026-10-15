@@ -1269,7 +1269,7 @@ func ApplyDelta(base Publication, reader io.Reader) (Publication, error) {
 		return Publication{}, err
 	}
 
-	hash, _, err := ContentHashes(base)
+	hash, baseMembership, err := ContentHashes(base)
 	if err != nil {
 		return Publication{}, err
 	}
@@ -1290,12 +1290,12 @@ func ApplyDelta(base Publication, reader io.Reader) (Publication, error) {
 		return Publication{}, err
 	}
 
-	hash, _, err = candidate.ContentHashes()
+	hash, membership, err := candidate.ContentHashes()
 	if err != nil {
 		return Publication{}, err
 	}
 
-	if hash != d.ContentHash {
+	if hash != d.ContentHash || d.MembershipVersion == base.MembershipVersion && membership != baseMembership {
 		return Publication{}, Conflict
 	}
 

@@ -124,10 +124,11 @@ pub fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(inner.as_slice());
     hash.update(msg);
-    let digest = hash.finalize();
+    // sha2 0.10 cannot wipe its private hash state; wipe our digest buffer.
+    let digest = Zeroizing::new(<[u8; 32]>::from(hash.finalize()));
     let mut hash = Sha256::new();
     hash.update(outer.as_slice());
-    hash.update(digest);
+    hash.update(digest.as_slice());
     hash.finalize().into()
 }
 
@@ -290,12 +291,11 @@ pub mod identity {
             mut bundle: racer_control_wire::KeyringBundle,
         ) -> std::result::Result<(BundleGeneration, Vec<Vec<u8>>), BundleError> {
             bundle.peer_trust_roots.sort();
+            // Avoid stable sort's heap scratch copies of inline secret material.
             bundle
                 .cache_keys
-                .sort_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
-            let encoded = Zeroizing::new(
-                racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
-            );
+                .sort_unstable_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
+            let encoded = racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?;
             let hash: [u8; 32] = Sha256::digest(&*encoded).into();
             let mut state = self.state.borrow_mut();
             if let Some(old) = state.accepted.as_ref()
@@ -616,6 +616,17 @@ pub mod identity {
         entries: Vec<Entry>,
     }
 
+    impl PublishedBundle {
+        fn entry(&self, reference: &CacheKeyRef) -> Option<&Entry> {
+            self.entries
+                .binary_search_by(|entry| {
+                    reference_order(&entry.reference).cmp(&reference_order(reference))
+                })
+                .ok()
+                .map(|position| &self.entries[position])
+        }
+    }
+
     struct InstalledIdentity {
         identity: Arc<SigningIdentity>,
 
@@ -862,7 +873,8 @@ pub mod identity {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            root_store(&bundle.peer_trust_roots)?;
+            // Installation admits future and expired anchors; verification filters time.
+            check_roots(&bundle.peer_trust_roots)?;
             let mut hash = Sha256::new();
             hash.update(b"racer/keyring/bundle/v1\0");
             hash.update((bundle.peer_trust_roots.len() as u64).to_be_bytes());
@@ -947,15 +959,11 @@ pub mod identity {
                         .generation()
                         .ok_or(Error::InvalidConfiguration)?;
                     // Removed IDs cannot reenter admission, even as prepared keys.
-                    if generation <= current.generation.0
-                        && !current.entries.iter().any(|e| e.reference == candidate.key)
-                    {
+                    let retained = current.entry(&candidate.key);
+                    if generation <= current.generation.0 && retained.is_none() {
                         return Err(Error::InvalidConfiguration);
                     }
-                    if let Some(old) = current
-                        .entries
-                        .iter()
-                        .find(|e| e.reference == candidate.key)
+                    if let Some(old) = retained
                         && *old.secret.0 != *candidate.material
                     {
                         return Err(Error::InvalidConfiguration);
@@ -975,12 +983,7 @@ pub mod identity {
                 .cache_keys
                 .iter()
                 .map(|candidate| {
-                    let retained = current.and_then(|current| {
-                        current
-                            .entries
-                            .iter()
-                            .find(|e| e.reference == candidate.key)
-                    });
+                    let retained = current.and_then(|current| current.entry(&candidate.key));
                     Entry {
                         reference: candidate.key.clone(),
                         state: candidate.state,
@@ -1100,13 +1103,7 @@ pub mod identity {
             if published.cluster != self.cluster {
                 return Err(Error::MissingKey);
             }
-            let position = published
-                .entries
-                .binary_search_by(|entry| {
-                    reference_order(&entry.reference).cmp(&reference_order(&reference))
-                })
-                .map_err(|_| Error::MissingKey)?;
-            let entry = &published.entries[position];
+            let entry = published.entry(&reference).ok_or(Error::MissingKey)?;
             Ok(KeyLease {
                 reference,
                 secret: entry.secret.clone(),
@@ -1270,13 +1267,26 @@ pub mod identity {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
         root_store_with_validity(roots, unix_time()).map(|(store, _)| store)
+    }
+
+    /// Check root structure without filtering by time, as keyring installation does.
+    pub(super) fn check_roots(roots: &[Vec<u8>]) -> Result<()> {
+        build_root_store(roots, None).map(|_| ())
     }
 
     fn root_store_with_validity(
         roots: &[Vec<u8>],
         now: rustls::pki_types::UnixTime,
+    ) -> Result<(RootCertStore, Vec<(u64, u64)>)> {
+        build_root_store(roots, Some(now))
+    }
+
+    fn build_root_store(
+        roots: &[Vec<u8>],
+        now: Option<rustls::pki_types::UnixTime>,
     ) -> Result<(RootCertStore, Vec<(u64, u64)>)> {
         if roots.is_empty() || roots.len() > 32 {
             return Err(Error::Unauthorized);
@@ -1293,14 +1303,17 @@ pub mod identity {
             }
             let start = cert.validity().not_before.timestamp();
             let end = cert.validity().not_after.timestamp();
-            let seconds = i64::try_from(now.as_secs()).map_err(|_| Error::Unauthorized)?;
-            if seconds < start || seconds >= end {
-                continue;
-            }
             store
                 .add(CertificateDer::from(root.clone()))
                 .map_err(|_| Error::Unauthorized)?;
-            bounds.push((start.max(0) as u64, end as u64));
+            if let Some(now) = now {
+                let seconds = i64::try_from(now.as_secs()).map_err(|_| Error::Unauthorized)?;
+                if seconds < start || seconds >= end {
+                    store.roots.pop();
+                    continue;
+                }
+            }
+            bounds.push((start.max(0) as u64, end.max(0) as u64));
         }
         if store.is_empty() {
             return Err(Error::Unauthorized);
@@ -1382,6 +1395,65 @@ pub mod identity {
     mod bundle_tests {
         use super::test_util::*;
         use super::*;
+
+        #[test]
+        fn installation_accepts_time_invalid_roots_but_verification_does_not() {
+            use std::time::Duration;
+
+            let clock = environment::SimulationClock::new(111);
+            let _environment = clock.environment(0).enter();
+            let now = environment::wall_now();
+            let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
+            let node = NodeId("22222222-2222-4222-8222-222222222222".into());
+            let (_, ca_key) = ca();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            params.not_before = (now + Duration::from_secs(60)).into();
+            params.not_after = (now + Duration::from_secs(120)).into();
+            let future = params.clone().self_signed(&ca_key).unwrap();
+            params.not_before = (now - Duration::from_secs(120)).into();
+            params.not_after = now.into();
+            let expired = params.self_signed(&ca_key).unwrap();
+            let (_, chain) = issue(&future, &ca_key, &cluster, &node, |_| {});
+
+            for roots in [
+                vec![future.der().to_vec()],
+                vec![expired.der().to_vec()],
+                vec![expired.der().to_vec(), future.der().to_vec()],
+            ] {
+                let keys = Rc::new(Keyring::new(cluster.clone(), node.clone(), Arc::default()));
+                let installer = BundleInstaller::new(keys.clone());
+                let mut bundle = racer_control_wire::KeyringBundle {
+                    schema_version: SCHEMA_VERSION,
+                    cluster: cluster.clone(),
+                    generation: BundleGeneration(1),
+                    peer_trust_roots: roots.clone(),
+                    cache_keys: vec![],
+                };
+                installer.install(bundle.clone()).unwrap();
+                installer.install(bundle.clone()).unwrap();
+                assert!(verify_chain(&roots, &chain, &cluster, &node).is_err());
+                clock.set_wall_time(now + Duration::from_secs(60));
+                assert_eq!(
+                    verify_chain(&roots, &chain, &cluster, &node).is_ok(),
+                    roots.contains(&future.der().to_vec())
+                );
+                clock.set_wall_time(now + Duration::from_secs(120));
+                assert!(verify_chain(&roots, &chain, &cluster, &node).is_err());
+                bundle.generation = BundleGeneration(2);
+                installer.install(bundle.clone()).unwrap();
+                bundle.generation = BundleGeneration(3);
+                for invalid in [vec![], vec![vec![0; 128]], chain.clone()] {
+                    bundle.peer_trust_roots = invalid;
+                    assert!(installer.install(bundle.clone()).is_err());
+                    assert!(keys.install(bundle.clone()).is_err());
+                    assert_eq!(keys.generation().unwrap(), Some(2));
+                    assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+                }
+                clock.set_wall_time(now);
+            }
+        }
 
         #[test]
         fn cached_delivery_revalidates_shared_keyring_epoch() {
@@ -1891,6 +1963,8 @@ pub mod identity {
             }
 
             initial.generation = BundleGeneration(2);
+            // Direct callers may reorder retained references in a newer generation.
+            initial.cache_keys.reverse();
             keys.install_inner(&initial).unwrap();
             assert_eq!(keys.generation().unwrap(), Some(2));
             assert!(Arc::ptr_eq(&roots, &keys.peer_trust_roots().unwrap()));

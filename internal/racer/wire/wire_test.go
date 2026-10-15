@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,6 +132,68 @@ func TestBootstrapBlockDevicesVectors(t *testing.T) {
 			} else {
 				require.Equal(t, raw, string(encoded))
 			}
+		})
+	}
+}
+
+func TestSharedControlCharacters(t *testing.T) {
+	var vectors []struct {
+		Name, Text        string
+		DeviceValid       bool   `json:"device_valid"`
+		EncodedText       string `json:"encoded_text"`
+		BootstrapSHA256   string `json:"bootstrap_sha256"`
+		PublicationSHA256 string `json:"publication_sha256"`
+		ContentHash       string `json:"content_hash"`
+		MembershipHash    string `json:"membership_hash"`
+	}
+	require.NoError(t, json.Unmarshal(fixture(t, "control-characters.json"), &vectors))
+	// Pin exact encoder output: these bytes feed content hashes in Go and Rust.
+	digest := func(b []byte) string {
+		sum := sha256.Sum256(b)
+		return hex.EncodeToString(sum[:])
+	}
+
+	for _, vector := range vectors {
+		t.Run(vector.Name, func(t *testing.T) {
+			p, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
+			require.NoError(t, err)
+
+			p.Members[1].RDMANICs[0].Device = vector.Text
+			raw, err := json.Marshal(p)
+			require.NoError(t, err)
+
+			decoded, err := DecodePublication(bytes.NewReader(raw))
+			if vector.DeviceValid {
+				require.NoError(t, err)
+				require.Equal(t, vector.Text, decoded.Members[1].RDMANICs[0].Device)
+				encoded, err := EncodePublication(decoded)
+				require.NoError(t, err)
+				require.Contains(t, string(encoded), `"device":`+vector.EncodedText)
+				require.Equal(t, vector.PublicationSHA256, digest(encoded))
+
+				ch, mh, err := ContentHashes(decoded)
+				require.NoError(t, err)
+				require.Equal(t, vector.ContentHash, ch)
+				require.Equal(t, vector.MembershipHash, mh)
+
+				again, err := DecodePublication(bytes.NewReader(encoded))
+				require.NoError(t, err)
+				require.Equal(t, decoded, again)
+			} else {
+				require.ErrorIs(t, err, InvalidRequest)
+			}
+
+			response, err := DecodeBootstrapResponse(bytes.NewReader(fixture(t, "bootstrap-response.json")))
+			require.NoError(t, err)
+
+			response.BlockDevices = vector.Text
+			encoded, err := EncodeBootstrap(response)
+			require.NoError(t, err)
+			require.Contains(t, string(encoded), `"block_devices":`+vector.EncodedText)
+			require.Equal(t, vector.BootstrapSHA256, digest(encoded))
+			got, err := DecodeBootstrapResponse(bytes.NewReader(encoded))
+			require.NoError(t, err)
+			require.Equal(t, vector.Text, got.BlockDevices)
 		})
 	}
 }
@@ -1341,6 +1405,99 @@ func TestDeltaValidationFailures(t *testing.T) {
 	got, err = ApplyDelta(base, strings.NewReader("{"))
 	require.ErrorIs(t, err, InvalidRequest)
 	require.Equal(t, Publication{}, got)
+}
+
+func TestSharedDeltaRejections(t *testing.T) {
+	var vectors []siteVector
+	require.NoError(t, json.Unmarshal(fixture(t, "site-vectors.json"), &vectors))
+	base, err := DecodePublication(strings.NewReader(vectors[0].Publication))
+	require.NoError(t, err)
+
+	var cases []struct {
+		Name, Old, New string
+		Code           ErrorCode
+		// BaseMembershipVersion optionally overrides the base counter. Content
+		// hashes exclude counters, so the delta's base_hash still matches.
+		BaseMembershipVersion MembershipVersion `json:"base_membership_version"`
+	}
+	require.NoError(t, json.Unmarshal(fixture(t, "delta-rejections.json"), &cases))
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			base := base
+			if tc.BaseMembershipVersion != 0 {
+				base.MembershipVersion = tc.BaseMembershipVersion
+			}
+
+			original, err := EncodePublication(base)
+			require.NoError(t, err)
+
+			raw := strings.Replace(vectors[1].Delta, tc.Old, tc.New, 1)
+			require.NotEqual(t, vectors[1].Delta, raw)
+
+			got, err := ApplyDelta(base, strings.NewReader(raw))
+			require.ErrorIs(t, err, tc.Code)
+			require.Equal(t, Publication{}, got)
+
+			unchanged, err := EncodePublication(base)
+			require.NoError(t, err)
+			require.Equal(t, string(original), string(unchanged))
+		})
+	}
+}
+
+func TestDeltaMembershipVersion(t *testing.T) {
+	base, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
+	require.NoError(t, err)
+
+	base.Sequence, base.MembershipVersion = 1, 2
+	original, err := EncodePublication(base)
+	require.NoError(t, err)
+
+	for _, change := range []string{"add", "remove", "shares", "endpoint", "rails", "site", "cache", "unchanged"} {
+		t.Run(change, func(t *testing.T) {
+			next := canonicalPublication(base)
+			next.Sequence++
+
+			switch change {
+			case "add":
+				added := next.Members[0]
+				added.Node = "77777777-7777-4777-8777-777777777777"
+				next.Members = append(next.Members, added)
+			case "remove":
+				next.Members = next.Members[:1]
+			case "shares":
+				next.Members[0].Shares = 9
+			case "endpoint":
+				next.Members[0].PeerEndpoint = "192.0.2.2:7443"
+			case "rails":
+				next.Members[1].RDMANICs = nil
+			case "site":
+				next.Members[0].Site = "site2"
+			case "cache":
+				next.Caches = nil
+			}
+
+			for _, version := range []MembershipVersion{1, 2, 3} {
+				next.MembershipVersion = version
+				raw, err := EncodeDelta(base, next)
+				require.NoError(t, err)
+
+				got, err := ApplyDelta(base, bytes.NewReader(raw))
+				if version < 2 || version == 2 && change != "cache" && change != "unchanged" {
+					require.ErrorIs(t, err, Conflict)
+					require.Equal(t, Publication{}, got)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, canonicalPublication(next), got)
+				}
+			}
+
+			unchanged, err := EncodePublication(base)
+			require.NoError(t, err)
+			require.Equal(t, original, unchanged)
+		})
+	}
 }
 
 func TestUnicodeEscapeValidation(t *testing.T) {

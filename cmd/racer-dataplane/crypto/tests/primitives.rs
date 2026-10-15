@@ -579,6 +579,9 @@ mod identity_workflows {
     fn existing_key_and_customized_certificate_contract_are_preserved() {
         use racer_crypto::identity::test_util::{ca, issue_pending};
 
+        let clock = uring_runtime::environment::SimulationClock::new(112);
+        let _environment = clock.environment(0).enter();
+        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let (ca, ca_key) = ca();
         let cluster = ClusterId(CLUSTER.into());
         let node = NodeId(NODE.into());
@@ -1036,6 +1039,49 @@ mod identity_workflows {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn installer_canonicalizes_secret_records_and_rejects_duplicate_references() {
+        use racer_crypto::identity::BundleInstaller;
+
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = Rc::new(Keyring::new(
+            ClusterId(CLUSTER.into()),
+            NodeId(NODE.into()),
+            Arc::default(),
+        ));
+        let installer = BundleInstaller::new(keys.clone());
+        let mut bundle = bundle(1, roots);
+        for ordinal in 2..42 {
+            bundle.cache_keys.push(CacheEncryptionKey::new(
+                CacheKeyRef {
+                    cache: CacheId(CACHE.into()),
+                    id: KeyId::from_generation(1, ordinal).unwrap(),
+                    purpose: KeyPurpose::Page,
+                },
+                CacheKeyState::Prepared,
+                Zeroizing::new([ordinal as u8 + 32; 32]),
+            ));
+        }
+        let accepted = installer.install(bundle.clone()).unwrap();
+        bundle.cache_keys.reverse();
+        assert_eq!(installer.install(bundle.clone()).unwrap(), accepted);
+        bundle.cache_keys.rotate_left(17);
+        assert_eq!(installer.install(bundle.clone()).unwrap(), accepted);
+        for record in &bundle.cache_keys {
+            assert_eq!(
+                keys.lease(Some(&record.key.cache), record.key.id, record.key.purpose)
+                    .unwrap()
+                    .reference(),
+                &record.key
+            );
+        }
+        bundle.generation = BundleGeneration(2);
+        bundle.cache_keys.push(bundle.cache_keys[0].clone());
+        assert!(installer.install(bundle).is_err());
+        assert_eq!(installer.generation(), Some(BundleGeneration(1)));
+        assert_eq!(keys.generation().unwrap(), Some(1));
     }
 
     #[test]

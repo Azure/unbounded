@@ -14,9 +14,9 @@ use testing::{FixtureIo, TestIdentity};
 
 type ControlTransport = Transport<FixtureIo>;
 
-const SNAPSHOT_PATH: &str = "/snapshot";
+const SNAPSHOT_PATH: &str = "/v1/snapshot";
 
-const BOOTSTRAP_PATH: &str = "/enroll";
+const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
 
 #[test]
 fn real_server_auth_and_mutual_tls_chunked_response() {
