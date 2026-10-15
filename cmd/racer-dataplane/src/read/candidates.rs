@@ -83,8 +83,93 @@ pub enum ProbeOutcome {
     /// An authenticated response carried a copy that could not be used locally.
     UnusableCopy,
 }
+/// How a non-owner requester orders its remote attempts across a page's
+/// ranked owners. Placement, rank, and origin authority are unchanged: this only
+/// chooses which owner receives the first Acquire.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReplicaSelection {
+    /// Visit owners in canonical rank order, so every remote read of a page
+    /// lands on the primary owner first.
+    Primary,
+    /// Visit owners that are direct overlay neighbors before owners that need
+    /// a relay hop. Among equally preferred owners, a rendezvous hash of the
+    /// requester and page picks a stable order, so one requester keeps using
+    /// the same replica for a page while different requesters spread the
+    /// load across all replicas.
+    #[default]
+    Spread,
+}
+
+/// Canonical ranks in the order a non-owner requester visits them. At most
+/// three owners exist; `ordered` itself stays the authoritative rank order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VisitOrder {
+    ranks: [u8; 3],
+    len: u8,
+}
+
+impl VisitOrder {
+    /// The identity order over the first `len` (at most three) ranks.
+    pub(crate) fn canonical(len: usize) -> Self {
+        Self {
+            ranks: [0, 1, 2],
+            len: len.min(3) as u8,
+        }
+    }
+
+    /// Canonical ranks in visiting order.
+    pub(crate) fn ranks(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.ranks[..usize::from(self.len)]
+            .iter()
+            .map(|rank| usize::from(*rank))
+    }
+
+    /// The canonical rank visited at `index`, if any.
+    pub(crate) fn get(&self, index: usize) -> Option<usize> {
+        self.ranks[..usize::from(self.len)]
+            .get(index)
+            .map(|rank| usize::from(*rank))
+    }
+}
+
+/// Order `len` canonical ranks for a non-owner requester. `Primary` returns the
+/// canonical order. `Spread` visits ranks for which `neighbor` holds first, then
+/// orders each group by descending `score` (ties keep canonical order).
+pub(crate) fn visit_order(
+    selection: ReplicaSelection,
+    len: usize,
+    neighbor: impl Fn(usize) -> bool,
+    score: impl Fn(usize) -> u64,
+) -> VisitOrder {
+    let mut order = VisitOrder::canonical(len);
+    if selection == ReplicaSelection::Primary || order.len < 2 {
+        return order;
+    }
+    let mut keys = [(false, 0u64); 3];
+    for (rank, key) in keys.iter_mut().enumerate().take(usize::from(order.len)) {
+        *key = (!neighbor(rank), u64::MAX - score(rank));
+    }
+    order.ranks[..usize::from(order.len)].sort_by_key(|rank| (keys[usize::from(*rank)], *rank));
+    order
+}
+
+/// Rendezvous weight of one owner for one requester and page. Stable within a
+/// process; it only spreads load, so it never needs to agree across nodes.
+fn replica_score(requester: &NodeId, object: &ObjectId, page: PageNumber, owner: &NodeId) -> u64 {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    let mut hasher = std::hash::DefaultHasher::new();
+    requester.0.hash(&mut hasher);
+    object.cache.0.hash(&mut hasher);
+    object.key.0.hash(&mut hasher);
+    page.0.hash(&mut hasher);
+    owner.0.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub struct CandidatePolicy {
     hedge: Option<Arc<Hedges>>,
+    replica_selection: ReplicaSelection,
     attempt_timeout: std::time::Duration,
     observer: Observer,
     pub(super) node: NodeId,
@@ -137,18 +222,29 @@ impl CandidatePolicy {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
             return Ok(None);
         };
+        // The hedge primary and duplicate are the first two owners in the same
+        // visiting order the serial fallback uses, so `primary_consumed` skips
+        // exactly the owner the hedge already asked.
+        let (object, page) = operation_identity(operation);
+        let order = self.visit_order(candidates, object, page);
+        let (first, second) = (order.get(0).unwrap_or(0), order.get(1).unwrap_or(0));
         let eligible = matches!(operation, PeerOperation::Page { .. })
             && !self.is_candidate(candidates)
             && candidates.ordered.len() >= 2
-            && candidates.ordered[0] != candidates.ordered[1]
-            // Preserve ONE cold fallback: primary(2) + duplicate(1) +
-            // rank1(sender+probe+origin=3), with links1+1+8. Additional
-            // candidates are attempted only when the original remainder funds them.
-            && budget.remaining_attempts() >= 6
+            // A pinned direct exchange carries one link, so its receiver
+            // cannot probe predecessors. Only rank 0 can serve as hedge primary.
+            && first == 0
+            && candidates.ordered[first] != candidates.ordered[second]
+            // Preserve ONE cold fallback: primary(2) + duplicate(1) + the second
+            // visited owner at rank r (sender + r probes + origin = r + 2), with
+            // links 1+1+8. Additional candidates are attempted only when the
+            // original remainder funds them.
+            && budget.remaining_attempts() >= 3 + second as u32 + 2
             && budget.remaining_links() >= 10
-            && candidates.ordered[..2]
-                .iter()
-                .all(|n| self.peers.direct_hedge_available(&candidates.membership, n));
+            && [first, second].iter().all(|rank| {
+                self.peers
+                    .direct_hedge_available(&candidates.membership, &candidates.ordered[*rank])
+            });
         if !eligible {
             hedges.suppressed();
             return Ok(None);
@@ -183,7 +279,7 @@ impl CandidatePolicy {
             let response = self
                 .request_mode(
                     &candidates.membership,
-                    &candidates.ordered[0],
+                    &candidates.ordered[first],
                     context,
                     operation,
                     FetchMode::Acquire,
@@ -214,7 +310,7 @@ impl CandidatePolicy {
         let secondary = async {
             if !self
                 .peers
-                .direct_hedge_available(&candidates.membership, &candidates.ordered[1])
+                .direct_hedge_available(&candidates.membership, &candidates.ordered[second])
             {
                 hedges.suppressed();
                 return Err(Error::Overloaded);
@@ -231,7 +327,7 @@ impl CandidatePolicy {
             let response = self
                 .request_mode(
                     &candidates.membership,
-                    &candidates.ordered[1],
+                    &candidates.ordered[second],
                     context,
                     operation,
                     FetchMode::CopyOnly,
@@ -374,6 +470,9 @@ impl CandidatePolicy {
     ) -> Self {
         Self {
             hedge: None,
+            // Low-level construction keeps canonical order; the service reads
+            // its selection from configuration (default `Spread`).
+            replica_selection: ReplicaSelection::Primary,
             attempt_timeout: std::time::Duration::from_secs(30),
             observer: Observer::default(),
             node,
@@ -392,6 +491,34 @@ impl CandidatePolicy {
     pub(crate) fn with_hedges(mut self, hedges: Arc<Hedges>) -> Self {
         self.hedge = Some(hedges);
         self
+    }
+
+    /// Choose how a non-owner requester orders its attempts across owners.
+    pub(crate) fn with_replica_selection(mut self, selection: ReplicaSelection) -> Self {
+        self.replica_selection = selection;
+        self
+    }
+
+    /// The order in which this node, as a non-owner, visits `candidates`.
+    /// Owners never use this: they probe predecessors in canonical order.
+    /// Allocation-free: neighbor checks binary-search the overlay graph.
+    pub(crate) fn visit_order(
+        &self,
+        candidates: &Candidates,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> VisitOrder {
+        let ordered = &candidates.ordered;
+        visit_order(
+            self.replica_selection,
+            ordered.len(),
+            |rank| {
+                candidates
+                    .membership
+                    .is_neighbor(&self.node, &ordered[rank])
+            },
+            |rank| replica_score(&self.node, object, page, &ordered[rank]),
+        )
     }
 
     /// Bound each local peer exchange independently of the signed operation ceiling.
@@ -724,7 +851,16 @@ impl CandidatePolicy {
             let mut saw_transient = false;
             let mut saw_version = false;
             let count = rank.unwrap_or(candidates.ordered.len());
-            for (index, destination) in candidates.ordered[..count].iter().enumerate() {
+            // Owners probe predecessors in canonical order. A non-owner may
+            // visit owners out of rank order; `canonical` is the destination's
+            // authoritative rank and `index` its position in the visit.
+            let order = if rank.is_some() {
+                VisitOrder::canonical(count)
+            } else {
+                self.visit_order(&candidates, object, page)
+            };
+            for (index, canonical) in order.ranks().enumerate() {
+                let destination = &candidates.ordered[canonical];
                 if continuation.primary_consumed && index == 0 {
                     let outcome = continuation
                         .primary_outcome
@@ -760,8 +896,23 @@ impl CandidatePolicy {
                     // an incoming eight-link envelope selected failure routing.
                     let remaining = (count - index) as u8;
                     Some(budget.partition(1, (budget.remaining_links() / remaining).min(4))?)
-                } else if continuation.bounded_routes {
-                    let attempts = if rank.is_some() { 1 } else { index as u32 + 2 };
+                } else if continuation.bounded_routes
+                    || (rank.is_none()
+                        && !copy_only
+                        && canonical > index
+                        && budget.remaining_attempts() >= canonical as u32 + 2
+                        && budget.remaining_links() >= 8)
+                {
+                    // Fund by the destination's canonical rank: it probes all
+                    // of its predecessors, wherever it falls in this visit.
+                    // An owner visited ahead of its canonical turn takes the
+                    // funded failure route when affordable, so its predecessor
+                    // probes are not starved of links on the shared route.
+                    let attempts = if rank.is_some() {
+                        1
+                    } else {
+                        canonical as u32 + 2
+                    };
                     let links = if rank.is_some() { 4 } else { 8 };
                     if budget.remaining_attempts() < attempts || budget.remaining_links() < links {
                         // Never send an Acquire whose receiving coordinator cannot
@@ -780,6 +931,7 @@ impl CandidatePolicy {
                 } else {
                     None
                 };
+                let funded = continuation.bounded_routes || (rank.is_none() && bounded.is_some());
                 let request_budget = bounded.as_mut().unwrap_or(&mut *budget);
                 let response = self
                     .request_traced(
@@ -790,13 +942,15 @@ impl CandidatePolicy {
                         mode,
                         scope,
                         request_budget,
+                        // Remaining opportunities in visiting order, including
+                        // this one; owners also reserve a share for origin.
                         (count - index + usize::from(rank.is_some())) as u32,
-                        if continuation.bounded_routes {
+                        if funded {
                             RequestMode::FundedRoute
                         } else {
                             RequestMode::SharedRoute
                         },
-                        Some((trail, index as u8)),
+                        Some((trail, canonical as u8)),
                     )
                     .await;
                 if let Some(bounded) = bounded {
@@ -1968,6 +2122,320 @@ pub(super) mod tests {
             Rc::new(CredentialCrypto::new(keys, admission)),
         )
     }
+    fn visit(
+        selection: ReplicaSelection,
+        len: usize,
+        neighbors: &[usize],
+        scores: [u64; 3],
+    ) -> Vec<usize> {
+        super::visit_order(selection, len, |r| neighbors.contains(&r), |r| scores[r])
+            .ranks()
+            .collect()
+    }
+
+    #[test]
+    fn visit_order_primary_is_canonical_regardless_of_neighbors_or_scores() {
+        for len in 0..=4 {
+            let expected: Vec<_> = (0..len.min(3)).collect();
+            assert_eq!(
+                visit(ReplicaSelection::Primary, len, &[2], [1, 2, 3]),
+                expected
+            );
+            assert_eq!(
+                visit(ReplicaSelection::Primary, len, &[], [9, 0, 5]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn visit_order_spread_prefers_neighbors_then_highest_score() {
+        use ReplicaSelection::Spread;
+        // All neighbors: pure rendezvous order by descending score.
+        assert_eq!(visit(Spread, 3, &[0, 1, 2], [1, 3, 2]), vec![1, 2, 0]);
+        // Neighbors first even with lower scores; non-neighbors last.
+        assert_eq!(visit(Spread, 3, &[2], [9, 8, 1]), vec![2, 0, 1]);
+        assert_eq!(visit(Spread, 3, &[0, 2], [1, 9, 2]), vec![2, 0, 1]);
+        // No neighbors: rendezvous order over all owners.
+        assert_eq!(visit(Spread, 3, &[], [1, 3, 2]), vec![1, 2, 0]);
+        // Equal scores keep canonical order within a group.
+        assert_eq!(visit(Spread, 3, &[0, 1, 2], [5, 5, 5]), vec![0, 1, 2]);
+        // Two candidates and fewer.
+        assert_eq!(visit(Spread, 2, &[1], [9, 1, 0]), vec![1, 0]);
+        assert_eq!(visit(Spread, 2, &[0, 1], [1, 9, 0]), vec![1, 0]);
+        assert_eq!(visit(Spread, 1, &[], [0, 9, 9]), vec![0]);
+        assert!(visit(Spread, 0, &[0], [0, 0, 0]).is_empty());
+        // Never more than three ranks.
+        assert_eq!(visit(Spread, 5, &[0, 1, 2], [1, 2, 3]), vec![2, 1, 0]);
+    }
+
+    fn spread_membership(count: usize) -> std::sync::Arc<crate::topology::Membership> {
+        use crate::topology::Member;
+        use crate::topology::Membership;
+        std::sync::Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                (0..count)
+                    .map(|i| Member {
+                        node: NodeId(format!("33333333-3333-4333-8333-{i:012}")),
+                        shares: std::num::NonZeroU32::new(4).unwrap(),
+                        peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
+                        rails: vec![],
+                        site: String::new(),
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn spread_policy(node: NodeId, selection: ReplicaSelection) -> CandidatePolicy {
+        let peers = Rc::new(RecordedPeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        policy(node, peers).with_replica_selection(selection)
+    }
+
+    #[test]
+    fn policy_visit_order_is_deterministic_and_neighbor_first_on_large_membership() {
+        let membership = spread_membership(100);
+        let placement = Placement::new(64);
+        let mut neighbor_first = 0;
+        let mut relayed_first_primary = 0;
+        let mut relayed_first_spread = 0;
+        for requester in membership.members().iter().take(20) {
+            let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+            let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
+            for page in 0..64 {
+                let candidates = placement
+                    .rank(membership.clone(), &object(), PageNumber(page))
+                    .unwrap();
+                if candidates.ordered.contains(&requester.node) {
+                    continue;
+                }
+                let order = spread.visit_order(&candidates, &object(), PageNumber(page));
+                assert_eq!(
+                    order,
+                    spread.visit_order(&candidates, &object(), PageNumber(page)),
+                    "same requester and page must keep the same replica"
+                );
+                assert_eq!(
+                    primary
+                        .visit_order(&candidates, &object(), PageNumber(page))
+                        .ranks()
+                        .collect::<Vec<_>>(),
+                    vec![0, 1, 2]
+                );
+                let near: Vec<bool> = order
+                    .ranks()
+                    .map(|rank| membership.is_neighbor(&requester.node, &candidates.ordered[rank]))
+                    .collect();
+                // Neighbors strictly precede non-neighbors.
+                assert!(near.windows(2).all(|w| w[0] || !w[1]), "{near:?}");
+                let mut ranks: Vec<_> = order.ranks().collect();
+                ranks.sort_unstable();
+                assert_eq!(ranks, vec![0, 1, 2]);
+                neighbor_first += usize::from(near[0]);
+                relayed_first_spread += usize::from(!near[0]);
+                relayed_first_primary +=
+                    usize::from(!membership.is_neighbor(&requester.node, &candidates.ordered[0]));
+            }
+        }
+        assert!(neighbor_first > 0);
+        assert!(
+            relayed_first_spread < relayed_first_primary,
+            "spread {relayed_first_spread} must relay less than primary {relayed_first_primary}"
+        );
+    }
+
+    #[test]
+    fn spread_splits_first_choice_evenly_across_neighbor_replicas() {
+        // Four members form a complete graph, so every owner is a neighbor.
+        let membership = membership();
+        let placement = Placement::new(64);
+        let mut counts = [0usize; 3];
+        let mut total = 0;
+        for requester in membership.members() {
+            let policy = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+            for page in 0..3000 {
+                let candidates = placement
+                    .rank(membership.clone(), &object(), PageNumber(page))
+                    .unwrap();
+                if candidates.ordered.contains(&requester.node) {
+                    continue;
+                }
+                assert!(
+                    candidates
+                        .ordered
+                        .iter()
+                        .all(|owner| membership.is_neighbor(&requester.node, owner))
+                );
+                let first = policy
+                    .visit_order(&candidates, &object(), PageNumber(page))
+                    .get(0)
+                    .unwrap();
+                counts[first] += 1;
+                total += 1;
+            }
+        }
+        assert!(total > 2000, "{total}");
+        for count in counts {
+            let share = count as f64 / total as f64;
+            assert!((0.28..0.39).contains(&share), "{counts:?}");
+        }
+    }
+
+    #[test]
+    fn spread_noncandidate_funds_out_of_order_owner_by_canonical_rank() {
+        futures::executor::block_on(async {
+            let membership = membership();
+            let placement = Placement::new(8);
+            let local = membership
+                .members()
+                .iter()
+                .find(|member| {
+                    !placement
+                        .rank(membership.clone(), &object(), PageNumber(0))
+                        .unwrap()
+                        .ordered
+                        .contains(&member.node)
+                })
+                .unwrap()
+                .node
+                .clone();
+            // Find a page whose spread order visits a non-primary owner first.
+            let probe = spread_policy(local.clone(), ReplicaSelection::Spread);
+            let (page, candidates, order) = (0..256)
+                .map(PageNumber)
+                .find_map(|page| {
+                    let candidates = placement.rank(membership.clone(), &object(), page).ok()?;
+                    if candidates.ordered.contains(&local) {
+                        return None;
+                    }
+                    let order = probe.visit_order(&candidates, &object(), page);
+                    (order.get(0) == Some(2)).then_some((page, candidates, order))
+                })
+                .expect("some page visits rank 2 first");
+            for selection in [ReplicaSelection::Primary, ReplicaSelection::Spread] {
+                let peers = Rc::new(FundedPeer::default());
+                let policy = CandidatePolicy::new(
+                    local.clone(),
+                    Rc::new(Placement::new(8)),
+                    Requester::scripted(
+                        peers.clone(),
+                        FundedPeer::direct_hedge_available,
+                        FundedPeer::request,
+                        FundedPeer::request_direct,
+                    ),
+                    probe.credentials.clone(),
+                    probe.published.clone(),
+                )
+                .with_replica_selection(selection);
+                let context = OriginContext {
+                    object: object(),
+                    metadata: None,
+                    authorization: None,
+                };
+                let scope = scope();
+                let mut budget = AcquisitionBudget::new(scope.deadline.0, 32, 96);
+                let operation = PeerOperation::Page {
+                    page: crate::model::PageId {
+                        version: crate::model::ObjectVersion {
+                            object: object(),
+                            etag: crate::model::StrongEtag::test_value("v1"),
+                        },
+                        number: page,
+                    },
+                    mode: FetchMode::Acquire,
+                };
+                assert!(matches!(
+                    policy
+                        .resolve_with_budget(
+                            candidates.clone(),
+                            &context,
+                            operation,
+                            &scope,
+                            &mut budget
+                        )
+                        .await,
+                    Err(Error::Unavailable)
+                ));
+                let calls = peers.calls.borrow();
+                let visited: Vec<_> = calls.iter().map(|(to, ..)| to.clone()).collect();
+                let expected: Vec<usize> = match selection {
+                    ReplicaSelection::Primary => vec![0, 1, 2],
+                    ReplicaSelection::Spread => order.ranks().collect(),
+                };
+                assert_eq!(
+                    visited,
+                    expected
+                        .iter()
+                        .map(|rank| candidates.ordered[*rank].clone())
+                        .collect::<Vec<_>>()
+                );
+                assert!(calls.iter().all(|(_, copy, ..)| !copy));
+                if selection == ReplicaSelection::Spread {
+                    // Rank 2 visited first: it must be able to probe two
+                    // predecessors and then reach origin, over failure routes.
+                    let (_, _, attempts, links) = &calls[0];
+                    assert_eq!(*attempts, 3);
+                    assert_eq!(*links, 8);
+                } else {
+                    // Legacy primary first: shared route, shared credits.
+                    assert_eq!(calls[0].3, 4);
+                }
+            }
+        });
+    }
+
+    /// Records each request's destination, mode, and route funding, then fails.
+    #[derive(Default)]
+    struct FundedPeer {
+        #[allow(clippy::type_complexity)]
+        calls: RefCell<Vec<(NodeId, bool, u32, u8)>>,
+    }
+    impl FundedPeer {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
+            false
+        }
+        fn request_direct<'a>(
+            &'a self,
+            _: PeerRequest,
+            _: std::sync::Arc<crate::topology::Membership>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            panic!("funding fixture does not admit direct hedges")
+        }
+        fn request<'a>(
+            &'a self,
+            request: PeerRequest,
+            _: std::sync::Arc<crate::topology::Membership>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            Box::pin(async move {
+                let copy = matches!(
+                    request.operation,
+                    PeerOperation::Page {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    }
+                );
+                self.calls.borrow_mut().push((
+                    request.route.destination,
+                    copy,
+                    request.route.remaining_attempts,
+                    request.route.remaining_links,
+                ));
+                Err(Error::Unavailable)
+            })
+        }
+    }
+
     #[test]
     fn only_candidates_mint_authority_after_ordered_copy_probes() {
         ordered_predecessor_probes(4);

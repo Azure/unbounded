@@ -92,6 +92,8 @@ pub struct Config {
     pub warm: crate::read::warm::Config,
     pub send_crc_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
+    /// Order in which a non-owner requester visits a page's ranked owners.
+    pub replica_selection: crate::read::candidates::ReplicaSelection,
     pub peer_admission: crate::peer::Config,
     pub peer_receive: crate::peer::receive::Config,
     pub shares: std::num::NonZeroU32,
@@ -209,6 +211,11 @@ impl Config {
                     raw.page_hedge_bytes
                         .unwrap_or(crate::read::candidates::DUPLICATE_BYTES as u64),
                 )?,
+            },
+            replica_selection: match raw.replica_selection.as_deref().unwrap_or("spread") {
+                "primary" => crate::read::candidates::ReplicaSelection::Primary,
+                "spread" => crate::read::candidates::ReplicaSelection::Spread,
+                _ => return Err(Error::InvalidConfiguration),
             },
             peer_admission: crate::peer::Config {
                 total: to_usize(raw.peer_inflight_max.unwrap_or(256))?,
@@ -593,6 +600,7 @@ const ENV_NAMES: &[&str] = &[
     "PAGE_HEDGE_DELAY_MS",
     "PAGE_HEDGE_SLOTS",
     "PAGE_HEDGE_BYTES",
+    "REPLICA_SELECTION",
     "PEER_INFLIGHT_MAX",
     "PEER_PER_NEIGHBOR_MAX",
     "SHARES",
@@ -676,6 +684,7 @@ struct RawConfig {
     page_hedge_slots: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     page_hedge_bytes: Option<u64>,
+    replica_selection: Option<String>,
     #[serde(default, deserialize_with = "decimal")]
     peer_inflight_max: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -1690,6 +1699,33 @@ mod tests {
             ],
         ] {
             assert!(parse(&pairs).is_err());
+        }
+    }
+
+    #[test]
+    fn replica_selection_defaults_to_spread_and_accepts_exact_values() {
+        use crate::read::candidates::ReplicaSelection;
+        assert_eq!(
+            parse(&[]).unwrap().replica_selection,
+            ReplicaSelection::Spread
+        );
+        assert_eq!(
+            parse(&[("RACER_REPLICA_SELECTION", "spread")])
+                .unwrap()
+                .replica_selection,
+            ReplicaSelection::Spread
+        );
+        assert_eq!(
+            parse(&[("RACER_REPLICA_SELECTION", "primary")])
+                .unwrap()
+                .replica_selection,
+            ReplicaSelection::Primary
+        );
+        for value in ["", "Primary", "SPREAD", "neighbor", "primary ", "random"] {
+            assert!(
+                parse(&[("RACER_REPLICA_SELECTION", value)]).is_err(),
+                "{value:?}"
+            );
         }
     }
 

@@ -288,6 +288,7 @@ pub mod cluster {
             warm: Default::default(),
             send_crc_pair: None,
             page_hedge: Default::default(),
+            replica_selection: Default::default(),
             peer_admission: Default::default(),
             peer_receive: Default::default(),
             shares: NonZeroU32::new(4).unwrap(),
