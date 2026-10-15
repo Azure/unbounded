@@ -14,8 +14,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-// siteAffinity mirrors component.SiteNodeAffinity: two OR'd terms, matching the
-// canonical and the deprecated Site label. Per-Site workloads always carry it.
+// siteAffinity mirrors component.SiteNodeAffinity's canonical Site label.
 func siteAffinity(site string) map[string]any {
 	term := func(key string) any {
 		return map[string]any{
@@ -34,7 +33,6 @@ func siteAffinity(site string) map[string]any {
 			"requiredDuringSchedulingIgnoredDuringExecution": map[string]any{
 				"nodeSelectorTerms": []any{
 					term("unbounded-cloud.io/site"),
-					term("net.unbounded-cloud.io/site"),
 				},
 			},
 		},
@@ -227,8 +225,8 @@ func TestApplyPreservesSiteAffinity(t *testing.T) {
 	spec := podSpec(t, plan.Operations[0].Object)
 
 	terms := spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
-	if len(terms) != 2 {
-		t.Fatalf("terms = %d, want 2 (two operator terms x one user term)", len(terms))
+	if len(terms) != 1 {
+		t.Fatalf("terms = %d, want 1 (one operator term x one user term)", len(terms))
 	}
 
 	// Every product term must carry both the Site constraint and the user's.
@@ -237,7 +235,7 @@ func TestApplyPreservesSiteAffinity(t *testing.T) {
 
 		for _, expr := range term.MatchExpressions {
 			switch expr.Key {
-			case "unbounded-cloud.io/site", "net.unbounded-cloud.io/site":
+			case "unbounded-cloud.io/site":
 				sawSite = true
 
 				if expr.Values[0] != "rack-a" {
@@ -262,6 +260,21 @@ func TestApplyPreservesSiteAffinity(t *testing.T) {
 // operator terms combined with two user terms must produce four, not two.
 func TestApplyAffinityIsCartesian(t *testing.T) {
 	workload := testWorkload("rack-a")
+	// Generic OR composition is independent of the product's one Site term.
+	path := []string{"spec", "template", "spec", "affinity", "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution", "nodeSelectorTerms"}
+
+	operatorTerms, _, err := unstructured.NestedSlice(workload.Object, path...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	operatorTerms = append(operatorTerms, map[string]any{"matchExpressions": []any{map[string]any{
+		"key": "topology.kubernetes.io/zone", "operator": "In", "values": []any{"zone-a"},
+	}}})
+	if err := unstructured.SetNestedSlice(workload.Object, operatorTerms, path...); err != nil {
+		t.Fatal(err)
+	}
+
 	plan := planWith(workload, "metalman", "rack-a")
 
 	entries := entriesFrom(t, doc(`  - component: metalman

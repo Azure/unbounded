@@ -254,11 +254,11 @@ func assertSiteAffinity(t *testing.T, affinity *corev1.Affinity, siteName string
 	}
 
 	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
-	if len(terms) != 2 {
-		t.Fatalf("node selector terms len = %d, want 2: %#v", len(terms), terms)
+	if len(terms) != 1 {
+		t.Fatalf("node selector terms len = %d, want 1: %#v", len(terms), terms)
 	}
 
-	want := map[string]bool{component.SiteLabelKey: false, component.DeprecatedSiteLabelKey: false}
+	want := map[string]bool{component.SiteLabelKey: false}
 
 	for _, term := range terms {
 		if len(term.MatchExpressions) != 1 {

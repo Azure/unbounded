@@ -17,10 +17,10 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-func TestEmbeddedInventoryIsControllerOnly(t *testing.T) {
+func TestEmbeddedInventory(t *testing.T) {
 	files, err := fs.Glob(manifests.Manifests, "*")
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"config.yaml", "controller.yaml", "controller-pdb.yaml", "node-restriction.yaml", "rbac.yaml"}, files)
+	require.ElementsMatch(t, []string{"config.yaml", "controller.yaml", "controller-pdb.yaml", "dataplane-config.yaml", "node-restriction.yaml", "rbac.yaml"}, files)
 
 	for _, namespace := range []string{"unbounded-system", "custom-system"} {
 		t.Run(namespace, func(t *testing.T) {
@@ -35,7 +35,10 @@ func TestEmbeddedInventoryIsControllerOnly(t *testing.T) {
 					require.Equal(t, namespace, obj.GetNamespace())
 				}
 
-				require.NotContains(t, obj.GetName(), "dataplane")
+				// The DaemonSets are built in Go; only their config and identity are static.
+				if obj.GetKind() != "ServiceAccount" && obj.GetKind() != "ConfigMap" {
+					require.NotContains(t, obj.GetName(), "dataplane")
+				}
 
 				if obj.GetKind() == "Role" || obj.GetKind() == "ClusterRole" {
 					role := &rbacv1.ClusterRole{}
@@ -80,7 +83,7 @@ func TestEmbeddedInventoryIsControllerOnly(t *testing.T) {
 			}
 
 			require.ElementsMatch(t, []string{
-				"ConfigMap/racer-config", "Deployment/racer-controller", "Service/racer-controller", "PodDisruptionBudget/racer-controller",
+				"ConfigMap/racer-config", "ConfigMap/racer-dataplane-config", "ServiceAccount/racer-dataplane", "Deployment/racer-controller", "Service/racer-controller", "PodDisruptionBudget/racer-controller",
 				"ServiceAccount/racer-controller", "Role/racer-controller", "RoleBinding/racer-controller", "ClusterRole/racer-controller", "ClusterRoleBinding/racer-controller",
 				"ValidatingAdmissionPolicy/racer-node-write-restriction", "ValidatingAdmissionPolicyBinding/racer-node-write-restriction",
 			}, inventory)

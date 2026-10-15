@@ -6,7 +6,6 @@ package main
 import (
 	"context"
 	"os"
-	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -29,8 +28,6 @@ func TestObsoleteRacerEnvironmentIgnored(t *testing.T) {
 		{name: "invalid", value: "yes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			unsetenv(t, "UNBOUNDED_REAP_LEGACY_RESOURCES")
-
 			if tc.unset {
 				unsetenv(t, "ENABLE_RACER")
 			} else {
@@ -61,81 +58,6 @@ func TestRuntimeSchemeIncludesClusterCache(t *testing.T) {
 		if _, err := scheme.New(racerv1.GroupVersion.WithKind(kind)); err != nil {
 			t.Fatal(err)
 		}
-	}
-}
-
-func TestReapLegacyResourcesConfiguration(t *testing.T) {
-	cases := []struct {
-		name    string
-		setEnv  bool
-		env     string
-		args    []string
-		want    bool
-		wantErr bool
-	}{
-		{name: "unset defaults true", want: true},
-		{name: "valid false environment", setEnv: true, env: "false", want: false},
-		{name: "valid true environment", setEnv: true, env: "true", want: true},
-		{name: "empty environment errors", setEnv: true, env: "", wantErr: true},
-		{name: "invalid environment errors", setEnv: true, env: "notabool", wantErr: true},
-		{
-			name:   "explicit flag overrides malformed environment",
-			setEnv: true,
-			env:    "notabool",
-			args:   []string{"--reap-legacy-resources=false"},
-			want:   false,
-		},
-	}
-
-	const key = "UNBOUNDED_REAP_LEGACY_RESOURCES"
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.setEnv {
-				t.Setenv(key, tc.env)
-			} else {
-				unsetenv(t, key)
-			}
-
-			called := false
-
-			var got config
-
-			cmd := newCommand(func(_ context.Context, cfg config) error {
-				called = true
-				got = cfg
-
-				return nil
-			})
-			cmd.SetArgs(tc.args)
-			cmd.SilenceErrors = true
-			cmd.SilenceUsage = true
-
-			err := cmd.Execute()
-			if tc.wantErr {
-				if err == nil || !strings.Contains(err.Error(), key) {
-					t.Fatalf("Execute error = %v, want error naming %s", err, key)
-				}
-
-				if called {
-					t.Fatal("runner called after environment parsing error")
-				}
-
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("Execute returned error: %v", err)
-			}
-
-			if !called {
-				t.Fatal("runner was not called")
-			}
-
-			if got.reapLegacyResources != tc.want {
-				t.Fatalf("reapLegacyResources = %v, want %v", got.reapLegacyResources, tc.want)
-			}
-		})
 	}
 }
 

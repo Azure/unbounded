@@ -6,6 +6,15 @@ metadata:
   name: racer-controller
   namespace: unbounded-system
 ---
+# Dataplane Pods authenticate with projected tokens mounted by the operator's
+# DaemonSets; the default automount stays off.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-dataplane
+  namespace: unbounded-system
+automountServiceAccountToken: false
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

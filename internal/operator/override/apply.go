@@ -201,6 +201,12 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 		return result
 	}
 
+	if err := normalizeDaemonSetStrategy(candidate, target.Contributors); err != nil {
+		result.Err = err
+
+		return result
+	}
+
 	if validate := plan.Operations[target.Index].ValidateOverride; validate != nil {
 		if err := validate(original, candidate); err != nil {
 			result.Err = fmt.Errorf("%s: %w", contributorSources(target.Contributors), err)

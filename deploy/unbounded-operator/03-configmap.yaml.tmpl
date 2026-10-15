@@ -35,6 +35,3 @@ data:
   # --set APIServerEndpoint=; `kubectl unbounded install --api-server-endpoint`
   # overrides it in place (an empty value is preserved across reinstalls).
   UNBOUNDED_API_SERVER_ENDPOINT: {{ default "" .APIServerEndpoint | quote }}
-  # Whether the operator translates legacy net-group Sites, migrates state into
-  # this namespace, and reaps the pre-consolidation namespaces.
-  UNBOUNDED_REAP_LEGACY_RESOURCES: {{ default "true" .ReapLegacyResources | quote }}

@@ -62,9 +62,9 @@ var componentImages = map[string][]string{
 	"net":             {"unbounded-net-controller", "unbounded-net-node"},
 	"machina":         {"machina"},
 	"gantry":          {"gantry"},
+	"racer":           {"racer-controller", "racer-dataplane"},
 	"metalman":        {"metalman"},
 	"token-refresher": {"token-refresher"},
-	"racer":           {"racer-controller"},
 }
 
 // releaseBOMSource is the tool whose hardcoded image list feeds the signed

@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -90,8 +92,8 @@ func checkNewInstallation(ctx context.Context, env *component.Env) error {
 	return checkInstallationResources(ctx, env, false)
 }
 
-// Existing controller state cannot be adopted or overwritten with a new identity.
-// External dataplane workloads are not installation evidence owned by this component.
+// Existing controller or dataplane state cannot be adopted or overwritten with a
+// new identity. This component owns the dataplane workloads, so they are evidence.
 func checkInstallationResources(ctx context.Context, env *component.Env, stagedMarker bool) error {
 	manifests, err := decodeRuntimeManifests(env)
 	if err != nil {
@@ -103,6 +105,9 @@ func checkInstallationResources(ctx context.Context, env *component.Env, stagedM
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tlsName, Namespace: env.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: credentialsName, Namespace: env.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: dataplaneConfig, Namespace: env.Namespace}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: members.PodNetworkDaemonSetName, Namespace: env.Namespace}},
 	}
 	if !stagedMarker {
 		objects = append(objects, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: env.Namespace}})

@@ -1,0 +1,11 @@
+# Operations carrier only; does not rebuild or replace the Rust dataplane.
+FROM docker.io/library/golang:1.26-bookworm AS builder
+WORKDIR /src
+COPY hack/scripts/racer-dynamic-guard/launcher/main.go ./main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /racer-guard-launch main.go
+
+FROM docker.io/library/python:3.12-slim
+COPY --from=builder /racer-guard-launch /racer-guard-launch
+COPY LICENSE NOTICE /usr/share/licenses/racer-guard/
+USER 0:0
+ENTRYPOINT ["/bin/cp", "/racer-guard-launch", "/out/racer-guard-launch"]
