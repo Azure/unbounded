@@ -725,7 +725,7 @@ impl<S> Drop for CapacityWaiter<'_, S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "simulation"))]
 mod expiry_snapshot_tests {
     use super::*;
 
