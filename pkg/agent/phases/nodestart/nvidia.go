@@ -85,6 +85,14 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 		slog.Int("libraries", len(libs)),
 	)
 
+	// Rootfs images without Debian multiarch paths, such as Azure Linux, lack
+	// this directory and do not search it.
+	for _, args := range nvidiaContainerLibDirCommands(s.goalState.Nvidia.ContainerLibDir) {
+		if _, err := executil.MachineRun(ctx, s.log, machine, args...); err != nil {
+			return fmt.Errorf("prepare NVIDIA library directory %s: %w", s.goalState.Nvidia.ContainerLibDir, err)
+		}
+	}
+
 	// Clean stale symlinks from a previous session that may point into
 	// /run/host-nvidia/ paths that no longer exist.
 	if _, err := executil.MachineRun(ctx, s.log, machine,
@@ -122,6 +130,20 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	)
 
 	return nil
+}
+
+// nvidiaContainerLinkerConfig lists the container library directory for the
+// dynamic linker. It duplicates the default entry on Debian-based images.
+const nvidiaContainerLinkerConfig = "/etc/ld.so.conf.d/unbounded-nvidia.conf"
+
+// nvidiaContainerLibDirCommands returns the commands that create the container
+// library directory for host NVIDIA library links and add it to the linker
+// search path.
+func nvidiaContainerLibDirCommands(libDir string) [][]string {
+	return [][]string{
+		{"mkdir", "-p", libDir},
+		{"sh", "-c", `printf '%s\n' "$1" > "$2"`, "sh", libDir, nvidiaContainerLinkerConfig},
+	}
 }
 
 type nvidiaDriverRootPaths struct {

@@ -22,11 +22,12 @@ name: unbounded release
 #     -> binaries          (GoReleaser; creates draft GitHub release)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
-#     -> netboot-image     (PXE boot artifact image)
+#     -> netboot-image     (PXE boot artifact images)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           orca, gantry, host-ubuntu2404,
-#                           inventory-aggregator, inventory-inspector, inventory-viewer)
+#                           orca, gantry, host-ubuntu2404, host-azurelinux3,
+#                           host-azurelinux3-nvidia, inventory-aggregator,
+#                           inventory-inspector, inventory-viewer)
 #         -> gantry-chart  (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> finalize          (attach extras + krew manifest)
@@ -621,12 +622,22 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # Build, push, sign, and SBOM-attest the netboot image before metalman is
+  # Build, push, sign, and SBOM-attest the netboot images before metalman is
   # built. The metalman binary is stamped with this exact default netboot tag.
+  # netboot-azurelinux runs the Azure Linux installer kernel for hosts whose
+  # NIC driver the Ubuntu kernel lacks.
   # ---------------------------------------------------------------------------
   netboot-image:
     needs: version
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - name: netboot
+            kernel: ubuntu
+          - name: netboot-azurelinux
+            kernel: azurelinux
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -661,24 +672,25 @@ jobs:
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
             CONTAINER_REGISTRY=${{ env.REGISTRY }}
-          tags: ${{ env.REGISTRY }}/netboot:${{ needs.version.outputs.tag }}
-          cache-from: type=gha,scope=netboot
-          cache-to: type=gha,scope=netboot,mode=max
+            INSTALLER_KERNEL=${{ matrix.component.kernel }}
+          tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.component.name }}
+          cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
 
       - name: Sign container image
         run: |
           cosign sign --yes \
-            "${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}"
+            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          image: ${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           format: spdx-json
-          artifact-name: sbom-netboot.spdx.json
-          output-file: sbom-netboot.spdx.json
+          artifact-name: sbom-${{ matrix.component.name }}.spdx.json
+          output-file: sbom-${{ matrix.component.name }}.spdx.json
           # Defaults to true, and its uploader is neither idempotent nor
           # able to cope with a release that does not exist yet. The next
           # step attaches this with --clobber instead; see the header.
@@ -687,9 +699,9 @@ jobs:
       - name: Attest SBOM to image
         run: |
           cosign attest --yes \
-            --predicate sbom-netboot.spdx.json \
+            --predicate sbom-${{ matrix.component.name }}.spdx.json \
             --type spdxjson \
-            "${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}"
+            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       # After the attestation, not before: the attestation is the
       # authoritative, digest-bound copy, and it should never be blocked by the
@@ -702,7 +714,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh release upload "$TAG" sbom-netboot.spdx.json --clobber
+          gh release upload "$TAG" sbom-${{ matrix.component.name }}.spdx.json --clobber
 
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest metalman after its default netboot
@@ -813,8 +825,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest the component images that have no
   # release-time image ordering requirements.
-  # Go components cross-compile natively for amd64 and arm64; host-ubuntu2404
-  # publishes both platforms for PXE architecture support.
+  # Go components cross-compile natively for amd64 and arm64; the host-* machine
+  # images publish both platforms for PXE architecture support.
   # ---------------------------------------------------------------------------
   component-images:
     needs: version
@@ -859,6 +871,14 @@ jobs:
             trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: false
+          - name: host-azurelinux3
+            file: images/host-azurelinux3/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: false
+          - name: host-azurelinux3-nvidia
+            file: images/host-azurelinux3-nvidia/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: false
           - name: inventory-aggregator

@@ -83,6 +83,57 @@ log_disks() {
     done
 }
 
+# The installer has no udev, so /dev/disk/by-id links do not exist. Create the
+# common NVMe and virtio names so targetDisk can use a stable by-id path.
+trim_id() {
+    # Drop leading and trailing spaces and join inner runs with "_".
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    trim_ifs=$IFS
+    IFS=_
+    echo "$*"
+    IFS=$trim_ifs
+}
+
+link_disk_ids() {
+    mkdir -p /dev/disk/by-id
+    for disk in /sys/block/nvme*n* /sys/block/vd*; do
+        [ -e "$disk" ] || continue
+        [ -e "$disk/partition" ] && continue
+        name=$(basename "$disk")
+        case "$name" in
+            nvme*)
+                model=$(trim_id "$(cat "$disk/device/model" 2>/dev/null || true)")
+                serial=$(trim_id "$(cat "$disk/device/serial" 2>/dev/null || true)")
+                wwid=$(trim_id "$(cat "$disk/wwid" 2>/dev/null || true)")
+                nsid=$(cat "$disk/nsid" 2>/dev/null || true)
+                nsid=${nsid:-${name##*n}}
+                if [ -n "$model" ] && [ -n "$serial" ]; then
+                    ln -sfn "../../$name" "/dev/disk/by-id/nvme-${model}_${serial}_${nsid}"
+                    [ "$nsid" = 1 ] && ln -sfn "../../$name" "/dev/disk/by-id/nvme-${model}_${serial}"
+                fi
+                [ -n "$wwid" ] && ln -sfn "../../$name" "/dev/disk/by-id/nvme-${wwid}"
+                ;;
+            vd*)
+                serial=$(trim_id "$(cat "$disk/serial" 2>/dev/null || true)")
+                [ -n "$serial" ] && ln -sfn "../../$name" "/dev/disk/by-id/virtio-${serial}"
+                ;;
+        esac
+    done
+    return 0
+}
+
+target_disk_exists() {
+    [ -e "$TARGET_DISK" ] && return 0
+    case "$TARGET_DISK" in
+        /dev/disk/by-id/*) link_disk_ids ;;
+        *) return 1 ;;
+    esac
+    [ -e "$TARGET_DISK" ]
+}
+
 target_disk_sysfs() {
     base=$(basename "$TARGET_DISK")
     sysdisk=$(readlink -f "/sys/class/block/$base" 2>/dev/null || true)
@@ -129,6 +180,14 @@ NODE_NAME=$(get_param unbounded.node_name || true)
 NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
 APISERVER_URL=$(get_param unbounded.apiserver_url || true)
 DNS_SERVERS=$(get_param unbounded.dns || true)
+VIRTUAL_MEDIA=$(get_param unbounded.virtual_media || true)
+MEDIA_CALLBACK=$(get_param unbounded.media_callback || true)
+if [ "$VIRTUAL_MEDIA" = 1 ]; then
+    case "$MEDIA_CALLBACK" in
+        http://*/bootmedia/*) ;;
+        *) fatal "invalid virtual media callback URL" ;;
+    esac
+fi
 BOOT_MAC=$(normalize_mac "$BOOT_MAC")
 if [ -z "$BOOT_MAC" ] && [ -n "$BOOTIF" ]; then
     BOOT_MAC=$(bootif_to_mac "$BOOTIF")
@@ -268,7 +327,8 @@ if [ -z "$TARGET_DISK" ]; then
     retry 30 1 "find block device" find_disk || fatal "no target disk found"
     log "WARNING: target disk was not specified, selected largest disk"
 else
-    if [ ! -e "$TARGET_DISK" ]; then
+    if ! retry 30 1 "find target disk $TARGET_DISK" target_disk_exists; then
+        log_disks
         fatal "target disk $TARGET_DISK does not exist"
     fi
 fi
@@ -317,7 +377,31 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
     retry 20 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
     retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
 
-    if [ -n "$IP_PARAM" ]; then
+    if [ -n "$IP_PARAM" ] && [ ! -d /mnt/etc/netplan ] && [ -d /mnt/etc/systemd/network ]; then
+        # Images without netplan (for example Azure Linux) use
+        # systemd-networkd directly. The lower file name sorts before the
+        # image's default DHCP file, which is removed so that other NICs do
+        # not add competing default routes.
+        log "persisting static network configuration for systemd-networkd"
+        rm -f /mnt/etc/systemd/network/90-unbounded-dhcp.network
+        {
+            echo "[Match]"
+            echo "MACAddress=${BOOT_MAC}"
+            echo ""
+            echo "[Network]"
+            echo "DHCP=no"
+            echo "IPv6AcceptRA=no"
+            echo "Address=${CLIENT_IP}/${PREFIX}"
+            [ -z "$GW" ] || echo "Gateway=${GW}"
+            old_ifs=$IFS
+            IFS=,
+            for dns in $DNS_SERVERS; do
+                echo "DNS=${dns}"
+            done
+            IFS=$old_ifs
+        } > /mnt/etc/systemd/network/10-unbounded-metal.network
+        chmod 644 /mnt/etc/systemd/network/10-unbounded-metal.network
+    elif [ -n "$IP_PARAM" ]; then
         log "persisting static network configuration"
         mkdir -p /mnt/etc/netplan
         rm -f /mnt/etc/netplan/50-cloud-init.yaml
@@ -416,7 +500,28 @@ if [ -d /sys/firmware/efi ]; then
     done
 fi
 
-if [ -n "$SERVE_URL" ]; then
+if [ "$VIRTUAL_MEDIA" = 1 ]; then
+    # Stay in RAM until the controller has detached the ISO and cleared its
+    # boot override. Requests are bounded, but waiting has no deadline: late
+    # cleanup must let this installer reboot without writing the disk again.
+    # If ownership is removed, an operator must resolve the blocked handoff.
+    media_ack() {
+        local status
+        status=$(curl --connect-timeout 5 --max-time 15 --retry 0 \
+            --silent --output /dev/null --write-out '%{http_code}' \
+            --request "$1" "$MEDIA_CALLBACK/$2") || return 1
+        [ "$status" = 200 ]
+    }
+    log "reporting virtual media installation complete"
+    until media_ack POST complete; do
+        log "waiting to persist image-written status; reboot remains blocked"
+        sleep 5
+    done
+    until media_ack GET ready; do
+        log "waiting for virtual media cleanup acknowledgment; reboot remains blocked"
+        sleep 5
+    done
+elif [ -n "$SERVE_URL" ]; then
     log "disabling PXE boot"
     retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
         || log "WARNING: failed to disable PXE boot"
