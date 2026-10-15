@@ -47,7 +47,7 @@ func TestOptionsDefaults(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if o.volume != "racer-object" || o.namespace != "store" || len(o.buckets) != 0 {
+			if o.cache != "racer-object" || o.namespace != "store" || len(o.buckets) != 0 {
 				t.Fatalf("unexpected shared defaults: %+v", o)
 			}
 
@@ -61,34 +61,34 @@ func TestOptionsDefaults(t *testing.T) {
 		})
 	}
 
-	o, err := parseOptions([]string{"origin", "--namespace=store", "--bucket=one", "--bucket=two", "--volume=custom", "--metadata-ttl=0", "--path-style=false", "--region=us-west-2", "--endpoint=https://s3.example/", "--request-timeout=2s"}, io.Discard)
+	o, err := parseOptions([]string{"origin", "--namespace=store", "--bucket=one", "--bucket=two", "--cache=custom", "--metadata-ttl=0", "--path-style=false", "--region=us-west-2", "--endpoint=https://s3.example/", "--request-timeout=2s"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if strings.Join(o.buckets, ",") != "one,two" || o.volume != "custom" || o.metadataTTL != 0 || o.pathStyle || o.region != "us-west-2" || o.requestTimeout != 2*time.Second {
+	if strings.Join(o.buckets, ",") != "one,two" || o.cache != "custom" || o.metadataTTL != 0 || o.pathStyle || o.region != "us-west-2" || o.requestTimeout != 2*time.Second {
 		t.Fatalf("flags not applied: %+v", o)
 	}
 }
 
-func TestVolumeFlag(t *testing.T) {
+func TestCacheFlag(t *testing.T) {
 	for _, mode := range []string{"origin", "sidecar"} {
 		t.Run(mode, func(t *testing.T) {
 			for _, name := range []string{"custom", "a-b.c0", strings.Repeat("a", 63) + "." + strings.Repeat("b", 18)} {
-				o, err := parseOptions([]string{mode, "--namespace=store", "--volume=" + name}, io.Discard)
-				if err != nil || o.volume != name {
-					t.Fatalf("valid volume %q: options=%+v err=%v", name, o, err)
+				o, err := parseOptions([]string{mode, "--namespace=store", "--cache=" + name}, io.Discard)
+				if err != nil || o.cache != name {
+					t.Fatalf("valid cache %q: options=%+v err=%v", name, o, err)
 				}
 			}
 
 			for _, name := range []string{"", "../bad", "Upper", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 19)} {
-				_, err := parseOptions([]string{mode, "--namespace=store", "--volume=" + name}, io.Discard)
-				if err == nil || err.Error() != "invalid --volume" {
-					t.Fatalf("invalid volume %q: %v", name, err)
+				_, err := parseOptions([]string{mode, "--namespace=store", "--cache=" + name}, io.Discard)
+				if err == nil || err.Error() != "invalid --cache" {
+					t.Fatalf("invalid cache %q: %v", name, err)
 				}
 			}
 
-			_, err := parseOptions([]string{mode, "--namespace=store", "--volume=custom", "--cache=custom"}, io.Discard)
+			_, err := parseOptions([]string{mode, "--namespace=store", "--cache=custom", "--volume=custom"}, io.Discard)
 			if err == nil || err.Error() != "invalid flags (use --help)" {
 				t.Fatalf("old flag was not rejected: %v", err)
 			}
@@ -96,7 +96,7 @@ func TestVolumeFlag(t *testing.T) {
 			var output bytes.Buffer
 
 			_, err = parseOptions([]string{mode, "--help"}, &output)
-			if !errors.Is(err, flag.ErrHelp) || !strings.Contains(output.String(), "-volume") || strings.Contains(output.String(), "-cache") {
+			if !errors.Is(err, flag.ErrHelp) || !strings.Contains(output.String(), "-cache") || strings.Contains(output.String(), "-volume") {
 				t.Fatalf("unexpected help: %q, %v", output.String(), err)
 			}
 		})
@@ -110,7 +110,7 @@ func TestOptionsErrors(t *testing.T) {
 		{"origin"},
 		{"sidecar"},
 		{"origin", "--namespace=has space"},
-		{"sidecar", "--namespace=store", "--volume=../bad"},
+		{"sidecar", "--namespace=store", "--cache=../bad"},
 		{"origin", "--namespace=store", "--bucket="},
 		{"sidecar", "--namespace=store", "--bucket=../bad"},
 		{"origin", "--namespace=store", "--request-timeout=0"},

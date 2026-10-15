@@ -42,7 +42,7 @@ func (b *bucketsFlag) Set(value string) error {
 
 type options struct {
 	mode            string
-	volume          string
+	cache           string
 	namespace       string
 	buckets         bucketsFlag
 	provider        string
@@ -99,7 +99,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 		helpErr = writeHelp(output, "Usage: racer-object "+o.mode+" [flags]\n"+defaults.String())
 	}
-	volume := fs.String("volume", "racer-object", "Racer volume name")
+	cache := fs.String("cache", "racer-object", "Racer cache name (ClusterCache)")
 	fs.StringVar(&o.namespace, "namespace", "", "Required stable upstream identity; use the same value in origin and sidecar")
 	fs.Var(&o.buckets, "bucket", "Allowed bucket/container (repeatable; omitted allows all buckets/containers)")
 	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
@@ -136,11 +136,11 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return o, writeHelp(output, version.String()+"\n")
 	}
 
-	o.volume = *volume
+	o.cache = *cache
 
-	validationClient, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.volume})
+	validationClient, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.cache})
 	if err != nil {
-		return o, errors.New("invalid --volume")
+		return o, errors.New("invalid --cache")
 	}
 
 	closeResource(validationClient)
@@ -342,12 +342,12 @@ func runOrigin(ctx context.Context, o options) error {
 	}
 	defer closeResource(root)
 
-	if err := prepareOriginDirectory(root, []string{"run", "racer", o.volume, "origin"}); err != nil {
+	if err := prepareOriginDirectory(root, []string{"run", "racer", o.cache, "origin"}); err != nil {
 		return errors.New("could not prepare safe origin directory")
 	}
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
-		Cache: o.volume, RecoverStaleSocket: true,
+		Cache: o.cache, RecoverStaleSocket: true,
 	}, origin)
 	if ctx.Err() != nil {
 		return nil
@@ -406,7 +406,7 @@ func prepareOriginDirectory(parent *os.File, parts []string) error {
 }
 
 func runSidecar(ctx context.Context, o options) error {
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.volume})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.cache})
 	if err != nil {
 		return errors.New("could not configure Racer client")
 	}

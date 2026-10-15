@@ -95,19 +95,19 @@ func TestProviderFlagConflicts(t *testing.T) {
 	}
 }
 
-func TestAzureVolumeOptions(t *testing.T) {
+func TestAzureCacheOptions(t *testing.T) {
 	for _, args := range [][]string{
 		{"origin", "--namespace=store", "--provider=azure", "--account-url=https://account.blob.core.windows.net"},
 		{"sidecar", "--namespace=store", "--api=azure"},
 	} {
 		t.Run(args[0], func(t *testing.T) {
-			o, err := parseOptions(append(args, "--volume=azure-test"), io.Discard)
-			if err != nil || o.volume != "azure-test" {
-				t.Fatalf("Azure volume: %+v, %v", o, err)
+			o, err := parseOptions(append(args, "--cache=azure-test"), io.Discard)
+			if err != nil || o.cache != "azure-test" {
+				t.Fatalf("Azure cache: %+v, %v", o, err)
 			}
 
-			if _, err := parseOptions(append(args, "--cache=azure-test"), io.Discard); err == nil {
-				t.Fatal("accepted legacy cache flag")
+			if _, err := parseOptions(append(args, "--volume=azure-test"), io.Discard); err == nil {
+				t.Fatal("accepted removed volume flag")
 			}
 		})
 	}

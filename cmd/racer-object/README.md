@@ -8,14 +8,14 @@ requirements, request limits, and the security model.
 
 ## Example
 
-Use the same `--volume`, `--namespace`, and `--bucket` on the origin and sidecar.
+Use the same `--cache`, `--namespace`, and `--bucket` on the origin and sidecar.
 This pairs an Azure Blob origin with the Azure Blob client API:
 
 ```sh
-racer-object origin --volume=racer-object --namespace=example-azure-store \
+racer-object origin --cache=racer-object --namespace=example-azure-store \
   --provider=azure --account-url=https://ACCOUNT.blob.core.windows.net \
   --azure-credential=default --bucket=example-container
-racer-object sidecar --volume=racer-object --namespace=example-azure-store \
+racer-object sidecar --cache=racer-object --namespace=example-azure-store \
   --api=azure --bucket=example-container --listen=127.0.0.1:8080
 ```
 
