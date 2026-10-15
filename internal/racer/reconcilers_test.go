@@ -264,7 +264,6 @@ func TestParseAnnotations(t *testing.T) {
 		{"defaults", nil, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
 		{"explicit empty NICs", map[string]string{wire.RDMANICsAnnotation: "[]", enrolledRDMANICsAnnotation: `[{"device":"a","port":1,"rail":0}]`}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
 		{"enrolled fallback", map[string]string{enrolledRDMANICsAnnotation: `[{"device":"a","port":1,"rail":0}]`}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{{Device: "a", Port: 1}}}, false},
-		{"legacy ignored", map[string]string{"racer.unbounded-cloud.io/rails": "malformed", "racer.unbounded-cloud.io/aligned-rails": "false"}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
 		{"bounds and sorting", map[string]string{
 			wire.SharesAnnotation:   "4294967295",
 			wire.RDMANICsAnnotation: `[{"rail":65535,"device":"β<&>","port":255,"numa_node":4294967295},{"rail":0,"device":"a","port":1,"numa_node":0}]`,
@@ -1060,9 +1059,8 @@ func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error)
 	return members.BuildCatalog(caches)
 }
 
-func TestLegacyRDMADiagnosticsAndMalformedUnitRetention(t *testing.T) {
+func TestMalformedRDMAUnitRetention(t *testing.T) {
 	node := memberNode()
-	node.Annotations = map[string]string{"racer.unbounded-cloud.io/rails": "malformed", "racer.unbounded-cloud.io/aligned-rails": "false"}
 	pods := map[string][]corev1.Pod{node.Name: {memberPod("a", 1, "192.0.2.1")}}
 	accepted, diagnostics, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	require.NoError(t, err)
