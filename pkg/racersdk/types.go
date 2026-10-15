@@ -117,6 +117,21 @@ func fromWireMetadata(m wire.Metadata) Metadata {
 	return Metadata{Size: int64(m.Size), ETag: m.ETag, ExpiresAt: m.ExpiresAt, ContentType: m.ContentType}
 }
 
+// WarmOptions selects the version to warm. The zero value selects the current version.
+type WarmOptions struct {
+	// ETag pins warming to this strong entity tag. An unavailable version fails
+	// with [ErrVersionMismatch].
+	ETag string
+}
+
+// WarmResult reports the selected version and whether retention was accepted.
+type WarmResult struct {
+	Metadata Metadata
+	// RetainUntil is the accepted deadline. Zero means retention was refused.
+	// Acceptance does not mean that all pages have finished loading.
+	RetainUntil time.Time
+}
+
 // ReadOptions selects part of an object or a specific version. The zero value
 // reads the whole current version.
 type ReadOptions struct {

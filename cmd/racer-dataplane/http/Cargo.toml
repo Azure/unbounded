@@ -1,0 +1,22 @@
+[package]
+name = "http1"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Strict fixed-length HTTP/1.1 over an explicitly driven uring runtime"
+
+[features]
+test-util = []
+
+[dependencies]
+futures = "0.3"
+flow-control = { path = "../flow" }
+uring-runtime = { path = "../runtime" }
+httparse = "1"
+zeroize = "1"
+libc = "0.2"
+
+[[test]]
+name = "pool"
+required-features = ["test-util"]

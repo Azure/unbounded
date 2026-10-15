@@ -384,6 +384,9 @@ func TestEnvtestServer(t *testing.T) {
 
 	t.Run("initialization-and-CAS", func(t *testing.T) { integrationInitialization(t, c) })
 	t.Run("cache-name-admission", func(t *testing.T) { integrationCacheNameAdmission(t, c) })
+	t.Run("volume-name-admission", func(t *testing.T) { integrationVolumeNameAdmission(t, c) })
+	t.Run("volume-type-admission", func(t *testing.T) { integrationVolumeTypeAdmission(t, c) })
+	t.Run("volume-type-immutability", func(t *testing.T) { integrationVolumeTypeImmutability(t, c) })
 	t.Run("rotation-crash-recovery", func(t *testing.T) { integrationRotation(t, c) })
 	t.Run("manager-election-HTTPS-failover", func(t *testing.T) { integrationManagers(t, rc, scheme, c) })
 }

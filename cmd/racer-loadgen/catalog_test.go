@@ -43,7 +43,7 @@ func TestCatalogIdenticalOriginsAndCompatibility(t *testing.T) {
 		}
 	}
 
-	for _, catalog := range []*blobCatalog{first, second} {
+	for _, catalog := range []*imageCatalog{first, second} {
 		handler := catalog.handler()
 		prefix := "/v2/" + opts.Repository
 
@@ -170,7 +170,7 @@ func TestCatalogWorkerTraversalAndVerifiedBytes(t *testing.T) {
 			opts := pullTestOptions(server.URL)
 			opts.Interval, opts.RetryDelay = time.Millisecond, time.Millisecond
 			p, metrics := pullTestNew(t, catalog.images[0], opts)
-			p.batches = catalog.batches
+			p.images = catalog.images
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan struct{})
 

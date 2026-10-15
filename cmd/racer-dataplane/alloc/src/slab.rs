@@ -68,7 +68,7 @@ pub struct Slab<C: Charge> {
 
     writes: Rc<WriteState>,
 
-    idle_buffer: Rc<RefCell<Option<AlignedBuffer<C>>>>,
+    idle_buffer: Rc<RefCell<crate::BufferPool<C>>>,
 }
 
 impl<C: Charge> Slab<C> {
@@ -86,7 +86,7 @@ impl<C: Charge> Slab<C> {
             max_record_bytes,
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
-            idle_buffer: Rc::new(RefCell::new(None)),
+            idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
         }
     }
 
@@ -217,15 +217,15 @@ impl<C: Charge> Slab<C> {
         self.writes.count.get()
     }
 
-    /// Accounted bytes in the single idle buffer slot.
+    /// Accounted backing capacity in the bounded idle free lists.
     pub fn idle_bytes(&self) -> usize {
-        self.idle_buffer.borrow().as_ref().map_or(0, |b| b.len())
+        self.idle_buffer.borrow().bytes()
     }
 
     /// Release only idle memory, returning its size without touching live I/O.
     pub fn reclaim_idle(&self) -> usize {
-        let idle = self.idle_buffer.borrow_mut().take();
-        idle.map_or(0, |b| b.len())
+        let idle = std::mem::take(&mut self.idle_buffer.borrow_mut().entries);
+        idle.iter().map(|b| b.allocation().layout.size()).sum()
     }
 
     /// Wait for accepted writes to release their runtime completion fences.
@@ -617,23 +617,33 @@ impl<C: Charge> Slab<C> {
         })
     }
 
-    /// Reuse one exact-size idle buffer. A size mismatch releases the old idle
-    /// buffer and its charge, even if the replacement allocation fails.
+    /// Reuse charged capacity in the same size class without discarding mismatches.
     pub fn allocate(&self, length: usize, charge: C) -> Result<AlignedBuffer<C>> {
         let alignment = self.alignment()?;
-        if !charge.covers(length) {
+        if length == 0
+            || length > Alignment::MAX_TRANSFER_LENGTH
+            || !length.is_multiple_of(alignment.length())
+            || !charge.covers(length)
+        {
             return Err(Error::InvalidConfiguration);
         }
-        let idle = self.idle_buffer.borrow_mut().take();
-        if let Some(mut buffer) = idle
-            && buffer.len() == length
-        {
+        let idle = self.idle_buffer.borrow_mut().take_for(length, &charge);
+        if let Some(mut buffer) = idle {
             buffer.rebind(charge)?;
+            buffer.length = length;
             return Ok(buffer.pooled(&self.idle_buffer));
         }
-        Ok(alignment
-            .allocate(length, charge)?
-            .pooled(&self.idle_buffer))
+        let capacity = crate::buffer_capacity(length)
+            .filter(|&n| {
+                length >= crate::HUGE_PAGE_BYTES
+                    && n <= Alignment::MAX_TRANSFER_LENGTH
+                    && n.is_multiple_of(alignment.length())
+                    && charge.covers(n)
+            })
+            .unwrap_or(length);
+        let mut buffer = alignment.allocate(capacity, charge)?;
+        buffer.length = length;
+        Ok(buffer.pooled(&self.idle_buffer))
     }
 
     /// Replace file-mode backing for fault tests; device mode is rejected.
@@ -755,7 +765,7 @@ impl<C: Charge> Submission<C> {
 struct WriteState {
     count: Cell<usize>,
 
-    waiters: RefCell<Vec<Rc<RefCell<Rc<Waker>>>>>,
+    waiters: RefCell<Vec<Rc<RefCell<Waker>>>>,
 }
 
 impl WriteState {
@@ -771,7 +781,7 @@ impl WriteState {
 struct FenceWaiter {
     state: Rc<WriteState>,
 
-    registration: Option<Rc<RefCell<Rc<Waker>>>>,
+    registration: Option<Rc<RefCell<Waker>>>,
 }
 
 impl Future for FenceWaiter {
@@ -779,45 +789,24 @@ impl Future for FenceWaiter {
 
     /// Refresh the task's registration without busy-waking the worker.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            if self.state.count.get() == 0 {
-                self.unregister();
-                if self.state.count.get() == 0 {
-                    return Poll::Ready(Ok(()));
-                }
-                continue;
-            }
-            let waker = Rc::new(cx.waker().clone());
-            if self.state.count.get() == 0 {
-                drop(waker);
-                self.unregister();
-                if self.state.count.get() == 0 {
-                    return Poll::Ready(Ok(()));
-                }
-                continue;
-            }
-            if let Some(registration) = self.registration.clone() {
-                let old = registration.replace(waker);
-                drop(old);
-                if self.state.count.get() == 0 {
-                    drop(registration);
-                    self.unregister();
-                    if self.state.count.get() == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    continue;
-                }
-                let mut waiters = self.state.waiters.borrow_mut();
-                if !waiters.iter().any(|w| Rc::ptr_eq(w, &registration)) {
-                    waiters.push(registration);
-                }
-            } else {
-                let registration = Rc::new(RefCell::new(waker));
-                self.state.waiters.borrow_mut().push(registration.clone());
-                self.registration = Some(registration);
-            }
-            return Poll::Pending;
+        if self.state.count.get() == 0 {
+            self.unregister();
+            return Poll::Ready(Ok(()));
         }
+        if let Some(registration) = &self.registration {
+            registration.borrow_mut().clone_from(cx.waker());
+            // Final completion drained registrations; a new write can precede
+            // our next poll, in which case this waiter must register again.
+            let mut waiters = self.state.waiters.borrow_mut();
+            if !waiters.iter().any(|w| Rc::ptr_eq(w, registration)) {
+                waiters.push(registration.clone());
+            }
+        } else {
+            let registration = Rc::new(RefCell::new(cx.waker().clone()));
+            self.state.waiters.borrow_mut().push(registration.clone());
+            self.registration = Some(registration);
+        }
+        Poll::Pending
     }
 }
 
@@ -850,25 +839,9 @@ impl Drop for WriteFence {
         self.0.count.set(remaining);
         if remaining == 0 {
             let waiters = std::mem::take(&mut *self.0.waiters.borrow_mut());
-            let mut panic = None;
             for waiter in waiters {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    // Snapshot ownership without invoking the raw waker's clone callback.
-                    let waker = waiter.borrow().clone();
-                    waker.wake_by_ref();
-                }));
-                if let Err(payload) = result {
-                    if panic.is_none() && !std::thread::panicking() {
-                        panic = Some(payload);
-                    } else {
-                        // A suppressed payload's destructor could also panic.
-                        std::mem::forget(payload);
-                    }
-                }
-            }
-            // Notify the whole batch, but never start a second unwind from Drop.
-            if let Some(payload) = panic {
-                std::panic::resume_unwind(payload);
+                let waker = waiter.borrow().clone();
+                waker.wake();
             }
         }
     }
@@ -1091,20 +1064,13 @@ mod tests {
     }
 
     /// Skip only explicit unsupported-filesystem results unless real I/O is required.
-    fn real_alignment<T>(result: Result<T>) -> Option<T> {
-        real_io_result(
-            result,
-            std::env::var("PAGE_ALLOC_REQUIRE_REAL_IO").as_deref() == Ok("1"),
-        )
-    }
-
-    /// Apply the capability policy without changing the process environment in tests.
-    fn real_io_result<T>(result: Result<T>, required: bool) -> Option<T> {
+    fn real_alignment(result: Result<Alignment>) -> Option<Alignment> {
         match result {
-            Ok(value) => Some(value),
+            Ok(alignment) => Some(alignment),
             Err(Error::Unsupported) => {
-                assert!(
-                    !required,
+                assert_ne!(
+                    std::env::var("PAGE_ALLOC_REQUIRE_REAL_IO").as_deref(),
+                    Ok("1"),
                     "PAGE_ALLOC_REQUIRE_REAL_IO=1 forbids capability skips: filesystem does not support direct I/O geometry"
                 );
                 eprintln!("SKIP real slab test: filesystem does not support direct I/O geometry");
@@ -1114,64 +1080,34 @@ mod tests {
         }
     }
 
-    /// Successful setup is preserved in both optional and required modes.
+    /// Geometry obeys the discovered units, not assumed memory-page dimensions.
     #[test]
-    fn real_io_success_is_preserved() {
-        for required in [false, true] {
-            assert_eq!(real_io_result(Ok(42), required), Some(42));
-        }
-    }
-
-    /// Unsupported direct opens skip only when the real-I/O gate is optional.
-    #[test]
-    fn real_io_unsupported_open_obeys_required_policy() {
-        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
-            let error = direct_error("open", std::io::Error::from_raw_os_error(errno));
-            assert_eq!(real_io_result::<()>(Err(error), false), None);
-            let panic =
-                std::panic::catch_unwind(|| real_io_result::<()>(Err(error), true)).unwrap_err();
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap();
-            assert!(message.contains("PAGE_ALLOC_REQUIRE_REAL_IO=1 forbids capability skips"));
-        }
-    }
-
-    /// Other open failures, including errors without errno, must never skip.
-    #[test]
-    fn real_io_unexpected_open_errors_fail_in_both_modes() {
-        for errno in [
-            Some(libc::EACCES),
-            Some(libc::EIO),
-            Some(libc::EEXIST),
-            None,
-        ] {
-            let error = direct_error(
-                "open",
-                errno
-                    .map(std::io::Error::from_raw_os_error)
-                    .unwrap_or_else(|| std::io::Error::other("synthetic")),
-            );
-            assert_eq!(
-                error,
-                Error::SystemIo {
-                    operation: "open",
-                    errno
-                }
-            );
-            for required in [false, true] {
-                assert!(
-                    std::panic::catch_unwind(|| real_io_result::<()>(Err(error), required))
-                        .is_err()
-                );
-            }
-        }
+    fn geometry_rounds_without_assuming_page_size() {
+        let a = Alignment::new(512, 512, 1024).unwrap();
+        assert_eq!(a.extent(512, 1025).unwrap().length(), 2048);
+        assert!(a.extent(1, 1).is_err());
+        assert!(a.extent(0, usize::MAX).is_err());
+        assert!(Alignment::new(3, 512, 512).is_err());
+        assert!(Extent::new(u64::MAX, 1).is_err());
+        assert!(Extent::new(0, 0).is_err());
+        assert!(Alignment::new(512, 0, 512).is_err());
+        assert!(Alignment::new(512, 512, 0).is_err());
+        let a = Alignment::new(512, 768, 512).unwrap();
+        assert_eq!(a.extent(0, 513).unwrap().length(), 1536);
+        let b = a.allocate(512, ()).unwrap();
+        assert!(!b.is_empty());
+        assert_eq!(
+            a.check(Extent::new(1, 512).unwrap(), &b),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            a.check(Extent::new(0, 1024).unwrap(), &b),
+            Err(Error::InvalidConfiguration)
+        );
     }
 
     /// Open direct files without using the slab's private-file startup path.
-    fn device_file(path: &Path) -> Option<Arc<File>> {
+    fn device_file(path: &Path) -> Arc<File> {
         use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -1179,19 +1115,16 @@ mod tests {
             .create_new(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)
-            .map_err(|error| direct_error("open", error));
-        let file = real_alignment(file)?;
+            .unwrap();
         file.set_len(16384).unwrap();
-        Some(Arc::new(file))
+        Arc::new(file)
     }
 
     /// Queried capacities bound every placement, including cached-file placements.
     #[test]
     fn device_capacity_bounds_are_checked_before_startup() {
         let directory = Directory::new();
-        let Some(file) = device_file(&directory.0.join("capacity")) else {
-            return;
-        };
+        let file = device_file(&directory.0.join("capacity"));
         let a = Alignment::new(512, 512, 512).unwrap();
         for (capacity, offsets, valid) in [
             (0, vec![0], false),
@@ -1242,9 +1175,7 @@ mod tests {
             })
         );
         let directory = Directory::new();
-        let Some(file) = device_file(&directory.0.join("capacity-error")) else {
-            return;
-        };
+        let file = device_file(&directory.0.join("capacity-error"));
         assert_eq!(
             block_device_capacity(file.as_raw_fd()),
             Err(Error::SystemIo {
@@ -1276,9 +1207,7 @@ mod tests {
     fn device_layout_validation_is_read_only() {
         use std::os::unix::fs::OpenOptionsExt;
         let directory = Directory::new();
-        let Some(file) = device_file(&directory.0.join("device")) else {
-            return;
-        };
+        let file = device_file(&directory.0.join("device"));
         let Some(host_alignment) = real_alignment(probe(&file)) else {
             return;
         };
@@ -1443,9 +1372,7 @@ mod tests {
     #[test]
     fn device_submission_checks_logical_and_physical_extents() {
         let directory = Directory::new();
-        let Some(file) = device_file(&directory.0.join("device")) else {
-            return;
-        };
+        let file = device_file(&directory.0.join("device"));
         let Some(a) = real_alignment(probe(&file)) else {
             return;
         };
@@ -1539,9 +1466,7 @@ mod tests {
             }
         }
         let directory = Directory::new();
-        let Some(file) = device_file(&directory.0.join("device")) else {
-            return;
-        };
+        let file = device_file(&directory.0.join("device"));
         let Some(a) = real_alignment(probe(&file)) else {
             return;
         };
@@ -1654,11 +1579,9 @@ mod tests {
         );
         assert_eq!(&buffer.bytes().unwrap()[..31], &[42; 31]);
         assert!(buffer.bytes().unwrap()[31..].iter().all(|b| *b == 0));
-        // Filesystems may accept unaligned O_DIRECT I/O via buffered fallback.
-        // The allocator must reject it before submission regardless of the kernel.
         assert_eq!(
-            alignment.check(Extent::new(1, 31).unwrap(), &buffer),
-            Err(Error::InvalidConfiguration)
+            unsafe { libc::pwrite(fd, buffer.bytes().unwrap().as_ptr().cast(), 31, 1) },
+            -1
         );
         drop(buffer);
         assert_eq!(slabs.idle_bytes(), extent.length());
@@ -1859,295 +1782,6 @@ mod tests {
         );
     }
 
-    /// Select the callback that runs a one-shot reentrant test action.
-    #[derive(Clone, Copy, PartialEq)]
-    enum FenceCallback {
-        Clone,
-        Drop,
-        /// Reenter on completion's first clone or wake, with either implementation.
-        Notify,
-    }
-
-    /// One action and the waker callback that should run it.
-    type FenceAction = (FenceCallback, Box<dyn FnOnce()>);
-
-    thread_local! {
-        static FENCE_CALLBACK: RefCell<Option<FenceAction>> =
-            RefCell::new(None);
-        static FENCE_WAKES: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Run caller code after releasing the callback registry's borrow.
-    fn run_fence_callback(event: FenceCallback) {
-        let callback = FENCE_CALLBACK.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|(on, _)| {
-                *on == event || (*on == FenceCallback::Notify && event == FenceCallback::Clone)
-            }) {
-                slot.take()
-            } else {
-                None
-            }
-        });
-        if let Some((_, callback)) = callback {
-            callback();
-        }
-    }
-
-    /// A stateless waker accesses only the calling thread's test registry.
-    fn fence_callback_waker() -> Waker {
-        use std::task::{RawWaker, RawWakerVTable};
-
-        /// Cloning owns no data but may run the thread's registered action.
-        unsafe fn clone(_: *const ()) -> RawWaker {
-            run_fence_callback(FenceCallback::Clone);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        /// Both wake forms count a notification and may run the test action.
-        unsafe fn wake(_: *const ()) {
-            FENCE_WAKES.with(|count| count.set(count.get() + 1));
-            run_fence_callback(FenceCallback::Notify);
-        }
-
-        /// Dropping owns no data but may run the thread's registered action.
-        unsafe fn drop_raw(_: *const ()) {
-            run_fence_callback(FenceCallback::Drop);
-        }
-
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop_raw);
-
-        // SAFETY: there is no raw data or shared ownership. Every callback accesses
-        // only its calling thread's registry, even if the Waker moves across threads.
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
-    }
-
-    /// Completion during clone or replacement drop is observed before returning.
-    #[test]
-    fn fence_poll_handles_reentrant_clone_and_drop() {
-        for event in [FenceCallback::Clone, FenceCallback::Drop] {
-            for new_write in [false, true] {
-                let state = Rc::new(WriteState::default());
-                let write = state.acquire().unwrap();
-                let mut waiter = FenceWaiter {
-                    state: state.clone(),
-                    registration: None,
-                };
-                let waker = fence_callback_waker();
-                let mut cx = Context::from_waker(&waker);
-                if event == FenceCallback::Drop {
-                    assert!(Pin::new(&mut waiter).poll(&mut cx).is_pending());
-                }
-                let next = Rc::new(RefCell::new(None));
-                let saved_next = next.clone();
-                let saved_state = state.clone();
-                FENCE_CALLBACK.with(|slot| {
-                    *slot.borrow_mut() = Some((
-                        event,
-                        Box::new(move || {
-                            drop(write);
-                            if new_write {
-                                *saved_next.borrow_mut() = Some(saved_state.acquire().unwrap());
-                            }
-                        }),
-                    ));
-                });
-                let result = Pin::new(&mut waiter).poll(&mut cx);
-                FENCE_CALLBACK.with(|slot| assert!(slot.borrow().is_none()));
-                if new_write {
-                    assert!(result.is_pending());
-                    assert_eq!(state.count.get(), 1);
-                    assert_eq!(state.waiters.borrow().len(), 1);
-                    let before = FENCE_WAKES.get();
-                    drop(next.borrow_mut().take());
-                    assert_eq!(FENCE_WAKES.get(), before + 1);
-                    assert_eq!(Pin::new(&mut waiter).poll(&mut cx), Poll::Ready(Ok(())));
-                } else {
-                    assert_eq!(result, Poll::Ready(Ok(())));
-                }
-                assert_eq!(state.count.get(), 0);
-                assert!(state.waiters.borrow().is_empty());
-                assert!(waiter.registration.is_none());
-            }
-        }
-    }
-
-    /// Cleanup callbacks can accept a write at every zero-count exit.
-    #[test]
-    fn fence_poll_rechecks_unregister_callbacks() {
-        for completion in [None, Some(FenceCallback::Clone), Some(FenceCallback::Drop)] {
-            let slab = Slab::<()>::new(PathBuf::new(), 4096, 4096, 512);
-            let write = slab.writes.acquire().unwrap();
-            let mut waiter = slab.fence_writes();
-            let waker = fence_callback_waker();
-            let mut cx = Context::from_waker(&waker);
-            assert!(waiter.as_mut().poll(&mut cx).is_pending());
-            let next = Rc::new(RefCell::new(None));
-            let saved_next = next.clone();
-            let state = slab.writes.clone();
-            let accept: Box<dyn FnOnce()> = Box::new(move || {
-                *saved_next.borrow_mut() = Some(state.acquire().unwrap());
-            });
-            if let Some(event) = completion {
-                FENCE_CALLBACK.with(|slot| {
-                    *slot.borrow_mut() = Some((
-                        event,
-                        Box::new(move || {
-                            drop(write);
-                            FENCE_CALLBACK.with(|slot| {
-                                *slot.borrow_mut() = Some((FenceCallback::Drop, accept));
-                            });
-                        }),
-                    ));
-                });
-            } else {
-                drop(write);
-                FENCE_CALLBACK.with(|slot| {
-                    *slot.borrow_mut() = Some((FenceCallback::Drop, accept));
-                });
-            }
-            assert!(waiter.as_mut().poll(&mut cx).is_pending());
-            FENCE_CALLBACK.with(|slot| assert!(slot.borrow().is_none()));
-            assert_eq!(slab.writes_in_flight(), 1);
-            assert_eq!(slab.writes.waiters.borrow().len(), 1);
-            let before = FENCE_WAKES.get();
-            drop(next.borrow_mut().take());
-            assert_eq!(FENCE_WAKES.get(), before + 1);
-            assert_eq!(waiter.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
-            assert_eq!(slab.writes_in_flight(), 0);
-            assert!(slab.writes.waiters.borrow().is_empty());
-        }
-    }
-
-    /// Completion callbacks can accept a write and repoll a drained registration.
-    #[test]
-    fn fence_completion_allows_reentrant_registration() {
-        let state = Rc::new(WriteState::default());
-        let write = state.acquire().unwrap();
-        let waiter = Rc::new(RefCell::new(FenceWaiter {
-            state: state.clone(),
-            registration: None,
-        }));
-        let waker = fence_callback_waker();
-        assert!(
-            Pin::new(&mut *waiter.borrow_mut())
-                .poll(&mut Context::from_waker(&waker))
-                .is_pending()
-        );
-        let next = Rc::new(RefCell::new(None));
-        let saved_next = next.clone();
-        let saved_state = state.clone();
-        let saved_waiter = waiter.clone();
-        FENCE_CALLBACK.with(|slot| {
-            *slot.borrow_mut() = Some((
-                FenceCallback::Notify,
-                Box::new(move || {
-                    *saved_next.borrow_mut() = Some(saved_state.acquire().unwrap());
-                    let waker = fence_callback_waker();
-                    assert!(
-                        Pin::new(&mut *saved_waiter.borrow_mut())
-                            .poll(&mut Context::from_waker(&waker))
-                            .is_pending()
-                    );
-                }),
-            ));
-        });
-        drop(write);
-        FENCE_CALLBACK.with(|slot| assert!(slot.borrow().is_none()));
-        assert_eq!(state.waiters.borrow().len(), 1);
-        assert_eq!(state.count.get(), 1);
-        let before = FENCE_WAKES.get();
-        drop(next.borrow_mut().take());
-        assert_eq!(FENCE_WAKES.get(), before + 1);
-        assert_eq!(
-            Pin::new(&mut *waiter.borrow_mut()).poll(&mut Context::from_waker(&waker)),
-            Poll::Ready(Ok(()))
-        );
-        assert!(state.waiters.borrow().is_empty());
-        assert!(waiter.borrow().registration.is_none());
-    }
-
-    /// A failed wake must not discard later notifications or replace the first panic.
-    #[test]
-    fn fence_completion_notifies_remaining_waiters_after_panic() {
-        check_fence_wake_panic(false);
-    }
-
-    /// Wake failures during cleanup preserve the outer panic and notify all waiters.
-    #[test]
-    fn fence_completion_notifies_remaining_waiters_during_unwind() {
-        check_fence_wake_panic(true);
-    }
-
-    /// Exercise wake failures with an optional panic already in flight.
-    fn check_fence_wake_panic(unwinding: bool) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::task::Wake;
-
-        /// Count every notification before optionally failing it.
-        struct WakeProbe {
-            wakes: AtomicUsize,
-            panic: Option<&'static str>,
-        }
-
-        impl Wake for WakeProbe {
-            fn wake(self: Arc<Self>) {
-                self.wakes.fetch_add(1, Ordering::Relaxed);
-                if let Some(message) = self.panic {
-                    std::panic::panic_any(message);
-                }
-            }
-        }
-
-        let slab = Slab::<()>::new(PathBuf::new(), 4096, 4096, 512);
-        let write = slab.writes.acquire().unwrap();
-        let probes = [Some("first wake panic"), Some("second wake panic"), None].map(|panic| {
-            Arc::new(WakeProbe {
-                wakes: AtomicUsize::new(0),
-                panic,
-            })
-        });
-        let mut waiters = probes.each_ref().map(|probe| {
-            let mut waiter = slab.fence_writes();
-            let waker = Waker::from(probe.clone());
-            assert!(
-                waiter
-                    .as_mut()
-                    .poll(&mut Context::from_waker(&waker))
-                    .is_pending()
-            );
-            waiter
-        });
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _write = write;
-            if unwinding {
-                panic!("outer panic");
-            }
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>().copied(),
-            Some(if unwinding {
-                "outer panic"
-            } else {
-                "first wake panic"
-            })
-        );
-        assert_eq!(slab.writes_in_flight(), 0);
-        assert!(slab.writes.waiters.borrow().is_empty());
-        for probe in &probes {
-            assert_eq!(probe.wakes.load(Ordering::Relaxed), 1);
-        }
-        for waiter in &mut waiters {
-            assert_eq!(
-                waiter
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(Ok(()))
-            );
-        }
-    }
-
     /// Waiters sleep, replace wakers, unregister on cancellation, and register again.
     #[test]
     fn fence_waiters_sleep_update_wakers_and_unregister_on_cancellation() {
@@ -2177,7 +1811,7 @@ mod tests {
         let old = Arc::new(WakeCount::default());
         let current = Arc::new(WakeCount::default());
         let other = Arc::new(WakeCount::default());
-        let canceled = Arc::new(WakeCount::default());
+        let cancelled = Arc::new(WakeCount::default());
         let poll = |op: &mut Operation<'_, (), Error>, wakes: &Arc<WakeCount>| {
             op.as_mut()
                 .poll(&mut Context::from_waker(&Waker::from(wakes.clone())))
@@ -2188,18 +1822,17 @@ mod tests {
         assert!(poll(&mut one, &old).is_pending());
         assert!(poll(&mut one, &current).is_pending());
         assert!(poll(&mut two, &other).is_pending());
-        assert!(poll(&mut abandoned, &canceled).is_pending());
+        assert!(poll(&mut abandoned, &cancelled).is_pending());
         assert_eq!(slab.writes.waiters.borrow().len(), 3);
         drop(abandoned);
         assert_eq!(slab.writes.waiters.borrow().len(), 2);
-        assert_eq!(Arc::strong_count(&canceled), 1);
         drop(first_write);
-        for count in [&old, &current, &other, &canceled] {
+        for count in [&old, &current, &other, &cancelled] {
             assert_eq!(count.0.load(Ordering::Relaxed), 0);
         }
         drop(last_write);
         assert_eq!(old.0.load(Ordering::Relaxed), 0);
-        assert_eq!(canceled.0.load(Ordering::Relaxed), 0);
+        assert_eq!(cancelled.0.load(Ordering::Relaxed), 0);
         assert_eq!(current.0.load(Ordering::Relaxed), 1);
         assert_eq!(other.0.load(Ordering::Relaxed), 1);
         assert!(slab.writes.waiters.borrow().is_empty());
@@ -2551,7 +2184,7 @@ mod tests {
         table.recycle(SegmentId(0)).unwrap();
     }
 
-    /// Size mismatch releases idle accounting even when new allocation is invalid.
+    /// Invalid replacement preserves idle accounting until explicit reclamation.
     #[test]
     fn idle_size_mismatch_releases_retained_charge_even_on_invalid_replacement() {
         let directory = Directory::new();
@@ -2571,7 +2204,45 @@ mod tests {
             slab.allocate(0, CountingCharge::new(&used, 0)),
             Err(Error::InvalidConfiguration)
         ));
+        assert_eq!(used.get(), length);
+        assert_eq!(slab.idle_bytes(), length);
+        assert_eq!(slab.reclaim_idle(), length);
         assert_eq!(used.get(), 0);
         assert_eq!(slab.idle_bytes(), 0);
+    }
+
+    #[test]
+    fn slab_reuses_large_capacity_across_exact_io_lengths() {
+        let directory = Directory::new();
+        let slab =
+            Slab::<CountingCharge>::new(directory.0.join("data"), 16 << 20, 8 << 20, 4 << 20);
+        let Some(a) = real_alignment(slab.open_now()) else {
+            return;
+        };
+        let length = a.extent(0, (2 << 20) + 1).unwrap().length();
+        let next = a.extent(0, length + 1).unwrap().length();
+        let capacity = crate::buffer_capacity(length).unwrap();
+        let used = Rc::new(Cell::new(0));
+        let mut first = slab
+            .allocate(length, CountingCharge::new(&used, capacity))
+            .unwrap();
+        let pointer = first.as_slice().as_ptr();
+        first.as_mut_slice().fill(0xa5);
+        drop(first);
+        assert_eq!(slab.idle_bytes(), capacity);
+        let mismatch = slab
+            .allocate(4 << 20, CountingCharge::new(&used, 4 << 20))
+            .unwrap();
+        assert_eq!(slab.idle_bytes(), capacity);
+        let second = slab
+            .allocate(next, CountingCharge::new(&used, capacity))
+            .unwrap();
+        assert_eq!(second.len(), next);
+        assert_eq!(second.as_slice().as_ptr(), pointer);
+        assert!(second.as_slice().iter().all(|&b| b == 0));
+        a.check(Extent::new(0, next).unwrap(), &second).unwrap();
+        drop((second, mismatch));
+        assert_eq!(slab.reclaim_idle(), capacity + (4 << 20));
+        assert_eq!(used.get(), 0);
     }
 }

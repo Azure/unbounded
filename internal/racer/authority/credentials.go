@@ -30,7 +30,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -108,13 +107,13 @@ func (r *credentials) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{}, err
 	}
 
-	var caches racerv1.ClusterCacheList
-	if err := r.APIReader.List(ctx, &caches); err != nil {
-		return ctrl.Result{}, authorityReadFailure(err)
-	}
-
-	catalog, err := members.BuildCatalog(caches.Items)
+	catalog, err := members.ReadCatalog(ctx, r.APIReader)
 	if err != nil {
+		var unread members.CatalogReadError
+		if errors.As(err, &unread) {
+			return ctrl.Result{}, authorityReadFailure(err)
+		}
+
 		return ctrl.Result{}, err
 	}
 

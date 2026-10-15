@@ -172,11 +172,11 @@ func prepareOriginDirectory(volume string) error {
 // Merely finding a socket (possibly a competing owner) is not readiness. stop
 // cancels and joins ServeOrigin so its owned-socket cleanup finishes before exit.
 func startUDSOrigin(ctx, startup context.Context, config racersdk.OriginConfig, origin racersdk.Origin, probe racersdk.Key, failed func(error)) (func(), error) {
-	if err := prepareOriginDirectory(config.Cache); err != nil {
+	if err := prepareOriginDirectory(config.Volume); err != nil {
 		return nil, err
 	}
 
-	return startUDSOriginOnPath(ctx, startup, "/run/racer/"+config.Cache+"/origin/socket", origin, probe, failed,
+	return startUDSOriginOnPath(ctx, startup, "/run/racer/"+config.Volume+"/origin/socket", origin, probe, failed,
 		func(ctx context.Context, origin racersdk.Origin) error {
 			return racersdk.ServeOrigin(ctx, config, origin)
 		})

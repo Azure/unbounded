@@ -1,0 +1,17 @@
+[package]
+name = "flow-control"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Policy-driven quotas, keyed coalescing, completion-owned flights, and bounded I/O resources"
+
+[features]
+simulation = ["uring-runtime/simulation"]
+
+[dependencies]
+futures = "0.3"
+libc = "0.2"
+zeroize = "1"
+page-alloc = { path = "../alloc" }
+uring-runtime = { path = "../runtime" }

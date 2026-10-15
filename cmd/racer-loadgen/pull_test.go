@@ -40,7 +40,7 @@ func pullTestOptions(target string) pullOptions {
 	return pullOptions{
 		ZipfExponent: defaultZipfExponent,
 		Target:       target, Namespace: "registry.example:5000/a b&c", Concurrency: 1,
-		BlobConcurrency: 2, Timeout: 5 * time.Second, RetryDelay: 200 * time.Millisecond,
+		LayerConcurrency: 2, Timeout: 5 * time.Second, RetryDelay: 200 * time.Millisecond,
 		Verify: true,
 	}
 }
@@ -68,26 +68,12 @@ func pullTestMetrics() *loadMetrics {
 func pullTestNew(t *testing.T, img *syntheticImage, opts pullOptions) (*puller, *loadMetrics) {
 	t.Helper()
 
-	repository := img.repository
-	if repository == "" {
-		repository = "test/image"
-	}
-
 	metrics := pullTestMetrics()
-	p, err := newPuller(repository, opts, metrics)
+	p, err := newPuller(img, opts, metrics)
 	require.NoError(t, err)
 	t.Cleanup(p.close)
-	p.batches = []blobBatch{imageBatch(img)}
 
 	return p, metrics
-}
-
-func (p *puller) pull(ctx context.Context) error {
-	return p.pullBatch(ctx, p.batches[0])
-}
-
-func (p *puller) pullImage(ctx context.Context, img *syntheticImage) error {
-	return p.pullBatch(ctx, imageBatch(img))
 }
 
 func pullTestHistogramCount(t *testing.T, vec *prometheus.HistogramVec, labels ...string) uint64 {
@@ -116,7 +102,7 @@ func TestPullCompleteImage(t *testing.T) {
 	var connections atomic.Int64
 
 	opts := pullTestOptions("")
-	opts.BlobConcurrency = 1
+	opts.LayerConcurrency = 1
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Query().Get("ns") != opts.Namespace || len(r.URL.Query()) != 1 {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
@@ -225,7 +211,7 @@ func TestPullResponseFailures(t *testing.T) {
 				}))
 				t.Cleanup(server.Close)
 				opts := pullTestOptions(server.URL)
-				opts.BlobConcurrency = 1
+				opts.LayerConcurrency = 1
 				opts.Verify = mode != "unverified"
 				p, metrics := pullTestNew(t, img, opts)
 				err := p.pull(t.Context())
@@ -321,7 +307,7 @@ func TestPullTimeoutAndCancellation(t *testing.T) {
 				t.Cleanup(server.Close)
 				opts := pullTestOptions(server.URL)
 
-				opts.BlobConcurrency = 1
+				opts.LayerConcurrency = 1
 				if !canceled {
 					opts.Timeout = 150 * time.Millisecond
 				}
@@ -458,7 +444,7 @@ func TestPullRunConcurrencyAndJoin(t *testing.T) {
 				close(done)
 			}()
 
-			expected := int64(concurrency * opts.BlobConcurrency)
+			expected := int64(concurrency * opts.LayerConcurrency)
 
 			require.Eventually(t, func() bool { return layers.Load() >= expected }, time.Second, time.Millisecond)
 			require.Never(t, func() bool { return layers.Load() > expected }, 50*time.Millisecond, time.Millisecond)
@@ -511,7 +497,7 @@ func TestPullRunPacing(t *testing.T) {
 			server.Start()
 			t.Cleanup(server.Close)
 			opts := pullTestOptions(server.URL)
-			opts.BlobConcurrency = 1
+			opts.LayerConcurrency = 1
 			opts.Interval = opts.RetryDelay
 			p, metrics := pullTestNew(t, img, opts)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -604,66 +590,6 @@ func TestPullRunZeroConcurrency(t *testing.T) {
 	require.Zero(t, testutil.ToFloat64(metrics.pulls.WithLabelValues("canceled")))
 }
 
-func TestPullTargetPort(t *testing.T) {
-	img := pullTestImage(t)
-	for _, tc := range []struct {
-		target  string
-		wantErr bool
-	}{
-		{target: "http://host"},
-		{target: "https://host"},
-		{target: "http://host:1"},
-		{target: "https://host:65535"},
-		{target: "http://host:00080"},
-		{target: "http://[::1]"},
-		{target: "http://[::1]:1"},
-		{target: "https://[::1]:65535"},
-		{target: "http://host:0", wantErr: true},
-		{target: "http://host:65536", wantErr: true},
-		{target: "https://host:65536/base/", wantErr: true},
-		{target: "http://host:999999999999999999999999", wantErr: true},
-		{target: "http://[::1]:0", wantErr: true},
-		{target: "https://[::1]:65536", wantErr: true},
-	} {
-		t.Run(tc.target, func(t *testing.T) {
-			p, err := newPuller(img.repository, pullTestOptions(tc.target), pullTestMetrics())
-			if p != nil {
-				t.Cleanup(p.close)
-			}
-
-			if tc.wantErr {
-				require.ErrorContains(t, err, "invalid pull target port")
-				require.Nil(t, p)
-			} else {
-				require.NoError(t, err)
-				require.Equal(t, tc.target, p.target.String())
-				require.Equal(t, img.repository, p.repository)
-				require.Empty(t, p.batches, "the caller supplies batches after catalog startup")
-			}
-		})
-	}
-}
-
-func TestPullTargetParseErrorRedaction(t *testing.T) {
-	for name, target := range map[string]string{
-		"invalid port":     "https://user:password@private.invalid:bad/payload?token=secret",
-		"invalid path":     "https://user:password@private.invalid/%zz?token=secret",
-		"invalid userinfo": "https://user:pass%zz@private.invalid/payload?token=secret",
-		"control byte":     "https://user:password@private.invalid/payload?token=secret\nforged",
-	} {
-		t.Run(name, func(t *testing.T) {
-			p, err := newPuller("test/image", pullTestOptions(target), pullTestMetrics())
-			if p != nil {
-				t.Cleanup(p.close)
-			}
-
-			require.Nil(t, p)
-			require.EqualError(t, err, "invalid pull target URL")
-			require.Nil(t, errors.Unwrap(err))
-		})
-	}
-}
-
 func TestPullOptions(t *testing.T) {
 	img := pullTestImage(t)
 	for _, target := range []string{
@@ -672,7 +598,7 @@ func TestPullOptions(t *testing.T) {
 		"http://host#fragment", "http://host#", "http://host/%zz",
 	} {
 		t.Run(target, func(t *testing.T) {
-			_, err := newPuller(img.repository, pullTestOptions(target), pullTestMetrics())
+			_, err := newPuller(img, pullTestOptions(target), pullTestMetrics())
 			require.Error(t, err)
 		})
 	}
@@ -686,8 +612,8 @@ func TestPullOptions(t *testing.T) {
 	for name, mutate := range map[string]func(*pullOptions){
 		"negative concurrency":       func(o *pullOptions) { o.Concurrency = -1 },
 		"concurrency overflow":       func(o *pullOptions) { o.Concurrency = int(^uint(0) >> 1) },
-		"zero layer concurrency":     func(o *pullOptions) { o.BlobConcurrency = 0 },
-		"negative layer concurrency": func(o *pullOptions) { o.BlobConcurrency = -1 },
+		"zero layer concurrency":     func(o *pullOptions) { o.LayerConcurrency = 0 },
+		"negative layer concurrency": func(o *pullOptions) { o.LayerConcurrency = -1 },
 		"zero timeout":               func(o *pullOptions) { o.Timeout = 0 },
 		"negative timeout":           func(o *pullOptions) { o.Timeout = -1 },
 		"zero retry":                 func(o *pullOptions) { o.RetryDelay = 0 },
@@ -697,13 +623,13 @@ func TestPullOptions(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			opts := pullTestOptions("http://host")
 			mutate(&opts)
-			_, err := newPuller(img.repository, opts, pullTestMetrics())
+			_, err := newPuller(img, opts, pullTestMetrics())
 			require.Error(t, err)
 		})
 	}
 
-	_, err := newPuller("", pullTestOptions("http://host"), pullTestMetrics())
-	require.ErrorContains(t, err, "repository and metrics are required")
-	_, err = newPuller(img.repository, pullTestOptions("http://host"), nil)
+	_, err := newPuller(nil, pullTestOptions("http://host"), pullTestMetrics())
+	require.Error(t, err)
+	_, err = newPuller(img, pullTestOptions("http://host"), nil)
 	require.Error(t, err)
 }

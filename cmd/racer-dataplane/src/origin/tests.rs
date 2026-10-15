@@ -1,0 +1,1627 @@
+use super::*;
+use crate::config::Limits;
+use crate::control::Snapshot;
+use crate::control::publication::PublicationTarget;
+use crate::http::Codec;
+use crate::model::CacheKey;
+use crate::model::ObjectId;
+use crate::model::RequestId;
+use crate::model::StrongEtag;
+use crate::runtime::Reactor;
+use crate::security::Authorization;
+use crate::security::OpaqueMetadata;
+use controlplane::Published;
+use futures::executor::block_on;
+use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
+use std::future::Future;
+use std::io::Read;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+
+fn context() -> OriginContext {
+    OriginContext {
+        object: ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([0xab; 32]),
+        },
+        metadata: Some(OpaqueMetadata::from_header(b"opaque\xff").unwrap()),
+        authorization: Some(Authorization::from_header(b"credential\xfe").unwrap()),
+    }
+}
+fn scope() -> RequestScope {
+    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
+}
+pub(super) fn response_head(status: u16, fields: &[(&str, &[u8])]) -> MessageHead {
+    MessageHead {
+        start: StartLine::Response { status },
+        headers: fields
+            .iter()
+            .map(|(name, value)| Header {
+                name: (*name).into(),
+                value: value.to_vec(),
+            })
+            .collect(),
+    }
+}
+
+// Endpoint-level socket scenarios allocate here; production callers supply their
+// existing reservation through the Origin trait's reserved operations.
+impl OriginClient {
+    async fn bootstrap_at(
+        &self,
+        endpoint: &Endpoint,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<MetadataReply> {
+        scope.check()?;
+        let reservation = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        )?;
+        self.bootstrap_reserved_at(endpoint, context, reservation, scope)
+            .await
+    }
+
+    async fn page_at(
+        &self,
+        endpoint: &Endpoint,
+        context: &OriginContext,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<OriginPage> {
+        let reservation = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        )?;
+        self.page_reserved_at(endpoint, context, page, reservation, scope)
+            .await
+    }
+}
+fn credentials(
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+) -> Rc<crate::security::CredentialCrypto> {
+    use crate::security::CredentialCrypto;
+    use racer_crypto::identity::KeyEpochs;
+    use racer_crypto::identity::Keyring;
+    Rc::new(CredentialCrypto::new(
+        Rc::new(Keyring::new(
+            ClusterId("cluster".into()),
+            racer_control_wire::NodeId("local".into()),
+            Arc::new(KeyEpochs::default()),
+        )),
+        admission,
+    ))
+}
+fn client() -> (
+    OriginClient,
+    Rc<flow_control::Quotas<AdmissionPolicy>>,
+    Rc<Reactor>,
+) {
+    let n = NonZeroUsize::new(32).unwrap();
+    let bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
+    let limits = Limits {
+        plaintext_bytes: bytes,
+        ciphertext_bytes: bytes,
+        dirty_bytes: bytes,
+        registered_bytes: bytes,
+        request_context_bytes: bytes,
+        flights: n,
+        waiters_per_flight: n,
+        queue_entries: n,
+        connections_per_neighbor: n,
+        client_connections: n,
+        pipes: n,
+        range_window_pages: n,
+        header_bytes: NonZeroUsize::new(32768).unwrap(),
+        placement_cache_bytes: n,
+        path_cache_bytes: n,
+        active_path_searches: n,
+        cached_paths: n,
+        retained_snapshots: n,
+        metadata_entries: n,
+        relay_transfers: n,
+    };
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2));
+    let io = Rc::new(crate::http::new_io(
+        reactor.clone(),
+        Codec::new(32768),
+        admission.clone(),
+        PAGE_BYTES,
+    ));
+    let snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let buffers = BufferPool::new(admission.clone());
+    (
+        OriginClient::new(
+            snapshots,
+            pool,
+            io,
+            admission.clone(),
+            buffers,
+            "/run/racer",
+        )
+        .unwrap(),
+        admission,
+        reactor,
+    )
+}
+
+fn published_client() -> (
+    OriginClient,
+    Rc<flow_control::Quotas<AdmissionPolicy>>,
+    Rc<Reactor>,
+    std::sync::Arc<crate::control::Snapshot>,
+) {
+    let (mut client, admission, reactor) = client();
+    let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../internal/racer/wire/testdata/publication.json"
+    )))
+    .unwrap();
+    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    let snapshot = target.apply(publication).unwrap();
+    (client, admission, reactor, snapshot)
+}
+
+fn remap(client: OriginClient, root: impl Into<PathBuf>) -> Result<OriginClient> {
+    OriginClient::new(
+        client.snapshots,
+        client.pool,
+        client.io,
+        client.admission,
+        client.buffers,
+        root,
+    )
+}
+
+#[test]
+fn socket_root_is_lexical_and_preserves_canonical_publications() {
+    let (client, _, _, snapshot) = published_client();
+    let mut context = context();
+    context.object.cache = snapshot.caches[0].id.clone();
+    assert_eq!(
+        client.endpoint(&context).unwrap(),
+        Endpoint::Origin {
+            cache: context.object.cache.clone(),
+            path: "/run/racer/cache-a/origin/socket".into(),
+        }
+    );
+    let root = PathBuf::from("/nonexistent-racer-fixture-root");
+    let client = remap(client, root.clone()).unwrap();
+    assert_eq!(
+        client.endpoint(&context).unwrap(),
+        Endpoint::Origin {
+            cache: context.object.cache.clone(),
+            path: root.join("cache-a/origin/socket"),
+        }
+    );
+    assert_eq!(
+        snapshot.caches[0].origin_socket,
+        PathBuf::from("/run/racer/cache-a/origin/socket")
+    );
+    context.object.cache = CacheId("unknown".into());
+    assert_eq!(client.endpoint(&context), Err(Error::Unavailable));
+
+    for root in [
+        "", "relative", ".", "/a/../b", "/a/./b", "/a//b", "/a/", "//a", "/a\0b",
+    ] {
+        let (client, _, _) = self::client();
+        assert!(
+            matches!(remap(client, root), Err(Error::InvalidConfiguration)),
+            "{root:?}"
+        );
+    }
+    let (client, _, _) = self::client();
+    assert!(remap(client, "/").is_ok());
+    let mut cache = snapshot.caches[0].clone();
+    for path in ["/elsewhere/socket", "/run/racer/cache-a/origin//socket"] {
+        cache.origin_socket = path.into();
+        assert_eq!(
+            resolve_socket(Path::new("/fixture"), &cache),
+            Err(Error::InvalidRequest)
+        );
+    }
+    cache = snapshot.caches[0].clone();
+    cache.name = "../escape".into();
+    assert_eq!(
+        resolve_socket(Path::new("/fixture"), &cache),
+        Err(Error::InvalidRequest)
+    );
+
+    let suffix = "/cache-a/origin/socket";
+    let root = PathBuf::from(format!("/{}", "x".repeat(107 - suffix.len() - 1)));
+    let (client, _, _, snapshot) = published_client();
+    let client = remap(client, root.clone()).unwrap();
+    assert_eq!(
+        resolve_socket(&client.socket_root, &snapshot.caches[0])
+            .unwrap()
+            .as_os_str()
+            .len(),
+        107
+    );
+    let too_long = PathBuf::from(format!("{}x", root.display()));
+    assert_eq!(
+        resolve_socket(&too_long, &snapshot.caches[0]),
+        Err(Error::InvalidConfiguration)
+    );
+    let (client, _, _) = self::client();
+    assert!(matches!(
+        remap(client, format!("/{}", "x".repeat(107))),
+        Err(Error::InvalidConfiguration)
+    ));
+}
+
+#[test]
+fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
+    use crate::peer::protocol::FetchMode;
+    use crate::peer::protocol::Operation as PeerOperation;
+    use crate::read::candidates::CandidatePolicy;
+    use crate::read::candidates::CandidateResolution;
+    use crate::test_support::NoPeers;
+    use crate::topology::Placement;
+    use std::os::fd::AsRawFd;
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("origin-root-{}", std::process::id()));
+    // A shared CARGO_TARGET_DIR need not create this worktree's local target directory.
+    std::fs::create_dir_all(&path).unwrap();
+    let _cleanup = Directory(path.clone());
+    std::fs::create_dir_all(path.join("cache-a/origin")).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let root = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    let listener = UnixListener::bind(root.join("cache-a/origin/socket")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (client, admission, reactor, snapshot) = published_client();
+    let client = remap(client, root).unwrap();
+    let mut context = context();
+    context.object.cache = snapshot.caches[0].id.clone();
+    let candidates = Placement::new(2)
+        .rank(snapshot.membership.clone(), &context.object, PageNumber(0))
+        .unwrap();
+    let policy = CandidatePolicy::new(
+        candidates.ordered[0].clone(),
+        Rc::new(Placement::new(2)),
+        NoPeers::requester(),
+        credentials(admission.clone()),
+        Arc::new(Published::new(Snapshot::retention(2))),
+    );
+    let scope = scope();
+    let CandidateResolution::Origin(authority) = block_on(policy.resolve(
+        candidates,
+        &context,
+        PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::Acquire,
+        },
+        &scope,
+    ))
+    .unwrap() else {
+        panic!("origin authority required");
+    };
+    let mut wrong = OriginContext {
+        object: context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    wrong.object.key.0[0] ^= 1;
+    assert!(matches!(
+        block_on(client.metadata(&authority, &wrong, MetadataSelector::Fresh, &scope)),
+        Err(Error::Unauthorized)
+    ));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At:  1234\r\n\r\n").unwrap();
+    });
+    assert_eq!(
+        drive(
+            &reactor,
+            client.metadata(&authority, &context, MetadataSelector::Fresh, &scope)
+        )
+        .unwrap()
+        .metadata
+        .length,
+        3
+    );
+    assert!(matches!(
+        drive(
+            &reactor,
+            client.metadata(&authority, &context, MetadataSelector::Fresh, &scope)
+        ),
+        Err(Error::BadGateway)
+    ));
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
+fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let deadline = Instant::now() + Duration::from_secs(7);
+    loop {
+        if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "origin operation made no progress"
+        );
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+}
+
+#[test]
+fn shared_adapter_controls_real_head_bootstrap_pin_and_rejection() {
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectMetadata;
+    use crate::model::ObjectVersion;
+    use crate::test_support::origin::AdapterOrigin;
+    use crate::test_support::origin::RequestKind;
+    let (client, admission, reactor, snapshot) = published_client();
+    let mut context = context();
+    context.object.cache = snapshot.caches[0].id.clone();
+    let mut metadata = ObjectMetadata {
+        version: ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::test_value("v1"),
+        },
+        length: 3,
+        content_type: None,
+        expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH + Duration::from_secs(1234))
+            .unwrap(),
+    };
+    let adapter = AdapterOrigin::new("cache-a", metadata.clone());
+    let client = remap(client, adapter.root.clone()).unwrap();
+    let endpoint = client.endpoint(&context).unwrap();
+    let scope = scope();
+    let head = drive(
+        &reactor,
+        client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope),
+    )
+    .unwrap();
+    assert_eq!(head.metadata, metadata);
+    adapter.set_body(b"xyz".to_vec());
+    let initial = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
+    assert_eq!(
+        initial.page_zero.unwrap().plaintext.bytes().unwrap(),
+        b"xyz"
+    );
+    let page = PageId {
+        version: metadata.version.clone(),
+        number: PageNumber(0),
+    };
+    adapter.delay(RequestKind::PinnedGet, Duration::from_millis(5));
+    adapter.block(RequestKind::PinnedGet);
+    let mut pending = Box::pin(client.page_at(&endpoint, &context, &page, &scope));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while adapter.count(RequestKind::PinnedGet) == 0 {
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert!(pending.as_mut().poll(&mut cx).is_pending());
+    adapter.release(RequestKind::PinnedGet);
+    assert_eq!(
+        drive(&reactor, pending).unwrap().plaintext.bytes().unwrap(),
+        b"xyz"
+    );
+    metadata.version.etag = StrongEtag::test_value("v2");
+    adapter.set_version(metadata);
+    assert!(matches!(
+        drive(&reactor, client.page_at(&endpoint, &context, &page, &scope)),
+        Err(Error::VersionUnavailable)
+    ));
+    adapter.reject_next(RequestKind::Head, 403);
+    assert!(matches!(
+        drive(
+            &reactor,
+            client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope)
+        ),
+        Err(Error::OriginForbidden)
+    ));
+    assert_eq!(adapter.count(RequestKind::Head), 2);
+    assert_eq!(adapter.count(RequestKind::InitialGet), 1);
+    assert_eq!(adapter.count(RequestKind::PinnedGet), 2);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
+fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
+    use std::os::fd::AsRawFd;
+    let directory_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("origin-replacement-{}", std::process::id()));
+    std::fs::create_dir_all(directory_path.join("cache-a/origin")).unwrap();
+    let directory = std::fs::File::open(&directory_path).unwrap();
+    let root = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    let socket = root.join("cache-a/origin/socket");
+    let old_listener = UnixListener::bind(&socket).unwrap();
+    old_listener.set_nonblocking(true).unwrap();
+    let (mut client, admission, reactor) = self::client();
+    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../internal/racer/wire/testdata/publication.json"
+    )))
+    .unwrap();
+    publication.sequence.0 = 1;
+    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    let snapshot = target.apply(publication.clone()).unwrap();
+    let client = remap(client, root).unwrap();
+    let mut old_context = context();
+    old_context.object.cache = snapshot.caches[0].id.clone();
+    let old_endpoint = client.endpoint(&old_context).unwrap();
+    let scope = scope();
+    let (release, held) = std::sync::mpsc::channel();
+    let old_server = thread::spawn(move || {
+        // All three exchanges must use this one accepted socket, including the
+        // delayed old operation after the replacement starts serving.
+        let mut stream = accept(&old_listener);
+        for _ in 0..2 {
+            check_request(&receive(&mut stream), "HEAD", None, None, true);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"old\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        }
+        held.recv_timeout(Duration::from_secs(5)).unwrap();
+        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"old\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+    });
+    for _ in 0..2 {
+        let result = drive(
+            &reactor,
+            client.metadata_at(&old_endpoint, &old_context, MetadataSelector::Fresh, &scope),
+        )
+        .unwrap();
+        assert_eq!(
+            result.metadata.version.etag,
+            StrongEtag::parse(b"\"old\"").unwrap()
+        );
+    }
+    assert_eq!(admission.used(ResourceClass::Connection), 1);
+    let delayed = client.metadata_at(&old_endpoint, &old_context, MetadataSelector::Fresh, &scope);
+    std::fs::remove_file(&socket).unwrap();
+    let replacement_listener = UnixListener::bind(&socket).unwrap();
+    replacement_listener.set_nonblocking(true).unwrap();
+    publication.sequence.0 += 2; // The worker can skip the intervening removal.
+    publication.caches[0].id = CacheId("55555555-5555-4555-8555-555555555555".into());
+    let mut new_context = context();
+    new_context.object.cache = publication.caches[0].id.clone();
+    new_context.authorization =
+        Some(Authorization::from_header(b"replacement-credential").unwrap());
+    target.apply(publication).unwrap();
+    let new_endpoint = client.endpoint(&new_context).unwrap();
+    assert_ne!(old_endpoint, new_endpoint);
+    let replacement = thread::spawn(move || {
+        let mut stream = accept(&replacement_listener);
+        for _ in 0..2 {
+            assert_eq!(
+                receive(&mut stream).unique("Authorization").unwrap(),
+                Some(b"replacement-credential".as_slice())
+            );
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"new\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        }
+    });
+    for _ in 0..2 {
+        let result = drive(
+            &reactor,
+            client.metadata_at(&new_endpoint, &new_context, MetadataSelector::Fresh, &scope),
+        )
+        .unwrap();
+        assert_eq!(
+            result.metadata.version.etag,
+            StrongEtag::parse(b"\"new\"").unwrap()
+        );
+    }
+    release.send(()).unwrap();
+    assert_eq!(
+        drive(&reactor, delayed).unwrap().metadata.version.etag,
+        StrongEtag::parse(b"\"old\"").unwrap()
+    );
+    old_server.join().unwrap();
+    replacement.join().unwrap();
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    std::fs::remove_dir_all(directory_path).unwrap();
+}
+
+struct SocketPath(PathBuf);
+impl Drop for SocketPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+fn listen() -> (SocketPath, UnixListener, Endpoint) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // A short relative socket path stays inside the owned source directory and
+    // below sockaddr_un's limit even when the worktree's absolute path is long.
+    let path = PathBuf::from(format!(
+        "src/origin/.origin-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    (SocketPath(path.clone()), listener, Endpoint::Unix(path))
+}
+fn accept(listener: &UnixListener) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                return stream;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1))
+            }
+            Err(error) => panic!("origin accept failed: {error}"),
+        }
+    }
+}
+fn receive(stream: &mut UnixStream) -> MessageHead {
+    let mut raw = Vec::new();
+    while !raw.ends_with(b"\r\n\r\n") {
+        assert!(raw.len() < 32768);
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        raw.push(byte[0]);
+    }
+    Codec::new(32768).decode_head(&raw).unwrap().unwrap().0
+}
+fn check_request(
+    head: &MessageHead,
+    method: &str,
+    pin: Option<&[u8]>,
+    range: Option<&[u8]>,
+    credentials: bool,
+) {
+    match &head.start {
+        StartLine::Request {
+            method: actual,
+            target,
+        } => {
+            assert_eq!(actual, method);
+            assert_eq!(target, &format!("/v1/objects/{}", "ab".repeat(32)));
+        }
+        _ => panic!("expected request"),
+    }
+    assert_eq!(head.unique("Host").unwrap(), Some(b"racer".as_slice()));
+    assert_eq!(head.unique("If-Match").unwrap(), pin);
+    assert_eq!(head.unique("Range").unwrap(), range);
+    assert_eq!(
+        head.unique("Authorization").unwrap(),
+        credentials.then_some(b"credential\xfe".as_slice())
+    );
+    assert_eq!(
+        head.unique("Racer-Metadata").unwrap(),
+        credentials.then_some(b"opaque\xff".as_slice())
+    );
+}
+
+#[test]
+fn distinct_cold_requests_wait_for_origin_slots_and_finish_complete_bodies() {
+    let (_path, listener, endpoint) = listen();
+    let (client, admission, reactor) = client();
+    let contexts: Vec<_> = (0..3)
+        .map(|index| {
+            let mut context = context();
+            context.object.key = CacheKey([index; 32]);
+            context
+        })
+        .collect();
+    let scope = scope();
+    let mut requests: Vec<_> = contexts
+        .iter()
+        .map(|context| Box::pin(client.bootstrap_at(&endpoint, context, &scope)))
+        .collect();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    // Admit two connects. The third must wait without starting I/O or failing.
+    for request in &mut requests {
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(admission.used(ResourceClass::Connection), 2);
+    assert_eq!(reactor.in_flight(), 2);
+    let server = thread::spawn(move || {
+        let mut sockets = [accept(&listener), accept(&listener)];
+        let mut targets = std::collections::HashSet::new();
+        for socket in &mut sockets {
+            let head = receive(socket);
+            let StartLine::Request { method, target } = head.start else {
+                panic!("request required")
+            };
+            assert_eq!(method, "GET");
+            assert!(targets.insert(target));
+        }
+        // Release only the first slot; the queued request must reuse it while
+        // the other distinct cold request is still waiting for its response.
+        let response = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nabc";
+        sockets[0].write_all(response).unwrap();
+        let head = receive(&mut sockets[0]);
+        let StartLine::Request { target, .. } = head.start else {
+            panic!("request required")
+        };
+        assert!(targets.insert(target));
+        assert_eq!(targets.len(), 3);
+        sockets[0].write_all(response).unwrap();
+        sockets[1].write_all(response).unwrap();
+    });
+    let mut pending: Vec<_> = requests.into_iter().map(Some).collect();
+    let mut completed = 0;
+    while completed < 3 {
+        scope.check().unwrap();
+        client.pool.poll_waiters(2);
+        for (index, request) in pending.iter_mut().enumerate() {
+            if let Some(future) = request
+                && let Poll::Ready(result) = future.as_mut().poll(&mut cx)
+            {
+                let result = result.unwrap();
+                assert_eq!(result.metadata.version.object, contexts[index].object);
+                assert_eq!(result.page_zero.unwrap().plaintext.bytes().unwrap(), b"abc");
+                *request = None;
+                completed += 1;
+            }
+        }
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    server.join().unwrap();
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
+fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        // All three exchanges must use this one accepted connection.
+        let mut stream = accept(&listener);
+        check_request(
+            &receive(&mut stream),
+            "GET",
+            None,
+            Some(b"bytes=0-16777215"),
+            true,
+        );
+        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nRacer-Content-Type: text/plain\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\na").unwrap();
+        thread::sleep(Duration::from_millis(10));
+        stream.write_all(b"bc").unwrap();
+        check_request(&receive(&mut stream), "HEAD", Some(b"\"v\""), None, false);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nRacer-Content-Type: text/plain\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        check_request(
+            &receive(&mut stream),
+            "GET",
+            Some(b"\"v\""),
+            Some(b"bytes=0-16777215"),
+            false,
+        );
+        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nRacer-Content-Type: text/plain\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nab").unwrap();
+        thread::sleep(Duration::from_millis(10));
+        stream.write_all(b"c").unwrap();
+    });
+    let (client, admission, reactor) = client();
+    let mut context = context();
+    let scope = scope();
+    let reply = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
+    assert_eq!(reply.metadata.expires_at.to_unix_millis().unwrap(), 1234);
+    assert_eq!(
+        reply.metadata.content_type.as_ref().unwrap().as_str(),
+        "text/plain"
+    );
+    assert_eq!(
+        reply.page_zero.as_ref().unwrap().plaintext.bytes().unwrap(),
+        b"abc"
+    );
+    let page = PageId {
+        version: reply.metadata.version.clone(),
+        number: PageNumber(0),
+    };
+    drop(reply);
+    context.authorization = None;
+    context.metadata = None;
+    let head = drive(
+        &reactor,
+        client.metadata_at(
+            &endpoint,
+            &context,
+            MetadataSelector::Pinned(page.version.etag.clone()),
+            &scope,
+        ),
+    )
+    .unwrap();
+    assert_eq!(head.metadata.length, 3);
+    assert_eq!(
+        head.metadata.content_type.as_ref().unwrap().as_str(),
+        "text/plain"
+    );
+    assert_eq!(
+        admission.used(ResourceClass::Plaintext),
+        0,
+        "HEAD must not allocate a body"
+    );
+    let received = drive(&reactor, client.page_at(&endpoint, &context, &page, &scope)).unwrap();
+    assert_eq!(received.plaintext.bytes().unwrap(), b"abc");
+    assert_eq!(
+        received.metadata.content_type.as_ref().unwrap().as_str(),
+        "text/plain"
+    );
+    drop(received);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn real_uds_head_progresses_when_page_plaintext_budget_is_exhausted() {
+    let (_path, listener, endpoint) = listen();
+    let (client, admission, reactor) = client();
+    let context = context();
+    let scope = scope();
+    let held = admission
+        .reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            admission.policy().limits().plaintext_bytes.get(),
+        )
+        .unwrap();
+    let page = PageId {
+        version: crate::model::ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::parse(b"\"v\"").unwrap(),
+        },
+        number: PageNumber(0),
+    };
+    assert!(matches!(
+        block_on(client.bootstrap_at(&endpoint, &context, &scope)),
+        Err(Error::Overloaded)
+    ));
+    assert!(matches!(
+        block_on(client.page_at(&endpoint, &context, &page, &scope)),
+        Err(Error::Overloaded)
+    ));
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        check_request(&receive(&mut stream), "HEAD", Some(b"\"v\""), None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+    });
+    let reply = drive(
+        &reactor,
+        client.metadata_at(
+            &endpoint,
+            &context,
+            MetadataSelector::Pinned(page.version.etag.clone()),
+            &scope,
+        ),
+    )
+    .unwrap();
+    assert_eq!(reply.metadata.version, page.version);
+    assert_eq!(reply.metadata.length, 3);
+    assert!(reply.page_zero.is_none());
+    assert_eq!(
+        admission.used(ResourceClass::Plaintext),
+        admission.policy().limits().plaintext_bytes.get()
+    );
+    drop(held);
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn real_uds_empty_bootstrap_and_truncated_page() {
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        receive(&mut stream);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\n").unwrap();
+        receive(&mut stream);
+        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\nab").unwrap();
+    });
+    let (client, admission, reactor) = client();
+    let context = context();
+    let scope = scope();
+    let reply = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
+    assert_eq!(reply.metadata.length, 0);
+    assert!(reply.page_zero.is_none());
+    let page = PageId {
+        version: reply.metadata.version,
+        number: PageNumber(0),
+    };
+    assert!(matches!(
+        drive(&reactor, client.page_at(&endpoint, &context, &page, &scope)),
+        Err(Error::BadGateway)
+    ));
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn real_uds_errors_preserve_credential_and_version_contracts() {
+    for (status, fields, expected) in [
+        (401, "", Error::OriginRejected),
+        (403, "", Error::OriginForbidden),
+        (404, "", Error::BadGateway),
+        (412, "", Error::VersionUnavailable),
+        (
+            416,
+            "Content-Range: bytes */27\r\n",
+            Error::UnsatisfiableRangeWithLength(27),
+        ),
+        (503, "", Error::Unavailable),
+        (
+            200,
+            "ETag: \"wrong\"\r\nRacer-Expires-At: 0\r\n",
+            Error::BadGateway,
+        ),
+        (401, "Range: x\r\nrange: x\r\n", Error::BadGateway),
+    ] {
+        let (_path, listener, endpoint) = listen();
+        let server = thread::spawn(move || {
+            let mut stream = accept(&listener);
+            receive(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 {status} Response\r\nContent-Length: 0\r\n{fields}\r\n"
+            )
+            .unwrap();
+        });
+        let (client, admission, reactor) = client();
+        let result = drive(
+            &reactor,
+            client.metadata_at(
+                &endpoint,
+                &context(),
+                MetadataSelector::Pinned(StrongEtag::parse(b"\"v\"").unwrap()),
+                &scope(),
+            ),
+        );
+        assert!(matches!(result, Err(error) if error == expected));
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn public_operations_reject_wrong_authority_before_io() {
+    use crate::peer::protocol::FetchMode;
+    use crate::peer::protocol::Operation as PeerOperation;
+    use crate::read::candidates::CandidatePolicy;
+    use crate::read::candidates::CandidateResolution;
+    use crate::test_support::NoPeers;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Placement;
+    use racer_control_wire::MembershipVersion;
+    use racer_control_wire::NodeId;
+    let node = NodeId("node".into());
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            vec![Member {
+                node: node.clone(),
+                shares: std::num::NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:1234".into(),
+                rails: vec![],
+                site: String::new(),
+            }],
+        )
+        .unwrap(),
+    );
+    let policy = CandidatePolicy::new(
+        node,
+        Rc::new(Placement::new(2)),
+        NoPeers::requester(),
+        credentials(client().1),
+        Arc::new(Published::new(Snapshot::retention(2))),
+    );
+    let context = context();
+    let scope = scope();
+    let candidates = policy
+        .candidates(membership, &context.object, PageNumber(0))
+        .unwrap();
+    let resolution = block_on(policy.resolve(
+        candidates,
+        &context,
+        PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::Acquire,
+        },
+        &scope,
+    ))
+    .unwrap();
+    let CandidateResolution::Origin(authority) = resolution else {
+        panic!("expected local authority")
+    };
+    let (client, admission, _) = client();
+    let mut wrong = OriginContext {
+        object: context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    wrong.object.key.0[0] ^= 1;
+    assert!(matches!(
+        block_on(client.metadata(&authority, &wrong, MetadataSelector::Fresh, &scope)),
+        Err(Error::Unauthorized)
+    ));
+    let reserve = || {
+        admission
+            .reserve(
+                Some(&context.object.cache),
+                ResourceClass::Plaintext,
+                PAGE_BYTES as usize,
+            )
+            .unwrap()
+    };
+    assert!(matches!(
+        block_on(client.bootstrap_reserved(&authority, &wrong, reserve(), &scope)),
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    let page = PageId {
+        version: crate::model::ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::parse(b"\"v\"").unwrap(),
+        },
+        number: PageNumber(1),
+    };
+    assert!(matches!(
+        block_on(client.page_reserved(&authority, &context, &page, reserve(), &scope)),
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
+fn real_uds_final_page_consumes_supplied_budget_without_second_charge() {
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        check_request(
+            &receive(&mut stream),
+            "GET",
+            Some(b"\"v\""),
+            Some(b"bytes=16777216-33554431"),
+            true,
+        );
+        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 16777216-16777218/16777219\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nend").unwrap();
+    });
+    let (client, admission, reactor) = client();
+    let context = context();
+    let held = admission
+        .reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            3 * PAGE_BYTES as usize,
+        )
+        .unwrap();
+    let supplied = admission
+        .reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        )
+        .unwrap();
+    assert!(matches!(
+        admission.reserve(Some(&context.object.cache), ResourceClass::Plaintext, 1),
+        Err(flow_control::Error::Overloaded)
+    ));
+    let page = PageId {
+        version: crate::model::ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::parse(b"\"v\"").unwrap(),
+        },
+        number: PageNumber(1),
+    };
+    let result = drive(
+        &reactor,
+        client.page_reserved_at(&endpoint, &context, &page, supplied, &scope()),
+    )
+    .unwrap();
+    assert_eq!(result.metadata.length, PAGE_BYTES + 3);
+    assert_eq!(result.plaintext.bytes().unwrap(), b"end");
+    drop(result);
+    drop(held);
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        receive(&mut stream);
+        let response = format!(
+            "HTTP/1.1 200 {}\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\n",
+            "x".repeat(32768)
+        );
+        // The receiver may close immediately upon reaching its raw-head limit.
+        let _ = stream.write_all(response.as_bytes());
+    });
+    let (mut client, admission, reactor) = client();
+    client.io = Rc::new(crate::http::new_io(
+        reactor.clone(),
+        Codec::new(65536),
+        admission.clone(),
+        PAGE_BYTES,
+    ));
+    reactor.init().unwrap();
+    let infrastructure_bytes = admission.used(ResourceClass::RequestContext);
+    assert!(matches!(
+        drive(
+            &reactor,
+            client.metadata_at(&endpoint, &context(), MetadataSelector::Fresh, &scope())
+        ),
+        Err(Error::BadGateway)
+    ));
+    assert_eq!(
+        admission.used(ResourceClass::RequestContext),
+        infrastructure_bytes + client.io.retained_buffer_bytes()
+    );
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn real_uds_canceled_and_expired_reads_release_owned_resources() {
+    for cancel in [false, true] {
+        let (_path, listener, endpoint) = listen();
+        let scope = RequestScope::new(
+            RequestId([4; 16]),
+            Instant::now() + Duration::from_millis(250),
+        )
+        .unwrap();
+        let cancellation = scope.cancellation.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = accept(&listener);
+            receive(&mut stream);
+            if cancel {
+                cancellation.cancel().unwrap();
+            }
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (client, admission, reactor) = client();
+        reactor.init().unwrap();
+        let infrastructure_bytes = admission.used(ResourceClass::RequestContext);
+        let result = drive(&reactor, client.bootstrap_at(&endpoint, &context(), &scope));
+        assert!(
+            matches!(result, Err(error) if error == if cancel { Error::Cancelled } else { Error::DeadlineExceeded })
+        );
+        release.send(()).unwrap();
+        server.join().unwrap();
+        drive(&reactor, reactor.drain()).unwrap();
+        client.pool.expire_idle();
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            infrastructure_bytes + client.io.retained_buffer_bytes()
+        );
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+}
+
+/// Transport framing failures become gateway errors without hiding admission or cancellation.
+#[test]
+fn exchange_errors_preserve_resource_and_request_failures() {
+    for error in [
+        Error::InvalidRequest,
+        Error::HeaderTooLarge,
+        Error::CorruptRecord,
+        Error::Io,
+        Error::Os(libc::ECONNRESET),
+    ] {
+        assert_eq!(response_error(error), Error::BadGateway);
+    }
+    for error in [
+        Error::Overloaded,
+        Error::Cancelled,
+        Error::DeadlineExceeded,
+        Error::OriginRejected,
+        Error::OriginForbidden,
+        Error::VersionUnavailable,
+    ] {
+        assert_eq!(response_error(error), error);
+    }
+}
+
+#[test]
+fn opaque_request_values_reject_present_empty_and_keep_obs_text() {
+    for bytes in [b"".as_slice(), b" x", b"x ", b"x\t", b"x\r\ny", b"x\x7f"] {
+        assert!(opaque(bytes).is_err());
+    }
+    assert!(opaque(&vec![b'x'; 8193]).is_err());
+    let head = request(&context(), "HEAD").unwrap();
+    check_request(&head, "HEAD", None, None, true);
+}
+
+#[test]
+fn reserved_operations_reject_invalid_charges_before_io_and_release_them() {
+    let (client, admission, _) = client();
+    let (_, foreign, _) = self::client();
+    let context = context();
+    let wrong_cache = CacheId("other".into());
+    let page = PageId {
+        version: crate::model::ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::parse(b"\"v\"").unwrap(),
+        },
+        number: PageNumber(0),
+    };
+    for (owner, cache, class, amount) in [
+        (
+            &foreign,
+            &context.object.cache,
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        ),
+        (
+            &admission,
+            &wrong_cache,
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        ),
+        (
+            &admission,
+            &context.object.cache,
+            ResourceClass::Plaintext,
+            1,
+        ),
+        (
+            &admission,
+            &context.object.cache,
+            ResourceClass::Ciphertext,
+            PAGE_BYTES as usize,
+        ),
+    ] {
+        let supplied = owner.reserve(Some(cache), class, amount).unwrap();
+        let result = block_on(client.bootstrap_reserved_at(
+            &Endpoint::Unix("does-not-exist".into()),
+            &context,
+            supplied,
+            &scope(),
+        ));
+        assert!(matches!(result, Err(Error::InvalidConfiguration)));
+        assert_eq!(owner.used(class), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        let supplied = owner.reserve(Some(cache), class, amount).unwrap();
+        let result = block_on(client.page_reserved_at(
+            &Endpoint::Unix("does-not-exist".into()),
+            &context,
+            &page,
+            supplied,
+            &scope(),
+        ));
+        assert!(matches!(result, Err(Error::InvalidConfiguration)));
+        assert_eq!(owner.used(class), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+}
+mod metadata_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+    fn object() -> ObjectId {
+        ObjectId {
+            cache: CacheId("cache-uid".into()),
+            key: CacheKey([0xab; 32]),
+        }
+    }
+    fn head(length: &[u8], expiry: &[u8], etag: &[u8]) -> MessageHead {
+        response_head(
+            200,
+            &[
+                ("Content-Length", length),
+                ("Racer-Expires-At", expiry),
+                ("ETag", etag),
+            ],
+        )
+    }
+    #[test]
+    fn head_retains_quoted_validator_and_exact_millisecond_expiry() {
+        let metadata = validate_metadata(&head(b"0", b"1234", b"\"v,\\1\""), &object()).unwrap();
+        assert_eq!(metadata.length, 0);
+        assert_eq!(metadata.version.etag.as_bytes(), b"\"v,\\1\"");
+        assert_eq!(
+            metadata.expires_at.as_system_time(),
+            UNIX_EPOCH + Duration::from_millis(1234)
+        );
+        assert_eq!(
+            validate_metadata(
+                &head(b"9223372036854775807", b"9223372036854775807", b"\"\""),
+                &object()
+            )
+            .unwrap()
+            .length,
+            i64::MAX as u64
+        );
+    }
+    #[test]
+    fn metadata_rejects_ambiguous_and_out_of_domain_fields() {
+        for invalid in [
+            b"".as_slice(),
+            b"01",
+            b"-1",
+            b"+1",
+            b" 1",
+            b"1 ",
+            b"\t1",
+            b"1\t",
+            b"1.0",
+            b"9223372036854775808",
+        ] {
+            assert_eq!(decimal(invalid), Err(Error::BadGateway));
+            assert_eq!(
+                validate_metadata(&head(b"1", invalid, b"\"v\""), &object()),
+                Err(Error::BadGateway)
+            );
+            assert_eq!(
+                validate_metadata(&head(invalid, b"0", b"\"v\""), &object()),
+                Err(Error::BadGateway)
+            );
+        }
+        for etag in [b"v".as_slice(), b"W/\"v\"", b"*", b"\"v\", \"w\""] {
+            assert_eq!(
+                validate_metadata(&head(b"1", b"0", etag), &object()),
+                Err(Error::BadGateway)
+            );
+        }
+        for name in [
+            "ETag",
+            "Content-Length",
+            "Racer-Expires-At",
+            "Content-Range",
+            "Transfer-Encoding",
+            "Content-Encoding",
+        ] {
+            let mut response = head(b"1", b"0", b"\"v\"");
+            response.headers.push(Header {
+                name: name.into(),
+                value: b"1".to_vec(),
+            });
+            assert_eq!(
+                validate_metadata(&response, &object()),
+                Err(Error::BadGateway)
+            );
+        }
+    }
+    #[test]
+    fn bootstrap_empty_and_short_page_are_distinct_from_head() {
+        let mut response = head(b"0", b"0", b"\"v\"");
+        response.headers.push(Header {
+            name: "Content-Type".into(),
+            value: b"application/octet-stream".to_vec(),
+        });
+        assert_eq!(validate_bootstrap(&response, &object()).unwrap().1, 0);
+        response.headers[0].value = b"3".to_vec();
+        assert_eq!(
+            validate_bootstrap(&response, &object()),
+            Err(Error::BadGateway)
+        );
+        response.start = StartLine::Response { status: 206 };
+        response.headers.push(Header {
+            name: "Content-Range".into(),
+            value: b"bytes 0-2/3".to_vec(),
+        });
+        assert_eq!(
+            validate_bootstrap(&response, &object()).unwrap().0.length,
+            3
+        );
+        response.headers.last_mut().unwrap().value = b"bytes 0-2/4".to_vec();
+        assert_eq!(
+            validate_bootstrap(&response, &object()),
+            Err(Error::BadGateway)
+        );
+    }
+    #[test]
+    fn raw_expiry_whitespace_is_rejected_before_metadata_publication() {
+        for expiry in ["0", " 0", "0 ", "\t0", "0\t", "0 \t"] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: {expiry}\r\n\r\n"
+            );
+            let (head, _) = Codec::new(32768)
+                .decode_head(raw.as_bytes())
+                .unwrap()
+                .unwrap();
+            let result = validate_metadata(&head, &object());
+            if expiry == "0" {
+                assert_eq!(result.unwrap().expires_at.as_system_time(), UNIX_EPOCH);
+            } else {
+                assert_eq!(result, Err(Error::BadGateway), "expiry={expiry:?}");
+            }
+        }
+    }
+}
+mod page_tests {
+    use super::*;
+    fn page() -> PageId {
+        PageId {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::parse(b"\"v\"").unwrap(),
+            },
+            number: PageNumber(1),
+        }
+    }
+    fn head() -> MessageHead {
+        response_head(
+            206,
+            &[
+                ("Content-Length", b"3"),
+                ("Content-Type", b"application/octet-stream"),
+                ("Content-Range", b"bytes 16777216-16777218/16777219"),
+                ("ETag", b"\"v\""),
+                ("Racer-Expires-At", b"0"),
+            ],
+        )
+    }
+    #[test]
+    fn pinned_final_page_accepts_only_exact_body_range_and_version() {
+        let page = page();
+        assert_eq!(
+            validate_page(&head(), &page, 3).unwrap().length,
+            PAGE_BYTES + 3
+        );
+        for count in [0, 2, 4, PAGE_BYTES as usize] {
+            assert_eq!(validate_page(&head(), &page, count), Err(Error::BadGateway));
+        }
+        for range in [
+            "bytes 0-2/3",
+            "bytes 16777216-16777218/16777220",
+            "bytes */16777219",
+            "bytes 16777216-16777219/16777219",
+            "bytes 016777216-16777218/16777219",
+        ] {
+            let mut response = head();
+            response.headers[2].value = range.as_bytes().to_vec();
+            assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        }
+        let mut response = head();
+        response.headers[3].value = b"\"other\"".to_vec();
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        response = head();
+        response.start = StartLine::Response { status: 200 };
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        response = head();
+        response.headers[1].value = b"multipart/byteranges".to_vec();
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+    }
+}
+mod protocol_tests {
+    use super::*;
+    #[test]
+    fn optional_content_type_is_validated_without_transport_substitution() {
+        let object = ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([0; 32]),
+        };
+        let base = response_head(
+            200,
+            &[
+                ("ETag", b"\"v1\""),
+                ("Content-Length", b"3"),
+                ("Racer-Expires-At", b"0"),
+                ("Content-Type", b"application/octet-stream"),
+            ],
+        );
+        assert!(metadata(&base, &object, 3).unwrap().content_type.is_none());
+        for value in [
+            b"application/vnd.oci.image.manifest.v1+json".as_slice(),
+            b"",
+            b"text",
+            b"text/plain\t",
+            b"text/plain, text/html",
+            b"text/\xff",
+            b"text/plain\r\nx:y",
+        ] {
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: base
+                    .headers
+                    .iter()
+                    .map(|h| Header {
+                        name: h.name.clone(),
+                        value: h.value.clone(),
+                    })
+                    .collect(),
+            };
+            head.headers.push(Header {
+                name: "Racer-Content-Type".into(),
+                value: value.to_vec(),
+            });
+            let valid = value.starts_with(b"application/");
+            assert_eq!(validate_response(&head, false).is_ok(), valid, "{value:?}");
+            assert_eq!(metadata(&head, &object, 3).is_ok(), valid);
+            if valid {
+                assert_eq!(
+                    metadata(&head, &object, 3)
+                        .unwrap()
+                        .content_type
+                        .unwrap()
+                        .as_bytes(),
+                    value
+                );
+            }
+            head.headers.push(Header {
+                name: "racer-content-type".into(),
+                value: value.to_vec(),
+            });
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+            assert!(metadata(&head, &object, 3).is_err());
+        }
+    }
+    #[test]
+    fn numeric_headers_reject_padding_before_any_normalization() {
+        let object = ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([0; 32]),
+        };
+        for (name, canonical) in [
+            ("Racer-Expires-At", "0"),
+            ("Content-Length", "1"),
+            ("Content-Range", "bytes 0-0/1"),
+        ] {
+            for (prefix, suffix) in [("", ""), (" ", ""), ("", " "), ("\t", ""), ("", "\t")] {
+                let fields = [
+                    ("Content-Length", "1"),
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Range", "bytes 0-0/1"),
+                    ("ETag", "\"v\""),
+                    ("Racer-Expires-At", "0"),
+                ];
+                let mut raw = String::from("HTTP/1.1 206 Partial Content\r\n");
+                for (field, value) in fields {
+                    if field == name {
+                        raw.push_str(&format!("{field}: {prefix}{canonical}{suffix}\r\n"));
+                    } else {
+                        raw.push_str(&format!("{field}: {value}\r\n"));
+                    }
+                }
+                raw.push_str("\r\n");
+                let result = Codec::new(32768)
+                    .decode_head(raw.as_bytes())
+                    .map_err(|_| Error::BadGateway)
+                    .and_then(|head| validate_bootstrap(&head.unwrap().0, &object));
+                if prefix.is_empty() && suffix.is_empty() {
+                    assert_eq!(result.unwrap().1, 1);
+                } else {
+                    assert_eq!(result, Err(Error::BadGateway), "{name}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn all_sdk_singletons_reject_case_insensitive_duplicates() {
+        for name in [
+            "Host",
+            "Content-Length",
+            "Content-Type",
+            "Content-Range",
+            "ETag",
+            "If-Match",
+            "Range",
+            "Racer-Expires-At",
+            "Racer-Metadata",
+            "Authorization",
+        ] {
+            let mut head = response_head(200, &[("Content-Length", b"0")]);
+            if name != "Content-Length" {
+                head.headers.push(Header {
+                    name: name.into(),
+                    value: b"x".to_vec(),
+                });
+            }
+            head.headers.push(Header {
+                name: name.to_ascii_lowercase(),
+                value: b"x".to_vec(),
+            });
+            assert_eq!(
+                validate_response(&head, false),
+                Err(Error::BadGateway),
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn error_contracts_preserve_origin_credential_and_status_distinctions() {
+        for (status, expected) in [
+            (400, Error::InvalidRequest),
+            (401, Error::OriginRejected),
+            (403, Error::OriginForbidden),
+            (404, Error::NotFound),
+            (405, Error::MethodNotAllowed),
+            (412, Error::VersionUnavailable),
+            (416, Error::UnsatisfiableRangeWithLength(27)),
+            (431, Error::HeaderTooLarge),
+            (500, Error::Internal),
+            (502, Error::BadGateway),
+            (503, Error::Unavailable),
+            (302, Error::BadGateway),
+        ] {
+            let mut head = response_head(status, &[("Content-Length", b"0")]);
+            if status == 416 {
+                head.headers.push(Header {
+                    name: "Content-Range".into(),
+                    value: b"bytes */27".to_vec(),
+                });
+            }
+            if status == 405 {
+                head.headers.push(Header {
+                    name: "Allow".into(),
+                    value: b"HEAD, GET".to_vec(),
+                });
+            }
+            assert_eq!(validate_response(&head, false), Err(expected));
+            if status == 404 {
+                assert_eq!(validate_response(&head, true), Err(Error::BadGateway));
+            }
+            head.headers[0].value = b"1".to_vec();
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+            head.headers[0].value = b"0".to_vec();
+            head.headers.push(Header {
+                name: "ETag".into(),
+                value: b"\"v\"".to_vec(),
+            });
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+        }
+    }
+}

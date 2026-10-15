@@ -62,6 +62,9 @@ func zipfIndex(cdf []float64, draw float64) int {
 	return sort.Search(len(cdf), func(index int) bool { return cdf[index] > draw })
 }
 
+// imageCatalog is the legacy name used by OCI fixture helpers.
+type imageCatalog = blobCatalog
+
 type blobCatalog struct {
 	batches    []blobBatch
 	images     []*syntheticImage
@@ -72,7 +75,7 @@ type blobCatalog struct {
 
 // newCatalog hashes one image at a time with one bounded scratch buffer. Only
 // descriptors, tar headers, and generator state survive initialization, not payloads.
-func newCatalog(ctx context.Context, opts imageOptions, count int) (*blobCatalog, error) {
+func newCatalog(ctx context.Context, opts imageOptions, count int) (*imageCatalog, error) {
 	if count < 1 || count > maxCatalogImages {
 		return nil, fmt.Errorf("catalog-images must be in [1, %d]", maxCatalogImages)
 	}
@@ -99,10 +102,10 @@ func newCatalog(ctx context.Context, opts imageOptions, count int) (*blobCatalog
 	return catalog, nil
 }
 
-func catalogFromImages(images []*syntheticImage) *blobCatalog {
-	c := &blobCatalog{
+func catalogFromImages(images []*syntheticImage) *imageCatalog {
+	c := &imageCatalog{
 		images: images, repository: images[0].repository,
-		manifests: make(map[string]*syntheticImage), blobs: make(map[digest.Digest]blobSource),
+		manifests: make(map[string]*syntheticImage), blobs: make(map[digest.Digest]imageBlob),
 	}
 
 	c.manifests["latest"] = images[0]
@@ -143,10 +146,14 @@ type catalogTraversal struct {
 func (p *puller) newTraversal() catalogTraversal {
 	traversal := catalogTraversal{randomFloat64: p.randomFloat64}
 	if p.opts.Profile == profileZipf {
-		traversal.zipfCDF = newZipfCDF(len(p.batches), p.opts.ZipfExponent)
+		traversal.zipfCDF = newZipfCDF(p.batchCount(), p.opts.ZipfExponent)
 	}
 
 	return traversal
+}
+
+func (t *catalogTraversal) nextImage(images []*syntheticImage) *syntheticImage {
+	return images[t.nextIndex(len(images))]
 }
 
 func (t *catalogTraversal) nextIndex(count int) int {

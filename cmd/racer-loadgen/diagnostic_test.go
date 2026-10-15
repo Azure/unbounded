@@ -55,7 +55,7 @@ func TestDiagnosticReader(t *testing.T) {
 			actual[offset] ^= 1
 		}
 
-		n, hash, e, err := p.readBodyDiagnostic(&diagnosticChunks{actual, 32749, io.EOF}, blobSource{desc, bytes.NewReader(data)})
+		n, hash, e, err := p.readBodyDiagnostic(&diagnosticChunks{actual, 32749, io.EOF}, imageBlob{desc, bytes.NewReader(data)})
 		require.NoError(t, err)
 		require.Equal(t, int64(len(data)), n)
 		require.Equal(t, digest.FromBytes(actual).String(), hash)
@@ -73,9 +73,9 @@ func TestDiagnosticReader(t *testing.T) {
 		require.Equal(t, sha256.Sum256(data[r.Offset:r.Offset+r.Length]), r.Expected)
 	}
 
-	_, _, _, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.ErrUnexpectedEOF}, blobSource{desc, bytes.NewReader(data)})
+	_, _, _, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.ErrUnexpectedEOF}, imageBlob{desc, bytes.NewReader(data)})
 	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-	_, _, _, err = p.readBodyDiagnostic(bytes.NewReader(data), blobSource{desc, bytes.NewReader(nil)})
+	_, _, _, err = p.readBodyDiagnostic(bytes.NewReader(data), imageBlob{desc, bytes.NewReader(nil)})
 	require.ErrorContains(t, err, "oracle")
 }
 
@@ -146,7 +146,7 @@ func TestDiagnosticFiniteTarget(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); img.handler().ServeHTTP(w, r) }))
 	defer server.Close()
 
-	cfg := diagnosticTargetConfig{Target: server.URL, Image: opts, ImageIndices: []int{2}, Iterations: 2, BlobConcurrency: 1, StartupTimeout: "2s", PullTimeout: "2s", TotalTimeout: "5s"}
+	cfg := diagnosticTargetConfig{Target: server.URL, Image: opts, ImageIndices: []int{2}, Iterations: 2, LayerConcurrency: 1, StartupTimeout: "2s", PullTimeout: "2s", TotalTimeout: "5s"}
 	require.NoError(t, runDiagnosticTarget(t.Context(), cfg))
 	require.Equal(t, int64(2*(2+opts.Layers)), requests.Load())
 
@@ -159,7 +159,7 @@ func TestDiagnosticFiniteTarget(t *testing.T) {
 
 	op := pullTestOptions(server.URL)
 	op.DiagnoseIntegrity, op.Verify = true, false
-	_, err = newPuller(img.repository, op, pullTestMetrics())
+	_, err = newPuller(img, op, pullTestMetrics())
 	require.Error(t, err)
 	require.False(t, errors.Is(err, io.EOF))
 }
@@ -184,7 +184,7 @@ func TestDiagnosticPageCapAndLogging(t *testing.T) {
 	p, _ := pullTestNew(t, pullTestImage(t), pullTestOptions("http://localhost"))
 	desc := byteDescriptor("test", nil)
 	desc.Size = 9 * diagnosticPageSize
-	_, _, evidence, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{true}, 0, desc.Size), blobSource{desc, diagnosticPattern{}})
+	_, _, evidence, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{true}, 0, desc.Size), imageBlob{desc, diagnosticPattern{}})
 	require.NoError(t, err)
 	require.Equal(t, int64(9), evidence.examined)
 	require.Equal(t, int64(9), evidence.mismatching)
@@ -293,7 +293,7 @@ func TestDiagnosticTruncatedAndEmpty(t *testing.T) {
 	for _, size := range []int64{0, diagnosticPageSize} {
 		desc := byteDescriptor("test", nil)
 		desc.Size = size
-		n, _, e, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{}, 0, size), blobSource{desc, diagnosticPattern{}})
+		n, _, e, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{}, 0, size), imageBlob{desc, diagnosticPattern{}})
 		require.NoError(t, err)
 		require.Equal(t, size, n)
 		require.Equal(t, size/diagnosticPageSize, e.examined)
@@ -301,7 +301,7 @@ func TestDiagnosticTruncatedAndEmpty(t *testing.T) {
 	}
 
 	desc := byteDescriptor("test", []byte{0, 0})
-	n, _, e, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.EOF}, blobSource{desc, diagnosticPattern{}})
+	n, _, e, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.EOF}, imageBlob{desc, diagnosticPattern{}})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), n)
 	require.Zero(t, e.examined, "short final page must not be finalized")
@@ -317,7 +317,7 @@ func TestDiagnosticTargetDeadline(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
 	defer server.Close()
 
-	cfg := diagnosticTargetConfig{Target: server.URL, Image: testImageOptions(), ImageIndices: []int{0}, Iterations: 2, BlobConcurrency: 1, StartupTimeout: "1s", PullTimeout: "1s", TotalTimeout: "20ms"}
+	cfg := diagnosticTargetConfig{Target: server.URL, Image: testImageOptions(), ImageIndices: []int{0}, Iterations: 2, LayerConcurrency: 1, StartupTimeout: "1s", PullTimeout: "1s", TotalTimeout: "20ms"}
 	require.ErrorIs(t, runDiagnosticTarget(t.Context(), cfg), context.DeadlineExceeded)
 
 	for _, indices := range [][]int{nil, {-1}, {512}} {
