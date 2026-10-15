@@ -133,6 +133,10 @@ pub struct Config {
     pub identity_directory: PathBuf,
     pub slab_directory: PathBuf,
     pub device_directory: PathBuf,
+    /// Startup bound for retrying selected devices whose exclusive open reports
+    /// EBUSY, such as a predecessor process still releasing its claim. Zero
+    /// disables waiting.
+    pub device_busy_wait: Duration,
     pub slab_bytes: u64,
     pub segment_bytes: u64,
     pub free_segment_reserve: usize,
@@ -275,6 +279,7 @@ impl Config {
                 .device_directory
                 .unwrap_or_else(|| "/host/dev".into())
                 .into(),
+            device_busy_wait: Duration::from_secs(raw.device_busy_wait_secs.unwrap_or(120)),
             slab_bytes: raw.slab_bytes.unwrap_or(16 * 1024 * MIB),
             segment_bytes: raw.segment_bytes.unwrap_or(1024 * MIB),
             free_segment_reserve: to_usize(raw.free_segment_reserve.unwrap_or(2))?,
@@ -416,6 +421,7 @@ impl Config {
             || !(32..=512 * MIB as usize).contains(&self.admission_history_bytes.get())
             || self.admission_period < Duration::from_secs(1)
             || self.admission_period > Duration::from_secs(86_400)
+            || self.device_busy_wait > Duration::from_secs(3_600)
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -588,6 +594,7 @@ const ENV_NAMES: &[&str] = &[
     "IDENTITY_DIRECTORY",
     "SLAB_DIRECTORY",
     "DEVICE_DIRECTORY",
+    "DEVICE_BUSY_WAIT_SECS",
     "ADMISSION_MODE",
     "MAX_THREADS",
     "IO_WORKERS",
@@ -713,6 +720,8 @@ struct RawConfig {
     shutdown_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     admission_period_secs: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    device_busy_wait_secs: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     plaintext_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -1412,6 +1421,37 @@ mod tests {
             "8816d91d-e896-49bf-ba8a-da97ede93818,8816d91d-e896-49bf-ba8a-da97ede93818",
         ] {
             assert!(parse(&[("RACER_SEND_CRC_PAIR", invalid)]).is_err());
+        }
+    }
+
+    #[test]
+    fn device_busy_wait_defaults_overrides_and_bounds() {
+        assert_eq!(
+            parse(&[]).unwrap().device_busy_wait,
+            Duration::from_secs(120)
+        );
+        for (value, secs) in [("0", 0), ("1", 1), ("3600", 3_600)] {
+            assert_eq!(
+                parse(&[("RACER_DEVICE_BUSY_WAIT_SECS", value)])
+                    .unwrap()
+                    .device_busy_wait,
+                Duration::from_secs(secs),
+                "{value}"
+            );
+        }
+        for value in [
+            "",
+            "3601",
+            "-1",
+            "1.5",
+            "60s",
+            " 60",
+            "18446744073709551616",
+        ] {
+            assert!(
+                parse(&[("RACER_DEVICE_BUSY_WAIT_SECS", value)]).is_err(),
+                "{value}"
+            );
         }
     }
 

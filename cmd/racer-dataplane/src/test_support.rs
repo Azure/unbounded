@@ -298,6 +298,7 @@ pub mod cluster {
             admission_period: Duration::from_secs(60),
             checkpoint_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
             device_directory: "/host/dev".into(),
+            device_busy_wait: Duration::ZERO,
             cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
             node: NodeId("00000000-0000-4000-8000-000000000002".into()),
             max_threads: 2,
