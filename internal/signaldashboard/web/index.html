@@ -1,0 +1,182 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation. SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project Signal workflow status</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">Read-only hardware certification</p>
+      <h1>Project Signal workflow status</h1>
+      <p>Policy selects approved idle nodes. Argo Workflows makes every execution stage visible.</p>
+    </div>
+    <div class="refresh">
+      <span id="refresh-state">Loading...</span>
+      <button id="refresh-now" type="button">Refresh now</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="global-error" class="notice error hidden" role="alert"></div>
+
+    <section aria-labelledby="overview-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">At a glance</p>
+          <h2 id="overview-title">Execution overview</h2>
+        </div>
+        <div id="health" class="health-row"></div>
+      </div>
+      <div id="cards" class="cards primary-cards" aria-live="polite"></div>
+      <div class="section-heading history-heading">
+        <div>
+          <p class="eyebrow">Retained history</p>
+          <h3>Terminal attempts kept for audit and troubleshooting</h3>
+        </div>
+      </div>
+      <div id="history-cards" class="cards history-cards" aria-live="polite"></div>
+      <div id="latest-outcomes" class="latest-outcomes"></div>
+    </section>
+
+    <section aria-labelledby="runs-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Argo visibility</p>
+          <h2 id="runs-title">Active and recent runs</h2>
+        </div>
+        <div class="filters" aria-label="Run filters">
+          <select id="phase-filter" aria-label="Filter by phase">
+            <option value="">All phases</option>
+            <option>Pending</option>
+            <option>Running</option>
+            <option>Succeeded</option>
+            <option>Failed</option>
+            <option>Inconclusive</option>
+          </select>
+          <select id="verdict-filter" aria-label="Filter by verdict">
+            <option value="">All verdicts</option>
+            <option>Pass</option>
+            <option>Fail</option>
+          </select>
+          <select id="view-filter" aria-label="Filter by current or retained view">
+            <option value="">All records</option>
+            <option value="Current">Current</option>
+            <option value="Historical">Historical</option>
+            <option value="Diagnostics">Diagnostics</option>
+            <option value="Superseded">Superseded</option>
+          </select>
+          <input id="profile-filter" type="search" placeholder="Profile" aria-label="Filter by profile">
+          <input id="hardware-filter" type="search" placeholder="GPU class" aria-label="Filter by GPU class">
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Run / profile</th>
+              <th>Purpose / scope</th>
+              <th>Approved node</th>
+              <th>Phase</th>
+              <th>Typed result</th>
+              <th>Workflow / MPIJob</th>
+              <th>Timing</th>
+              <th>Trigger</th>
+            </tr>
+          </thead>
+          <tbody id="runs-body"></tbody>
+        </table>
+        <div id="runs-empty" class="empty hidden">No runs match the current filters.</div>
+      </div>
+    </section>
+
+    <section aria-labelledby="nodes-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Policy projection</p>
+          <h2 id="nodes-title">Approved nodes</h2>
+        </div>
+        <p>Only nodes referenced by a Project Signal profile or run are shown.</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>Profile</th>
+              <th>State</th>
+              <th>Eligibility</th>
+              <th>Last result</th>
+              <th>Next due / policy reason</th>
+            </tr>
+          </thead>
+          <tbody id="nodes-body"></tbody>
+        </table>
+        <div id="nodes-empty" class="empty hidden">No approved Project Signal nodes are visible.</div>
+      </div>
+    </section>
+
+    <section aria-labelledby="reasons-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Why is it waiting?</p>
+          <h2 id="reasons-title">Admission and failure reasons</h2>
+        </div>
+      </div>
+      <div id="reason-grid" class="reason-grid"></div>
+    </section>
+  </main>
+
+  <dialog id="run-dialog">
+    <div class="dialog-heading">
+      <div>
+        <p class="eyebrow">Run details</p>
+        <h2 id="detail-title">Certification run</h2>
+        <p id="detail-subtitle"></p>
+      </div>
+      <button id="close-detail" type="button" aria-label="Close details">Close</button>
+    </div>
+    <div id="detail-error" class="notice error hidden"></div>
+    <section>
+      <h3>Admission and policy</h3>
+      <div id="admission-list" class="stage-list compact"></div>
+    </section>
+    <section>
+      <h3>Full execution plan</h3>
+      <div id="plan-issues" class="notice error hidden"></div>
+      <div id="stage-list" class="stage-list"></div>
+    </section>
+    <section>
+      <h3>Finalization and cleanup</h3>
+      <div id="finalization-list" class="stage-list compact"></div>
+    </section>
+    <section class="detail-grid">
+      <div>
+        <h3>Outer Argo orchestration</h3>
+        <div id="argo-task" class="panel"></div>
+        <h3>Script identity</h3>
+        <div id="script-status" class="panel"></div>
+        <h3>Actual Argo status nodes</h3>
+        <div id="workflow-nodes" class="stack"></div>
+      </div>
+      <div>
+        <h3>Typed hardware result</h3>
+        <div id="typed-result" class="panel"></div>
+        <h3>MPIJob status</h3>
+        <div id="mpi-status" class="panel"></div>
+        <h3>Retained evidence</h3>
+        <div id="evidence-status" class="panel"></div>
+      </div>
+    </section>
+    <section>
+      <h3>Participants and cleanup</h3>
+      <div id="participant-list" class="stack"></div>
+    </section>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: gpu-gb200-smoke-example
+  annotations:
+    signal.unbounded-cloud.io/example: "fail-closed sample; replace all placeholders before use"
+spec:
+  participants:
+    count: 1
+    selector:
+      matchLabels:
+        node.kubernetes.io/instance-type: REPLACE_WITH_VERIFIED_GB200_INSTANCE_TYPE
+        nvidia.com/gpu.product: REPLACE_WITH_VERIFIED_GB200_PRODUCT_LABEL
+    requiredResources:
+      nvidia.com/gpu: "1"
+  script:
+    name: project-signal-scripts
+    key: gpu-identity-example.sh
+  workflow:
+    name: project-signal-gpu-certification
+  backend:
+    apiVersion: kubeflow.org/v2beta1
+    kind: MPIJob
+  runnerImage: REPLACE_WITH_REVIEWED_GPU_RUNNER_IMAGE
+  parameters:
+    expected-gpu-product-regex: ^REPLACE_WITH_VERIFIED_GB200_NVIDIA_SMI_PRODUCT$
+    expected-gpu-count: "REPLACE_WITH_VERIFIED_GPU_COUNT"
+  evidencePath: project-signal/gb200-example
+  deadline: 15m
+  maxAttempts: 2
+  recurring:
+    enabled: false
+    nodeNames:
+      - REPLACE_WITH_APPROVED_GB200_NODE
+    minIdleDuration: 15m
+    validFor: 1h
+    expiresAt: "1970-01-01T00:00:00Z"
+    evaluationInterval: 1m
+    failureBackoff: 30m
+    maxConsecutiveFailures: 2
+    maxConcurrent: 1
+    failureDomainLabel: topology.kubernetes.io/zone
+    maxConcurrentPerFailureDomain: 1
+    exclusiveProfiles: []

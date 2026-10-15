@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM docker.io/nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867
+
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+
+LABEL org.opencontainers.image.title="Project Signal runner" \
+      org.opencontainers.image.description="GPU identity and MPI execution environment for Project Signal" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_TIME}" \
+      org.opencontainers.image.source="https://github.com/Azure/unbounded"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        openmpi-bin \
+        openssh-client \
+        openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /root/.ssh /run/sshd \
+    && chmod 0700 /root/.ssh \
+    && printf '%s\n' \
+        'PasswordAuthentication no' \
+        'PermitRootLogin prohibit-password' \
+        'PubkeyAuthentication yes' \
+        'UsePAM no' \
+        > /etc/ssh/sshd_config.d/project-signal.conf
+
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+CMD ["/bin/bash"]
