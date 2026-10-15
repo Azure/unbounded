@@ -36,7 +36,7 @@ func TestBlobOptions(t *testing.T) {
 	require.Equal(t, "blob-test", opts.pull.Cache)
 	require.Equal(t, 3, opts.catalogBlobs)
 	require.Equal(t, int64(123), opts.blobBytes)
-	require.Equal(t, 7, opts.pull.LayerConcurrency)
+	require.Equal(t, 7, opts.pull.BlobConcurrency)
 
 	for _, args := range [][]string{
 		{"--backend=other"},
@@ -50,7 +50,6 @@ func TestBlobOptions(t *testing.T) {
 		{"--catalog-blobs=1", "--layers=2"},
 		{"--catalog-blobs=1", "--layer-bytes=3"},
 		{"--catalog-blobs=1", "--catalog-images=1"},
-		{"--blob-concurrency=2", "--layer-concurrency=2"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			_, err := parseOptions(args, io.Discard)
@@ -73,17 +72,11 @@ func TestCacheFlag(t *testing.T) {
 		require.ErrorContains(t, err, "cache name")
 	}
 
-	for _, backend := range []string{"gantry", "uds"} {
-		_, err := parseOptions([]string{"--backend=" + backend, "--cache=custom", "--volume=custom"}, io.Discard)
-		require.ErrorContains(t, err, "flag provided but not defined: -volume")
-	}
-
 	var output bytes.Buffer
 
 	_, err := parseOptions([]string{"--help"}, &output)
 	require.ErrorIs(t, err, flag.ErrHelp)
 	require.Contains(t, output.String(), "-cache")
-	require.NotContains(t, output.String(), "-volume")
 }
 
 func TestBlobCatalogExactDeterministic(t *testing.T) {
@@ -259,7 +252,7 @@ func TestBlobStreamMustFinishAndMatchMetadata(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/diagnostic=%v", mode, diagnostic), func(t *testing.T) {
 				p, metrics := pullTestNew(t, &syntheticImage{}, pullTestOptions("http://unused"))
 				p.opts.DiagnoseIntegrity = diagnostic
-				p.expected = map[digest.Digest]imageBlob{desc.Digest: {descriptor: desc, data: bytes.NewReader(data)}}
+				p.expected = map[digest.Digest]blobSource{desc.Digest: {descriptor: desc, data: bytes.NewReader(data)}}
 
 				var closed atomic.Int32
 
@@ -303,7 +296,7 @@ func (b *blobTestBody) Close() error { b.closed.Add(1); return b.closeErr }
 
 func TestSDKAdmissionAndIndependentTarget(t *testing.T) {
 	opts := pullTestOptions("not a URL")
-	opts.Backend, opts.Cache, opts.Concurrency, opts.LayerConcurrency = "uds", "test", 100, 8
+	opts.Backend, opts.Cache, opts.Concurrency, opts.BlobConcurrency = "uds", "test", 100, 8
 	config := sdkClientConfig(opts, opts.Concurrency)
 	require.Equal(t, 800, config.MaxConnections)
 	config = sdkClientConfig(opts, maxLiveConcurrency)

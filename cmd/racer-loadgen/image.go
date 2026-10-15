@@ -38,11 +38,8 @@ type syntheticImage struct {
 
 	repository string
 	manifest   []byte
-	blobs      map[digest.Digest]imageBlob
+	blobs      map[digest.Digest]blobSource
 }
-
-// imageBlob is retained for compatibility with the OCI fixture helpers.
-type imageBlob = blobSource
 
 type blobSource struct {
 	descriptor ocispec.Descriptor
@@ -83,7 +80,7 @@ func newImage(ctx context.Context, opts imageOptions) (*syntheticImage, error) {
 		return nil, errors.New("jittered layer payload is too large")
 	}
 
-	img := &syntheticImage{repository: opts.Repository, blobs: make(map[digest.Digest]imageBlob)}
+	img := &syntheticImage{repository: opts.Repository, blobs: make(map[digest.Digest]blobSource)}
 	diffIDs := make([]digest.Digest, 0)
 	buffer := make([]byte, 128*1024)
 
@@ -122,7 +119,7 @@ func newImage(ctx context.Context, opts imageOptions) (*syntheticImage, error) {
 
 		desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: digester.Digest(), Size: layer.size}
 		img.Layers = append(img.Layers, desc)
-		img.blobs[desc.Digest] = imageBlob{descriptor: desc, data: layer}
+		img.blobs[desc.Digest] = blobSource{descriptor: desc, data: layer}
 		diffIDs = append(diffIDs, desc.Digest)
 	}
 
@@ -140,7 +137,7 @@ func newImage(ctx context.Context, opts imageOptions) (*syntheticImage, error) {
 	}
 
 	img.Config = byteDescriptor(ocispec.MediaTypeImageConfig, config)
-	img.blobs[img.Config.Digest] = imageBlob{descriptor: img.Config, data: bytes.NewReader(config)}
+	img.blobs[img.Config.Digest] = blobSource{descriptor: img.Config, data: bytes.NewReader(config)}
 
 	img.manifest, err = json.Marshal(ocispec.Manifest{
 		Versioned: specs.Versioned{SchemaVersion: 2},

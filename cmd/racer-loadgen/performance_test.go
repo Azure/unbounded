@@ -119,7 +119,7 @@ func TestRacerMixedPerformance(t *testing.T) {
 	server := httptest.NewServer(gantryracer.WrapHTTP(mirror.New(cfg, nil, upstream, mirror.WithContentBackend(gantryracer.NewHandler(performanceObservedClient{Client: client, t: t}, upstream, nil))).Handler(), 60*time.Second, nil))
 	t.Cleanup(server.Close)
 	opts := pullTestOptions(server.URL)
-	opts.Namespace, opts.Concurrency, opts.LayerConcurrency, opts.Timeout = "loadgen.invalid", concurrency, 1, 60*time.Second
+	opts.Namespace, opts.Concurrency, opts.BlobConcurrency, opts.Timeout = "loadgen.invalid", concurrency, 1, 60*time.Second
 	p, _ := pullTestNew(t, img, opts)
 	report := map[string]any{"scope": "real Rust process + Go SDK + Gantry HTTP mirror/origin + synthetic loadgen registry; single node", "go": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "bulk_concurrency": concurrency, "layer_bytes": img.Layers[0].Size, "rust_pid": pid}
 	report["start_spacing"] = os.Getenv("RACER_PERF_START_SPACING")

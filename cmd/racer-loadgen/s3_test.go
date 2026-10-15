@@ -30,7 +30,7 @@ func TestS3Options(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, s3Options{Endpoint: "http://127.0.0.1:8080", Bucket: "benchmark", Count: 128, Bytes: 64 << 20}, opts.s3)
 	require.Equal(t, opts.s3.Endpoint, opts.pull.Target)
-	require.Equal(t, 1, opts.pull.LayerConcurrency)
+	require.Equal(t, 1, opts.pull.BlobConcurrency)
 	opts, err = parseOptions([]string{"--backend=s3", "--endpoint=https://origin:443/", "--bucket=my-bucket", "--object-count=3", "--object-bytes=123", "--s3-origin", "--concurrency=0", "--profile=zipf"}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, s3Options{Endpoint: "https://origin:443/", Bucket: "my-bucket", Count: 3, Bytes: 123, Origin: true}, opts.s3)
@@ -44,8 +44,8 @@ func TestS3Options(t *testing.T) {
 		"--endpoint=", "--endpoint=ftp://origin", "--endpoint=http://origin/base", "--endpoint=http://origin?x=1", "--endpoint=http://origin?",
 		"--endpoint=http://user:pass@origin", "--endpoint=http://origin#", "--endpoint=http://origin:", "--endpoint=http://origin:65536",
 		"--bucket=", "--bucket=bad/bucket", "--object-count=0", "--object-count=513", "--object-bytes=0", "--object-bytes=-1",
-		"--target=http://origin", "--namespace=store", "--cache=test", "--volume=test", "--repository=test", "--catalog-blobs=1", "--blob-bytes=1",
-		"--catalog-images=1", "--layers=1", "--layer-bytes=1", "--jitter=0", "--blob-concurrency=2", "--layer-concurrency=2",
+		"--target=http://origin", "--namespace=store", "--cache=test", "--repository=test", "--catalog-blobs=1", "--blob-bytes=1",
+		"--catalog-images=1", "--layers=1", "--layer-bytes=1", "--jitter=0", "--blob-concurrency=2",
 	} {
 		t.Run(flag, func(t *testing.T) {
 			_, err := parseOptions([]string{"--backend=s3", flag}, io.Discard)
@@ -67,7 +67,7 @@ func s3TestPuller(t *testing.T, c *blobCatalog, endpoint string) (*puller, *load
 
 	opts := pullTestOptions(endpoint)
 	opts.Backend = "s3"
-	opts.LayerConcurrency = 1
+	opts.BlobConcurrency = 1
 	p, m := pullTestNew(t, &syntheticImage{}, opts)
 	p.batches = c.batches
 	p.configureS3(c, "benchmark")

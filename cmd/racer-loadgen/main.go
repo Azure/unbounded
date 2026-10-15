@@ -74,8 +74,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.StringVar(&opts.pull.ConcurrencyFile, "concurrency-file", "", "Optional regular file containing concurrency 0-256; polled every second without restarting the origin")
 	f.StringVar(&opts.pull.NodeCapsFile, "node-concurrency-caps-file", "", "Optional versioned node-cap JSON key in the same projected ConfigMap as concurrency-file")
 	f.StringVar(&opts.pull.NodeName, "node-name", "", "Exact Kubernetes node name for optional node concurrency caps")
-	f.IntVar(&opts.pull.LayerConcurrency, "blob-concurrency", 4, "Concurrent blob requests per batch (generic single-blob operations use one)")
-	f.IntVar(&opts.pull.LayerConcurrency, "layer-concurrency", 4, "Compatibility alias for blob-concurrency")
+	f.IntVar(&opts.pull.BlobConcurrency, "blob-concurrency", 4, "Concurrent blob requests per batch (generic single-blob operations use one)")
 	f.DurationVar(&opts.pull.Timeout, "pull-timeout", 2*time.Minute, "Deadline for one complete blob-batch operation")
 	f.DurationVar(&opts.pull.RetryDelay, "retry-delay", time.Second, "Per-worker delay after failed pulls")
 	f.DurationVar(&opts.pull.Interval, "interval", 0, "Per-worker delay after successful pulls")
@@ -117,10 +116,6 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		if err := client.Close(); err != nil {
 			return opts, err
 		}
-	}
-
-	if seen["blob-concurrency"] && seen["layer-concurrency"] {
-		return opts, errors.New("specify only one of blob-concurrency and layer-concurrency")
 	}
 
 	if seen["catalog-blobs"] {

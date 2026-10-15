@@ -51,7 +51,7 @@ allowed; loadgen neither uploads objects nor signs requests.
 
 Recommended DaemonSet split:
 
-1. Replace the old load workload with origin-only loadgen containers using
+1. Run origin-only loadgen containers using
    `--s3-origin --concurrency=0`. Run a `racer-object origin` container on every
    eligible Racer origin node, with `--cache=racer-object --namespace=benchmark-v1
    --bucket=benchmark --region=us-east-1 --path-style=true
@@ -178,17 +178,16 @@ expected digest and size.
   hashes the full working set before readiness. Size the startup deadline and
   CPU budget accordingly. Choose catalog size and Zipf skew from measured cache
   hit rates; a larger catalog alone does not guarantee a balanced cache mix.
-- Without `--catalog-blobs`, existing OCI invocations remain compatible. Each
+- Without `--catalog-blobs`, loadgen generates an OCI image catalog. Each
   catalog entry becomes a blob batch: ordered manifest and config, then concurrent
   layer blobs. This workload also works directly over UDS.
-- `--catalog-images`, `--layers`, `--layer-bytes`, and `--jitter` retain their OCI
+- `--catalog-images`, `--layers`, `--layer-bytes`, and `--jitter` keep their OCI
   meanings and cannot be explicitly combined with `--catalog-blobs`. The OCI
-  catalog limit remains 512 images; the S3 limit remains 512 objects.
+  catalog limit is 512 images; the S3 limit is 512 objects.
   `--blob-bytes` requires `--catalog-blobs`.
 - `--concurrency` counts admitted operations, not individual requests.
   `--blob-concurrency` bounds parallel blobs within a batch (default 4).
-  `--layer-concurrency` is a compatibility alias; specify only one. Independent
-  single-blob operations always use one request.
+  Independent single-blob operations always use one request.
 - `--profile=shuffle` traverses the catalog in shuffled passes; `--profile=zipf`
   samples by stable catalog rank with `--zipf-exponent` controlling skew.
 - Live `--concurrency-file` and node caps apply to the same admission loop for
@@ -211,7 +210,7 @@ memory. `--verify=true` uses a 32 KiB read buffer to hash each object, so bytes
 are copied into Go memory. Protocol, socket, origin, and runtime allocations
 still contribute to RSS; there is no fixed page-storage budget per read.
 
-Metric names remain compatible:
+Metrics:
 
 - `racer_loadgen_pulls_total`, pull duration, and in-flight metrics describe
   operations: one raw blob or one complete OCI batch, according to workload.
@@ -226,14 +225,14 @@ Metric names remain compatible:
 - UDS origin metrics count callback operations and bytes generated for the SDK,
   not HTTP socket writes. They are not network throughput counters.
 
-Existing image-oriented dashboards should not be interpreted as image-pull
-measurements for raw-blob jobs. Keep backend/workload jobs distinguishable through
+Image-oriented dashboards should not be interpreted as image-pull measurements
+for raw-blob jobs. Keep backend/workload jobs distinguishable through
 deployment labels. A warmed read does not guarantee permanent cache residency;
 changing the seed changes content identities, whereas restarting loadgen with
 the same seed does not make Racer's cache cold.
 
 `--verify=false` is the default. Use `--verify` to hash on the copy path;
-[`--diagnose-integrity`](DIAGNOSTICS.md) also requires `--verify` and uses the
+`--diagnose-integrity` also requires `--verify` and uses the
 same deterministic oracle on both backends. Tests cover the shared SDK and Gantry
 adapters, including a noncaching SDK fake and temporary UDS readiness servers;
 they do not establish real Racer cache-hit behavior or throughput.

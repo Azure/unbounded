@@ -24,11 +24,6 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
-type corruptBody struct {
-	io.Reader
-	io.Closer
-}
-
 func TestSDKFullReadUnpinnedMetadataValidation(t *testing.T) {
 	for _, mode := range []string{"valid", "wrong-etag", "wrong-size", "incomplete"} {
 		for _, verify := range []bool{true, false} {

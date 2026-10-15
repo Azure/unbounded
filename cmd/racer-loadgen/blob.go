@@ -33,7 +33,7 @@ type blobRequest struct {
 }
 
 // blobBatch is one admitted operation. Its prefix is ordered; the remaining blobs
-// share the bounded per-operation worker pool. OCI compatibility uses an ordered
+// share the bounded per-operation worker pool. OCI image batches use an ordered
 // manifest/config prefix followed by layers. Generic operations contain one blob.
 type blobBatch struct {
 	prefix []blobRequest

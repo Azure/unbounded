@@ -41,13 +41,13 @@ func TestBlobCatalogWorkerOptions(t *testing.T) {
 func TestBlobCatalogWorkersStableContent(t *testing.T) {
 	const size = 2*catalogBufferBytes + 17
 
-	legacy, err := newBlobCatalog(t.Context(), "test/blobs", "parallel", 9, size)
+	baseline, err := newBlobCatalog(t.Context(), "test/blobs", "parallel", 9, size)
 	require.NoError(t, err)
 
 	for _, workers := range []int{1, 4, maxCatalogWorkers} {
 		catalog, err := newBlobCatalogWithWorkers(t.Context(), "other/repo", "parallel", 9, size, workers)
 		require.NoError(t, err)
-		require.Equal(t, legacy.batches, catalog.batches)
+		require.Equal(t, baseline.batches, catalog.batches)
 
 		for _, batch := range catalog.batches {
 			desc := batch.blobs[0].descriptor

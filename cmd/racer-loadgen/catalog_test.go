@@ -18,16 +18,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCatalogIdenticalOriginsAndCompatibility(t *testing.T) {
+func TestCatalogIdenticalOriginsAndSingleImageBaseline(t *testing.T) {
 	opts := testImageOptions()
-	legacy, err := newImage(t.Context(), opts)
+	baseline, err := newImage(t.Context(), opts)
 	require.NoError(t, err)
 	first, err := newCatalog(t.Context(), opts, 3)
 	require.NoError(t, err)
 	second, err := newCatalog(t.Context(), opts, 4)
 	require.NoError(t, err)
-	require.Equal(t, legacy.manifest, first.images[0].manifest)
-	require.Equal(t, legacy.Layers, first.images[0].Layers)
+	require.Equal(t, baseline.manifest, first.images[0].manifest)
+	require.Equal(t, baseline.Layers, first.images[0].Layers)
 
 	seen := make(map[digest.Digest]bool)
 
@@ -43,7 +43,7 @@ func TestCatalogIdenticalOriginsAndCompatibility(t *testing.T) {
 		}
 	}
 
-	for _, catalog := range []*imageCatalog{first, second} {
+	for _, catalog := range []*blobCatalog{first, second} {
 		handler := catalog.handler()
 		prefix := "/v2/" + opts.Repository
 
@@ -63,7 +63,7 @@ func TestCatalogIdenticalOriginsAndCompatibility(t *testing.T) {
 			}
 		}
 
-		require.Equal(t, legacy.manifest, registryRequest(handler, http.MethodGet, prefix+"/manifests/latest", "").Body.Bytes())
+		require.Equal(t, baseline.manifest, registryRequest(handler, http.MethodGet, prefix+"/manifests/latest", "").Body.Bytes())
 
 		for _, ref := range []string{"image-000512", "image--1", "image-1", "missing"} {
 			require.Equal(t, http.StatusNotFound, registryRequest(handler, http.MethodGet, prefix+"/manifests/"+ref, "").Code)
