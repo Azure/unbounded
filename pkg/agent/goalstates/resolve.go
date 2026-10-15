@@ -87,13 +87,13 @@ func resolveNSpawnConfig(
 			return nil, fmt.Errorf("%w: %v", ErrNVIDIAHostUnqualified, err)
 		}
 
-		if nvidia.IMEXQualification == nil {
+		if nvidia.IMEX.Qualification == nil {
 			qualification, err := resolveNVIDIAIMEXQualificationForContract(contract, contract.artifactPath)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrNVIDIAHostUnqualified, err)
 			}
 
-			nvidia.IMEXQualification = qualification
+			nvidia.IMEX.Qualification = qualification
 		}
 	}
 

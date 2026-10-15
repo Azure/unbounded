@@ -106,27 +106,9 @@ type NvidiaHost struct {
 	// unversioned or SONAME aliases through ldconfig.
 	DriverVersion string
 
-	// IMEXMode records the selected IMEX lifecycle owner. Empty means IMEX
-	// preparation and exposure are disabled.
-	IMEXMode config.NVIDIAIMEXMode
-
-	// IMEXManagementCapability reports whether the loaded driver exposes the
-	// fabric IMEX management capability required by nvidia-imex.
-	IMEXManagementCapability bool
-
-	// IMEXDeviceClass reports whether the kernel registered the
-	// nvidia-caps-imex-channels character-device class.
-	IMEXDeviceClass bool
-
-	// IMEXServiceActive is true when the host nvidia-imex service is running.
-	IMEXServiceActive bool
-
-	// IMEXServiceUnitState is the systemd unit-file state, such as masked.
-	IMEXServiceUnitState string
-
-	// IMEXQualification records immutable host-image evidence decoded with the
-	// exact registered contract for the selected GPU Operator readiness profile.
-	IMEXQualification *resolvedNVIDIAQualification
+	// IMEX contains host state used only by NVIDIA IMEX validation and
+	// exposure.
+	IMEX NvidiaHostIMEX
 
 	// HostKernelVersion is the running host kernel release.
 	HostKernelVersion string
@@ -140,6 +122,32 @@ type NvidiaHost struct {
 	// LocalNVLinkHealthy reports whether nvidia-smi found active local links
 	// without any inactive link in its read-only status output.
 	LocalNVLinkHealthy bool
+}
+
+// NvidiaHostIMEX contains IMEX-specific host discovery and qualification
+// state.
+type NvidiaHostIMEX struct {
+	// Mode records the selected IMEX lifecycle owner. Empty means IMEX
+	// preparation and exposure are disabled.
+	Mode config.NVIDIAIMEXMode
+
+	// ManagementCapability reports whether the loaded driver exposes the
+	// fabric IMEX management capability required by nvidia-imex.
+	ManagementCapability bool
+
+	// DeviceClass reports whether the kernel registered the
+	// nvidia-caps-imex-channels character-device class.
+	DeviceClass bool
+
+	// ServiceActive is true when the host nvidia-imex service is running.
+	ServiceActive bool
+
+	// ServiceUnitState is the systemd unit-file state, such as masked.
+	ServiceUnitState string
+
+	// Qualification records immutable host-image evidence decoded with the
+	// exact registered contract for the selected GPU Operator readiness profile.
+	Qualification *resolvedNVIDIAQualification
 }
 
 // NVIDIAIMEXQualification is written by the host-image provisioning pipeline.
@@ -472,16 +480,18 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		NvidiaIMEXPath:    imexPath,
 		NvidiaIMEXCtlPath: imexCtlPath,
 		DriverVersion:     libraries.driverVersion,
-		IMEXManagementCapability: pathExists(
-			"/proc/driver/nvidia/capabilities/fabric-imex-mgmt",
-		),
-		IMEXDeviceClass:      procDeviceClassExists("/proc/devices", nvidiaIMEXDirName),
-		IMEXServiceActive:    imexServiceActive,
-		IMEXServiceUnitState: imexServiceUnitState,
-		HostKernelVersion:    kernelVersion,
-		HostArchitecture:     arch,
-		HostDistroVersion:    hostDistroVersionFromOSRelease(hostOSReleasePath),
-		LocalNVLinkHealthy:   nvidiaLocalNVLinkHealthy(nvidiaSMIPath),
+		IMEX: NvidiaHostIMEX{
+			ManagementCapability: pathExists(
+				"/proc/driver/nvidia/capabilities/fabric-imex-mgmt",
+			),
+			DeviceClass:      procDeviceClassExists("/proc/devices", nvidiaIMEXDirName),
+			ServiceActive:    imexServiceActive,
+			ServiceUnitState: imexServiceUnitState,
+		},
+		HostKernelVersion:  kernelVersion,
+		HostArchitecture:   arch,
+		HostDistroVersion:  hostDistroVersionFromOSRelease(hostOSReleasePath),
+		LocalNVLinkHealthy: nvidiaLocalNVLinkHealthy(nvidiaSMIPath),
 	}, nil
 }
 
@@ -1451,13 +1461,13 @@ func configureNVIDIAIMEX(
 		return path == imexDir
 	})
 
-	if imex == nil || imex.Mode == "" {
+	if imex == nil || imex.Mode == config.NVIDIAIMEXModeDisabled {
 		nvidia.NvidiaIMEXPath = ""
 		nvidia.NvidiaIMEXCtlPath = ""
-		nvidia.IMEXManagementCapability = false
-		nvidia.IMEXDeviceClass = false
-		nvidia.IMEXServiceActive = false
-		nvidia.IMEXServiceUnitState = ""
+		nvidia.IMEX.ManagementCapability = false
+		nvidia.IMEX.DeviceClass = false
+		nvidia.IMEX.ServiceActive = false
+		nvidia.IMEX.ServiceUnitState = ""
 
 		return nvidia, nil
 	}
@@ -1476,7 +1486,7 @@ func configureNVIDIAIMEX(
 		return NvidiaHost{}, err
 	}
 
-	qualification := nvidia.IMEXQualification
+	qualification := nvidia.IMEX.Qualification
 	if qualification == nil {
 		return NvidiaHost{}, fmt.Errorf(
 			"NVIDIA IMEX DRA mode requires host qualification evidence at %s",
@@ -1535,20 +1545,20 @@ func configureNVIDIAIMEX(
 		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires nvidia-imex and nvidia-imex-ctl from the branch-matched host package")
 	}
 
-	if !nvidia.IMEXManagementCapability {
+	if !nvidia.IMEX.ManagementCapability {
 		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires /proc/driver/nvidia/capabilities/fabric-imex-mgmt")
 	}
 
-	if !nvidia.IMEXDeviceClass {
+	if !nvidia.IMEX.DeviceClass {
 		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires the nvidia-caps-imex-channels character-device class")
 	}
 
-	if nvidia.IMEXServiceActive {
+	if nvidia.IMEX.ServiceActive {
 		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires the host nvidia-imex service to be inactive")
 	}
 
-	if nvidia.IMEXServiceUnitState != "masked" {
-		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires the host nvidia-imex service to be masked, found %q", nvidia.IMEXServiceUnitState)
+	if nvidia.IMEX.ServiceUnitState != "masked" {
+		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires the host nvidia-imex service to be masked, found %q", nvidia.IMEX.ServiceUnitState)
 	}
 
 	if !slices.Contains(nvidia.GPUDevicePaths, filepath.Join(devDir, nvidiaCapsDirName)) {
@@ -1559,7 +1569,7 @@ func configureNVIDIAIMEX(
 		return NvidiaHost{}, fmt.Errorf("NVIDIA IMEX DRA mode requires preprovisioned %s", imexDir)
 	}
 
-	nvidia.IMEXMode = imex.Mode
+	nvidia.IMEX.Mode = imex.Mode
 	nvidia.GPUDevicePaths = append(nvidia.GPUDevicePaths, imexDir)
 	slices.Sort(nvidia.GPUDevicePaths)
 

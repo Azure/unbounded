@@ -478,7 +478,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
 	copy.Gantry.Disabled = false
-	copy.NVIDIA.IMEX.Mode = ""
+	copy.NVIDIA.IMEX.Mode = NVIDIAIMEXModeDisabled
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
@@ -495,6 +495,35 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.Equal(t, "hillsboro.nvidia-host-capabilities/v1", original.NVIDIA.IMEX.HostContractVersion)
 	require.Equal(t, "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json", original.NVIDIA.IMEX.HostArtifactPath)
 	require.Equal(t, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", original.NVIDIA.IMEX.HostProfileDigest)
+}
+
+func TestNVIDIAConfigDeepCopy(t *testing.T) {
+	t.Parallel()
+
+	var nilConfig *NVIDIAConfig
+	require.Nil(t, nilConfig.DeepCopy())
+
+	withoutIMEX := (&NVIDIAConfig{}).DeepCopy()
+	require.NotNil(t, withoutIMEX)
+	require.Nil(t, withoutIMEX.IMEX)
+
+	original := &NVIDIAConfig{
+		IMEX: &NVIDIAIMEXConfig{
+			Mode:        NVIDIAIMEXModeDRA,
+			HostProfile: "profile-a",
+		},
+	}
+	copy := original.DeepCopy()
+
+	require.NotSame(t, original, copy)
+	require.NotSame(t, original.IMEX, copy.IMEX)
+	require.Equal(t, original, copy)
+
+	copy.IMEX.Mode = NVIDIAIMEXModeDisabled
+	copy.IMEX.HostProfile = "profile-b"
+
+	require.Equal(t, NVIDIAIMEXModeDRA, original.IMEX.Mode)
+	require.Equal(t, "profile-a", original.IMEX.HostProfile)
 }
 
 func TestNormalizeNVIDIAProfileVersionLabel(t *testing.T) {

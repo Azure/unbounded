@@ -144,6 +144,9 @@ type NVIDIAIMEXConfig struct {
 type NVIDIAIMEXMode string
 
 const (
+	// NVIDIAIMEXModeDisabled disables IMEX preparation and exposure.
+	NVIDIAIMEXModeDisabled NVIDIAIMEXMode = ""
+
 	// NVIDIAIMEXModeDRA validates and exposes a prequalified host to NVIDIA DRA
 	// ComputeDomains, which own IMEX daemon and channel lifecycle.
 	NVIDIAIMEXModeDRA NVIDIAIMEXMode = "DRA"
@@ -161,6 +164,29 @@ const (
 func (a *AgentConfig) IMEXDRAEnabled() bool {
 	return a != nil && a.NVIDIA != nil && a.NVIDIA.IMEX != nil &&
 		a.NVIDIA.IMEX.Mode == NVIDIAIMEXModeDRA
+}
+
+// DeepCopy returns a copy of NVIDIAConfig with mutable nested values cloned.
+func (n *NVIDIAConfig) DeepCopy() *NVIDIAConfig {
+	if n == nil {
+		return nil
+	}
+
+	out := *n
+	out.IMEX = n.IMEX.DeepCopy()
+
+	return &out
+}
+
+// DeepCopy returns a copy of NVIDIAIMEXConfig.
+func (n *NVIDIAIMEXConfig) DeepCopy() *NVIDIAIMEXConfig {
+	if n == nil {
+		return nil
+	}
+
+	out := *n
+
+	return &out
 }
 
 // AdditionalHostMount configures a host path bind mount for the nspawn
@@ -250,13 +276,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
-	if a.NVIDIA != nil {
-		out.NVIDIA = &NVIDIAConfig{}
-		if a.NVIDIA.IMEX != nil {
-			imex := *a.NVIDIA.IMEX
-			out.NVIDIA.IMEX = &imex
-		}
-	}
+	out.NVIDIA = a.NVIDIA.DeepCopy()
 
 	if a.Gantry != nil {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
@@ -340,7 +360,7 @@ func (a *AgentConfig) validateNVIDIA() error {
 	imex := a.NVIDIA.IMEX
 
 	switch imex.Mode {
-	case "":
+	case NVIDIAIMEXModeDisabled:
 		if strings.TrimSpace(imex.HostProfile) != "" ||
 			strings.TrimSpace(imex.HostProfileVersion) != "" ||
 			strings.TrimSpace(imex.HostContractVersion) != "" ||

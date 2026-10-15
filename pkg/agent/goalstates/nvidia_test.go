@@ -580,19 +580,21 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 				"/dev/nvidia-caps",
 				"/dev/nvidia-caps-imex-channels",
 			},
-			NvidiaSMIPath:            "/usr/bin/nvidia-smi",
-			NvidiaIMEXPath:           "/usr/bin/nvidia-imex",
-			NvidiaIMEXCtlPath:        "/usr/bin/nvidia-imex-ctl",
-			DriverVersion:            "580.159.04",
-			IMEXManagementCapability: true,
-			IMEXDeviceClass:          true,
-			IMEXServiceUnitState:     "masked",
-			HostKernelVersion:        "6.18.48.1-1.azl3.aarch64",
-			HostArchitecture:         "arm64",
-			HostDistroVersion:        "3.0",
-			LocalNVLinkHealthy:       true,
-			IMEXQualification: &resolvedNVIDIAQualification{
-				NVIDIAIMEXQualification: &qualification,
+			NvidiaSMIPath:      "/usr/bin/nvidia-smi",
+			NvidiaIMEXPath:     "/usr/bin/nvidia-imex",
+			NvidiaIMEXCtlPath:  "/usr/bin/nvidia-imex-ctl",
+			DriverVersion:      "580.159.04",
+			HostKernelVersion:  "6.18.48.1-1.azl3.aarch64",
+			HostArchitecture:   "arm64",
+			HostDistroVersion:  "3.0",
+			LocalNVLinkHealthy: true,
+			IMEX: NvidiaHostIMEX{
+				ManagementCapability: true,
+				DeviceClass:          true,
+				ServiceUnitState:     "masked",
+				Qualification: &resolvedNVIDIAQualification{
+					NVIDIAIMEXQualification: &qualification,
+				},
 			},
 		}
 	}
@@ -640,7 +642,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "missing management capability",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXManagementCapability = false
+				host.IMEX.ManagementCapability = false
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "fabric-imex-mgmt",
@@ -648,7 +650,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "missing device class",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXDeviceClass = false
+				host.IMEX.DeviceClass = false
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "character-device class",
@@ -688,7 +690,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "host service active",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXServiceActive = true
+				host.IMEX.ServiceActive = true
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "service to be inactive",
@@ -696,7 +698,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "host service not masked",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXServiceUnitState = "disabled"
+				host.IMEX.ServiceUnitState = "disabled"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "service to be masked",
@@ -712,7 +714,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "missing qualification",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification = nil
+				host.IMEX.Qualification = nil
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "host qualification evidence",
@@ -720,7 +722,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "unsupported qualification schema",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.SchemaVersion = 2
+				host.IMEX.Qualification.SchemaVersion = 2
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "schemaVersion 1",
@@ -728,7 +730,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "profile mismatch",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.ProfileVersion = "v2"
+				host.IMEX.Qualification.ProfileVersion = "v2"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "expected hillsboro-gb200-gpu-operator-ready/v2026.10.14-1",
@@ -736,7 +738,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "contract substitution",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.ContractVersion = "other.contract/v1"
+				host.IMEX.Qualification.ContractVersion = "other.contract/v1"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "expected hillsboro-gb200-gpu-operator-ready/v2026.10.14-1 contract hillsboro.nvidia-host-capabilities/v1",
@@ -744,7 +746,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "qualification digest mismatch",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.DocumentDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+				host.IMEX.Qualification.DocumentDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "qualification digest",
@@ -752,7 +754,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "artifact path substitution",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Integrity.ArtifactPath = "/etc/unbounded/host-capabilities/other.json"
+				host.IMEX.Qualification.Integrity.ArtifactPath = "/etc/unbounded/host-capabilities/other.json"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "integrity contract is unsupported",
@@ -760,7 +762,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "invalid image digest",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Image.Digest = ptr("sha256:invalid")
+				host.IMEX.Qualification.Image.Digest = ptr("sha256:invalid")
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "immutable image ID",
@@ -797,7 +799,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "driver branch mismatch",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Driver.Branch = "570"
+				host.IMEX.Qualification.Driver.Branch = "570"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "qualification driver",
@@ -813,7 +815,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "userspace mismatch",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Driver.UserspaceVersion = "580.178.04"
+				host.IMEX.Qualification.Driver.UserspaceVersion = "580.178.04"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "qualification driver",
@@ -821,7 +823,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "IMEX package mismatch",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.IMEX.Package = nil
+				host.IMEX.Qualification.IMEX.Package = nil
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "approved IMEX package evidence",
@@ -829,7 +831,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "IMEX version mismatch",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.IMEX.Version = ptr("580.178.04")
+				host.IMEX.Qualification.IMEX.Version = ptr("580.178.04")
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "approved IMEX package evidence",
@@ -837,7 +839,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "unqualified service ownership",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.IMEX.Service.Masked = false
+				host.IMEX.Qualification.IMEX.Service.Masked = false
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "service ownership",
@@ -845,7 +847,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "missing toolkit evidence",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Toolkit.Ready = false
+				host.IMEX.Qualification.Toolkit.Ready = false
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "Container Toolkit 1.18.0",
@@ -853,7 +855,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "CDI disabled",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.ContainerRuntime.CDIEnabled = false
+				host.IMEX.Qualification.ContainerRuntime.CDIEnabled = false
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "containerd 2.0.0",
@@ -861,7 +863,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "unsupported acceptance result version",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Acceptance.ResultVersion = "unsupported"
+				host.IMEX.Qualification.Acceptance.ResultVersion = "unsupported"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "acceptance status is blocked or unsupported",
@@ -869,8 +871,8 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "failed acceptance test",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Acceptance.Status = "blocked"
-				host.IMEXQualification.Acceptance.FailClosedReasons = []string{"blocked"}
+				host.IMEX.Qualification.Acceptance.Status = "blocked"
+				host.IMEX.Qualification.Acceptance.FailClosedReasons = []string{"blocked"}
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "acceptance status is blocked",
@@ -878,7 +880,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "GPU count mismatch",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Acceptance.Evidence.GPUCount = ptr(8)
+				host.IMEX.Qualification.Acceptance.Evidence.GPUCount = ptr(8)
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "requires four GPUs",
@@ -894,8 +896,8 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 		{
 			name: "authenticity unavailable",
 			mutate: func(host *NvidiaHost) {
-				host.IMEXQualification.Authenticity.Status = "unavailable"
-				host.IMEXQualification.Authenticity.Attestation = nil
+				host.IMEX.Qualification.Authenticity.Status = "unavailable"
+				host.IMEX.Qualification.Authenticity.Attestation = nil
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "authenticity is not verified",
@@ -923,7 +925,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 			}
 
 			require.NoError(t, err)
-			require.Equal(t, config.NVIDIAIMEXModeDRA, got.IMEXMode)
+			require.Equal(t, config.NVIDIAIMEXModeDRA, got.IMEX.Mode)
 			require.Contains(t, got.GPUDevicePaths, "/dev/nvidia-caps-imex-channels")
 		})
 	}
@@ -955,18 +957,20 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 				"/dev/nvidia-caps",
 				"/dev/nvidia-caps-imex-channels",
 			},
-			NvidiaSMIPath:            "/usr/bin/nvidia-smi",
-			NvidiaIMEXPath:           "/usr/bin/nvidia-imex",
-			NvidiaIMEXCtlPath:        "/usr/bin/nvidia-imex-ctl",
-			DriverVersion:            "580.178.04",
-			IMEXManagementCapability: true,
-			IMEXDeviceClass:          true,
-			IMEXServiceUnitState:     "masked",
-			HostKernelVersion:        "6.14.0-1009-azure-nvidia",
-			HostArchitecture:         "arm64",
-			HostDistroVersion:        "24.04",
-			LocalNVLinkHealthy:       true,
-			IMEXQualification:        testUbuntuNVIDIAQualification(t, true),
+			NvidiaSMIPath:      "/usr/bin/nvidia-smi",
+			NvidiaIMEXPath:     "/usr/bin/nvidia-imex",
+			NvidiaIMEXCtlPath:  "/usr/bin/nvidia-imex-ctl",
+			DriverVersion:      "580.178.04",
+			HostKernelVersion:  "6.14.0-1009-azure-nvidia",
+			HostArchitecture:   "arm64",
+			HostDistroVersion:  "24.04",
+			LocalNVLinkHealthy: true,
+			IMEX: NvidiaHostIMEX{
+				ManagementCapability: true,
+				DeviceClass:          true,
+				ServiceUnitState:     "masked",
+				Qualification:        testUbuntuNVIDIAQualification(t, true),
+			},
 		}
 	}
 
@@ -981,7 +985,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "blocked producer artifact",
 			mutate: func(t *testing.T, host *NvidiaHost) {
-				host.IMEXQualification = testUbuntuNVIDIAQualification(t, false)
+				host.IMEX.Qualification = testUbuntuNVIDIAQualification(t, false)
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "verified immutable image ID",
@@ -990,7 +994,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 			name: "Azure artifact cannot satisfy Ubuntu profile",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
 				qualification := validTestNVIDIAQualification()
-				host.IMEXQualification = &resolvedNVIDIAQualification{
+				host.IMEX.Qualification = &resolvedNVIDIAQualification{
 					NVIDIAIMEXQualification: &qualification,
 				}
 			},
@@ -1011,7 +1015,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "image identity missing",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.Image.ID = nil
+				host.IMEX.Qualification.Ubuntu.Image.ID = nil
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "verified immutable image ID",
@@ -1024,7 +1028,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "driver package mismatch",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.Driver.Package = "other-package"
+				host.IMEX.Qualification.Ubuntu.Driver.Package = "other-package"
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "driver evidence is unsupported",
@@ -1032,7 +1036,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "IMEX service not masked",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.IMEX.Service.Masked = false
+				host.IMEX.Qualification.Ubuntu.IMEX.Service.Masked = false
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "service ownership",
@@ -1040,7 +1044,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "containerd binary mismatch",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.ContainerRuntime.BinaryDigest = testNVIDIAQualificationDigest
+				host.IMEX.Qualification.Ubuntu.ContainerRuntime.BinaryDigest = testNVIDIAQualificationDigest
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "approved containerd 2.1.8",
@@ -1048,8 +1052,8 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "acceptance blocked",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.Acceptance.Status = "blocked"
-				host.IMEXQualification.Ubuntu.Acceptance.FailClosedReasons = []string{"blocked"}
+				host.IMEX.Qualification.Ubuntu.Acceptance.Status = "blocked"
+				host.IMEX.Qualification.Ubuntu.Acceptance.FailClosedReasons = []string{"blocked"}
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "acceptance status is blocked",
@@ -1057,8 +1061,8 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "attestation unavailable",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.Authenticity.Status = "unavailable"
-				host.IMEXQualification.Ubuntu.Authenticity.Attestation.Verified = false
+				host.IMEX.Qualification.Ubuntu.Authenticity.Status = "unavailable"
+				host.IMEX.Qualification.Ubuntu.Authenticity.Attestation.Verified = false
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "authenticity is not verified",
@@ -1066,7 +1070,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "attestation subject mismatch",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.Authenticity.Attestation.SubjectDigest = ptr(testNVIDIAQualificationDigest)
+				host.IMEX.Qualification.Ubuntu.Authenticity.Attestation.SubjectDigest = ptr(testNVIDIAQualificationDigest)
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "bound to the image digest",
@@ -1074,7 +1078,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 		{
 			name: "qualification digest mismatch",
 			mutate: func(_ *testing.T, host *NvidiaHost) {
-				host.IMEXQualification.Ubuntu.DocumentDigest = testNVIDIAQualificationDigest
+				host.IMEX.Qualification.Ubuntu.DocumentDigest = testNVIDIAQualificationDigest
 			},
 			distro:  hostDistroUbuntu2404,
 			wantErr: "qualification digest",
@@ -1102,7 +1106,7 @@ func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
 			}
 
 			require.NoError(t, err)
-			require.Equal(t, config.NVIDIAIMEXModeDRA, got.IMEXMode)
+			require.Equal(t, config.NVIDIAIMEXModeDRA, got.IMEX.Mode)
 			require.Contains(t, got.GPUDevicePaths, "/dev/nvidia-caps-imex-channels")
 		})
 	}
@@ -1120,7 +1124,7 @@ func TestConfigureNVIDIAIMEXDisabledRemovesExposure(t *testing.T) {
 	require.NotContains(t, got.GPUDevicePaths, "/dev/nvidia-caps-imex-channels")
 	require.Empty(t, got.NvidiaIMEXPath)
 	require.Empty(t, got.NvidiaIMEXCtlPath)
-	require.Empty(t, got.IMEXMode)
+	require.Empty(t, got.IMEX.Mode)
 }
 
 func TestParseNVIDIALibraries(t *testing.T) {
