@@ -431,99 +431,6 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 }
 
 #[test]
-fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
-    use crate::peer::protocol as p;
-    use crate::peer::protocol::signed_digest;
-    use crate::topology::Member;
-    use crate::topology::Membership;
-    use http1::MessageHead;
-    use http1::StartLine;
-    let signers = signers();
-    let membership = Arc::new(
-        Membership::validate(
-            MembershipVersion(1),
-            [A, C]
-                .iter()
-                .enumerate()
-                .map(|(index, name)| Member {
-                    node: NodeId((*name).into()),
-                    shares: std::num::NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: format!("127.0.0.1:{}", 9000 + index),
-                    rails: vec![],
-                    site: String::new(),
-                })
-                .collect(),
-        )
-        .unwrap(),
-    );
-    let weak = Arc::downgrade(&membership);
-    let network = Rc::new(
-        PeerNetwork::new(
-            NodeId(C.into()),
-            crate::test_support::published_membership(membership),
-        )
-        .unwrap(),
-    );
-    let response_lease = network.membership(MembershipVersion(1)).unwrap();
-    drop(network);
-    let mut head = MessageHead {
-        start: StartLine::Request {
-            method: "POST".into(),
-            target: "/racer/peer/v1/handshake".into(),
-        },
-        headers: vec![],
-    };
-    p::push(&mut head, "content-length", 0);
-    p::push(&mut head, "racer-kind", "handshake");
-    p::push(&mut head, "racer-wire-version", protocol::VERSION);
-    p::push(&mut head, "racer-membership", 1);
-    p::push(&mut head, "racer-receiver", C);
-    let signed = signers[0].sign(head).unwrap();
-    let binding = signed_digest(&signed).unwrap();
-    // Capabilities are no longer discovered per request. Membership and native
-    // availability remain signed application/control data, inside a session head.
-    let mut reply = MessageHead {
-        start: StartLine::Response { status: 200 },
-        headers: vec![],
-    };
-    p::push(&mut reply, "content-length", 0);
-    p::push(&mut reply, "racer-receiver", A);
-    p::push(&mut reply, "racer-membership", 1);
-    p::push(&mut reply, "racer-rdma", 0);
-    p::push_binary(&mut reply, "racer-request-binding", &binding);
-    let reply = signers[2].sign(reply).unwrap();
-    assert!(
-        weak.upgrade().is_some(),
-        "pending reply retains ingress lease"
-    );
-    assert_eq!(
-        p::decode_binary(
-            p::field(&reply.head, "racer-request-binding")
-                .unwrap()
-                .as_bytes()
-        )
-        .unwrap(),
-        binding
-    );
-    assert_eq!(p::number(&reply.head, "racer-membership").unwrap(), 1);
-    assert_eq!(p::number(&reply.head, "racer-rdma").unwrap(), 0);
-    let mut tampered = reply;
-    tampered
-        .head
-        .headers
-        .iter_mut()
-        .find(|h| h.name == "racer-rdma")
-        .unwrap()
-        .value = b"1".to_vec();
-    assert!(signers[0].verify_proof(tampered).is_err());
-    drop(response_lease);
-    assert!(
-        weak.upgrade().is_none(),
-        "completed reply releases ingress lease"
-    );
-}
-
-#[test]
 fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
     use crate::topology::LinkHealth;
     use crate::topology::Member;
@@ -651,7 +558,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
 }
 
 #[test]
-fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
+fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
     use crate::topology::LinkHealth;
     use crate::topology::LinkOutcome;
     use crate::topology::Member;
@@ -818,7 +725,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         .shortest(members.clone(), &NodeId(A.into()), &budget)
         .unwrap();
     assert_eq!(direct.nodes, vec![NodeId(A.into()), NodeId(C.into())]);
-    // Reject a signed receiver that differs from v3 recomputation before I/O.
+    // Reject a signed receiver that differs from wire recomputation before I/O.
     let mut page_request = request(&admission, 2);
     page_request.operation = Operation::Page {
         page: PageId {

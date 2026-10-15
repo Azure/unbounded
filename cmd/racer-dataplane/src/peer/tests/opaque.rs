@@ -876,7 +876,7 @@ fn drive<T>(
 }
 
 // Wall and thread CPU include all three roles. The same signed fixture can
-// execute the pre-change materialized relay path for a local mechanism A/B.
+// execute the materialized relay path for a local mechanism A/B.
 fn exchange(
     materialized: bool,
     fallback: bool,

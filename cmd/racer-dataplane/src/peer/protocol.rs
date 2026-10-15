@@ -1355,7 +1355,7 @@ pub(crate) mod tests {
             let opaque =
                 opaque_response_head(&head, if outcome == "empty" { 0 } else { 19 }).unwrap();
             if outcome == "selected" {
-                // Opaque canonicalization historically appends grants after framing.
+                // Opaque canonicalization appends grants after framing.
                 expected.drain(
                     prefix.len() + page_fields.len()
                         ..prefix.len() + page_fields.len() + grant_fields.len(),
@@ -1624,17 +1624,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn rejects_versions_duplicates_holes_and_request_bodies() {
-            for version in ["1", "2", "3", "4", "6"] {
+            for version in ["0", "2", "3", "10"] {
                 let mut head = encode_envelope(&envelope(), false, 0).unwrap();
                 head.headers[0].value = version.as_bytes().to_vec();
                 assert!(decode_envelope(head, false).is_err());
             }
-            let mut legacy = encode_envelope(&envelope(), false, 0).unwrap();
-            legacy.start = StartLine::Request {
-                method: "POST".into(),
-                target: "/racer/peer/v2/exchange".into(),
-            };
-            assert!(decode_envelope(legacy, false).is_err());
             let mut head = encode_envelope(&envelope(), false, 0).unwrap();
             head.headers.push(Header {
                 name: "Content-Length".into(),

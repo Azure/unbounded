@@ -1,7 +1,7 @@
 //! Canonical peer heads, retained proofs, and socket-owned replay admission.
 //!
 //! Payload interpretation, credentials, topology selection, and telemetry belong
-//! to callers. This crate preserves the Racer v5 wire profile without importing
+//! to callers. This crate implements the Racer peer wire profile without importing
 //! its application model. Historical proof verification does not admit a message;
 //! the carrying connection must first admit its fresh session head.
 
@@ -446,7 +446,7 @@ fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
 pub fn signed_digest(head: &SignedHead) -> Result<[u8; 32]> {
     let base = signature_base(&head.head)?;
     let mut hash = Sha256::new();
-    hash.update(b"racer-peer-v2/signed-head\0");
+    hash.update(b"racer-peer-v1/signed-head\0");
     hash.update((base.len() as u64).to_be_bytes());
     hash.update(base);
     hash.update((head.signature.len() as u64).to_be_bytes());
@@ -497,9 +497,9 @@ fn decode_chain(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Current framing version.
-pub const VERSION: &str = "5";
+pub const VERSION: &str = "1";
 /// Current exchange target.
-pub const REQUEST_TARGET: &str = "/racer/peer/v5/exchange";
+pub const REQUEST_TARGET: &str = "/racer/peer/v1/exchange";
 /// Maximum carried hop count.
 pub const MAX_HOPS: usize = 8;
 /// Maximum retained signed HTTP head.
@@ -507,7 +507,7 @@ pub const MAX_SIGNED_HEAD: usize = MAX_HEAD;
 /// Maximum expanded envelope and its outer authentication head.
 pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
 /// Canonical signature profile tag.
-pub const PROFILE: &str = "racer-peer-v5";
+pub const PROFILE: &str = "racer-peer-v1";
 /// Maximum ordinary canonical field or head.
 pub const MAX_HEAD: usize = 64 * 1024;
 /// Maximum opaque payload admitted by this wire profile, including the AEAD tag.

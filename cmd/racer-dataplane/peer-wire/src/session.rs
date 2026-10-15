@@ -4,8 +4,8 @@ use crate::*;
 use http1::connection::{ConnectionLease, HttpIo};
 use uring_runtime::Scope;
 
-const SESSION_TARGET: &str = "/racer/peer/v2/session";
-const SESSION_DOMAIN: &[u8] = b"racer-peer-v2/connection\0";
+const SESSION_TARGET: &str = "/racer/peer/v1/session";
+const SESSION_DOMAIN: &[u8] = b"racer-peer-v1/connection\0";
 
 /// Application hooks needed by the generic handshake driver.
 pub trait Context: http1::connection::Context {
