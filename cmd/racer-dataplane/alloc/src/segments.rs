@@ -543,13 +543,41 @@ impl Segments {
                 open = true;
             }
         }
+        // Generations are monotonic: an image older than the live table could
+        // revalidate mappings to bytes that were since reissued.
+        if images
+            .iter()
+            .zip(slots.iter())
+            .any(|(s, l)| s.generation.0 < l.image.generation.0)
+        {
+            return Err(Error::Stale);
+        }
+        for (s, l) in images.iter().zip(slots.iter()) {
+            Self::restored_generation(s, &l.image)?;
+        }
         self.restore_epoch
             .get()
             .checked_add(1)
             .ok_or(Error::Unavailable)
     }
 
+    /// Generation published for one restored slot. Turning an occupied slot Free
+    /// at its live generation advances it, so bytes are never reissued under a
+    /// generation that earlier mappings carry; Unavailable if that would wrap.
+    fn restored_generation(image: &SegmentSnapshot, live: &SegmentSnapshot) -> Result<Generation> {
+        if image.state == SegmentState::Free
+            && image.generation == live.generation
+            && live.state != SegmentState::Free
+        {
+            return Ok(Generation(
+                live.generation.0.checked_add(1).ok_or(Error::Unavailable)?,
+            ));
+        }
+        Ok(image.generation)
+    }
+
     /// Validate the complete image before publishing it, sealing its open tail.
+    /// Images older than the live table are Stale.
     /// Frozen tables and outstanding leases return Busy without changing state.
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
         let epoch = self.validate_restore_epoch(&images)?;
@@ -563,6 +591,7 @@ impl Segments {
         }
         for (slot, mut image) in slots.iter_mut().zip(images) {
             image.retained_records.clear();
+            image.generation = Self::restored_generation(&image, &slot.image)?;
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;
             }
@@ -1069,6 +1098,10 @@ mod tests {
         drop(held);
         s.recycle(SegmentId(0)).unwrap();
         assert_eq!(s.usage(), [(1024, 0), (2048, 512)]);
+        assert_eq!(s.restore(image.clone()), Err(Error::Stale));
+        let mut image = image;
+        // Restore never rolls a generation back, so carry the recycled one.
+        image[0].generation = s.snapshot()[0].generation;
         s.restore(image.clone()).unwrap();
         assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
         let mut invalid = image;
@@ -1077,7 +1110,10 @@ mod tests {
         assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
         s.configure_usage_groups(&[3]).unwrap();
         assert_eq!(s.usage(), [(3072, 1536)]);
-        let fresh = segments(1024, 3).snapshot();
+        let mut fresh = segments(1024, 3).snapshot();
+        for (f, live) in fresh.iter_mut().zip(s.snapshot()) {
+            f.generation = live.generation;
+        }
         s.restore(fresh).unwrap();
         assert_eq!(s.usage(), [(3072, 0)]);
     }
