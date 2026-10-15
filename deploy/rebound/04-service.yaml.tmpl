@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rebound
+  namespace: {{ default "unbounded-system" .Namespace }}
+spec:
+  selector:
+    app.kubernetes.io/name: rebound
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rebound
+  namespace: {{ default "unbounded-system" .Namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rebound

@@ -1,0 +1,272 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package apiserver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/spf13/pflag"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
+	authorizerunion "k8s.io/apiserver/pkg/authorization/union"
+	"k8s.io/apiserver/pkg/endpoints/openapi"
+	"k8s.io/apiserver/pkg/registry/rest"
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	"k8s.io/apiserver/pkg/server/healthz"
+	genericoptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/component-base/compatibility"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
+
+	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
+	"github.com/Azure/unbounded/internal/rebound/ledger"
+)
+
+// Options holds serving and delegated security settings.
+type Options struct {
+	SecureServing    *genericoptions.SecureServingOptions
+	Authentication   *genericoptions.DelegatingAuthenticationOptions
+	Authorization    *genericoptions.DelegatingAuthorizationOptions
+	MaxTTL           time.Duration
+	MaxNodesPerGrant int
+}
+
+func NewOptions() *Options {
+	serving := genericoptions.NewSecureServingOptions()
+	serving.BindPort = 8443
+
+	return &Options{
+		SecureServing: serving, Authentication: genericoptions.NewDelegatingAuthenticationOptions(),
+		Authorization: genericoptions.NewDelegatingAuthorizationOptions(), MaxTTL: time.Hour,
+		MaxNodesPerGrant: 500,
+	}
+}
+
+func (o *Options) AddFlags(fs *pflag.FlagSet) {
+	o.SecureServing.AddFlags(fs)
+	o.Authentication.AddFlags(fs)
+	o.Authorization.AddFlags(fs)
+	fs.DurationVar(&o.MaxTTL, "max-ttl", o.MaxTTL, "Maximum and default NodeGrant lifetime.")
+	fs.IntVar(&o.MaxNodesPerGrant, "max-nodes-per-grant", o.MaxNodesPerGrant, "Maximum number of nodes a grant's selector may match.")
+}
+
+// ServerConfig supplies the ledger client and an externally managed serving certificate.
+// Authenticator and Authorizer override delegation when non-nil, for embedded use and tests.
+type ServerConfig struct {
+	Client        kubernetes.Interface
+	Namespace     string
+	Cert          dynamiccertificates.CertKeyContentProvider
+	Clock         clock.Clock
+	Authenticator authenticator.Request
+	Authorizer    authorizer.Authorizer
+	// ReadyzChecks are added to the server's /readyz endpoint.
+	ReadyzChecks []healthz.HealthChecker
+}
+
+type Server struct {
+	server   *genericapiserver.GenericAPIServer
+	informer cache.SharedIndexInformer
+	handler  cache.ResourceEventHandlerRegistration
+	storage  *storage
+}
+
+func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
+	if cfg.Client == nil || cfg.Namespace == "" || cfg.Cert == nil {
+		return nil, errors.New("client, namespace, and serving certificate are required")
+	}
+
+	if o.MaxTTL <= 0 {
+		return nil, errors.New("max-ttl must be positive")
+	}
+
+	if o.MaxNodesPerGrant <= 0 {
+		return nil, errors.New("max-nodes-per-grant must be positive")
+	}
+
+	if cfg.Clock == nil {
+		cfg.Clock = clock.RealClock{}
+	}
+
+	scheme := runtime.NewScheme()
+	if err := rebound.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+
+	scheme.AddKnownTypes(schema.GroupVersion{Group: rebound.GroupName, Version: runtime.APIVersionInternal}, &rebound.NodeGrant{}, &rebound.NodeGrantList{})
+	metav1.AddToGroupVersion(scheme, schema.GroupVersion{Version: "v1"})
+	scheme.AddUnversionedTypes(schema.GroupVersion{Version: "v1"}, &metav1.Status{}, &metav1.APIVersions{}, &metav1.APIGroupList{}, &metav1.APIGroup{}, &metav1.APIResourceList{})
+
+	if err := scheme.AddFieldLabelConversionFunc(rebound.SchemeGroupVersion.WithKind(rebound.Kind), func(label, value string) (string, string, error) {
+		if label != "metadata.name" && label != "metadata.namespace" {
+			return "", "", fmt.Errorf("unsupported field selector: %s", label)
+		}
+
+		return label, value, nil
+	}); err != nil {
+		return nil, err
+	}
+
+	codecs := serializer.NewCodecFactory(scheme)
+	config := genericapiserver.NewConfig(codecs)
+	config.BuildHandlerChainFunc = func(handler http.Handler, c *genericapiserver.Config) http.Handler {
+		chain := genericapiserver.DefaultBuildHandlerChain(handler, c)
+
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Generic handlers default legacy watches to sendInitialEvents=true.
+			// Keep explicit watch-list requests distinct so legacy watches still work.
+			if !r.URL.Query().Has("sendInitialEvents") {
+				r = r.WithContext(context.WithValue(r.Context(), legacyWatchKey{}, true))
+			}
+
+			chain.ServeHTTP(w, r)
+		})
+	}
+	config.EffectiveVersion = compatibility.NewEffectiveVersionFromString("1.37.0", "", "")
+	config.EnableProfiling = false
+	// The namer tags each schema with its group, version, and kind, which kubectl
+	// needs for client-side validation. It gets a scheme without the internal
+	// version so the published schema lists only v1alpha1.
+	namerScheme := runtime.NewScheme()
+	if err := rebound.AddToScheme(namerScheme); err != nil {
+		return nil, err
+	}
+
+	namer := openapi.NewDefinitionNamer(namerScheme)
+	config.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(rebound.GetOpenAPIDefinitions, namer)
+
+	config.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(rebound.GetOpenAPIDefinitions, namer)
+	success := false
+
+	defer func() {
+		if !success && config.SecureServing != nil && config.SecureServing.Listener != nil {
+			if err := config.SecureServing.Listener.Close(); err != nil {
+				klog.ErrorS(err, "Close listener after server setup failure")
+			}
+		}
+	}()
+
+	if err := o.SecureServing.WithLoopback().ApplyTo(&config.SecureServing, &config.LoopbackClientConfig); err != nil {
+		return nil, err
+	}
+
+	if config.SecureServing == nil {
+		return nil, errors.New("secure serving must be enabled")
+	}
+
+	config.SecureServing.Cert = cfg.Cert
+
+	config.ExternalAddress = config.SecureServing.Listener.Addr().String()
+	if cfg.Authenticator != nil {
+		config.Authentication.Authenticator = cfg.Authenticator
+	} else if err := o.Authentication.ApplyTo(&config.Authentication, config.SecureServing, config.OpenAPIConfig); err != nil {
+		return nil, err
+	}
+
+	if cfg.Authorizer != nil {
+		// Complete authenticates the loopback token as system:masters but does not wrap authorization.
+		// Preserve delegated authorization's privileged group allowance for overrides too.
+		authz, err := authorizerunion.New(
+			authorizerunion.NamedAuthorizer{AuthorizerName: "loopback", Authorizer: authorizerfactory.NewPrivilegedGroups(user.SystemPrivilegedGroup)},
+			authorizerunion.NamedAuthorizer{AuthorizerName: "override", Authorizer: cfg.Authorizer},
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		config.Authorization.Authorizer = authz
+	} else if err := o.Authorization.ApplyTo(&config.Authorization); err != nil {
+		return nil, err
+	}
+
+	config.AddReadyzChecks(cfg.ReadyzChecks...)
+
+	server, err := config.Complete(nil).New("rebound", genericapiserver.NewEmptyDelegate())
+	if err != nil {
+		return nil, err
+	}
+
+	storage := newStorage(ledger.Store{Client: cfg.Client, Namespace: cfg.Namespace}, o.MaxTTL, o.MaxNodesPerGrant, cfg.Clock)
+	group := genericapiserver.NewDefaultAPIGroupInfo(rebound.GroupName, scheme, runtime.NewParameterCodec(scheme), codecs)
+	group.NegotiatedSerializer = withoutProtobuf{codecs}
+
+	group.VersionedResourcesStorageMap[rebound.SchemeGroupVersion.Version] = map[string]rest.Storage{rebound.Resource: storage}
+	if err := server.InstallAPIGroup(&group); err != nil {
+		return nil, err
+	}
+
+	factory := informers.NewSharedInformerFactoryWithOptions(cfg.Client, 0, informers.WithNamespace(cfg.Namespace), informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+		options.FieldSelector = fields.OneTermEqualSelector("metadata.name", ledger.ConfigMapName).String()
+	}))
+	informer := factory.Core().V1().ConfigMaps().Informer()
+
+	handler, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { storage.observe(obj, false) },
+		UpdateFunc: func(_, obj interface{}) { storage.observe(obj, false) },
+		DeleteFunc: func(obj interface{}) { storage.observe(obj, true) },
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	success = true
+
+	return &Server{server: server, informer: informer, handler: handler, storage: storage}, nil
+}
+
+// Run starts the ledger cache before accepting API requests and blocks until shutdown.
+func (s *Server) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer s.storage.Destroy()
+
+	done := make(chan struct{})
+
+	go func() { defer close(done); s.informer.RunWithContext(ctx) }()
+
+	defer func() { cancel(); <-done }()
+
+	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced, s.handler.HasSynced) {
+		if err := s.server.SecureServingInfo.Listener.Close(); err != nil {
+			return err
+		}
+
+		return ctx.Err()
+	}
+
+	return s.server.PrepareRun().RunWithContext(ctx)
+}
+
+// withoutProtobuf removes protobuf from the media types the API group offers.
+// NodeGrant has no protobuf encoding, so clients that prefer protobuf, such as
+// the namespace controller, must get JSON instead of a 406 error.
+type withoutProtobuf struct {
+	serializer.CodecFactory
+}
+
+func (w withoutProtobuf) SupportedMediaTypes() []runtime.SerializerInfo {
+	var infos []runtime.SerializerInfo
+
+	for _, info := range w.CodecFactory.SupportedMediaTypes() {
+		if info.MediaType != runtime.ContentTypeProtobuf {
+			infos = append(infos, info)
+		}
+	}
+
+	return infos
+}

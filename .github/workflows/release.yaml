@@ -25,7 +25,7 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact image)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           orca, gantry, host-ubuntu2404,
+#                           orca, gantry, rebound, host-ubuntu2404,
 #                           inventory-aggregator, inventory-inspector, inventory-viewer)
 #         -> gantry-chart  (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
@@ -855,6 +855,10 @@ jobs:
             trivy: true
           - name: racer-controller
             file: images/racer-controller/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: rebound
+            file: images/rebound/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: host-ubuntu2404

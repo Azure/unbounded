@@ -404,13 +404,29 @@ class TestGalleryVersion(unittest.TestCase):
             self.assertEqual(e2e.acl_gallery_version(), "3.20261007.1021")
 
         args = az.call_args.args[0]
-        self.assertEqual(args[:4], ["az", "sig", "image-version", "show-shared"])
-        for flag, value in (("--gallery-unique-name", "b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL"),
-                            ("--gallery-image-definition", "acl-1es-eval"),
-                            ("--gallery-image-version", "latest"),
-                            ("--location", e2e.ACL_IMAGE_GALLERY_LOCATION),
-                            ("--subscription", "sub")):
-            self.assertEqual(args[args.index(flag) + 1], value)
+        self.assertEqual(args[:4], ["az", "rest", "--method", "get"])
+        self.assertNotIn("--subscription", args)
+        self.assertEqual(args[args.index("--query") + 1], "name")
+        self.assertEqual(
+            args[args.index("--url") + 1],
+            "https://management.azure.com/subscriptions/sub/providers/Microsoft.Compute"
+            f"/locations/{e2e.ACL_IMAGE_GALLERY_LOCATION}"
+            "/sharedGalleries/b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL/images/acl-1es-eval"
+            f"/versions/latest?api-version={e2e.ACL_GALLERY_API_VERSION}")
+
+    def test_latest_uses_the_default_subscription(self):
+        with patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", ""), \
+                patch.object(e2e, "capture", return_value="3.1") as az:
+            self.assertEqual(e2e.acl_gallery_version(), "3.1")
+
+        args = az.call_args.args[0]
+        self.assertIn("/subscriptions/{subscriptionId}/", args[args.index("--url") + 1])
+
+    def test_a_failed_lookup_is_reported(self):
+        error = subprocess.CalledProcessError(1, ["az"], stderr="NoRegisteredProviderFound")
+        with patch.object(e2e, "capture", side_effect=error):
+            with self.assertRaises(SystemExit):
+                e2e.acl_gallery_version()
 
     def test_a_pinned_version_is_not_looked_up(self):
         with patch.object(e2e, "ACL_IMAGE_VERSION", "3.1"), \

@@ -1,0 +1,129 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rebound
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+  # Deletes pods that a grant does not allow on its nodes.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, delete]
+  # List/watch clients must use fieldSelector metadata.name for this rule.
+  - apiGroups: [apiregistration.k8s.io]
+    resources: [apiservices]
+    resourceNames: [v1alpha1.rebound.unbounded-cloud.io]
+    verbs: [get, list, watch, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rebound
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rebound
+subjects:
+  - kind: ServiceAccount
+    name: rebound
+    namespace: {{ default "unbounded-system" .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rebound-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: rebound
+    namespace: {{ default "unbounded-system" .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rebound
+  namespace: {{ default "unbounded-system" .Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, secrets]
+    verbs: [create]
+  # List/watch clients must use fieldSelector metadata.name for these rules.
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [rebound-ledger]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [rebound-serving]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [rebound]
+    verbs: [get, update]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rebound
+  namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rebound
+subjects:
+  - kind: ServiceAccount
+    name: rebound
+    namespace: {{ default "unbounded-system" .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rebound-authentication-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: rebound
+    namespace: {{ default "unbounded-system" .Namespace }}
+---
+# Label each destination explicitly; do not rely on an aggregation chain.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rebound-nodegrants-view
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: [rebound.unbounded-cloud.io]
+    resources: [nodegrants]
+    verbs: [get, list, watch]
+---
+# Not aggregated into edit or admin. A grant can take any node in the cluster
+# and deletes other namespaces' pods on it, so bind this role on purpose with a
+# RoleBinding in each namespace that may hold grants.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rebound-nodegrants-edit
+rules:
+  - apiGroups: [rebound.unbounded-cloud.io]
+    resources: [nodegrants]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
