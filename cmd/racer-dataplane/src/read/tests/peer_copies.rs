@@ -2543,7 +2543,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
 /// A non-owner in `Spread` mode sends its first Acquire to the owner chosen by
 /// its visiting order. A non-primary owner then checks its local copy, probes
 /// its predecessors CopyOnly, and fills from origin. `Primary` mode keeps the
-/// legacy primary-first order.
+/// primary-first order.
 #[test]
 fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
     use crate::read::candidates::ReplicaSelection;

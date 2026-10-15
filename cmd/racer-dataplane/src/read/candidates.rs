@@ -2382,7 +2382,7 @@ pub(super) mod tests {
                     assert_eq!(*attempts, 3);
                     assert_eq!(*links, 8);
                 } else {
-                    // Legacy primary first: shared route, shared credits.
+                    // Primary first: shared route, shared credits.
                     assert_eq!(calls[0].3, 4);
                 }
             }

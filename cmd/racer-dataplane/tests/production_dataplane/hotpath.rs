@@ -1,10 +1,9 @@
 //! Opt-in bottleneck probe, reusing the production graph fixture above.
 //!
-//! Automatic sizing has no historical four-shard cap. Count distinct crypto groups,
-//! and scale RAM-disk capacity and memory preflight with the selected I/O shards.
-//! Requests use v2 POST subscriptions with Page, Complete, and EOF validation and
-//! reconnect per request. Focused harness checks are not new performance results;
-//! historical paired-worker measurements do not characterize this shared policy.
+//! Automatic sizing counts distinct crypto groups and scales RAM-disk capacity and
+//! memory preflight with the selected I/O shards. Requests use POST subscriptions
+//! with Page, Complete, and EOF validation and reconnect per request. Focused
+//! harness checks are not performance results.
 use super::*;
 use racer_dataplane::config::Config;
 use racer_dataplane::config::DEFAULT_MAX_THREADS;
@@ -229,7 +228,7 @@ impl Service {
                                         .entry(format!("body:{error:?}"))
                                         .or_default() += 1;
                                 }
-                                // Every v2 subscription closes after completion.
+                                // Every subscription closes after completion.
                                 drop(sent?);
                                 Ok(())
                             }
@@ -345,7 +344,7 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
     use std::io::BufRead;
     write!(
         client.get_mut(),
-        "POST /v2/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n"
+        "POST /v1/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n"
     )?;
     let mut head = String::new();
     loop {
@@ -461,7 +460,7 @@ fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
     config.max_threads = 1;
     assert!(AffinityPlan::from_topology(&config, topology.clone(), &[]).is_err());
     config.max_threads = 2;
-    // Legacy fixtures can still explicitly assign a different crypto CPU to
+    // Fixtures can explicitly assign a different crypto CPU to
     // every I/O shard; shared execution is determined by CPU identity only.
     let mut paired = AffinityPlan::from_topology(&config, topology.clone(), &[]).unwrap();
     let first = paired.pairs[0].clone();
@@ -641,7 +640,7 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
                     barrier.wait();
                     barrier.wait();
                     for index in (client_index..REQUESTS).step_by(concurrency) {
-                        // V2 completion closes each subscription after success.
+                        // Completion closes each subscription after success.
                         let mut client = connect(commands);
                         let key = match mode {
                             "memory" => keys[(index + 1) % workers],

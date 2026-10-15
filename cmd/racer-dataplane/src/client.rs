@@ -1,4 +1,4 @@
-//! Validate v2 subscriptions and HEAD metadata while preserving opaque fields.
+//! Validate subscriptions and HEAD metadata while preserving opaque fields.
 //!
 //! Wire values follow pkg/racersdk: canonical lowercase keys, quoted strong pins,
 //! signed-63-bit decimal ranges, and byte-preserving opaque context.
