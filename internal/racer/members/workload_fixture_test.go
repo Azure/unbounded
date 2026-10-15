@@ -3,19 +3,11 @@
 
 package members
 
-import "github.com/Azure/unbounded/internal/racer/testutil"
+import "testing"
 
 // Keep external-workload security assertions without a production builder API.
-type Config = testutil.Config
-
-const (
-	DataplaneDaemonSetName  = testutil.DataplaneDaemonSetName
-	PodNetworkDaemonSetName = testutil.PodNetworkDaemonSetName
-)
-
-var (
-	ConfigFromLookup  = testutil.ConfigFromLookup
-	DesiredDaemonSet  = testutil.DesiredDaemonSet
-	DesiredDaemonSets = testutil.DesiredDaemonSets
-	ManagedNames      = testutil.ManagedNames
-)
+func TestWorkloadCompatibilityNames(t *testing.T) {
+	if DataplaneDaemonSetName != "racer-dataplane" || PodNetworkDaemonSetName != "racer-dataplane-podnet" {
+		t.Fatal("workload compatibility names changed")
+	}
+}

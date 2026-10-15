@@ -31,10 +31,10 @@ type ClientConfig struct {
 	// client connects to /run/racer/<Cache>/client/socket.
 	Cache string
 	// MaxConnections bounds concurrent [Client.Get] transfers without
-	// [ReadOptions.SmallObject]. Zero means 64. SmallObject transfers and
-	// [Client.Stat] calls each have a separate four-slot lane. Each lane has a
-	// bounded queue; calls fail with [ErrUnavailable] if it is full or the
-	// wait times out.
+	// [ReadOptions.SmallObject]. Zero means 64. SmallObject transfers have a
+	// separate four-slot lane. [Client.Stat] and [Client.Warm] share another
+	// four-slot lane. Each lane has a bounded queue; calls fail with
+	// [ErrUnavailable] if it is full or the wait times out.
 	MaxConnections int
 }
 
@@ -176,21 +176,63 @@ func (c *Client) Close() error {
 // reading its contents. Pass the returned ETag to [ReadOptions] to read
 // exactly that version later.
 func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
-	const op = "stat"
-
 	r, err := request.wire(wire.OperationHead)
 	if err != nil {
 		return Metadata{}, err
 	}
 
+	response, err := c.head(ctx, r, "stat")
+	if err != nil {
+		return Metadata{}, err
+	}
+
+	return fromWireMetadata(response.Metadata), nil
+}
+
+// Warm asks Racer to load and retain an object without returning its contents.
+// ttl must be positive and is rounded up to whole seconds. A duration whose
+// rounded value overflows time.Duration is invalid. A zero RetainUntil means
+// Racer refused retention; metadata is still returned. Warm shares Stat's lane.
+func (c *Client) Warm(ctx context.Context, request Request, ttl time.Duration, opts WarmOptions) (WarmResult, error) {
+	const op = "warm"
+
+	if ttl <= 0 {
+		return WarmResult{}, invalid(op, errors.New("ttl must be positive"))
+	}
+
+	seconds := ttl / time.Second
+	if ttl%time.Second != 0 {
+		seconds++
+	}
+
+	if seconds > time.Duration(math.MaxInt64)/time.Second {
+		return WarmResult{}, invalid(op, errors.New("rounded ttl overflows duration"))
+	}
+
+	r, err := request.wire(wire.OperationHead)
+	if err != nil {
+		return WarmResult{}, err
+	}
+
+	r.Pin, r.RetainSeconds = opts.ETag, uint64(seconds)
+
+	response, err := c.head(ctx, r, op)
+	if err != nil {
+		return WarmResult{}, err
+	}
+
+	return WarmResult{Metadata: fromWireMetadata(response.Metadata), RetainUntil: response.RetainUntil}, nil
+}
+
+func (c *Client) head(ctx context.Context, r wire.Request, op string) (wire.Response, error) {
 	head, err := wire.ClientHead(r)
 	if err != nil {
-		return Metadata{}, invalid(op, err)
+		return wire.Response{}, invalid(op, err)
 	}
 
 	release, err := c.admit(ctx, &c.stat, op)
 	if err != nil {
-		return Metadata{}, err
+		return wire.Response{}, err
 	}
 	defer release()
 
@@ -200,7 +242,7 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 	for attempt := 0; ; attempt++ {
 		conn, reused, err := c.conn(ctx, op, attempt > 0)
 		if err != nil {
-			return Metadata{}, err
+			return wire.Response{}, err
 		}
 
 		response, started, err := c.exchangeHead(ctx, conn, head, r)
@@ -211,13 +253,13 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 				closeQuietly(conn)
 			}
 
-			return fromWireMetadata(response.Metadata), nil
+			return response, nil
 		}
 
 		closeQuietly(conn)
 
 		if ctx.Err() != nil {
-			return Metadata{}, contextError(op, ctx)
+			return wire.Response{}, contextError(op, ctx)
 		}
 
 		// A pooled connection may have been closed by Racer while idle.
@@ -226,7 +268,7 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 			continue
 		}
 
-		return Metadata{}, ioFailure(op, err)
+		return wire.Response{}, ioFailure(op, err)
 	}
 }
 

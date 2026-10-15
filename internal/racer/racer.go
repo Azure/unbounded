@@ -823,7 +823,8 @@ func (r *KeyringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.CredentialsSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).Complete(r)
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
+		Complete(r)
 }
 
 // Kubernetes field selectors cannot OR two names. Each controller watches the

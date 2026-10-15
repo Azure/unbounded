@@ -138,6 +138,8 @@ func TestBadRequests(t *testing.T) {
 		{"POST", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Racer-Byte-Credits", "1"},
 		{"POST", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Range", "bytes=-1"},
 		{"HEAD", "/invalid", "", ""},
+		{"HEAD", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Cache-Control", "max-age=1, max-age=2"},
+		{"HEAD", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Cache-Control", "max-age=bad"},
 		{"GET", wire.ClientObjectPrefix + strings.Repeat("0", 64), "", ""},
 	} {
 		t.Run(test.method+test.path+test.header, func(t *testing.T) {
