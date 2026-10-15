@@ -3,6 +3,7 @@
 
 ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
+# Build stage
 # Build on the target platform: both Rust and the verbs adapter use its ABI.
 FROM ${RUST_IMAGE} AS builder
 ARG RACER_NATIVE_RDMA=true
@@ -53,7 +54,7 @@ COPY cmd/racer-dataplane/wire-codec/tests ./wire-codec/tests
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
 RUN set -eu; \
-    mkdir -p /out/usr/local/bin /out/usr/local/lib; \
+    mkdir -p /out/unbounded/bin /out/usr/local/lib; \
     if [ "$RACER_NATIVE_RDMA" = true ]; then \
         cargo build --locked --release --bin racer-dataplane --no-default-features --features rdma; \
         sh ./build-native.sh verbs/native/verbs.c /out/usr/local/lib/librdma_verbs.so.1; \
@@ -61,16 +62,13 @@ RUN set -eu; \
         cargo build --locked --release --bin racer-dataplane --no-default-features; \
     fi; \
     sh ./check-debug-info.sh target/release/racer-dataplane; \
-    install -m 0755 target/release/racer-dataplane /out/usr/local/bin/racer-dataplane
+    install -m 0755 target/release/racer-dataplane /out/unbounded/bin/racer-dataplane
 
+# Runtime stage
+# Debian rather than ubuntu:noble so the runtime glibc and libibverbs match
+# the Rust builder that linked the binary and the verbs adapter.
 FROM ${RUNTIME_IMAGE}
 ARG RACER_NATIVE_RDMA=true
-ARG VERSION=dev
-ARG GIT_COMMIT=unknown
-LABEL org.opencontainers.image.title="racer-dataplane" \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${GIT_COMMIT}"
 RUN set -eu; \
     case "$RACER_NATIVE_RDMA" in \
         true) set -- libibverbs1 ibverbs-providers ;; \
@@ -78,17 +76,28 @@ RUN set -eu; \
         *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
     esac; \
     apt-get update; \
+    apt-get upgrade -y; \
     apt-get install -y --no-install-recommends libgcc-s1 "$@"; \
+    apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /run/racer /var/lib/racer/identity /var/lib/racer/slabs; \
     chown -R 65532:65532 /run/racer /var/lib/racer; \
     chmod 0700 /var/lib/racer/identity /var/lib/racer/slabs
+
+# Install /unbounded/bin/racer-dataplane and, with RDMA, the verbs adapter
+# under /usr/local/lib where the dynamic loader finds it by soname.
 COPY --from=builder /out/ /
-COPY LICENSE NOTICE /usr/share/licenses/racer-dataplane/
+COPY LICENSE NOTICE /unbounded/licenses/
 RUN ldconfig
+
+ENV PATH="/unbounded/bin:${PATH}"
+
+WORKDIR /unbounded
+
 USER 65532:65532
-WORKDIR /
+
 # Peer HTTP and loopback diagnostics. Client/origin traffic uses mounted UDS paths.
 EXPOSE 7443 9090
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/usr/local/bin/racer-dataplane"]
+
+ENTRYPOINT ["/unbounded/bin/racer-dataplane"]
