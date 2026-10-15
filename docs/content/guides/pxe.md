@@ -38,8 +38,7 @@ kubectl unbounded site init --name my-edge-site --enable-metalman
 `kubectl unbounded site init` requires the operator to be installed first (the
 `kubectl unbounded install` step above), and errors otherwise. The operator then
 reconciles the `unbounded-system` namespace, ServiceAccounts
-(`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a metalman
-Deployment for the Site.
+(`metalman-controller`), RBAC roles, and a metalman Deployment for the Site.
 
 Key `serve-pxe` flags (baked into the operator-managed per-site Deployment; `--site`
 scoping is inherent to the per-site component):
@@ -53,6 +52,7 @@ scoping is inherent to the per-site component):
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
 | `--default-netboot-image` | release-matched `netboot` image | PXE boot environment used when `spec.pxe.netbootImage` is omitted |
+| `--trusted-proxy-cidr` | *(none)* | Proxy CIDR allowed to supply `X-Forwarded-For`; repeat for multiple CIDRs |
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
 
@@ -204,10 +204,11 @@ Metalman uses TPM 2.0 to securely deliver a bootstrap token without embedding se
 Metalman uses trust-on-first-use (TOFU) for TPM attestation: once a machine's EK public key is stored in `status.tpm.ekPublicKey`, any attestation from a different EK is rejected (HTTP 403). If a TPM is legitimately replaced, you must clear `status.tpm.ekPublicKey` from the Machine CR before the machine can re-enroll.
 {{< /callout >}}
 
-3. Metalman wraps an AES-256 key via `tpm2.CreateCredential` (bound to the EK and SRK), then encrypts a 1-hour ServiceAccount token with AES-256-GCM and returns both to the client.
+2. Metalman identifies the Machine from the direct TCP peer address. It ignores forwarding headers unless the direct peer matches an explicit `--trusted-proxy-cidr`; trusted proxy chains are evaluated from the nearest hop outward.
+3. Metalman wraps an AES-256 key via `tpm2.CreateCredential` (bound to the EK and SRK), then encrypts a one-hour Kubernetes bootstrap token with AES-256-GCM and returns both to the client. The token is annotated for exactly one Machine.
 4. The agent uses the TPM `ActivateCredential` operation to recover the AES key, decrypts the token, and writes a bootstrap kubeconfig for kubelet to use during TLS bootstrapping.
 
-The `metalman-bootstrap` ServiceAccount has RBAC for `system:node-bootstrapper` and `certificatesigningrequests:nodeclient` auto-approval.
+Metalman tokens use a dedicated bootstrap group. Machina validates their CSR shape and approves them only when the token's Machine binding matches the requested node name. Existing non-Metalman bootstrap-token flows retain their previous bootstrap and auto-approval behavior.
 
 ## Site Isolation
 
@@ -250,7 +251,7 @@ Running metalman's DHCP server on a network segment that already has an active D
 
 **TPM attestation rejected (403).** The EK public key has changed since the initial TOFU. If the TPM was legitimately replaced, clear `status.tpm.ekPublicKey` from the Machine CR to allow re-enrollment.
 
-**Node not joining.** Verify the target machine can reach the Kubernetes API on TCP/6443. Check that the `metalman-bootstrap` ServiceAccount and RBAC are in place. Inspect kubelet logs on the target for certificate signing request errors.
+**Node not joining.** Verify the target machine can reach the Kubernetes API on TCP/6443 and that the Machina controller is running with CSR approval RBAC. Inspect kubelet logs and the pending CertificateSigningRequest for a Machine-binding denial.
 
 ## Limitations
 

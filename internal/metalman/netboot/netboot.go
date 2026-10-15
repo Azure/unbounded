@@ -235,6 +235,7 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 				},
 				ProviderLabels: f.ProviderLabels,
 				AttestURL:      f.ServeURL,
+				NodeName:       node.NodeName(),
 			})
 
 			// The MarshalIndent prefix "    " (4 spaces) must match the

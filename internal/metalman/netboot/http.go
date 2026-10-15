@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"path"
 	"strings"
 
@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/clientip"
 )
 
 // cloudInitEvent represents a cloud-init webhook reporting event.
@@ -38,6 +39,7 @@ type HTTPServer struct {
 	Mux      *http.ServeMux
 	FileResolver
 	StatusRecorder StatusRecorder
+	TrustedProxies []netip.Prefix
 }
 
 type StatusRecorder interface {
@@ -129,7 +131,11 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
+
 	log := slog.With("proto", "http", "path", path, "ip", ip)
 
 	node, err := h.LookupNodeByIP(r.Context(), ip)
@@ -241,7 +247,10 @@ func serveMissingShimRevocationsFile(w http.ResponseWriter, log *slog.Logger, no
 }
 
 func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -277,7 +286,10 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -375,7 +387,11 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 }
 
 func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
+
 	log := slog.With("handler", "pxe-disable", "ip", ip)
 
 	node, err := h.LookupNodeByIP(r.Context(), ip)
@@ -458,16 +474,14 @@ func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger
 	}
 }
 
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.SplitN(fwd, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+func (h *HTTPServer) requestClientIP(w http.ResponseWriter, r *http.Request) (string, bool) {
+	ip, err := (clientip.Resolver{TrustedProxies: h.TrustedProxies}).FromRequest(r)
 	if err != nil {
-		return r.RemoteAddr
+		slog.Warn("invalid remote address", "remote", r.RemoteAddr, "err", err)
+		http.Error(w, "invalid remote address", http.StatusBadRequest)
+
+		return "", false
 	}
 
-	return host
+	return ip, true
 }

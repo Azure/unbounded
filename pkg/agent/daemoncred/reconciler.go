@@ -23,8 +23,13 @@ const (
 	approvalReasonDenied   = "Denied"
 )
 
+// CSRApproverEvaluator evaluates a CertificateSigningRequest.
+type CSRApproverEvaluator interface {
+	Evaluate(context.Context, *certificatesv1.CertificateSigningRequest) (CSRDecision, error)
+}
+
 // CSRApproverReconciler watches CertificateSigningRequest objects and writes
-// approval or denial conditions for requests evaluated by CSRApprover.
+// approval or denial conditions for requests evaluated by its approver.
 type CSRApproverReconciler struct {
 	// Client reads CertificateSigningRequest objects from the controller cache.
 	client.Client
@@ -32,8 +37,8 @@ type CSRApproverReconciler struct {
 	// KubeClient updates the CSR approval subresource.
 	KubeClient kubernetes.Interface
 
-	// Approver evaluates daemon-controller CSR requests.
-	Approver *CSRApprover
+	// Approver evaluates CSR requests.
+	Approver CSRApproverEvaluator
 
 	// EventFilter optionally customizes which CSR events enqueue reconcile work.
 	// When nil, create, update, and generic events are processed and deletes are ignored.
@@ -43,7 +48,7 @@ type CSRApproverReconciler struct {
 func NewCSRApproverReconciler(
 	c client.Client,
 	kubeClient kubernetes.Interface,
-	approver *CSRApprover,
+	approver CSRApproverEvaluator,
 ) (*CSRApproverReconciler, error) {
 	if c == nil {
 		return nil, fmt.Errorf("client is required")

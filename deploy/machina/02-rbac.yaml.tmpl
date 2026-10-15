@@ -92,10 +92,12 @@ rules:
   - apiGroups: ["certificates.k8s.io"]
     resources: ["certificatesigningrequests/approval"]
     verbs: ["update"]
-  # Approve daemon controller CSRs signed by the standard client signer.
+  # Approve daemon controller and Machine-bound kubelet client CSRs.
   - apiGroups: ["certificates.k8s.io"]
     resources: ["signers"]
-    resourceNames: ["kubernetes.io/kube-apiserver-client"]
+    resourceNames:
+      - "kubernetes.io/kube-apiserver-client"
+      - "kubernetes.io/kube-apiserver-client-kubelet"
     verbs: ["approve"]
 
 ---

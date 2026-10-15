@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,11 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
+
+var testTrustedProxies = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+}
 
 func newScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -113,6 +119,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:             cache,
 			Reader:            fc,
@@ -271,6 +278,7 @@ func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 				Build()
 			recorder := &recordingStatusRecorder{}
 			srv := &HTTPServer{
+				TrustedProxies: testTrustedProxies,
 				FileResolver: FileResolver{
 					Cache:  cache,
 					Reader: fc,
@@ -328,6 +336,7 @@ func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -396,6 +405,7 @@ func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -446,6 +456,7 @@ menuentry "Install" {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:             cache,
 			Reader:            fc,
@@ -512,6 +523,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:             cache,
 			Reader:            fc,
@@ -570,6 +582,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:             cache,
 			Reader:            fc,
@@ -615,6 +628,7 @@ func TestHTTPServer_UnknownSourceIP(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -723,6 +737,7 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 		Build()
 	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -791,6 +806,7 @@ func TestHTTPServer_UsesMachineImageForBootFilesWhenNetbootImageUnset(t *testing
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -1156,7 +1172,7 @@ func TestHTTPServer_NetworkConfigOmitsGatewayAndInvalidDNS(t *testing.T) {
 		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
-	server := &HTTPServer{FileResolver: FileResolver{
+	server := &HTTPServer{TrustedProxies: testTrustedProxies, FileResolver: FileResolver{
 		Cache: cache, Reader: fc, Cluster: &StaticClusterInfo{}, DefaultNetbootRef: imageRef,
 	}}
 	mux := http.NewServeMux()
@@ -1887,6 +1903,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:             cache,
 			Reader:            fc,
@@ -1964,6 +1981,7 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:             cache,
 			Reader:            fc,
@@ -2024,6 +2042,9 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 	nodeWithAgent := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-with-agent"},
 		Spec: v1alpha3.MachineSpec{
+			Kubernetes: &v1alpha3.KubernetesSpec{
+				NodeRef: &v1alpha3.LocalObjectReference{Name: "custom-node-name"},
+			},
 			Agent: &v1alpha3.AgentSpec{
 				Image: "ghcr.io/org/rootfs:v1",
 			},
@@ -2041,6 +2062,10 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 
 	if !strings.Contains(string(resolved.Data), `"MachineName": "node-with-agent"`) {
 		t.Errorf("expected MachineName in rendered template, got %q", resolved.Data)
+	}
+
+	if !strings.Contains(string(resolved.Data), `"NodeName": "custom-node-name"`) {
+		t.Errorf("expected NodeName in rendered template, got %q", resolved.Data)
 	}
 
 	// Without agent image (spec.agent is nil)
@@ -2071,8 +2096,9 @@ func TestHTTPServer_Start_Shutdown(t *testing.T) {
 	cache := NewOCICache(t.TempDir())
 
 	srv := &HTTPServer{
-		BindAddr: "127.0.0.1",
-		Port:     port,
+		TrustedProxies: testTrustedProxies,
+		BindAddr:       "127.0.0.1",
+		Port:           port,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -2223,14 +2249,15 @@ func TestTFTPServer_StaticFile(t *testing.T) {
 
 func TestClientIP(t *testing.T) {
 	tests := []struct {
-		name     string
-		fwdFor   string
-		remote   string
-		expected string
+		name           string
+		fwdFor         string
+		remote         string
+		trustedProxies []netip.Prefix
+		expected       string
 	}{
-		{"forwarded", "10.0.1.10", "192.168.1.1:1234", "10.0.1.10"},
-		{"forwarded multiple", "10.0.1.10, 192.168.1.1", "192.168.1.1:1234", "10.0.1.10"},
-		{"remote only", "", "10.0.1.10:1234", "10.0.1.10"},
+		{"untrusted forwarded", "10.0.1.10", "192.168.1.1:1234", nil, "192.168.1.1"},
+		{"trusted forwarded", "10.0.1.10", "192.168.1.1:1234", []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}, "10.0.1.10"},
+		{"remote only", "", "10.0.1.10:1234", nil, "10.0.1.10"},
 	}
 
 	for _, tt := range tests {
@@ -2243,7 +2270,13 @@ func TestClientIP(t *testing.T) {
 				r.Header.Set("X-Forwarded-For", tt.fwdFor)
 			}
 
-			got := clientIP(r)
+			srv := &HTTPServer{TrustedProxies: tt.trustedProxies}
+
+			got, ok := srv.requestClientIP(httptest.NewRecorder(), r)
+			if !ok {
+				t.Fatal("requestClientIP rejected valid request")
+			}
+
 			if got != tt.expected {
 				t.Errorf("ClientIP: got %q, want %q", got, tt.expected)
 			}
@@ -2284,6 +2317,7 @@ menuentry "Install {{ .Machine.Name }}" {
 		Build()
 
 	httpSrv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:             cache,
 			Reader:            fc,
@@ -2383,7 +2417,7 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	srv := &HTTPServer{FileResolver: FileResolver{Cache: cache, Reader: fc}}
+	srv := &HTTPServer{TrustedProxies: testTrustedProxies, FileResolver: FileResolver{Cache: cache, Reader: fc}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
@@ -2460,6 +2494,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -2555,7 +2590,7 @@ func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	srv := &HTTPServer{FileResolver: FileResolver{Cache: cache, Reader: fc}}
+	srv := &HTTPServer{TrustedProxies: testTrustedProxies, FileResolver: FileResolver{Cache: cache, Reader: fc}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
@@ -2612,7 +2647,8 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		FileResolver: FileResolver{Cache: cache, Reader: fc, DefaultNetbootRef: "ghcr.io/test/pending:v1"},
+		TrustedProxies: testTrustedProxies,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc, DefaultNetbootRef: "ghcr.io/test/pending:v1"},
 	}
 
 	mux := http.NewServeMux()
@@ -2682,6 +2718,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 
 	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: recorder,
@@ -2750,6 +2787,7 @@ func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
 		Build()
 	recorder := &recordingStatusRecorder{err: fmt.Errorf("simulated status failure")}
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: recorder,
@@ -2784,6 +2822,7 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
@@ -2809,6 +2848,54 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected 404 for unknown IP, got %d", resp.StatusCode)
 	}
+}
+
+func TestHTTPServerStateCallbacksIgnoreForwardedForFromUntrustedPeer(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "victim"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{IPv4: "10.0.6.12"}},
+			},
+		},
+	}
+
+	fc := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingStatusRecorder{}
+	srv := &HTTPServer{
+		Client:         fc,
+		FileResolver:   FileResolver{Reader: fc},
+		StatusRecorder: recorder,
+	}
+
+	disableReq := httptest.NewRequest(http.MethodPost, "/pxe/disable", nil)
+	disableReq.RemoteAddr = "203.0.113.77:44444"
+	disableReq.Header.Set("X-Forwarded-For", "10.0.6.12")
+
+	disableResp := httptest.NewRecorder()
+	srv.handleDisablePXE(disableResp, disableReq)
+
+	require.Equal(t, http.StatusNotFound, disableResp.Code)
+	require.Empty(t, recorder.bootImageWrittenEvents())
+	require.Empty(t, recorder.pxeDisabledEvents())
+
+	body := `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`
+	cloudInitReq := httptest.NewRequest(http.MethodPost, "/cloudinit/log", strings.NewReader(body))
+	cloudInitReq.RemoteAddr = "203.0.113.77:44444"
+	cloudInitReq.Header.Set("X-Forwarded-For", "10.0.6.12")
+
+	cloudInitResp := httptest.NewRecorder()
+	srv.handleCloudInitLog(cloudInitResp, cloudInitReq)
+
+	require.Equal(t, http.StatusOK, cloudInitResp.Code)
+	require.Empty(t, recorder.conditionEvents())
+	require.Empty(t, recorder.cloudInitDoneEvents())
 }
 
 func TestOCICache_Metadata(t *testing.T) {
@@ -3087,7 +3174,7 @@ func TestHandleCloudInitLog(t *testing.T) {
 		},
 	}
 
-	srv := &HTTPServer{}
+	srv := &HTTPServer{TrustedProxies: testTrustedProxies}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
@@ -3298,6 +3385,7 @@ func TestInstallLogEndpointAcceptsPlainTextWithoutRecordingCondition(t *testing.
 	recorder := &recordingStatusRecorder{}
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: recorder,
@@ -3342,6 +3430,7 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
@@ -3404,6 +3493,7 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
@@ -3470,6 +3560,7 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
@@ -3522,7 +3613,7 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 func TestCloudInitCondition_NoClientSkipsUpdate(t *testing.T) {
 	// When Client is nil, handleCloudInitLog should still return 200
 	// but not attempt any status update.
-	srv := &HTTPServer{}
+	srv := &HTTPServer{TrustedProxies: testTrustedProxies}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
@@ -3557,6 +3648,7 @@ func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
@@ -3610,6 +3702,7 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 	recorder := &recordingStatusRecorder{err: injectedErr}
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: recorder,
@@ -3661,6 +3754,7 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 
 	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: recorder,
@@ -3758,6 +3852,7 @@ func TestHTTPServerRecordsCloudInitDoneOnlyOnFinalSuccess(t *testing.T) {
 	recorder := &recordingStatusRecorder{}
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: recorder,
@@ -3817,6 +3912,7 @@ func TestHTTPServerDoesNotRecordCloudInitDoneOnFailure(t *testing.T) {
 	recorder := &recordingStatusRecorder{}
 
 	srv := &HTTPServer{
+		TrustedProxies: testTrustedProxies,
 		Client:         fc,
 		FileResolver:   FileResolver{Cache: cache, Reader: fc},
 		StatusRecorder: recorder,

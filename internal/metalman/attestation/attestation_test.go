@@ -20,21 +20,19 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-tpm/tpm2"
-	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
-	clienttesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	metalmanbootstrap "github.com/Azure/unbounded/internal/metalman/bootstrap"
 )
 
 // rsaKeyToTPM2BPublicEK creates a TPM2B_PUBLIC (EK-style) from an RSA public key.
@@ -167,27 +165,8 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		Build()
 
-	ns := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{Name: unbounded.SystemNamespace()},
-	}
-	sa := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "metalman-bootstrap",
-			Namespace: unbounded.SystemNamespace(),
-		},
-	}
-	clientset := fake.NewClientset(ns, sa)
-	clientset.PrependReactor("create", "serviceaccounts/token", func(action clienttesting.Action) (bool, runtime.Object, error) {
-		return true, &authenticationv1.TokenRequest{
-			Status: authenticationv1.TokenRequestStatus{
-				Token:               "fake-bootstrap-token-for-testing",
-				ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
-			},
-		}, nil
-	})
-
 	return &Handler{
-		Clientset:      clientset,
+		Clientset:      fake.NewClientset(),
 		LookupNodeByIP: testLookupByIP(crClient),
 		StatusUpdater:  &testStatusUpdater{client: crClient},
 	}
@@ -464,6 +443,82 @@ func TestAttestE2E(t *testing.T) {
 
 	if string(token) == "" {
 		t.Fatal("expected non-empty bootstrap token")
+	}
+
+	parts := strings.Split(string(token), ".")
+	if len(parts) != 2 {
+		t.Fatalf("expected bootstrap token format, got %q", token)
+	}
+
+	secret, err := handler.Clientset.CoreV1().Secrets(metav1.NamespaceSystem).Get(
+		t.Context(),
+		"bootstrap-token-"+parts[0],
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		t.Fatalf("get generated bootstrap token: %v", err)
+	}
+
+	if got := secret.Annotations[v1alpha3.MachineBootstrapTokenAnnotationKey]; got != node.Name {
+		t.Fatalf("bootstrap token machine annotation = %q, want %q", got, node.Name)
+	}
+
+	if secret.Type != corev1.SecretTypeBootstrapToken {
+		t.Fatalf("bootstrap token secret type = %q", secret.Type)
+	}
+
+	if got := string(secret.Data["auth-extra-groups"]); got != metalmanbootstrap.Group {
+		t.Fatalf("bootstrap token group = %q, want %q", got, metalmanbootstrap.Group)
+	}
+}
+
+func TestAttestIgnoresForwardedForFromUntrustedPeer(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+
+	victim := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "victim"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{{IPv4: "10.0.1.42"}},
+			},
+		},
+	}
+
+	handler := testHandler(t, victim)
+
+	body, err := json.Marshal(AttestRequest{EKPub: ekPub, SRKPub: srkPub})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/attest", bytes.NewReader(body))
+	req.RemoteAddr = "203.0.113.77:44444"
+	req.Header.Set("X-Forwarded-For", "10.0.1.42")
+
+	w := httptest.NewRecorder()
+	handler.Attest(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+
+	updated, err := handler.LookupNodeByIP(t.Context(), "10.0.1.42")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Status.TPM != nil {
+		t.Fatalf("spoofed request modified victim TPM status: %+v", updated.Status.TPM)
+	}
+
+	secrets, err := handler.Clientset.CoreV1().Secrets(metav1.NamespaceSystem).List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(secrets.Items) != 0 {
+		t.Fatalf("spoofed request created %d bootstrap tokens", len(secrets.Items))
 	}
 }
 

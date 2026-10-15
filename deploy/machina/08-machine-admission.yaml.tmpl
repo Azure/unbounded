@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Daemon certificates intentionally retain Machine create permission for
+# dynamic registration. Prevent that permission from creating Metalman
+# enrollment records, which must come from a trusted provisioning authority.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-daemon-machine-create-restriction
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["unbounded-cloud.io"]
+        apiVersions: ["v1alpha3"]
+        operations: ["CREATE"]
+        resources: ["machines"]
+  matchConditions:
+    - name: "is-unbounded-agent-daemon"
+      expression: >-
+        request.userInfo.groups.exists(group, group == 'unbounded-agent-daemons')
+  validations:
+    - expression: >-
+        !has(object.spec.pxe) &&
+        (!has(object.spec.host) || !has(object.spec.host.netboot))
+      message: "unbounded-agent daemons may not create Metalman PXE or netboot enrollment records"
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-daemon-machine-create-restriction
+spec:
+  policyName: unbounded-daemon-machine-create-restriction
+  validationActions: ["Deny"]

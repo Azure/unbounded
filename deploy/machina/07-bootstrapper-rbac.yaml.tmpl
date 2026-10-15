@@ -63,8 +63,8 @@ roleRef:
 
 ---
 # Allow kube-controller-manager to auto-approve the kubelet's initial node
-# client CSR from the unbounded-agent bootstrap token group. This is not used
-# for daemon-controller CSR approval.
+# client CSR for existing non-Metalman bootstrap flows. Metalman uses a
+# separate group and Machina's Machine-bound approver.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
