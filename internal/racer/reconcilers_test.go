@@ -2031,7 +2031,7 @@ func TestMemberSiteLabelsOverrideHistory(t *testing.T) {
 	}{
 		{"unlabeled", nil, ""},
 		{"canonical", map[string]string{machinav1.MachineSiteLabelKey: "site-a"}, "site-a"},
-		{"deprecated ignored", map[string]string{"net.unbounded-cloud.io/site": "site-b"}, ""},
+		{"net site label ignored", map[string]string{"net.unbounded-cloud.io/site": "site-b"}, ""},
 		{"canonical only", map[string]string{machinav1.MachineSiteLabelKey: "site-a", "net.unbounded-cloud.io/site": "site-b"}, "site-a"},
 		{"empty canonical no fallback", map[string]string{machinav1.MachineSiteLabelKey: "", "net.unbounded-cloud.io/site": "site-b"}, ""},
 		{"empty labels", map[string]string{machinav1.MachineSiteLabelKey: ""}, ""},

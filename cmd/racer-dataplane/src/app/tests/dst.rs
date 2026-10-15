@@ -30,7 +30,7 @@ const MAX_TURNS: usize = 100_000;
 /// Subscription fields every simulated reader sends with its POST.
 const SUBSCRIPTION_FIELDS: &str = "Content-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n";
 
-/// The application owns this historical replay domain, not the generic runtime.
+/// The application owns this deterministic replay domain, not the generic runtime.
 trait RacerEntropy {
     fn racer_environment(&self, stream: u64) -> uring_runtime::environment::Environment;
 }
@@ -41,7 +41,7 @@ impl RacerEntropy for SimulationClock {
 }
 
 #[test]
-fn racer_entropy_preserves_historical_replay_bytes() {
+fn racer_entropy_replay_bytes_are_stable() {
     let clock = SimulationClock::new(7);
     let role = clock.racer_environment(11);
     let mut bytes = [0; 32];
