@@ -25,8 +25,8 @@
 //!
 //! In the full application, publication adapters bind these wire records to the
 //! separate `controlplane` component's synchronization, immutable publication,
-//! retention, and generation-tagged rollout APIs. That component is application
-//! context, not a dependency or member of this extracted workspace. Application
+//! retention, and generation-tagged rollout APIs. That component is a separate
+//! workspace member, and this crate does not depend on it. Application
 //! adapters own placement, cache/resource installation, credential policy, and
 //! error classification. Only owned preparation jobs and immutable shared
 //! generations cross threads, not worker-local I/O or credentials. Topology
@@ -1741,7 +1741,7 @@ mod codec {
             let vectors: Vec<SiteVector> =
                 serde_json::from_slice(&fixture("site-vectors.json")).unwrap();
             assert_eq!(vectors.len(), 4);
-            let legacy = decode_publication(&fixture("publication.json")).unwrap();
+            let base = decode_publication(&fixture("publication.json")).unwrap();
             let mut previous = None;
             for (i, (name, site)) in [
                 ("absent", ""),
@@ -1757,7 +1757,7 @@ mod codec {
                 assert_eq!(v.site, site);
                 let bytes = v.publication.as_bytes();
                 let p = decode_publication(bytes).unwrap();
-                let mut want = legacy.clone();
+                let mut want = base.clone();
                 want.sequence.0 = (i + 1) as u64;
                 want.membership_version.0 = (i + 1) as u64;
                 want.members[0].site = site.into();
@@ -1811,9 +1811,9 @@ mod codec {
         fn site_wire_defaults_validation_and_hashes() {
             let mut p = decode_publication(&fixture("publication.json")).unwrap();
             assert!(p.members.iter().all(|m| m.site.is_empty()));
-            let legacy = encode_publication(&p).unwrap();
+            let without_site = encode_publication(&p).unwrap();
             assert!(
-                String::from_utf8(legacy.clone())
+                String::from_utf8(without_site.clone())
                     .unwrap()
                     .contains("\"site\"")
             );
@@ -1829,14 +1829,14 @@ mod codec {
             for site in ["-a", "a-", "a_", ".a", "a/b", "é", &"a".repeat(64)] {
                 p.members[0].site = site.into();
                 assert_eq!(encode_publication(&p), Err(Error::InvalidRequest));
-                let mut json: Value = serde_json::from_slice(&legacy).unwrap();
+                let mut json: Value = serde_json::from_slice(&without_site).unwrap();
                 json["members"][0]["site"] = site.into();
                 assert!(decode_publication(&serde_json::to_vec(&json).unwrap()).is_err());
             }
             p.members[0].site.clear();
-            assert_eq!(encode_publication(&p).unwrap(), legacy);
+            assert_eq!(encode_publication(&p).unwrap(), without_site);
             for value in ["null", "1", "true", "[]", "{}", "\"a\",\"site\":\"b\""] {
-                let raw = String::from_utf8(legacy.clone()).unwrap().replacen(
+                let raw = String::from_utf8(without_site.clone()).unwrap().replacen(
                     "\"site\":\"\"",
                     &format!("\"site\":{value}"),
                     1,
@@ -1859,9 +1859,9 @@ mod codec {
         }
 
         #[test]
-        fn optional_block_device_selector_preserves_legacy_and_rejects_non_strings() {
-            let legacy = fixture("bootstrap-response.json");
-            let mut response = decode_enrollment_response(&legacy).unwrap();
+        fn optional_block_device_selector_is_omitted_when_absent_and_rejects_non_strings() {
+            let without_selector = fixture("bootstrap-response.json");
+            let mut response = decode_enrollment_response(&without_selector).unwrap();
             assert!(response.block_devices.is_none());
             for selector in ["nvme.*cache", "[", ""] {
                 response.block_devices = Some(selector.into());
@@ -1872,7 +1872,7 @@ mod codec {
                     (!selector.is_empty()).then_some(selector)
                 );
                 if selector.is_empty() {
-                    assert_eq!(encoded, legacy);
+                    assert_eq!(encoded, without_selector);
                 }
             }
             for value in [
@@ -1881,7 +1881,7 @@ mod codec {
                 serde_json::json!(true),
                 serde_json::json!([]),
             ] {
-                let mut json: Value = serde_json::from_slice(&legacy).unwrap();
+                let mut json: Value = serde_json::from_slice(&without_selector).unwrap();
                 json["block_devices"] = value;
                 assert!(decode_enrollment_response(&serde_json::to_vec(&json).unwrap()).is_err());
             }
@@ -1889,13 +1889,13 @@ mod codec {
 
         #[test]
         fn shared_block_device_selector_vectors() {
-            let legacy = String::from_utf8(fixture("bootstrap-response.json")).unwrap();
+            let without_selector = String::from_utf8(fixture("bootstrap-response.json")).unwrap();
             let vectors: Vec<Value> =
                 serde_json::from_slice(&fixture("bootstrap-block-devices.json")).unwrap();
             for vector in vectors {
                 let bytes = format!(
                     "{}{} }}",
-                    legacy.trim_end().strip_suffix('}').unwrap(),
+                    without_selector.trim_end().strip_suffix('}').unwrap(),
                     vector["fields"].as_str().unwrap()
                 );
                 let decoded = decode_enrollment_response(bytes.as_bytes());
