@@ -159,10 +159,15 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		return
 	}
 
+	nextServer := s.ServerIP
+	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
+		nextServer = net.IPv4zero
+	}
+
 	resp, err := dhcpv4.NewReplyFromRequest(
 		m,
 		dhcpv4.WithYourIP(clientIP),
-		dhcpv4.WithServerIP(s.ServerIP),
+		dhcpv4.WithServerIP(nextServer),
 		dhcpv4.WithOption(dhcpv4.OptSubnetMask(net.IPMask(net.ParseIP(lease.SubnetMask).To4()))),
 		dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.ServerIP)),
 		dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(86400*time.Second)),
@@ -194,7 +199,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		netbootImage = s.DefaultNetbootRef
 	}
 
-	if netbootImage != "" && s.OCICache != nil {
+	if netbootImage != "" && s.OCICache != nil && node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolVirtualMedia {
 		architecture := node.Spec.Netboot().TargetArchitecture()
 
 		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)

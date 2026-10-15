@@ -22,6 +22,8 @@ import (
 // ErrUnsupported indicates the BMC does not support the requested operation.
 var ErrUnsupported = errors.New("not supported by BMC")
 
+var errTLSCertPin = errors.New("TLS certificate pin verification failed")
+
 type responseError struct {
 	method string
 	path   string
@@ -58,6 +60,10 @@ type PowerState string
 const (
 	PowerOn  PowerState = "On"
 	PowerOff PowerState = "Off"
+
+	// Redfish transition states reported while power is changing.
+	powerTurningOn  PowerState = "PoweringOn"
+	powerTurningOff PowerState = "PoweringOff"
 )
 
 // ResetType represents a Redfish ComputerSystem.Reset action type.
@@ -128,6 +134,7 @@ const (
 type Client struct {
 	session  *bmcSession
 	deviceID string
+	rack     *rackManager
 }
 
 // Dial connects to a BMC and returns a ready-to-use Client.
@@ -140,6 +147,16 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 		baseURL:    url,
 		user:       user,
 		pass:       pass,
+	}
+
+	rack, inconclusive, err := detectRackManager(ctx, s)
+	if err != nil {
+		httpClient.CloseIdleConnections()
+		return nil, err
+	}
+
+	if rack != nil {
+		return &Client{session: s, deviceID: rack.slot, rack: rack}, nil
 	}
 
 	token, location, err := createSession(ctx, httpClient, url, user, pass)
@@ -156,6 +173,16 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 		return nil, err
 	}
 
+	// Do not cache an unverified standard BMC after a transient rack probe failure.
+	if inconclusive {
+		if err := validateFallbackSystem(ctx, s, id); err != nil {
+			s.close()
+			httpClient.CloseIdleConnections()
+
+			return nil, fmt.Errorf("validating standard BMC after inconclusive rack detection: %w", err)
+		}
+	}
+
 	slog.InfoContext(ctx, "Redfish dialed BMC", "url", url, "device", id)
 
 	return &Client{session: s, deviceID: id}, nil
@@ -164,10 +191,18 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 // Close releases the client's Redfish session.
 func (c *Client) Close() {
 	c.session.close()
+
+	if c.rack != nil {
+		c.session.httpClient.CloseIdleConnections()
+	}
 }
 
 // PowerState returns the current power state of the system.
 func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
+	if c.rack != nil {
+		return c.rackPowerState(ctx)
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
 	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
@@ -193,6 +228,19 @@ func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 
 // Reset sends a ComputerSystem.Reset action.
 func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
+	if c.rack != nil {
+		if resetType != ResetForceOff && resetType != ResetOn {
+			return ErrUnsupported
+		}
+
+		op := recoveryNone
+		if resetType == ResetOn {
+			op = recoveryResetOn
+		}
+
+		return c.rackMutate(ctx, http.MethodPost, rackSystemPath+"/Actions/ComputerSystem.Reset", map[string]ResetType{"ResetType": resetType}, op)
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s/Actions/ComputerSystem.Reset", c.deviceID)
 	body := map[string]ResetType{"ResetType": resetType}
 
@@ -212,6 +260,10 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 
 // GetBootConfig returns the current boot source override configuration.
 func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
+	if c.rack != nil {
+		return c.rackBootConfig(ctx)
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
 	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
@@ -255,6 +307,22 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 // SetBootOverride sets the boot source override target and enabled mode.
 // Returns ErrUnsupported if the BMC does not support the PATCH.
 func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled BootEnabled) error {
+	if c.rack != nil {
+		if target != BootTargetPxe && target != BootTargetHdd {
+			return ErrUnsupported
+		}
+
+		if enabled == BootDisabled {
+			return c.DisableBootOverride(ctx)
+		}
+
+		if enabled != BootContinuous && enabled != BootOnce {
+			return ErrUnsupported
+		}
+
+		return c.rackSetBoot(ctx, string(target))
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
 	body := map[string]any{
@@ -285,6 +353,10 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 // SetHTTPBootOverride sets a persistent Redfish UEFI HTTP boot override.
 // Returns ErrUnsupported if the BMC does not support the PATCH.
 func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error {
+	if c.rack != nil {
+		return ErrUnsupported
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
 	body := map[string]any{
@@ -317,6 +389,10 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 // GetBIOSHTTPBootURI returns the pending BIOS UEFI HTTP boot URI.
 // Returns ErrUnsupported if the BMC does not support BIOS settings.
 func (c *Client) GetBIOSHTTPBootURI(ctx context.Context) (string, error) {
+	if c.rack != nil {
+		return "", ErrUnsupported
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s/Bios/Settings", c.deviceID)
 
 	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
@@ -349,6 +425,10 @@ func (c *Client) GetBIOSHTTPBootURI(ctx context.Context) (string, error) {
 // SetBIOSHTTPBootURI sets the pending BIOS UEFI HTTP boot URI.
 // Returns ErrUnsupported if the BMC does not support BIOS settings.
 func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
+	if c.rack != nil {
+		return ErrUnsupported
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s/Bios/Settings", c.deviceID)
 	body := map[string]any{
 		"Attributes": map[string]string{
@@ -377,6 +457,10 @@ func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
 // SetBIOSStaticIPv4 sets pending BIOS UEFI HTTP boot IPv4 settings.
 // Returns ErrUnsupported if the BMC does not support BIOS settings.
 func (c *Client) SetBIOSStaticIPv4(ctx context.Context, config StaticIPv4Config) error {
+	if c.rack != nil {
+		return ErrUnsupported
+	}
+
 	if err := ValidateStaticIPv4Config(config); err != nil {
 		return err
 	}
@@ -423,6 +507,10 @@ func (c *Client) SetBIOSStaticIPv4(ctx context.Context, config StaticIPv4Config)
 // The interface is selected by MACAddress or PermanentMACAddress.
 // Returns ErrUnsupported if the BMC does not expose writable EthernetInterface resources.
 func (c *Client) SetStaticIPv4(ctx context.Context, config StaticIPv4Config) error {
+	if c.rack != nil {
+		return ErrUnsupported
+	}
+
 	mac, err := normalizeMAC(config.MAC)
 	if err != nil {
 		return err
@@ -476,6 +564,10 @@ func (c *Client) SetStaticIPv4(ctx context.Context, config StaticIPv4Config) err
 // DisableBootOverride disables the boot source override.
 // Returns ErrUnsupported if the BMC does not support disabling.
 func (c *Client) DisableBootOverride(ctx context.Context) error {
+	if c.rack != nil {
+		return c.rackSetBoot(ctx, "None")
+	}
+
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
 	body := map[string]any{
@@ -724,12 +816,12 @@ func newHTTPClient(certSHA256 string) *http.Client {
 					}
 
 					if len(cs.PeerCertificates) == 0 {
-						return fmt.Errorf("no TLS peer certificates")
+						return fmt.Errorf("no TLS peer certificates: %w", errTLSCertPin)
 					}
 
 					fp := formatFingerprint(sha256Sum(cs.PeerCertificates[0].Raw))
 					if fp != certSHA256 {
-						return fmt.Errorf("TLS cert SHA256 mismatch: got %s, want %s", fp, certSHA256)
+						return fmt.Errorf("TLS cert SHA256 mismatch: got %s, want %s: %w", fp, certSHA256, errTLSCertPin)
 					}
 
 					return nil
@@ -737,6 +829,34 @@ func newHTTPClient(certSHA256 string) *http.Client {
 			},
 		},
 	}
+}
+
+func validateFallbackSystem(ctx context.Context, s *bmcSession, deviceID string) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s", deviceID)
+
+	data, status, err := s.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+
+	if status != http.StatusOK {
+		return redfishResponseError(http.MethodGet, path, status, data, nil)
+	}
+
+	var system struct {
+		ID      string          `json:"Id"`
+		ODataID string          `json:"@odata.id"`
+		Error   json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(data, &system); err != nil {
+		return fmt.Errorf("parsing fallback system: %w", err)
+	}
+
+	if system.Error != nil || (strings.TrimSpace(system.ID) == "" && strings.TrimSpace(system.ODataID) == "") {
+		return fmt.Errorf("invalid fallback system response from %s", path)
+	}
+
+	return nil
 }
 
 // resolveDeviceID returns the given deviceID if non-empty, or discovers it

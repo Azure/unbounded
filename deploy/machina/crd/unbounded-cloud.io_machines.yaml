@@ -385,9 +385,12 @@ spec:
                           BootProtocol selects how metalman should trigger network boot for
                           repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
                           HTTP boot with a URL derived from the netboot image metadata.
+                          VirtualMedia mounts an operation-owned bootstrap ISO through Redfish.
+                          It requires redfish, a digest Image, and a digest NetbootImage.
                         enum:
                         - PXE
                         - HTTP
+                        - VirtualMedia
                         type: string
                       cloudInit:
                         description: |-
@@ -453,6 +456,7 @@ spec:
                         description: |-
                           Image is an OCI image reference containing the machine disk image.
                           The image must contain /disk/disk.img.gz.
+                          VirtualMedia requires a digest reference (image@sha256:...).
                           Example: "ghcr.io/azure/host-ubuntu2404:v1"
                         type: string
                       netbootImage:
@@ -460,6 +464,8 @@ spec:
                           NetbootImage is an OCI image reference containing the PXE boot
                           artifacts used to install Image. When omitted, metalman uses the
                           default netboot image that corresponds to its release.
+                          VirtualMedia requires this field to be set to a digest reference
+                          (image@sha256:...).
                         type: string
                       netbootPullSecretRef:
                         description: |-
@@ -504,8 +510,9 @@ spec:
                         properties:
                           deviceID:
                             default: "1"
-                            description: DeviceID is the Redfish system device ID.
-                              Defaults to "1".
+                            description: |-
+                              DeviceID is the Redfish system device ID. Defaults to "1".
+                              It is ignored when the endpoint exposes a single system selected by its URL.
                             type: string
                           passwordRef:
                             description: PasswordRef references a secret containing
@@ -526,7 +533,9 @@ spec:
                             - namespace
                             type: object
                           url:
-                            description: URL is the Redfish endpoint URL.
+                            description: |-
+                              URL is the Redfish endpoint URL. It may include a per-system path prefix,
+                              for example https://manager:8080/7. Do not include /redfish/v1.
                             type: string
                           username:
                             description: Username is the Redfish username.
@@ -545,6 +554,10 @@ spec:
                     required:
                     - image
                     type: object
+                    x-kubernetes-validations:
+                    - message: VirtualMedia requires redfish
+                      rule: '!has(self.bootProtocol) || self.bootProtocol != ''VirtualMedia''
+                        || has(self.redfish)'
                   provisioningFormat:
                     description: |-
                       ProvisioningFormat declares the first-boot format for the desired host
@@ -673,9 +686,12 @@ spec:
                       BootProtocol selects how metalman should trigger network boot for
                       repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
                       HTTP boot with a URL derived from the netboot image metadata.
+                      VirtualMedia mounts an operation-owned bootstrap ISO through Redfish.
+                      It requires redfish, a digest Image, and a digest NetbootImage.
                     enum:
                     - PXE
                     - HTTP
+                    - VirtualMedia
                     type: string
                   cloudInit:
                     description: |-
@@ -741,6 +757,7 @@ spec:
                     description: |-
                       Image is an OCI image reference containing the machine disk image.
                       The image must contain /disk/disk.img.gz.
+                      VirtualMedia requires a digest reference (image@sha256:...).
                       Example: "ghcr.io/azure/host-ubuntu2404:v1"
                     type: string
                   netbootImage:
@@ -748,6 +765,8 @@ spec:
                       NetbootImage is an OCI image reference containing the PXE boot
                       artifacts used to install Image. When omitted, metalman uses the
                       default netboot image that corresponds to its release.
+                      VirtualMedia requires this field to be set to a digest reference
+                      (image@sha256:...).
                     type: string
                   netbootPullSecretRef:
                     description: |-
@@ -792,8 +811,9 @@ spec:
                     properties:
                       deviceID:
                         default: "1"
-                        description: DeviceID is the Redfish system device ID. Defaults
-                          to "1".
+                        description: |-
+                          DeviceID is the Redfish system device ID. Defaults to "1".
+                          It is ignored when the endpoint exposes a single system selected by its URL.
                         type: string
                       passwordRef:
                         description: PasswordRef references a secret containing the
@@ -814,7 +834,9 @@ spec:
                         - namespace
                         type: object
                       url:
-                        description: URL is the Redfish endpoint URL.
+                        description: |-
+                          URL is the Redfish endpoint URL. It may include a per-system path prefix,
+                          for example https://manager:8080/7. Do not include /redfish/v1.
                         type: string
                       username:
                         description: Username is the Redfish username.
@@ -833,6 +855,10 @@ spec:
                 required:
                 - image
                 type: object
+                x-kubernetes-validations:
+                - message: VirtualMedia requires redfish
+                  rule: '!has(self.bootProtocol) || self.bootProtocol != ''VirtualMedia''
+                    || has(self.redfish)'
               ssh:
                 description: |-
                   SSH contains the SSH connection and credential details for the

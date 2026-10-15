@@ -6,7 +6,10 @@ package nodestart
 import (
 	"context"
 	"log/slog"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -31,6 +34,28 @@ func TestReconcileNVIDIANonGPUIsNoop(t *testing.T) {
 		slog.New(slog.DiscardHandler),
 		&goalstates.NodeStart{MachineName: "kube1"},
 	).Do(context.Background()))
+}
+
+func TestNVIDIAContainerLibDirCommands(t *testing.T) {
+	t.Parallel()
+
+	cmds := nvidiaContainerLibDirCommands("/usr/lib/aarch64-linux-gnu")
+	require.Len(t, cmds, 2)
+	require.Equal(t, []string{"mkdir", "-p", "/usr/lib/aarch64-linux-gnu"}, cmds[0])
+	require.Equal(t, nvidiaContainerLinkerConfig, cmds[1][len(cmds[1])-1])
+
+	// Run the config command with a temporary target to check what it writes.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "unbounded-nvidia.conf")
+	args := slices.Clone(cmds[1])
+	args[len(args)-1] = target
+
+	out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	got, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "/usr/lib/aarch64-linux-gnu\n", string(got))
 }
 
 func TestRequiredVersionedNVIDIALibraryPaths(t *testing.T) {

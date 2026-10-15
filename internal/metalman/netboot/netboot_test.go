@@ -1228,6 +1228,41 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 	require.NotContains(t, body, "unbounded.disk=")
 }
 
+func TestGrubTemplate_SerialConsoleByArchitecture(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		arch    string
+		console bool
+	}{
+		{arch: "", console: true},
+		{arch: v1alpha3.PXEArchitectureAMD64, console: true},
+		// arm64 servers often use a PL011 UART, not ttyS0. Leave the
+		// choice to the firmware SPCR table.
+		{arch: v1alpha3.PXEArchitectureARM64, console: false},
+	} {
+		t.Run(tc.arch, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-console"},
+				Spec: v1alpha3.MachineSpec{
+					Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{Architecture: tc.arch}},
+				},
+			}
+
+			data := newTemplateData(node, ClusterInfo{ApiserverURL: "https://k8s.example.com"}, "http://10.0.1.1:8080", "", "10.0.1.21", true)
+			result, err := renderTemplate(string(grubTmpl), data)
+			require.NoError(t, err)
+
+			if tc.console {
+				require.Contains(t, string(result), "console=ttyS0,115200n8")
+			} else {
+				require.NotContains(t, string(result), "console=")
+			}
+		})
+	}
+}
+
 func TestInstallRequestedStopsAfterBootImageWritten(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-install", Namespace: "default"},
@@ -1355,6 +1390,8 @@ func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 		"install_log=/var/log/unbounded-agent-install.log",
 		"trap report_unbounded_failure ERR",
 		"last 120 lines of ${install_log}",
+		"systemctl list-units --all --state=failed,auto-restart --plain --no-legend",
+		`journalctl -b --no-pager -u "$unit" 2>&1 | grep -v ' systemd-nspawn\[' | tail -n 60`,
 		`curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "http://10.0.1.1:8080/unbounded-agent/install-log"`,
 		`bash /usr/local/bin/unbounded-agent-install.sh 2>&1 | tee "$install_log"`,
 	} {
@@ -2099,6 +2136,72 @@ func TestHTTPServer_Start_Shutdown(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("healthz: got %d, want 200", resp.StatusCode)
+	}
+
+	cancel()
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("server returned error: %v", err)
+	}
+}
+
+func TestHTTPServer_StartWithMediaRoutes(t *testing.T) {
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	port := freePort(t)
+
+	srv := &HTTPServer{
+		BindAddr: "127.0.0.1",
+		Port:     port,
+		FileResolver: FileResolver{
+			Cache:  NewOCICache(t.TempDir()),
+			Reader: fc,
+		},
+		Client: fc,
+		Media:  &MediaProvider{Client: fc},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- srv.Start(ctx)
+	}()
+
+	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
+	waitForHTTP(t, addr+"/healthz", 3*time.Second)
+
+	id := strings.Repeat("a", 32)
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodGet, "/bootmedia/" + id + "/grub.cfg", http.StatusNotFound},
+		{http.MethodPost, "/bootmedia/" + id + "/complete", http.StatusNotFound},
+		{http.MethodPut, "/bootmedia/" + id + "/complete", http.StatusMethodNotAllowed},
+	} {
+		req, err := http.NewRequestWithContext(t.Context(), tc.method, addr+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s %s: got %d, want %d", tc.method, tc.path, resp.StatusCode, tc.want)
+		}
+
+		if got := resp.Header.Get("Cache-Control"); tc.want == http.StatusNotFound && got != "no-store" {
+			t.Errorf("%s %s: request did not reach media handler (Cache-Control %q)", tc.method, tc.path, got)
+		}
 	}
 
 	cancel()
@@ -3872,8 +3975,13 @@ func TestCleanRequestPath(t *testing.T) {
 		{"/bootx64.efi", "/bootx64.efi"},
 		{"//grubx64.efi", "/grubx64.efi"},
 		{"/a//b", "/a/b"},
-		{"/dir/", "/dir/"},
-		{"/dir//", "/dir/"},
+		{"/dir/", "/dir"},
+		{"/dir//", "/dir"},
+		{"/grub/./grub.cfg/", "/grub/grub.cfg"},
+		{"/unused/../vmlinuz//", "/vmlinuz"},
+		{"//cloud-init//vendor-data/", "/cloud-init/vendor-data"},
+		{"/cloud-init/vendor-data/child/..", "/cloud-init/vendor-data"},
+		{"/../../", "/"},
 	}
 
 	for _, tc := range cases {

@@ -127,6 +127,20 @@ jobs:
           cache-from: type=gha,scope=netboot
           cache-to: type=gha,scope=netboot,mode=max
 
+      - name: Build and push Azure Linux netboot dependency
+        if: needs.resolve.outputs.name == 'metalman'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/netboot/Containerfile
+          platforms: ${{ needs.resolve.outputs.platforms }}
+          push: true
+          build-args: |
+            INSTALLER_KERNEL=azurelinux
+          tags: ${{ env.CONTAINER_REGISTRY }}/netboot-azurelinux:${{ needs.resolve.outputs.tag }}
+          cache-from: type=gha,scope=netboot-azurelinux
+          cache-to: type=gha,scope=netboot-azurelinux,mode=max
+
       - name: Build and push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:

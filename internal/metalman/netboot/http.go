@@ -38,6 +38,7 @@ type HTTPServer struct {
 	Mux      *http.ServeMux
 	FileResolver
 	StatusRecorder StatusRecorder
+	Media          *MediaProvider
 }
 
 type StatusRecorder interface {
@@ -63,6 +64,13 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /cloudinit/log", h.handleCloudInitLog)
 	mux.HandleFunc("POST /unbounded-agent/install-log", h.handleInstallLog)
 
+	if h.Media != nil {
+		// Method-qualified patterns are required: a method-less pattern
+		// conflicts with "GET /" in net/http and panics at registration.
+		mux.Handle("GET /bootmedia/", h.Media)
+		mux.Handle("POST /bootmedia/", h.Media)
+	}
+
 	if h.Client != nil {
 		mux.HandleFunc("POST /pxe/disable", h.handleDisablePXE)
 		mux.HandleFunc("GET /pxe/disable", h.handleDisablePXE)
@@ -87,8 +95,8 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	return nil
 }
 
-// normalizePath collapses redundant slashes in the request path before the
-// ServeMux routes it. When shim is HTTP-booted from the web root it requests
+// normalizePath canonicalizes paths before routing, authorization, and file
+// resolution. When shim is HTTP-booted from the web root it requests
 // its second stage as "//grubx64.efi": it appends its absolute-path loader name
 // to its boot URL's directory. Go's ServeMux would answer that with a 307
 // redirect, which shim refuses to follow (it treats the 3xx as EFI_HTTP_ERROR
@@ -96,30 +104,30 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 // file directly with a 200.
 func normalizePath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
-			r.URL.Path = cleaned
-			r.URL.RawPath = ""
+		cleaned := cleanRequestPath(r.URL.Path)
+
+		// Capabilities must not gain aliases through path normalization.
+		if strings.Contains(r.URL.Path, "bootmedia") && (r.URL.RawPath != "" || cleaned != r.URL.Path) {
+			http.NotFound(w, r)
+			return
 		}
+
+		// ServeMux must route the same decoded path that the handlers check.
+		r.URL.Path = cleaned
+		r.URL.RawPath = ""
 
 		next.ServeHTTP(w, r)
 	})
 }
 
-// cleanRequestPath normalizes a URL path the same way path.Clean does, so the
-// middleware can collapse unclean paths (e.g. "//grubx64.efi") that the
-// ServeMux would otherwise redirect. A trailing slash is preserved to mirror
-// ServeMux behavior.
+// cleanRequestPath removes duplicate slashes, dot segments, and trailing
+// slashes so authorization checks match the cache resolver's path cleaning.
 func cleanRequestPath(p string) string {
 	if p == "" {
 		return "/"
 	}
 
-	cleaned := path.Clean(p)
-	if cleaned != "/" && strings.HasSuffix(p, "/") {
-		cleaned += "/"
-	}
-
-	return cleaned
+	return path.Clean(p)
 }
 
 func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -131,8 +139,82 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	ip := clientIP(r)
 	log := slog.With("proto", "http", "path", path, "ip", ip)
+	// The running installer keeps its original lease even if the Machine is
+	// edited. Resolve its artifacts from the operation snapshot, never live input.
+	if h.Media != nil {
+		switch path {
+		case "disk.img.gz", "vmlinuz", "initrd", "init.cpio", "grub.cfg", "grub/grub.cfg":
+			remote, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
 
-	node, err := h.LookupNodeByIP(r.Context(), ip)
+			o, claimed, err := h.Media.artifactOwner(r.Context(), remote)
+			if claimed {
+				if err != nil || strings.HasSuffix(path, "grub.cfg") {
+					log.Warn("rejected boot media artifact request", "err", err)
+					http.NotFound(w, r)
+
+					return
+				}
+
+				log = log.With("handler", "bootmedia", "operation", o.op.Name)
+
+				ref := o.status().Netboot.NetbootImage
+				if path == "disk.img.gz" {
+					ref = o.status().Netboot.Image
+				}
+
+				resolved, err := h.Media.Resolver.ResolveFileByPathForIP(r.Context(), path, o.machine, ref, remote)
+				if err != nil {
+					log.Warn("boot media artifact unavailable", "ref", ref, "err", err)
+					http.Error(w, "media artifact unavailable", http.StatusServiceUnavailable)
+
+					return
+				}
+
+				log.Info("serving boot media artifact", "ref", ref, "range", r.Header.Get("Range"))
+
+				if resolved.DiskPath != "" {
+					// GRUB's gzip arm64 kernel loader needs HTTP Range support.
+					// ServeFile preserves it for hybrid ISO boots.
+					http.ServeFile(w, r, resolved.DiskPath)
+				} else {
+					w.Write(resolved.Data) //nolint:errcheck // Best-effort response.
+				}
+
+				return
+			}
+
+			if ip != remote {
+				if _, claimed, err := h.Media.artifactOwner(r.Context(), ip); claimed {
+					log.Warn("rejected forwarded boot media artifact request", "err", err)
+					http.NotFound(w, r)
+
+					return
+				}
+			}
+		}
+	}
+
+	var (
+		node *v1alpha3.Machine
+		err  error
+	)
+
+	switch path {
+	case "cloud-init/meta-data", "cloud-init/user-data", "cloud-init/vendor-data", "cloud-init/network-config":
+		var owner *mediaOwner
+
+		node, owner, err = h.firstBootMachine(r)
+		if owner != nil {
+			ip = owner.status().Netboot.DHCPLeases[0].IPv4
+		}
+	default:
+		node, err = h.LookupNodeByIP(r.Context(), ip)
+	}
+
 	if err != nil {
 		log.Warn("no node for source IP", "err", err)
 		http.NotFound(w, r)
@@ -145,6 +227,20 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 
 		return
+	}
+
+	if node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" && strings.HasSuffix(path, "grub.cfg") {
+		// Virtual media install intent is available only through its capability.
+		http.NotFound(w, r)
+		return
+	}
+
+	if node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
+		switch path {
+		case "disk.img.gz", "vmlinuz", "initrd", "init.cpio":
+			http.NotFound(w, r)
+			return
+		}
 	}
 
 	imageRef := node.Spec.Netboot().Image
@@ -270,7 +366,40 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
 	}
 
-	machineName := h.recordCloudInitCondition(r.Context(), log, ip, &ev)
+	var node *v1alpha3.Machine
+
+	if h.Media != nil || h.Reader != nil {
+		var owner *mediaOwner
+
+		node, owner, err = h.firstBootMachine(r)
+		if err != nil {
+			log.Warn("cloud-init report has no authorized Machine", "err", err)
+
+			if errors.Is(err, errMediaFirstBootUnauthorized) {
+				http.NotFound(w, r)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+
+			return
+		}
+
+		if owner != nil {
+			if err := h.Media.recordFirstBootCondition(r.Context(), owner, &ev); err != nil {
+				log.Error("recording media cloud-init condition", "operation", owner.op.Name, "err", err)
+				w.Header().Set("Retry-After", "5")
+				http.Error(w, "cannot save media cloud-init condition", http.StatusServiceUnavailable)
+
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+			return
+		}
+	}
+
+	machineName := h.recordCloudInitCondition(r.Context(), log, node, &ev)
 	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
 	w.WriteHeader(http.StatusOK)
@@ -287,8 +416,65 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Warn("unbounded-agent install log", "ip", ip, "body", strings.TrimSpace(string(body)))
+	log := slog.With("ip", ip)
+
+	if h.Media != nil || h.Reader != nil {
+		node, owner, err := h.firstBootMachine(r)
+		if err != nil {
+			log.Warn("install log has no authorized Machine", "err", err)
+
+			if errors.Is(err, errMediaFirstBootUnauthorized) {
+				http.NotFound(w, r)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+
+			return
+		}
+
+		log = log.With("node", node.Name)
+		if owner != nil {
+			log = log.With("operation", owner.op.Name)
+		}
+	}
+
+	log.Warn("unbounded-agent install log", "body", strings.TrimSpace(string(body)))
 	w.WriteHeader(http.StatusOK)
+}
+
+var errMediaFirstBootUnauthorized = errors.New("no authorized media first-boot owner")
+
+// Only the direct peer can claim a frozen lease. Live-IP fallback, including
+// forwarding headers, is allowed only for Machines and leases without media owners.
+func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *mediaOwner, error) {
+	if h.Media != nil {
+		remote, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, err)
+		}
+
+		o, claimed, err := h.Media.firstBootOwner(r.Context(), remote)
+		if claimed {
+			if err != nil {
+				return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, err)
+			}
+
+			return o.machine, o, nil
+		}
+	}
+
+	node, err := h.LookupNodeByIP(r.Context(), clientIP(r))
+	if node != nil && node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
+		return nil, nil, errMediaFirstBootUnauthorized
+	}
+
+	if h.Media != nil {
+		if mediaErr := h.Media.rejectFirstBootFallback(r.Context(), node, clientIP(r)); mediaErr != nil {
+			return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, mediaErr)
+		}
+	}
+
+	return node, nil, err
 }
 
 // cloudInitLastStage is the final cloud-init stage. When this stage
@@ -297,15 +483,8 @@ const cloudInitLastStage = "modules-final"
 
 // recordCloudInitCondition records the CloudInitDone condition for the active
 // MachineOperation targeting the Machine that matches the request source IP.
-func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
-	if h.Reader == nil {
-		return ""
-	}
-
-	node, err := h.LookupNodeByIP(ctx, ip)
-	if err != nil {
-		log.Error("cloud-init condition: looking up Machine", "ip", ip, "err", err)
-
+func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, ev *cloudInitEvent) string {
+	if node == nil {
 		return ""
 	}
 
@@ -383,6 +562,11 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		log.Warn("no node for source IP", "err", err)
 		http.NotFound(w, r)
 
+		return
+	}
+
+	if node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
+		http.NotFound(w, r)
 		return
 	}
 

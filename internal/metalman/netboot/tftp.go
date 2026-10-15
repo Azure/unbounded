@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pin/tftp/v3"
 
@@ -22,6 +23,7 @@ type TFTPServer struct {
 	BindAddr string
 	FileResolver
 	StatusRecorder TFTPStatusRecorder
+	Media          *MediaProvider
 }
 
 type TFTPStatusRecorder interface {
@@ -52,10 +54,45 @@ func (t *TFTPServer) Start(ctx context.Context) error {
 }
 
 func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	// Rack managers fetch the ISO using their own IP, not the host lease.
+	if t.Media != nil && (strings.HasPrefix(filename, "ub-") || strings.HasSuffix(filename, ".iso")) {
+		log := slog.With("proto", "tftp", "filename", filename)
+		if transfer, ok := rf.(tftp.OutgoingTransfer); ok {
+			log = log.With("ip", transfer.RemoteAddr().IP.String())
+		}
+
+		file, err := t.Media.OpenISO(ctx, filename)
+		if err != nil {
+			log.Warn("rejecting boot media transfer", "err", err)
+			return err
+		}
+		defer file.Close() //nolint:errcheck // Best-effort close after transfer.
+
+		log.Info("serving boot media")
+
+		n, err := rf.ReadFrom(file)
+		if err != nil {
+			log.Error("boot media transfer failed", "bytes", n, "err", err)
+			return err
+		}
+
+		log.Info("boot media transfer complete", "bytes", n)
+
+		return nil
+	}
+
 	ip := rf.(tftp.OutgoingTransfer).RemoteAddr().IP.String() //nolint:errcheck // Type is guaranteed by the tftp library.
 	filename = strings.TrimPrefix(filename, "/")
 	log := slog.With("proto", "tftp", "filename", filename, "ip", ip)
+
+	if t.Media != nil {
+		if _, claimed, err := t.Media.artifactOwner(ctx, ip); claimed {
+			log.Warn("rejecting boot media artifact transfer", "err", err)
+			return fmt.Errorf("source IP is claimed by boot media; artifacts require HTTP")
+		}
+	}
 
 	node, err := t.LookupNodeByIP(ctx, ip)
 	if err != nil {
@@ -66,6 +103,10 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	if node.Spec.Netboot() == nil {
 		log.Warn("node has no PXE config", "node", node.Name)
 		return fmt.Errorf("node %s has no PXE config", node.Name)
+	}
+
+	if node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
+		return fmt.Errorf("virtual media requires an operation-scoped ISO")
 	}
 
 	imageRef := t.NetbootImageRef(node)

@@ -10,6 +10,12 @@ namespace:
 
 manager: helm
 
+# Rollout strategy for the agent DaemonSet. Lower maxUnavailable on large
+# clusters to bound how many nodes lose the local mirror at once.
+updateStrategy:
+  rollingUpdate:
+    maxUnavailable: 50%
+
 nodeSelector:
   kubernetes.io/os: linux
 
@@ -65,6 +71,8 @@ gantry:
   pprofListen: ""
   chairCount: 64
   chairSeedCount: 8
+  peerFetchTimeout: 15m
+  transferMaxConcurrentServes: 10
   upstreamRegistries:
     - name: registry.example.com
       endpoint: https://registry.example.com

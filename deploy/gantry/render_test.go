@@ -214,6 +214,37 @@ func TestRendersOptionalMetricsService(t *testing.T) {
 	}
 }
 
+func TestRendersConfiguredPeerTransferSettings(t *testing.T) {
+	t.Parallel()
+
+	defaultConfig, err := os.ReadFile(filepath.Join(renderChart(t, false), "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read default rendered config: %v", err)
+	}
+
+	for _, want := range []string{`peer_fetch_timeout: "15m"`, "transfer_max_concurrent_serves: 10\n"} {
+		if !bytes.Contains(defaultConfig, []byte(want)) {
+			t.Fatalf("default rendered config does not contain %q", want)
+		}
+	}
+
+	outputDir := renderChart(t, false,
+		"--set-string", "gantry.peerFetchTimeout=60s",
+		"--set", "gantry.transferMaxConcurrentServes=100",
+	)
+
+	rawConfig, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered config: %v", err)
+	}
+
+	for _, want := range []string{`peer_fetch_timeout: "60s"`, "transfer_max_concurrent_serves: 100\n"} {
+		if !bytes.Contains(rawConfig, []byte(want)) {
+			t.Fatalf("rendered config does not contain %q", want)
+		}
+	}
+}
+
 func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
 	t.Parallel()
 
@@ -763,4 +794,39 @@ func sourceFile(t *testing.T) string {
 	}
 
 	return file
+}
+
+func TestRendersConfiguredAgentUpdateStrategy(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "default", want: "maxUnavailable: 50%"},
+		{
+			name: "override",
+			args: []string{"--set-string", "updateStrategy.rollingUpdate.maxUnavailable=10%"},
+			want: "maxUnavailable: 10%",
+		},
+		{
+			name: "count",
+			args: []string{"--set", "updateStrategy.rollingUpdate.maxUnavailable=3"},
+			want: "maxUnavailable: 3\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := os.ReadFile(filepath.Join(renderChart(t, false, tc.args...), "daemonset.yaml"))
+			if err != nil {
+				t.Fatalf("read rendered agent DaemonSet: %v", err)
+			}
+
+			if !bytes.Contains(raw, []byte(tc.want)) {
+				t.Fatalf("rendered agent DaemonSet does not contain %q", tc.want)
+			}
+		})
+	}
 }
