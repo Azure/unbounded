@@ -157,7 +157,7 @@ func (s Snapshot) ActiveCountWithin(chairCount int, now time.Time) int {
 	return count
 }
 
-func (s Snapshot) HolderChair(peerID ifaces.NodeID) (Chair, bool) {
+func (s Snapshot) HolderChair(peerID ifaces.PeerID) (Chair, bool) {
 	for _, chair := range s.Chairs {
 		if chair.Holder.PeerID == peerID {
 			return chair, true
@@ -182,7 +182,7 @@ func Rank(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
 
 		name := chair.ID.Name()
 		byName[name] = chair
-		candidates = append(candidates, ifaces.Node{ID: ifaces.NodeID(name)})
+		candidates = append(candidates, ifaces.Node{ID: ifaces.PeerID(name)})
 	}
 
 	scored := hrw.TopK(candidates, d, len(candidates))

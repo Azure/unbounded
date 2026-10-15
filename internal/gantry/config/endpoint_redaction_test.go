@@ -40,7 +40,7 @@ func TestRedactedEndpoints(t *testing.T) {
 		{"relative", "//private-user:private-password@registry.example", "[REDACTED]"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			upstream := UpstreamRegistry{Name: "registry.example", Endpoint: tt.endpoint, CredentialsPath: "/credentials", NSAlias: "alias"}
+			upstream := UpstreamRegistry{Name: "registry.example", Endpoint: tt.endpoint, NSAlias: "alias"}
 			c := &Config{UpstreamRegistries: []UpstreamRegistry{upstream, {Name: "public.example", Endpoint: "https://public.example"}}}
 			redacted := c.Redacted()
 			want := upstream

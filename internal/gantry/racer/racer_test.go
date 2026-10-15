@@ -715,6 +715,32 @@ func TestOriginInvalidSizesAndShortBody(t *testing.T) {
 	}
 }
 
+func TestPageBodyCloseInterruptsRead(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+
+	body := &pageBody{Reader: io.LimitReader(reader, 10), upstream: reader}
+	readDone := make(chan error, 1)
+
+	go func() {
+		_, err := body.Read(make([]byte, 1))
+		readDone <- err
+	}()
+
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("closed read succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not interrupt upstream Read")
+	}
+}
+
 func TestFakeClientContinuationFailureIsTerminal(t *testing.T) {
 	size := int64(racersdk.PageSize) + 1
 	upstream := &testUpstream{

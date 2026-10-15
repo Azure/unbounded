@@ -16,8 +16,8 @@ func TestProviderFailureSweep_EvictsExpiredEntriesWhenProvidersFiltered(t *testi
 	d1 := digest.MustParse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	d2 := digest.MustParse("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
-	expiredKey := providerDigestKey{digest: d1, nodeID: "expired", addr: "expired:5001"}
-	freshKey := providerDigestKey{digest: d1, nodeID: "fresh", addr: "fresh:5001"}
+	expiredKey := providerDigestKey{digest: d1, peerID: "expired", addr: "expired:5001"}
+	freshKey := providerDigestKey{digest: d1, peerID: "fresh", addr: "fresh:5001"}
 
 	s := &Server{
 		staleProviders: map[providerDigestKey]time.Time{
@@ -34,7 +34,7 @@ func TestProviderFailureSweep_EvictsExpiredEntriesWhenProvidersFiltered(t *testi
 		},
 	}
 
-	providers, summary := s.filterProvidersForDigest(d2, []ifaces.Provider{{NodeID: "other", Addr: "other:5001"}})
+	providers, summary := s.filterProvidersForDigest(d2, []ifaces.Provider{{PeerID: "other", Addr: "other:5001"}})
 	if len(providers) != 1 || providers[0].Addr != "other:5001" {
 		t.Fatalf("providers = %+v, want unrelated provider preserved", providers)
 	}

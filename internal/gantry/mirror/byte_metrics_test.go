@@ -95,7 +95,7 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 	peerAddr := startPeerTransfer(t, peerCache)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: "peer-a", Addr: peerAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "peer-a", Addr: peerAddr})
 
 	var fetched, served, completed []byteObservation
 
@@ -104,7 +104,6 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 	}))
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, peerClient),
 		mirror.WithPeerBudgets(time.Second, 5*time.Second, 1),
 		mirror.WithByteMetrics(
@@ -168,7 +167,6 @@ func TestMirrorByteMetricsOriginSource(t *testing.T) {
 	var served, completed []byteObservation
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			served = append(served, byteObservation{kind: kind, source: source, bytes: bytes})
 		}),

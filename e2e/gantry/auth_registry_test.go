@@ -28,19 +28,15 @@ const (
 	// In-cluster auth registry test fixtures. The registry is deployed
 	// in the unbounded-system namespace so it can be reached via the
 	// well-known cluster-DNS name without RBAC churn.
-	authRegistryNS       = "unbounded-system"
-	authRegistryName     = "auth-registry"
-	authRegistryHost     = "auth-registry.unbounded-system.svc.cluster.local"
-	authRegistryUser     = "testuser"
-	authRegistryPass     = "testpass"
-	authRegistryImage    = "registry:2"
-	authRegistrySkopeo   = "quay.io/skopeo/stable:latest"
-	authRegistryRefShort = "auth-registry.unbounded-system.svc.cluster.local:5000"
-	// authRegistryCredsKey is the Secret data key (and on-disk filename
-	// under /etc/gantry/registry/) holding the Basic-auth credentials
-	// for authRegistryRefShort. Secret keys cannot contain ':' so this
-	// is a sanitized variant of authRegistryRefShort.
-	authRegistryCredsKey = "auth-registry.unbounded-system.svc.cluster.local_5000"
+	authRegistryNS         = "unbounded-system"
+	authRegistryName       = "auth-registry"
+	authRegistryHost       = "auth-registry.unbounded-system.svc.cluster.local"
+	authRegistryUser       = "testuser"
+	authRegistryPass       = "testpass"
+	authRegistryImage      = "registry:2"
+	authRegistrySkopeo     = "quay.io/skopeo/stable:latest"
+	authRegistryRefShort   = "auth-registry.unbounded-system.svc.cluster.local:5000"
+	authRegistryPullSecret = "gantry-e2e-registry-pull"
 )
 
 // TestE2E_PrivateAuthRegistry proves that Gantry's credentialed
@@ -51,10 +47,8 @@ const (
 //   - Use skopeo (in a Job) to copy registry.k8s.io/e2e-test-images/agnhost
 //     into the in-cluster registry so we have a real OCI image protected
 //     by auth.
-//   - Project the credentials into the gantry pods via the existing
-//     gantry-registry-credentials Secret hook (see deploy/daemonset.yaml).
-//   - Patch the gantry ConfigMap to add the in-cluster registry with
-//     credentials_path pointing at the projected Secret file.
+//   - Give the workload an imagePullSecret; Gantry has no shared identity.
+//   - Patch the gantry ConfigMap to add the in-cluster registry endpoint.
 //   - Restart the gantry DaemonSet so origin.New picks up the new entry.
 //   - Configure containerd on each kind node with hosts.toml routing the
 //     in-cluster registry through Gantry's mirror.
@@ -99,18 +93,16 @@ func TestE2E_PrivateAuthRegistry(t *testing.T) {
 	authRegistryDigest := h.inspectAuthRegistryDigest(ctx)
 	authRegistryRef := authRegistryHost + ":5000/agnhost@" + authRegistryDigest
 
-	// Project the credentials into gantry pods via the existing
-	// optional Secret hook.
+	// Kubelet delegates workload credentials through containerd's mirror auth.
 	h.installRegistryCredentials(ctx)
 	h.configureGantryAuthRegistryCA(ctx)
 
-	// Re-patch the gantry ConfigMap to add the auth registry with
-	// credentials_path. Default e2e ConfigMap is replaced (not merged)
+	// Re-patch the gantry ConfigMap to add the auth registry endpoint.
+	// Default e2e ConfigMap is replaced (not merged)
 	// because origin.New requires the full upstream_registries list.
 	h.applyConfigMapWithAuthRegistry(ctx)
 
-	// Restart the DaemonSet so the agent rereads the ConfigMap +
-	// projected Secret and rebuilds the origin registry client list.
+	// Restart the DaemonSet to reread the ConfigMap and trusted CA.
 	if err := h.run(ctx, "kubectl", "-n", namespace, "rollout", "restart", "daemonset/"+dsName); err != nil {
 		t.Fatalf("rollout restart: %v", err)
 	}
@@ -474,36 +466,41 @@ func (h *harness) populateAuthRegistry(ctx context.Context) {
 	}
 }
 
-// installRegistryCredentials creates the gantry-registry-credentials
-// Secret. The DaemonSet mounts this Secret at /etc/gantry/registry
-// (optional: true) so creating it triggers a mount on next pod start.
+// installRegistryCredentials creates a workload imagePullSecret, never a
+// credential mount in Gantry pods.
 func (h *harness) installRegistryCredentials(ctx context.Context) {
 	h.t.Helper()
 
-	manifest := strings.Join([]string{
-		"apiVersion: v1",
-		"kind: Secret",
-		"metadata:",
-		"  name: gantry-registry-credentials",
-		"  namespace: " + namespace,
-		"  labels:",
-		"    app.kubernetes.io/name: gantry",
-		"type: Opaque",
-		"stringData:",
-		// Secret data keys cannot contain ':' so we use a sanitized
-		// filename. The ConfigMap's credentials_path points at the same
-		// filename under /etc/gantry/registry.
-		"  " + authRegistryCredsKey + ": \"" + authRegistryUser + ":" + authRegistryPass + "\"",
-		"",
-	}, "\n")
+	manifest := authRegistrySecretManifest()
 	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
 		h.t.Fatalf("apply registry credentials secret: %v", err)
 	}
 }
 
+func authRegistrySecretManifest() string {
+	// Marshal known fixture values without embedding a persistent credential.
+	dockerConfig, _ := json.Marshal(map[string]any{"auths": map[string]any{
+		authRegistryRefShort: map[string]string{"auth": base64.StdEncoding.EncodeToString([]byte(authRegistryUser + ":" + authRegistryPass))},
+	}})
+
+	return strings.Join([]string{
+		"apiVersion: v1",
+		"kind: Secret",
+		"metadata:",
+		"  name: " + authRegistryPullSecret,
+		"  namespace: default",
+		"  labels:",
+		"    app.kubernetes.io/name: gantry",
+		"type: kubernetes.io/dockerconfigjson",
+		"data:",
+		"  .dockerconfigjson: " + base64.StdEncoding.EncodeToString(dockerConfig),
+		"",
+	}, "\n")
+}
+
 // applyConfigMapWithAuthRegistry rewrites the gantry ConfigMap so that
-// the upstream_registries list includes the in-cluster auth registry
-// with a credentials_path. origin.New requires the full list so we
+// the upstream_registries list includes the in-cluster auth registry.
+// origin.New requires the full list so we
 // replace, not merge.
 func (h *harness) applyConfigMapWithAuthRegistry(ctx context.Context) {
 	h.t.Helper()
@@ -511,7 +508,14 @@ func (h *harness) applyConfigMapWithAuthRegistry(ctx context.Context) {
 	// our auth registry. We don't reuse the deploy/configmap.yaml file
 	// because patching it deterministically across versions is more
 	// fragile than emitting the snippet we need.
-	manifest := strings.Join([]string{
+	manifest := authRegistryConfigManifest()
+	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
+		h.t.Fatalf("apply configmap with auth registry: %v", err)
+	}
+}
+
+func authRegistryConfigManifest() string {
+	return strings.Join([]string{
 		"apiVersion: v1",
 		"kind: ConfigMap",
 		"metadata:",
@@ -529,10 +533,8 @@ func (h *harness) applyConfigMapWithAuthRegistry(ctx context.Context) {
 		"      - \"/ip4/0.0.0.0/tcp/4001\"",
 		"      - \"/ip4/0.0.0.0/udp/4001/quic-v1\"",
 		"    libp2p_identity_path: \"/var/lib/gantry/libp2p/identity.key\"",
-		"    members_label_selector: \"app.kubernetes.io/name=gantry\"",
 		"    chair_count: 8",
 		"    chair_seed_count: 8",
-		"    storage_mode: \"containerd\"",
 		"    containerd_socket: \"/run/containerd/containerd.sock\"",
 		"    containerd_namespace: \"k8s.io\"",
 		"    containerd_lease_ttl: \"60m\"",
@@ -542,12 +544,8 @@ func (h *harness) applyConfigMapWithAuthRegistry(ctx context.Context) {
 		"        endpoint: \"" + e2eRegistryServer + "\"",
 		"      - name: \"" + authRegistryRefShort + "\"",
 		"        endpoint: \"https://" + authRegistryRefShort + "\"",
-		"        credentials_path: \"/etc/gantry/registry/" + authRegistryCredsKey + "\"",
 		"",
 	}, "\n")
-	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
-		h.t.Fatalf("apply configmap with auth registry: %v", err)
-	}
 }
 
 // installMirrorHostsFor installs a containerd hosts.toml on each kind
@@ -576,7 +574,14 @@ func (h *harness) installMirrorHostsFor(ctx context.Context, registryHost, serve
 func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, image string) {
 	h.t.Helper()
 
-	manifest := strings.Join([]string{
+	manifest := authRegistryPodManifest(name, nodeName, image)
+	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
+		h.t.Fatalf("apply pull pod %s: %v", name, err)
+	}
+}
+
+func authRegistryPodManifest(name, nodeName, image string) string {
+	return strings.Join([]string{
 		"apiVersion: v1",
 		"kind: Pod",
 		"metadata:",
@@ -587,6 +592,8 @@ func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, ima
 		"spec:",
 		"  restartPolicy: Never",
 		"  nodeName: " + nodeName,
+		"  imagePullSecrets:",
+		"    - name: " + authRegistryPullSecret,
 		"  tolerations:",
 		"    - operator: Exists",
 		"  containers:",
@@ -596,9 +603,6 @@ func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, ima
 		"      command: [\"/agnhost\", \"pause\"]",
 		"",
 	}, "\n")
-	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
-		h.t.Fatalf("apply pull pod %s: %v", name, err)
-	}
 }
 
 // waitForDeploymentReady waits for the given Deployment's available

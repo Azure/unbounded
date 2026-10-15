@@ -195,7 +195,7 @@ func TestRacerValidation(t *testing.T) {
 
 func TestRacerDisabledPreservesLegacyValidation(t *testing.T) {
 	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: "https://registry.example", CredentialsPath: "/legacy/credentials"}}
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: "https://registry.example"}}
 	c.RacerMaxConnections = -1
 
 	c.RacerOriginConcurrentRequests = -1
@@ -207,12 +207,9 @@ func TestRacerDisabledPreservesLegacyValidation(t *testing.T) {
 		field  string
 		change func(*Config)
 	}{
-		{"storage_mode", func(c *Config) { c.StorageMode = "invalid" }},
 		{"containerd_socket", func(c *Config) { c.ContainerdSocket = "" }},
 		{"transfer_listen", func(c *Config) { c.TransferListen = "" }},
-		{"hrw_k", func(c *Config) { c.HRWK = 0 }},
 		{"chair_count", func(c *Config) { c.ChairCount = 0 }},
-		{"coord_peer_authz_enforce", func(c *Config) { c.CoordPeerAuthzEnforce = true }},
 	} {
 		t.Run(test.field, func(t *testing.T) {
 			copy := *c

@@ -91,6 +91,50 @@ func TestOriginPuller_NotFound(t *testing.T) {
 	}
 }
 
+func TestOriginPullerBoundedPages(t *testing.T) {
+	o := NewOriginPuller()
+	d := mustDigest([]byte("abcdef"))
+	o.Put(d, []byte("abcdef"))
+
+	for _, offset := range []int64{0, 4} {
+		body, size, _, err := o.PullRange(context.Background(), ifaces.OriginRef{Digest: d, Offset: offset}, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := io.ReadAll(body)
+		_ = body.Close()
+
+		want := "abcd"
+		if offset == 4 {
+			want = "ef"
+		}
+
+		if err != nil || string(got) != want || size != 6 {
+			t.Fatalf("page=%q size=%d err=%v", got, size, err)
+		}
+	}
+
+	if o.HeadCount(d) != 0 || o.PullCount(d) != 2 {
+		t.Fatal("bounded reads performed HEAD or lost accounting")
+	}
+
+	_, _, _, err := o.PullRange(context.Background(), ifaces.OriginRef{Digest: d, Offset: 6}, 4)
+	if err == nil {
+		t.Fatal("accepted offset past EOF")
+	}
+
+	empty := mustDigest(nil)
+	o.Put(empty, nil)
+
+	body, size, _, err := o.PullRange(context.Background(), ifaces.OriginRef{Digest: empty}, 4)
+	if err != nil || size != 0 {
+		t.Fatalf("empty=%d %v", size, err)
+	}
+
+	_ = body.Close()
+}
+
 func mustDigest(b []byte) digest.Digest {
 	sum := sha256.Sum256(b)
 	return digest.MustParse("sha256:" + hex.EncodeToString(sum[:]))

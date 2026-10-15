@@ -109,7 +109,7 @@ func TestMirror_ColdStart_EmptyDHTRoutedThroughColdStartHit(t *testing.T) {
 	peerAddr := startPeerTransfer(t, peerCache)
 
 	cs := &stubColdStart{
-		providers: []ifaces.Provider{{NodeID: "cs-peer", Addr: peerAddr}},
+		providers: []ifaces.Provider{{PeerID: "cs-peer", Addr: peerAddr}},
 	}
 
 	srv, originHits, peerFetches := newMirrorWithColdStart(t,
@@ -156,12 +156,12 @@ func TestMirror_ColdStart_SelfPullRechecksLocalCacheBeforeSelfFilter(t *testing.
 	originPuller := fakes.NewOriginPuller()
 
 	const (
-		selfNode = ifaces.NodeID("self-node")
+		selfNode = ifaces.PeerID("self-peer")
 		selfAddr = "self:5001"
 	)
 
 	cs := &stubColdStart{
-		providers: []ifaces.Provider{{NodeID: selfNode, Addr: selfAddr}},
+		providers: []ifaces.Provider{{PeerID: selfNode, Addr: selfAddr}},
 		onResolve: func(d digest.Digest) {
 			local.Put(d, body)
 		},
@@ -170,10 +170,9 @@ func TestMirror_ColdStart_SelfPullRechecksLocalCacheBeforeSelfFilter(t *testing.
 		UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "http://unused"}},
 	}
 	m := mirror.New(cfg, local, originPuller,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, peerDialer),
 		mirror.WithColdStart(cs),
-		mirror.WithSelfNodeID(selfNode),
+		mirror.WithSelfPeerID(selfNode),
 	)
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
@@ -250,7 +249,7 @@ func TestMirror_ColdStart_WarmPathSkipsResolver(t *testing.T) {
 
 	srv, originHits, _ := newMirrorWithColdStart(t,
 		map[digest.Digest][]byte{d: body},
-		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "p", Addr: peerAddr}}},
+		map[digest.Digest][]ifaces.Provider{d: {{PeerID: "p", Addr: peerAddr}}},
 		cs,
 	)
 
@@ -382,10 +381,10 @@ func TestMirror_PeerProvidersExhausted_ConsultsColdStart(t *testing.T) {
 	deadAddr := startPeerTransfer(t, deadCache)
 
 	staleProviders := map[digest.Digest][]ifaces.Provider{
-		d: {{NodeID: "peer-stale", Addr: deadAddr}},
+		d: {{PeerID: "peer-stale", Addr: deadAddr}},
 	}
 	cs := &stubColdStart{
-		providers: []ifaces.Provider{{NodeID: "peer-fresh", Addr: freshAddr}},
+		providers: []ifaces.Provider{{PeerID: "peer-fresh", Addr: freshAddr}},
 	}
 
 	srv, _, originHits, peerFetches := buildColdStartMirrorExposingDHT(t,
@@ -397,6 +396,10 @@ func TestMirror_PeerProvidersExhausted_ConsultsColdStart(t *testing.T) {
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
+	if got, err := io.ReadAll(resp.Body); err != nil || string(got) != string(body) {
+		t.Fatalf("body=%q err=%v", got, err)
+	}
 
 	if resp.StatusCode != 200 {
 		got, _ := io.ReadAll(resp.Body)
@@ -431,8 +434,8 @@ func TestMirror_StaleOnlyFilteredProviders_ConsultsColdStartWithoutRefetch(t *te
 	peerDialer.Put(freshAddr, d, body)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: "peer-stale", Addr: staleAddr})
-	cs := &stubColdStart{providers: []ifaces.Provider{{NodeID: "peer-fresh", Addr: freshAddr}}}
+	dht.Inject(d, ifaces.Provider{PeerID: "peer-stale", Addr: staleAddr})
+	cs := &stubColdStart{providers: []ifaces.Provider{{PeerID: "peer-fresh", Addr: freshAddr}}}
 	originPuller := fakes.NewOriginPuller()
 	local := &writerSpyCache{}
 	cfg := &config.Config{
@@ -445,7 +448,6 @@ func TestMirror_StaleOnlyFilteredProviders_ConsultsColdStartWithoutRefetch(t *te
 	)
 
 	m := mirror.New(cfg, local, originPuller,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, peerDialer),
 		mirror.WithColdStart(cs),
 		mirror.WithDhtStaleOnlyMetric(func() { atomic.AddInt32(&staleOnlyCount, 1) }),
@@ -606,7 +608,7 @@ func TestMirror_DHTLookupError_ConsultsColdStart(t *testing.T) {
 	peerAddr := startPeerTransfer(t, peerCache)
 
 	cs := &stubColdStart{
-		providers: []ifaces.Provider{{NodeID: "cs-peer", Addr: peerAddr}},
+		providers: []ifaces.Provider{{PeerID: "cs-peer", Addr: peerAddr}},
 	}
 
 	srv, dht, originHits, peerFetches := buildColdStartMirrorExposingDHT(t,
@@ -626,6 +628,10 @@ func TestMirror_DHTLookupError_ConsultsColdStart(t *testing.T) {
 	if resp.StatusCode != 200 {
 		got, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, body = %q; want 200 (cold-start should have surfaced peer despite DHT error)", resp.StatusCode, got)
+	}
+
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
 	}
 
 	if atomic.LoadInt32(originHits) != 0 {

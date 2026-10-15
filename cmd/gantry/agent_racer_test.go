@@ -371,9 +371,9 @@ func TestRacerSocketAvailability(t *testing.T) {
 	}
 }
 
-func TestRacerIgnoresSharedCredentialFile(t *testing.T) {
+func TestRacerIgnoresSharedEndpointCredentials(t *testing.T) {
 	c := racerTestConfig(t)
-	c.UpstreamRegistries[0].CredentialsPath = filepath.Join(t.TempDir(), "missing-credentials")
+	c.UpstreamRegistries[0].Endpoint = "https://shared:secret@registry.example.com"
 	client := &startupRacerClient{}
 	want := errors.New("origin callback started")
 

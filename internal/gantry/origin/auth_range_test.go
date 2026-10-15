@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,7 +22,7 @@ import (
 )
 
 func TestPullRangeAuthRetriesKeepBounds(t *testing.T) {
-	for _, mode := range []string{"basic", "bearer", "stale bearer", "no challenge"} {
+	for _, mode := range []string{"bearer", "stale bearer", "no challenge"} {
 		t.Run(mode, func(t *testing.T) {
 			var requests, tokens atomic.Int64
 
@@ -34,9 +32,8 @@ func TestPullRangeAuthRetriesKeepBounds(t *testing.T) {
 				if r.URL.Path == "/token" {
 					tokens.Add(1)
 
-					user, password, ok := r.BasicAuth()
-					if !ok || user != "shared" || password != "secret" || r.Header.Get("Range") != "" {
-						t.Error("token exchange lost shared credentials or received resource range")
+					if r.Header.Get("Authorization") != "" || r.Header.Get("Range") != "" {
+						t.Error("token exchange used shared credentials or received resource range")
 					}
 
 					_, _ = io.WriteString(w, `{"token":"fresh"}`)
@@ -56,8 +53,6 @@ func TestPullRangeAuthRetriesKeepBounds(t *testing.T) {
 					}
 
 					switch mode {
-					case "basic":
-						w.Header().Set("WWW-Authenticate", `Basic realm="registry"`)
 					case "bearer", "stale bearer":
 						w.Header().Set("WWW-Authenticate", `Bearer realm="`+srv.URL+`/token"`)
 					}
@@ -71,8 +66,8 @@ func TestPullRangeAuthRetriesKeepBounds(t *testing.T) {
 					if r.Header.Get("Authorization") != "Bearer fresh" {
 						t.Error("missing refreshed token")
 					}
-				} else if user, password, ok := r.BasicAuth(); !ok || user != "shared" || password != "secret" {
-					t.Error("legacy Basic retry lost credentials")
+				} else if r.Header.Get("Authorization") != "" {
+					t.Error("unchallenged retry sent credentials")
 				}
 
 				w.Header().Set("Content-Range", "bytes 4-6/10")
@@ -83,7 +78,6 @@ func TestPullRangeAuthRetriesKeepBounds(t *testing.T) {
 
 			c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
 			r := c.registries["reg"]
-			r.username, r.password = "shared", "secret"
 
 			r.hc = srv.Client()
 			if mode == "stale bearer" {
@@ -161,18 +155,13 @@ func TestDelegatedCredentialsOnly(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			path := filepath.Join(t.TempDir(), "credentials")
-			if err := os.WriteFile(path, []byte("shared:secret"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-
 			endpoint, err := url.Parse(srv.URL)
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			endpoint.User = url.UserPassword("endpoint", "secret")
-			cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: endpoint.String(), CredentialsPath: path}}}
+			cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: endpoint.String()}}}
 
 			c, err := New(cfg, WithDelegatedCredentialsOnly())
 			if err != nil {
@@ -180,7 +169,7 @@ func TestDelegatedCredentialsOnly(t *testing.T) {
 			}
 
 			r := c.registries["reg"]
-			if r.username != "" || r.password != "" || r.base.User != nil || cfg.UpstreamRegistries[0].CredentialsPath != path {
+			if r.base.User != nil || cfg.UpstreamRegistries[0].Endpoint != endpoint.String() {
 				t.Fatal("option retained shared identity or mutated caller config")
 			}
 
@@ -225,17 +214,6 @@ func TestDelegatedCredentialsOnly(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestDelegatedCredentialsOnlySkipsCredentialFile(t *testing.T) {
-	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: "https://registry.example", CredentialsPath: filepath.Join(t.TempDir(), "missing")}}}
-	if _, err := New(cfg, WithDelegatedCredentialsOnly()); err != nil {
-		t.Fatalf("delegated client read shared credential file: %v", err)
-	}
-
-	if _, err := New(cfg); err == nil {
-		t.Fatal("legacy client stopped validating credential file")
 	}
 }
 

@@ -151,7 +151,7 @@ func (s *Store) Renew(ctx context.Context, id ID, holder Holder, epoch int64, du
 	return DecodeLease(updated)
 }
 
-func (s *Store) SetNextHolder(ctx context.Context, id ID, holder ifaces.NodeID, generation int64, next Holder) (Chair, error) {
+func (s *Store) SetNextHolder(ctx context.Context, id ID, holder ifaces.PeerID, generation int64, next Holder) (Chair, error) {
 	lease, err := s.leases.Get(ctx, id.Name(), metav1.GetOptions{})
 	if err != nil {
 		return Chair{}, fmt.Errorf("get chair %s for successor: %w", id.Name(), err)
@@ -182,7 +182,7 @@ func (s *Store) SetNextHolder(ctx context.Context, id ID, holder ifaces.NodeID, 
 	return DecodeLease(updated)
 }
 
-func (s *Store) Rotate(ctx context.Context, id ID, holder ifaces.NodeID, generation, epoch int64, duration time.Duration, now time.Time) (Chair, error) {
+func (s *Store) Rotate(ctx context.Context, id ID, holder ifaces.PeerID, generation, epoch int64, duration time.Duration, now time.Time) (Chair, error) {
 	lease, err := s.leases.Get(ctx, id.Name(), metav1.GetOptions{})
 	if err != nil {
 		return Chair{}, fmt.Errorf("get chair %s for rotation: %w", id.Name(), err)
@@ -207,7 +207,7 @@ func (s *Store) Rotate(ctx context.Context, id ID, holder ifaces.NodeID, generat
 	return DecodeLease(updated)
 }
 
-func (s *Store) Vacate(ctx context.Context, id ID, holder ifaces.NodeID) error {
+func (s *Store) Vacate(ctx context.Context, id ID, holder ifaces.PeerID) error {
 	lease, err := s.leases.Get(ctx, id.Name(), metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get chair %s for vacate: %w", id.Name(), err)
@@ -254,7 +254,7 @@ func DecodeLease(lease *coordinationv1.Lease) (Chair, error) {
 
 	chair := Chair{ID: id}
 	if lease.Spec.HolderIdentity != nil {
-		chair.Holder.PeerID = ifaces.NodeID(*lease.Spec.HolderIdentity)
+		chair.Holder.PeerID = ifaces.PeerID(*lease.Spec.HolderIdentity)
 	}
 
 	if lease.Spec.RenewTime != nil {
@@ -276,7 +276,7 @@ func DecodeLease(lease *coordinationv1.Lease) (Chair, error) {
 
 	chair.Holder.P2PAddrs = decodeAddrs(annotations[AnnotationP2PAddrs])
 	chair.Holder.TransferAddr = annotations[AnnotationTransferAddr]
-	chair.NextHolder.PeerID = ifaces.NodeID(annotations[AnnotationNextPeerID])
+	chair.NextHolder.PeerID = ifaces.PeerID(annotations[AnnotationNextPeerID])
 	chair.NextHolder.P2PAddrs = decodeAddrs(annotations[AnnotationNextP2PAddrs])
 	chair.NextHolder.TransferAddr = annotations[AnnotationNextTransfer]
 

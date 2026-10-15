@@ -180,7 +180,7 @@ func TestWalkBlobs_SimpleImage(t *testing.T) {
 	}
 	manifestDesc := store.putJSON(t, ocispec.MediaTypeImageManifest, manifest)
 
-	got, err := walkBlobs(context.Background(), store, manifestDesc)
+	got, err := walkBlobsWithRecorder(context.Background(), store, manifestDesc, nil)
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestWalkBlobs_AbsentChildNotAdvertised(t *testing.T) {
 	}
 	manifestDesc := store.putJSON(t, ocispec.MediaTypeImageManifest, manifest)
 
-	got, err := walkBlobs(context.Background(), store, manifestDesc)
+	got, err := walkBlobsWithRecorder(context.Background(), store, manifestDesc, nil)
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestWalkBlobs_MultiArchIndexPartialPlatform(t *testing.T) {
 	}
 	indexDesc := store.putJSON(t, ocispec.MediaTypeImageIndex, index)
 
-	got, err := walkBlobs(context.Background(), store, indexDesc)
+	got, err := walkBlobsWithRecorder(context.Background(), store, indexDesc, nil)
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestWalkBlobs_UnsupportedAlgorithmSkipped(t *testing.T) {
 		Size:      int64(len(store.blobs[sha512Digest])),
 	}
 
-	got, err := walkBlobs(context.Background(), store, manifestDesc)
+	got, err := walkBlobsWithRecorder(context.Background(), store, manifestDesc, nil)
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestWalkBlobs_PropagatesNonNotFoundError(t *testing.T) {
 	// Force Info on the manifest digest to return our injected error.
 	flaky.failDigest = manifestDesc.Digest
 
-	if _, err := walkBlobs(context.Background(), flaky, manifestDesc); err == nil {
+	if _, err := walkBlobsWithRecorder(context.Background(), flaky, manifestDesc, nil); err == nil {
 		t.Fatal("walkBlobs returned nil err, expected transient outage to propagate")
 	}
 }

@@ -450,12 +450,10 @@ func (h *Host) Withdraw(_ context.Context, _ digest.Digest) error {
 }
 
 // FindProviders implements ifaces.DHT. Returns providers whose multiaddrs
-// expose at least one IP-based transport (TCP or QUIC). Provider.NodeID is
+// expose at least one IP-based transport (TCP or QUIC). Provider.PeerID is
 // the libp2p peer.ID as a string; Provider.Addr is the first IP-based
 // multiaddr's IP, suffixed with the conventional transfer port `:5001`.
-// coord layer will reconcile peer.ID with k8s NodeID using
-// Members; callers (the mirror miss path) only need a dialable
-// transfer URL.
+// No Kubernetes membership alias resolution is performed.
 func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error) {
 	c, err := DigestToCID(d)
 	if err != nil {
@@ -485,7 +483,7 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 		// require another DHT round-trip.
 		h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
 		out = append(out, ifaces.Provider{
-			NodeID: ifaces.NodeID(ai.ID.String()),
+			PeerID: ifaces.PeerID(ai.ID.String()),
 			Addr:   addr,
 		})
 	}
