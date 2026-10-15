@@ -105,3 +105,23 @@ The script fails if any selected test is missing or ignored. This small subset
 checks completion, final-handle cleanup, capacity, and handoff waker ownership.
 It does not cover pipe syscalls or the recycler's `explicit_bzero` path, and it
 is not a concurrency model or a substitute for real-I/O tests.
+
+The `http1` library provides strict fixed-length HTTP/1.1 heads, exclusive
+connections and bounded pools, immutable-body delivery, and opaque-body relay.
+Callers own admission, scheduling, authorization, and exchange finalization.
+Its crate docs describe framing and completion-ownership contracts.
+
+Validate HTTP independently so workspace feature unification cannot enable runtime
+simulation. HTTP's only optional feature is `test-util`; both isolated modes use
+real Unix sockets and io_uring, with no capability skips:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p http1 --no-default-features -j 2 -- --test-threads=1
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p http1 --all-features -j 2 -- --test-threads=1
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 doc --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p http1 --no-deps --all-features
+```
+
+Tests cover parser rejection, sequential upload/fetch exchanges, body bounds,
+read-ahead, cancellation fences, and transfer fallback. Transfer fixtures script
+pipe outcomes while checking actual Unix socket bytes. CI checks all targets and
+runs strict Clippy separately for production and all HTTP features.
