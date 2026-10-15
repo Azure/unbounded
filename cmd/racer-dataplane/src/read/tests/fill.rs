@@ -1672,7 +1672,7 @@ fn final_fill_diagnostic_reports_exhaustion_not_recovered_or_optional_reserves()
             admission.limit(ResourceClass::Plaintext),
         )
         .unwrap();
-    // Legacy helper remains unobserved for optional writeback/test preflights.
+    // This helper is unobserved; it serves optional writeback and test preflights.
     assert!(matches!(
         f.fill.reserve_bootstrap(&f.context.object.cache),
         Err(Error::Overloaded)
@@ -3609,8 +3609,8 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
                 .used(ResourceClass::Ciphertext),
             0
         );
-        // Previously this source reservation failed while the remote owner held
-        // an idle page. No target eviction should be required to free the source.
+        // The source reservation must succeed while the remote owner holds an
+        // idle page. No target eviction should be required to free the source.
         assert!(
             source
                 .fill
@@ -5167,7 +5167,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
         retained.push(page);
     }
     // Fill the remaining quota after reclaiming idle buffers: a single slab
-    // allocation now fits where the old staging-plus-copy reservation did not.
+    // allocation fits without a separate staging copy.
     deps.writer.slabs().reclaim_idle();
     deps.admission.reclaim_buffers();
     let pressure = deps

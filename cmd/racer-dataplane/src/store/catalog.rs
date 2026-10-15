@@ -1552,10 +1552,10 @@ mod tests {
     }
     #[test]
     fn content_type_is_immutable_including_absence() {
-        let legacy = descriptor("v1", 3);
-        let mut typed = legacy.clone();
+        let untyped = descriptor("v1", 3);
+        let mut typed = untyped.clone();
         typed.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
-        for (first, second) in [(legacy.clone(), typed.clone()), (typed.clone(), legacy)] {
+        for (first, second) in [(untyped.clone(), typed.clone()), (typed.clone(), untyped)] {
             let index = index(8);
             index.publish_version(first.clone()).unwrap();
             assert_eq!(index.publish_version(second), Err(Error::CorruptRecord));

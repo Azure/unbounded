@@ -1576,28 +1576,31 @@ mod tests {
     #[test]
     fn retained_metadata_requires_exact_mime_in_both_orders() {
         let version = version();
-        let legacy = VersionMetadata {
+        let untyped = VersionMetadata {
             version: version.clone(),
             length: 3,
             content_type: None,
         };
-        let mut typed = legacy.clone();
+        let mut typed = untyped.clone();
         typed.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
         let mut conflict = typed.clone();
         conflict.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
-        let mut wrong_length = legacy.clone();
+        let mut wrong_length = untyped.clone();
         wrong_length.length += 1;
-        let mut wrong_version = legacy.clone();
+        let mut wrong_version = untyped.clone();
         wrong_version.version.etag = StrongEtag::test_value("other");
         for (values, expected) in [
-            ([legacy.clone(), legacy.clone()], Ok(Some(legacy.clone()))),
+            (
+                [untyped.clone(), untyped.clone()],
+                Ok(Some(untyped.clone())),
+            ),
             ([typed.clone(), typed.clone()], Ok(Some(typed.clone()))),
-            ([legacy.clone(), typed.clone()], Err(Error::CorruptRecord)),
-            ([typed.clone(), legacy.clone()], Err(Error::CorruptRecord)),
+            ([untyped.clone(), typed.clone()], Err(Error::CorruptRecord)),
+            ([typed.clone(), untyped.clone()], Err(Error::CorruptRecord)),
             ([typed.clone(), conflict.clone()], Err(Error::CorruptRecord)),
             ([conflict, typed.clone()], Err(Error::CorruptRecord)),
-            ([legacy.clone(), wrong_length], Err(Error::CorruptRecord)),
-            ([legacy, wrong_version], Err(Error::CorruptRecord)),
+            ([untyped.clone(), wrong_length], Err(Error::CorruptRecord)),
+            ([untyped, wrong_version], Err(Error::CorruptRecord)),
         ] {
             let directory = directory(1);
             let scope = scope();

@@ -173,7 +173,7 @@ impl Retention {
         if self.enabled {
             state.heat.touch(page, now);
         }
-        // Disabled second-sight keeps legacy owned-only admission.
+        // Disabled second-sight admits only owned pages.
         let observation = Observation {
             eligible: owned || (self.enabled && seen),
         };

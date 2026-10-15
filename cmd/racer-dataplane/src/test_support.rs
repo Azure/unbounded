@@ -725,8 +725,8 @@ pub(crate) mod security {
             Arc::new(KeyEpochs::default()),
         );
         let mut initial = rotation_bundle(1, roots);
-        // keys() historically used the unrotated seed bundle; rotation_bundle(1)
-        // intentionally has different suffixes and material just like later epochs.
+        // rotation_bundle(1) intentionally has different suffixes and material,
+        // just like later epochs, rather than reusing the unrotated seed bundle.
         for (i, record) in initial.cache_keys.iter_mut().enumerate() {
             record.key.id = crate::model::key_id_from_generation(1, i as u32 + 1).unwrap();
             *record = CacheEncryptionKey::new(
