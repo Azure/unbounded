@@ -481,24 +481,14 @@ impl Placement {
     /// Does all the work before returning. If the cache is full of entries in
     /// use, it skips the cache instead of failing. An empty membership returns
     /// an empty list.
-    ///
-    /// # Errors
-    ///
-    /// Never fails today. The `Result` is kept for API compatibility.
-    pub fn rank<M: Member>(
-        &self,
-        membership: &Membership<M>,
-        key: &[u8],
-    ) -> Result<Vec<usize>, Error> {
+    pub fn rank<M: Member>(&self, membership: &Membership<M>, key: &[u8]) -> Vec<usize> {
         let slot = slot::<M>(key);
-        let ranking = match self.ranking(membership, slot) {
-            Ok(ranking) => ranking,
-            Err(Error::Overloaded) => Rc::new(RefCell::new(Ranking::default())),
-            Err(error) => return Err(error),
-        };
+        let ranking = self
+            .ranking(membership, slot)
+            .unwrap_or_else(|_| Rc::new(RefCell::new(Ranking::default())));
         let mut ranking = ranking.borrow_mut();
         ranking.advance(membership, slot, usize::MAX);
-        Ok(ranking.candidates())
+        ranking.candidates()
     }
 
     /// Like [`Self::rank`], but yields so it does not block the executor.
@@ -549,12 +539,7 @@ impl Placement {
     /// Partial rescore work is held between steps so requests cannot evict it,
     /// and a restarted scan keeps it. Passing a different membership starts
     /// over and drops that work.
-    ///
-    /// # Errors
-    ///
-    /// Never fails today. An entry in use returns [`Maintenance::Blocked`]
-    /// instead. The `Result` is kept for API compatibility.
-    pub fn maintain<M: Member>(&self, membership: &Membership<M>) -> Result<Maintenance, Error> {
+    pub fn maintain<M: Member>(&self, membership: &Membership<M>) -> Maintenance {
         use std::ops::Bound::{Excluded, Unbounded};
         let mut work = self.maintenance.borrow_mut();
         let identity = membership.identity();
@@ -575,7 +560,7 @@ impl Placement {
             }
         }
         if work.finished {
-            return Ok(Maintenance::Idle);
+            return Maintenance::Idle;
         }
         if let Some((slot, ranking)) = &work.active {
             let done = {
@@ -586,11 +571,11 @@ impl Placement {
             if done {
                 work.active = None;
             }
-            return Ok(Maintenance::Progress);
+            return Maintenance::Progress;
         }
         let Some(delta) = &membership.delta else {
             work.finished = true;
-            return Ok(Maintenance::Idle);
+            return Maintenance::Idle;
         };
         let next = {
             let cache = self.cache.borrow();
@@ -602,12 +587,14 @@ impl Placement {
         };
         let Some((key, pinned)) = next.filter(|(key, _)| key.0 == delta.base) else {
             work.finished = true;
-            return Ok(Maintenance::Idle);
+            return Maintenance::Idle;
         };
         if pinned {
-            return Ok(Maintenance::Blocked);
+            return Maintenance::Blocked;
         }
-        let ranking = self.ranking(membership, key.1)?;
+        let Ok(ranking) = self.ranking(membership, key.1) else {
+            return Maintenance::Blocked;
+        };
         // If a foreground request already installed the new generation in spare
         // capacity, remove its now-unpinned predecessor as part of this migration.
         self.cache.borrow_mut().remove(&key);
@@ -615,7 +602,7 @@ impl Placement {
         if ranking.borrow().cursor != membership.members().len() {
             work.active = Some((key.1, ranking));
         }
-        Ok(Maintenance::Progress)
+        Maintenance::Progress
     }
 }
 
@@ -643,7 +630,7 @@ mod tests {
         }
         assert!(!placement.is_owner(&membership(1001), key, |_| true));
         let disabled = Placement::new(0);
-        disabled.rank(&members, key).unwrap();
+        disabled.rank(&members, key);
         assert!(!disabled.is_owner(&members, key, |_| true));
     }
 
@@ -698,7 +685,7 @@ mod tests {
             assert!(placement.refresh(&members, &key(0)).is_none());
         }
         let actual = placement.refresh(&members, &key(0)).unwrap();
-        assert_eq!(actual, Placement::new(0).rank(&members, &key(0)).unwrap());
+        assert_eq!(actual, Placement::new(0).rank(&members, &key(0)));
         let cache_key = (members.identity(), slot::<TestMember>(&key(0)));
         placement.cache.borrow().entries[&cache_key]
             .borrow_mut()
@@ -733,7 +720,7 @@ mod tests {
         }
         assert_eq!(
             placement.refresh(&next, &key(0)),
-            Some(Placement::new(0).rank(&next, &key(0)).unwrap())
+            Some(Placement::new(0).rank(&next, &key(0)))
         );
         assert!(placement.cached(&old, &key(0)).is_none());
         assert_eq!(placement.refresh(&membership(0), &key(1)), Some(vec![]));
@@ -806,7 +793,7 @@ mod tests {
         assert!(placement.cached(&next, &key(0)).is_none());
         let updated = placement.refresh(&next, &key(0)).unwrap();
         assert_ne!(initial, updated);
-        assert_eq!(updated, Placement::new(0).rank(&next, &key(0)).unwrap());
+        assert_eq!(updated, Placement::new(0).rank(&next, &key(0)));
         assert_eq!(placement.cached(&old, &key(0)), Some(initial));
         assert_eq!(placement.cached(&next, &key(0)), Some(updated));
     }
@@ -829,10 +816,7 @@ mod tests {
             (u64::MAX, 922_998, [0, 3, 2]),
         ] {
             assert_eq!(slot::<TestMember>(&key(page)), expected_slot);
-            assert_eq!(
-                placement.rank(&members, &key(page)).unwrap(),
-                expected_order
-            );
+            assert_eq!(placement.rank(&members, &key(page)), expected_order);
         }
         for (sample, cost) in [
             (0xe410_9581_2e88_5f6f, 715_971_622),
@@ -900,7 +884,7 @@ mod tests {
             assert!(actual.abs_diff(expected) < 400, "{counts:?}");
         }
         let huge = Membership::new(vec![member(0, u32::MAX), member(1, 1)]).unwrap();
-        assert_eq!(Placement::new(1).rank(&huge, &key(0)).unwrap()[0], 0);
+        assert_eq!(Placement::new(1).rank(&huge, &key(0))[0], 0);
     }
 
     /// Async requests share work, the cache stays bounded, and dropping a
@@ -948,11 +932,11 @@ mod tests {
         );
         drop(first);
         let result = futures::executor::block_on(second).unwrap();
-        assert_eq!(result, placement.rank(&members, &key(0)).unwrap());
-        placement.rank(&members, &key(1)).unwrap();
+        assert_eq!(result, placement.rank(&members, &key(0)));
+        placement.rank(&members, &key(1));
         assert_eq!(placement.cache.borrow().entries.len(), 1);
         let uncached = Placement::new(0);
-        uncached.rank(&members, &key(0)).unwrap();
+        uncached.rank(&members, &key(0));
         assert!(uncached.cache.borrow().entries.is_empty());
     }
 
@@ -987,18 +971,15 @@ mod tests {
             slot::<Other>(b"opaque\0key")
         );
         let placement = Placement::new(4);
-        placement.rank(&a, b"opaque\0key").unwrap();
+        placement.rank(&a, b"opaque\0key");
         assert_eq!(
-            placement.rank(&b, b"opaque\0key").unwrap(),
-            Placement::new(0).rank(&b, b"opaque\0key").unwrap()
+            placement.rank(&b, b"opaque\0key"),
+            Placement::new(0).rank(&b, b"opaque\0key")
         );
         assert_eq!(placement.cache.borrow().entries.len(), 2);
         for count in 0..=4 {
             assert_eq!(
-                Placement::new(0)
-                    .rank(&membership(count), b"")
-                    .unwrap()
-                    .len(),
+                Placement::new(0).rank(&membership(count), b"").len(),
                 count.min(3)
             );
         }
@@ -1013,7 +994,7 @@ mod tests {
         let mut old = membership(80);
         for generation in 2..42 {
             for page in 0..40 {
-                placement.rank(&old, &key(page)).unwrap();
+                placement.rank(&old, &key(page));
             }
             let mut members = old.members().to_vec();
             members.remove(generation % members.len());
@@ -1022,12 +1003,12 @@ mod tests {
                 NonZeroU32::new(u32::try_from(generation % 7 + 1).unwrap()).unwrap();
             let next = Membership::new(members).unwrap().with_predecessor(&old);
             for _ in 0..100 {
-                placement.maintain(&next).unwrap();
+                placement.maintain(&next);
             }
             for page in 0..40 {
                 assert_eq!(
-                    placement.rank(&next, &key(page)).unwrap(),
-                    oracle.rank(&next, &key(page)).unwrap(),
+                    placement.rank(&next, &key(page)),
+                    oracle.rank(&next, &key(page)),
                     "generation {generation} page {page}"
                 );
             }
@@ -1038,7 +1019,7 @@ mod tests {
     /// Run maintenance until idle. Fail if it blocks or takes too many steps.
     fn warm_to_idle(placement: &Placement, members: &Membership<TestMember>, limit: usize) {
         for _ in 0..limit {
-            match placement.maintain(members).unwrap() {
+            match placement.maintain(members) {
                 Maintenance::Idle => return,
                 Maintenance::Progress => {}
                 Maintenance::Blocked => panic!("unexpected pinned predecessor"),
@@ -1055,7 +1036,7 @@ mod tests {
             let placement = Placement::new(32);
             let old = membership(600);
             for page in 0..32 {
-                placement.rank(&old, &key(page)).unwrap();
+                placement.rank(&old, &key(page));
             }
             let slots: Vec<_> = placement
                 .cache
@@ -1068,7 +1049,7 @@ mod tests {
             let mut values = old.members().to_vec();
             if cold {
                 // A removed winner exposes an unretained candidate.
-                let winner = placement.rank(&old, &key(0)).unwrap()[0];
+                let winner = placement.rank(&old, &key(0))[0];
                 values.remove(winner);
             } else {
                 values.push(member(9999, 4));
@@ -1106,34 +1087,31 @@ mod tests {
         let placement = Placement::new(8);
         let old = membership(20);
         let next = membership(21).with_predecessor(&old);
-        placement.rank(&old, &key(0)).unwrap();
+        placement.rank(&old, &key(0));
         warm_to_idle(&placement, &next, 10);
         let completed_cursor = placement.maintenance.borrow().cursor;
         assert!(completed_cursor.is_some());
         for value in 0..3 {
-            placement.rank(&next, &key(value)).unwrap();
+            placement.rank(&next, &key(value));
             assert!(!placement.cache.borrow().predecessor_dirty);
-            assert_eq!(placement.maintain(&next), Ok(Maintenance::Idle));
+            assert_eq!(placement.maintain(&next), Maintenance::Idle);
             assert_eq!(placement.maintenance.borrow().cursor, completed_cursor);
         }
         let late_slot = slot::<TestMember>(&key(3));
-        placement.rank(&old, &key(3)).unwrap();
+        placement.rank(&old, &key(3));
         assert!(placement.cache.borrow().predecessor_dirty);
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
+        assert_eq!(placement.maintain(&next), Maintenance::Progress);
         warm_to_idle(&placement, &next, 10);
         let cache = placement.cache.borrow();
         assert!(!cache.entries.contains_key(&(old.identity(), late_slot)));
         let warmed = cache.entries[&(next.identity(), late_slot)].borrow();
         assert!(warmed.incremental);
-        assert_eq!(
-            warmed.candidates(),
-            Placement::new(0).rank(&next, &key(3)).unwrap()
-        );
+        assert_eq!(warmed.candidates(), Placement::new(0).rank(&next, &key(3)));
         drop(warmed);
         drop(cache);
         let completed_cursor = placement.maintenance.borrow().cursor;
         for _ in 0..3 {
-            assert_eq!(placement.maintain(&next), Ok(Maintenance::Idle));
+            assert_eq!(placement.maintain(&next), Maintenance::Idle);
             assert_eq!(placement.maintenance.borrow().cursor, completed_cursor);
         }
     }
@@ -1150,12 +1128,12 @@ mod tests {
         let late_slot = slot::<TestMember>(&late_key);
         let active_slot = slot::<TestMember>(&active_key);
         assert!(late_slot < active_slot);
-        let winner = placement.rank(&old, &active_key).unwrap()[0];
+        let winner = placement.rank(&old, &active_key)[0];
         let mut values = old.members().to_vec();
         values.remove(winner);
         let next = Membership::new(values).unwrap().with_predecessor(&old);
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
+        assert_eq!(placement.maintain(&next), Maintenance::Progress);
+        assert_eq!(placement.maintain(&next), Maintenance::Progress);
         assert_eq!(
             placement.maintenance.borrow().cursor,
             Some((old.identity(), active_slot))
@@ -1166,7 +1144,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(grace.as_mut().poll(&mut cx).is_pending());
         assert!(placement.cache.borrow().predecessor_dirty);
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
+        assert_eq!(placement.maintain(&next), Maintenance::Progress);
         assert!(placement.maintenance.borrow().cursor.is_none());
         assert_eq!(active.borrow().cursor, 2 * WORK_QUANTUM);
         assert!(Rc::ptr_eq(
@@ -1174,13 +1152,13 @@ mod tests {
             &placement.maintenance.borrow().active.as_ref().unwrap().1
         ));
         for _ in 0..2 {
-            assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
+            assert_eq!(placement.maintain(&next), Maintenance::Progress);
         }
         assert_eq!(active.borrow().scored, next.members().len());
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Blocked));
+        assert_eq!(placement.maintain(&next), Maintenance::Blocked);
         assert_eq!(
             futures::executor::block_on(grace),
-            Placement::new(0).rank(&old, &late_key)
+            Ok(Placement::new(0).rank(&old, &late_key))
         );
         warm_to_idle(&placement, &next, 10);
         let cache = placement.cache.borrow();
@@ -1189,7 +1167,7 @@ mod tests {
             cache.entries[&(next.identity(), late_slot)]
                 .borrow()
                 .candidates(),
-            Placement::new(0).rank(&next, &late_key).unwrap()
+            Placement::new(0).rank(&next, &late_key)
         );
     }
 
@@ -1204,16 +1182,16 @@ mod tests {
         let mut values = old.members().to_vec();
         values.push(member(9999, 4));
         let next = Membership::new(values).unwrap().with_predecessor(&old);
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Blocked));
+        assert_eq!(placement.maintain(&next), Maintenance::Blocked);
         assert!(placement.maintenance.borrow().cursor.is_none());
         assert_eq!(
             placement.rank(&next, &key(0)),
             Placement::new(0).rank(&next, &key(0))
         );
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Blocked));
+        assert_eq!(placement.maintain(&next), Maintenance::Blocked);
         assert_eq!(
             futures::executor::block_on(pending),
-            Placement::new(0).rank(&old, &key(0))
+            Ok(Placement::new(0).rank(&old, &key(0)))
         );
         warm_to_idle(&placement, &next, 10);
         assert!(
@@ -1230,12 +1208,12 @@ mod tests {
     fn cold_maintenance_progress_is_pinned_and_coalesces_with_requests() {
         let placement = Placement::new(1);
         let old = membership(1000);
-        let winner = placement.rank(&old, &key(0)).unwrap()[0];
+        let winner = placement.rank(&old, &key(0))[0];
         let mut values = old.members().to_vec();
         values.remove(winner);
         let next = Membership::new(values).unwrap().with_predecessor(&old);
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
-        assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
+        assert_eq!(placement.maintain(&next), Maintenance::Progress);
+        assert_eq!(placement.maintain(&next), Maintenance::Progress);
         let cache_key = (next.identity(), slot::<TestMember>(&key(0)));
         assert_eq!(
             placement.cache.borrow().entries[&cache_key].borrow().cursor,
@@ -1339,7 +1317,7 @@ mod tests {
         )
         .unwrap();
         let expected: Vec<_> = (0..20)
-            .map(|page| Placement::new(0).rank(&members, &key(page)).unwrap())
+            .map(|page| Placement::new(0).rank(&members, &key(page)))
             .collect();
         for value in members.members() {
             value.id.set(b"changed");
@@ -1347,9 +1325,7 @@ mod tests {
         }
         for (page, expected) in expected.into_iter().enumerate() {
             assert_eq!(
-                Placement::new(0)
-                    .rank(&members, &key(u64::try_from(page).unwrap()))
-                    .unwrap(),
+                Placement::new(0).rank(&members, &key(u64::try_from(page).unwrap())),
                 expected
             );
         }
@@ -1449,7 +1425,7 @@ mod tests {
         assert!(map_node + rc + dynamic_scores + clock <= Placement::ENTRY_BYTES);
         let placement = Placement::new(1);
         let empty_bytes = placement.retained_bytes();
-        placement.rank(&membership(4), b"key").unwrap();
+        placement.rank(&membership(4), b"key");
         assert!(placement.retained_bytes() >= empty_bytes + Placement::ENTRY_BYTES);
     }
 }

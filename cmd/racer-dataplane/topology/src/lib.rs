@@ -120,7 +120,7 @@
 //!
 //! - Changing a domain changes the hashes; placement and routes may move.
 //! - Hash formats are versioned (`/slot/v1`, `/hrw/v1`,
-//!   `/placement-identity/v1`, `/next-hop/v5`, and ring `v1`). Changing one
+//!   `/placement-identity/v1`, `/next-hop/v1`, and ring `v1`). Changing one
 //!   needs a planned cluster-wide rollout. Nothing here detects a mismatch.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -930,7 +930,7 @@ mod tests {
             hash::finish(hash::domain::<Adversarial>(b"/placement-identity/v1\0"))
         );
         let placement = crate::Placement::new(2);
-        assert_eq!(placement.rank(&members, b"key").unwrap(), vec![0]);
+        assert_eq!(placement.rank(&members, b"key"), vec![0]);
         assert_eq!(
             Membership::<Adversarial>::new(vec![]).unwrap_err(),
             Error::InvalidDomain
@@ -1120,9 +1120,9 @@ mod tests {
         );
     }
 
-    /// Placement hash is unchanged from v1; graph hash ignores weights.
+    /// Placement identity matches a fixed vector; graph hash ignores weights.
     #[test]
-    fn placement_identity_preserves_v1_and_topology_ignores_weights() {
+    fn placement_identity_matches_vector_and_topology_ignores_weights() {
         let old = Membership::new(vec![member(b"b", 9), member(b"a", 1)]).unwrap();
         let expected: [u8; 32] = sha2::Sha256::digest(
             b"binary-store/placement-identity/v1\0\0\0\0\x01a\0\0\0\x01\0\0\0\x01b\0\0\0\x09",

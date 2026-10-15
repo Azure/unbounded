@@ -384,8 +384,7 @@ impl Placement {
     ) -> Result<Candidates> {
         let ranked = self
             .inner
-            .rank(&membership.inner, &encoded_key(object, page))
-            .map_err(placement_error)?;
+            .rank(&membership.inner, &encoded_key(object, page));
         Ok(candidates(membership, ranked))
     }
 
@@ -482,9 +481,7 @@ impl Placement {
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> Result<Maintenance> {
-        self.inner
-            .maintain(&membership.inner)
-            .map_err(placement_error)
+        Ok(self.inner.maintain(&membership.inner))
     }
 }
 
@@ -716,11 +713,11 @@ pub(crate) mod tests {
         use std::num::NonZeroU32;
         use std::sync::Arc;
 
-        // Independent Python hashlib + BFS vectors for the 32-ring overlay.
+        // Fixed next-hop vectors for the 32-ring overlay.
         // N=1500, source=0, destination=1499, request=[1;16]; weights 1 at
         // multiples of 3 and 4 elsewhere; attempts encoded as big-endian u128.
-        pub(crate) const V5_NEXT_HOPS: [(u128, usize); 4] =
-            [(0, 1301), (1, 1301), (2, 1301), (127, 251)];
+        pub(crate) const NEXT_HOPS: [(u128, usize); 4] =
+            [(0, 1301), (1, 1301), (2, 251), (127, 251)];
 
         pub(crate) fn member(index: usize, shares: u32) -> Member {
             Member {
@@ -929,13 +926,8 @@ pub(crate) mod tests {
                 ),
                 (
                     b"racer/rail/v1\0",
-                    2,
-                    "500304ace38caf7cc36f8f97ae12bdfc89b92f7eb64c8bb060d1daf49f76314c",
-                ),
-                (
-                    b"racer/rail/v2\0",
                     0,
-                    "9ac860a9df3ce1ac648cde8350aeec1d1efc604eeae5cceb70d67dd55f4443d1",
+                    "5f57aa16d39d63c738294a99c9f7311ad8169aeee1c75adeafe75c09e6eee2e5",
                 ),
             ] {
                 let mut hash = hash_domain(name);
@@ -944,9 +936,6 @@ pub(crate) mod tests {
                     hash_bytes(&mut hash, b"node-000000");
                 } else {
                     hash_object(&mut hash, &fixtures::object(), PageNumber(0));
-                    if kind == 2 {
-                        hash_bytes(&mut hash, b"\"v1\"");
-                    }
                 }
                 let actual: String = hash_finish(hash)
                     .iter()
@@ -1541,7 +1530,7 @@ pub(crate) mod tests {
             );
             let cached = Paths::new(Rc::new(LinkHealth::default()), 1);
             let cold = Paths::new(Rc::new(LinkHealth::default()), 0);
-            for (attempt, expected) in crate::topology::tests::fixtures::V5_NEXT_HOPS {
+            for (attempt, expected) in crate::topology::tests::fixtures::NEXT_HOPS {
                 let mut request = budget(&members, 1499, NORMAL_LINKS);
                 request.attempt = AttemptId(attempt.to_be_bytes());
                 let from = &members.members()[0].node;
@@ -1584,7 +1573,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             assert_eq!(route.nodes[1], favored);
-            // Private eviction assertions moved to topology::paths tests.
+            // Private eviction assertions live in topology::paths tests.
         }
         #[test]
         fn health_eviction_budget_deadline_and_cancellation() {

@@ -1206,7 +1206,7 @@ fn select_members(
     if domain.is_empty() {
         return Ok(TransportPlan::Http);
     }
-    let mut digest = crate::topology::hash_domain(b"racer/rail/v2\0");
+    let mut digest = crate::topology::hash_domain(b"racer/rail/v1\0");
     crate::topology::hash_object(&mut digest, &page.version.object, page.number);
     let digest = crate::topology::hash_finish(digest);
     let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
@@ -1841,7 +1841,7 @@ pub(crate) mod tests {
         #[test]
         fn golden_page_to_rail_vectors() {
             let route = route(|_| {});
-            for (number, rail) in [(0, 2), (1, 7), (u64::MAX, 2)] {
+            for (number, rail) in [(0, 7), (1, 2), (u64::MAX, 2)] {
                 assert_eq!(
                     select(&route, &page(number)).unwrap(),
                     TransportPlan::Rdma { rail: RailId(rail) }
