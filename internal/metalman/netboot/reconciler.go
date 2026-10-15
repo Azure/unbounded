@@ -41,12 +41,13 @@ func init() {
 // to detect updated images pushed under the same tag.
 const imageResyncInterval = 5 * time.Minute
 
-// OCIReconciler watches Machine CRs and pulls their referenced OCI images.
+// OCIReconciler watches Machines and retained operation media for OCI images.
 // Work items are deduplicated by image reference, architecture, and pull secret
 // so machines sharing the same pull identity only trigger one download.
 type OCIReconciler struct {
 	Client                      client.Client
 	Cache                       *OCICache
+	Site                        string
 	DefaultNetbootRef           string
 	DefaultNetbootPullSecretRef *v1alpha3.NamespacedSecretReference
 }
@@ -61,6 +62,7 @@ func (r *OCIReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("oci-image").
 		Watches(&v1alpha3.Machine{}, handler.EnqueueRequestsFromMapFunc(r.mapMachineToImage)).
+		Watches(&v1alpha3.MachineOperation{}, handler.EnqueueRequestsFromMapFunc(r.mapOperationToImage)).
 		Complete(r)
 }
 
@@ -99,6 +101,39 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		})
 	}
 
+	return imageReconcileRequests(refs)
+}
+
+func (r *OCIReconciler) mapOperationToImage(_ context.Context, obj client.Object) []reconcile.Request {
+	op, ok := obj.(*v1alpha3.MachineOperation)
+	if !ok || op.Spec.OperationKind != v1alpha3.OperationHostReplace {
+		return nil
+	}
+
+	var refs []imagePullRequest
+
+	for _, target := range op.Status.Targets {
+		media := target.BootMedia
+		if !mediaInSite(media, r.Site) || media.Netboot == nil {
+			continue
+		}
+
+		spec := media.Netboot
+
+		artifactsNeeded := !mediaArtifactsReleased(op, target)
+		if artifactsNeeded {
+			refs = append(refs, imagePullRequest{ImageRef: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef})
+		}
+
+		if artifactsNeeded || mediaFirstBootPending(target) {
+			refs = append(refs, imagePullRequest{ImageRef: spec.NetbootImage, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.NetbootPullSecretRef})
+		}
+	}
+
+	return imageReconcileRequests(refs)
+}
+
+func imageReconcileRequests(refs []imagePullRequest) []reconcile.Request {
 	reqs := make([]reconcile.Request, 0, len(refs))
 
 	seen := make(map[string]struct{}, len(refs))
@@ -407,18 +442,13 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 	}
 	defer os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup
 
-	store, err := oci.New(layoutDir)
-	if err != nil {
-		return fmt.Errorf("create OCI layout store: %w", err)
-	}
-
 	// Copy (pull) the image from the remote repository into the local OCI layout.
-	if _, err := oras.Copy(ctx, repo, tagOrDigest, store, tagOrDigest, oras.DefaultCopyOptions); err != nil {
+	if err := copyToLayout(ctx, repo, tagOrDigest, layoutDir); err != nil {
 		return fmt.Errorf("pull image %q: %w", imageRef, err)
 	}
 
 	// Unpack the OCI layout into the image directory using umoci.
-	if err := unpackOCILayout(ctx, layoutDir, tagOrDigest, imageDir, architecture); err != nil {
+	if err := unpackOCILayout(ctx, layoutDir, layoutTag, imageDir, architecture); err != nil {
 		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
 		return fmt.Errorf("unpack OCI image: %w", err)
 	}
@@ -428,6 +458,26 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 	if _, err := os.Stat(diskDir); err != nil {
 		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
 		return fmt.Errorf("OCI image missing /disk directory")
+	}
+
+	return nil
+}
+
+// layoutTag is the tag given to an image copied into a temporary OCI layout.
+// The layout index only stores names for tags, not digests. A fixed tag lets
+// umoci find the image when the source reference is a digest.
+const layoutTag = "metalman"
+
+// copyToLayout copies the image named by ref from src into a new OCI layout
+// at layoutDir and tags it with layoutTag.
+func copyToLayout(ctx context.Context, src oras.ReadOnlyTarget, ref, layoutDir string) error {
+	store, err := oci.New(layoutDir)
+	if err != nil {
+		return fmt.Errorf("create OCI layout store: %w", err)
+	}
+
+	if _, err := oras.Copy(ctx, src, ref, store, layoutTag, oras.DefaultCopyOptions); err != nil {
+		return err
 	}
 
 	return nil

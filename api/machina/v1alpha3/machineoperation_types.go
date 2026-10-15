@@ -284,6 +284,10 @@ type MachineOperationStatus struct {
 
 // MachineOperationTargetStatus records execution state for one target Machine.
 type MachineOperationTargetStatus struct {
+	// BootMedia records immutable media ownership and cleanup progress.
+	// +optional
+	BootMedia *MachineOperationBootMediaStatus `json:"bootMedia,omitempty"`
+
 	// MachineRef is the name of the targeted Machine.
 	// +kubebuilder:validation:Required
 	MachineRef string `json:"machineRef"`
@@ -337,6 +341,43 @@ type MachineOperationTargetStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MachineOperationBootMediaStatus persists media ownership before BMC changes.
+type MachineOperationBootMediaStatus struct {
+	ID              string    `json:"id"`
+	SourceServer    string    `json:"sourceServer,omitempty"`
+	SourceName      string    `json:"sourceName,omitempty"`
+	Phase           string    `json:"phase"`
+	MachineUID      types.UID `json:"machineUID"`
+	Netboot         *PXESpec  `json:"netboot"`
+	CertFingerprint string    `json:"certFingerprint,omitempty"`
+	ImageWritten    bool      `json:"imageWritten,omitempty"`
+	Cleaned         bool      `json:"cleaned,omitempty"`
+	// StagedDeleted confirms rack media deletion after safe boot is restored.
+	StagedDeleted bool `json:"stagedDeleted,omitempty"`
+	// CleanedAt starts the bounded wait for installer reboot handoff.
+	CleanedAt *metav1.Time `json:"cleanedAt,omitempty"`
+	// RebootRequestedAt is set by the successful installer ready callback.
+	RebootRequestedAt *metav1.Time `json:"rebootRequestedAt,omitempty"`
+	// Released confirms local media removal after Cleaned revokes serving.
+	Released bool `json:"released,omitempty"`
+	// Site preserves controller ownership after the Machine is deleted.
+	Site string `json:"site,omitempty"`
+	// NodeName preserves the expected Node across Machine edits.
+	NodeName string `json:"nodeName,omitempty"`
+	// PhaseStartedAt bounds active progress without spending retry attempts.
+	PhaseStartedAt *metav1.Time `json:"phaseStartedAt,omitempty"`
+	// ReadinessStartedAt gives AC recovery one fixed grace window per phase.
+	ReadinessStartedAt *metav1.Time `json:"readinessStartedAt,omitempty"`
+	// LoaderStartedAt is set when the bootloader on the media first fetches
+	// its install config. It proves the host booted the media.
+	LoaderStartedAt *metav1.Time `json:"loaderStartedAt,omitempty"`
+	// BootAttempts counts power-on attempts used to boot the media.
+	BootAttempts int32 `json:"bootAttempts,omitempty"`
+	// Abandoned ends ownership after the installer never finished its
+	// handoff within the allowed time.
+	Abandoned bool `json:"abandoned,omitempty"`
 }
 
 // IsTerminal returns true if the operation phase is Complete or Failed.

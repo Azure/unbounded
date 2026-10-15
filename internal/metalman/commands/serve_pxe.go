@@ -50,6 +50,7 @@ func ServePXECmd() *cobra.Command {
 		dhcpAutoInterface              bool
 		dhcpPort                       int
 		serveURL                       string
+		mediaTFTPServer                string
 		leaseDuration                  time.Duration
 		renewDeadline                  time.Duration
 		retryPeriod                    time.Duration
@@ -206,6 +207,7 @@ func ServePXECmd() *cobra.Command {
 			if err := (&netboot.OCIReconciler{
 				Client:                      mgr.GetClient(),
 				Cache:                       ociCache,
+				Site:                        site,
 				DefaultNetbootRef:           defaultNetbootImage,
 				DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
 			}).SetupWithManager(mgr); err != nil {
@@ -215,7 +217,7 @@ func ServePXECmd() *cobra.Command {
 			redfishPool := redfish.NewPool()
 			defer redfishPool.Close()
 
-			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient(), Site: site}
 
 			resolver := netboot.FileResolver{
 				Cache:             ociCache,
@@ -228,6 +230,21 @@ func ServePXECmd() *cobra.Command {
 				ProviderLabels:    providerLabels,
 			}
 
+			directClient, err := client.New(cfg, client.Options{Scheme: mgr.GetScheme()})
+			if err != nil {
+				return fmt.Errorf("creating media API client: %w", err)
+			}
+
+			mediaTFTPServer, err = resolveMediaTFTPServer(mediaTFTPServer, serverIP)
+			if err != nil {
+				return err
+			}
+
+			media := &netboot.MediaProvider{
+				Site:     site,
+				Resolver: &resolver, Client: directClient, CacheDir: cacheDir, TFTPServer: mediaTFTPServer,
+			}
+
 			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool, FileResolver: &resolver}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
@@ -238,6 +255,7 @@ func ServePXECmd() *cobra.Command {
 				Site:                  site,
 				PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
 				HTTPBootURL:           resolver.HTTPBootURL,
+				BootMedia:             media,
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
@@ -287,6 +305,7 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			tftpServer := &netboot.TFTPServer{
+				Media:          media,
 				BindAddr:       bindAddress,
 				FileResolver:   resolver,
 				StatusRecorder: statusQueue,
@@ -296,16 +315,17 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			attestHandler := &attestation.Handler{
-				Clientset:      clientset,
-				ClusterCA:      clusterCA,
-				LookupNodeByIP: resolver.LookupNodeByIP,
-				StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+				Clientset:     clientset,
+				ClusterCA:     clusterCA,
+				LookupMachine: media.LookupAttestationMachine,
+				StatusUpdater: &StatusUpdater{Client: mgr.GetClient()},
 			}
 
 			httpMux := http.NewServeMux()
 			httpMux.HandleFunc("POST /attest", attestHandler.Attest)
 
 			httpServer := &netboot.HTTPServer{
+				Media:          media,
 				BindAddr:       bindAddress,
 				Port:           httpPort,
 				Client:         mgr.GetClient(),
@@ -355,6 +375,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().BoolVar(&dhcpAutoInterface, "dhcp-auto-interface", false, "Auto-detect the DHCP interface from the server IP")
 	cmd.Flags().IntVar(&dhcpPort, "dhcp-port", 67, "UDP port for the DHCP server")
 	cmd.Flags().StringVar(&serveURL, "serve-url", "", "External URL of this serve instance")
+	cmd.Flags().StringVar(&mediaTFTPServer, "media-tftp-server", "", "Advertised IPv4 address for virtual-media TFTP pulls (defaults to server IP)")
 	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
 	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")
 	cmd.Flags().DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second, "Duration between leader election retries")
@@ -365,6 +386,23 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
 
 	return cmd
+}
+
+func resolveMediaTFTPServer(raw string, serverIP net.IP) (string, error) {
+	if raw != "" {
+		ip := net.ParseIP(raw)
+		if ip == nil || ip.To4() == nil || ip.IsUnspecified() {
+			return "", fmt.Errorf("--media-tftp-server must be an advertised IPv4 address")
+		}
+
+		return ip.To4().String(), nil
+	}
+
+	if ip := serverIP.To4(); ip != nil && !ip.IsUnspecified() {
+		return ip.String(), nil
+	}
+
+	return "", nil
 }
 
 func parseNamespacedSecretReference(ref string) (*v1alpha3.NamespacedSecretReference, error) {
