@@ -419,7 +419,7 @@ mod definitions {
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct ClusterId(pub String);
 
-    /// Kubernetes ClusterVolume UID, not its reusable resource name.
+    /// Kubernetes ClusterCache UID, not its reusable resource name.
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct CacheId(pub String);
 

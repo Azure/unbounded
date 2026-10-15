@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer embeds tracked Racer templates and CRDs. Operator manifests are
+// Package racer embeds tracked Racer templates. Operator manifests are
 // rendered in memory, independently of ignored standalone output in rendered/.
 package racer
 
@@ -17,10 +17,10 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
-//go:embed *.yaml.tmpl crd/*.yaml
+//go:embed *.yaml.tmpl
 var sources embed.FS
 
-// Manifests exposes flat *.yaml names and crd/*.yaml, matching the standalone
+// Manifests exposes flat *.yaml names, matching the standalone
 // renderer. Images default to the binary version; the operator replaces them
 // with its configured registry and tag before applying resources.
 var Manifests fs.FS = manifestFS{}
