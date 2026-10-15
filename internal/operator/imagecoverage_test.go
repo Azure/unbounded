@@ -64,10 +64,7 @@ var componentImages = map[string][]string{
 	"gantry":          {"gantry"},
 	"metalman":        {"metalman"},
 	"token-refresher": {"token-refresher"},
-	// racer-dataplane is applied by the racer controller rather than through
-	// component.Config.Image: deploy/racer/embed.go pins it to the operator's
-	// compiled version, so it has to ship at the same tag.
-	"racer": {"racer-controller", "racer-dataplane"},
+	"racer":           {"racer-controller"},
 }
 
 // releaseBOMSource is the tool whose hardcoded image list feeds the signed
