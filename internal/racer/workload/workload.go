@@ -46,7 +46,8 @@ type Config struct {
 	PeerPort                uint16
 	HostNetwork             bool
 	PodNetworkNodes         []string
-	// Zero preserves the legacy automatic diagnostics port (9090, or 9091).
+	// Zero selects the automatic diagnostics port (9090, or 9091 when the peer
+	// port is 9090).
 	DiagnosticsPort         uint16
 	DataplaneServiceAccount string
 	DaemonSetName           string
@@ -180,23 +181,6 @@ func (c Config) validateEndpoint() error {
 	return nil
 }
 
-// DesiredDaemonSet declares the token audience, controller trust projection,
-// node-private identity and slab storage, socket mounts, and exclusion affinity.
-// It must never introduce a per-node Secret or trust a node-name as a Node UID.
-// This fixture models an externally provisioned workload, never controller startup.
-func DesiredDaemonSet(c Config) (*appsv1.DaemonSet, error) {
-	if err := c.Validate(); err != nil {
-		return nil, err
-	}
-
-	// Callers must implement drain-before-admit before opting into two workloads.
-	if len(c.PodNetworkNodes) != 0 {
-		return nil, fmt.Errorf("mixed networking requires the drain-aware two-workload planner: %w", wire.InvalidRequest)
-	}
-
-	return buildDaemonSet(c), nil
-}
-
 func buildDaemonSet(c Config) *appsv1.DaemonSet {
 	// Use workload identity, not the manager's identity, for the Pod selector.
 	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/instance": c.DaemonSetName}
@@ -244,8 +228,8 @@ func dataplanePod(c Config) corev1.PodSpec {
 }
 
 func diagnosticsPort(c Config) int32 {
-	// Preserve the automatic port for existing installations; explicit ports
-	// are validated rather than silently moved on collision.
+	// Zero selects the automatic port; explicit ports are validated rather than
+	// silently moved on collision.
 	diagnosticsPort := int32(c.DiagnosticsPort)
 	if diagnosticsPort == 0 {
 		diagnosticsPort = 9090

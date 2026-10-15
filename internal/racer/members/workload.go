@@ -14,7 +14,6 @@ const (
 
 var (
 	ConfigFromLookup  = workload.ConfigFromLookup
-	DesiredDaemonSet  = workload.DesiredDaemonSet
 	DesiredDaemonSets = workload.DesiredDaemonSets
 	ManagedNames      = workload.ManagedNames
 )
