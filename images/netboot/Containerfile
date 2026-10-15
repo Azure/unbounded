@@ -22,7 +22,7 @@ RUN mkdir -p /artifacts && \
     KVER=$(ls /lib/modules | head -1) && \
     cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
-        NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
+        NETBOOT_BASE="https://releases.ubuntu.com/noble/netboot/amd64"; \
         curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
             -o /artifacts/shimx64.efi "${NETBOOT_BASE}/bootx64.efi" && \
         curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
@@ -30,14 +30,13 @@ RUN mkdir -p /artifacts && \
         curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
             -o /artifacts/initrd "${NETBOOT_BASE}/initrd"; \
     elif [ "${TARGETARCH}" = "arm64" ]; then \
-        NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
+        NETBOOT_BASE="https://cdimage.ubuntu.com/ubuntu/releases/noble/release/netboot/arm64"; \
         curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
-            -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
-        tar -xzf /tmp/netboot.tar.gz -C /tmp && \
-        cp /tmp/arm64/bootaa64.efi /artifacts/shimaa64.efi && \
-        cp /tmp/arm64/grubaa64.efi /artifacts/grubaa64.efi && \
-        cp /tmp/arm64/initrd /artifacts/initrd && \
-        rm -rf /tmp/netboot.tar.gz /tmp/arm64; \
+            -o /artifacts/shimaa64.efi "${NETBOOT_BASE}/bootaa64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/grubaa64.efi "${NETBOOT_BASE}/grubaa64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/initrd "${NETBOOT_BASE}/initrd"; \
     else \
         echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1; \
     fi
