@@ -2390,7 +2390,7 @@ mod tests {
                 "racer-metadata-version"
             )
             .unwrap(),
-            "2"
+            "1"
         );
         assert_eq!(
             protocol::field(&signed.authentication.original.head, "content-length").unwrap(),

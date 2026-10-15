@@ -524,7 +524,7 @@ fn metadata_fields(head: &mut MessageHead, metadata: &ObjectMetadata) -> Result<
     version_fields(head, &metadata.version)?;
     push(head, "racer-length", metadata.length);
     push(head, "racer-expires", metadata.expires_at.to_header()?);
-    push(head, "racer-metadata-version", 2);
+    push(head, "racer-metadata-version", 1);
     if let Some(content_type) = &metadata.content_type {
         push(head, "racer-content-type", content_type.as_str());
     }
@@ -833,7 +833,7 @@ pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::Transfer
 }
 fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     let content_type = match head.unique("racer-metadata-version")? {
-        Some(b"2") => head
+        Some(b"1") => head
             .unique("racer-content-type")?
             .map(crate::model::ContentType::parse)
             .transpose()?,
@@ -1264,7 +1264,7 @@ pub(crate) mod tests {
             ("racer-etag", "\"v1\""),
             ("racer-length", "3"),
             ("racer-expires", "0"),
-            ("racer-metadata-version", "2"),
+            ("racer-metadata-version", "1"),
         ];
         let page_fields = [
             ("racer-page", "0"),
@@ -1569,14 +1569,14 @@ pub(crate) mod tests {
                 assert!(metadata(&missing_version).is_err());
                 assert_eq!(
                     head.unique("racer-metadata-version").unwrap(),
-                    Some(b"2".as_slice())
+                    Some(b"1".as_slice())
                 );
                 assert_eq!(
                     head.unique("content-length").unwrap(),
                     Some(b"0".as_slice())
                 );
                 if typed {
-                    for value in [b"3".as_slice(), b"1", b""] {
+                    for value in [b"2".as_slice(), b"0", b""] {
                         let mut bad =
                             response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path)
                                 .unwrap();
