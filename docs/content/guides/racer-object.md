@@ -2,9 +2,6 @@
 title: "Cache Object Storage with Racer"
 weight: 10
 description: "Read objects from an S3 bucket or an Azure Blob container through a pod-local Racer endpoint."
-aliases:
-  - /guides/racer-s3/
-  - /guides/racer/
 ---
 
 {{< callout type="warning" >}}
