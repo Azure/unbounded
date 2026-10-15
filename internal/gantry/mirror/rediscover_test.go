@@ -5,6 +5,7 @@ package mirror_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -156,20 +157,36 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 	dialer.Put(lateAddr, d, body)
 
 	dht := fakes.NewDHT()
-	coldStart := &stubColdStart{err: mirror.ErrColdStartExhausted}
+	gate := make(chan struct{})
+
+	var once sync.Once
+
+	release := func() { once.Do(func() { close(gate) }) }
+	coldStart := &gatedRediscoverColdStart{
+		stubColdStart: &stubColdStart{err: mirror.ErrColdStartExhausted},
+		entered:       make(chan struct{}),
+		release:       gate,
+	}
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
 		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
 		mirror.WithColdStart(coldStart),
 		mirror.WithPeerBudgets(time.Second, time.Second, 20),
-		mirror.WithPeerRediscover(5*time.Millisecond, 3*time.Second),
+		mirror.WithPeerRediscover(5*time.Second, 10*time.Millisecond),
 	)
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
+	// Unblock cold-start before closing the server, including on assertion failures.
+	t.Cleanup(release)
 
-	// Returns as soon as the headers are flushed; no provider exists yet.
-	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	transport := &http.Transport{ResponseHeaderTimeout: 2 * time.Second}
+	t.Cleanup(transport.CloseIdleConnections)
+
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+
+	// Headers must arrive while cold-start is still blocked and no provider exists.
+	resp, err := client.Get(srv.URL + "/v2/r/blobs/" + d.String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,18 +205,16 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
 	}
 
-	// Headers are flushed before round 0. Wait for cold-start so the late
-	// provider cannot satisfy the initial lookup and skip the exhausted path.
-	deadline := time.Now().Add(5 * time.Second)
-	for atomic.LoadInt32(&coldStart.calls) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("cold-start was not called before provider advertisement")
-		}
-
-		time.Sleep(time.Millisecond)
+	// A header flush precedes round 0, so it does not prove cold-start has run.
+	// Wait for its entry before making a provider visible to later rounds.
+	select {
+	case <-coldStart.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cold-start did not begin after headers were flushed")
 	}
 
 	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
+	release()
 
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -212,6 +227,25 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 
 	if calls := atomic.LoadInt32(&coldStart.calls); calls != 1 {
 		t.Fatalf("cold-start calls = %d, want 1 (round 0 only)", calls)
+	}
+}
+
+type gatedRediscoverColdStart struct {
+	*stubColdStart
+
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (s *gatedRediscoverColdStart) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, size int64) (*mirror.ColdStartResolution, error) {
+	s.once.Do(func() { close(s.entered) })
+
+	select {
+	case <-s.release:
+		return s.stubColdStart.Resolve(ctx, d, kind, upstream, repo, size)
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
