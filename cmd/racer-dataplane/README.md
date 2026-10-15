@@ -53,3 +53,55 @@ timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manife
 The production gate requires real io_uring and direct-I/O support: capability
 skips fail when `PAGE_ALLOC_REQUIRE_REAL_IO=1`. CI also checks all targets and
 runs strict Clippy for each allocator mode.
+
+The `flow-control` library provides policy-driven quotas, charged buffers, bounded
+kernel pipes, adaptive admission, and worker-local coalescing. Application policy
+and real operation completion remain the caller's responsibility. Flow requires
+Rust 1.91 or newer (`BTreeMap::extract_if`); workspace CI uses Rust 1.96.0. Its crate docs
+describe ownership and admission contracts; generate them with:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 doc --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-deps
+```
+
+This extraction is a smaller API, not a drop-in replacement for the `racer-v2`
+branch. It does not include `reserve_detailed`, `ReserveError`,
+`observe_rejections`, `ChargedBytes`, `ChargedBuffer::unpooled`, or the `progress`,
+`fifo`, and `subscriptions` modules. `reserve` returns the coarse `Error` enum;
+`Policy::rejected` reports individual failed attempts, not a detailed return value
+for the whole reservation, which may retry after reclamation. Callers must not
+treat that hook as a correlated replacement for `ReserveError`.
+
+The placeholder executable does not yet use flow. Before importing a consumer
+from `racer-v2`, check its API needs and ownership contracts against this crate.
+Any missing compatibility API needs its own design and tests; this extraction
+does not promise to add every omitted API in a follow-up.
+
+Use these commands for focused flow validation. The separate production run also
+checks the build with runtime simulation disabled, unlike workspace tests where
+other crates enable that runtime feature:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-default-features -j 2 -- --test-threads=1
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-default-features --features simulation -j 2 -- --test-threads=1
+```
+
+The flow production tests require Linux kernel pipes, Unix sockets, and splice.
+They exercise real I/O and fail rather than skipping unsupported operations.
+Simulation adds simulated and mixed-descriptor contracts without removing the
+real pipe tests: simulated pipes require an active `Simulation` scope, not just
+the feature. CI runs strict Clippy on all targets in each mode, the isolated
+production tests, and simulation tests through the workspace all-features run.
+
+CI also runs six exact coalescing and handoff ownership tests under pinned Miri,
+with simulation enabled and Miri's default checks. After installing the pinned
+Miri toolchain and preparing its sysroot as above, run:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/flow-miri.py
+```
+
+The script fails if any selected test is missing or ignored. This small subset
+checks completion, final-handle cleanup, capacity, and handoff waker ownership.
+It does not cover pipe syscalls or the recycler's `explicit_bzero` path, and it
+is not a concurrency model or a substitute for real-I/O tests.
