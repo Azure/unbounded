@@ -46,6 +46,8 @@ type Handler struct {
 	Clientset      kubernetes.Interface
 	ClusterCA      []byte // PEM-encoded cluster CA certificate
 	LookupNodeByIP func(ctx context.Context, ip string) (*v1alpha3.Machine, error)
+	// LookupMachine takes precedence over LookupNodeByIP when set.
+	LookupMachine  func(r *http.Request, ip string) (*v1alpha3.Machine, error)
 	StatusUpdater  StatusUpdater
 	TrustedProxies []netip.Prefix
 }
@@ -106,7 +108,14 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	node, err := h.LookupNodeByIP(ctx, ip)
+	var node *v1alpha3.Machine
+
+	if h.LookupMachine != nil {
+		node, err = h.LookupMachine(r, ip)
+	} else {
+		node, err = h.LookupNodeByIP(ctx, ip)
+	}
+
 	if err != nil {
 		log.Warn("attest: no Machine for client IP", "err", err)
 		http.Error(w, "node not found", http.StatusNotFound)

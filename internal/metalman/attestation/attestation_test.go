@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/google/go-tpm/tpm2"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,6 +34,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	metalmanbootstrap "github.com/Azure/unbounded/internal/metalman/bootstrap"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
 )
 
 // rsaKeyToTPM2BPublicEK creates a TPM2B_PUBLIC (EK-style) from an RSA public key.
@@ -355,6 +357,75 @@ func TestAttestTOFURejectsNewKey(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+func TestAttestRetainedMediaAfterLeaseEdit(t *testing.T) {
+	ekPriv, ekPub := testEKKeyPair(t)
+	srkPub, srkName := testSRKPub(t)
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "media-host", UID: "media-host-uid", Labels: map[string]string{"unbounded-cloud.io/site": "site-a"}},
+		Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
+			BootProtocol: v1alpha3.PXEBootProtocolVirtualMedia,
+			DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "02:11:22:33:44:55", IPv4: "192.0.2.20", SubnetMask: "255.255.255.0", Gateway: "192.0.2.1"}},
+		}}},
+	}
+	now := metav1.Now()
+	op := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "replace", UID: "replace-uid"},
+		Spec:       v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace},
+		Status: v1alpha3.MachineOperationStatus{Targets: []v1alpha3.MachineOperationTargetStatus{{
+			MachineRef: node.Name,
+			BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+				MachineUID: node.UID, Site: "site-a", Netboot: node.Spec.Netboot().DeepCopy(),
+				ImageWritten: true, RebootRequestedAt: &now, Released: true, Cleaned: true,
+			},
+		}}},
+	}
+	handler := testHandler(t, node, op)
+	c := handler.StatusUpdater.(*testStatusUpdater).client
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(node), node))
+	node.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.99"
+	require.NoError(t, c.Update(t.Context(), node))
+	provider := &netboot.MediaProvider{Client: c, Site: "site-a"}
+	handler.LookupMachine = provider.LookupAttestationMachine
+	handler.LookupNodeByIP = func(context.Context, string) (*v1alpha3.Machine, error) {
+		t.Fatal("request lookup must take precedence over legacy IP lookup")
+		return nil, fmt.Errorf("unexpected legacy lookup")
+	}
+
+	resp := doAttest(t, handler, "192.0.2.20", ekPub, srkPub)
+	aesKey := activateCredential(t, ekPriv, resp.CredentialBlob, resp.EncryptedSecret, srkName)
+	block, err := aes.NewCipher(aesKey)
+	require.NoError(t, err)
+	gcm, err := cipher.NewGCM(block)
+	require.NoError(t, err)
+	token, err := gcm.Open(nil, resp.GCMNonce, resp.EncryptedToken, nil)
+	require.NoError(t, err)
+
+	tokenParts := strings.Split(string(token), ".")
+	require.Len(t, tokenParts, 2)
+	tokenSecret, err := handler.Clientset.CoreV1().Secrets(metav1.NamespaceSystem).Get(
+		t.Context(),
+		"bootstrap-token-"+tokenParts[0],
+		metav1.GetOptions{},
+	)
+	require.NoError(t, err)
+	require.Equal(t, node.Name, tokenSecret.Annotations[v1alpha3.MachineBootstrapTokenAnnotationKey])
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(node), node))
+	require.NotEmpty(t, node.Status.TPM.EKPublicKey)
+	require.Equal(t, "192.0.2.99", node.Spec.Netboot().DHCPLeases[0].IPv4)
+
+	body, err := json.Marshal(AttestRequest{EKPub: ekPub, SRKPub: srkPub})
+	require.NoError(t, err)
+	// A changed live site must fail without falling back to the legacy callback.
+	node.Labels["unbounded-cloud.io/site"] = "site-b"
+	require.NoError(t, c.Update(t.Context(), node))
+
+	r := httptest.NewRequest(http.MethodPost, "/attest", bytes.NewReader(body))
+	r.RemoteAddr = "192.0.2.20:4321"
+	w := httptest.NewRecorder()
+	handler.Attest(w, r)
+	require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 }
 
 func TestAttestEKMismatch(t *testing.T) {

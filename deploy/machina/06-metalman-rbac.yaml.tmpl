@@ -110,7 +110,10 @@ rules:
   # MachineOperation controller
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations"]
-    verbs: ["get", "list", "watch", "delete"]
+    verbs: ["get", "list", "watch", "delete", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperations/finalizers"]
+    verbs: ["update", "patch"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations/status"]
     verbs: ["get", "update", "patch"]
