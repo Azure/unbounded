@@ -637,6 +637,34 @@ where
         }
     }
 
+    /// Advance local preparation and installation on the tick timer without any
+    /// network I/O, until no received document awaits preparation or install.
+    /// Callers that need a received document installed before fetching again use
+    /// this instead of another turn, which would issue a redundant GET whenever
+    /// preparation outlasts one tick.
+    pub async fn settle(&mut self, scope: &H::Scope) -> Result<(), H::Error> {
+        if self.stopped.get() {
+            return Err(uring_runtime::Error::Cancelled.into());
+        }
+        let now = uring_runtime::environment::now();
+        let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
+        loop {
+            scope.check()?;
+            self.state
+                .advance(&self.feed, &self.target, self.host.as_ref(), self.schedule)?;
+            if self.state.job.is_none()
+                && self.state.prepared.is_none()
+                && self.state.queued.is_none()
+            {
+                return Ok(());
+            }
+            let now = uring_runtime::environment::now();
+            self.host
+                .sleep(now.checked_add(self.schedule.tick).unwrap_or(now), &scope)
+                .await?;
+        }
+    }
+
     /// Stop fetches and boundedly wait for the sole CPU job. On timeout or caller
     /// cancellation the job stays owned; invoke shutdown again with a fresh scope.
     pub async fn shutdown(&mut self, scope: &H::Scope) -> Result<(), H::Error> {

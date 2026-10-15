@@ -585,7 +585,7 @@ impl Session {
     /// Key feed must accept trust before identity recovery and fresh issuance.
     async fn start_inner(&self, scope: &RequestScope) -> Result<LocalSigningIdentity> {
         while self.auth.startup_bundle.borrow().is_none() {
-            let mut turn = self.keyring_progress(scope);
+            let mut turn = self.keyring_startup_turn(scope);
             std::future::poll_fn(|cx| {
                 let result = turn.as_mut().poll(cx);
                 if self.auth.startup_bundle.borrow().is_some() {
@@ -761,6 +761,27 @@ impl Session {
                 _ if self.auth.started.get() => scope.check(),
                 _ => result,
             }
+        })
+    }
+
+    /// Startup keyring turn: after a receipt, settle local preparation before the
+    /// caller loops. Another turn would GET again once preparation outlasts one
+    /// tick, sending a redundant bootstrap-token request before trust is installed.
+    fn keyring_startup_turn<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(async move {
+            self.auth.check()?;
+            let mut driver = Turn::take(&self.keyrings)?;
+            let result = match driver.turn(scope).await {
+                Ok(()) => driver.settle(scope).await,
+                Err(error) => Err(error),
+            };
+            self.keyring_error
+                .set(if result.is_ok() && driver.status().pending.is_none() {
+                    None
+                } else {
+                    driver.status().error
+                });
+            result
         })
     }
 

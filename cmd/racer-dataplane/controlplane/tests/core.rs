@@ -851,6 +851,36 @@ fn install_retries_during_network_wait_and_retry_after_does_not_advance_acceptan
     });
 }
 
+/// Settling installs a slow preparation without issuing another GET.
+#[test]
+fn settle_installs_slow_preparation_without_network() {
+    futures::executor::block_on(async {
+        let target = Installer::new();
+        target.release.store(false, Ordering::Release);
+        let script = Script::new([full(1), full(2)]);
+        let mut sync = driver(script.clone(), target.clone());
+        sync.settle(&Scope::new()).await.unwrap();
+        assert!(script.requests.borrow().is_empty(), "idle settle is local");
+        sync.turn(&Scope::new()).await.unwrap();
+        assert_eq!(sync.status().pending, Some(1));
+        assert_eq!(
+            sync.settle(&Scope::new()).await.unwrap_err(),
+            Failure::Runtime(uring_runtime::Error::DeadlineExceeded),
+            "settle is bounded by the turn schedule"
+        );
+        target.release.store(true, Ordering::Release);
+        sync.settle(&Scope::new()).await.unwrap();
+        assert_eq!(*target.installed.borrow(), vec![1]);
+        assert_eq!(sync.status().accepted, Some(1));
+        assert_eq!(script.requests.borrow().len(), 1, "settle never fetches");
+        sync.shutdown(&Scope::new()).await.unwrap();
+        assert_eq!(
+            sync.settle(&Scope::new()).await.unwrap_err(),
+            Failure::Runtime(uring_runtime::Error::Cancelled)
+        );
+    });
+}
+
 /// A shutdown deadline closes submissions but retains work for a later fence.
 #[test]
 fn bounded_shutdown_retains_unfinished_job_for_later_fence() {
