@@ -287,6 +287,17 @@ impl Membership {
     pub fn member(&self, node: &NodeId) -> Result<&Member> {
         Ok(&self.members()[self.position(node)?])
     }
+    /// Whether `a` and `b` share a direct overlay edge, without allocating.
+    /// Unknown members and `a == b` are not neighbors.
+    pub fn is_neighbor(&self, a: &NodeId, b: &NodeId) -> bool {
+        match (
+            self.inner.position(a.0.as_bytes()),
+            self.inner.position(b.0.as_bytes()),
+        ) {
+            (Some(a), Some(b)) => self.inner.is_neighbor(a, b),
+            _ => false,
+        }
+    }
     pub fn neighbors(&self, node: &NodeId) -> Result<Vec<NodeId>> {
         let position = self.position(node)?;
         Ok(self
@@ -1671,6 +1682,24 @@ pub(crate) mod tests {
             assert!(empty.neighbors(&NodeId("unknown".into())).is_err());
             let one = membership(1);
             assert!(one.neighbors(&one.members()[0].node).unwrap().is_empty());
+        }
+
+        #[test]
+        fn is_neighbor_matches_allocated_neighbors() {
+            let members = membership(100);
+            let unknown = NodeId("unknown".into());
+            for source in members.members() {
+                let neighbors = members.neighbors(&source.node).unwrap();
+                for other in members.members() {
+                    assert_eq!(
+                        members.is_neighbor(&source.node, &other.node),
+                        neighbors.contains(&other.node)
+                    );
+                }
+                assert!(!members.is_neighbor(&source.node, &source.node));
+                assert!(!members.is_neighbor(&source.node, &unknown));
+                assert!(!members.is_neighbor(&unknown, &source.node));
+            }
         }
 
         #[test]

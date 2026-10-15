@@ -230,7 +230,8 @@ impl PeerNetwork {
         membership: &std::sync::Arc<crate::topology::Membership>,
         node: &NodeId,
     ) -> Result<crate::http::Endpoint> {
-        if !membership.neighbors(&self.local)?.contains(node) {
+        membership.position(&self.local)?;
+        if !membership.is_neighbor(&self.local, node) {
             return Err(Error::InvalidRequest);
         }
         let member = membership.member(node)?;

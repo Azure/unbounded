@@ -463,6 +463,14 @@ impl<M: Member> Membership<M> {
         self.neighbor_slice(position).to_vec()
     }
 
+    /// Whether two members share an overlay edge. Allocation-free: neighbor
+    /// lists are sorted, so this is one binary search. False when either
+    /// position is out of range or both positions are the same member.
+    #[must_use]
+    pub fn is_neighbor(&self, position: usize, other: usize) -> bool {
+        self.neighbor_slice(position).binary_search(&other).is_ok()
+    }
+
     /// Like [`Self::neighbors`], but borrows instead of copying.
     fn neighbor_slice(&self, position: usize) -> &[usize] {
         self.graph.get(position).map_or(&[], Vec::as_slice)
@@ -779,6 +787,28 @@ mod overlay {
                 assert!(members.neighbors(count as usize).is_empty());
                 assert!(members.neighbor_slice(usize::MAX).is_empty());
                 assert!(members.neighbors(usize::MAX).is_empty());
+            }
+        }
+
+        /// `is_neighbor` agrees with the neighbor lists and rejects bad positions.
+        #[test]
+        fn is_neighbor_matches_neighbor_lists() {
+            for count in [0, 1, 2, 3, 32, 100, 257] {
+                let members = membership(count);
+                let count = count as usize;
+                for position in 0..count {
+                    let neighbors = members.neighbors(position);
+                    for other in 0..count {
+                        assert_eq!(
+                            members.is_neighbor(position, other),
+                            neighbors.contains(&other)
+                        );
+                    }
+                    assert!(!members.is_neighbor(position, position));
+                    assert!(!members.is_neighbor(position, count));
+                    assert!(!members.is_neighbor(count, position));
+                }
+                assert!(!members.is_neighbor(usize::MAX, 0));
             }
         }
 
