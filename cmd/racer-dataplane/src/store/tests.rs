@@ -2338,14 +2338,14 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
 }
 
 #[test]
-fn old_format_and_unknown_cipher_records_are_cache_misses() {
+fn other_format_version_and_unknown_cipher_records_are_cache_misses() {
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let page = f.copy(3, 23);
     let id = page.ciphertext.envelope().page.clone();
     let request = scope();
-    for old_format in [true, false] {
+    for other_version in [true, false] {
         f.enqueue(page.clone()).unwrap();
         drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
         let location = f
@@ -2379,16 +2379,13 @@ fn old_format_and_unknown_cipher_records_are_cache_misses() {
         let bytes = stored.bytes_mut().unwrap();
         let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
         let cipher_offset = header_len - 36;
-        let digest_end = if old_format {
-            // Rebuild v4: remove the cipher ID, shift digest and ciphertext back.
-            bytes.copy_within(cipher_offset + 4.., cipher_offset);
-            bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
-            bytes[12..16].copy_from_slice(&((header_len - 4) as u32).to_le_bytes());
-            header_len - 36
+        if other_version {
+            // A well-formed record from another format version.
+            bytes[8..12].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         } else {
             bytes[cipher_offset..cipher_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            header_len - 32
-        };
+        }
+        let digest_end = header_len - 32;
         let digest = Sha256::digest(&bytes[..digest_end]);
         bytes[digest_end..digest_end + 32].copy_from_slice(&digest);
         assert!(matches!(
@@ -2412,7 +2409,7 @@ fn old_format_and_unknown_cipher_records_are_cache_misses() {
         assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
         assert_eq!(
             f.metrics.count(crate::telemetry::Event::CorruptMiss),
-            u64::from(!old_format)
+            u64::from(!other_version)
         );
     }
 }
@@ -3112,24 +3109,23 @@ mod records {
             .collect()
     }
 
-    // Independently packed little-endian fixture, verified against the pre-change
-    // serializer. Includes the header digest and ciphertext; remaining bytes are zero.
+    // Little-endian record header for `page(3, 0, "cache", "v1")` at
+    // generation 7, including the header digest and ciphertext. Bytes past the
+    // logical record are zero padding.
     const GOLDEN_LOGICAL: &str = concat!(
-        "524352504147453101000000a900000007000000000000000300000000000000",
+        "524352504147453101000000b900000007000000000000000300000000000000",
         "0000000000000000030000001300000001010101010101010101010101010101",
-        "020202020202020202020202020202020202020202020202",
-        "0303030303030303030303030303030303030303030303030303030303030303",
-        "0500000004000000636163686522763122",
-        "c5f4f39966532d8ab0ede8139c81d2a7368448b01ac36f50e5a2d39078b51b3c",
-        "02020202020202020202020202020202020202",
+        "0202020202020202020202020202020202020202020202020303030303030303",
+        "0303030303030303030303030303030303030303030303030500000004000000",
+        "6361636865227631227853ecbd5e15ca0c0000000001000000c49c9e3d747d13",
+        "105b9fa5b7cf40f7b7d36e745029bbc001738e28cfbaa6edaa02020202020202",
+        "020202020202020202020202",
     );
-    const GOLDEN_RECORD_SHA256: &str =
-        "5825196396c3fc29342422518a98d9fe550bcdb05701b97aadcb9c02271f3f03";
 
     #[test]
     fn current_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
         let admission = admission();
-        // Normal v5 header is 185 bytes, plus a 16-byte tag. Straddle both units.
+        // Normal header is 185 bytes, plus a 16-byte tag. Straddle both units.
         for (length, number, maximum, geometry, offset) in [
             (1, 0, false, (512, 512, 512), 0),
             (310, 0, false, (512, 512, 512), 512),
@@ -3469,17 +3465,24 @@ mod records {
     }
 
     #[test]
-    fn frozen_v1_record_is_rejected() {
-        let mut expected = unhex(GOLDEN_LOGICAL);
-        expected.resize(512, 0);
-        assert_eq!(
-            Sha256::digest(&expected).as_slice(),
-            unhex(GOLDEN_RECORD_SHA256)
-        );
-        assert!(matches!(
-            parse_bytes(&expected, Extent::new(0, 512).unwrap()),
-            Err(Error::CorruptRecord)
-        ));
+    fn current_record_matches_golden_vector() {
+        let admission = admission();
+        let page = page(&admission, 3, 0, "cache", "v1");
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(&admission, alignment, 512),
+        )
+        .unwrap();
+        let bytes = encoded.buffer.bytes().unwrap();
+        let logical = logical_length(&page).unwrap();
+        assert_eq!(bytes[..logical], unhex(GOLDEN_LOGICAL));
+        assert!(bytes[logical..].iter().all(|&b| b == 0));
+        let parsed = parse_bytes(bytes, Extent::new(0, 512).unwrap()).unwrap();
+        assert_eq!(parsed.header.format_version, FORMAT_VERSION);
+        assert_eq!(parsed.checksum, page.ciphertext.checksum());
     }
 
     #[test]
@@ -3500,21 +3503,6 @@ mod records {
         assert_eq!(parsed.header.metadata, page.metadata.immutable());
         assert_eq!(parsed.checksum, page.ciphertext.checksum());
 
-        // Reconstruct the obsolete v2 layout: content type, without a CRC.
-        let mut version_two = encoded.buffer.bytes().unwrap().to_vec();
-        let old_header = u32::from_le_bytes(version_two[12..16].try_into().unwrap()) as usize;
-        let crc_offset = 128 + "cache".len() + "\"v1\"".len();
-        version_two.drain(crc_offset..crc_offset + 8);
-        version_two.resize(512, 0);
-        version_two[8..12].copy_from_slice(&2u32.to_le_bytes());
-        let header = old_header - 8;
-        version_two[12..16].copy_from_slice(&(header as u32).to_le_bytes());
-        let digest = Sha256::digest(&version_two[..header - 32]);
-        version_two[header - 32..header].copy_from_slice(&digest);
-        assert!(matches!(
-            parse_bytes(&version_two, encoded.header.extent),
-            Err(Error::CorruptRecord)
-        ));
         let mut corrupted = encoded.buffer.bytes().unwrap().to_vec();
         let start = corrupted
             .windows(10)
@@ -3540,33 +3528,16 @@ mod records {
         )
         .unwrap();
         let original = encoded.buffer.bytes().unwrap();
-        assert_eq!(&original[8..12], &5u32.to_le_bytes());
+        assert_eq!(&original[8..12], &FORMAT_VERSION.to_le_bytes());
         let header_len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
         let crc_offset = 128 + "cache".len() + "\"v1\"".len();
         assert_eq!(
             &original[crc_offset..crc_offset + 8],
             &page.ciphertext.checksum().to_le_bytes()
         );
-        for version in [0u32, 1, 2, 3, 4, 5, u32::MAX] {
+        for version in [0, FORMAT_VERSION, FORMAT_VERSION + 1, u32::MAX] {
             let mut bytes = original.to_vec();
             bytes[8..12].copy_from_slice(&version.to_le_bytes());
-            if version == 3 {
-                // Reconstruct an actual v3 checksum, not just its version label.
-                let mut ecma = 0u64;
-                for byte in page.ciphertext.bytes() {
-                    ecma ^= u64::from(*byte) << 56;
-                    for _ in 0..8 {
-                        ecma = (ecma << 1)
-                            ^ if ecma >> 63 != 0 {
-                                0x42f0_e1eb_a9ea_3693
-                            } else {
-                                0
-                            };
-                    }
-                }
-                assert_ne!(ecma, page.ciphertext.checksum());
-                bytes[crc_offset..crc_offset + 8].copy_from_slice(&ecma.to_le_bytes());
-            }
             let digest = Sha256::digest(&bytes[..header_len - 32]);
             bytes[header_len - 32..header_len].copy_from_slice(&digest);
             let parsed = parse_bytes(&bytes, encoded.header.extent);
@@ -4115,30 +4086,27 @@ mod checkpoint {
             .collect();
         assert_eq!(
             digest,
-            "f11edbc0b0013ffecace44dd362a58e6a700accfe1cc3c9ea1b0f06246862e8c"
+            "a5d7c2c881f46d3839ebae21db2a1617779fa6a1673a488c55ac29286641718e"
         );
     }
 
     #[test]
-    fn populated_cut_preserves_legacy_slab_wire_field_and_rejects_nonzero() {
+    fn populated_cut_has_stable_current_binary_vector() {
         let bytes = checkpoint_format::encode(&image(7)).unwrap();
-        // Literal version-4 image(7) layout, independent of Encoder/Decoder:
-        // header 32 + shard count 4 + worker 2 + geometry 80 + segment count 4
-        // + two segments 58 + page count 4 + descriptor 92 (36-byte cache,
-        // 32-byte key, 4-byte quoted ETag, length 8, three string lengths 12)
-        // + page number 8 + key ID 16 + segment 8 + generation 8 = 316.
-        const SLAB_OFFSET: usize = 316;
-        assert_eq!(bytes.len(), 471);
-        assert_eq!(&bytes[SLAB_OFFSET..SLAB_OFFSET + 8], &[0; 8]);
-        // Independently packed legacy single-slab fixture, including its zero slab
-        // u64, extent (0, 4096), and standalone "empty" descriptor, has 439 body bytes.
-        let digest: String = bytes[439..]
+        // image(7) layout: header 32 + shard count 4 + worker 2 + geometry 80
+        // + segment count 4 + two segments 58 + page count 4 + descriptor 92
+        // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
+        // string lengths 12) + page fields 56 (page number, key ID, segment,
+        // generation, extent offset and length) + descriptor count 4 + the
+        // standalone "empty" descriptor 95 = 431 body bytes, then the digest.
+        assert_eq!(bytes.len(), 463);
+        let digest: String = bytes[431..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "01c3c2ba61feea8045dc5e8090301a6566b8a18a7eb25c827f7b0f6a42188b86"
+            "e7169d41349dfb5f3b9fc55abc47268d1d6a7b4272261e4e1e423c65a9b40c61"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);
@@ -4146,24 +4114,13 @@ mod checkpoint {
             decoded.shards[0].index.entries[0].1.metadata,
             descriptor("v1", 17)
         );
-
-        // Exercise low and high bits of the whole legacy u64, not just its first byte.
-        for slab in [1u64, 1 << 63, u64::MAX] {
-            let mut malformed = bytes.clone();
-            malformed[SLAB_OFFSET..SLAB_OFFSET + 8].copy_from_slice(&slab.to_le_bytes());
-            resign(&mut malformed);
-            assert_eq!(&Sha256::digest(&malformed[..439])[..], &malformed[439..]);
-            assert!(matches!(
-                checkpoint_format::decode(&malformed),
-                Err(Error::CorruptRecord)
-            ));
-        }
+        assert_eq!(checkpoint_format::encode(&decoded).unwrap(), bytes);
     }
 
     #[test]
-    fn older_checkpoint_versions_are_rejected_and_recover_as_cold_cache() {
+    fn other_checkpoint_versions_are_rejected_and_recover_as_cold_cache() {
         let directory = Directory::new();
-        for version in [0u32, 1, 2, 3, 5] {
+        for version in [0, CHECKPOINT_VERSION + 1, u32::MAX] {
             let mut cut = image(9);
             cut.version = version;
             assert!(checkpoint_format::encode(&cut).is_err());

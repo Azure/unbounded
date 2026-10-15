@@ -460,20 +460,20 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
 }
 
 // Bounded, versioned binary checkpoints. SHA-256 covers the header and body.
-// Version 3 uses little-endian integers: magic[8], version:u32, flags:u32,
-// sequence:u64, total_bytes:u64, shard_count:u32, then shards and digest[32].
-// Each shard is worker:u16, six geometry u64s, layout_digest[32], counted segments, counted page
-// entries, and counted standalone descriptors. Counts and string lengths are
-// u32. A descriptor is cache UTF-8 string, key[32], quoted ETag string, length:u64.
-// A segment is id:u64, generation:u64, state:u8, used_bytes:u64. A page entry is
-// its descriptor, page:u64, key_id[16], segment:u64, generation:u64, slab:u64,
-// offset:u64, disk_length:u64. Encoder ordering is canonical by worker, segment,
-// and full version/page identity. No freshness or payload bytes are serialized.
-// Version 2 appends a counted ASCII MIME string to every descriptor. Zero length
-// means absent. Version 3 binds each shard to its raw-device layout or file mode.
-// Version 4 adds counted record-offset hold deadlines to each segment.
-// Older versions are discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 4;
+// Integers are little-endian: magic[8], version:u32, flags:u32, sequence:u64,
+// total_bytes:u64, shard_count:u32, then shards and digest[32]. Each shard is
+// worker:u16, six geometry u64s, layout_digest[32] (the raw-device layout or
+// file mode), counted segments, counted page entries, and counted standalone
+// descriptors. Counts and string lengths are u32. A descriptor is cache UTF-8
+// string, key[32], quoted ETag string, length:u64, and a counted ASCII MIME
+// string where zero length means absent. A segment is id:u64, generation:u64,
+// state:u8, used_bytes:u64, and counted record-offset hold deadlines
+// (offset:u64, seconds:u64, nanos:u32). A page entry is its descriptor,
+// page:u64, key_id[16], segment:u64, generation:u64, offset:u64,
+// disk_length:u64. Encoder ordering is canonical by worker, segment, and full
+// version/page identity. No freshness or payload bytes are serialized.
+// Checkpoints with any other version are discarded as disposable cache hints.
+pub const CHECKPOINT_VERSION: u32 = 1;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
@@ -489,7 +489,8 @@ const SHARD_BYTES: usize = 94; // worker + geometry + digest + three u32 counts.
 const SEGMENT_BYTES: usize = 29; // id + generation + state + used + record count.
 pub(super) const RETAINED_RECORD_BYTES: usize = 20; // offset + seconds + nanos.
 const DESCRIPTOR_BYTES: usize = 52; // key + length + three u32 string lengths.
-const PAGE_ENTRY_BYTES: usize = DESCRIPTOR_BYTES + 64; // descriptor + page fields.
+const PAGE_ENTRY_BYTES: usize = DESCRIPTOR_BYTES + PAGE_FIELD_BYTES;
+const PAGE_FIELD_BYTES: usize = 56; // page + key ID + segment + generation + offset + length.
 
 /// Persist allocation geometry so a valid checksum cannot hide incompatible slabs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -770,7 +771,6 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
             out.bytes(&entry.key_id.0)?;
             out.u64(entry.location.segment.0)?;
             out.u64(entry.location.generation.0)?;
-            out.u64(0)?; // Reserved single-slab field preserves checkpoint encoding.
             out.u64(entry.location.extent.offset())?;
             out.u64(entry.location.extent.length() as u64)?;
         }
@@ -883,9 +883,6 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
             let key_id = KeyId(input.array()?);
             let segment = SegmentId(input.u64()?);
             let generation = Generation(input.u64()?);
-            if input.u64()? != 0 {
-                return Err(Error::CorruptRecord);
-            }
             let offset = input.u64()?;
             let length = usize::try_from(input.u64()?).map_err(|_| Error::CorruptRecord)?;
             let extent = Extent::new(offset, length)?;
@@ -970,7 +967,7 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
         charge(pages, std::mem::size_of::<(PageId, IndexedPage)>() + 512)?;
         for _ in 0..pages {
             charge(input.descriptor_bytes()?, 4)?;
-            input.take(64)?;
+            input.take(PAGE_FIELD_BYTES)?;
         }
         let metadata = input.count(MAX_ITEMS, DESCRIPTOR_BYTES)?;
         charge(metadata, std::mem::size_of::<VersionMetadata>() + 512)?;
@@ -1137,8 +1134,8 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 // Standalone store fixtures use the production candidate scanner and cache-scoped
-// filter, but do not create an application worker directory. No legacy loader is
-// compiled into the dataplane.
+// filter, but do not create an application worker directory. This test-only
+// loader is not compiled into the dataplane.
 impl Recovery {
     pub(crate) fn load(&self, alignment: Alignment) -> Operation<'_, Option<CheckpointImage>> {
         self.load_filtered(alignment, |_, _| true)
@@ -1200,9 +1197,9 @@ mod budget_tests {
                 let mut encoder = Encoder(Vec::new());
                 encoder.descriptor(&metadata).unwrap();
                 assert_eq!(snapshot_metadata_bytes(&metadata), encoder.0.len());
-                assert_eq!(snapshot_entry_bytes(&metadata), encoder.0.len() + 64);
+                assert_eq!(snapshot_entry_bytes(&metadata), encoder.0.len() + 56);
                 assert_eq!(DESCRIPTOR_BYTES, 52);
-                assert_eq!(PAGE_ENTRY_BYTES, 116);
+                assert_eq!(PAGE_ENTRY_BYTES, 108);
             }
         }
     }

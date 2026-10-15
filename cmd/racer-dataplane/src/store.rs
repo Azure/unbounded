@@ -227,8 +227,9 @@ impl StoreReader {
                 }
                 Err(e) => return Err(e),
             };
-            // A recognized record from another format is a cold cache miss,
-            // not evidence of damaged storage. Never parse its remaining fields.
+            // A record with this magic but a different format version (for
+            // example, written by a newer release) is a cold cache miss, not
+            // evidence of damaged storage. Never parse its remaining fields.
             let bytes = buffer.bytes()?;
             if bytes.get(..8) == Some(MAGIC)
                 && bytes
@@ -1222,8 +1223,9 @@ impl Drop for DirtyCleanup<'_> {
         }
     }
 }
-// Version 5 adds the page cipher ID after the optional content type.
-pub const FORMAT_VERSION: u32 = 5;
+// Page record format version, stored after the magic. Readers treat any other
+// version as a cold miss.
+pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 pub const MAX_HEADER_BYTES: usize = 16384;
