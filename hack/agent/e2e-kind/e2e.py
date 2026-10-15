@@ -1750,6 +1750,11 @@ def acl_image_source() -> str:
     return ACL_IMAGE_SOURCE
 
 
+# Compute api-version for sharedGalleries lookups, pinned to one Azure lists as
+# supported in every region rather than whatever the runner's az CLI defaults to.
+ACL_SHARED_GALLERY_API_VERSION = "2024-03-03"
+
+
 def acl_gallery_image() -> tuple[str, str]:
     """Return the gallery's unique name and the image definition."""
     match = ACL_GALLERY_IMAGE_PATTERN.fullmatch(ACL_IMAGE_GALLERY_IMAGE)
@@ -1769,14 +1774,19 @@ def acl_gallery_version() -> str:
     version = ACL_IMAGE_VERSION
     if not version:
         gallery, image = acl_gallery_image()
+        # az rest with a pinned api-version, not az sig image-version
+        # show-shared: newer az CLIs call an api-version that Azure has not
+        # rolled out for sharedGalleries in every region, which fails with
+        # NoRegisteredProviderFound. The service resolves "latest" itself.
+        subscription = urllib.parse.quote(ACL_IMAGE_SUBSCRIPTION, safe="") or "{subscriptionId}"
+        path = "/".join(urllib.parse.quote(part, safe="") for part in (
+            ACL_IMAGE_GALLERY_LOCATION, "sharedGalleries", gallery, "images", image, "versions", "latest"))
         version = acl_az([
-            "sig", "image-version", "show-shared",
-            "--gallery-unique-name", gallery,
-            "--gallery-image-definition", image,
-            "--gallery-image-version", "latest",
-            "--location", ACL_IMAGE_GALLERY_LOCATION,
+            "rest", "--method", "get",
+            "--url", f"https://management.azure.com/subscriptions/{subscription}/providers/"
+                     f"Microsoft.Compute/locations/{path}?api-version={ACL_SHARED_GALLERY_API_VERSION}",
             "--query", "name", "-o", "tsv",
-        ])
+        ], subscription=False)
         log(f"Azure Container Linux gallery version {version} is the latest of {ACL_IMAGE_GALLERY_IMAGE}")
 
     _check_acl_build_id(version, "ACL_IMAGE_VERSION" if ACL_IMAGE_VERSION else "the gallery's latest version")
@@ -1784,18 +1794,21 @@ def acl_gallery_version() -> str:
     return version
 
 
-def acl_az(args: list[str]) -> str:
+def acl_az(args: list[str], subscription: bool = True) -> str:
     """Run az for the gallery source and return its output. A failure reports
     az's own error, which never holds a SAS: only grant-access prints one, to
     stdout."""
     try:
-        return capture(_acl_az_command(args))
+        return capture(_acl_az_command(args, subscription))
     except subprocess.CalledProcessError as exc:
         die(f"az {' '.join(args[:3])} failed (exit {exc.returncode}): {(exc.stderr or '').strip()[-2000:]}")
         raise AssertionError("unreachable") from exc
 
 
-def _acl_az_command(args: list[str]) -> list[str]:
+def _acl_az_command(args: list[str], subscription: bool = True) -> list[str]:
+    """az rest takes no --subscription; its URL names the subscription."""
+    if not subscription:
+        return ["az", *args, "--only-show-errors"]
     subscription = ["--subscription", ACL_IMAGE_SUBSCRIPTION] if ACL_IMAGE_SUBSCRIPTION else []
     return ["az", *args, *subscription, "--only-show-errors"]
 
