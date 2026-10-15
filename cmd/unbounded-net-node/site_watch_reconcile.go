@@ -2201,7 +2201,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			// site underlay (e.g. a service ClusterIP DNAT'd by a remote
 			// node to an in-site host-network pod) leave eth0 and need
 			// MASQUERADE in nat/POSTROUTING, which requires conntrack.
-			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, siteRouting.gatewayReturnCIDRs, supernets); err != nil {
+			// Flows sourced from this gateway's routedCidrs are tracked too:
+			// their replies come back through this gateway to a tracked
+			// local destination.
+			var sourceCIDRs []string
+			for _, pool := range gatewayPoolsForNode {
+				sourceCIDRs = append(sourceCIDRs, pool.Spec.RoutedCidrs...)
+			}
+
+			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, siteRouting.gatewayReturnCIDRs, sourceCIDRs, supernets); err != nil {
 				return fmt.Errorf("reconcile notrack CIDRs: %w", err)
 			}
 		} else {
