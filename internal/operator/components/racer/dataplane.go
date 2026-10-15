@@ -204,17 +204,39 @@ func ValidateDataplaneOverride(original, candidate *unstructured.Unstructured) e
 		return errors.New("racer DaemonSet container dataplane envFrom must match the canonical configuration; tune ConfigMap racer-dataplane-config instead")
 	}
 
+	containerEnv := func(c map[string]any) ([]any, error) {
+		raw, present := c["env"]
+		if !present || raw == nil {
+			return nil, nil
+		}
+
+		envs, ok := raw.([]any)
+		if !ok {
+			return nil, fmt.Errorf("racer DaemonSet container dataplane env must be a list, got %T", raw)
+		}
+
+		return envs, nil
+	}
+
+	afterEnvs, err := containerEnv(after)
+	if err != nil {
+		return err
+	}
+
 	afterEnv := map[string]any{}
 
-	envs, _ := after["env"].([]any)
-	for _, entry := range envs {
+	for _, entry := range afterEnvs {
 		if e, ok := entry.(map[string]any); ok {
 			afterEnv[fmt.Sprint(e["name"])] = e
 		}
 	}
 
-	envs, _ = before["env"].([]any)
-	for _, entry := range envs {
+	beforeEnvs, err := containerEnv(before)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range beforeEnvs {
 		e, ok := entry.(map[string]any)
 		if !ok {
 			continue
@@ -226,9 +248,16 @@ func ValidateDataplaneOverride(original, candidate *unstructured.Unstructured) e
 	}
 
 	for _, field := range []string{"serviceAccountName", "volumes"} {
-		beforeValue, _, _ := unstructured.NestedFieldNoCopy(original.Object, "spec", "template", "spec", field)
+		beforeValue, _, err := unstructured.NestedFieldNoCopy(original.Object, "spec", "template", "spec", field)
+		if err != nil {
+			return fmt.Errorf("reading canonical racer DaemonSet pod %s: %w", field, err)
+		}
 
-		afterValue, _, _ := unstructured.NestedFieldNoCopy(candidate.Object, "spec", "template", "spec", field)
+		afterValue, _, err := unstructured.NestedFieldNoCopy(candidate.Object, "spec", "template", "spec", field)
+		if err != nil {
+			return fmt.Errorf("reading racer DaemonSet override pod %s: %w", field, err)
+		}
+
 		if !reflect.DeepEqual(beforeValue, afterValue) {
 			return fmt.Errorf("racer DaemonSet pod %s is operator-owned wiring and cannot be overridden", field)
 		}

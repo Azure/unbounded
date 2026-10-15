@@ -282,3 +282,44 @@ func TestDataplaneOverrides(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateDataplaneOverrideMalformedEnv(t *testing.T) {
+	daemonSet := func(env any) *unstructured.Unstructured {
+		container := map[string]any{"name": dataplaneContainerName}
+		if env != nil {
+			container["env"] = env
+		}
+
+		return &unstructured.Unstructured{Object: map[string]any{
+			"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+				"serviceAccountName": "racer",
+				"containers":         []any{container},
+			}}},
+		}}
+	}
+
+	canonical := []any{map[string]any{"name": "RACER_CONTROL_ENDPOINT", "value": "https://racer:8443"}}
+
+	t.Run("unchanged", func(t *testing.T) {
+		require.NoError(t, ValidateDataplaneOverride(daemonSet(canonical), daemonSet(canonical)))
+	})
+
+	t.Run("no env", func(t *testing.T) {
+		require.NoError(t, ValidateDataplaneOverride(daemonSet(nil), daemonSet(nil)))
+	})
+
+	t.Run("override env not a list", func(t *testing.T) {
+		err := ValidateDataplaneOverride(daemonSet(canonical), daemonSet("RACER_CONTROL_ENDPOINT=https://evil:8443"))
+		require.ErrorContains(t, err, "env must be a list")
+	})
+
+	t.Run("canonical env not a list", func(t *testing.T) {
+		err := ValidateDataplaneOverride(daemonSet(map[string]any{}), daemonSet(canonical))
+		require.ErrorContains(t, err, "env must be a list")
+	})
+
+	t.Run("removed canonical env", func(t *testing.T) {
+		err := ValidateDataplaneOverride(daemonSet(canonical), daemonSet(nil))
+		require.ErrorContains(t, err, "RACER_CONTROL_ENDPOINT")
+	})
+}
