@@ -156,8 +156,8 @@ type MachineConfigurationNVIDIA struct {
 }
 
 // MachineConfigurationNVIDIAIMEX configures NVIDIA IMEX integration.
-// +kubebuilder:validation:XValidation:rule="!has(self.mode) || (has(self.hostProfile) && has(self.hostProfileVersion) && has(self.hostProfileDigest))",message="mode DRA requires hostProfile, hostProfileVersion, and hostProfileDigest"
-// +kubebuilder:validation:XValidation:rule="has(self.mode) || (!has(self.hostProfile) && !has(self.hostProfileVersion) && !has(self.hostProfileDigest))",message="host qualification fields require mode DRA"
+// +kubebuilder:validation:XValidation:rule="!has(self.mode) || (has(self.hostProfile) && has(self.hostProfileVersion) && has(self.hostContractVersion) && has(self.hostArtifactPath) && has(self.hostProfileDigest))",message="mode DRA requires hostProfile, hostProfileVersion, hostContractVersion, hostArtifactPath, and hostProfileDigest"
+// +kubebuilder:validation:XValidation:rule="has(self.mode) || (!has(self.hostProfile) && !has(self.hostProfileVersion) && !has(self.hostContractVersion) && !has(self.hostArtifactPath) && !has(self.hostProfileDigest))",message="host qualification fields require mode DRA"
 type MachineConfigurationNVIDIAIMEX struct {
 	// Mode selects the IMEX lifecycle owner. DRA exposes a prequalified node to
 	// NVIDIA DRA ComputeDomains; an empty value disables IMEX exposure.
@@ -179,6 +179,21 @@ type MachineConfigurationNVIDIAIMEX struct {
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`
 	HostProfileVersion string `json:"hostProfileVersion,omitempty"`
+
+	// HostContractVersion is the exact qualification contract selected for the
+	// profile and version.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	HostContractVersion string `json:"hostContractVersion,omitempty"`
+
+	// HostArtifactPath is the exact canonical qualification artifact path
+	// selected for the profile contract.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=4096
+	// +kubebuilder:validation:Pattern=`^/.*$`
+	HostArtifactPath string `json:"hostArtifactPath,omitempty"`
 
 	// HostProfileDigest is the sha256 digest of the RFC 8785 canonical
 	// qualification document produced with the host image.

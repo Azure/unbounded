@@ -28,6 +28,8 @@ func configCreateCommand() *cobra.Command {
 		nvidiaIMEXMode    string
 		nvidiaHostProfile string
 		nvidiaProfileVer  string
+		nvidiaContractVer string
+		nvidiaArtifact    string
 		nvidiaProfileHash string
 	)
 
@@ -63,6 +65,8 @@ Example:
 				nvidiaIMEXMode:    nvidiaIMEXMode,
 				nvidiaHostProfile: nvidiaHostProfile,
 				nvidiaProfileVer:  nvidiaProfileVer,
+				nvidiaContractVer: nvidiaContractVer,
+				nvidiaArtifact:    nvidiaArtifact,
 				nvidiaProfileHash: nvidiaProfileHash,
 			}, cmd.OutOrStdout())
 		},
@@ -77,6 +81,8 @@ Example:
 	cmd.Flags().StringVar(&nvidiaIMEXMode, "nvidia-imex-mode", "", "NVIDIA IMEX lifecycle mode: DRA")
 	cmd.Flags().StringVar(&nvidiaHostProfile, "nvidia-host-profile", "", "Prequalified NVIDIA host profile name")
 	cmd.Flags().StringVar(&nvidiaProfileVer, "nvidia-host-profile-version", "", "Prequalified NVIDIA host profile version")
+	cmd.Flags().StringVar(&nvidiaContractVer, "nvidia-host-contract-version", "", "Exact NVIDIA host qualification contract version")
+	cmd.Flags().StringVar(&nvidiaArtifact, "nvidia-host-artifact-path", "", "Exact absolute path to the canonical NVIDIA host qualification artifact")
 	cmd.Flags().StringVar(&nvidiaProfileHash, "nvidia-host-profile-digest", "", "sha256 digest of the RFC 8785 canonical host qualification document")
 
 	return cmd
@@ -92,6 +98,8 @@ type configCreateOpts struct {
 	nvidiaIMEXMode    string
 	nvidiaHostProfile string
 	nvidiaProfileVer  string
+	nvidiaContractVer string
+	nvidiaArtifact    string
 	nvidiaProfileHash string
 }
 
@@ -143,10 +151,18 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 			return fmt.Errorf("--nvidia-host-profile is required with --nvidia-imex-mode=DRA")
 		case strings.TrimSpace(opts.nvidiaProfileVer) == "":
 			return fmt.Errorf("--nvidia-host-profile-version is required with --nvidia-imex-mode=DRA")
+		case strings.TrimSpace(opts.nvidiaContractVer) == "":
+			return fmt.Errorf("--nvidia-host-contract-version is required with --nvidia-imex-mode=DRA")
+		case strings.TrimSpace(opts.nvidiaArtifact) == "":
+			return fmt.Errorf("--nvidia-host-artifact-path is required with --nvidia-imex-mode=DRA")
 		case strings.TrimSpace(opts.nvidiaProfileHash) == "":
 			return fmt.Errorf("--nvidia-host-profile-digest is required with --nvidia-imex-mode=DRA")
 		}
-	} else if opts.nvidiaHostProfile != "" || opts.nvidiaProfileVer != "" || opts.nvidiaProfileHash != "" {
+	} else if opts.nvidiaHostProfile != "" ||
+		opts.nvidiaProfileVer != "" ||
+		opts.nvidiaContractVer != "" ||
+		opts.nvidiaArtifact != "" ||
+		opts.nvidiaProfileHash != "" {
 		return fmt.Errorf("NVIDIA host qualification flags require --nvidia-imex-mode=DRA")
 	}
 
@@ -157,10 +173,12 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 		if opts.nvidiaIMEXMode != "" {
 			mc.Spec.Template.Agent.NVIDIA = &v1alpha3.MachineConfigurationNVIDIA{
 				IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
-					Mode:               v1alpha3.NVIDIAIMEXMode(opts.nvidiaIMEXMode),
-					HostProfile:        opts.nvidiaHostProfile,
-					HostProfileVersion: opts.nvidiaProfileVer,
-					HostProfileDigest:  opts.nvidiaProfileHash,
+					Mode:                v1alpha3.NVIDIAIMEXMode(opts.nvidiaIMEXMode),
+					HostProfile:         opts.nvidiaHostProfile,
+					HostProfileVersion:  opts.nvidiaProfileVer,
+					HostContractVersion: opts.nvidiaContractVer,
+					HostArtifactPath:    opts.nvidiaArtifact,
+					HostProfileDigest:   opts.nvidiaProfileHash,
 				},
 			}
 		}
@@ -184,6 +202,8 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 		printConfig(out, "nvidia-imex-mode", opts.nvidiaIMEXMode)
 		printConfig(out, "nvidia-host-profile", opts.nvidiaHostProfile)
 		printConfig(out, "nvidia-host-profile-version", opts.nvidiaProfileVer)
+		printConfig(out, "nvidia-host-contract-version", opts.nvidiaContractVer)
+		printConfig(out, "nvidia-host-artifact-path", opts.nvidiaArtifact)
 		printConfig(out, "nvidia-host-profile-digest", opts.nvidiaProfileHash)
 	}
 

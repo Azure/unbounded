@@ -226,10 +226,12 @@ func TestSyncNVIDIAIMEXNodeMetadata(t *testing.T) {
 	assert.NotContains(t, got.Annotations, provision.NVIDIAHostProfileDigestAnnotationKey)
 
 	imex := &provision.NVIDIAIMEXConfig{
-		Mode:               provision.NVIDIAIMEXModeDRA,
-		HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-		HostProfileVersion: "v2026.10.14-1",
-		HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Mode:                provision.NVIDIAIMEXModeDRA,
+		HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+		HostProfileVersion:  "v2026.10.14-1",
+		HostContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+		HostArtifactPath:    "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json",
+		HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
 	require.NoError(t, syncNVIDIAIMEXNodeMetadata(ctx, kubeClient, node.Name, imex))
 	require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, &got))

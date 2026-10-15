@@ -281,10 +281,12 @@ func TestAgentConfig_Validate(t *testing.T) {
 			mutate: func(cfg *AgentConfig) {
 				cfg.NVIDIA = &NVIDIAConfig{
 					IMEX: &NVIDIAIMEXConfig{
-						Mode:               NVIDIAIMEXModeDRA,
-						HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-						HostProfileVersion: "v1",
-						HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+						Mode:                NVIDIAIMEXModeDRA,
+						HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+						HostProfileVersion:  "v1",
+						HostContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+						HostArtifactPath:    "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json",
+						HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 					},
 				}
 			},
@@ -294,9 +296,11 @@ func TestAgentConfig_Validate(t *testing.T) {
 			mutate: func(cfg *AgentConfig) {
 				cfg.NVIDIA = &NVIDIAConfig{
 					IMEX: &NVIDIAIMEXConfig{
-						Mode:               NVIDIAIMEXModeDRA,
-						HostProfileVersion: "v1",
-						HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+						Mode:                NVIDIAIMEXModeDRA,
+						HostProfileVersion:  "v1",
+						HostContractVersion: "contract/v1",
+						HostArtifactPath:    "/qualification.json",
+						HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 					},
 				}
 			},
@@ -307,10 +311,12 @@ func TestAgentConfig_Validate(t *testing.T) {
 			mutate: func(cfg *AgentConfig) {
 				cfg.NVIDIA = &NVIDIAConfig{
 					IMEX: &NVIDIAIMEXConfig{
-						Mode:               NVIDIAIMEXModeDRA,
-						HostProfile:        "Hillsboro profile",
-						HostProfileVersion: "v1",
-						HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+						Mode:                NVIDIAIMEXModeDRA,
+						HostProfile:         "Hillsboro profile",
+						HostProfileVersion:  "v1",
+						HostContractVersion: "contract/v1",
+						HostArtifactPath:    "/qualification.json",
+						HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 					},
 				}
 			},
@@ -321,14 +327,47 @@ func TestAgentConfig_Validate(t *testing.T) {
 			mutate: func(cfg *AgentConfig) {
 				cfg.NVIDIA = &NVIDIAConfig{
 					IMEX: &NVIDIAIMEXConfig{
-						Mode:               NVIDIAIMEXModeDRA,
-						HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-						HostProfileVersion: "v1",
-						HostProfileDigest:  "sha256:ABC",
+						Mode:                NVIDIAIMEXModeDRA,
+						HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+						HostProfileVersion:  "v1",
+						HostContractVersion: "contract/v1",
+						HostArtifactPath:    "/qualification.json",
+						HostProfileDigest:   "sha256:ABC",
 					},
 				}
 			},
 			wantErr: "64 lowercase hexadecimal",
+		},
+		{
+			name: "NVIDIA IMEX missing contract version",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NVIDIA = &NVIDIAConfig{
+					IMEX: &NVIDIAIMEXConfig{
+						Mode:               NVIDIAIMEXModeDRA,
+						HostProfile:        "hillsboro-gb200-gpu-operator-ready",
+						HostProfileVersion: "v1",
+						HostArtifactPath:   "/qualification.json",
+						HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					},
+				}
+			},
+			wantErr: "NVIDIA.IMEX.HostContractVersion is required",
+		},
+		{
+			name: "NVIDIA IMEX unsafe artifact path",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NVIDIA = &NVIDIAConfig{
+					IMEX: &NVIDIAIMEXConfig{
+						Mode:                NVIDIAIMEXModeDRA,
+						HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+						HostProfileVersion:  "v1",
+						HostContractVersion: "contract/v1",
+						HostArtifactPath:    "/etc/../qualification.json",
+						HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					},
+				}
+			},
+			wantErr: "NVIDIA.IMEX.HostArtifactPath must be a clean absolute path",
 		},
 		{
 			name: "unsupported NVIDIA IMEX mode",
@@ -411,10 +450,12 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 		Gantry: &GantryConfig{Disabled: true},
 		NVIDIA: &NVIDIAConfig{
 			IMEX: &NVIDIAIMEXConfig{
-				Mode:               NVIDIAIMEXModeDRA,
-				HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-				HostProfileVersion: "v1",
-				HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				Mode:                NVIDIAIMEXModeDRA,
+				HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+				HostProfileVersion:  "v1",
+				HostContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+				HostArtifactPath:    "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json",
+				HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			},
 		},
 	}
@@ -451,6 +492,8 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.Equal(t, NVIDIAIMEXModeDRA, original.NVIDIA.IMEX.Mode)
 	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", original.NVIDIA.IMEX.HostProfile)
 	require.Equal(t, "v1", original.NVIDIA.IMEX.HostProfileVersion)
+	require.Equal(t, "hillsboro.nvidia-host-capabilities/v1", original.NVIDIA.IMEX.HostContractVersion)
+	require.Equal(t, "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json", original.NVIDIA.IMEX.HostArtifactPath)
 	require.Equal(t, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", original.NVIDIA.IMEX.HostProfileDigest)
 }
 

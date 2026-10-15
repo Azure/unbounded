@@ -17,7 +17,10 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
-const testNVIDIAQualificationDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const (
+	testNVIDIAQualificationDigest       = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testUbuntuNVIDIAQualificationDigest = "sha256:311893302546decb52cc9420e1b71603f22a48623a1686e17cd7eb2b0abe8596"
+)
 
 func ptr[T any](value T) *T {
 	return &value
@@ -113,6 +116,45 @@ func validTestNVIDIAQualification() NVIDIAIMEXQualification {
 		},
 		DocumentDigest: testNVIDIAQualificationDigest,
 	}
+}
+
+func testUbuntuNVIDIAQualification(t *testing.T, qualified bool) *resolvedNVIDIAQualification {
+	t.Helper()
+
+	data, err := os.ReadFile("testdata/nvidia-gpu-operator-ubuntu.blocked.json")
+	require.NoError(t, err)
+
+	resolved, err := decodeUbuntuNVIDIAQualification(data, testUbuntuNVIDIAQualificationDigest)
+	require.NoError(t, err)
+
+	if !qualified {
+		return resolved
+	}
+
+	qualification := resolved.Ubuntu
+	imageDigest := "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	qualification.Image = NVIDIAQualificationImage{
+		ID:      ptr("hillsboro-ubuntu2404-gb200"),
+		Version: ptr("2026.10.14"),
+		Digest:  ptr(imageDigest),
+	}
+	qualification.Distro.KernelHeaders = ptr("6.14.0-1009-azure-nvidia")
+	qualification.Driver.Installed = true
+	qualification.FabricManager.Installed = true
+	qualification.NSCQ.Installed = true
+	qualification.IMEX.Installed = true
+	qualification.IMEX.Service.Present = true
+	qualification.IMEX.Service.Masked = true
+	qualification.Acceptance.Status = "qualified"
+	qualification.Acceptance.QualifiedAt = ptr("2026-10-14T00:00:00Z")
+	qualification.Acceptance.FailClosedReasons = []string{}
+	qualification.Authenticity.Status = "verified"
+	qualification.Authenticity.Attestation.SubjectDigest = ptr(imageDigest)
+	qualification.Authenticity.Attestation.Reference = ptr("attestation://hillsboro/ubuntu/2026.10.14")
+	qualification.Authenticity.Attestation.Verifier = ptr("hillsboro-image-verifier")
+	qualification.Authenticity.Attestation.Verified = true
+
+	return resolved
 }
 
 func TestNVIDIAStateAvailable(t *testing.T) {
@@ -217,16 +259,44 @@ func TestNVIDIAQualificationContractForRequiresExactProfileAndVersion(t *testing
 	contract, err := nvidiaQualificationContractFor(
 		azureLinuxNVIDIAQualificationProfile,
 		azureLinuxNVIDIAQualificationProfileVersion,
+		azureLinuxNVIDIAQualificationContractVersion,
+		azureLinuxNVIDIAQualificationPath,
 	)
 	require.NoError(t, err)
 	require.Equal(t, azureLinuxNVIDIAQualificationContractVersion, contract.contractVersion)
 	require.Equal(t, azureLinuxNVIDIAQualificationPath, contract.artifactPath)
 
-	_, err = nvidiaQualificationContractFor("unknown-profile", azureLinuxNVIDIAQualificationProfileVersion)
-	require.ErrorContains(t, err, "unsupported NVIDIA host qualification profile")
+	_, err = nvidiaQualificationContractFor(
+		"unknown-profile",
+		azureLinuxNVIDIAQualificationProfileVersion,
+		azureLinuxNVIDIAQualificationContractVersion,
+		azureLinuxNVIDIAQualificationPath,
+	)
+	require.ErrorContains(t, err, "unsupported NVIDIA host qualification tuple")
 
-	_, err = nvidiaQualificationContractFor(azureLinuxNVIDIAQualificationProfile, "unknown-version")
-	require.ErrorContains(t, err, "unsupported NVIDIA host qualification profile")
+	_, err = nvidiaQualificationContractFor(
+		azureLinuxNVIDIAQualificationProfile,
+		"unknown-version",
+		azureLinuxNVIDIAQualificationContractVersion,
+		azureLinuxNVIDIAQualificationPath,
+	)
+	require.ErrorContains(t, err, "unsupported NVIDIA host qualification tuple")
+
+	_, err = nvidiaQualificationContractFor(
+		azureLinuxNVIDIAQualificationProfile,
+		azureLinuxNVIDIAQualificationProfileVersion,
+		ubuntuNVIDIAQualificationContractVersion,
+		azureLinuxNVIDIAQualificationPath,
+	)
+	require.ErrorContains(t, err, "unsupported NVIDIA host qualification tuple")
+
+	_, err = nvidiaQualificationContractFor(
+		azureLinuxNVIDIAQualificationProfile,
+		azureLinuxNVIDIAQualificationProfileVersion,
+		azureLinuxNVIDIAQualificationContractVersion,
+		ubuntuNVIDIAQualificationPath,
+	)
+	require.ErrorContains(t, err, "unsupported NVIDIA host qualification tuple")
 }
 
 func TestResolveNVIDIAIMEXQualificationRejectsCrossContractSubstitution(t *testing.T) {
@@ -251,6 +321,51 @@ func TestResolveNVIDIAIMEXQualificationRejectsCrossContractSubstitution(t *testi
 	_, err = resolveNVIDIAIMEXQualificationForContract(otherContract, path)
 	require.ErrorContains(t, err, "identity is")
 	require.ErrorContains(t, err, "expected other-profile/v1 contract other.contract/v1")
+}
+
+func TestResolveUbuntuNVIDIAQualificationMatchesProducerBlockedExample(t *testing.T) {
+	t.Parallel()
+
+	path := "testdata/nvidia-gpu-operator-ubuntu.blocked.json"
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Len(t, data, 4325)
+	require.Equal(
+		t,
+		"311893302546decb52cc9420e1b71603f22a48623a1686e17cd7eb2b0abe8596",
+		fmt.Sprintf("%x", sha256.Sum256(data)),
+	)
+
+	resolved, err := resolveNVIDIAIMEXQualificationForContract(ubuntuNVIDIAQualificationContract, path)
+	require.NoError(t, err)
+	require.NotNil(t, resolved.Ubuntu)
+	require.Equal(t, ubuntuNVIDIAQualificationProfile, resolved.Ubuntu.Profile)
+	require.Equal(t, "blocked", resolved.Ubuntu.Acceptance.Status)
+	require.Equal(t, testUbuntuNVIDIAQualificationDigest, resolved.Ubuntu.DocumentDigest)
+}
+
+func TestResolveUbuntuNVIDIAQualificationRejectsUnknownNestedField(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile("testdata/nvidia-gpu-operator-ubuntu.blocked.json")
+	require.NoError(t, err)
+
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(data, &document))
+	document["authenticity"].(map[string]any)["unexpected"] = true
+
+	encoded, err := json.Marshal(document)
+	require.NoError(t, err)
+	canonical, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "nvidia-gpu-operator-ubuntu.json")
+	require.NoError(t, os.WriteFile(path, canonical, 0o600))
+	digest := fmt.Sprintf("%x", sha256.Sum256(canonical))
+	require.NoError(t, os.WriteFile(path+".sha256", []byte(digest+"  "+filepath.Base(path)+"\n"), 0o600))
+
+	_, err = resolveNVIDIAIMEXQualificationForContract(ubuntuNVIDIAQualificationContract, path)
+	require.ErrorContains(t, err, `unknown field "unexpected" in authenticity`)
 }
 
 func TestResolveNVIDIAIMEXQualificationRejectsUnknownFields(t *testing.T) {
@@ -443,10 +558,12 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 	t.Parallel()
 
 	imex := &config.NVIDIAIMEXConfig{
-		Mode:               config.NVIDIAIMEXModeDRA,
-		HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-		HostProfileVersion: "v2026.10.14-1",
-		HostProfileDigest:  testNVIDIAQualificationDigest,
+		Mode:                config.NVIDIAIMEXModeDRA,
+		HostProfile:         azureLinuxNVIDIAQualificationProfile,
+		HostProfileVersion:  azureLinuxNVIDIAQualificationProfileVersion,
+		HostContractVersion: azureLinuxNVIDIAQualificationContractVersion,
+		HostArtifactPath:    azureLinuxNVIDIAQualificationPath,
+		HostProfileDigest:   testNVIDIAQualificationDigest,
 	}
 
 	valid := func() NvidiaHost {
@@ -474,7 +591,9 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 			HostArchitecture:         "arm64",
 			HostDistroVersion:        "3.0",
 			LocalNVLinkHealthy:       true,
-			IMEXQualification:        &qualification,
+			IMEXQualification: &resolvedNVIDIAQualification{
+				NVIDIAIMEXQualification: &qualification,
+			},
 		}
 	}
 
@@ -492,7 +611,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 				imex.HostProfile = "unknown-profile"
 			},
 			distro:  hostDistroAzureLinux3,
-			wantErr: "unsupported NVIDIA host qualification profile",
+			wantErr: "unsupported NVIDIA host qualification tuple",
 		},
 		{
 			name: "unsupported profile version",
@@ -500,7 +619,7 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 				imex.HostProfileVersion = "unknown-version"
 			},
 			distro:  hostDistroAzureLinux3,
-			wantErr: "unsupported NVIDIA host qualification profile",
+			wantErr: "unsupported NVIDIA host qualification tuple",
 		},
 		{
 			name: "missing binaries",
@@ -793,6 +912,185 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 			}
 
 			testIMEX := *imex
+			if tt.mutateConfig != nil {
+				tt.mutateConfig(&testIMEX)
+			}
+
+			got, err := configureNVIDIAIMEX(host, &testIMEX, tt.distro)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, config.NVIDIAIMEXModeDRA, got.IMEXMode)
+			require.Contains(t, got.GPUDevicePaths, "/dev/nvidia-caps-imex-channels")
+		})
+	}
+}
+
+func TestConfigureNVIDIAIMEXDRAUbuntu(t *testing.T) {
+	t.Parallel()
+
+	ubuntuConfig := config.NVIDIAIMEXConfig{
+		Mode:                config.NVIDIAIMEXModeDRA,
+		HostProfile:         ubuntuNVIDIAQualificationProfile,
+		HostProfileVersion:  ubuntuNVIDIAQualificationProfileVersion,
+		HostContractVersion: ubuntuNVIDIAQualificationContractVersion,
+		HostArtifactPath:    ubuntuNVIDIAQualificationPath,
+		HostProfileDigest:   testUbuntuNVIDIAQualificationDigest,
+	}
+
+	valid := func(t *testing.T) NvidiaHost {
+		t.Helper()
+
+		return NvidiaHost{
+			GPUDevicePaths: []string{
+				"/dev/nvidia0",
+				"/dev/nvidia1",
+				"/dev/nvidia2",
+				"/dev/nvidia3",
+				"/dev/nvidiactl",
+				"/dev/nvidia-uvm",
+				"/dev/nvidia-caps",
+				"/dev/nvidia-caps-imex-channels",
+			},
+			NvidiaSMIPath:            "/usr/bin/nvidia-smi",
+			NvidiaIMEXPath:           "/usr/bin/nvidia-imex",
+			NvidiaIMEXCtlPath:        "/usr/bin/nvidia-imex-ctl",
+			DriverVersion:            "580.178.04",
+			IMEXManagementCapability: true,
+			IMEXDeviceClass:          true,
+			IMEXServiceUnitState:     "masked",
+			HostKernelVersion:        "6.14.0-1009-azure-nvidia",
+			HostArchitecture:         "arm64",
+			HostDistroVersion:        "24.04",
+			LocalNVLinkHealthy:       true,
+			IMEXQualification:        testUbuntuNVIDIAQualification(t, true),
+		}
+	}
+
+	tests := []struct {
+		name         string
+		mutate       func(*testing.T, *NvidiaHost)
+		mutateConfig func(*config.NVIDIAIMEXConfig)
+		distro       string
+		wantErr      string
+	}{
+		{name: "supported", distro: hostDistroUbuntu2404},
+		{
+			name: "blocked producer artifact",
+			mutate: func(t *testing.T, host *NvidiaHost) {
+				host.IMEXQualification = testUbuntuNVIDIAQualification(t, false)
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "verified immutable image ID",
+		},
+		{
+			name: "Azure artifact cannot satisfy Ubuntu profile",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				qualification := validTestNVIDIAQualification()
+				host.IMEXQualification = &resolvedNVIDIAQualification{
+					NVIDIAIMEXQualification: &qualification,
+				}
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "expected hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1 contract hillsboro.ubuntu-nvidia-host-capabilities/v1",
+		},
+		{
+			name: "Ubuntu artifact cannot satisfy Azure profile",
+			mutateConfig: func(imex *config.NVIDIAIMEXConfig) {
+				imex.HostProfile = azureLinuxNVIDIAQualificationProfile
+				imex.HostProfileVersion = azureLinuxNVIDIAQualificationProfileVersion
+				imex.HostContractVersion = azureLinuxNVIDIAQualificationContractVersion
+				imex.HostArtifactPath = azureLinuxNVIDIAQualificationPath
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "expected hillsboro-gb200-gpu-operator-ready/v2026.10.14-1 contract hillsboro.nvidia-host-capabilities/v1",
+		},
+		{
+			name: "image identity missing",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.Image.ID = nil
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "verified immutable image ID",
+		},
+		{
+			name:    "wrong host distro",
+			distro:  hostDistroAzureLinux3,
+			wantErr: "OS/kernel",
+		},
+		{
+			name: "driver package mismatch",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.Driver.Package = "other-package"
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "driver evidence is unsupported",
+		},
+		{
+			name: "IMEX service not masked",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.IMEX.Service.Masked = false
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "service ownership",
+		},
+		{
+			name: "containerd binary mismatch",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.ContainerRuntime.BinaryDigest = testNVIDIAQualificationDigest
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "approved containerd 2.1.8",
+		},
+		{
+			name: "acceptance blocked",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.Acceptance.Status = "blocked"
+				host.IMEXQualification.Ubuntu.Acceptance.FailClosedReasons = []string{"blocked"}
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "acceptance status is blocked",
+		},
+		{
+			name: "attestation unavailable",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.Authenticity.Status = "unavailable"
+				host.IMEXQualification.Ubuntu.Authenticity.Attestation.Verified = false
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "authenticity is not verified",
+		},
+		{
+			name: "attestation subject mismatch",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.Authenticity.Attestation.SubjectDigest = ptr(testNVIDIAQualificationDigest)
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "bound to the image digest",
+		},
+		{
+			name: "qualification digest mismatch",
+			mutate: func(_ *testing.T, host *NvidiaHost) {
+				host.IMEXQualification.Ubuntu.DocumentDigest = testNVIDIAQualificationDigest
+			},
+			distro:  hostDistroUbuntu2404,
+			wantErr: "qualification digest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			host := valid(t)
+			if tt.mutate != nil {
+				tt.mutate(t, &host)
+			}
+
+			testIMEX := ubuntuConfig
 			if tt.mutateConfig != nil {
 				tt.mutateConfig(&testIMEX)
 			}

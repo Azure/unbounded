@@ -127,6 +127,14 @@ type NVIDIAIMEXConfig struct {
 	// HostProfileVersion is the expected version of HostProfile.
 	HostProfileVersion string `json:"HostProfileVersion,omitempty"`
 
+	// HostContractVersion is the exact qualification contract selected for the
+	// profile and version.
+	HostContractVersion string `json:"HostContractVersion,omitempty"`
+
+	// HostArtifactPath is the exact canonical qualification artifact path
+	// selected for the profile contract.
+	HostArtifactPath string `json:"HostArtifactPath,omitempty"`
+
 	// HostProfileDigest is the sha256 digest of the RFC 8785 canonical
 	// qualification document produced with the host image.
 	HostProfileDigest string `json:"HostProfileDigest,omitempty"`
@@ -335,6 +343,8 @@ func (a *AgentConfig) validateNVIDIA() error {
 	case "":
 		if strings.TrimSpace(imex.HostProfile) != "" ||
 			strings.TrimSpace(imex.HostProfileVersion) != "" ||
+			strings.TrimSpace(imex.HostContractVersion) != "" ||
+			strings.TrimSpace(imex.HostArtifactPath) != "" ||
 			strings.TrimSpace(imex.HostProfileDigest) != "" {
 			return fmt.Errorf("NVIDIA.IMEX host qualification fields require Mode %q", NVIDIAIMEXModeDRA)
 		}
@@ -352,6 +362,16 @@ func (a *AgentConfig) validateNVIDIA() error {
 			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileVersion is required"))
 		} else if NormalizeNVIDIAProfileVersionLabel(imex.HostProfileVersion) == "" {
 			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostProfileVersion must normalize to a lowercase DNS label of at most 63 characters"))
+		}
+
+		if strings.TrimSpace(imex.HostContractVersion) == "" {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostContractVersion is required"))
+		}
+
+		if strings.TrimSpace(imex.HostArtifactPath) == "" {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostArtifactPath is required"))
+		} else if !filepath.IsAbs(imex.HostArtifactPath) || filepath.Clean(imex.HostArtifactPath) != imex.HostArtifactPath {
+			errs = append(errs, fmt.Errorf("NVIDIA.IMEX.HostArtifactPath must be a clean absolute path"))
 		}
 
 		if !validSHA256Digest(imex.HostProfileDigest) {

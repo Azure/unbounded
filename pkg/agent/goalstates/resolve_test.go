@@ -80,29 +80,67 @@ func TestValidateNVIDIAIMEXKubernetesVersion(t *testing.T) {
 	}
 }
 
-func TestResolveNSpawnConfigRejectsUnknownNVIDIAProfileBeforeArtifactRead(t *testing.T) {
+func TestResolveNSpawnConfigRejectsUnsupportedNVIDIATupleBeforeArtifactRead(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.AgentConfig{
-		Cluster: config.AgentClusterConfig{Version: "1.34.3"},
-		NVIDIA: &config.NVIDIAConfig{
-			IMEX: &config.NVIDIAIMEXConfig{
-				Mode:               config.NVIDIAIMEXModeDRA,
-				HostProfile:        "unknown-profile",
-				HostProfileVersion: "v1",
-				HostProfileDigest:  testNVIDIAQualificationDigest,
+	tests := []struct {
+		name string
+		imex config.NVIDIAIMEXConfig
+	}{
+		{
+			name: "unknown profile",
+			imex: config.NVIDIAIMEXConfig{
+				Mode:                config.NVIDIAIMEXModeDRA,
+				HostProfile:         "unknown-profile",
+				HostProfileVersion:  "v1",
+				HostContractVersion: "unknown.contract/v1",
+				HostArtifactPath:    "/etc/unbounded/host-capabilities/unknown.json",
+				HostProfileDigest:   testNVIDIAQualificationDigest,
+			},
+		},
+		{
+			name: "contract substitution",
+			imex: config.NVIDIAIMEXConfig{
+				Mode:                config.NVIDIAIMEXModeDRA,
+				HostProfile:         azureLinuxNVIDIAQualificationProfile,
+				HostProfileVersion:  azureLinuxNVIDIAQualificationProfileVersion,
+				HostContractVersion: ubuntuNVIDIAQualificationContractVersion,
+				HostArtifactPath:    azureLinuxNVIDIAQualificationPath,
+				HostProfileDigest:   testNVIDIAQualificationDigest,
+			},
+		},
+		{
+			name: "artifact substitution",
+			imex: config.NVIDIAIMEXConfig{
+				Mode:                config.NVIDIAIMEXModeDRA,
+				HostProfile:         azureLinuxNVIDIAQualificationProfile,
+				HostProfileVersion:  azureLinuxNVIDIAQualificationProfileVersion,
+				HostContractVersion: azureLinuxNVIDIAQualificationContractVersion,
+				HostArtifactPath:    ubuntuNVIDIAQualificationPath,
+				HostProfileDigest:   testNVIDIAQualificationDigest,
 			},
 		},
 	}
 
-	_, err := resolveNSpawnConfig(
-		cfg,
-		NSpawnMachineKube1,
-		func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
-	)
-	require.ErrorIs(t, err, ErrNVIDIAHostUnqualified)
-	require.ErrorContains(t, err, "unsupported NVIDIA host qualification profile unknown-profile/v1")
-	require.NotContains(t, err.Error(), "read NVIDIA host qualification")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config.AgentConfig{
+				Cluster: config.AgentClusterConfig{Version: "1.34.3"},
+				NVIDIA:  &config.NVIDIAConfig{IMEX: &tt.imex},
+			}
+
+			_, err := resolveNSpawnConfig(
+				cfg,
+				NSpawnMachineKube1,
+				func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
+			)
+			require.ErrorIs(t, err, ErrNVIDIAHostUnqualified)
+			require.ErrorContains(t, err, "unsupported NVIDIA host qualification tuple")
+			require.NotContains(t, err.Error(), "read NVIDIA host qualification")
+		})
+	}
 }
 
 func TestResolveKubeletAddsIMEXModeLabelWithoutMutatingConfig(t *testing.T) {

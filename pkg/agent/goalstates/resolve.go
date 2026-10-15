@@ -77,7 +77,12 @@ func resolveNSpawnConfig(
 			return nil, fmt.Errorf("%w: %v", ErrNVIDIAHostUnqualified, err)
 		}
 
-		contract, err := nvidiaQualificationContractFor(imex.HostProfile, imex.HostProfileVersion)
+		contract, err := nvidiaQualificationContractFor(
+			imex.HostProfile,
+			imex.HostProfileVersion,
+			imex.HostContractVersion,
+			imex.HostArtifactPath,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrNVIDIAHostUnqualified, err)
 		}

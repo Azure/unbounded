@@ -99,11 +99,12 @@ GPUCluster, ComputeDomain, ResourceClaim, or DRA ResourceSlice was installed.
 
 The latest read-only preflight found gb200-2/3/4 Ready and advertising four
 GPUs in the existing Racer domain. gb200-1 is Ready but cordoned and excluded.
-That does not make any node eligible for the new Ubuntu profile:
+That does not make any node eligible for the Ubuntu profile:
 
-- The producer has named the Ubuntu profile, but has not generated a canonical
-  qualification artifact, digest, authenticity attestation, or final consumer
-  schema. Its status is `not-generated-unqualified`.
+- The producer has published the closed Ubuntu schema and canonical blocked
+  regression fixture, but no host has produced a qualified artifact with an
+  immutable image digest and verified authenticity attestation. The committed
+  fixture has `acceptance.status=blocked` and must be rejected for readiness.
 - gb200-3 and gb200-4 have authoritative rack, MAC, and target-disk mappings:
   gb200-3 is Node `gb2002159d2425`, rack slot 26, MAC ending `9c:d7`, and disk
   WWID ending `ef1a0`; gb200-4 is Node `gb2002159d2424`, rack slot 25, MAC
@@ -123,14 +124,14 @@ identity, rack mapping, and host authenticity baseline all agree.
 
 ## Selected host profile
 
-The proposed Ubuntu image contract is named:
+The Ubuntu image contract is named:
 
 ```text
 hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1
 ```
 
 The producer source of truth is `aks-flex-dev` commit
-`9c285427b1bc38b5c468470fcf51ac9638168e33` and
+`aad7463945848555d392b1c33c906ef4d4e37eeb` and
 [ADO PR 17532408](https://dev.azure.com/msazure/09706533-03bf-4b43-9a9b-b49c75429646/_git/678b10b4-3043-4c26-9eb1-46f7c336019b/pullrequest/17532408).
 The profile root is:
 
@@ -140,55 +141,55 @@ labs/gb200-hillsboro/gpu-operator-ownership/host-profiles/hillsboro-gb200-ubuntu
 
 The producer documentation is
 `labs/gb200-hillsboro/gpu-operator-ownership/docs/hillsboro-gb200-ubuntu-host-profile.md`;
-the future consumer example is
+the consumer example is
 `labs/gb200-hillsboro/gpu-operator-ownership/unbounded/machineconfiguration-hillsboro-gb200-ubuntu.example.yaml`.
 The contract identifier is
 `hillsboro.ubuntu-nvidia-host-capabilities/v1`.
 
-This profile is **not generated and unqualified**. Approved IMEX, Fabric
-Manager, NSCQ, immutable image provenance, canonical evidence, digest, and
-authenticity gates remain unresolved. PR #913 must not hardcode provisional
-Ubuntu values or accept the old Azure Linux fixture as authorization for an
-Ubuntu join.
-
-The producer proposes the artifact path
-`/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json`. The
-Unbounded consumer must not adopt that path or new contract constants until
-the producer commits the final closed schema, canonical qualified artifact,
-sidecar format, digest, and attestation semantics.
+The producer has committed the closed schema at
+`labs/gb200-hillsboro/gpu-operator-ownership/schemas/nvidia-gpu-operator-ubuntu-host-capabilities-v1.schema.json`
+and the canonical blocked fixture at
+`labs/gb200-hillsboro/gpu-operator-ownership/examples/nvidia-gpu-operator-ubuntu.blocked.json`.
+That fixture is exactly 4,325 bytes, has SHA-256
+`311893302546decb52cc9420e1b71603f22a48623a1686e17cd7eb2b0abe8596`,
+and is intentionally not qualification evidence. It proves decoder and
+canonicalization compatibility only.
 
 The consumer maintains an explicit registry keyed by exact profile and profile
 version. Each entry binds one contract version, canonical artifact path,
 closed-field decoder, and semantic validator. It does not select a contract
-from the detected OS. The existing Azure Linux entry remains supported; the
-Ubuntu profile intentionally has no registry entry until its final contract is
-published.
+from the detected OS. Exact Azure Linux and Ubuntu entries coexist without
+aliases or fallback. MachineConfiguration must identify the profile, profile
+version, contract version, artifact path, and qualified artifact digest.
 
-The prior Azure Linux blocked artifact and digest remain useful only as
-decoder regression fixtures. They do not qualify any Hillsboro node and are
-not the selected rollout contract.
+Both committed blocked artifacts remain decoder regression fixtures. Neither
+qualifies a Hillsboro node.
 
 | Field | Required value |
 |---|---|
 | `profile` | `hillsboro-gb200-ubuntu-gpu-operator-ready` |
 | `profileVersion` | `v2026.10.14-1` |
 | `contractVersion` | `hillsboro.ubuntu-nvidia-host-capabilities/v1` |
-| proposed artifact | `/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json` |
-| producer status | `not-generated-unqualified` |
+| artifact | `/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json` |
+| blocked fixture digest | `sha256:311893302546decb52cc9420e1b71603f22a48623a1686e17cd7eb2b0abe8596` |
+| producer status | contract published; qualified host artifact unavailable |
 
-After the producer publishes and PR #913 implements the final schema, a future
-MachineConfiguration will supply the exact producer digest:
+A future MachineConfiguration will supply the exact digest of a qualified host
+artifact:
 
 ```bash
 kubectl unbounded machine config create hillsboro-gb200-dra \
   --nvidia-imex-mode=DRA \
   --nvidia-host-profile=hillsboro-gb200-ubuntu-gpu-operator-ready \
   --nvidia-host-profile-version=v2026.10.14-1 \
+  --nvidia-host-contract-version=hillsboro.ubuntu-nvidia-host-capabilities/v1 \
+  --nvidia-host-artifact-path=/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json \
   --nvidia-host-profile-digest=sha256:<producer-published-qualified-digest>
 ```
 
-Do not run this command while the producer status is
-`not-generated-unqualified`. The final consumer must fail closed unless:
+Do not substitute the committed blocked fixture digest or run this command
+until the producer publishes a qualified host artifact and rollout is
+separately authorized. The consumer must fail closed unless:
 
 - The final producer schema, profile, profile version, contract/result
   versions, canonical digest and sidecar, immutable Ubuntu image identity,

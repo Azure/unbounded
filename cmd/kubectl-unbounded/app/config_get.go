@@ -127,6 +127,8 @@ func runConfigGetOne(ctx context.Context, c client.WithWatch, name string, out i
 			printConfig(out, "nvidia-imex-mode", string(imex.Mode))
 			printConfig(out, "nvidia-host-profile", imex.HostProfile)
 			printConfig(out, "nvidia-host-profile-version", imex.HostProfileVersion)
+			printConfig(out, "nvidia-host-contract-version", imex.HostContractVersion)
+			printConfig(out, "nvidia-host-artifact-path", imex.HostArtifactPath)
 			printConfig(out, "nvidia-host-profile-digest", imex.HostProfileDigest)
 		}
 	}

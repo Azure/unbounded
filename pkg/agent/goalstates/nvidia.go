@@ -124,9 +124,9 @@ type NvidiaHost struct {
 	// IMEXServiceUnitState is the systemd unit-file state, such as masked.
 	IMEXServiceUnitState string
 
-	// IMEXQualification records immutable host-image evidence for the selected
-	// GPU Operator readiness profile.
-	IMEXQualification *NVIDIAIMEXQualification
+	// IMEXQualification records immutable host-image evidence decoded with the
+	// exact registered contract for the selected GPU Operator readiness profile.
+	IMEXQualification *resolvedNVIDIAQualification
 
 	// HostKernelVersion is the running host kernel release.
 	HostKernelVersion string
@@ -260,6 +260,147 @@ type NVIDIAQualificationAuthenticity struct {
 	Attestation           *string `json:"attestation"`
 }
 
+type NVIDIAUbuntuIMEXQualification struct {
+	SchemaVersion   int    `json:"schemaVersion"`
+	Profile         string `json:"profile"`
+	ProfileVersion  string `json:"profileVersion"`
+	ContractVersion string `json:"contractVersion"`
+	Architecture    string `json:"architecture"`
+
+	Image            NVIDIAQualificationImage                  `json:"image"`
+	Distro           NVIDIAUbuntuQualificationDistro           `json:"distro"`
+	Driver           NVIDIAUbuntuQualificationDriver           `json:"driver"`
+	FabricManager    NVIDIAUbuntuQualificationVersionedPackage `json:"fabricManager"`
+	NSCQ             NVIDIAUbuntuQualificationVersionedPackage `json:"nscq"`
+	IMEX             NVIDIAUbuntuQualificationIMEX             `json:"imex"`
+	Toolkit          NVIDIAUbuntuQualificationToolkit          `json:"toolkit"`
+	ContainerRuntime NVIDIAUbuntuQualificationContainerRuntime `json:"containerRuntime"`
+	Prerequisites    NVIDIAQualificationPrerequisites          `json:"prerequisites"`
+	Acceptance       NVIDIAQualificationAcceptance             `json:"acceptance"`
+	Integrity        NVIDIAQualificationIntegrity              `json:"integrity"`
+	Authenticity     NVIDIAUbuntuQualificationAuthenticity     `json:"authenticity"`
+
+	DocumentDigest string `json:"-"`
+}
+
+type NVIDIAUbuntuQualificationDistro struct {
+	Name          string  `json:"name"`
+	Version       string  `json:"version"`
+	Kernel        string  `json:"kernel"`
+	KernelHeaders *string `json:"kernelHeaders"`
+}
+
+type NVIDIAUbuntuQualificationDriver struct {
+	Branch           string `json:"branch"`
+	Version          string `json:"version"`
+	UserspaceVersion string `json:"userspaceVersion"`
+	Package          string `json:"package"`
+	PackageDigest    string `json:"packageDigest"`
+	Repository       string `json:"repository"`
+	Installed        bool   `json:"installed"`
+	InstallSource    string `json:"installSource"`
+}
+
+type NVIDIAUbuntuQualificationVersionedPackage struct {
+	Package       string `json:"package"`
+	Version       string `json:"version"`
+	PackageDigest string `json:"packageDigest"`
+	Installed     bool   `json:"installed"`
+}
+
+type NVIDIAUbuntuQualificationIMEX struct {
+	Package        string                           `json:"package"`
+	Version        string                           `json:"version"`
+	Architecture   string                           `json:"architecture"`
+	PackageDigest  string                           `json:"packageDigest"`
+	Repository     string                           `json:"repository"`
+	Installed      bool                             `json:"installed"`
+	ExpectedPaths  []string                         `json:"expectedPaths"`
+	Service        NVIDIAUbuntuQualificationService `json:"service"`
+	LifecycleOwner string                           `json:"lifecycleOwner"`
+}
+
+type NVIDIAUbuntuQualificationService struct {
+	Name    string `json:"name"`
+	Present bool   `json:"present"`
+	Enabled bool   `json:"enabled"`
+	Masked  bool   `json:"masked"`
+}
+
+type NVIDIAUbuntuQualificationToolkit struct {
+	Version        string            `json:"version"`
+	MinimumVersion string            `json:"minimumVersion"`
+	Ready          bool              `json:"ready"`
+	PackageDigests map[string]string `json:"packageDigests"`
+}
+
+type NVIDIAUbuntuQualificationContainerRuntime struct {
+	Name               string   `json:"name"`
+	Version            string   `json:"version"`
+	MinimumVersion     string   `json:"minimumVersion"`
+	CDIEnabled         bool     `json:"cdiEnabled"`
+	CDISpecDirectories []string `json:"cdiSpecDirectories"`
+	BinaryPath         string   `json:"binaryPath"`
+	BinaryDigest       string   `json:"binaryDigest"`
+	Package            *string  `json:"package"`
+}
+
+type NVIDIAUbuntuQualificationAuthenticity struct {
+	Status                string                               `json:"status"`
+	RequiredBeforeRelease bool                                 `json:"requiredBeforeRelease"`
+	Attestation           NVIDIAUbuntuQualificationAttestation `json:"attestation"`
+}
+
+type NVIDIAUbuntuQualificationAttestation struct {
+	StatementType string  `json:"statementType"`
+	PredicateType string  `json:"predicateType"`
+	SubjectDigest *string `json:"subjectDigest"`
+	Reference     *string `json:"reference"`
+	Verifier      *string `json:"verifier"`
+	Verified      bool    `json:"verified"`
+}
+
+type resolvedNVIDIAQualification struct {
+	*NVIDIAIMEXQualification
+	Ubuntu *NVIDIAUbuntuIMEXQualification
+}
+
+type nvidiaQualificationIdentity struct {
+	schemaVersion   int
+	profile         string
+	profileVersion  string
+	contractVersion string
+	documentDigest  string
+}
+
+func (q *resolvedNVIDIAQualification) identity() nvidiaQualificationIdentity {
+	if q == nil {
+		return nvidiaQualificationIdentity{}
+	}
+
+	if q.Ubuntu != nil {
+		return nvidiaQualificationIdentity{
+			schemaVersion:   q.Ubuntu.SchemaVersion,
+			profile:         q.Ubuntu.Profile,
+			profileVersion:  q.Ubuntu.ProfileVersion,
+			contractVersion: q.Ubuntu.ContractVersion,
+			documentDigest:  q.Ubuntu.DocumentDigest,
+		}
+	}
+
+	if q.NVIDIAIMEXQualification != nil {
+		return nvidiaQualificationIdentity{
+			schemaVersion:   q.SchemaVersion,
+			profile:         q.Profile,
+			profileVersion:  q.ProfileVersion,
+			contractVersion: q.ContractVersion,
+			documentDigest:  q.DocumentDigest,
+		}
+	}
+
+	return nvidiaQualificationIdentity{}
+}
+
 // NvidiaLibMapping maps a host NVIDIA library to its corresponding paths
 // inside the nspawn container.
 type NvidiaLibMapping struct {
@@ -373,6 +514,12 @@ const (
 	azureLinuxNVIDIAQualificationContractVersion = "hillsboro.nvidia-host-capabilities/v1"
 	azureLinuxNVIDIAQualificationResultVersion   = "hillsboro-gb200-acceptance/v1"
 	azureLinuxNVIDIAQualificationPath            = "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json"
+
+	ubuntuNVIDIAQualificationProfile         = "hillsboro-gb200-ubuntu-gpu-operator-ready"
+	ubuntuNVIDIAQualificationProfileVersion  = "v2026.10.14-1"
+	ubuntuNVIDIAQualificationContractVersion = "hillsboro.ubuntu-nvidia-host-capabilities/v1"
+	ubuntuNVIDIAQualificationResultVersion   = "hillsboro-gb200-ubuntu-acceptance/v1"
+	ubuntuNVIDIAQualificationPath            = "/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json"
 )
 
 type nvidiaQualificationContract struct {
@@ -380,8 +527,8 @@ type nvidiaQualificationContract struct {
 	profileVersion  string
 	contractVersion string
 	artifactPath    string
-	validateFields  func([]byte) error
-	validate        func(*NVIDIAIMEXQualification, NvidiaHost, string) error
+	decode          func([]byte, string) (*resolvedNVIDIAQualification, error)
+	validate        func(*resolvedNVIDIAQualification, NvidiaHost, string) error
 }
 
 type nvidiaQualificationContractKey struct {
@@ -394,8 +541,17 @@ var azureLinuxNVIDIAQualificationContract = nvidiaQualificationContract{
 	profileVersion:  azureLinuxNVIDIAQualificationProfileVersion,
 	contractVersion: azureLinuxNVIDIAQualificationContractVersion,
 	artifactPath:    azureLinuxNVIDIAQualificationPath,
-	validateFields:  validateRequiredAzureLinuxNVIDIAQualificationFields,
+	decode:          decodeAzureLinuxNVIDIAQualification,
 	validate:        validateAzureLinuxNVIDIAQualificationContract,
+}
+
+var ubuntuNVIDIAQualificationContract = nvidiaQualificationContract{
+	profile:         ubuntuNVIDIAQualificationProfile,
+	profileVersion:  ubuntuNVIDIAQualificationProfileVersion,
+	contractVersion: ubuntuNVIDIAQualificationContractVersion,
+	artifactPath:    ubuntuNVIDIAQualificationPath,
+	decode:          decodeUbuntuNVIDIAQualification,
+	validate:        validateUbuntuNVIDIAQualificationContract,
 }
 
 var nvidiaQualificationContracts = map[nvidiaQualificationContractKey]nvidiaQualificationContract{
@@ -403,32 +559,50 @@ var nvidiaQualificationContracts = map[nvidiaQualificationContractKey]nvidiaQual
 		profile:        azureLinuxNVIDIAQualificationProfile,
 		profileVersion: azureLinuxNVIDIAQualificationProfileVersion,
 	}: azureLinuxNVIDIAQualificationContract,
+	{
+		profile:        ubuntuNVIDIAQualificationProfile,
+		profileVersion: ubuntuNVIDIAQualificationProfileVersion,
+	}: ubuntuNVIDIAQualificationContract,
 }
 
-func nvidiaQualificationContractFor(profile, profileVersion string) (nvidiaQualificationContract, error) {
+func nvidiaQualificationContractFor(
+	profile,
+	profileVersion,
+	contractVersion,
+	artifactPath string,
+) (nvidiaQualificationContract, error) {
 	contract, ok := nvidiaQualificationContracts[nvidiaQualificationContractKey{
 		profile:        profile,
 		profileVersion: profileVersion,
 	}]
-	if ok {
+	if ok &&
+		contract.contractVersion == contractVersion &&
+		contract.artifactPath == artifactPath {
 		return contract, nil
 	}
 
 	return nvidiaQualificationContract{}, fmt.Errorf(
-		"unsupported NVIDIA host qualification profile %s/%s",
+		"unsupported NVIDIA host qualification tuple %s/%s contract %s artifact %s",
 		profile,
 		profileVersion,
+		contractVersion,
+		artifactPath,
 	)
 }
 
 func resolveNVIDIAIMEXQualification(path string) (*NVIDIAIMEXQualification, error) {
-	return resolveNVIDIAIMEXQualificationForContract(azureLinuxNVIDIAQualificationContract, path)
+	resolved, err := resolveNVIDIAIMEXQualificationForContract(azureLinuxNVIDIAQualificationContract, path)
+	if err != nil {
+		return nil, err
+	}
+
+	return resolved.NVIDIAIMEXQualification, nil
 }
 
 func resolveNVIDIAIMEXQualificationForContract(
 	contract nvidiaQualificationContract,
 	path string,
-) (*NVIDIAIMEXQualification, error) {
+) (*resolvedNVIDIAQualification, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read NVIDIA host qualification %s: %w", path, err)
@@ -446,39 +620,29 @@ func resolveNVIDIAIMEXQualificationForContract(
 		)
 	}
 
-	if err := contract.validateFields(canonical); err != nil {
+	digest := fmt.Sprintf("%x", sha256.Sum256(canonical))
+
+	qualification, err := contract.decode(canonical, "sha256:"+digest)
+	if err != nil {
 		return nil, fmt.Errorf("decode NVIDIA host qualification %s: %w", path, err)
 	}
 
-	var qualification NVIDIAIMEXQualification
-
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&qualification); err != nil {
-		return nil, fmt.Errorf("decode NVIDIA host qualification %s: %w", path, err)
-	}
-
-	if err := ensureJSONEOF(decoder); err != nil {
-		return nil, fmt.Errorf("decode NVIDIA host qualification %s: %w", path, err)
-	}
-
-	if qualification.Profile != contract.profile ||
-		qualification.ProfileVersion != contract.profileVersion ||
-		qualification.ContractVersion != contract.contractVersion {
+	identity := qualification.identity()
+	if identity.profile != contract.profile ||
+		identity.profileVersion != contract.profileVersion ||
+		identity.contractVersion != contract.contractVersion {
 		return nil, fmt.Errorf(
 			"NVIDIA host qualification %s identity is %s/%s contract %s, expected %s/%s contract %s",
 			path,
-			qualification.Profile,
-			qualification.ProfileVersion,
-			qualification.ContractVersion,
+			identity.profile,
+			identity.profileVersion,
+			identity.contractVersion,
 			contract.profile,
 			contract.profileVersion,
 			contract.contractVersion,
 		)
 	}
 
-	digest := fmt.Sprintf("%x", sha256.Sum256(canonical))
 	sidecarPath := path + ".sha256"
 
 	sidecar, err := os.ReadFile(sidecarPath)
@@ -491,9 +655,48 @@ func resolveNVIDIAIMEXQualificationForContract(
 		return nil, fmt.Errorf("NVIDIA host qualification digest sidecar %s does not match canonical artifact", sidecarPath)
 	}
 
-	qualification.DocumentDigest = "sha256:" + digest
+	return qualification, nil
+}
 
-	return &qualification, nil
+func decodeAzureLinuxNVIDIAQualification(data []byte, digest string) (*resolvedNVIDIAQualification, error) {
+	if err := validateRequiredAzureLinuxNVIDIAQualificationFields(data); err != nil {
+		return nil, err
+	}
+
+	var qualification NVIDIAIMEXQualification
+	if err := decodeNVIDIAQualification(data, &qualification); err != nil {
+		return nil, err
+	}
+
+	qualification.DocumentDigest = digest
+
+	return &resolvedNVIDIAQualification{NVIDIAIMEXQualification: &qualification}, nil
+}
+
+func decodeUbuntuNVIDIAQualification(data []byte, digest string) (*resolvedNVIDIAQualification, error) {
+	if err := validateRequiredUbuntuNVIDIAQualificationFields(data); err != nil {
+		return nil, err
+	}
+
+	var qualification NVIDIAUbuntuIMEXQualification
+	if err := decodeNVIDIAQualification(data, &qualification); err != nil {
+		return nil, err
+	}
+
+	qualification.DocumentDigest = digest
+
+	return &resolvedNVIDIAQualification{Ubuntu: &qualification}, nil
+}
+
+func decodeNVIDIAQualification(data []byte, qualification any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(qualification); err != nil {
+		return err
+	}
+
+	return ensureJSONEOF(decoder)
 }
 
 func canonicalQualificationJSON(data []byte) ([]byte, error) {
@@ -709,6 +912,254 @@ func validateRequiredAzureLinuxNVIDIAQualificationFields(data []byte) error {
 	}
 
 	return requireJSONFields(authenticity, "authenticity", []string{"status", "requiredBeforeRelease", "attestation"})
+}
+
+func validateRequiredUbuntuNVIDIAQualificationFields(data []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("decode qualification object: %w", err)
+	}
+
+	if err := requireJSONFields(root, "qualification", []string{
+		"schemaVersion", "profile", "profileVersion", "contractVersion", "image",
+		"architecture", "distro", "driver", "fabricManager", "nscq", "imex",
+		"toolkit", "containerRuntime", "prerequisites", "acceptance", "integrity",
+		"authenticity",
+	}); err != nil {
+		return err
+	}
+
+	image, err := requiredJSONObject(root, "image", "image")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(image, "image", []string{"id", "version", "digest"}); err != nil {
+		return err
+	}
+
+	distro, err := requiredJSONObject(root, "distro", "distro")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(distro, "distro", []string{"name", "version", "kernel", "kernelHeaders"}); err != nil {
+		return err
+	}
+
+	driver, err := requiredJSONObject(root, "driver", "driver")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(driver, "driver", []string{
+		"branch", "version", "userspaceVersion", "package", "packageDigest",
+		"repository", "installed", "installSource",
+	}); err != nil {
+		return err
+	}
+
+	if err := requireJSONNonNull(driver, "installed", "driver.installed"); err != nil {
+		return err
+	}
+
+	for _, name := range []string{"fabricManager", "nscq"} {
+		value, err := requiredJSONObject(root, name, name)
+		if err != nil {
+			return err
+		}
+
+		if err := requireJSONFields(value, name, []string{"package", "version", "packageDigest", "installed"}); err != nil {
+			return err
+		}
+
+		if err := requireJSONNonNull(value, "installed", name+".installed"); err != nil {
+			return err
+		}
+	}
+
+	imex, err := requiredJSONObject(root, "imex", "imex")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(imex, "imex", []string{
+		"package", "version", "architecture", "packageDigest", "repository",
+		"installed", "expectedPaths", "service", "lifecycleOwner",
+	}); err != nil {
+		return err
+	}
+
+	if err := requireJSONNonNull(imex, "installed", "imex.installed"); err != nil {
+		return err
+	}
+
+	if err := requireJSONArray(imex, "expectedPaths", "imex.expectedPaths"); err != nil {
+		return err
+	}
+
+	service, err := requiredJSONObject(imex, "service", "imex.service")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(service, "imex.service", []string{"name", "present", "enabled", "masked"}); err != nil {
+		return err
+	}
+
+	for _, field := range []string{"present", "enabled", "masked"} {
+		if err := requireJSONNonNull(service, field, "imex.service."+field); err != nil {
+			return err
+		}
+	}
+
+	toolkit, err := requiredJSONObject(root, "toolkit", "toolkit")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(toolkit, "toolkit", []string{"version", "minimumVersion", "ready", "packageDigests"}); err != nil {
+		return err
+	}
+
+	if err := requireJSONNonNull(toolkit, "ready", "toolkit.ready"); err != nil {
+		return err
+	}
+
+	packageDigests, err := requiredJSONObject(toolkit, "packageDigests", "toolkit.packageDigests")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(packageDigests, "toolkit.packageDigests", []string{
+		"libnvidia-container-tools_1.19.1-1_arm64.deb",
+		"libnvidia-container1_1.19.1-1_arm64.deb",
+		"nvidia-container-toolkit_1.19.1-1_arm64.deb",
+		"nvidia-container-toolkit-base_1.19.1-1_arm64.deb",
+	}); err != nil {
+		return err
+	}
+
+	containerRuntime, err := requiredJSONObject(root, "containerRuntime", "containerRuntime")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(containerRuntime, "containerRuntime", []string{
+		"name", "version", "minimumVersion", "cdiEnabled", "cdiSpecDirectories",
+		"binaryPath", "binaryDigest", "package",
+	}); err != nil {
+		return err
+	}
+
+	if err := requireJSONNonNull(containerRuntime, "cdiEnabled", "containerRuntime.cdiEnabled"); err != nil {
+		return err
+	}
+
+	if err := requireJSONArray(containerRuntime, "cdiSpecDirectories", "containerRuntime.cdiSpecDirectories"); err != nil {
+		return err
+	}
+
+	prerequisites, err := requiredJSONObject(root, "prerequisites", "prerequisites")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(prerequisites, "prerequisites", []string{
+		"requiredFiles", "requiredServices", "requiredDevices", "requiredKernelModules",
+	}); err != nil {
+		return err
+	}
+
+	for _, field := range []string{"requiredFiles", "requiredServices", "requiredDevices", "requiredKernelModules"} {
+		if err := requireJSONArray(prerequisites, field, "prerequisites."+field); err != nil {
+			return err
+		}
+	}
+
+	acceptance, err := requiredJSONObject(root, "acceptance", "acceptance")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(acceptance, "acceptance", []string{
+		"contractVersion", "resultVersion", "status", "qualifiedAt", "evidence", "failClosedReasons",
+	}); err != nil {
+		return err
+	}
+
+	if err := requireJSONArray(acceptance, "failClosedReasons", "acceptance.failClosedReasons"); err != nil {
+		return err
+	}
+
+	evidence, err := requiredJSONObject(acceptance, "evidence", "acceptance.evidence")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(evidence, "acceptance.evidence", []string{
+		"gpuCount", "fourGpuDetected", "localNvlink", "multiNodeNvlinkClaimed",
+	}); err != nil {
+		return err
+	}
+
+	for _, field := range []string{"fourGpuDetected", "multiNodeNvlinkClaimed"} {
+		if err := requireJSONNonNull(evidence, field, "acceptance.evidence."+field); err != nil {
+			return err
+		}
+	}
+
+	localNVLink, err := requiredJSONObject(evidence, "localNvlink", "acceptance.evidence.localNvlink")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(localNVLink, "acceptance.evidence.localNvlink", []string{"checked", "healthy", "evidence"}); err != nil {
+		return err
+	}
+
+	for _, field := range []string{"checked", "healthy"} {
+		if err := requireJSONNonNull(localNVLink, field, "acceptance.evidence.localNvlink."+field); err != nil {
+			return err
+		}
+	}
+
+	integrity, err := requiredJSONObject(root, "integrity", "integrity")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(integrity, "integrity", []string{
+		"artifactPath", "canonicalization", "encoding", "trailingNewline", "digestAlgorithm", "digestSidecar",
+	}); err != nil {
+		return err
+	}
+
+	if err := requireJSONNonNull(integrity, "trailingNewline", "integrity.trailingNewline"); err != nil {
+		return err
+	}
+
+	authenticity, err := requiredJSONObject(root, "authenticity", "authenticity")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(authenticity, "authenticity", []string{"status", "requiredBeforeRelease", "attestation"}); err != nil {
+		return err
+	}
+
+	attestation, err := requiredJSONObject(authenticity, "attestation", "authenticity.attestation")
+	if err != nil {
+		return err
+	}
+
+	if err := requireJSONFields(attestation, "authenticity.attestation", []string{
+		"statementType", "predicateType", "subjectDigest", "reference", "verifier", "verified",
+	}); err != nil {
+		return err
+	}
+
+	return requireJSONNonNull(attestation, "verified", "authenticity.attestation.verified")
 }
 
 func requiredJSONObject(parent map[string]json.RawMessage, key, path string) (map[string]json.RawMessage, error) {
@@ -1015,7 +1466,12 @@ func configureNVIDIAIMEX(
 		return NvidiaHost{}, fmt.Errorf("unsupported NVIDIA IMEX mode %q", imex.Mode)
 	}
 
-	contract, err := nvidiaQualificationContractFor(imex.HostProfile, imex.HostProfileVersion)
+	contract, err := nvidiaQualificationContractFor(
+		imex.HostProfile,
+		imex.HostProfileVersion,
+		imex.HostContractVersion,
+		imex.HostArtifactPath,
+	)
 	if err != nil {
 		return NvidiaHost{}, err
 	}
@@ -1028,31 +1484,32 @@ func configureNVIDIAIMEX(
 		)
 	}
 
-	if qualification.SchemaVersion != 1 {
+	identity := qualification.identity()
+	if identity.schemaVersion != 1 {
 		return NvidiaHost{}, fmt.Errorf(
 			"NVIDIA IMEX DRA mode requires host qualification schemaVersion 1, found %d",
-			qualification.SchemaVersion,
+			identity.schemaVersion,
 		)
 	}
 
-	if qualification.Profile != imex.HostProfile ||
-		qualification.ProfileVersion != imex.HostProfileVersion ||
-		qualification.ContractVersion != contract.contractVersion {
+	if identity.profile != imex.HostProfile ||
+		identity.profileVersion != imex.HostProfileVersion ||
+		identity.contractVersion != contract.contractVersion {
 		return NvidiaHost{}, fmt.Errorf(
 			"NVIDIA IMEX DRA host qualification is %s/%s contract %s, expected %s/%s contract %s",
-			qualification.Profile,
-			qualification.ProfileVersion,
-			qualification.ContractVersion,
+			identity.profile,
+			identity.profileVersion,
+			identity.contractVersion,
 			imex.HostProfile,
 			imex.HostProfileVersion,
 			contract.contractVersion,
 		)
 	}
 
-	if qualification.DocumentDigest != imex.HostProfileDigest {
+	if identity.documentDigest != imex.HostProfileDigest {
 		return NvidiaHost{}, fmt.Errorf(
 			"NVIDIA IMEX DRA host qualification digest is %q, expected %q",
-			qualification.DocumentDigest,
+			identity.documentDigest,
 			imex.HostProfileDigest,
 		)
 	}
@@ -1110,10 +1567,15 @@ func configureNVIDIAIMEX(
 }
 
 func validateAzureLinuxNVIDIAQualificationContract(
-	qualification *NVIDIAIMEXQualification,
+	resolved *resolvedNVIDIAQualification,
 	nvidia NvidiaHost,
 	hostDistro string,
 ) error {
+	qualification := resolved.NVIDIAIMEXQualification
+	if qualification == nil || resolved.Ubuntu != nil {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification document does not match the Azure Linux contract")
+	}
+
 	const (
 		driverVersion        = "580.159.04"
 		driverPackage        = "cuda-open-hwe-580.159.04-2_6.18.48.1.1.azl3.aarch64"
@@ -1294,6 +1756,245 @@ func validateAzureLinuxNVIDIAQualificationContract(
 	return nil
 }
 
+func validateUbuntuNVIDIAQualificationContract(
+	resolved *resolvedNVIDIAQualification,
+	nvidia NvidiaHost,
+	hostDistro string,
+) error {
+	qualification := resolved.Ubuntu
+	if qualification == nil || resolved.NVIDIAIMEXQualification != nil {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification document does not match the Ubuntu contract")
+	}
+
+	const (
+		kernelVersion = "6.14.0-1009-azure-nvidia"
+		driverVersion = "580.178.04"
+
+		driverPackage       = "nvidia-driver-580-server=580.178.04-0ubuntu0.24.04.1"
+		driverPackageDigest = "sha256:e0876fd47d551c10e3e9a335f9e22e04bce19a58d801c6daf8a7c85f40f51c85"
+		driverRepository    = "http://ports.ubuntu.com/ubuntu-ports"
+
+		fabricManagerPackage       = "nvidia-fabricmanager-580"
+		fabricManagerVersion       = "580.178.04-0ubuntu0.24.04.1"
+		fabricManagerPackageDigest = "sha256:74df86e252596e6c0ccfa04b513ba7c38437265d34473091d960f7da3a54cc39"
+
+		nscqPackage       = "libnvidia-nscq-580"
+		nscqVersion       = "580.178.04-0ubuntu0.24.04.1"
+		nscqPackageDigest = "sha256:650634200fe95c7835dadfff2d578a42e592cbddc42ef5fb3dd2169d5122f00e"
+
+		imexPackage       = "nvidia-imex"
+		imexVersion       = "580.178.04-1ubuntu1"
+		imexPackageDigest = "sha256:01d1bef149c56c1dc597b42baf92193241ff1d155f53d59c8d1de8ac968365b6"
+		imexRepository    = "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/"
+
+		containerdBinaryDigest = "sha256:1492b1fa0de5cf6790b2a4a29b1721612deed8a31cb8f7fafeef31ee3fd09f63"
+	)
+
+	if qualification.SchemaVersion != 1 ||
+		qualification.Profile != ubuntuNVIDIAQualificationProfile ||
+		qualification.ProfileVersion != ubuntuNVIDIAQualificationProfileVersion ||
+		qualification.ContractVersion != ubuntuNVIDIAQualificationContractVersion {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification schema, profile, or contract version is unsupported")
+	}
+
+	if qualification.Architecture != "arm64" ||
+		nvidia.HostArchitecture != qualification.Architecture {
+		return fmt.Errorf(
+			"NVIDIA IMEX DRA host qualification architecture is %q, running architecture is %q",
+			qualification.Architecture,
+			nvidia.HostArchitecture,
+		)
+	}
+
+	if qualification.Image.ID == nil ||
+		qualification.Image.Version == nil ||
+		qualification.Image.Digest == nil ||
+		strings.TrimSpace(*qualification.Image.ID) == "" ||
+		strings.TrimSpace(*qualification.Image.Version) == "" ||
+		!validSHA256Digest(*qualification.Image.Digest) {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification must record a verified immutable image ID, version, and digest")
+	}
+
+	if hostDistro != hostDistroUbuntu2404 ||
+		qualification.Distro.Name != "Ubuntu" ||
+		qualification.Distro.Version != "24.04.4 LTS" ||
+		nvidia.HostDistroVersion != "24.04" ||
+		qualification.Distro.Kernel != kernelVersion ||
+		qualification.Distro.KernelHeaders == nil ||
+		*qualification.Distro.KernelHeaders != kernelVersion ||
+		qualification.Distro.Kernel != nvidia.HostKernelVersion {
+		return fmt.Errorf(
+			"NVIDIA IMEX DRA qualification OS/kernel is %s %s %s, running host is %s %s",
+			qualification.Distro.Name,
+			qualification.Distro.Version,
+			qualification.Distro.Kernel,
+			qualificationDistroID(hostDistro),
+			nvidia.HostKernelVersion,
+		)
+	}
+
+	if qualification.Driver.Branch != "580" ||
+		qualification.Driver.Version != driverVersion ||
+		qualification.Driver.UserspaceVersion != driverVersion ||
+		qualification.Driver.Package != driverPackage ||
+		qualification.Driver.PackageDigest != driverPackageDigest ||
+		qualification.Driver.Repository != driverRepository ||
+		!qualification.Driver.Installed ||
+		strings.TrimSpace(qualification.Driver.InstallSource) == "" ||
+		nvidia.DriverVersion != driverVersion {
+		return fmt.Errorf(
+			"NVIDIA IMEX DRA qualification driver evidence is unsupported or does not match running NVIDIA version %q",
+			nvidia.DriverVersion,
+		)
+	}
+
+	if qualification.FabricManager.Package != fabricManagerPackage ||
+		qualification.FabricManager.Version != fabricManagerVersion ||
+		qualification.FabricManager.PackageDigest != fabricManagerPackageDigest ||
+		!qualification.FabricManager.Installed ||
+		qualification.NSCQ.Package != nscqPackage ||
+		qualification.NSCQ.Version != nscqVersion ||
+		qualification.NSCQ.PackageDigest != nscqPackageDigest ||
+		!qualification.NSCQ.Installed {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification fabric manager or NSCQ package evidence is unsupported")
+	}
+
+	expectedIMEXPaths := []string{"/usr/bin/nvidia-imex", "/usr/bin/nvidia-imex-ctl"}
+	if qualification.IMEX.Package != imexPackage ||
+		qualification.IMEX.Version != imexVersion ||
+		qualification.IMEX.Architecture != "arm64" ||
+		qualification.IMEX.PackageDigest != imexPackageDigest ||
+		qualification.IMEX.Repository != imexRepository ||
+		!qualification.IMEX.Installed ||
+		!slices.Equal(qualification.IMEX.ExpectedPaths, expectedIMEXPaths) ||
+		qualification.IMEX.LifecycleOwner != "gpu-operator-dra-driverManaged" ||
+		qualification.IMEX.Service.Name != "nvidia-imex.service" ||
+		!qualification.IMEX.Service.Present ||
+		qualification.IMEX.Service.Enabled ||
+		!qualification.IMEX.Service.Masked {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification IMEX package, paths, service ownership, or lifecycle owner is invalid")
+	}
+
+	if nvidia.NvidiaSMIPath != "/usr/bin/nvidia-smi" ||
+		nvidia.NvidiaIMEXPath != expectedIMEXPaths[0] ||
+		nvidia.NvidiaIMEXCtlPath != expectedIMEXPaths[1] {
+		return fmt.Errorf("NVIDIA IMEX DRA required binaries were not discovered at the qualified paths")
+	}
+
+	expectedToolkitDigests := map[string]string{
+		"libnvidia-container-tools_1.19.1-1_arm64.deb":     "sha256:39d83e766f0945fec049c17cbcf8af15eb95adb680c1a5f009a8b66ba35dd42e",
+		"libnvidia-container1_1.19.1-1_arm64.deb":          "sha256:6fee6070c90b76e83b29d0a9e7e714120e6baaa6b486fbeff856b3bcfbcaf430",
+		"nvidia-container-toolkit_1.19.1-1_arm64.deb":      "sha256:f929f638d1a1b85b976b883564c65d9eb7d62a9f484a4750e586a7f159012497",
+		"nvidia-container-toolkit-base_1.19.1-1_arm64.deb": "sha256:87455a740daa41743a3fca96ce89068347bdf020dc6c6377eeec484a8f64579f",
+	}
+	if qualification.Toolkit.Version != "1.19.1" ||
+		qualification.Toolkit.MinimumVersion != "1.18.0" ||
+		!qualification.Toolkit.Ready ||
+		!equalStringMap(qualification.Toolkit.PackageDigests, expectedToolkitDigests) {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification requires the approved ready Container Toolkit 1.19.1 package set")
+	}
+
+	if qualification.ContainerRuntime.Name != "containerd" ||
+		qualification.ContainerRuntime.Version != "2.1.8" ||
+		qualification.ContainerRuntime.MinimumVersion != "2.0.0" ||
+		!qualification.ContainerRuntime.CDIEnabled ||
+		!validNonemptyStrings(qualification.ContainerRuntime.CDISpecDirectories, true) ||
+		qualification.ContainerRuntime.BinaryPath != "/usr/local/bin/containerd" ||
+		qualification.ContainerRuntime.BinaryDigest != containerdBinaryDigest {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification requires the approved containerd 2.1.8 binary with CDI enabled")
+	}
+
+	requiredFiles := []string{"/usr/bin/nvidia-smi", "/usr/bin/nvidia-imex", "/usr/bin/nvidia-imex-ctl"}
+	requiredServices := []string{"containerd.service", "nvidia-fabricmanager.service", "nvidia-imex.service"}
+	requiredDevices := []string{
+		"/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2", "/dev/nvidia3",
+		"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-caps",
+	}
+
+	requiredKernelModules := []string{"nvidia", "nvidia_drm", "nvidia_modeset", "nvidia_uvm", "mana", "mana_ib", "gdma"}
+	if !validUniqueNonemptyStrings(qualification.Prerequisites.RequiredFiles, false) ||
+		!validUniqueNonemptyStrings(qualification.Prerequisites.RequiredServices, false) ||
+		!validUniqueNonemptyStrings(qualification.Prerequisites.RequiredDevices, false) ||
+		!validUniqueNonemptyStrings(qualification.Prerequisites.RequiredKernelModules, false) ||
+		!containsAllStrings(qualification.Prerequisites.RequiredFiles, requiredFiles) ||
+		!containsAllStrings(qualification.Prerequisites.RequiredServices, requiredServices) ||
+		!containsAllStrings(qualification.Prerequisites.RequiredDevices, requiredDevices) ||
+		!containsAllStrings(qualification.Prerequisites.RequiredKernelModules, requiredKernelModules) {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification is missing required prerequisite evidence")
+	}
+
+	for _, device := range qualification.Prerequisites.RequiredDevices {
+		if !slices.Contains(nvidia.GPUDevicePaths, device) {
+			return fmt.Errorf("NVIDIA IMEX DRA qualification requires missing device %s", device)
+		}
+	}
+
+	if qualification.Acceptance.ContractVersion != ubuntuNVIDIAQualificationContractVersion ||
+		qualification.Acceptance.ResultVersion != ubuntuNVIDIAQualificationResultVersion ||
+		qualification.Acceptance.Status != "qualified" ||
+		qualification.Acceptance.QualifiedAt == nil ||
+		strings.TrimSpace(*qualification.Acceptance.QualifiedAt) == "" ||
+		!validUniqueNonemptyStrings(qualification.Acceptance.FailClosedReasons, false) ||
+		len(qualification.Acceptance.FailClosedReasons) != 0 {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification acceptance status is blocked or unsupported")
+	}
+
+	evidence := qualification.Acceptance.Evidence
+	if evidence.GPUCount == nil ||
+		*evidence.GPUCount != 4 ||
+		!evidence.FourGPUDetected ||
+		nvidiaGPUCount(nvidia.GPUDevicePaths) != 4 ||
+		!evidence.LocalNVLink.Checked ||
+		!evidence.LocalNVLink.Healthy ||
+		evidence.LocalNVLink.Evidence == nil ||
+		strings.TrimSpace(*evidence.LocalNVLink.Evidence) == "" ||
+		evidence.MultiNodeNVLinkClaimed ||
+		!nvidia.LocalNVLinkHealthy {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification requires four GPUs and healthy verified local NVLink")
+	}
+
+	if qualification.Integrity.ArtifactPath != ubuntuNVIDIAQualificationPath ||
+		qualification.Integrity.Canonicalization != "RFC8785-JCS" ||
+		qualification.Integrity.Encoding != "UTF-8-without-BOM" ||
+		qualification.Integrity.TrailingNewline ||
+		qualification.Integrity.DigestAlgorithm != "sha256" ||
+		qualification.Integrity.DigestSidecar != "nvidia-gpu-operator-ubuntu.json.sha256" {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification integrity contract is unsupported")
+	}
+
+	attestation := qualification.Authenticity.Attestation
+	if qualification.Authenticity.Status != "verified" ||
+		!qualification.Authenticity.RequiredBeforeRelease ||
+		attestation.StatementType != "https://in-toto.io/Statement/v1" ||
+		attestation.PredicateType != "https://slsa.dev/provenance/v1" ||
+		attestation.SubjectDigest == nil ||
+		qualification.Image.Digest == nil ||
+		*attestation.SubjectDigest != *qualification.Image.Digest ||
+		attestation.Reference == nil ||
+		strings.TrimSpace(*attestation.Reference) == "" ||
+		attestation.Verifier == nil ||
+		strings.TrimSpace(*attestation.Verifier) == "" ||
+		!attestation.Verified {
+		return fmt.Errorf("NVIDIA IMEX DRA qualification authenticity is not verified or bound to the image digest")
+	}
+
+	return nil
+}
+
+func equalStringMap(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for key, value := range right {
+		if left[key] != value {
+			return false
+		}
+	}
+
+	return true
+}
+
 func containsAllStrings(values, required []string) bool {
 	for _, expected := range required {
 		if !slices.Contains(values, expected) {
@@ -1305,21 +2006,31 @@ func containsAllStrings(values, required []string) bool {
 }
 
 func validUniqueNonemptyStrings(values []string, requireOne bool) bool {
-	if requireOne && len(values) == 0 {
+	if !validNonemptyStrings(values, requireOne) {
 		return false
 	}
 
 	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		if value == "" {
-			return false
-		}
-
 		if _, ok := seen[value]; ok {
 			return false
 		}
 
 		seen[value] = struct{}{}
+	}
+
+	return true
+}
+
+func validNonemptyStrings(values []string, requireOne bool) bool {
+	if requireOne && len(values) == 0 {
+		return false
+	}
+
+	for _, value := range values {
+		if value == "" {
+			return false
+		}
 	}
 
 	return true

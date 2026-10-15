@@ -210,10 +210,12 @@ func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
 			OCIImage: "existing-image",
 			NVIDIA: &NVIDIAConfig{
 				IMEX: &NVIDIAIMEXConfig{
-					Mode:               NVIDIAIMEXModeDRA,
-					HostProfile:        "old-profile",
-					HostProfileVersion: "v0",
-					HostProfileDigest:  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					Mode:                NVIDIAIMEXModeDRA,
+					HostProfile:         "old-profile",
+					HostProfileVersion:  "v0",
+					HostContractVersion: "old.contract/v0",
+					HostArtifactPath:    "/old.json",
+					HostProfileDigest:   "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 				},
 			},
 		},
@@ -223,10 +225,12 @@ func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
 		Agent: &v1alpha3.MachineConfigurationAgent{
 			NVIDIA: &v1alpha3.MachineConfigurationNVIDIA{
 				IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
-					Mode:               v1alpha3.NVIDIAIMEXModeDRA,
-					HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-					HostProfileVersion: "v1",
-					HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					Mode:                v1alpha3.NVIDIAIMEXModeDRA,
+					HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+					HostProfileVersion:  "v1",
+					HostContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+					HostArtifactPath:    "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json",
+					HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				},
 			},
 		},
@@ -238,6 +242,8 @@ func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
 	require.Equal(t, NVIDIAIMEXModeDRA, cfg.NVIDIA.IMEX.Mode)
 	require.Equal(t, "hillsboro-gb200-gpu-operator-ready", cfg.NVIDIA.IMEX.HostProfile)
 	require.Equal(t, "v1", cfg.NVIDIA.IMEX.HostProfileVersion)
+	require.Equal(t, "hillsboro.nvidia-host-capabilities/v1", cfg.NVIDIA.IMEX.HostContractVersion)
+	require.Equal(t, "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json", cfg.NVIDIA.IMEX.HostArtifactPath)
 	require.Equal(t, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.NVIDIA.IMEX.HostProfileDigest)
 
 	ApplyMachineConfigurationTemplate(&cfg, v1alpha3.MachineConfigurationTemplate{})
@@ -245,10 +251,12 @@ func TestApplyMachineConfigurationTemplate_NVIDIAIMEX(t *testing.T) {
 
 	cfg.NVIDIA = &NVIDIAConfig{
 		IMEX: &NVIDIAIMEXConfig{
-			Mode:               NVIDIAIMEXModeDRA,
-			HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-			HostProfileVersion: "v1",
-			HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Mode:                NVIDIAIMEXModeDRA,
+			HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+			HostProfileVersion:  "v1",
+			HostContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+			HostArtifactPath:    "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json",
+			HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		},
 	}
 	ApplyMachineConfigurationTemplate(&cfg, v1alpha3.MachineConfigurationTemplate{

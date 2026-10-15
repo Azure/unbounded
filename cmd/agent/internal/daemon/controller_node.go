@@ -169,6 +169,7 @@ func syncNVIDIAIMEXNodeMetadata(
 		_, versionPresent := node.Labels[provision.NVIDIAHostProfileVersionLabelKey]
 
 		_, digestPresent := node.Annotations[provision.NVIDIAHostProfileDigestAnnotationKey]
+
 		if !modePresent && !profilePresent && !versionPresent && !digestPresent {
 			return nil
 		}

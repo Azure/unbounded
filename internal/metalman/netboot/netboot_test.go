@@ -2072,10 +2072,12 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 				Agent: &v1alpha3.MachineConfigurationAgent{
 					NVIDIA: &v1alpha3.MachineConfigurationNVIDIA{
 						IMEX: &v1alpha3.MachineConfigurationNVIDIAIMEX{
-							Mode:               v1alpha3.NVIDIAIMEXModeDRA,
-							HostProfile:        "hillsboro-gb200-gpu-operator-ready",
-							HostProfileVersion: "v1",
-							HostProfileDigest:  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+							Mode:                v1alpha3.NVIDIAIMEXModeDRA,
+							HostProfile:         "hillsboro-gb200-gpu-operator-ready",
+							HostProfileVersion:  "v1",
+							HostContractVersion: "hillsboro.nvidia-host-capabilities/v1",
+							HostArtifactPath:    "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json",
+							HostProfileDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 						},
 					},
 				},

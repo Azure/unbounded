@@ -176,6 +176,21 @@ spec:
                             description: IMEX configures validation and exposure for
                               multi-node NVLink.
                             properties:
+                              hostArtifactPath:
+                                description: |-
+                                  HostArtifactPath is the exact canonical qualification artifact path
+                                  selected for the profile contract.
+                                maxLength: 4096
+                                minLength: 1
+                                pattern: ^/.*$
+                                type: string
+                              hostContractVersion:
+                                description: |-
+                                  HostContractVersion is the exact qualification contract selected for the
+                                  profile and version.
+                                maxLength: 128
+                                minLength: 1
+                                type: string
                               hostProfile:
                                 description: |-
                                   HostProfile is the immutable host qualification profile recorded by the
@@ -207,11 +222,13 @@ spec:
                             type: object
                             x-kubernetes-validations:
                             - message: mode DRA requires hostProfile, hostProfileVersion,
-                                and hostProfileDigest
+                                hostContractVersion, hostArtifactPath, and hostProfileDigest
                               rule: '!has(self.mode) || (has(self.hostProfile) &&
-                                has(self.hostProfileVersion) && has(self.hostProfileDigest))'
+                                has(self.hostProfileVersion) && has(self.hostContractVersion)
+                                && has(self.hostArtifactPath) && has(self.hostProfileDigest))'
                             - message: host qualification fields require mode DRA
                               rule: has(self.mode) || (!has(self.hostProfile) && !has(self.hostProfileVersion)
+                                && !has(self.hostContractVersion) && !has(self.hostArtifactPath)
                                 && !has(self.hostProfileDigest))
                         type: object
                     type: object

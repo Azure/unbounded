@@ -67,13 +67,14 @@ IMEX is disabled by default. Unbounded does not install or repair NVIDIA
 drivers or IMEX userspace. Enable exposure only after the host-image pipeline
 has applied and tested a qualified profile:
 
-> The proposed Ubuntu Hillsboro profile
-> `hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1` is currently
-> `not-generated-unqualified`. Do not enable it until `aks-flex-dev` publishes
-> the final closed schema, canonical qualified artifact, digest, and
-> authenticity attestation, and Unbounded implements that exact contract. The
-> producer definition is in `aks-flex-dev` commit
-> `9c285427b1bc38b5c468470fcf51ac9638168e33` under
+> The Ubuntu Hillsboro contract
+> `hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1` is implemented by
+> the consumer, but the producer's committed canonical example is intentionally
+> blocked. Do not enable it until the selected host contains a qualified
+> artifact with immutable image identity and verified authenticity, and the
+> rollout is separately authorized. The producer definition is in
+> `aks-flex-dev` commit
+> `aad7463945848555d392b1c33c906ef4d4e37eeb` under
 > `labs/gb200-hillsboro/gpu-operator-ownership/host-profiles/hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1/`.
 
 ```bash
@@ -81,6 +82,8 @@ kubectl unbounded machine config create gb200-dra \
   --nvidia-imex-mode=DRA \
   --nvidia-host-profile=hillsboro-gb200-ubuntu-gpu-operator-ready \
   --nvidia-host-profile-version=v2026.10.14-1 \
+  --nvidia-host-contract-version=hillsboro.ubuntu-nvidia-host-capabilities/v1 \
+  --nvidia-host-artifact-path=/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json \
   --nvidia-host-profile-digest=sha256:<producer-published-qualified-digest>
 ```
 
@@ -95,27 +98,27 @@ spec:
           mode: DRA
           hostProfile: hillsboro-gb200-ubuntu-gpu-operator-ready
           hostProfileVersion: v2026.10.14-1
+          hostContractVersion: hillsboro.ubuntu-nvidia-host-capabilities/v1
+          hostArtifactPath: /etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json
           hostProfileDigest: sha256:<producer-published-qualified-digest>
 ```
 
-The command and API example show the future configuration shape; do not apply
-them while the producer status is `not-generated-unqualified`. This remains a
-strict, read-only capability gate. Goal-state resolution occurs before normal
-host preparation and fails unless all of the following are true:
+Do not use the committed blocked fixture digest in these examples. This
+remains a strict, read-only capability gate. Goal-state resolution occurs
+before normal host preparation and fails unless all of the following are true:
 
 - The configured profile and version select one exact registered contract,
   which binds its own contract version, artifact path, closed-field decoder,
   and semantic validator. Host OS detection never selects or substitutes a
   qualification contract.
-- The final producer artifact records the expected schema, profile and version,
+- The producer artifact records the expected schema, profile and version,
   contract/result versions, immutable image identity, authenticity
   attestation, OS, architecture, exact kernel and kernel-devel, driver branch
   and exact driver/userspace/package versions, driver-matched Fabric Manager,
   NSCQ and IMEX packages, runtime/CDI versions and readiness, capability scope,
   GPU count, local NVLink result, host service ownership, device prerequisites,
-  and versioned acceptance result. The proposed Ubuntu artifact path is
-  `/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json`, but the
-  consumer must wait for the committed final schema and canonical fixture.
+  and versioned acceptance result. The Ubuntu artifact path is
+  `/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json`.
 - The artifact is RFC 8785 canonical UTF-8 JSON with no BOM or trailing
   newline. Its required sidecar format and filename must exactly match the
   final producer contract. The configured digest binds the evidence content

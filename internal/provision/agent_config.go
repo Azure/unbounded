@@ -279,10 +279,12 @@ func NVIDIAConfigFromSpec(spec *v1alpha3.MachineConfigurationNVIDIA) *NVIDIAConf
 	out := &NVIDIAConfig{}
 	if spec.IMEX != nil {
 		out.IMEX = &NVIDIAIMEXConfig{
-			Mode:               NVIDIAIMEXMode(spec.IMEX.Mode),
-			HostProfile:        spec.IMEX.HostProfile,
-			HostProfileVersion: spec.IMEX.HostProfileVersion,
-			HostProfileDigest:  spec.IMEX.HostProfileDigest,
+			Mode:                NVIDIAIMEXMode(spec.IMEX.Mode),
+			HostProfile:         spec.IMEX.HostProfile,
+			HostProfileVersion:  spec.IMEX.HostProfileVersion,
+			HostContractVersion: spec.IMEX.HostContractVersion,
+			HostArtifactPath:    spec.IMEX.HostArtifactPath,
+			HostProfileDigest:   spec.IMEX.HostProfileDigest,
 		}
 	}
 
