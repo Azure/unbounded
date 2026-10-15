@@ -63,7 +63,7 @@ func sdkClientConfig(opts pullOptions, capacity int) racersdk.ClientConfig {
 
 	limit := max(1, capacity*blobConcurrency)
 
-	return racersdk.ClientConfig{Volume: opts.Volume, MaxConnections: limit}
+	return racersdk.ClientConfig{Cache: opts.Volume, MaxConnections: limit}
 }
 
 func (p *puller) configureUDS(capacity int) error {

@@ -361,7 +361,7 @@ func waitSidecar(t *testing.T, done <-chan error) {
 }
 
 func TestSidecarLoopbackAndShutdown(t *testing.T) {
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: "test"})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}

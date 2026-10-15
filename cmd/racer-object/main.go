@@ -138,7 +138,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	o.volume = *volume
 
-	validationClient, err := racersdk.NewClient(racersdk.ClientConfig{Volume: o.volume})
+	validationClient, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.volume})
 	if err != nil {
 		return o, errors.New("invalid --volume")
 	}
@@ -347,7 +347,7 @@ func runOrigin(ctx context.Context, o options) error {
 	}
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
-		Volume: o.volume, RecoverStaleSocket: true,
+		Cache: o.volume, RecoverStaleSocket: true,
 	}, origin)
 	if ctx.Err() != nil {
 		return nil
@@ -406,7 +406,7 @@ func prepareOriginDirectory(parent *os.File, parts []string) error {
 }
 
 func runSidecar(ctx context.Context, o options) error {
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: o.volume})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.volume})
 	if err != nil {
 		return errors.New("could not configure Racer client")
 	}

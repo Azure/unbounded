@@ -23,7 +23,7 @@ func TestRustWireClientFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client, err := newClient(ClientConfig{Volume: "conformance", MaxConnections: 1}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
+	client, err := newClient(ClientConfig{Cache: "conformance", MaxConnections: 1}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestRustWireRangeFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client, err := newClient(ClientConfig{Volume: "conformance", MaxConnections: 1}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
+	client, err := newClient(ClientConfig{Cache: "conformance", MaxConnections: 1}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestRustWireOriginFixture(t *testing.T) {
 		cancel()
 	}()
 
-	err := serveOrigin(ctx, OriginConfig{Volume: "conformance"}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+	err := serveOrigin(ctx, OriginConfig{Cache: "conformance"}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
 		m := Metadata{Size: 3, ETag: `"v"`, ExpiresAt: time.UnixMilli(0), ContentType: "text/plain"}
 		if r.Metadata != "opaque,  bytes\xff" || r.Authorization != "fixture credential\x80" {
 			return Metadata{}, nil, errors.New("changed context")

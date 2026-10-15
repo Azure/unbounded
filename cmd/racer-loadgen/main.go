@@ -109,7 +109,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 			return opts, fmt.Errorf("uds requires a valid volume: empty volume name: %w", racersdk.ErrInvalidRequest)
 		}
 
-		client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: opts.pull.Volume})
+		client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: opts.pull.Volume})
 		if err != nil {
 			return opts, fmt.Errorf("uds requires a valid volume: %w", err)
 		}
@@ -333,7 +333,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 				var stopOrigin func()
 
 				stopOrigin, err = startOrigin(ctx, startupCtx, racersdk.OriginConfig{
-					Volume: p.opts.Volume, RecoverStaleSocket: true,
+					Cache: p.opts.Volume, RecoverStaleSocket: true,
 					MaxConcurrentRequests: max(64, limit),
 				}, adapter, probe, func(originErr error) { serveErrors <- originErr; cancel() })
 				if err == nil {

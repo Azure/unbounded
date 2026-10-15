@@ -301,7 +301,7 @@ func TestCreateOriginS3Selection(t *testing.T) {
 }
 
 func TestCreateSidecarAPISelection(t *testing.T) {
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: "test"})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
