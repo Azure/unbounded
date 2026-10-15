@@ -1842,8 +1842,8 @@ func TestRacerStalledDownstreamClosesSDKStream(t *testing.T) {
 }
 
 func TestRacerCancellationClosesStream(t *testing.T) {
-	// "range suffix" is retained as the historical case name. Cancellation now
-	// interrupts the requested suffix directly; the mirror never skips bytes.
+	// Cancellation interrupts the requested suffix directly; the mirror never
+	// skips bytes.
 	for _, mode := range []string{"before headers", "streaming", "range suffix"} {
 		t.Run(mode, func(t *testing.T) {
 			data := bytes.Repeat([]byte("x"), 256*1024)
