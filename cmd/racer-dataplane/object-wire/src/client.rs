@@ -197,7 +197,7 @@ impl RequestParser {
         }
         let key = CacheKey::parse_hex(
             target
-                .strip_prefix("/v2/objects/")
+                .strip_prefix("/v1/objects/")
                 .ok_or(Error::InvalidRequest)?
                 .as_bytes(),
         )?;

@@ -1378,17 +1378,15 @@ fn small_versions_keep_persisting_at_index_capacity_and_serve_from_disk_offline(
     );
 }
 fn request(method: &str, fields: &str) -> String {
-    // GET is retained only to verify rejection of the retired client protocol.
-    let version = if method == "GET" { "v1" } else { "v2" };
     format!(
-        "{method} /{version}/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{fields}\r\n",
+        "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{fields}\r\n",
         "ab".repeat(32)
     )
 }
 
 fn subscription_request(fields: &str) -> String {
     format!(
-        "POST /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Ordered: 1\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
+        "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Ordered: 1\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
         "ab".repeat(32)
     )
 }
@@ -1474,7 +1472,7 @@ fn check_subscription(reply: &Reply, version: u8, start: u64, end: u64, total: u
 }
 
 #[test]
-fn v2_subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline() {
+fn subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline() {
     let length = 2 * P + 113;
     // Fund every page independently of asynchronous write completion. Dirty-only
     // pressure intentionally skips persistence and is covered by separate tests.
@@ -1524,7 +1522,7 @@ fn v2_subscription_credits_persist_three_pages_and_serve_partial_disk_range_offl
 }
 
 #[test]
-fn v2_subscription_zero_ttl_revalidates_metadata_without_losing_retained_pin() {
+fn subscription_zero_ttl_revalidates_metadata_without_losing_retained_pin() {
     let rig = Rig::new(113, true, 4);
     check_subscription(&rig.subscribe(""), 1, 0, 113, 113);
     rig.flush();
@@ -1546,26 +1544,13 @@ fn v2_subscription_zero_ttl_revalidates_metadata_without_losing_retained_pin() {
 }
 
 #[test]
-fn v2_empty_subscription_completes_without_pages_and_v1_get_is_rejected() {
+fn empty_subscription_completes_without_pages() {
     let rig = Rig::new(0, true, 1);
     check_subscription(&rig.subscribe(""), 1, 0, 0, 0);
     assert_eq!(rig.adapter.calls().len(), 1);
     assert_eq!(rig.adapter.calls()[0].method, "HEAD");
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
     assert_eq!(rig.admission.used(ResourceClass::DirtyCiphertext), 0);
-    let (local, mut remote) = UnixStream::pair().unwrap();
-    remote
-        .write_all(request("GET", "Range: bytes=0-16777215\r\n").as_bytes())
-        .unwrap();
-    assert_eq!(
-        rig.drive(rig.serve(local, &scope())),
-        Err(Error::InvalidRequest)
-    );
-    assert_eq!(
-        rig.adapter.calls().len(),
-        1,
-        "rejected v1 GET reached origin"
-    );
 }
 struct Reply {
     status: u16,

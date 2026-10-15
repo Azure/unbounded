@@ -1,4 +1,4 @@
-//! Independent client v2 and origin v1 wire checks.
+//! Independent client and origin wire checks.
 //! These exercise production HTTP/parser/writer components over real Unix sockets;
 //! they do not substitute for an Application/Coordinator end-to-end deployment.
 use http1::Header;
@@ -129,10 +129,8 @@ fn object() -> ObjectId {
     }
 }
 fn request(method: &str, fields: &[u8]) -> Vec<u8> {
-    // Client request fixtures use only the current v2 target.
-    let version = "v2";
     let mut raw = format!(
-        "{method} /{version}/objects/{} HTTP/1.1\r\nHost: racer\r\n",
+        "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n",
         "ab".repeat(32)
     )
     .into_bytes();
@@ -179,20 +177,14 @@ fn raw_uds_exact_targets_methods_and_bodyless_framing() {
     }
     reject(request("POST", b""), Error::InvalidRequest);
     reject(request("GET", b""), Error::MethodNotAllowed);
-    let canonical_v2 = canonical.replacen("v1", "v2", 1);
-    reject(
-        format!("POST {canonical} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n\r\n")
-            .into_bytes(),
-        Error::InvalidRequest,
-    );
     for target in [
-        format!("{canonical_v2}?"),
-        format!("{canonical_v2}#x"),
-        format!("{canonical_v2}/"),
-        canonical_v2.replace("ab", "AB"),
-        canonical_v2.replace("ab", "%61b"),
-        format!("http://racer{canonical_v2}"),
-        canonical_v2.replace("objects/", "objects//"),
+        format!("{canonical}?"),
+        format!("{canonical}#x"),
+        format!("{canonical}/"),
+        canonical.replace("ab", "AB"),
+        canonical.replace("ab", "%61b"),
+        format!("http://racer{canonical}"),
+        canonical.replace("objects/", "objects//"),
     ] {
         reject(
             format!("POST {target} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n\r\n")

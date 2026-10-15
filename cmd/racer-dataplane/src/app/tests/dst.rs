@@ -27,6 +27,8 @@ use uring_runtime::reactor::simulation::Simulation;
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
+/// Subscription fields every simulated reader sends with its POST.
+const SUBSCRIPTION_FIELDS: &str = "Content-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n";
 
 /// The application owns this historical replay domain, not the generic runtime.
 trait RacerEntropy {
@@ -137,7 +139,7 @@ mod faults {
                 _ => ("POST", "Host: racer\r\nContent-Length: 1\r\n", 400),
             };
             client.request =
-                format!("{method} /v2/objects/{} HTTP/1.1\r\n{fields}\r\n", key(2)).into_bytes();
+                format!("{method} /v1/objects/{} HTTP/1.1\r\n{fields}\r\n", key(2)).into_bytes();
             client.expected_status = Some(status);
             self.exchange(client, false);
             self.coverage.action("malformed-client");
@@ -356,7 +358,7 @@ mod faults {
             // than a random range that may entirely miss that record.
             client.first = page.number.0 as usize * PAGE_BYTES as usize;
             client.end = (client.first + PAGE_BYTES as usize).min(client.size);
-            client.request = format!("GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes={}-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(object), client.tag, client.first, client.end - 1).into_bytes();
+            client.request = format!("POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n{SUBSCRIPTION_FIELDS}If-Match: {}\r\nRange: bytes={}-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(object), client.tag, client.first, client.end - 1).into_bytes();
             let path = self.nodes[*node]
                 .config
                 .slab_directory
@@ -1189,7 +1191,7 @@ mod scenarios {
             client.end = client.size;
             // Match client credit to this small payload budget. Delivered leases no
             // longer occupy the independent server acquisition window.
-            client.request = format!("POST /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: {}\r\nRacer-Ordered: 1\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(1), 2 * PAGE_BYTES, client.tag, client.size - 1).into_bytes();
+            client.request = format!("POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: {}\r\nRacer-Ordered: 1\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(1), 2 * PAGE_BYTES, client.tag, client.size - 1).into_bytes();
             harness.exchange(client, false);
         }
         assert_eq!(harness.coverage.success, 40);
@@ -1231,7 +1233,7 @@ mod scenarios {
                 let mut client = harness.request_on(object, true, false, 0);
                 client.first = 0;
                 client.end = client.size;
-                client.request = format!("GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(object), client.tag, client.size - 1).into_bytes();
+                client.request = format!("POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n{SUBSCRIPTION_FIELDS}If-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(object), client.tag, client.size - 1).into_bytes();
                 client
             }).collect();
             let mut charges = Vec::new();
@@ -1311,7 +1313,7 @@ mod scenarios {
         assert!(harness.coverage.relay_turns > 0);
         // Exact deterministic count under injected pressure. Delivery mode and
         // replica selection change turn ordering, so this pins the default
-        // `spread` selection: legacy `primary` selection lost one more opaque
+        // `spread` selection: `primary` selection loses one more opaque
         // read (8) to the injected pressure window.
         assert_eq!(harness.coverage.success, 9, "opaque={opaque}");
     }
@@ -1451,15 +1453,6 @@ mod traffic {
     }
     impl Client {
         pub(super) fn poll(&mut self) -> bool {
-            if self.sent == 0
-                && !self.head
-                && self.expected_status.is_none()
-                && self.request.starts_with(b"GET ")
-            {
-                let request = String::from_utf8(self.request.clone()).unwrap();
-                self.request = request.replacen("GET /v1/", "POST /v2/", 1)
-                    .replacen("Host: racer\r\n", "Host: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n", 1).into_bytes();
-            }
             let fd = handle(self.fd.as_ref().unwrap());
             if self.released < self.releases.len() {
                 match fd.send(&self.releases[self.released..]) {
@@ -2776,8 +2769,7 @@ impl Harness {
         } else {
             String::new()
         };
-        let endpoint = if head { "v2" } else { "v1" };
-        let request = format!("{} /{endpoint}/objects/{} HTTP/1.1\r\nHost: racer\r\n{pin}{range}Racer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", if head { "HEAD" } else { "GET" }, key(object)).into_bytes();
+        let request = format!("{} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n{}{pin}{range}Racer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", if head { "HEAD" } else { "POST" }, key(object), if head { "" } else { SUBSCRIPTION_FIELDS }).into_bytes();
         let fd = self
             .sim
             .connect(SocketAddress::Unix(
@@ -3042,7 +3034,7 @@ fn dst_generated_traffic_churn_oracle() {
 }
 
 #[test]
-fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
+fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     let sim = Simulation::new();
     let _os = sim.enter();
     let clock = SimulationClock::new(505);

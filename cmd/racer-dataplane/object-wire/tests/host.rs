@@ -6,7 +6,7 @@ fn request(method: &str, host: &str) -> MessageHead {
     MessageHead {
         start: StartLine::Request {
             method: method.into(),
-            target: format!("/v2/objects/{}", CacheKey([0xab; 32]).to_hex()),
+            target: format!("/v1/objects/{}", CacheKey([0xab; 32]).to_hex()),
         },
         headers: vec![
             Header::new("Host", host),
@@ -41,7 +41,7 @@ fn raw_http_host_ows_survives_decoding_and_parses() {
     for method in ["HEAD", "POST"] {
         for host in ["racer", " racer", "\tracer", "  racer \t", " \t racer\t  "] {
             let raw = format!(
-                "{method} /v2/objects/{} HTTP/1.1\r\nHost:{host}\r\nContent-Length: 0\r\n\r\n",
+                "{method} /v1/objects/{} HTTP/1.1\r\nHost:{host}\r\nContent-Length: 0\r\n\r\n",
                 CacheKey([0xab; 32]).to_hex()
             );
             let (head, consumed) = Codec::<()>::new(MAX_HEAD_BYTES)

@@ -136,7 +136,7 @@ fn request() -> MessageHead {
     MessageHead {
         start: StartLine::Request {
             method: "POST".into(),
-            target: format!("/v2/objects/{}", CacheKey([0xab; 32]).to_hex()),
+            target: format!("/v1/objects/{}", CacheKey([0xab; 32]).to_hex()),
         },
         headers: vec![
             Header::new("Host", "racer"),

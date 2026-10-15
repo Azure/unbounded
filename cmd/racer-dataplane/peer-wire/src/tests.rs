@@ -252,7 +252,7 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
     assert_eq!(consumed, encoded.len());
     decoded.start = StartLine::Request {
         method: "HEAD".into(),
-        target: format!("/v2/objects/{}", CacheKey([0xab; 32]).to_hex()),
+        target: format!("/v1/objects/{}", CacheKey([0xab; 32]).to_hex()),
     };
     let parsed = RequestParser::new(MAX_HEAD).parse(&decoded).unwrap();
     assert_eq!(parsed.metadata, Some(metadata.as_slice()));

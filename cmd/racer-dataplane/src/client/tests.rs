@@ -1000,7 +1000,7 @@ fn request(method: &str, fields: &str) -> Vec<u8> {
         ""
     };
     format!(
-        "{method} /v2/objects/{} HTTP/1.1\r\nHost: racer\r\n{body}{fields}\r\n",
+        "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n{body}{fields}\r\n",
         "0".repeat(64)
     )
     .into_bytes()
@@ -1071,7 +1071,7 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
         let started = Instant::now();
         if mode == "partial" {
             sleep_until(started + timeout / 2);
-            socket.write_all(b"HEAD /v2/objects/").unwrap();
+            socket.write_all(b"HEAD /v1/objects/").unwrap();
             for _ in 0..16 {
                 fixture.pump(16);
             }
@@ -1637,7 +1637,7 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     for _ in 0..64 {
         fixture.pump(16);
     }
-    // The initial budget is not renewed: it is no longer the body lifetime.
+    // The initial budget is not renewed and does not bound the body lifetime.
     // Delivery remains live under its independent write-stall bound.
     assert_eq!(fixture.listeners.active_connections(), 1);
     output.extend(fixture.receive(&mut socket, true));
@@ -3433,7 +3433,7 @@ mod parser_tests {
         MessageHead {
             start: StartLine::Request {
                 method: method.into(),
-                target: format!("/v2/objects/{}", "01".repeat(32)),
+                target: format!("/v1/objects/{}", "01".repeat(32)),
             },
             headers: std::iter::once(Header {
                 name: "Host".into(),
@@ -3663,11 +3663,6 @@ mod parser_tests {
         for value in [b"0".as_slice(), b"00", b"1"] {
             assert!(parse(head("POST", &[("Content-Length", value)])).is_err());
         }
-        let mut legacy = head("POST", &[]);
-        if let StartLine::Request { target, .. } = &mut legacy.start {
-            *target = target.replace("/v2/", "/v1/");
-        }
-        assert!(parse(legacy).is_err());
     }
     #[test]
     fn context_duplicates_empty_and_limits() {
@@ -3699,15 +3694,15 @@ mod parser_tests {
         assert!(matches!(parse(request), Err(Error::HeaderTooLarge)));
     }
     #[test]
-    fn head_rejects_legacy_endpoint() {
+    fn head_accepts_only_the_object_endpoint() {
         let codec = Codec::new(MAX_HEAD_BYTES);
-        for endpoint in ["v1", "v2"] {
+        for endpoint in ["v1/objects", "v2/objects", "objects"] {
             let raw = format!(
-                "HEAD /{endpoint}/objects/{} HTTP/1.1\r\nHost: racer\r\n\r\n",
+                "HEAD /{endpoint}/{} HTTP/1.1\r\nHost: racer\r\n\r\n",
                 "0".repeat(64)
             );
             let (head, _) = codec.decode_head(raw.as_bytes()).unwrap().unwrap();
-            assert_eq!(parse(head).is_ok(), endpoint == "v2");
+            assert_eq!(parse(head).is_ok(), endpoint == "v1/objects");
         }
     }
     #[test]
@@ -3722,7 +3717,7 @@ mod parser_tests {
     fn sdk_raw_head_preserves_non_utf8_and_rejects_normalization() {
         let codec = Codec::new(MAX_HEAD_BYTES);
         let mut raw = format!(
-            "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: opaque,",
+            "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: opaque,",
             "0".repeat(64)
         )
         .into_bytes();
@@ -3743,7 +3738,7 @@ mod parser_tests {
             " secret\t",
         ] {
             let raw = format!(
-                "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization:{value}\r\n\r\n",
+                "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization:{value}\r\n\r\n",
                 "0".repeat(64)
             );
             let rejected = match codec.decode_head(raw.as_bytes()) {
@@ -3765,7 +3760,7 @@ mod parser_tests {
                     let parser = RequestParser::new(limit);
                     let codec = Codec::new(parser.header_limit());
                     let prefix = format!(
-                        "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nX:{separator}",
+                        "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nX:{separator}",
                         "0".repeat(64)
                     );
                     let suffix = format!("{trailing}\r\nY:\r\n\r\n");
