@@ -101,6 +101,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
+| `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
 | `RACER_CLIENT_CONNECTIONS` | `128` | Node-wide connection admission budget, partitioned among workers |
 | `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `8` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections, further clamped to the worker's connection budget |
@@ -149,7 +150,11 @@ deduplicated.
 general filesystem or data-signature check, formatting step, or preservation of
 cache-area contents.** Racer skips
 devices with child partitions, active holders, read-only state, or visible mounts.
-It opens devices with `O_RDWR | O_DIRECT | O_EXCL`; busy devices are skipped.
+It opens devices with `O_RDWR | O_DIRECT | O_EXCL`. A device whose open fails
+with `EBUSY`, for example while a replaced dataplane is still releasing its
+claim, is retried every 250 ms until `RACER_DEVICE_BUSY_WAIT_SECS` elapses;
+all busy devices share that one deadline. Devices still busy at the deadline
+are skipped. Other rejections, including active holders, are not retried.
 These checks are not proof that a device is safe to erase. A partition itself is
 allowed: a broad selector can overwrite an unmounted OS or data partition.
 Select only dedicated disposable cache devices after checking each match.
