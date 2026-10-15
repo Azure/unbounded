@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
-ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
+ARG RUNTIME_IMAGE=ubuntu:noble
 # Build stage
 # Build on the target platform: both Rust and the verbs adapter use its ABI.
 FROM ${RUST_IMAGE} AS builder
@@ -65,8 +65,9 @@ RUN set -eu; \
     install -m 0755 target/release/racer-dataplane /out/unbounded/bin/racer-dataplane
 
 # Runtime stage
-# Debian rather than ubuntu:noble so the runtime glibc and libibverbs match
-# the Rust builder that linked the binary and the verbs adapter.
+# ubuntu:noble like the other component images. The Debian bookworm builder
+# links against an older glibc and libibverbs, and both keep backward-compatible
+# symbol versions, so the binary and verbs adapter run on noble's newer ones.
 FROM ${RUNTIME_IMAGE}
 ARG RACER_NATIVE_RDMA=true
 RUN set -eu; \
