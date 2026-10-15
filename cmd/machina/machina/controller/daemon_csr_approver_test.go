@@ -132,6 +132,29 @@ func TestDaemonCSRBootstrapTokenMayClaimMetalmanMachine(t *testing.T) {
 	require.False(t, allowed)
 }
 
+func TestDaemonCSRBootstrapTokenMayClaimMetalmanMachineFromAPIReader(t *testing.T) {
+	token := bootstrapToken("abc123", "")
+	token.Annotations = map[string]string{
+		unboundedv1alpha3.MachineBootstrapTokenAnnotationKey: "machine-a",
+	}
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(token, machineForToken("machine-a", "node-a", "abc123", "")).
+		Build()
+	cachedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&unboundedv1alpha3.Machine{}, machineNodeRefNameField, func(client.Object) []string {
+			return nil
+		}).
+		Build()
+	checker := &daemonCSRClaimChecker{Client: cachedClient, APIReader: apiReader}
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
+	require.NoError(t, err)
+	require.True(t, allowed)
+}
+
 func TestDaemonCSRLegacyBootstrapTokenMayClaimBeforeMachineExists(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(bootstrapToken("abc123", "site-a"))
 	csr := csrForBinding("system:bootstrap:abc123")
@@ -234,7 +257,7 @@ func testDaemonCSRClaimChecker(objs ...client.Object) *daemonCSRClaimChecker {
 		}).
 		Build()
 
-	return &daemonCSRClaimChecker{Client: c}
+	return &daemonCSRClaimChecker{Client: c, APIReader: c}
 }
 
 func csrForBinding(username string) *certificatesv1.CertificateSigningRequest {
