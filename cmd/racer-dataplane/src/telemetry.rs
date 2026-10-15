@@ -1732,7 +1732,7 @@ impl Failures {
         let snapshot = self.5.ring.snapshot();
         writeln!(
             out,
-            "schema_version=2 counter_rows=58 coverage=flight_join_and_reactor_submit_events terminal_cause=false operation_identity=not_recorded page_identity=request_relative_number existing_failed=propagated_not_new_rejection unclassified=join_overload_origin_unknown wait_events=terminal_once wait_cause=prior_observation_not_terminal_capacity counters_and_ring=non_atomic_snapshot total={} retained={} overwritten={} capacity=64",
+            "schema_version=1 counter_rows=58 coverage=flight_join_and_reactor_submit_events terminal_cause=false operation_identity=not_recorded page_identity=request_relative_number existing_failed=propagated_not_new_rejection unclassified=join_overload_origin_unknown wait_events=terminal_once wait_cause=prior_observation_not_terminal_capacity counters_and_ring=non_atomic_snapshot total={} retained={} overwritten={} capacity=64",
             snapshot.total(),
             snapshot.len(),
             snapshot.total().saturating_sub(snapshot.len() as u64)
@@ -2230,7 +2230,7 @@ mod gate_event_tests {
         assert!(!text.contains("key="));
         text.clear();
         failures.write_gate_events(&mut text).unwrap();
-        assert!(text.contains("schema_version=2 counter_rows=58"));
+        assert!(text.contains("schema_version=1 counter_rows=58"));
         assert!(text.contains("total=0 retained=0 overwritten=0"));
     }
 
@@ -2262,7 +2262,7 @@ mod gate_event_tests {
         let mut output = String::new();
         failures.write_gate_events(&mut output).unwrap();
         assert!(output.contains("total=65 retained=64 overwritten=1 capacity=64"));
-        assert!(output.contains("schema_version=2 counter_rows=58"));
+        assert!(output.contains("schema_version=1 counter_rows=58"));
         assert_eq!(
             output
                 .lines()
