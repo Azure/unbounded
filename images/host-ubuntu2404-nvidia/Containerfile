@@ -1,0 +1,64 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Metalman machine image for Ubuntu 24.04 on arm64 NVIDIA GB200 hosts.
+# Package versions intentionally form one tested kernel/driver contract.
+
+FROM --platform=linux/arm64 docker.io/library/ubuntu:noble@sha256:84e77dee7d1bc93fb029a45e3c6cb9d8aa4831ccfcc7103d36e876938d28895b AS rootfs
+ARG TARGETARCH
+ARG KERNEL_RELEASE=6.8.0-1039-azure-nvidia
+ARG KERNEL_VERSION=6.8.0-1039.42
+ARG NVIDIA_KERNEL_MODULE_VERSION=6.8.0-1039.42+3
+ARG NVIDIA_DRIVER_VERSION=580.178.04-0ubuntu0.24.04.1
+ARG NVIDIA_TOOLKIT_VERSION=1.19.1-1
+ARG NVIDIA_IMEX_VERSION=580.178.04-1ubuntu1
+COPY images/host-ubuntu2404-nvidia/assets/rootfs.sh /usr/local/bin/build-rootfs
+RUN TARGETARCH="${TARGETARCH}" \
+    KERNEL_RELEASE="${KERNEL_RELEASE}" \
+    KERNEL_VERSION="${KERNEL_VERSION}" \
+    NVIDIA_KERNEL_MODULE_VERSION="${NVIDIA_KERNEL_MODULE_VERSION}" \
+    NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION}" \
+    NVIDIA_TOOLKIT_VERSION="${NVIDIA_TOOLKIT_VERSION}" \
+    NVIDIA_IMEX_VERSION="${NVIDIA_IMEX_VERSION}" \
+    sh /usr/local/bin/build-rootfs install
+RUN TARGETARCH="${TARGETARCH}" \
+    KERNEL_RELEASE="${KERNEL_RELEASE}" \
+    KERNEL_VERSION="${KERNEL_VERSION}" \
+    NVIDIA_KERNEL_MODULE_VERSION="${NVIDIA_KERNEL_MODULE_VERSION}" \
+    NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION}" \
+    NVIDIA_TOOLKIT_VERSION="${NVIDIA_TOOLKIT_VERSION}" \
+    NVIDIA_IMEX_VERSION="${NVIDIA_IMEX_VERSION}" \
+    sh /usr/local/bin/build-rootfs finish
+
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:noble@sha256:84e77dee7d1bc93fb029a45e3c6cb9d8aa4831ccfcc7103d36e876938d28895b AS build
+ARG TARGETARCH
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends \
+           dosfstools e2fsprogs fdisk mtools pigz; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=rootfs /rootfs.tar /rootfs.kver /
+COPY images/host-ubuntu2404-nvidia/assets/disk.sh /usr/local/bin/build-disk
+RUN TARGETARCH="${TARGETARCH}" sh /usr/local/bin/build-disk && rm /rootfs.tar
+
+FROM scratch
+ARG KERNEL_RELEASE=6.8.0-1039-azure-nvidia
+ARG NVIDIA_DRIVER_VERSION=580.178.04-0ubuntu0.24.04.1
+ARG NVIDIA_TOOLKIT_VERSION=1.19.1-1
+ARG NVIDIA_IMEX_VERSION=580.178.04-1ubuntu1
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.description="Metalman arm64 machine image for Ubuntu 24.04 NVIDIA GB200 hosts" \
+      io.unbounded.host.architecture="arm64" \
+      io.unbounded.host.kernel="${KERNEL_RELEASE}" \
+      io.unbounded.host.nvidia-driver="${NVIDIA_DRIVER_VERSION}" \
+      io.unbounded.host.nvidia-container-toolkit="${NVIDIA_TOOLKIT_VERSION}" \
+      io.unbounded.host.nvidia-imex="${NVIDIA_IMEX_VERSION}"
+COPY --from=build /disk /disk
+COPY LICENSE NOTICE /unbounded/licenses/

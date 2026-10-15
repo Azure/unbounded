@@ -1,0 +1,58 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Ubuntu GB200 host image
+
+on:
+  pull_request:
+    paths:
+      - images/host-ubuntu2404-nvidia/**
+      - hack/hostimage/**
+      - hack/verify-host-ubuntu2404-nvidia.sh
+      - .github/workflows/host-ubuntu2404-nvidia.yaml
+      - .github/workflows/images.yaml
+      - .github/workflows/release.yaml
+      - hack/cmd/release-bom/**
+  push:
+    branches: [main, release-*]
+    paths:
+      - images/host-ubuntu2404-nvidia/**
+      - hack/hostimage/**
+      - hack/verify-host-ubuntu2404-nvidia.sh
+      - .github/workflows/host-ubuntu2404-nvidia.yaml
+      - .github/workflows/images.yaml
+      - .github/workflows/release.yaml
+      - hack/cmd/release-bom/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install disk verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs fdisk jq mtools
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build arm64 Ubuntu GB200 host image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/host-ubuntu2404-nvidia/Containerfile
+          platforms: linux/arm64
+          outputs: type=local,dest=tmp/host-ubuntu2404-nvidia
+          cache-from: type=gha,scope=host-ubuntu2404-nvidia
+          cache-to: type=gha,mode=max,scope=host-ubuntu2404-nvidia
+          provenance: false
+
+      - name: Verify bootable disk artifact
+        run: hack/verify-host-ubuntu2404-nvidia.sh tmp/host-ubuntu2404-nvidia

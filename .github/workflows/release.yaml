@@ -825,8 +825,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest the component images that have no
   # release-time image ordering requirements.
-  # Go components cross-compile natively for amd64 and arm64; the host-* machine
-  # images publish both platforms for PXE architecture support.
+  # Go components cross-compile natively for amd64 and arm64. Most host-* machine
+  # images publish both platforms; the GB200 image is intentionally arm64-only.
   # ---------------------------------------------------------------------------
   component-images:
     needs: version
@@ -872,6 +872,10 @@ jobs:
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: false
+          - name: host-ubuntu2404-nvidia
+            file: images/host-ubuntu2404-nvidia/Containerfile
+            platforms: linux/arm64
             trivy: false
           - name: host-azurelinux3
             file: images/host-azurelinux3/Containerfile

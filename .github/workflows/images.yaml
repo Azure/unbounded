@@ -73,7 +73,13 @@ jobs:
             exit 1
           fi
 
-          if [[ -n "$INPUT_PLATFORMS" ]]; then
+          if [[ "$name" == "host-ubuntu2404-nvidia" ]]; then
+            if [[ -n "$INPUT_PLATFORMS" && "$INPUT_PLATFORMS" != "linux/arm64" ]]; then
+              echo "::error::${name} only supports linux/arm64"
+              exit 1
+            fi
+            platforms="linux/arm64"
+          elif [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
           else
             platforms="linux/amd64,linux/arm64"
