@@ -80,7 +80,6 @@ Keys below use the `racer.unbounded-cloud.io/` prefix unless shown in full.
 | Annotation `block-devices` | Startup-only regex selecting raw cache devices by `disk/by-id` basename; see [raw-device storage](#raw-device-storage) |
 | Annotations `enrolled-shares`, `enrolled-rdma-nics` | Controller-managed authenticated dataplane reports; do not edit |
 | Annotation `last-admitted-member` | Controller-managed, Node-UID-bound retained membership; do not edit |
-| Annotations `rails`, `aligned-rails` | Obsolete; ignored with diagnostics |
 
 Malformed membership annotations retain admitted attributes; invalid new nodes are omitted.
 Site uses current labels. Invalid `block-devices` selectors instead fall back to slab files.
@@ -188,8 +187,8 @@ exclusive `O_DIRECT` descriptor, using one aligned 1 MiB buffer. Nonzero bytes,
 short reads, I/O errors, or unsupported alignment reject that device. Racer never
 zeros the guards or bypasses partition, holder, or mount checks. Clearing old
 contents is a separate operator-approved operation, not an automatic repair.
-Keeping cache records out of these ends addresses the observed first-sector
-partition-signature collision; it is not proof against every partition parser.
+Keeping cache records out of these ends prevents cache data from looking like a
+partition table or filesystem signature; it is not proof against every partition parser.
 
 The managed privileged container mounts host `/dev` read-only at `/host/dev`.
 This protects directory entries, **not device contents**: raw writes are
@@ -219,16 +218,11 @@ checkpoint scratch, not just the configured admission budgets. The automatic
 checkpoint budget is not an RSS limit or a guarantee that a full cache can be
 checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
 
-Checkpoint **v4** stores completed-page hold deadlines and binds each worker to
-file mode or its raw-device IDs, sizes, and segment offsets. The raw-layout **v2**
-digest also includes both guard sizes; this is separate from the checkpoint
-format version. The prior offset-zero raw
-layout cannot recover into the guarded layout. Each checkpoint candidate is
+Checkpoints store completed-page hold deadlines and bind each worker to
+file mode or its raw-device IDs, sizes, and segment offsets. The raw-layout
+digest also includes both guard sizes. Each checkpoint candidate is
 validated for the whole node: one mismatched worker rejects the entire candidate.
-If both saved candidates use the old layout, the whole node starts cold. File-mode
-layout identity is unchanged by this migration.
-Older checkpoint versions are discarded, including in file
-mode. A changed device layout, storage mode, worker count, or incompatible
+A changed device layout, storage mode, worker count, or incompatible
 geometry rejects recovery and starts cold when no compatible checkpoint remains.
 Racer does not scan payloads to rebuild the index or migrate cached data. Preserve
 cluster and node identity state; it is separate from disposable cache checkpoints.
@@ -291,12 +285,11 @@ or storage failure.
 The background job owns a charged, zeroizing copy of `Authorization` and `Metadata`
 in memory only. It uses the fill timeout (600 seconds by default), separate from
 the HEAD deadline and retention TTL. Credentials are never checkpointed. On
-restart, jobs, waiters, and unused reservations are gone. Checkpoint v4 restores
+restart, jobs, waiters, and unused reservations are gone. Checkpoints restore
 only unexpired holds for completed disk records. Live hold expiry waits for both
 wall and monotonic deadlines; restart has only the saved wall-clock deadline.
 Neither payload nor checkpoint publication adds `fsync`, so process or host
-failure can lose pages or holds. Older checkpoint formats are rejected and start
-cold when no compatible checkpoint remains, including in file mode.
+failure can lose pages or holds.
 
 Warm gauges refresh on worker health ticks (normally every 100 ms). They report
 the shared node registry once, without worker, object, or version labels. A
@@ -439,8 +432,8 @@ one active search, while distinct searches can report overload. The node's total
 distinct-search concurrency can reach I/O worker count times
 `RACER_ACTIVE_PATH_SEARCHES`.
 
-The overlay is now the symmetric union of 32 independently hashed rings over
-stable node IDs, replacing the position-based radix overlay. It has at most 64
+The overlay is the symmetric union of 32 independently hashed rings over
+stable node IDs. It has at most 64
 neighbors per member and is independent of shares. Building a new graph costs
 O(32 N log N) for bounded-size IDs and retains approximately 64N adjacency
 `usize` slots plus N vector headers. On a 64-bit target at 100,000 members,
@@ -465,19 +458,11 @@ the owned job rather than detaching it, so cleanup may wait beyond the request
 deadline: the join has no independent timeout. Bounded input and job count are
 not a hard wall-clock shutdown guarantee.
 
-Routing selection uses `/next-hop/v5`, which independently length-prefixes the
-seed, source ID, and destination ID. Both ring edges and next-hop selection
-change routing compatibility. **Coordinate the cluster version transition and
-quiesce traffic until all participating dataplanes use the same routing
-implementation.** Matching membership version numbers do not negotiate the
-algorithm, and no automatic safe mixed-version routing is assumed. The
-placement slot, weighted rendezvous algorithm, and placement hash compatibility
-are unchanged for identical application keys, node IDs, and shares; that does
-not make mixed routing safe.
-
-Remove obsolete `RACER_ROUTING_ALGORITHM` and `RACER_CACHED_RANKINGS` settings:
-even empty values fail startup. Use the independent cache settings above, not
-an algorithm selector or the old ranking-entry setting.
+Routing selection uses `/next-hop/v1`, which independently length-prefixes the
+seed, source ID, and destination ID. All participating dataplanes must use the
+same routing implementation. Matching membership version numbers do not
+negotiate the algorithm, and mixed-version routing is not safe. **When upgrading,
+quiesce traffic until all dataplanes run the same version.**
 
 ## Controller and workload wiring
 
@@ -639,8 +624,7 @@ executable mapping snapshot still rejects capture with `mapping_changed`.
 
 Native capture requires kernel perf access; the endpoint does not change host perf
 settings, container capabilities, or seccomp policy. Release builds retain frame
-pointers even when profiling is disabled. That compiler change can affect CPU
-performance, so comparisons with older binaries are not profiling-only comparisons.
+pointers even when profiling is disabled, which can slightly affect CPU performance.
 
 Monitor `racer_requests_total`, `racer_request_errors_total`, `racer_overloads_total`,
 and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-source events
@@ -658,8 +642,7 @@ credentials, and node identity state. Do not delete them to force a fresh start.
 Cached bytes are disposable; this installation state is not. Deleting and
 recreating a ClusterCache creates a new cache identity, even with the same name.
 
-Checkpoint v4 discards older checkpoint formats in file and device modes. Expect
-a cold cache after upgrading from an older format or changing device layout,
+Expect a cold cache after changing device layout,
 worker count, or storage geometry. Recovery does not scan payloads to rebuild
 the cache. Make sure origins can serve the resulting misses.
 
@@ -765,8 +748,6 @@ Verify from the actual Pod namespaces:
   The adapter uses **GID index 0**. Annotation `gid` is a matching constraint, not an index
   selector or RoCE configuration; retain HTTP when another index is required.
 
-Coordinate controller/dataplane upgrades and quiesce traffic. The `rails`/`alignment_enabled`
-to `rdma_nics` change breaks compatibility despite wire schema version 1; rolling updates
-do not make mixed versions safe. Remove `RACER_RAILS`, `RACER_ALIGNED_RAILS`,
-`RACER_FABRIC_PORTS`, and `RACER_FABRIC_PORTS_FILE`: even empty values fail startup.
+Coordinate controller/dataplane upgrades and quiesce traffic; rolling updates
+do not make mixed versions safe.
 Validate transfers, HTTP fallback, and recovery on target hardware before relying on RDMA.
