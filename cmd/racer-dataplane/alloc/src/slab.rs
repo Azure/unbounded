@@ -1579,10 +1579,19 @@ mod tests {
         );
         assert_eq!(&buffer.bytes().unwrap()[..31], &[42; 31]);
         assert!(buffer.bytes().unwrap()[31..].iter().all(|b| *b == 0));
-        assert_eq!(
-            unsafe { libc::pwrite(fd, buffer.bytes().unwrap().as_ptr().cast(), 31, 1) },
-            -1
-        );
+        // statx(2) allows misaligned direct I/O to either fail with EINVAL or fall back to
+        // buffered I/O, so only a failure's errno is part of the contract.
+        // SAFETY: the descriptor and buffer remain live throughout this synchronous call.
+        let misaligned =
+            unsafe { libc::pwrite(fd, buffer.bytes().unwrap().as_ptr().cast(), 31, 1) };
+        if misaligned < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINVAL)
+            );
+        } else {
+            assert_eq!(misaligned, 31);
+        }
         drop(buffer);
         assert_eq!(slabs.idle_bytes(), extent.length());
         assert_eq!(slabs.reclaim_idle(), extent.length());
