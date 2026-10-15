@@ -67,19 +67,21 @@ IMEX is disabled by default. Unbounded does not install or repair NVIDIA
 drivers or IMEX userspace. Enable exposure only after the host-image pipeline
 has applied and tested a qualified profile:
 
-> The committed Hillsboro profile `v2026.10.14-1` is currently blocked and is
-> documentation/validation input only. Do not enable it until `aks-flex-dev`
-> publishes a passing authenticated result and a reviewed canonical digest.
-> The accepted producer contract is in `aks-flex-dev` commit
-> `84bae02adb8265dc8fb7d65b3c958048e22f7732` under
-> `labs/gb200-hillsboro/gpu-operator-ownership/`.
+> The proposed Ubuntu Hillsboro profile
+> `hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1` is currently
+> `not-generated-unqualified`. Do not enable it until `aks-flex-dev` publishes
+> the final closed schema, canonical qualified artifact, digest, and
+> authenticity attestation, and Unbounded implements that exact contract. The
+> producer definition is in `aks-flex-dev` commit
+> `9c285427b1bc38b5c468470fcf51ac9638168e33` under
+> `labs/gb200-hillsboro/gpu-operator-ownership/host-profiles/hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1/`.
 
 ```bash
 kubectl unbounded machine config create gb200-dra \
   --nvidia-imex-mode=DRA \
-  --nvidia-host-profile=hillsboro-gb200-gpu-operator-ready \
+  --nvidia-host-profile=hillsboro-gb200-ubuntu-gpu-operator-ready \
   --nvidia-host-profile-version=v2026.10.14-1 \
-  --nvidia-host-profile-digest=sha256:<canonical-qualification-digest>
+  --nvidia-host-profile-digest=sha256:<producer-published-qualified-digest>
 ```
 
 The corresponding API field is:
@@ -91,26 +93,29 @@ spec:
       nvidia:
         imex:
           mode: DRA
-          hostProfile: hillsboro-gb200-gpu-operator-ready
+          hostProfile: hillsboro-gb200-ubuntu-gpu-operator-ready
           hostProfileVersion: v2026.10.14-1
-          hostProfileDigest: sha256:<canonical-qualification-digest>
+          hostProfileDigest: sha256:<producer-published-qualified-digest>
 ```
 
-This is a strict, read-only capability gate. Goal-state resolution occurs
-before normal host preparation and fails unless all of the following are true:
+The command and API example show the future configuration shape; do not apply
+them while the producer status is `not-generated-unqualified`. This remains a
+strict, read-only capability gate. Goal-state resolution occurs before normal
+host preparation and fails unless all of the following are true:
 
-- `/etc/unbounded/host-capabilities/nvidia-gpu-operator.json` records the
-  expected schema, profile and version, contract/result versions, immutable
-  image identity, authenticity attestation, OS, architecture, exact kernel and
-  kernel-devel, driver branch and exact driver/userspace/package versions,
-  driver-matched IMEX package, runtime/CDI versions and readiness, GPU count,
-  local NVLink result, host service ownership, device prerequisites, and
-  versioned acceptance result.
+- The final producer artifact records the expected schema, profile and version,
+  contract/result versions, immutable image identity, authenticity
+  attestation, OS, architecture, exact kernel and kernel-devel, driver branch
+  and exact driver/userspace/package versions, driver-matched Fabric Manager,
+  NSCQ and IMEX packages, runtime/CDI versions and readiness, capability scope,
+  GPU count, local NVLink result, host service ownership, device prerequisites,
+  and versioned acceptance result. The proposed Ubuntu artifact path is
+  `/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json`, but the
+  consumer must wait for the committed final schema and canonical fixture.
 - The artifact is RFC 8785 canonical UTF-8 JSON with no BOM or trailing
-  newline. Its required sidecar contains the lowercase SHA-256 digest, two
-  spaces, `nvidia-gpu-operator.json`, and one newline. The configured digest
-  binds the evidence content but remains separate from the required verified
-  authenticity attestation.
+  newline. Its required sidecar format and filename must exactly match the
+  final producer contract. The configured digest binds the evidence content
+  but remains separate from the required verified authenticity attestation.
 - The running OS, architecture, kernel, NVIDIA version, and GPU count match
   the qualification evidence, and the NVIDIA driver is branch 580 or later.
 - The preinstalled driver-matched IMEX package provides

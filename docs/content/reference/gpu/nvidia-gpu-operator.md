@@ -29,7 +29,8 @@ has drifted.
 GPU Operator fully managed driver mode (`driver.enabled=true`) was evaluated
 but is not selected for Hillsboro. It would transfer kernel driver ownership to
 an in-cluster controller and requires a separate compatibility program for
-Linux arm64, GB200, Azure Linux, the Unbounded nspawn boundary, and rollback.
+Linux arm64, GB200, the selected Ubuntu stack, the Unbounded nspawn boundary,
+and rollback.
 
 ```mermaid
 flowchart LR
@@ -50,7 +51,7 @@ flowchart LR
 | NVIDIA DRA driver | `v0.5.1` |
 | Existing standalone NVIDIA device plugin | `v0.20.0` |
 | Ubuntu NVIDIA driver | `580.178.04` |
-| Azure Linux NVIDIA driver currently observed | `580.159.04` |
+| Excluded Azure Linux NVIDIA driver | `580.159.04` |
 
 DRA driver v0.5.1 requires Kubernetes 1.34.2 or later for GPU allocation and
 documents driver branch 580 or later for the evaluated ComputeDomain path.
@@ -85,10 +86,10 @@ declaration:
 
 | Hillsboro name | Kubernetes Node | Host OS and kernel | Driver and host tooling | Local NVLink | Current GPU owner | Other constraint |
 |---|---|---|---|---|---|---|
-| gb200-4 | `gb2002159d2424` | Ubuntu 24.04, `6.14.0-1009-azure-nvidia` | `580.178.04`; host `nvidia-smi`; IMEX package absent | Four GPUs report active local links | Standalone device plugin `0.20.0` | MetalMan is pinned here and must not be evicted |
-| gb200-3 | `gb2002159d2425` | Ubuntu 24.04, `6.14.0-1009-azure-nvidia` | `580.178.04`; host `nvidia-smi`; IMEX package absent | Four GPUs report active local links | Standalone device plugin `0.20.0` | Preferred first canary after image qualification |
-| gb200-2 | `gb2002159d2426` | Ubuntu 24.04, `6.14.0-1009-azure-nvidia` | `580.178.04`; host `nvidia-smi`; IMEX package absent | Degraded: GPU 0 has four active links; GPUs 1-3 report no active links | Standalone device plugin `0.20.0` | Not eligible for MNNVL until platform repair |
-| gb200-1 | `gb2002159d2427` | Azure Linux 3, `6.18.48.1-1.azl3` | `580.159.04`; no host `nvidia-smi`; no IMEX package in configured repositories; Container Toolkit `1.19.1` present | Previously unhealthy; not eligible for MNNVL | Standalone device plugin `0.20.0` | Ordinary GPU-ready, but not IMEX-qualified |
+| gb200-4 | `gb2002159d2424` | Ubuntu 24.04.4, `6.14.0-1009-azure-nvidia` | `580.178.04`; Container Toolkit `1.19.1`; containerd `2.1.8`; IMEX qualification pending | Healthy: links 0/1 at 53.125 GB/s, NV2 all pairs, Fabric `Completed/Success/Healthy/Full` | Standalone device plugin `0.20.0` | NVLink acceptance target; MetalMan is pinned here and must not be evicted |
+| gb200-3 | `gb2002159d2425` | Ubuntu 24.04.4, `6.14.0-1009-azure-nvidia` | `580.178.04`; Container Toolkit `1.19.1`; containerd `2.1.8`; IMEX qualification pending | Healthy: links 0/1 at 53.125 GB/s, NV2 all pairs, Fabric `Completed/Success/Healthy/Full` | Standalone device plugin `0.20.0` | NVLink acceptance target and preferred first canary after image qualification |
+| gb200-2 | `gb2002159d2426` | Ubuntu 24.04, `6.14.0-1009-azure-nvidia` | `580.178.04`; host `nvidia-smi`; IMEX package absent | Previously degraded: GPU 0 had four active links; GPUs 1-3 reported no active links | Standalone device plugin `0.20.0` | Non-NVLink scope only; it must not block gb200-3/4 fabric qualification |
+| gb200-1 | `gb2002159d2427` | Azure Linux 3, `6.18.48.1-1.azl3` | `580.159.04`; no host `nvidia-smi`; no IMEX package in configured repositories; Container Toolkit `1.19.1` present | Previously unhealthy | Standalone device plugin `0.20.0` | Cordoned and excluded from this rollout |
 
 All four Nodes were Ready, had `DiskPressure=False`, and advertised four legacy
 `nvidia.com/gpu` resources when the deployment was stopped. No GPU Operator,
@@ -96,21 +97,24 @@ GPUCluster, ComputeDomain, ResourceClaim, or DRA ResourceSlice was installed.
 
 ### Current rollout blockers
 
-The latest read-only preflight found all four Nodes Ready, schedulable, and
-advertising four GPUs in the existing Racer domain. That does not make any node
-eligible for this profile:
+The latest read-only preflight found gb200-2/3/4 Ready and advertising four
+GPUs in the existing Racer domain. gb200-1 is Ready but cordoned and excluded.
+That does not make any node eligible for the new Ubuntu profile:
 
-- `gb2002159d2424`, `gb2002159d2425`, and `gb2002159d2426` are Ubuntu 24.04
-  hosts, not the selected Azure Linux 3 profile. Their Machines also lack the
-  approved `spec.host.netboot` URL, rack slot, MAC address, host image, netboot
-  image, and target-disk inputs needed for an auditable HostReplace.
-- `gb2002159d2427` is Azure Linux 3, but the producer profile is blocked and
-  cannot authorize join.
-- Rack slots 25, 26, and 28 reported healthy. Slot 27 returned HTTP 500 with a
-  power-map failure.
-- Only the slot 28 to `gb2002159d2427` MAC mapping is verified. The other
-  physical mappings and newly observed SSH fingerprints do not have approved
-  baselines.
+- The producer has named the Ubuntu profile, but has not generated a canonical
+  qualification artifact, digest, authenticity attestation, or final consumer
+  schema. Its status is `not-generated-unqualified`.
+- gb200-3 and gb200-4 have authoritative rack, MAC, and target-disk mappings:
+  gb200-3 is Node `gb2002159d2425`, rack slot 26, MAC ending `9c:d7`, and disk
+  WWID ending `ef1a0`; gb200-4 is Node `gb2002159d2424`, rack slot 25, MAC
+  ending `0b:37`, and disk WWID ending `f7034`.
+- The immutable Ubuntu image digest and provenance are still absent, and the
+  corresponding Machines remain `ConfigurationPending`.
+- gb200-2 is outside NVLink/ComputeDomain/IMEX acceptance. Its earlier degraded
+  local NVLink evidence must not be converted into an eligibility claim.
+- gb200-1 was provisioned through an externally initiated direct Machine patch
+  without a durable MachineConfiguration or MachineConfigurationVersion. It
+  remains cordoned and is not a source profile for this rollout.
 
 These are producer/MetalMan preflight blockers, not inputs that the Unbounded
 agent can infer or repair. Do not set the DRA MachineConfiguration or begin
@@ -119,92 +123,70 @@ identity, rack mapping, and host authenticity baseline all agree.
 
 ## Selected host profile
 
-The selected image contract is named:
+The proposed Ubuntu image contract is named:
 
 ```text
-hillsboro-gb200-gpu-operator-ready/v2026.10.14-1
+hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1
 ```
 
 The producer source of truth is `aks-flex-dev` commit
-`84bae02adb8265dc8fb7d65b3c958048e22f7732` and
+`9c285427b1bc38b5c468470fcf51ac9638168e33` and
 [ADO PR 17532408](https://dev.azure.com/msazure/09706533-03bf-4b43-9a9b-b49c75429646/_git/678b10b4-3043-4c26-9eb1-46f7c336019b/pullrequest/17532408).
-Its ownership bundle is rooted at
-`labs/gb200-hillsboro/gpu-operator-ownership/`:
-
-| Surface | `aks-flex-dev` path |
-|---|---|
-| Unbounded contract | `labs/gb200-hillsboro/gpu-operator-ownership/docs/unbounded-interface.md` |
-| MachineConfiguration example | `labs/gb200-hillsboro/gpu-operator-ownership/unbounded/machineconfiguration-hillsboro-gb200.example.yaml` |
-| JSON Schema | `labs/gb200-hillsboro/gpu-operator-ownership/schemas/nvidia-gpu-operator-host-capabilities-v1.schema.json` |
-| Canonical blocked example | `labs/gb200-hillsboro/gpu-operator-ownership/examples/nvidia-gpu-operator.blocked.json` |
-
-The accepted producer profile is intentionally **blocked**. Approved IMEX
-artifacts, approved Container Toolkit 1.18 or later and containerd 2.0 or
-later sources, RPM digests, image authenticity attestation, and Hillsboro
-disk/storage/memory inventory remain unresolved. Do not use its example digest
-to enable a live join. The blocked example's canonical digest is
-`sha256:d82bdff682685fa4c78bf52b3dd57a7287919606820e02079f2cba33644a1e51`.
-It is a regression fixture, not an eligible MachineConfiguration digest.
-
-The image pipeline must write this evidence file:
+The profile root is:
 
 ```text
-/etc/unbounded/host-capabilities/nvidia-gpu-operator.json
+labs/gb200-hillsboro/gpu-operator-ownership/host-profiles/hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1/
 ```
 
-Do not hand-author the evidence. Generate and validate it with the producer's
-committed code and schema under the ownership bundle. The exact nested schema
-is closed at every object and rejects unknown fields. Its fixed identifiers
-are:
+The producer documentation is
+`labs/gb200-hillsboro/gpu-operator-ownership/docs/hillsboro-gb200-ubuntu-host-profile.md`;
+the future consumer example is
+`labs/gb200-hillsboro/gpu-operator-ownership/unbounded/machineconfiguration-hillsboro-gb200-ubuntu.example.yaml`.
+The contract identifier is
+`hillsboro.ubuntu-nvidia-host-capabilities/v1`.
+
+This profile is **not generated and unqualified**. Approved IMEX, Fabric
+Manager, NSCQ, immutable image provenance, canonical evidence, digest, and
+authenticity gates remain unresolved. PR #913 must not hardcode provisional
+Ubuntu values or accept the old Azure Linux fixture as authorization for an
+Ubuntu join.
+
+The producer proposes the artifact path
+`/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json`. The
+Unbounded consumer must not adopt that path or new contract constants until
+the producer commits the final closed schema, canonical qualified artifact,
+sidecar format, digest, and attestation semantics.
+
+The prior Azure Linux blocked artifact and digest remain useful only as
+decoder regression fixtures. They do not qualify any Hillsboro node and are
+not the selected rollout contract.
 
 | Field | Required value |
 |---|---|
-| `schemaVersion` | `1` |
-| `profile` | `hillsboro-gb200-gpu-operator-ready` |
+| `profile` | `hillsboro-gb200-ubuntu-gpu-operator-ready` |
 | `profileVersion` | `v2026.10.14-1` |
-| `contractVersion` | `hillsboro.nvidia-host-capabilities/v1` |
-| `architecture` | `arm64` |
-| `acceptance.resultVersion` | `hillsboro-gb200-acceptance/v1` |
-| `integrity.artifactPath` | `/etc/unbounded/host-capabilities/nvidia-gpu-operator.json` |
-| `integrity.canonicalization` | `RFC8785-JCS` |
+| `contractVersion` | `hillsboro.ubuntu-nvidia-host-capabilities/v1` |
+| proposed artifact | `/etc/unbounded/host-capabilities/nvidia-gpu-operator-ubuntu.json` |
+| producer status | `not-generated-unqualified` |
 
-The qualified profile must identify the immutable image, Azure Linux 3.0
-kernel and kernel-devel `6.18.48.1-1.azl3.aarch64`, driver branch `580`,
-driver/userspace `580.159.04`, the exact driver, Fabric Manager, NSCQ, and IMEX
-packages, Container Toolkit 1.18.0 or later, containerd 2.0.0 or later with
-CDI, four GPUs, healthy local NVLink, required files/devices/modules/services,
-and a verified nonempty authenticity attestation. The IMEX service assertion
-is `enabled=false`, `masked=true`, with lifecycle owner
-`gpu-operator-dra-driverManaged`. `multiNodeNvlinkClaimed` must remain false:
-the immutable artifact cannot prove post-join physical multi-node readiness.
-
-The artifact is one RFC 8785 canonical UTF-8 line with no BOM or trailing
-newline. Its adjacent `nvidia-gpu-operator.json.sha256` sidecar is exactly
-`<lowercase hex><two spaces>nvidia-gpu-operator.json<LF>`.
-`hostProfileDigest` is `sha256:<hex>` over those exact canonical bytes. The
-digest detects content mismatch but is separate from authenticity; the
-document itself must also report `authenticity.status=verified` and a nonempty
-attestation. Missing required fields, unknown fields at any level,
-noncanonical bytes, a sidecar mismatch, an unsupported contract/result
-version, `status=blocked`, or inconsistent evidence all fail closed.
-
-After the producer profile reports a passing, authentic result, configure the
-expected contract explicitly:
+After the producer publishes and PR #913 implements the final schema, a future
+MachineConfiguration will supply the exact producer digest:
 
 ```bash
 kubectl unbounded machine config create hillsboro-gb200-dra \
   --nvidia-imex-mode=DRA \
-  --nvidia-host-profile=hillsboro-gb200-gpu-operator-ready \
+  --nvidia-host-profile=hillsboro-gb200-ubuntu-gpu-operator-ready \
   --nvidia-host-profile-version=v2026.10.14-1 \
-  --nvidia-host-profile-digest=sha256:<canonical-qualification-digest>
+  --nvidia-host-profile-digest=sha256:<producer-published-qualified-digest>
 ```
 
-The selected MachineConfiguration fails closed unless:
+Do not run this command while the producer status is
+`not-generated-unqualified`. The final consumer must fail closed unless:
 
-- The artifact schema, profile, profile version, contract/result versions,
-  canonical digest and sidecar, immutable image identity, authenticity,
-  OS/version, architecture, exact kernel and kernel-devel, driver branch and
-  exact driver/userspace/package versions, IMEX package, runtime/CDI evidence,
+- The final producer schema, profile, profile version, contract/result
+  versions, canonical digest and sidecar, immutable Ubuntu image identity,
+  authenticity, OS/version, architecture, kernel, driver/userspace/package
+  versions, Fabric Manager, NSCQ, IMEX, runtime/CDI evidence, capability scope,
   GPU count, local NVLink result, and versioned acceptance result are complete
   and match the contract.
 - The running OS/version, architecture, kernel, driver version, GPU count, and
@@ -260,7 +242,7 @@ digest.
 | Surface | Owner | Required outcome |
 |---|---|---|
 | External NVSwitch, NVLSM, cables, and external InfiniBand | Rack/platform operator | Healthy physical fabric before MNNVL validation |
-| Azure Linux or Ubuntu host image, kernel, headers, NVIDIA driver/userspace, IMEX package, Container Toolkit, and qualification marker | `aks-flex-dev` Hillsboro image pipeline | Immutable, tested `hillsboro-gb200-gpu-operator-ready/v2026.10.14-1` image |
+| Ubuntu host image, kernel, headers, NVIDIA driver/userspace, IMEX package, Container Toolkit, and qualification marker | `aks-flex-dev` Hillsboro image pipeline | Immutable, tested `hillsboro-gb200-ubuntu-gpu-operator-ready/v2026.10.14-1` image |
 | Applying the qualified host image | MetalMan under a separately approved HostReplace | Serial replacement with rollback image retained |
 | Joining the qualified host | Flex Node and Unbounded agent | Read-only validation, nspawn device/library exposure, Node registration |
 | GPU Operator deployment definition | `aks-flex-dev` | Pinned chart values, image digests, rollout and rollback inputs |
@@ -318,7 +300,7 @@ and separate mutation approval are available.
    - GPU Operator chart/app `v26.7.2`.
    - DRA driver `v0.5.1`.
    - Every rendered image by digest.
-   - The target Azure Linux host image, kernel, driver, IMEX package, and nspawn
+   - The target Ubuntu host image, kernel, driver, IMEX package, and nspawn
      NVIDIA image by immutable identifier.
 2. Render both modes without applying:
 
@@ -343,7 +325,7 @@ and separate mutation approval are available.
 3. Extract every image from the rendered output, resolve its digest, inspect
    multi-architecture manifests, and inspect the selected driver image
    filesystem for IMEX binaries and libraries.
-4. On a disposable Azure Linux GB200 host only, verify exact kernel build
+4. On a disposable Ubuntu GB200 host only, verify exact kernel build
    inputs, module signing, driver-container startup, module load/unload,
    Container Toolkit/CDI generation, IMEX device creation, MANA stability, one
    reboot, one upgrade, and one rollback.
@@ -405,13 +387,14 @@ identity input stops the rollout before cordon, drain, HostReplace, or join.
      ResourceSlices, ComputeDomain status, daemon membership, channel devices,
      CDI specs, and workload-scoped claims.
 8. **Run bounded NCCL validation.**
-   - Start with two fabric-healthy nodes.
+   - Use only gb200-3 and gb200-4 for NVLink/ComputeDomain/IMEX acceptance.
    - Disable external IB for the test, use the agreed 32 MiB and 20-iteration
      profile, and require true MNNVL transport.
    - NET/Socket fallback is failure, not partial success.
 9. **Expand only after success.**
-   - Do not add gb200-2 until its local NVLink fault is repaired.
-   - Do not add gb200-1 until a qualified Azure Linux image is applied.
+   - Keep gb200-2 outside the NVLink/ComputeDomain scope. Its independent
+     non-NVLink qualification must not block gb200-3/4.
+   - Keep cordoned gb200-1 excluded from this rollout.
    - Migrate gb200-4 last while preserving MetalMan.
 10. **Capture the PR acceptance evidence.**
     - Record a simple 10-20 second video only after the qualified producer
@@ -459,8 +442,8 @@ rejoin satisfies the gate.
 
 ## Non-goals
 
-- GPU Operator cannot repair physical NVLink/NVSwitch faults on gb200-1 or
-  gb200-2.
+- GPU Operator cannot repair physical NVLink/NVSwitch faults. gb200-2 is
+  outside this rollout's NVLink scope, and gb200-1 is excluded.
 - GPU Operator does not repair external InfiniBand.
 - Unbounded does not globally inject static IMEX channel 0 as a multi-tenant
   solution.
@@ -472,9 +455,10 @@ rejoin satisfies the gate.
 
 The first live plan evaluated preinstalled-driver mode and assumed every host
 already had a supported driver-matched IMEX package path. Preflight disproved
-that assumption for the Azure Linux node: its image has driver `580.159.04`,
-no host `nvidia-smi`, and no IMEX package in its configured repositories.
-Another node also has degraded local NVLink.
+that assumption. The Azure Linux node lacked the required host tooling and is
+now excluded, while the selected Ubuntu producer profile is not yet generated
+or qualified. gb200-2 also had degraded local NVLink and is outside the
+NVLink/ComputeDomain acceptance scope.
 
 Switching to `driver.enabled=true` would be a different and more disruptive
 ownership design, not a parameter change. Hillsboro therefore stopped before
