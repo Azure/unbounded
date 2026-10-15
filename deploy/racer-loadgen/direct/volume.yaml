@@ -1,0 +1,7 @@
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterVolume
+metadata:
+  name: racer-loadgen
+# ClusterVolume is cluster-scoped; storage capacity is configured on Racer.
+spec:
+  type: Cache

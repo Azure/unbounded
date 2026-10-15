@@ -857,6 +857,11 @@ jobs:
             file: images/racer-controller/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: racer-dataplane
+            file: images/racer-dataplane/Containerfile
+            build-args: RACER_NATIVE_RDMA=true
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64
@@ -907,6 +912,7 @@ jobs:
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
             CONTAINER_REGISTRY=${{ env.REGISTRY }}
+            ${{ matrix.component.build-args }}
           tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
 
       - name: Scan with Trivy
@@ -930,6 +936,7 @@ jobs:
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
             CONTAINER_REGISTRY=${{ env.REGISTRY }}
+            ${{ matrix.component.build-args }}
           tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
           cache-from: type=gha,scope=${{ matrix.component.name }}
           cache-to: type=gha,scope=${{ matrix.component.name }},mode=max

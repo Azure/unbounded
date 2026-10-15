@@ -1003,10 +1003,8 @@ func TestRolloutComplete(t *testing.T) {
 	}
 }
 
-// TestServiceHasEndpointFallsBackToEndpoints covers the legacy path. The
-// controller writes both objects, and an apiserver old enough to resolve an
-// APIService through Endpoints alone is why it still does.
-func TestServiceHasEndpointFallsBackToEndpoints(t *testing.T) {
+// Legacy Endpoints cannot activate a backend, even when ready.
+func TestServiceHasEndpointRejectsLegacyEndpoints(t *testing.T) {
 	objects := servingObjects()
 	deployment := objects[1].(*appsv1.Deployment)
 	pod := objects[3]
@@ -1036,8 +1034,7 @@ func TestServiceHasEndpointFallsBackToEndpoints(t *testing.T) {
 		}},
 	}
 
-	// Legacy Endpoints are used only when the authoritative EndpointSlice is
-	// absent.
+	// A missing EndpointSlice is not a serving backend.
 	env := testEnv(t, endpoints, pod, replicaSet)
 
 	serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace, deployment)
@@ -1045,8 +1042,8 @@ func TestServiceHasEndpointFallsBackToEndpoints(t *testing.T) {
 		t.Fatalf("serviceHasEndpoint: %v", err)
 	}
 
-	if !serving {
-		t.Fatal("a ready legacy Endpoints subset was not recognized as serving")
+	if serving {
+		t.Fatal("a legacy Endpoints subset was accepted as serving")
 	}
 
 	// An existing not-ready slice is authoritative even if a legacy object has
@@ -1119,15 +1116,8 @@ func TestServiceHasEndpointRejectsStaleOrMalformedTargets(t *testing.T) {
 	}
 }
 
-// TestServiceHasEndpointAcceptsAnEndpointWithoutATargetRef pins the
-// compatibility path for controllers released before this gate existed.
-//
-// Those controllers publish their Endpoints and EndpointSlice with no
-// targetRef, and a workload override may pin the controller image to such a
-// version indefinitely. Rejecting them would freeze the registrations at
-// whatever the cluster already had, silently: nothing would be pending, so
-// NetReady would stay true while manifest changes were never applied.
-func TestServiceHasEndpointAcceptsAnEndpointWithoutATargetRef(t *testing.T) {
+// A backend must identify its Pod even if the Deployment rollout is complete.
+func TestServiceHasEndpointRejectsAnEndpointWithoutATargetRef(t *testing.T) {
 	objects := servingObjects()
 
 	deployment, ok := objects[1].(*appsv1.Deployment)
@@ -1142,9 +1132,7 @@ func TestServiceHasEndpointAcceptsAnEndpointWithoutATargetRef(t *testing.T) {
 
 	slice.Endpoints[0].TargetRef = nil
 
-	// Neither the Pod nor the ReplicaSet is loaded: an endpoint with no
-	// targetRef cannot be traced to one, and the rollout check the caller has
-	// already passed is what establishes that a Ready pod exists.
+	// Without a targetRef the endpoint cannot be traced to a Pod.
 	env := testEnv(t, slice)
 
 	serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace, deployment)
@@ -1152,8 +1140,8 @@ func TestServiceHasEndpointAcceptsAnEndpointWithoutATargetRef(t *testing.T) {
 		t.Fatalf("serviceHasEndpoint: %v", err)
 	}
 
-	if !serving {
-		t.Fatal("an endpoint published without a targetRef was rejected; a pinned older controller would never register")
+	if serving {
+		t.Fatal("an endpoint published without a targetRef was accepted")
 	}
 
 	// An address list that is empty is still not a backend.
@@ -1429,10 +1417,8 @@ func caBundlesOf(t *testing.T, obj *unstructured.Unstructured) []string {
 //
 // Net is the cluster dataplane and applies the largest object set of any
 // component, including the ValidatingAdmissionPolicy that restricts what its
-// own ServiceAccount may create. The reaper gates its migration on the
-// config-hash annotation the two workloads carry
-// (internal/operator/migrate.go), so an object or annotation silently
-// appearing, disappearing or being renamed here breaks the upgrade path.
+// own ServiceAccount may create. The config-hash annotations ensure that
+// changes to the config roll both workloads.
 //
 // Both workloads depend on the config, so a failure to write the ConfigMap
 // skips them rather than rolling pods that cannot mount it.

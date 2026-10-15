@@ -92,6 +92,11 @@ func testConfig() *config.Config {
 	return &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "registry.example", NSAlias: "alias.example"}}}
 }
 
+func racerTestVolume(t *testing.T) string {
+	t.Helper()
+	return VolumeName
+}
+
 func TestGantryOriginEnablesOwnedRecoveryAfterDirectoryPreparation(t *testing.T) {
 	root := t.TempDir()
 	want := errors.New("serve result")
@@ -253,10 +258,23 @@ func TestPrepareRacerOriginDirectoryRejectsUnsafePaths(t *testing.T) {
 }
 
 func TestRacerSDKConfigWiring(t *testing.T) {
-	if SocketPath("origin") != "/run/racer/gantry/origin/socket" || SocketPath("client") != "/run/racer/gantry/client/socket" {
-		t.Fatal("unexpected canonical sockets")
+	c := config.NewDefault()
+	c.RacerMaxConnections = 7
+	c.RacerOriginConcurrentRequests = 3
+	volume := racerTestVolume(t)
+
+	client := ClientConfig(c, volume)
+	if client.Volume != volume || client.MaxConnections != 7 {
+		t.Fatalf("client config=%+v", client)
 	}
 
+	origin := OriginConfig(c, volume)
+	if origin.Volume != volume || origin.MaxConcurrentRequests != 3 {
+		t.Fatalf("origin config=%+v", origin)
+	}
+}
+
+func TestRacerSDKDefaults(t *testing.T) {
 	for _, test := range []struct {
 		name                  string
 		config                *config.Config
@@ -264,13 +282,13 @@ func TestRacerSDKConfigWiring(t *testing.T) {
 	}{
 		{name: "defaults", config: config.NewDefault(), connections: 64, requests: 64},
 		{name: "zero selects SDK defaults", config: &config.Config{}},
-		{name: "explicit limits", config: &config.Config{RacerMaxConnections: 7, RacerOriginConcurrentRequests: 3}, connections: 7, requests: 3},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			client := ClientConfig(test.config, CacheName)
+			volume := racerTestVolume(t)
+			client := ClientConfig(test.config, volume)
 
-			origin := OriginConfig(test.config, CacheName)
-			if client.Cache != CacheName || origin.Cache != CacheName || client.MaxConnections != test.connections || origin.MaxConcurrentRequests != test.requests {
+			origin := OriginConfig(test.config, volume)
+			if client.MaxConnections != test.connections || origin.MaxConcurrentRequests != test.requests {
 				t.Fatalf("client=%+v origin=%+v", client, origin)
 			}
 
@@ -357,11 +375,6 @@ func TestRequest(t *testing.T) {
 
 			if req.Authorization != "Bearer private-token" {
 				t.Fatal("missing separate authorization")
-			}
-
-			other := requestFor(t, ref, "Bearer other")
-			if req.Key != other.Key || req.Metadata != other.Metadata {
-				t.Fatal("credentials affected cache identity")
 			}
 
 			decoded, err := decodeReference(req.Key, req.Metadata)
@@ -715,6 +728,32 @@ func TestOriginInvalidSizesAndShortBody(t *testing.T) {
 	}
 }
 
+func TestPageBodyCloseInterruptsRead(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+
+	body := &pageBody{Reader: io.LimitReader(reader, 10), upstream: reader}
+	readDone := make(chan error, 1)
+
+	go func() {
+		_, err := body.Read(make([]byte, 1))
+		readDone <- err
+	}()
+
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("closed read succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not interrupt upstream Read")
+	}
+}
+
 func TestFakeClientContinuationFailureIsTerminal(t *testing.T) {
 	size := int64(racersdk.PageSize) + 1
 	upstream := &testUpstream{
@@ -789,15 +828,9 @@ func TestOriginNonemptyHeadAndCanceledContext(t *testing.T) {
 		head: func(context.Context, ifaces.OriginRef) (int64, string, error) { return 123, "", nil },
 	}
 
-	before := time.Now()
-
 	metadata, body, err := open(context.Background(), upstream, testRef(), racersdk.OriginRequest{Head: true})
 	if err != nil || metadata.Size != 123 || !validRacerMetadata(metadata, testRef().Digest) || body != nil || upstream.pulls.Load() != 0 {
 		t.Fatalf("HEAD result: %+v, body=%v, error=%v", metadata, body, err)
-	}
-
-	if metadata.ExpiresAt.Before(before.Add(metadataTTL-time.Millisecond)) || metadata.ExpiresAt.After(time.Now().Add(metadataTTL)) {
-		t.Fatalf("expiry outside bounded TTL: %v", metadata.ExpiresAt)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -906,6 +939,15 @@ func TestOriginPinnedMetadataConsistency(t *testing.T) {
 				t.Fatal("page issued HEAD")
 			}
 		})
+	}
+}
+
+func TestOriginCredentialsDoNotChangeIdentity(t *testing.T) {
+	a := requestFor(t, testRef(), "Bearer first")
+
+	b := requestFor(t, testRef(), "Bearer second")
+	if a.Key != b.Key || a.Metadata != b.Metadata {
+		t.Fatal("credentials affected cache identity")
 	}
 }
 

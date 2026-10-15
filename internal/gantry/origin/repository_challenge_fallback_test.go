@@ -83,7 +83,6 @@ func TestRepositoryAuthenticationChallengeFallback(t *testing.T) {
 				r := c.registries["reg"]
 				r.hc = srv.Client()
 				r.base.User = url.UserPassword("endpoint", "password")
-				r.username, r.password = "shared", "password"
 
 				jar, err := cookiejar.New(nil)
 				if err != nil {

@@ -135,3 +135,12 @@ func TestServerTLSConfigPinsALPNAndTLS13(t *testing.T) {
 		t.Fatalf("NextProtos = %v, want h2 first", cfg.NextProtos)
 	}
 }
+
+func TestClientTLSConfigRequiresTLS13(t *testing.T) {
+	_, id := testIdentity(t)
+
+	cfg := ClientTLSConfig(id)
+	if cfg.MinVersion != tls.VersionTLS13 || cfg.VerifyPeerCertificate == nil {
+		t.Fatal("owned chair client must require TLS 1.3 and authenticate peer identity")
+	}
+}

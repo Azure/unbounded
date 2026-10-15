@@ -72,6 +72,12 @@ and an absent ConfigMap means no overrides.
 Every key in the ConfigMap is parsed as an independent document, so you can split
 by concern or by ownership.
 
+An entry can include `name` alongside `component` and `kind` to select an exact
+workload name.
+Required affinity is intersected with every operator term and cannot broaden
+the operator's placement. Site placement uses only `unbounded-cloud.io/site`;
+there are no pre-release migration affinity terms.
+
 ```yaml
 apiVersion: v1
 kind: ConfigMap
@@ -235,10 +241,19 @@ rejected everywhere, because both can delete operator-managed content.
 because that is how strategic merge removes operator-managed content. Replacing
 a list wholesale is still possible, and `args` is the case where that matters:
 see above. Where Kubernetes says two fields may not both be set, adding one is
-not enough, so the change cannot be expressed at all. Two cases are detected and reported rather than left to fail at apply time:
+not enough. Two unsupported cases are detected and reported rather than left to fail at apply time:
 setting `value` on an env variable the operator defines with `valueFrom` (or the
 reverse), and setting `spec.strategy.type: Recreate` on a Deployment whose
 `rollingUpdate` block the operator sets.
+
+DaemonSet `OnDelete` is a supported strategy transition: set only
+`patch.spec.updateStrategy.type: OnDelete` and omit `rollingUpdate` entirely.
+After merging validated overrides, the operator removes its inherited
+`rollingUpdate` block before apply. Supplying `rollingUpdate` with `OnDelete`,
+even as `{}` or in a separate contributing entry, is rejected; `null` and deletion
+directives remain forbidden. RollingUpdate settings are otherwise unchanged.
+Removing the override restores the operator's default strategy. This does not
+delete Pods or bypass scheduling guards.
 
 Values are checked against the type Kubernetes requires. Writing `containers:`
 as a mapping rather than a list, or `nodeSelector:` as a list rather than a

@@ -10,10 +10,13 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 func TestCRDReconcilerIgnoresUnownedCRD(t *testing.T) {
@@ -51,6 +54,18 @@ func TestCRDReconcilerAppliesOwnedCRD(t *testing.T) {
 
 	name := RequiredCRDNames[0]
 	applies := 0
+
+	for name, obj := range desired {
+		hash := obj.GetLabels()[component.AppliedHashLabel]
+		if hash == "" {
+			t.Fatalf("CRD %s has no applied hash", name)
+		}
+
+		if errs := validation.IsValidLabelValue(hash); len(errs) != 0 {
+			t.Errorf("CRD %s has invalid applied hash %q: %v", name, hash, errs)
+		}
+	}
+
 	base := fake.NewClientBuilder().WithScheme(scheme).Build()
 	r := &CRDReconciler{
 		Client: interceptor.NewClient(base, interceptor.Funcs{

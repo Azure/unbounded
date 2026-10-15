@@ -41,21 +41,21 @@ func runRacerAgent(c *config.Config, logger *slog.Logger) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	cache := racer.CacheName
+	volume := racer.VolumeName
 
-	client, err := racersdk.NewClient(racer.ClientConfig(c, cache))
+	client, err := racersdk.NewClient(racer.ClientConfig(c, volume))
 	if err != nil {
 		return fmt.Errorf("racer client: %w", err)
 	}
 
-	return serveRacerAgent(ctx, c, logger, cache, racerAgentDeps{
+	return serveRacerAgent(ctx, c, logger, volume, racerAgentDeps{
 		client: client, serveOrigin: racer.ServeOrigin, probe: probeRacerSocket,
 	})
 }
 
 // serveRacerAgent owns client and keeps origin service alive while HTTP drains.
 // There is deliberately no fallback to the legacy agent on any failure.
-func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger, cache string, deps racerAgentDeps) (retErr error) {
+func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger, volume string, deps racerAgentDeps) (retErr error) {
 	if deps.client != nil {
 		defer func() { retErr = errors.Join(retErr, deps.client.Close()) }()
 	}
@@ -64,7 +64,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	reg.RegisterDefaultCollectors()
 	telemetry := racer.NewMetrics(reg)
 
-	originClient, err := origin.New(c, origin.WithLogger(logger), origin.WithDelegatedCredentialsOnly(),
+	originClient, err := origin.New(c, origin.WithLogger(logger),
 		origin.WithRequestMetrics(telemetry.OriginRequest), origin.WithByteMetrics(telemetry.OriginBytes))
 	if err != nil {
 		return fmt.Errorf("racer origin client: %w", err)
@@ -79,7 +79,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	go func() {
 		defer close(originDone)
 
-		originErr = deps.serveOrigin(originCtx, racer.OriginConfig(c, cache), racer.Origin(c, originClient))
+		originErr = deps.serveOrigin(originCtx, racer.OriginConfig(c, volume), racer.Origin(c, originClient))
 	}()
 
 	// Always install the handler, even without a client, so unavailable requests
@@ -128,7 +128,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 		}
 	}
 
-	logger.Info("Racer agent started", slog.String("cache", racer.CacheName), slog.String("mirror", listener.Addr().String()))
+	logger.Info("Racer agent started", slog.String("volume", racer.VolumeName), slog.String("mirror", listener.Addr().String()))
 
 	return superviseRacerAgent(ctx, logger, mirrorSrv, &ready, deps.probe, racerAgentEvents{
 		originDone: originDone, originErr: &originErr,
@@ -191,7 +191,7 @@ func superviseRacerAgent(ctx context.Context, logger *slog.Logger, mirrorSrv *mi
 	}
 }
 
-// A successful Unix dial proves socket availability only, not cache readiness,
+// A successful Unix dial proves socket availability only, not volume readiness,
 // cluster health, origin registration, or the ability to serve an object.
 func racerSocketsAvailable(ctx context.Context, probe func(context.Context, string) error) bool {
 	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)

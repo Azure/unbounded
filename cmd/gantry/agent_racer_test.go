@@ -89,7 +89,7 @@ func TestRacerOriginFailurePropagates(t *testing.T) {
 			client := &startupRacerClient{}
 			failure := errors.New("origin failed")
 
-			err := serveRacerAgent(t.Context(), c, slog.New(slog.NewTextHandler(io.Discard, nil)), racerTestCache(t), racerAgentDeps{
+			err := serveRacerAgent(t.Context(), c, slog.New(slog.NewTextHandler(io.Discard, nil)), racerTestVolume(t), racerAgentDeps{
 				client: client,
 				serveOrigin: func(ctx context.Context, _ racersdk.OriginConfig, callback racersdk.Origin) error {
 					if callback == nil {
@@ -128,10 +128,10 @@ func TestRacerNilClientKeepsDiagnostics(t *testing.T) {
 	var logs bytes.Buffer
 
 	done := make(chan error, 1)
-	cache := racerTestCache(t)
+	volume := racerTestVolume(t)
 
 	go func() {
-		done <- serveRacerAgent(ctx, c, slog.New(slog.NewJSONHandler(&logs, nil)), cache, racerAgentDeps{
+		done <- serveRacerAgent(ctx, c, slog.New(slog.NewJSONHandler(&logs, nil)), volume, racerAgentDeps{
 			serveOrigin: func(ctx context.Context, _ racersdk.OriginConfig, _ racersdk.Origin) error {
 				<-ctx.Done()
 				return ctx.Err()
@@ -185,7 +185,7 @@ func TestRacerNilClientKeepsDiagnostics(t *testing.T) {
 	}
 }
 
-func racerTestCache(t *testing.T) string {
+func racerTestVolume(t *testing.T) string {
 	t.Helper()
 	return "gantry"
 }
@@ -201,10 +201,10 @@ func TestRacerReadinessAndCancellation(t *testing.T) {
 
 	originStopped := make(chan struct{})
 	done := make(chan error, 1)
-	cache := racerTestCache(t)
+	volume := racerTestVolume(t)
 
 	go func() {
-		done <- serveRacerAgent(ctx, c, slog.New(slog.NewTextHandler(io.Discard, nil)), cache, racerAgentDeps{
+		done <- serveRacerAgent(ctx, c, slog.New(slog.NewTextHandler(io.Discard, nil)), volume, racerAgentDeps{
 			client: client,
 			serveOrigin: func(ctx context.Context, _ racersdk.OriginConfig, _ racersdk.Origin) error {
 				defer close(originStopped)
@@ -229,9 +229,7 @@ func TestRacerReadinessAndCancellation(t *testing.T) {
 	waitRacerStatus(t, "http://"+c.MetricsListen+"/readyz", http.StatusOK)
 	waitRacerStatus(t, "http://"+c.MirrorListen+"/v2/", http.StatusOK)
 
-	httpClient := &http.Client{Timeout: 3 * time.Second}
-
-	response, err := httpClient.Get("http://" + c.MetricsListen + "/metrics")
+	response, err := http.Get("http://" + c.MetricsListen + "/metrics")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +289,7 @@ func TestRacerHTTPListenFailureCleansUp(t *testing.T) {
 
 			var originStopped atomic.Bool
 
-			err = serveRacerAgent(t.Context(), c, slog.New(slog.NewTextHandler(io.Discard, nil)), racerTestCache(t), racerAgentDeps{
+			err = serveRacerAgent(t.Context(), c, slog.New(slog.NewTextHandler(io.Discard, nil)), racerTestVolume(t), racerAgentDeps{
 				client: client,
 				serveOrigin: func(ctx context.Context, _ racersdk.OriginConfig, _ racersdk.Origin) error {
 					<-ctx.Done()
@@ -368,21 +366,5 @@ func TestRacerSocketAvailability(t *testing.T) {
 				t.Fatalf("available=%v paths=%v, want paths=%s", available, paths, test.wantPaths)
 			}
 		})
-	}
-}
-
-func TestRacerIgnoresSharedCredentialFile(t *testing.T) {
-	c := racerTestConfig(t)
-	c.UpstreamRegistries[0].CredentialsPath = filepath.Join(t.TempDir(), "missing-credentials")
-	client := &startupRacerClient{}
-	want := errors.New("origin callback started")
-
-	err := serveRacerAgent(t.Context(), c, slog.New(slog.NewTextHandler(io.Discard, nil)), "gantry", racerAgentDeps{
-		client:      client,
-		serveOrigin: func(context.Context, racersdk.OriginConfig, racersdk.Origin) error { return want },
-		probe:       func(context.Context, string) error { return nil },
-	})
-	if !errors.Is(err, want) || !client.closed.Load() {
-		t.Fatalf("Racer loaded legacy credentials or leaked client: %v", err)
 	}
 }

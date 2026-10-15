@@ -29,3 +29,18 @@ Applications access a cache through its client socket at
 
 Deleting and recreating a `ClusterCache` creates a new cache identity, even if
 you reuse the name.
+
+## ClusterVolume compatibility
+
+The controller also accepts `ClusterVolume` objects with `spec.type: Cache`.
+Both kinds keep their own Kubernetes UID as the cache identity. Names and UIDs
+must be unique across both kinds; a collision rejects the whole catalog update.
+Other volume types do not enter the cache catalog.
+
+Install the CRDs before starting the controller. Either kind may be absent.
+The controller needs list and watch permission for every installed kind; a
+permission error does not silently drop that kind from the catalog. Restart
+the controller after installing an additional catalog CRD so it watches it.
+
+SDK callers may set either `Cache` or `Volume` in client and origin configs.
+If both fields are set, they must match.

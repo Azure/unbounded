@@ -13,7 +13,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -128,7 +127,6 @@ func newReconcilerTestScheme(t *testing.T) *runtime.Scheme {
 		"core/v1":     corev1.AddToScheme,
 		"machina API": unboundedv1alpha3.AddToScheme,
 		"racer API":   racerv1.AddToScheme,
-		"rbac/v1":     rbacv1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add %s to scheme: %v", name, err)
@@ -597,7 +595,7 @@ func TestRegistryMaterializedOnceAndInstanceReused(t *testing.T) {
 }
 
 // TestSiteReconcilerSetupRequiresAnAPIReader guards the fallback in
-// Env.LiveReader, for the same reason the reaper guards its own.
+// Env.LiveReader in manager wiring.
 //
 // LiveReader falls back to the cached client when APIReader is nil, which is
 // harmless in a unit test against a fake client and is not harmless under a

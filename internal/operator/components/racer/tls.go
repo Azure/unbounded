@@ -22,7 +22,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -30,13 +29,11 @@ import (
 
 const (
 	day                = 24 * time.Hour
-	caRotationInterval = 180 * day
-	leafLifetime       = 365 * day
-	leafRenewBefore    = 30 * day
-	caLifetime         = 10 * 365 * day
-	trustOverlap       = 360 * day
-	legacyCALifetime   = 28 * day
-	legacyTrustOverlap = 14 * day
+	caRotationInterval = 7 * day
+	leafLifetime       = 14 * day
+	leafRenewBefore    = 7 * day
+	caLifetime         = 28 * day
+	trustOverlap       = 14 * day
 	tlsStateKey        = "rotation.json"
 	previousCAKey      = "previous-ca.crt"
 	caBundleKey        = "ca-bundle.crt"
@@ -44,8 +41,9 @@ const (
 	maxPreviousCAs     = 2
 )
 
-// Only the current CA private key is retained. Cross certificates form a bounded
-// path from the newest leaf back to every retained root.
+// Only the current CA's private key is retained. Each previous generation holds
+// the next generation's public certificate signed by that previous CA. In order,
+// these form a bounded path from the latest leaf back to every retained root.
 type previousCA struct {
 	Root     []byte    `json:"root"`
 	Cross    []byte    `json:"cross"`
@@ -58,11 +56,11 @@ type tlsState struct {
 	Previous  []previousCA `json:"previous"`
 }
 
-// Retained controllers can still serve without caches. Maintain existing TLS
-// without resuming installation or repairing workloads.
+// Retained controllers can still serve without catalog resources. Keep their
+// existing credentials usable without resuming installation or workload repair.
 func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
-	result := component.Disabled("no ClusterCaches; Racer resources are retained")
+	result := component.Disabled("no ClusterVolumes or ClusterCaches; Racer resources are retained")
 
 	claim := &corev1.ConfigMap{}
 	if err := env.LiveReader().Get(ctx, objectKey(env, claimName), claim); err != nil {
@@ -82,7 +80,7 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 		return nil, result, err
 	}
 
-	if (marker.Data["state"] == operatorPending || marker.Data["state"] == "fresh") && !ptr.Deref(marker.Immutable, false) && marker.Data["version_uid"] == "" {
+	if marker.Data["state"] == "fresh" && !ptr.Deref(marker.Immutable, false) {
 		return plan, result, nil
 	}
 
@@ -90,10 +88,18 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 		return nil, result, fmt.Errorf("invalid retained Racer installation state")
 	}
 
-	result.RequeueAfter = time.Hour
-	result.Message = "no ClusterCaches; maintaining retained Racer serving TLS only"
+	if err := env.LiveReader().Get(ctx, objectKey(env, tlsName), &corev1.Secret{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return plan, result, nil
+		}
 
-	secret, err := planTLSAt(ctx, env, plan, marker.UID, false, now)
+		return nil, result, err
+	}
+
+	result.RequeueAfter = time.Hour
+	result.Message = "no ClusterVolumes or ClusterCaches; maintaining retained Racer serving TLS only"
+
+	secret, err := planTLSAt(ctx, env, plan, false, now)
 	if err != nil {
 		return nil, result, err
 	}
@@ -102,19 +108,18 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 		result.RequeueAfter = 5 * time.Second
 		return plan, result, nil
 	}
-
+	// Trust is derived only from committed credentials. Avoid an apply every
+	// hour, and preserve unrelated retained ConfigMap fields under CAS.
 	trust := &corev1.ConfigMap{}
 	err = env.LiveReader().Get(ctx, objectKey(env, trustName), trust)
 
-	want := string(servingRoots(secret))
+	want := string(secret.Data["ca.crt"]) + string(secret.Data[previousCAKey])
 	if apierrors.IsNotFound(err) {
-		trust = &corev1.ConfigMap{
+		add(plan, component.OpCreateIfAbsent, &corev1.ConfigMap{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 			ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace},
 			Data:       map[string]string{"ca.crt": want},
-		}
-		bindRuntime(trust, marker.UID)
-		add(plan, component.OpCreateIfAbsent, trust)
+		})
 
 		result.RequeueAfter = 5 * time.Second
 
@@ -125,8 +130,8 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 		return nil, result, err
 	}
 
-	if err := validateRuntimeOwner(trust, marker.UID); err != nil {
-		return nil, result, err
+	if trust.DeletionTimestamp != nil {
+		return nil, result, fmt.Errorf("retained Racer bootstrap trust is being deleted")
 	}
 
 	if trust.Data["ca.crt"] != want {
@@ -146,9 +151,13 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 	return plan, result, nil
 }
 
-// Persist before publishing derived trust: a lost create/CAS race must not
-// deploy an uncommitted certificate.
-func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, installation types.UID, fresh bool, now time.Time) (*corev1.Secret, error) {
+// Persist credentials before deriving trust from them. A
+// lost create/CAS race therefore never deploys an uncommitted certificate.
+func planTLS(ctx context.Context, env *component.Env, plan *component.Plan, fresh bool) (*corev1.Secret, error) {
+	return planTLSAt(ctx, env, plan, fresh, time.Now())
+}
+
+func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, fresh bool, now time.Time) (*corev1.Secret, error) {
 	secret := &corev1.Secret{}
 
 	err := env.LiveReader().Get(ctx, objectKey(env, tlsName), secret)
@@ -166,7 +175,6 @@ func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, in
 			return nil, err
 		}
 
-		bindRuntime(secret, installation)
 		add(plan, component.OpCreateIfAbsent, secret)
 
 		return nil, nil
@@ -176,8 +184,8 @@ func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, in
 		return nil, err
 	}
 
-	if err := validateRuntimeOwner(secret, installation); err != nil {
-		return nil, err
+	if secret.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("racer serving Secret is being deleted")
 	}
 
 	updated, err := renewTLS(secret, env.Namespace, now)
@@ -236,15 +244,14 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 		return nil, fmt.Errorf("racer serving certificates are not yet valid")
 	}
 
-	// Check expired certificates at their last shared valid instant. Expiration
-	// permits reissue, but does not bypass signature, usage, or state validation.
+	if !now.Before(ca.NotAfter) {
+		return nil, fmt.Errorf("racer serving CA expired; restore valid serving state")
+	}
+	// An expired leaf can be renewed, but malformed usage must not be repaired
+	// silently. Verify its original usable interval as well as its signature.
 	verifyAt := now
 	if !verifyAt.Before(leaf.NotAfter) {
 		verifyAt = leaf.NotAfter.Add(-time.Second)
-	}
-
-	if !verifyAt.Before(ca.NotAfter) {
-		verifyAt = ca.NotAfter.Add(-time.Second)
 	}
 
 	roots := x509.NewCertPool()
@@ -265,8 +272,11 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 	}
 
 	updated := secret.DeepCopy()
+	// Repair derived trust only after validating the authoritative credentials
+	// and rotation state.
 	changed := !bytes.Equal(secret.Data[caBundleKey], servingRoots(secret))
-	// Retire the expired suffix: older roots cannot verify through it.
+	// Older generations are a suffix. If an intermediate has expired, no
+	// earlier root can verify through it, so retire that entire suffix.
 	for i, previous := range state.Previous {
 		if !now.Before(previous.RetireAt) {
 			state.Previous = state.Previous[:i]
@@ -276,12 +286,7 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 		}
 	}
 
-	interval := caRotationInterval
-	if ca.NotAfter.Equal(state.CreatedAt.Add(legacyCALifetime)) {
-		interval = 7 * day
-	}
-
-	rotate := !now.Before(state.CreatedAt.Add(interval))
+	rotate := !now.Before(state.CreatedAt.Add(caRotationInterval))
 	if rotate {
 		newKey, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if keyErr != nil {
@@ -293,24 +298,17 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 			return nil, issueErr
 		}
 
-		if now.Before(ca.NotAfter) {
-			cross, crossErr := crossSign(newCA, ca, key)
-			if crossErr != nil {
-				return nil, crossErr
-			}
-
-			retireAt := now.Add(trustOverlap)
-			if ca.NotAfter.Before(retireAt) {
-				retireAt = ca.NotAfter
-			}
-
-			state.Previous = append([]previousCA{{Root: updated.Data["ca.crt"], Cross: cross, RetireAt: retireAt}}, state.Previous...)
-		} else {
-			// No valid path can pass through the expired CA. Clients must load
-			// the republished trust bundle before they can use the new endpoint.
-			state.Previous = nil
+		cross, crossErr := crossSign(newCA, ca, key)
+		if crossErr != nil {
+			return nil, crossErr
 		}
 
+		retireAt := now.Add(trustOverlap)
+		if ca.NotAfter.Before(retireAt) {
+			retireAt = ca.NotAfter
+		}
+
+		state.Previous = append([]previousCA{{Root: updated.Data["ca.crt"], Cross: cross, RetireAt: retireAt}}, state.Previous...)
 		state.CreatedAt = newCA.NotBefore.Add(time.Hour)
 		updated.Data["ca.crt"] = caPEM
 
@@ -471,7 +469,7 @@ func servingChain(leafDER []byte, state tlsState) []byte {
 }
 
 func previousRoots(state tlsState) []byte {
-	// JSON merge patch treats null as deletion, so retain an explicit empty value.
+	// Keep an explicit empty value: JSON merge patch treats null as deletion.
 	roots := []byte{}
 	for _, previous := range state.Previous {
 		roots = append(roots, previous.Root...)
@@ -501,6 +499,7 @@ func writeTLSState(secret *corev1.Secret, state tlsState) error {
 
 	secret.Data[corev1.TLSCertKey] = servingChain(block.Bytes, state)
 	secret.Data[tlsStateKey] = encoded
+
 	secret.Data[previousCAKey] = previousRoots(state)
 
 	secret.Data[caBundleKey] = servingRoots(secret)
@@ -532,8 +531,9 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 		return state, fmt.Errorf("trailing Racer serving rotation state")
 	}
 
-	validLifetime := ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || ca.NotAfter.Equal(state.CreatedAt.Add(legacyCALifetime))
-	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" || !state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || !validLifetime || len(state.Previous) > maxPreviousCAs {
+	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" ||
+		!state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || state.CreatedAt.After(now) ||
+		!ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || len(state.Previous) > maxPreviousCAs {
 		return state, fmt.Errorf("invalid Racer serving rotation policy state")
 	}
 
@@ -559,17 +559,17 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 			expires = root.NotAfter
 		}
 
-		overlap := trustOverlap
-		if child.NotAfter.Equal(child.NotBefore.Add(time.Hour + legacyCALifetime)) {
-			overlap = legacyTrustOverlap
-		}
-
-		retireAt := child.NotBefore.Add(time.Hour + overlap)
+		retireAt := child.NotBefore.Add(time.Hour + trustOverlap)
 		if expires.Before(retireAt) {
 			retireAt = expires
 		}
 
-		if root.CheckSignatureFrom(root) != nil || cross.CheckSignatureFrom(root) != nil || !cross.IsCA || !cross.BasicConstraintsValid || cross.KeyUsage != child.KeyUsage || !bytes.Equal(cross.RawSubjectPublicKeyInfo, child.RawSubjectPublicKeyInfo) || !bytes.Equal(cross.RawSubject, child.RawSubject) || root.NotBefore.After(now) || !cross.NotBefore.Equal(child.NotBefore) || !cross.NotAfter.Equal(expires) || !previous.RetireAt.Equal(retireAt) || !previous.RetireAt.After(child.NotBefore.Add(time.Hour)) || (i > 0 && !previous.RetireAt.Before(state.Previous[i-1].RetireAt)) {
+		if root.CheckSignatureFrom(root) != nil || cross.CheckSignatureFrom(root) != nil ||
+			!cross.IsCA || !cross.BasicConstraintsValid || cross.KeyUsage != child.KeyUsage || !bytes.Equal(cross.RawSubjectPublicKeyInfo, child.RawSubjectPublicKeyInfo) ||
+			!bytes.Equal(cross.RawSubject, child.RawSubject) || root.NotBefore.After(now) ||
+			!cross.NotBefore.Equal(child.NotBefore) || !cross.NotAfter.Equal(expires) || !previous.RetireAt.Equal(retireAt) ||
+			!previous.RetireAt.After(child.NotBefore.Add(time.Hour)) ||
+			(i > 0 && !previous.RetireAt.Before(state.Previous[i-1].RetireAt)) {
 			return state, fmt.Errorf("invalid Racer previous CA compatibility chain")
 		}
 

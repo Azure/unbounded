@@ -34,8 +34,8 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-// CacheName is the fixed cache shared by Gantry's Racer client and origin.
-const CacheName = "gantry"
+// VolumeName is the fixed volume shared by Gantry's Racer client and origin.
+const VolumeName = "gantry"
 
 const (
 	socketRoot                     = "/run/racer"
@@ -53,16 +53,16 @@ const (
 // Configuration and registry origin adapter.
 
 // ClientConfig maps Gantry settings to the SDK without overriding SDK defaults.
-func ClientConfig(c *config.Config, cache string) racersdk.ClientConfig {
+func ClientConfig(c *config.Config, volume string) racersdk.ClientConfig {
 	return racersdk.ClientConfig{
-		Cache: cache, MaxConnections: c.RacerMaxConnections,
+		Volume: volume, MaxConnections: c.RacerMaxConnections,
 	}
 }
 
 // OriginConfig maps the registry callback's concurrency and request limits.
-func OriginConfig(c *config.Config, cache string) racersdk.OriginConfig {
+func OriginConfig(c *config.Config, volume string) racersdk.OriginConfig {
 	return racersdk.OriginConfig{
-		Cache: cache, MaxConcurrentRequests: c.RacerOriginConcurrentRequests,
+		Volume: volume, MaxConcurrentRequests: c.RacerOriginConcurrentRequests,
 	}
 }
 
@@ -330,7 +330,7 @@ func classifyError(err error) error {
 
 // SocketPath returns the canonical Gantry socket path for an SDK role.
 func SocketPath(role string) string {
-	return filepath.Join(socketRoot, CacheName, role, "socket")
+	return filepath.Join(socketRoot, VolumeName, role, "socket")
 }
 
 // ServeOrigin prepares Gantry's endpoint and enables recovery of owned stale sockets.
@@ -349,7 +349,7 @@ func serveOriginAt(ctx context.Context, config racersdk.OriginConfig, origin rac
 }
 
 // Gantry owns the origin endpoint; Racer creates only the client endpoint. The
-// shared mount must exist, but Gantry may start before Racer creates the cache
+// shared mount must exist, but Gantry may start before Racer creates the volume
 // directory. Match Racer's 0755 directory mode without changing existing modes
 // or touching either socket. As with the SDK, ancestors must be trusted against
 // concurrent replacement, and symlink traversal is refused.
@@ -366,7 +366,7 @@ func prepareRacerOriginDirectory(root string) error {
 		}
 	}
 
-	for _, part := range []string{CacheName, "origin"} {
+	for _, part := range []string{VolumeName, "origin"} {
 		parent = filepath.Join(parent, part)
 		if err := os.Mkdir(parent, 0o755); err != nil && !os.IsExist(err) {
 			return err
@@ -432,8 +432,6 @@ func NewHandler(client Client, auth authenticationChallenger, logger *slog.Logge
 // pinned resume; offsets for other kinds are ignored. The mirror owns parsing
 // the caller's Range header.
 func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef) {
-	writeRacerDownloadHeaders(w)
-
 	// Fresh opaque correlation, including for aborts after headers are committed.
 	id := rand.Text()
 	w.Header().Set("Gantry-Racer-Request-ID", id)
@@ -652,14 +650,6 @@ func writeRacerError(w http.ResponseWriter, err error) {
 
 // Downstream HTTP writes.
 
-// Registry objects are downloads, not browser documents. Attachment also covers
-// explicit HTML, SVG, and XML types, which nosniff alone does not make safe.
-// Preserve the original media type and bytes for OCI clients and digest checks.
-func writeRacerDownloadHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Disposition", "attachment")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-}
-
 // HTTPObservation reports actual downstream bytes, final HTTP status, and
 // handler duration. Aborted distinguishes incomplete responses after headers.
 type HTTPObservation struct {
@@ -796,12 +786,6 @@ func (w *racerResponseWriter) WriteHeader(status int) {
 		return
 	}
 
-	writeRacerDownloadHeaders(w.ResponseWriter)
-
-	if w.Header().Get("Content-Type") == "" {
-		w.ResponseWriter.Header().Set("Content-Type", "application/octet-stream")
-	}
-
 	if err := w.deadline(); err != nil {
 		panic(http.ErrAbortHandler)
 	}
@@ -819,12 +803,6 @@ func (w *racerResponseWriter) WriteHeader(status int) {
 
 func (w *racerResponseWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
-		// Untyped bodies must not be sniffed as HTML. Explicit header commits
-		// apply the same default in WriteHeader, including Flush and ReadFrom.
-		if w.Header().Get("Content-Type") == "" {
-			w.ResponseWriter.Header().Set("Content-Type", "application/octet-stream")
-		}
-
 		w.WriteHeader(http.StatusOK)
 	}
 

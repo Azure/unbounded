@@ -196,21 +196,8 @@ func TestMirror_Prefetch_FiresOnManifestOriginServe(t *testing.T) {
 		t.Fatalf("manifest serve: status=%d body=%q", resp.StatusCode, got)
 	}
 
-	if n := spy.waitForCount(1, 2*time.Second); n != 1 {
-		t.Fatalf("OnManifestServed calls after origin manifest serve: got %d want 1", n)
-	}
-
-	call := spy.snapshot()[0]
-	if call.registry != "reg.example.com" {
-		t.Errorf("registry: got %q want reg.example.com", call.registry)
-	}
-
-	if call.repository != "library/nginx" {
-		t.Errorf("repository: got %q want library/nginx", call.repository)
-	}
-
-	if call.digest.String() != d.String() {
-		t.Errorf("digest: got %s want %s", call.digest, d)
+	if n := spy.count(); n != 0 {
+		t.Fatalf("uncommitted live origin content triggered cache prefetch: %d", n)
 	}
 }
 
@@ -253,6 +240,7 @@ func TestMirror_Prefetch_FiresAgainOnCacheHit(t *testing.T) {
 	d := hashSum(body)
 	spy := newPrefetchSpy()
 	f := newPrefetchFixture(t, map[digest.Digest][]byte{d: body}, spy)
+	f.cache.Put(d, body) // Simulate an observed containerd commit.
 
 	url := f.server.URL + "/v2/library/nginx/manifests/" + d.String() + "?ns=reg.example.com"
 
@@ -282,8 +270,8 @@ func TestMirror_Prefetch_FiresAgainOnCacheHit(t *testing.T) {
 		t.Fatalf("cache-hit serve: got %d calls want 2", n)
 	}
 
-	if atomic.LoadInt32(f.originHits) != 1 {
-		t.Errorf("origin hits: got %d want 1 (second serve was cache hit)", *f.originHits)
+	if atomic.LoadInt32(f.originHits) != 0 {
+		t.Errorf("origin hits: got %d want 0 (both requests hit committed content)", *f.originHits)
 	}
 }
 
@@ -341,6 +329,7 @@ func TestMirror_Prefetch_DoesNotFireOnHeadCacheHit(t *testing.T) {
 	d := hashSum(body)
 	spy := newPrefetchSpy()
 	f := newPrefetchFixture(t, map[digest.Digest][]byte{d: body}, spy)
+	f.cache.Put(d, body) // Simulate an observed containerd commit.
 
 	url := f.server.URL + "/v2/library/nginx/manifests/" + d.String() + "?ns=reg.example.com"
 	// Warm cache via GET.
@@ -386,13 +375,12 @@ func TestMirror_Prefetch_FiresOnPeerServedManifestWithLiveStreamThrough(t *testi
 	dialer.Put("10.0.0.1:5001", d, body)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: "peer-a", Addr: "10.0.0.1:5001"})
+	dht.Inject(d, ifaces.Provider{PeerID: "peer-a", Addr: "10.0.0.1:5001"})
 
 	cfg, originSrc := newMirrorOriginNotFound(t)
 	spy := newPrefetchSpy()
 
 	m := mirror.New(cfg, &writerSpyCache{}, originSrc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
 		mirror.WithPeerBudgets(time.Second, time.Second, 2),
 		mirror.WithLayerPrefetcher(spy),

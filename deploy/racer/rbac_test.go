@@ -8,175 +8,180 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
-	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
-	manifests "github.com/Azure/unbounded/deploy/racer"
+	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/racer/authority"
 )
 
-func TestEnvtestRuntimeRBACWithoutAdmissionPolicy(t *testing.T) {
+func TestEnvtestRenderedNamedRBAC(t *testing.T) {
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
-		t.Skip("set KUBEBUILDER_ASSETS for real API RBAC tests")
+		t.Skip("set KUBEBUILDER_ASSETS for real API-server RBAC assertions")
 	}
 
-	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"../../api/racer/v1alpha1/crd"}, ErrorIfCRDPathMissing: true}
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"crd"}, ErrorIfCRDPathMissing: true}
 	environment.ControlPlane.GetAPIServer().Configure().Set("authorization-mode", "RBAC")
 	rc, err := environment.Start()
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
-	require.NoError(t, racerv1.AddToScheme(scheme.Scheme))
+
 	admin, err := client.New(rc, client.Options{Scheme: scheme.Scheme})
 	require.NoError(t, err)
-	ctx := t.Context()
-	policies := &admissionv1.ValidatingAdmissionPolicyList{}
-	require.NoError(t, admin.List(ctx, policies))
-	require.Empty(t, policies.Items)
 
-	bindings := &admissionv1.ValidatingAdmissionPolicyBindingList{}
-	require.NoError(t, admin.List(ctx, bindings))
-	require.Empty(t, bindings.Items)
+	for _, suffix := range []string{"", "-custom"} {
+		t.Run("names"+suffix, func(t *testing.T) {
+			ctx := t.Context()
+			namespace := "racer-rbac" + suffix
+			installation, version := "racer-installation"+suffix, "racer-version"+suffix
 
-	const namespace = "unbounded-system"
-	require.NoError(t, admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}))
-	env := &component.Env{Namespace: namespace}
-	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"rbac.yaml"}, nil)
-	require.NoError(t, err)
+			require.NoError(t, admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}))
 
-	for _, obj := range objects {
-		require.NoError(t, admin.Apply(ctx, client.ApplyConfigurationFromUnstructured(obj), client.FieldOwner("racer-rbac-test")))
-	}
-
-	config := rest.CopyConfig(rc)
-	config.Impersonate = rest.ImpersonationConfig{UserName: "system:serviceaccount:" + namespace + ":racer-controller", Groups: []string{"system:authenticated", "system:serviceaccounts", "system:serviceaccounts:" + namespace}}
-	controller, err := client.New(config, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-
-	for _, kind := range []string{"ConfigMap", "Secret"} {
-		for _, name := range []string{"racer-installation", "racer-version", "racer-credentials", "racer-controller-tls", "racer-config", "unrelated"} {
-			t.Run(kind+"/"+name, func(t *testing.T) {
-				meta := metav1.ObjectMeta{Name: name, Namespace: namespace}
-
-				var obj client.Object = &corev1.ConfigMap{ObjectMeta: meta}
-				if kind == "Secret" {
-					obj = &corev1.Secret{ObjectMeta: meta, Type: corev1.SecretTypeOpaque}
-				}
-
-				require.True(t, apierrors.IsForbidden(controller.Create(ctx, obj)))
-
-				if kind == "Secret" {
-					token := obj.DeepCopyObject().(*corev1.Secret)
-					token.Type = corev1.SecretTypeServiceAccountToken
-					token.Annotations = map[string]string{corev1.ServiceAccountNameKey: "racer-controller"}
-					require.True(t, apierrors.IsForbidden(controller.Create(ctx, token)))
-				}
-
-				err := controller.Update(ctx, obj.DeepCopyObject().(client.Object))
-				require.True(t, apierrors.IsForbidden(err) || apierrors.IsNotFound(err), "%v", err)
-
-				apply := component.ToUnstructured(obj)
-				apply.SetAPIVersion("v1")
-				apply.SetKind(kind)
-				require.True(t, apierrors.IsForbidden(controller.Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner("runtime-test"))))
-				require.True(t, apierrors.IsNotFound(admin.Get(ctx, client.ObjectKeyFromObject(obj), obj)))
-
-				named := kind == "ConfigMap" && (name == "racer-installation" || name == "racer-version") || kind == "Secret" && name == "racer-credentials"
-				if !named {
-					require.NoError(t, admin.Create(ctx, obj))
-					obj.SetLabels(map[string]string{"changed": "true"})
-					require.True(t, apierrors.IsForbidden(controller.Update(ctx, obj)))
-					require.True(t, apierrors.IsForbidden(controller.Patch(ctx, obj, client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"labels":{"changed":"true"}}}`)))))
-					require.True(t, apierrors.IsForbidden(controller.Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner("runtime-test"), client.ForceOwnership)))
-					require.NoError(t, admin.Get(ctx, client.ObjectKeyFromObject(obj), obj))
-					require.Empty(t, obj.GetLabels())
-				}
-			})
-		}
-	}
-
-	cfg := authority.Config{
-		Cluster: "00000000-0000-4000-8000-000000000001", Namespace: namespace,
-		DataplaneServiceAccount: "racer-dataplane", ControllerServiceAccount: "racer-controller", DaemonSetName: "racer-dataplane",
-		CredentialsSecretName: "racer-credentials", VersionConfigMapName: "racer-version", InstallationConfigMapName: "racer-installation",
-		Rotation: authority.RotationPolicy{Interval: time.Hour, PrepareFor: time.Minute, RetainFor: 24 * time.Hour},
-	}
-	marker := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cfg.InstallationConfigMapName, Namespace: namespace}, Data: map[string]string{
-		"cluster": string(cfg.Cluster), "version_configmap": cfg.VersionConfigMapName, "state": "fresh", "initialization_protocol": "staged-v1",
-	}}
-	require.NoError(t, admin.Create(ctx, marker))
-
-	now := time.Now().UTC().Truncate(time.Second)
-	initializer := authority.New(cfg, authority.Dependencies{Reader: admin, Writer: admin, Now: func() time.Time { return now }})
-	require.NoError(t, initializer.Recover(ctx, admin))
-	_, err = initializer.ReconcileCredentials(ctx)
-	require.NoError(t, err)
-
-	runtime := authority.New(cfg, authority.Dependencies{Reader: controller, Writer: controller, Now: func() time.Time { return now }})
-	require.NoError(t, runtime.Recover(ctx, controller))
-	require.NoError(t, runtime.Observe(ctx))
-
-	for _, name := range []string{cfg.InstallationConfigMapName, cfg.VersionConfigMapName} {
-		cm := &corev1.ConfigMap{}
-		require.NoError(t, controller.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cm))
-		cm.Labels = map[string]string{"runtime-update": "allowed"}
-		require.NoError(t, controller.Update(ctx, cm))
-		require.NoError(t, controller.Patch(ctx, cm, client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"labels":{"runtime-patch":"allowed"}}}`))))
-	}
-
-	before := &corev1.Secret{}
-	key := client.ObjectKey{Namespace: namespace, Name: cfg.CredentialsSecretName}
-	require.NoError(t, controller.Get(ctx, key, before))
-	require.Equal(t, corev1.SecretTypeOpaque, before.Type)
-
-	for _, method := range []string{"update", "patch", "apply"} {
-		t.Run("token-conversion/"+method, func(t *testing.T) {
-			obj := before.DeepCopy()
-			obj.Type = corev1.SecretTypeServiceAccountToken
-			obj.Annotations[corev1.ServiceAccountNameKey] = "racer-controller"
-
-			var err error
-
-			switch method {
-			case "update":
-				err = controller.Update(ctx, obj)
-			case "patch":
-				err = controller.Patch(ctx, obj, client.RawPatch(types.MergePatchType, []byte(`{"type":"kubernetes.io/service-account-token","metadata":{"annotations":{"kubernetes.io/service-account.name":"racer-controller"}}}`)))
-			case "apply":
-				apply := component.ToUnstructured(obj)
-				apply.SetAPIVersion("v1")
-				apply.SetKind("Secret")
-				apply.SetManagedFields(nil)
-				err = controller.Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner("runtime-test"), client.ForceOwnership)
+			data := map[string]string{"Namespace": namespace}
+			if suffix != "" {
+				data["InstallationConfigMapName"], data["VersionConfigMapName"] = installation, version
 			}
 
-			require.True(t, apierrors.IsInvalid(err), "%v", err)
-			require.ErrorContains(t, err, "field is immutable")
+			out := t.TempDir()
+			require.NoError(t, render.Render(".", out, data))
+
+			env := &component.Env{Namespace: namespace}
+			objects, err := env.DecodeManifestFiles(os.DirFS(out), []string{"rbac.yaml"}, nil)
+			require.NoError(t, err)
+
+			for _, obj := range objects {
+				require.NoError(t, admin.Apply(ctx, client.ApplyConfigurationFromUnstructured(obj), client.FieldOwner("racer-rbac-test")))
+			}
+
+			for _, name := range []string{installation, version, "unrelated"} {
+				require.NoError(t, admin.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}))
+			}
+
+			controllerConfig := rest.CopyConfig(rc)
+			controllerConfig.Impersonate = rest.ImpersonationConfig{UserName: "system:serviceaccount:" + namespace + ":racer-controller"}
+			controller, err := kubernetes.NewForConfig(controllerConfig)
+			require.NoError(t, err)
+			catalogClient, err := dynamic.NewForConfig(controllerConfig)
+			require.NoError(t, err)
+
+			configmaps := controller.CoreV1().ConfigMaps(namespace)
+
+			require.EventuallyWithT(t, func(c *assert.CollectT) {
+				_, err := configmaps.Get(ctx, version, metav1.GetOptions{})
+				require.NoError(c, err)
+			}, 10*time.Second, 100*time.Millisecond)
+
+			for _, resource := range []string{"clustercaches", "clustervolumes"} {
+				catalog := catalogClient.Resource(schema.GroupVersionResource{Group: "racer.unbounded-cloud.io", Version: "v1alpha1", Resource: resource})
+				_, err := catalog.List(ctx, metav1.ListOptions{})
+				require.NoError(t, err)
+				watch, err := catalog.Watch(ctx, metav1.ListOptions{})
+				require.NoError(t, err)
+				watch.Stop()
+
+				err = catalog.Delete(ctx, "not-owned", metav1.DeleteOptions{})
+				require.True(t, apierrors.IsForbidden(err), "%v", err)
+			}
+
+			for _, name := range []string{installation, version} {
+				cm, err := configmaps.Get(ctx, name, metav1.GetOptions{})
+				require.NoError(t, err)
+
+				cm.Data = map[string]string{"updated": "true"}
+				_, err = configmaps.Update(ctx, cm, metav1.UpdateOptions{})
+				require.NoError(t, err)
+				_, err = configmaps.Patch(ctx, name, types.MergePatchType, []byte(`{"data":{"patched":"true"}}`), metav1.PatchOptions{})
+				require.NoError(t, err)
+
+				options := metav1.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", name).String()}
+				list, err := configmaps.List(ctx, options)
+				require.NoError(t, err)
+				require.Len(t, list.Items, 1)
+				require.Equal(t, name, list.Items[0].Name)
+
+				watch, err := configmaps.Watch(ctx, options)
+				require.NoError(t, err)
+				watch.Stop()
+			}
+
+			_, err = configmaps.Get(ctx, "unrelated", metav1.GetOptions{})
+			require.True(t, apierrors.IsForbidden(err), "%v", err)
+
+			for _, selector := range []string{"", "metadata.name=unrelated", "metadata.name!=" + version} {
+				options := metav1.ListOptions{FieldSelector: selector}
+				_, err = configmaps.List(ctx, options)
+				require.True(t, apierrors.IsForbidden(err), "%v", err)
+
+				watch, err := configmaps.Watch(ctx, options)
+				if watch != nil {
+					watch.Stop()
+				}
+
+				require.True(t, apierrors.IsForbidden(err), "%v", err)
+			}
+
+			_, err = configmaps.Update(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "unrelated"}}, metav1.UpdateOptions{})
+			require.True(t, apierrors.IsForbidden(err), "%v", err)
+			_, err = configmaps.Patch(ctx, "unrelated", types.MergePatchType, []byte(`{"data":{"patched":"true"}}`), metav1.PatchOptions{})
+			require.True(t, apierrors.IsForbidden(err), "%v", err)
+			_, err = controller.CoreV1().ConfigMaps("default").Get(ctx, version, metav1.GetOptions{})
+			require.True(t, apierrors.IsForbidden(err), "%v", err)
+
+			lock := &resourcelock.LeaseLock{
+				LeaseMeta: metav1.ObjectMeta{Namespace: namespace, Name: "racer-controller"},
+				Client:    controller.CoordinationV1(), LockConfig: resourcelock.ResourceLockConfig{Identity: "controller/pod-uid"},
+			}
+			record := resourcelock.LeaderElectionRecord{HolderIdentity: lock.Identity(), LeaseDurationSeconds: 15, AcquireTime: metav1.Now(), RenewTime: metav1.Now()}
+			_, _, err = lock.Get(ctx)
+			require.True(t, apierrors.IsNotFound(err), "%v", err)
+			require.NoError(t, lock.Create(ctx, record))
+			observed, _, err := lock.Get(ctx)
+			require.NoError(t, err)
+			require.Equal(t, record.HolderIdentity, observed.HolderIdentity)
+			record.LeaderTransitions++
+			require.NoError(t, lock.Update(ctx, record))
+			observed, _, err = lock.Get(ctx)
+			require.NoError(t, err)
+			require.Equal(t, record.LeaderTransitions, observed.LeaderTransitions)
+
+			leases := controller.CoordinationV1().Leases(namespace)
+			_, err = leases.Get(ctx, "unrelated", metav1.GetOptions{})
+			require.True(t, apierrors.IsForbidden(err), "%v", err)
+			lease, err := leases.Get(ctx, "racer-controller", metav1.GetOptions{})
+			require.NoError(t, err)
+
+			lease.Name = "unrelated"
+			_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+			require.True(t, apierrors.IsForbidden(err), "%v", err)
+			_, err = leases.Patch(ctx, "racer-controller", types.MergePatchType, []byte(`{"metadata":{"labels":{"patched":"true"}}}`), metav1.PatchOptions{})
+			require.True(t, apierrors.IsForbidden(err), "%v", err)
+
+			for _, selector := range []string{"", "metadata.name=racer-controller"} {
+				options := metav1.ListOptions{FieldSelector: selector}
+				_, err = leases.List(ctx, options)
+				require.True(t, apierrors.IsForbidden(err), "%v", err)
+
+				watch, err := leases.Watch(ctx, options)
+				if watch != nil {
+					watch.Stop()
+				}
+
+				require.True(t, apierrors.IsForbidden(err), "%v", err)
+			}
 		})
 	}
-
-	now = now.Add(cfg.Rotation.Interval)
-	_, err = runtime.ReconcileCredentials(ctx)
-	require.NoError(t, err)
-
-	after := &corev1.Secret{}
-	require.NoError(t, controller.Get(ctx, key, after))
-	require.Equal(t, before.UID, after.UID)
-	require.NotEqual(t, before.ResourceVersion, after.ResourceVersion)
-	require.NotEqual(t, before.Data["bundle.json"], after.Data["bundle.json"])
-
-	now = now.Add(cfg.Rotation.PrepareFor)
-	_, err = runtime.ReconcileCredentials(ctx)
-	require.NoError(t, err)
-	require.NoError(t, runtime.TrustReady())
 }

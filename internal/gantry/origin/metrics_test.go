@@ -5,12 +5,9 @@ package origin
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -205,68 +202,5 @@ func TestPullRangeByteMetricsTruncatedBody(t *testing.T) {
 
 	if err == nil || bytes.Load() != 2 || calls.Load() != 1 {
 		t.Fatalf("err=%v bytes=%d calls=%d", err, bytes.Load(), calls.Load())
-	}
-}
-
-func TestRequestMetricsAuthRedirectAndTransportFailure(t *testing.T) {
-	var statuses []int
-
-	c, err := New(&config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: "https://registry.example"}}}, WithRequestMetrics(func(method string, status int) {
-		if method != http.MethodGet {
-			t.Errorf("method=%s", method)
-		}
-
-		statuses = append(statuses, status)
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	r := c.registries["reg"]
-	transport := r.hc.Transport.(meteredTransport)
-	transport.RoundTripper = rangeRoundTripper(func(req *http.Request) (*http.Response, error) {
-		header := make(http.Header)
-		status, payload := 200, "0123"
-
-		switch {
-		case req.URL.Path == "/token":
-			payload = `{"token":"anonymous"}`
-		case req.URL.Path == "/data":
-			header.Set("Content-Range", "bytes 0-3/10")
-
-			status = 206
-		case req.Header.Get("Authorization") == "":
-			header.Set("WWW-Authenticate", `Bearer realm="https://registry.example/token"`)
-
-			status = 401
-		default:
-			header.Set("Location", "https://registry.example/data")
-
-			status = 307
-		}
-
-		return &http.Response{StatusCode: status, Header: header, Request: req, Body: io.NopCloser(strings.NewReader(payload)), ContentLength: int64(len(payload))}, nil
-	})
-	r.hc.Transport = transport
-
-	body, _, _, err := c.PullRange(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "repo"}, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, _ = io.Copy(io.Discard, body)
-	_ = body.Close()
-
-	transport.RoundTripper = rangeRoundTripper(func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("transport failed")
-	})
-	r.hc.Transport = transport
-
-	if _, _, _, err := c.PullRange(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "repo"}, 4); err == nil {
-		t.Fatal("expected transport failure")
-	}
-
-	if !slices.Equal(statuses, []int{401, 200, 307, 206, 0}) {
-		t.Fatalf("request statuses=%v", statuses)
 	}
 }

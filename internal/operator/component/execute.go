@@ -219,18 +219,6 @@ type plannedOp struct {
 // the code that built it. Catching it here names the component instead.
 func validatePlan(plan *Plan) error {
 	for _, op := range plan.Operations {
-		if op.Kind == OpRun {
-			if op.Run == nil {
-				return fmt.Errorf("component %q planned a Run operation with no callback", op.Component)
-			}
-
-			if op.SharedKey != "" || op.Overridable {
-				return fmt.Errorf("component %q planned a Run operation with SharedKey or Overridable", op.Component)
-			}
-		} else if op.Run != nil {
-			return fmt.Errorf("component %q planned a %s operation with a Run callback", op.Component, op.Kind)
-		}
-
 		if op.Object == nil {
 			return fmt.Errorf("component %q planned a %s operation with no object", op.Component, op.Kind)
 		}
@@ -256,17 +244,18 @@ func validatePlan(plan *Plan) error {
 //   - a declared DependsOn that failed
 //   - an earlier operation on the same object that failed, since patching an
 //     object whose creation failed only produces a second, more confusing error
-//   - an earlier tier that failed for the same component, Site, and
-//     FailureDomain, which is the inferred form: a workload is not attempted
-//     when its domain's ConfigMap or RBAC did not get written
+//   - an earlier tier that failed for the same component and Site, which is the
+//     inferred form: a component's workload is not attempted when that
+//     component's own ConfigMap, RBAC or Namespace did not get written
 //
-// The inferred gate is scoped to one component, Site, and FailureDomain so a
-// failure does not block unrelated workloads. Different FailureDomain values
-// bypass only this gate, not declared dependencies or same-object failures.
+// The inferred gate is scoped to one component and Site deliberately. Skipping
+// every workload in the cluster because one component's ConfigMap failed would
+// turn a contained failure into an outage; skipping only the component that
+// owns the missing dependency keeps the blast radius where the failure is.
 //
 // A failed Namespace is the exception and gates every namespaced object in it,
-// regardless of component, Site, or FailureDomain, because nothing can be
-// written into a namespace that does not exist.
+// whichever component planned it, because nothing can be written into a
+// namespace that does not exist.
 func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 	var (
 		result    ExecutionResult
@@ -391,16 +380,15 @@ func dependsOnStale(op plannedOp, staleRef map[ObjectRef]bool) (ObjectRef, bool)
 	return ObjectRef{}, false
 }
 
-// subject identifies the component, Site, and FailureDomain an operation was
-// planned for, which together define the scope of the inferred tier gate.
+// subject identifies the component and Site an operation was planned for, which
+// is the scope the inferred tier gate applies to.
 type subject struct {
-	Component     string
-	Site          string
-	FailureDomain string
+	Component string
+	Site      string
 }
 
 func (o plannedOp) subject() subject {
-	return subject{Component: o.Component, Site: o.Site, FailureDomain: o.FailureDomain}
+	return subject{Component: o.Component, Site: o.Site}
 }
 
 // aliasSubjects returns the contributors that were deduplicated into this
@@ -408,7 +396,7 @@ func (o plannedOp) subject() subject {
 func (o plannedOp) aliasSubjects() []subject {
 	out := make([]subject, 0, len(o.aliases))
 	for _, alias := range o.aliases {
-		out = append(out, subject{Component: alias.Component, Site: alias.Site, FailureDomain: alias.FailureDomain})
+		out = append(out, subject{Component: alias.Component, Site: alias.Site})
 	}
 
 	return out
@@ -469,13 +457,6 @@ func (e *Env) execute(ctx context.Context, op Operation) error {
 
 	case OpDelete:
 		return e.DeleteIfExists(ctx, op.Object)
-
-	case OpRun:
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		return op.Run(ctx)
 
 	default:
 		return fmt.Errorf("unknown operation kind %s for %s", op.Kind, op.Ref())

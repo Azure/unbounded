@@ -63,7 +63,7 @@ on:
         required: false
         type: string
       force_init:
-        description: "Run 'site init' instead of upgrade-apply (use for first-ever bootstrap)"
+        description: "Run 'site init' on a fresh baseline (not an old-tag migration)"
         type: boolean
         default: false
       max_notready_nodes:
@@ -293,6 +293,8 @@ jobs:
             file: images/gantry/Containerfile
           - name: racer-controller
             file: images/racer-controller/Containerfile
+          - name: racer-dataplane
+            file: images/racer-dataplane/Containerfile
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator
@@ -326,7 +328,8 @@ jobs:
         # it needs that arg (images/metalman/Containerfile declares it and feeds
         # it to make). REGISTRY is lowercased by the step above.
         #
-        # Nothing else needs one. Which component images the operator deploys is
+        # Racer release images always include native RDMA support.
+        # Which component images the operator deploys is
         # decided at reconcile time from its own compiled version, so VERSION,
         # passed to every build below, is what selects them.
         run: |
@@ -336,6 +339,9 @@ jobs:
             case "${{ matrix.component.name }}" in
               metalman)
                 echo "CONTAINER_REGISTRY=${REGISTRY}"
+                ;;
+              racer-dataplane)
+                echo "RACER_NATIVE_RDMA=true"
                 ;;
             esac
             echo 'EOF'
@@ -362,8 +368,8 @@ jobs:
   #
   # Operator-driven, matching release-upgrade.yaml: 'kubectl unbounded install'
   # bootstraps the CRDs and the operator, the operator reconciles the Site and
-  # rolls out every component into unbounded-system, and the reaper migrates any
-  # legacy split-namespace state. Component manifests are never applied here.
+  # rolls out every component into unbounded-system on the fresh release baseline.
+  # Upgrades from old tags are unsupported. Component manifests are never applied here.
   #
   #   MODE=init     -> 'install' then 'site init', creating the Site. First
   #                    bootstrap only.
@@ -457,16 +463,6 @@ jobs:
           if [[ "${{ inputs.force_init }}" == "true" ]]; then
             MODE=init
             echo "force_init=true; selecting init mode"
-          elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
-            # First upgrade from the pre-redesign (v0.1) split-namespace
-            # layout: the old net-group Site CRD exists, and the new one is
-            # absent because the operator creates it during the later
-            # 'Bootstrap CRDs and operator' step. Upgrade mode is correct: the
-            # operator's always-on LegacyReaper migrates the old Site and the
-            # split layout into unbounded-system. 'site init' would create a
-            # fresh Site instead of migrating the existing one.
-            MODE=upgrade
-            echo "Legacy Site CRD present and new Site CRD absent; first v0.1->v0.2 upgrade. Operator migrates automatically. Selecting upgrade mode"
           elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
             MODE=init
             echo "Site CRD not present; selecting init mode"
@@ -555,12 +551,11 @@ jobs:
           set +e
           NS=unbounded-system
           echo "::group::Site CRDs"
-          kubectl get crd sites.unbounded-cloud.io sites.net.unbounded-cloud.io 2>&1
+          kubectl get crd sites.unbounded-cloud.io 2>&1
           echo "::endgroup::"
-          echo "::group::Sites (new + legacy)"
+          echo "::group::Sites"
           kubectl get sites.unbounded-cloud.io -o wide 2>&1
           kubectl get sites.unbounded-cloud.io -o yaml 2>&1
-          kubectl get sites.net.unbounded-cloud.io -A -o wide 2>&1
           echo "::endgroup::"
           echo "::group::Node readiness"
           # A DaemonSet counts every node toward desiredNumberScheduled, so a

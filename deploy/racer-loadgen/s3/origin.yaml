@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer-loadgen
+  labels:
+    app.kubernetes.io/name: racer-loadgen
+spec:
+  # Preserve the existing DaemonSet's immutable selector.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: racer-loadgen
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: racer-loadgen
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: racer.unbounded-cloud.io/exclude
+                    operator: DoesNotExist
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: racer-loadgen
+          image: racer-loadgen:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --backend=s3
+            - --s3-origin=true
+            - --listen=:8080
+            - --metrics-listen=:9090
+            - --bucket=benchmark
+            - --object-count=16
+            - --object-bytes=67108864
+            - --seed=benchmark-v1
+            - --concurrency=0
+            - --verify=true
+            - --startup-timeout=4m
+            - --retry-delay=1s
+          ports:
+            - name: origin
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+        - name: origin
+          image: racer-object:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - origin
+            - --volume=racer-object
+            - --namespace=s3-benchmark-v1
+            - --bucket=benchmark
+            - --endpoint=http://127.0.0.1:8080
+            - --region=us-east-1
+            - --path-style=true
+            - --metadata-ttl=30s
+            - --request-timeout=1m
+          # Fake SDK signing placeholders for the unauthenticated synthetic
+          # fixture only. Never replace these with real AWS credentials here.
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: synthetic-benchmark-only
+            - name: AWS_SECRET_ACCESS_KEY
+              value: synthetic-benchmark-only
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: origin
+              mountPath: /run/racer/racer-object/origin
+      volumes:
+        - name: origin
+          hostPath:
+            path: /run/racer/racer-object/origin
+            type: DirectoryOrCreate

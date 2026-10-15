@@ -6,9 +6,9 @@
 `cmd/racer-dataplane/alloc/`. It gives one worker thread three things:
 
 1. Memory buffers that are aligned for direct I/O and wiped before reuse.
-2. A table of fixed-size segments in a sparse cache file or caller-opened files
-   or devices, with leases that stop reuse while I/O still points at a segment.
-3. Async read and write of that storage through the `uring-runtime` reactor.
+2. A table of fixed-size segments inside one sparse cache file, with leases
+   that stop a segment from being reused while I/O still points at it.
+3. Async read and write of that file through the `uring-runtime` reactor.
 
 The crate stores bytes only. It does not know about page keys, record headers,
 encryption, checksums, or versions. The caller owns the page index and
@@ -76,9 +76,8 @@ next request without paying for a wipe on every allocation.
 
 ## Segments
 
-Storage is split into fixed-size logical segments. Segment `n` starts at
-`n * segment_bytes`; device placements map it to a caller-supplied physical range.
-Each segment has a state and a generation number:
+The file is split into fixed-size segments. Segment `n` starts at
+`n * segment_bytes`. Each segment has a state and a generation number:
 
 ```
 Free -> Open -> Sealed -> Evicting -> Free (generation + 1)
@@ -104,13 +103,7 @@ in `alloc/src/slab.rs`).
 
 `freeze`, `snapshot`, and `restore` support restart. Restore checks the whole
 image before it changes anything, requires that no leases are live, and seals
-any segment that was open before the restart. It also checks generations: an
-image with any slot generation below the live table returns `Stale`. An image
-that marks a slot Free at the generation of an occupied live slot publishes it
-at the next generation. Otherwise the next append would reissue the same
-extents under a generation that old mappings still match. When that increment
-would wrap, restore returns `Unavailable`. Restoring into a freshly configured
-table keeps the image generations, so recovered mappings stay valid.
+any segment that was open before the restart.
 
 ## Reclaim
 
@@ -119,12 +112,12 @@ table keeps the image generations, so recovered mappings stay valid.
 serves a read from a segment. The sweep clears that mark once before it picks the
 segment. Each call has limits on the number of segments it visits and the number
 of index entries it removes.
-For a nonzero reserve, `reclaim` and `reclaim_scored` succeed only when the reserve
-(capped at the slot count) is met and no evictions remain. They intentionally
-return `Busy` while evictions remain, even if enough slots are already free.
-Callers should use `Segments::free_count` to check capacity and keep retrying
-bounded reclamation later to drain pending evictions. A zero reserve is a no-op,
-not a drain request.
+For a nonzero reserve, `reclaim` and `reclaim_scored` can succeed once the reserve
+(capped at the slot count) is met, even with pending evictions. Success is not a
+drain guarantee. `Busy` means the bounded sweep could not meet the reserve, or
+table mutation was blocked. Callers should use `Segments::free_count` to check
+capacity and retry bounded reclamation when more free slots are needed. A zero
+reserve is a no-op, not a drain request.
 
 Evicting a segment happens in this order:
 
@@ -143,7 +136,7 @@ not eligible candidates. `reclaim_index` drops index entries one at a time until
 caller check (for example, an index size limit) passes. It does not free segments
 and does not ask `can_evict`.
 
-## Storage and I/O
+## File and I/O
 
 `Slab::new` describes one cache file. Opening is blocking and is meant to run at
 startup (see `Slab::open_configured` and `Slab::open_file` in `alloc/src/slab.rs`).
@@ -194,7 +187,7 @@ and it does not flush to disk.
 
 ## Simulation
 
-For file-backed slabs, the `simulation` feature routes open, lock, stat, and sizing to the
+The `simulation` feature routes file open, lock, stat, and sizing to the
 `uring-runtime` simulated filesystem. Buffers, leases, and segment rules do not
 change, so the same workflow tests run in both modes.
 
@@ -202,15 +195,9 @@ change, so the same workflow tests run in both modes.
 
 - Unit tests cover padding math, wipe and reuse rules, lease and generation
   checks, reclaim limits, the eviction veto, restore, and file security checks.
-- `alloc/tests/dst.rs` is a deterministic simulation test suite. One generator
-  drives appends, simulated I/O with injected faults, leases, freezes,
-  snapshots, historical and edited restores, reclaim, and restart. After every
-  step it checks the allocator against an independent record model. The checks
-  cover aliasing, generation monotonicity, mapping fencing, atomic restore
-  failure, reclaim bounds, and charge accounting. Fixed regression traces, a
-  restore cross-product, and seeded sequences all run through the same runner.
-- `alloc/tests/workflows.rs` covers short I/O, dropped and canceled reads and
-  writes, startup failures, and confirms that reuse does not erase disk bytes.
+- `alloc/tests/workflows.rs` covers restart, short I/O, dropped and cancelled
+  reads and writes, startup failures, and confirms that reuse does not erase
+  disk bytes.
 - CI checks and tests the production and simulation builds as separate
   commands, so feature unification cannot hide one from the other. The
   production run sets `PAGE_ALLOC_REQUIRE_REAL_IO=1`, so a host without

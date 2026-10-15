@@ -14,7 +14,7 @@
 //	subsystem one of {"mirror","transfer","cache","origin","coord",
 //	 "discovery","hrw","members","cdsub","agent"}
 //	digest OCI digest string ("sha256:...")
-//	peer NodeID of a remote peer
+//	peer libp2p identity of a remote peer
 //	registry upstream registry name
 //	repo OCI repository
 //	class the design doc failure class
@@ -82,8 +82,8 @@ func Repo(name string) slog.Attr { return slog.String("repo", name) }
 // Class builds a slog.Attr carrying the standard "class" key (the design doc failure class).
 func Class(c string) slog.Attr { return slog.String("class", c) }
 
-// NodeID builds a slog.Attr carrying the standard "node_id" key.
-func NodeID(id fmt.Stringer) slog.Attr { return slog.String("node_id", safeString(id)) }
+// PeerID builds a slog.Attr carrying the standard "peer_id" key.
+func PeerID(id fmt.Stringer) slog.Attr { return slog.String("peer_id", safeString(id)) }
 
 // Err builds a slog.Attr carrying the standard "err" key.
 func Err(err error) slog.Attr { return slog.Any("err", err) }

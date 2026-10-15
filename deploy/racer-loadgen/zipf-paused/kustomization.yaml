@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../zipf
+patches:
+  - target:
+      version: v1
+      kind: ConfigMap
+      name: racer-loadgen-control
+    patch: |-
+      - op: replace
+        path: /data/concurrency
+        value: "0"

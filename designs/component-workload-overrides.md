@@ -1,8 +1,18 @@
 # Component Workload Overrides
 
-**Status:** Draft for team review
+**Status:** Historical design and implementation review; superseded as an operational reference
 **Scope:** A mechanism for users to customize the Deployments and DaemonSets that
 unbounded-operator generates and reconciles.
+
+The implemented mechanism is documented in the [workload overrides reference](../docs/content/reference/workload-overrides.md).
+This document retains proposal alternatives, code sketches, and past review
+findings. Its reaper hooks, legacy Gantry cleanup, migration affinity interlocks,
+and pre-release upgrade tests are not part of the first-release contract.
+Current scheduling protections still intersect user affinity with operator
+placement, but do not support old Site labels or namespace migration. CLI status
+uses the operator's recorded workload state; missing or unknown state is reported
+as `unknown`, never inferred from hashes. Historical line citations and checklist
+items below must not be treated as current source locations or outstanding work.
 
 ---
 

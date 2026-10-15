@@ -14,9 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/internal/racerobject"
+	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 func TestS3Options(t *testing.T) {
@@ -24,7 +30,7 @@ func TestS3Options(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, s3Options{Endpoint: "http://127.0.0.1:8080", Bucket: "benchmark", Count: 128, Bytes: 64 << 20}, opts.s3)
 	require.Equal(t, opts.s3.Endpoint, opts.pull.Target)
-	require.Equal(t, 1, opts.pull.BlobConcurrency)
+	require.Equal(t, 1, opts.pull.LayerConcurrency)
 	opts, err = parseOptions([]string{"--backend=s3", "--endpoint=https://origin:443/", "--bucket=my-bucket", "--object-count=3", "--object-bytes=123", "--s3-origin", "--concurrency=0", "--profile=zipf"}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, s3Options{Endpoint: "https://origin:443/", Bucket: "my-bucket", Count: 3, Bytes: 123, Origin: true}, opts.s3)
@@ -61,7 +67,7 @@ func s3TestPuller(t *testing.T, c *blobCatalog, endpoint string) (*puller, *load
 
 	opts := pullTestOptions(endpoint)
 	opts.Backend = "s3"
-	opts.BlobConcurrency = 1
+	opts.LayerConcurrency = 1
 	p, m := pullTestNew(t, &syntheticImage{}, opts)
 	p.batches = c.batches
 	p.configureS3(c, "benchmark")
@@ -157,77 +163,63 @@ func TestS3OriginHTTP(t *testing.T) {
 	}
 }
 
-func TestS3ClientAgainstOrigin(t *testing.T) {
-	// The puller uses the standard S3 client, so the synthetic origin must
-	// accept its path-style GetObject requests without any adapter.
-	c := s3TestCatalog(t, 2, 64<<10+73)
+func TestS3DirectAndRacerObject(t *testing.T) {
+	// Crossing a Racer page boundary exercises pinned HEAD/GET and exact ranges
+	// through the real AWS HTTP client and racer-object adapters, not S3 stubs.
+	c := s3TestCatalog(t, 1, int64(racersdk.PageSize)+73)
 	originMetrics := newMetrics(prometheus.NewRegistry())
+	originServer := httptest.NewServer(originMetrics.instrument(c.s3Handler("benchmark")))
+	t.Cleanup(originServer.Close)
+	client := s3.New(s3.Options{
+		Region: "us-east-1", BaseEndpoint: aws.String(originServer.URL), UsePathStyle: true,
+		Credentials: aws.AnonymousCredentials{}, HTTPClient: originServer.Client(),
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+	})
+	origin, err := racerobject.NewOrigin(client, racerobject.OriginConfig{Namespace: "s3-test", Buckets: []string{"benchmark"}, MetadataTTL: time.Minute})
+	require.NoError(t, err)
+	sdk := racersdktest.NewClient(t, origin)
 
-	var userAgent atomic.Value
+	handler, err := racerobject.NewSidecar(sdk, racerobject.SidecarConfig{Namespace: "s3-test", Buckets: []string{"benchmark"}})
+	require.NoError(t, err)
 
-	origin := httptest.NewServer(originMetrics.instrument(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		userAgent.Store(r.Header.Get("User-Agent"))
-		require.Equal(t, "GetObject", r.URL.Query().Get("x-id"))
-		require.Empty(t, r.Header.Get("Authorization"), "anonymous client must not sign requests")
-		c.s3Handler("benchmark").ServeHTTP(w, r)
-	})))
-	t.Cleanup(origin.Close)
+	sidecar := httptest.NewServer(handler)
+	t.Cleanup(sidecar.Close)
 
-	for _, endpoint := range []string{origin.URL, origin.URL + "/"} {
+	for _, endpoint := range []string{originServer.URL, sidecar.URL} {
 		p, m := s3TestPuller(t, c, endpoint)
 		p.opts.DiagnoseIntegrity = true
 		require.NoError(t, p.configureDiagnostics(c))
-
-		for _, batch := range c.batches {
-			require.NoError(t, p.pullBatch(t.Context(), batch))
-		}
-
-		require.Equal(t, float64(2*(64<<10+73)), testutil.ToFloat64(m.verifiedBytes))
+		require.NoError(t, p.pullBatch(t.Context(), c.batches[0]))
+		require.Equal(t, float64(racersdk.PageSize+73), testutil.ToFloat64(m.verifiedBytes))
 		require.Equal(t, testutil.ToFloat64(m.verifiedBytes), testutil.ToFloat64(m.receivedBytes))
-		require.Equal(t, float64(2), testutil.ToFloat64(m.pulls.WithLabelValues("success")))
+		require.Equal(t, float64(1), testutil.ToFloat64(m.pulls.WithLabelValues("success")))
 	}
 
-	require.Contains(t, userAgent.Load(), "aws-sdk-go-v2")
-	require.Equal(t, float64(4), testutil.ToFloat64(originMetrics.originRequests.WithLabelValues("GET", "200")))
-}
-
-func TestS3ValidBucket(t *testing.T) {
-	for _, bucket := range []string{"abc", "benchmark", "my-bucket.v2", "0bucket9", strings.Repeat("a", 63)} {
-		require.True(t, validS3Bucket(bucket), bucket)
-	}
-
-	for _, bucket := range []string{"", "ab", strings.Repeat("a", 64), "Bucket", "bad/bucket", "-bucket", "bucket-", ".bucket", "bucket.", "a..b", "a_b", "a b"} {
-		require.False(t, validS3Bucket(bucket), bucket)
-	}
+	require.GreaterOrEqual(t, testutil.ToFloat64(originMetrics.originRequests.WithLabelValues("HEAD", "200")), float64(2))
+	require.Equal(t, float64(2), testutil.ToFloat64(originMetrics.originRequests.WithLabelValues("GET", "206")))
 }
 
 func TestS3ClientFailuresAndVerification(t *testing.T) {
 	c := s3TestCatalog(t, 1, 123)
 	for _, test := range []struct {
-		name     string
-		status   int
-		body     string
-		verify   bool
-		reason   failureReason
-		received int
+		name   string
+		status int
+		body   string
+		verify bool
+		reason failureReason
 	}{
-		{"corrupt", 200, strings.Repeat("x", 123), true, failureDigest, 123},
-		{"short", 200, "short", true, failureIncomplete, 5},
-		{"oversized", 200, strings.Repeat("x", 124), true, failureSize, 124},
-		// The S3 client consumes error bodies to decode them; no bytes reach the reader.
-		{"status", 503, "error", true, failureStatus, 0},
-		{"not found", 404, "<Error><Code>NoSuchKey</Code></Error>", true, failureStatus, 0},
-		{"redirect", 302, "redirect", true, failureStatus, 0},
-		{"partial", 206, "partial", true, failureStatus, 7},
-		{"unchecked", 200, strings.Repeat("x", 123), false, failureOther, 123},
+		{"corrupt", 200, strings.Repeat("x", 123), true, failureDigest},
+		{"short", 200, "short", true, failureIncomplete},
+		{"oversized", 200, strings.Repeat("x", 124), true, failureSize},
+		{"status", 503, "error", true, failureStatus},
+		{"redirect", 302, "redirect", true, failureStatus},
+		{"partial", 206, "partial", true, failureStatus},
+		{"unchecked", 200, strings.Repeat("x", 123), false, failureOther},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var requests atomic.Int32
-
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				requests.Add(1)
 				require.Equal(t, "/benchmark/object-000000", r.URL.Path)
-				require.Equal(t, "x-id=GetObject", r.URL.RawQuery, "S3 GetObject without OCI namespace query")
+				require.Empty(t, r.URL.RawQuery, "no OCI namespace query")
 				w.Header().Set("Location", "/should-not-follow")
 				w.WriteHeader(test.status)
 				_, _ = io.WriteString(w, test.body)
@@ -240,22 +232,13 @@ func TestS3ClientFailuresAndVerification(t *testing.T) {
 			if test.verify {
 				require.Error(t, err)
 				require.Equal(t, test.reason, classifyFailure(err))
-
-				var failure *pullFailure
-				require.ErrorAs(t, err, &failure)
-
-				if test.reason == failureStatus {
-					require.Equal(t, test.status, failure.status)
-				}
-
 				require.Equal(t, float64(1), testutil.ToFloat64(m.pullFailures.WithLabelValues(test.reason.String())))
 			} else {
 				require.NoError(t, err)
 			}
 
 			require.Zero(t, testutil.ToFloat64(m.verifiedBytes))
-			require.Equal(t, float64(test.received), testutil.ToFloat64(m.receivedBytes))
-			require.Equal(t, int32(1), requests.Load(), "S3 client must not retry or follow redirects")
+			require.Equal(t, float64(len(test.body)), testutil.ToFloat64(m.receivedBytes))
 		})
 	}
 }

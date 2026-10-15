@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer-s3-loadgen
+  labels:
+    app.kubernetes.io/name: racer-s3-loadgen
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: racer-s3-loadgen
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: racer-s3-loadgen
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        racer-s3-benchmark: enabled
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: racer.unbounded-cloud.io/exclude
+                    operator: DoesNotExist
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: racer-loadgen
+          image: racer-loadgen:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --backend=s3
+            - --s3-origin=false
+            - --endpoint=http://127.0.0.1:8080
+            - --metrics-listen=:9090
+            - --bucket=benchmark
+            - --object-count=16
+            - --object-bytes=67108864
+            - --seed=benchmark-v1
+            - --profile=shuffle
+            - --concurrency=0
+            - --concurrency-file=/etc/loadgen-control/concurrency
+            - --verify=true
+            - --startup-timeout=4m
+            - --pull-timeout=2m
+            - --retry-delay=1s
+            - --start-delay=10s
+          ports:
+            - name: metrics
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            # Mount the directory, not a subPath: projected updates must be visible.
+            - name: control
+              mountPath: /etc/loadgen-control
+              readOnly: true
+        - name: sidecar
+          image: racer-object:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - sidecar
+            - --volume=racer-object
+            - --namespace=s3-benchmark-v1
+            - --bucket=benchmark
+            - --listen=127.0.0.1:8080
+            - --request-timeout=5m
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: client
+              mountPath: /run/racer/racer-object/client
+              readOnly: true
+      volumes:
+        - name: control
+          configMap:
+            name: racer-s3-loadgen-control
+            items:
+              - key: concurrency
+                path: concurrency
+        - name: client
+          hostPath:
+            path: /run/racer/racer-object/client
+            type: Directory

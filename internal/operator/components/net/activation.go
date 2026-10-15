@@ -37,10 +37,10 @@ const (
 	// unknown state.
 	//
 	// Polling is necessary rather than lazy: readiness lives in Deployment
-	// status and in Endpoints, and neither produces an event this operator
+	// status and in EndpointSlices, and neither produces an event this operator
 	// sees. The workload predicate deliberately filters status-only updates,
 	// because reacting to them would re-apply every manifest on every pod
-	// restart, and Endpoints are not watched at all.
+	// restart, and EndpointSlices are not watched at all.
 	backendPollInterval = 15 * time.Second
 
 	// backendIdlePollInterval is how often a pass re-checks a backend that is
@@ -203,8 +203,8 @@ func readBackendState(ctx context.Context, env *component.Env) backendState {
 	}
 
 	if !serving {
-		// The Service has no selector: its leader pod writes the Endpoints and
-		// EndpointSlice itself, and only once it has both won the lease and
+		// The Service has no selector: its leader pod writes the EndpointSlice
+		// itself, and only once it has both won the lease and
 		// finished starting its site controller. So this is not a restatement
 		// of the Deployment check, it is the difference between a pod that is
 		// running and a pod that has taken leadership and is answering.
@@ -249,11 +249,7 @@ func rolloutComplete(deployment *appsv1.Deployment) (string, bool) {
 // serviceHasEndpoint reports whether anything is registered behind the
 // controller Service.
 //
-// EndpointSlice is authoritative on every supported version, so a slice that
-// exists settles the question either way. The legacy Endpoints object is
-// consulted only when no slice exists at all: the controller writes both, and
-// an apiserver old enough to resolve an APIService through Endpoints alone is
-// exactly the case it keeps writing that one for.
+// EndpointSlice is authoritative on every supported Kubernetes version (1.34+).
 func serviceHasEndpoint(ctx context.Context, reader client.Reader, namespace string, deployment *appsv1.Deployment) (bool, error) {
 	key := client.ObjectKey{Namespace: namespace, Name: controllerName}
 
@@ -286,37 +282,10 @@ func serviceHasEndpoint(ctx context.Context, reader client.Reader, namespace str
 		return false, fmt.Errorf("get endpoint slice %s/%s: %w", namespace, controllerName, err)
 	}
 
-	var endpoints corev1.Endpoints //nolint:staticcheck // the controller still writes it for APIService availability on Kubernetes 1.33 and earlier
-
-	switch err := reader.Get(ctx, key, &endpoints); {
-	case apierrors.IsNotFound(err):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("get endpoints %s/%s: %w", namespace, controllerName, err)
-	}
-
-	for _, subset := range endpoints.Subsets {
-		if !hasLegacyHTTPSPort(subset.Ports) {
-			continue
-		}
-
-		for _, address := range subset.Addresses {
-			ready, err := endpointTargetsReadyPod(ctx, reader, namespace, deployment, address.TargetRef, []string{address.IP})
-			if err != nil {
-				return false, err
-			}
-
-			if ready {
-				return true, nil
-			}
-		}
-	}
-
 	return false, nil
 }
 
-// hasHTTPSPort and hasLegacyHTTPSPort identify the controller's serving port by
-// name.
+// hasHTTPSPort identifies the controller's serving port by name.
 //
 // The number is not looked at. The controller publishes controller.healthPort
 // from its own config, while the name is a literal set by the same code, so the
@@ -340,30 +309,10 @@ func hasHTTPSPort(ports []discoveryv1.EndpointPort) bool {
 	return false
 }
 
-func hasLegacyHTTPSPort(ports []corev1.EndpointPort) bool {
-	for _, port := range ports {
-		if port.Name == "https" && port.Protocol == corev1.ProtocolTCP {
-			return true
-		}
-	}
-
-	return false
-}
-
 // endpointTargetsReadyPod reports whether an endpoint address is a live pod of
 // the current controller Deployment.
 //
-// A nil targetRef is accepted rather than rejected, on the strength of the
-// rollout check the caller has already passed. Controllers released before the
-// operator gated on backend readiness publish their Endpoints and EndpointSlice
-// without one, and a workload override may pin the controller image to such a
-// version indefinitely. Rejecting those would leave the registrations frozen at
-// whatever the cluster already had, silently: nothing would be pending, so
-// NetReady would stay true while manifest changes were never applied. What
-// rolloutComplete has established by this point is that the Deployment's current
-// revision is fully Ready and Available, so an address published against it is a
-// running pod; the targetRef checks below only add that it belongs to that
-// revision rather than being a stale record of the last one.
+// Every endpoint must identify its Pod so stale addresses cannot activate a backend.
 func endpointTargetsReadyPod(
 	ctx context.Context,
 	reader client.Reader,
@@ -373,7 +322,7 @@ func endpointTargetsReadyPod(
 	addresses []string,
 ) (bool, error) {
 	if target == nil {
-		return len(addresses) > 0, nil
+		return false, nil
 	}
 
 	if target.Kind != "Pod" || target.Name == "" || target.UID == "" ||

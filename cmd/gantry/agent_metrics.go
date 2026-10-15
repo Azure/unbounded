@@ -329,25 +329,23 @@ func (t *layerProgressTracker) completed(d digest.Digest) {
 // probe hit rate, in-flight pull gauge, cold-start latency, and coord
 // stream counters.
 type phase3Metrics struct {
-	hrwRankMismatch                   *prometheus.CounterVec
-	dhtFalseEmpty                     prometheus.Counter
-	topkProbeHit                      prometheus.Counter
-	coldStartDuration                 *prometheus.HistogramVec
-	coldStartSeedContacted            *prometheus.HistogramVec
-	coldStartSeedSelectable           *prometheus.HistogramVec
-	coldStartSeedAccepted             *prometheus.HistogramVec
-	coldStartChairDispatch            *prometheus.CounterVec
-	coldStartChairCallDur             *prometheus.HistogramVec
-	coordPullIntentServed             prometheus.Counter
-	coordPullIntentStorageUnavailable prometheus.Counter
-	coordPleasePullServed             prometheus.Counter
-	coordPleasePullStarted            prometheus.Counter
-	coordPleasePullDeclined           *prometheus.CounterVec
-	coordStreamError                  prometheus.Counter
-	prefetchBatchesTotal              prometheus.Counter
-	prefetchDigestsTotal              prometheus.Counter
-	prefetchPullersPerBatch           prometheus.Histogram
-	prefetchGroupsTotal               *prometheus.CounterVec
+	hrwRankMismatch         *prometheus.CounterVec
+	dhtFalseEmpty           prometheus.Counter
+	topkProbeHit            prometheus.Counter
+	coldStartDuration       *prometheus.HistogramVec
+	coldStartSeedContacted  *prometheus.HistogramVec
+	coldStartSeedSelectable *prometheus.HistogramVec
+	coldStartSeedAccepted   *prometheus.HistogramVec
+	coldStartChairDispatch  *prometheus.CounterVec
+	coldStartChairCallDur   *prometheus.HistogramVec
+	coordPleasePullServed   prometheus.Counter
+	coordPleasePullStarted  prometheus.Counter
+	coordPleasePullDeclined *prometheus.CounterVec
+	coordStreamError        prometheus.Counter
+	prefetchBatchesTotal    prometheus.Counter
+	prefetchDigestsTotal    prometheus.Counter
+	prefetchPullersPerBatch prometheus.Histogram
+	prefetchGroupsTotal     *prometheus.CounterVec
 }
 
 func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics {
@@ -411,14 +409,6 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Help:    "Round-trip time of one please_pull attempt to a remote chair, labeled by outcome. Deadline outcomes pile up at the resolver query timeout, so a mass of them means the deadline is the binding constraint; a long tail on ok means the transport is slow and raising the deadline only defers the problem.",
 			Buckets: prometheus.ExponentialBuckets(0.005, 2, 12),
 		}, []string{"digest_kind", "outcome"}),
-		coordPullIntentServed: reg.NewCounter("coord", prometheus.CounterOpts{
-			Name: "p2p_coord_pull_intent_served_total",
-			Help: "pull_intent_query RPCs answered by this node's coord server.",
-		}),
-		coordPullIntentStorageUnavailable: reg.NewCounter("coord", prometheus.CounterOpts{
-			Name: "p2p_coord_pull_intent_storage_unavailable_total",
-			Help: "pull_intent_query responses whose has_cached=false answer was caused by the local storage backend (typically containerd) returning ErrUnavailable rather than a definitive miss. Distinguishes \"we genuinely lack the blob\" from \"containerd is unreachable\" so transient storage flaps are observable independently of /readyz (PullIntent path).",
-		}),
 		coordPleasePullServed: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_please_pull_served_total",
 			Help: "please_pull RPCs answered by this node's coord server.",

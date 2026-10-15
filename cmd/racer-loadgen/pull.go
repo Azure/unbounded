@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +38,7 @@ type pullOptions struct {
 	ConcurrencyFile   string
 	NodeCapsFile      string
 	NodeName          string
+	LayerConcurrency  int // Compatibility input; normalized into BlobConcurrency.
 	BlobConcurrency   int
 	Timeout           time.Duration
 	RetryDelay        time.Duration
@@ -51,7 +51,8 @@ type puller struct {
 	batches      []blobBatch
 	acquire      func(context.Context, string, ocispec.Descriptor) (blobResponse, error)
 	closeBackend func() error
-	repository   string
+	img          *syntheticImage
+	images       []*syntheticImage
 	opts         pullOptions
 	target       *url.URL
 	metrics      *loadMetrics
@@ -65,7 +66,7 @@ type puller struct {
 	randomFloat64 func() float64
 }
 
-func newPuller(repository string, opts pullOptions, metrics *loadMetrics) (*puller, error) {
+func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*puller, error) {
 	if opts.Backend == "" {
 		opts.Backend = "gantry"
 	}
@@ -74,12 +75,16 @@ func newPuller(repository string, opts pullOptions, metrics *loadMetrics) (*pull
 		return nil, errors.New("backend must be gantry, uds, or s3")
 	}
 
+	if opts.BlobConcurrency == 0 {
+		opts.BlobConcurrency = opts.LayerConcurrency
+	}
+
 	if opts.DiagnoseIntegrity && !opts.Verify {
 		return nil, errors.New("diagnose-integrity requires verify")
 	}
 
-	if repository == "" || metrics == nil {
-		return nil, errors.New("repository and metrics are required")
+	if img == nil || metrics == nil {
+		return nil, errors.New("image and metrics are required")
 	}
 
 	if opts.Profile == "" {
@@ -118,19 +123,12 @@ func newPuller(repository string, opts pullOptions, metrics *loadMetrics) (*pull
 
 	target, err := url.Parse(opts.Target)
 	if err != nil {
-		return nil, errors.New("invalid pull target URL")
+		return nil, fmt.Errorf("parse pull target: %w", err)
 	}
 
 	if (target.Scheme != "http" && target.Scheme != "https") || target.Hostname() == "" || target.User != nil ||
 		target.RawQuery != "" || target.ForceQuery || strings.Contains(opts.Target, "#") || target.Opaque != "" {
 		return nil, errors.New("pull target must be an http or https URL with a host and no credentials, query, or fragment")
-	}
-
-	if port := target.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 {
-			return nil, errors.New("invalid pull target port")
-		}
 	}
 
 	base, ok := http.DefaultTransport.(*http.Transport)
@@ -144,7 +142,7 @@ func newPuller(repository string, opts pullOptions, metrics *loadMetrics) (*pull
 	transport.MaxIdleConns = transport.MaxIdleConnsPerHost
 	p := &puller{
 		randomFloat64: rand.Float64,
-		repository:    repository, opts: opts, target: target, metrics: metrics, transport: transport,
+		img:           img, images: []*syntheticImage{img}, opts: opts, target: target, metrics: metrics, transport: transport,
 		client: &http.Client{
 			Transport: transport,
 			// Read redirect responses as failures so every received body is accounted for.
@@ -240,6 +238,14 @@ func waitPullDelay(ctx context.Context, delay time.Duration) bool {
 	case <-timer.C:
 		return ctx.Err() == nil
 	}
+}
+
+func (p *puller) pull(ctx context.Context) error {
+	return p.pullImage(ctx, p.img)
+}
+
+func (p *puller) pullImage(ctx context.Context, img *syntheticImage) error {
+	return p.pullBatch(ctx, imageBatch(img))
 }
 
 func (p *puller) pullBatch(ctx context.Context, batch blobBatch) (err error) {
@@ -339,13 +345,8 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 
 	response, err := p.acquire(ctx, kind, desc)
 	if err != nil {
-		switch p.opts.Backend {
-		case "uds":
+		if p.opts.Backend == "uds" {
 			if code := sdkErrorStatus(err); code != 0 {
-				reason, status = failureStatus, code
-			}
-		case "s3":
-			if code := s3ErrorStatus(err); code != 0 {
 				reason, status = failureStatus, code
 			}
 		}

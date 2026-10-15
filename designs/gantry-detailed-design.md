@@ -1,7 +1,17 @@
 # Gantry  -  Architecture
 
-**Status:** Draft for team review
+**Status:** Historical architecture proposal; superseded by the first-release implementation
 **Scope:** High-level design for Gantry cluster-internal container image distribution at 10k+ node scale.
+
+Read the [current Gantry guide](../docs/content/guides/gantry.md) before using
+this document. The body preserves earlier design alternatives, not supported
+configuration or wire contracts. In particular, full-membership HRW puller
+selection, libp2p pull-intent/content RPCs, shared registry credential files,
+compatibility switches, and competing live-mirror cache writes are retired.
+Current cold seeding uses rotating Lease chairs and HRW over stable chair IDs;
+HTTPS content requests require an assignment and explicit kind. Libp2p retains
+chair-rotation offers. Containerd remains the default backend; Racer is optional.
+These distinctions supersede conflicting examples and guarantees below.
 
 ---
 
@@ -582,7 +592,7 @@ the DHT consistent with it.
 
 - **Transport encryption:** libp2p Noise (built-in).
 - **Content verification:** OCI digest verification on every byte received from peers. Non-negotiable.
-- **Origin auth:** request-scoped Basic/Bearer authorization from the incoming containerd mirror request is forwarded through peer and `please_pull` paths and takes precedence for origin. It is never cached or persisted, is sent only to HTTPS origins, and a rejection never falls back to the puller node's identity. Secret-mounted `credentials_path` is explicit legacy shared-identity mode. See §7.8.
+- **Origin auth:** request-scoped Basic/Bearer authorization from the incoming containerd mirror request is forwarded through peer and `please_pull` paths. It is never cached or persisted, is sent only to HTTPS origins, and a rejection never falls back to another identity. Anonymous Bearer exchange supports public registries. See §7.8.
 - **NetworkPolicy:** the transfer port (HTTP/2) and libp2p listen ports are restricted to inter-node traffic only.
 - **Signature verification:** out of scope. Existing tooling (Cosign, admission controllers) handles this and is unaffected by the P2P layer.
 
@@ -698,10 +708,8 @@ eventually exhausts; A may attempt its gated direct-origin fallback or return a
 5xx so containerd falls through/retries. A direct origin 401 includes the
 current challenge and re-enters containerd's normal credential refresh flow.
 
-Setting secret-mounted `credentials_path` explicitly opts a registry into the
-legacy shared-identity mode: Gantry skips requester challenge negotiation and
-authenticates to origin itself. Leaving it empty selects requester-mediated
-authentication.
+Gantry has no shared-identity file mode. Private registries use requester-mediated
+authentication; public registries may use anonymous Bearer exchange.
 
 The standard containerd Docker authorizer caches handlers by HTTP destination
 host, so an origin token is not proactively reused for the loopback mirror.
@@ -784,3 +792,22 @@ from an on-path observer.
 - **Designated puller**  -  for a given **digest**, the node that HRW ranks highest among reachable cluster members. Responsible for pulling that digest from origin in cold-start scenarios. An image's manifest, config, and layer digests generally have *different* designated pullers, since HRW is computed independently per digest.
 - **Warm path**  -  per-digest pull served from peer-cached content via DHT discovery.
 - **Cold path**  -  per-digest pull where no peer has the content; requires origin contact via the designated puller.
+# First-release implementation update
+
+The first-release implementation supersedes historical membership and content-RPC
+descriptions below. Libp2p coordination carries only OfferChair rotation messages.
+Content requests use the HTTPS chair endpoint with a required lease assignment and
+explicit Kind; missing or unknown kinds are rejected before pumping. Peer identity
+is the serialized libp2p identity, with no Kubernetes node-name resolver or rank
+response. Protobuf reserves retired envelope field numbers.
+
+Live mirror GETs always stream to containerd; only the caller's containerd commits
+those bytes. Background chair pulls retain their ingest, lease, and advertisement
+path. cdsub requires a presence notifier and never directly publishes DHT records.
+Lease cleanup uses containerd CreatedAt, conservatively retaining invalid timestamps.
+
+Owned chair HTTPS requires TLS 1.3 and peer pinning. Transfer remains h2c under the
+existing isolation contract. External registry/token and Kubernetes API clients
+retain secure defaults and configured trust. See the public Gantry guide for the
+current configuration contract; historical compatibility switches below are not
+supported settings.

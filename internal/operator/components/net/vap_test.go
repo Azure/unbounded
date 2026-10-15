@@ -93,6 +93,45 @@ func TestNodeFieldPolicyProtectsWireGuardPort(t *testing.T) {
 	}
 }
 
+func TestNodeFieldPolicyRejectsRetiredSiteLabelChanges(t *testing.T) {
+	policy := plannedNetObject(t, "ValidatingAdmissionPolicy", "unbounded-net-node-field-restriction")
+	retired := policyValidationExpression(t, policy, "unbounded-net may not modify the retired Site label")
+
+	current := policyValidationExpression(t, policy, "unbounded-net may only modify labels with the net.unbounded-cloud.io/ prefix or the unbounded-cloud.io/site label")
+	for _, tc := range []struct {
+		name    string
+		old     map[string]any
+		next    map[string]any
+		allowed bool
+	}{
+		{"absent", nil, nil, true},
+		{"canonical", nil, map[string]any{"unbounded-cloud.io/site": "site-a"}, true},
+		{"current net label", nil, map[string]any{"net.unbounded-cloud.io/managed-kube-proxy": "true"}, true},
+		{"retired add", nil, map[string]any{"net.unbounded-cloud.io/site": "site-a"}, false},
+		{"retired remove", map[string]any{"net.unbounded-cloud.io/site": "site-a"}, nil, false},
+		{"retired change", map[string]any{"net.unbounded-cloud.io/site": "site-a"}, map[string]any{"net.unbounded-cloud.io/site": "site-b"}, false},
+		{"retired unchanged", map[string]any{"net.unbounded-cloud.io/site": "site-a"}, map[string]any{"net.unbounded-cloud.io/site": "site-a", "unbounded-cloud.io/site": "site-b"}, true},
+		{"unrelated label", nil, map[string]any{"example.com/owned": "true"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			object := func(labels map[string]any) map[string]any {
+				metadata := map[string]any{}
+				if labels != nil {
+					metadata["labels"] = labels
+				}
+
+				return map[string]any{"metadata": metadata}
+			}
+			vars := map[string]any{"oldObject": object(tc.old), "object": object(tc.next)}
+
+			allowed := evalCEL(t, retired, vars) && evalCEL(t, current, vars)
+			if allowed != tc.allowed {
+				t.Fatalf("allowed = %v, want %v", allowed, tc.allowed)
+			}
+		})
+	}
+}
+
 func TestPublicIPAnnotationOwnershipPolicyScope(t *testing.T) {
 	t.Parallel()
 

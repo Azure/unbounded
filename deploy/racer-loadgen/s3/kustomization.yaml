@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - cache.yaml
+  - control.yaml
+  - origin.yaml
+  - consumer.yaml
+  - services.yaml
+# Explicit kinds keep the custom ClusterVolume resource cluster-scoped.
+patches:
+  - target:
+      kind: DaemonSet|Service|ConfigMap
+    patch: |-
+      - op: add
+        path: /metadata/namespace
+        value: unbounded-system
+images:
+  - name: racer-loadgen
+    newName: ghcr.io/azure/racer-loadgen
+    newTag: dev
+  - name: racer-object
+    newName: ghcr.io/azure/racer-object
+    newTag: dev

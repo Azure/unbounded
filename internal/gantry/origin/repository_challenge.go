@@ -58,8 +58,11 @@ func (c *Client) RepositoryAuthenticationChallenge(ctx context.Context, ref ifac
 	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 	for {
-		u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
+		u := *r.base
 		u.User = nil
+		u.Path = strings.TrimRight(u.Path, "/") + "/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String()
+		u.RawPath, u.RawQuery, u.Fragment, u.RawFragment = "", "", "", ""
+		u.ForceQuery = false
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.String(), nil)
 		if err != nil {

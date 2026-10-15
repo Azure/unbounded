@@ -19,7 +19,7 @@ import (
 	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
 )
 
-// walkBlobs traverses target's manifest tree in the supplied content
+// walkBlobsWithRecorder traverses target's manifest tree in the supplied content
 // store and returns every blob digest that is **present and serveable**
 // from containerd right now in DFS order: the target descriptor itself,
 // its config (for image manifests), its layers, plus every child of an
@@ -41,18 +41,13 @@ import (
 // index but absent from the content store. Absent subtrees are
 // skipped silently so the rest of the image still produces useful
 // announcements.
-func walkBlobs(ctx context.Context, store content.Store, target ocispec.Descriptor) ([]gdigest.Digest, error) {
-	return walkBlobsWithRecorder(ctx, store, target, nil)
-}
-
-// walkBlobsWithRecorder is walkBlobs that additionally calls recorder
+// It additionally calls recorder
 // for every present descriptor's (digest, mediaType) pair. Used by
 // the containerdstore descriptor index - populating it during the
 // reconcile-walk we already do (per "Descriptor index"
 // sources of truth) means the transfer endpoint's manifest replies
 // can fill the Content-Type header without parsing the manifest
-// body. recorder may be nil; nil is a no-op for back-compat with
-// callers that only want the digest set.
+// body. recorder may be nil when no descriptor index is needed.
 func walkBlobsWithRecorder(ctx context.Context, store content.Store, target ocispec.Descriptor, recorder func(d gdigest.Digest, mediaType string)) ([]gdigest.Digest, error) {
 	var (
 		out  []gdigest.Digest
@@ -105,7 +100,7 @@ func walkBlobsWithRecorder(ctx context.Context, store content.Store, target ocis
 }
 
 // childrenIfPresent calls images.Children and downgrades a content-
-// store "not found" miss to (nil, nil). See walkBlobs for the rationale.
+// store "not found" miss to (nil, nil). See walkBlobsWithRecorder for the rationale.
 func childrenIfPresent(ctx context.Context, store content.Store, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 	children, err := images.Children(ctx, store, desc)
 	if err != nil && errdefs.IsNotFound(err) {

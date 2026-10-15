@@ -6,6 +6,8 @@ name: release upgrade
 # ---------------------------------------------------------------------------
 # Deploys an Unbounded release to the integration cluster (unbounded-stable)
 # so it can soak before being published to end users.
+# The integration cluster must start from the fresh first-release baseline.
+# Reconciliation of that baseline is not support for upgrades from old tags.
 #
 # In short: release.yaml builds and signs a tag into a DRAFT release, this
 # workflow fires on that run completing, deploys it, smokes it, and publishes
@@ -61,7 +63,7 @@ on:
         description: "Release tag to deploy (e.g. v1.2.3)"
         required: true
       force_init:
-        description: "Run 'site init' instead of upgrade-apply (use for first-ever bootstrap)"
+        description: "Run 'site init' on a fresh baseline (not an old-tag migration)"
         type: boolean
         default: false
       max_notready_nodes:
@@ -424,16 +426,6 @@ jobs:
           if [[ "${{ inputs.force_init }}" == "true" ]]; then
             MODE=init
             echo "force_init=true; selecting init mode"
-          elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
-            # First upgrade from the pre-redesign (v0.1) split-namespace
-            # layout: the old net-group Site CRD exists, and the new one is
-            # absent because the operator creates it during the later
-            # 'Bootstrap CRDs and operator' step. Upgrade mode is correct: the
-            # operator's always-on LegacyReaper migrates the old Site and the
-            # split layout into unbounded-system. 'site init' would create a
-            # fresh Site instead of migrating the existing one.
-            MODE=upgrade
-            echo "Legacy Site CRD present and new Site CRD absent; first v0.1->v0.2 upgrade. Operator migrates automatically. Selecting upgrade mode"
           elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
             MODE=init
             echo "Site CRD not present; selecting init mode"
@@ -541,12 +533,11 @@ jobs:
           set +e
           NS=unbounded-system
           echo "::group::Site CRDs"
-          kubectl get crd sites.unbounded-cloud.io sites.net.unbounded-cloud.io 2>&1
+          kubectl get crd sites.unbounded-cloud.io 2>&1
           echo "::endgroup::"
-          echo "::group::Sites (new + legacy)"
+          echo "::group::Sites"
           kubectl get sites.unbounded-cloud.io -o wide 2>&1
           kubectl get sites.unbounded-cloud.io -o yaml 2>&1
-          kubectl get sites.net.unbounded-cloud.io -A -o wide 2>&1
           echo "::endgroup::"
           echo "::group::Node readiness"
           # A DaemonSet counts every node toward desiredNumberScheduled, so a

@@ -242,22 +242,14 @@ and rolling upgrades do not require every node to become a chair.
     table plus peers with an in-flight transfer, and so grows logarithmically in
     cluster size rather than with it.
 
-**Rolling Interoperability**
+**First-release interoperability**
 
-- Chair assignment fields and successor offers are additive messages on the
-    existing coordination protocol.
-- `please_pull` moved to its own HTTPS listener, so a requester on this build
-    cannot reach a chair that predates the listener. The chair port must be
-    rolled out before the transport is relied on. The libp2p `please_pull`
-    handler still exists and still serves legacy callers.
-- A new server accepts legacy `please_pull` requests without chair metadata.
-- A new client can call an old server because old protobuf readers ignore the
-    additive chair field.
-- Agent downtime during the rollout is acceptable, so the transition keeps no
-    bridge for old agents. New pods do not publish their peer endpoint on their
-    own Pod, and the Pod/Node read RBAC and the `pods/patch` grant are removed
-    rather than retained: the binary starts no informer and issues no watch, so
-    an old agent cannot discover a new one and falls back to the origin
-    registry until it is replaced.
-- After rollout, set `coord_require_chair_assignment: true` to reject legacy
-    `please_pull` requests that do not carry a chair generation.
+- Deploy matching first-release agents. There is no transition bridge or
+    compatibility promise for pre-release peers.
+- `please_pull` uses the TLS 1.3 HTTPS chair listener. An explicit content kind
+    and current chair assignment are required before origin work is admitted.
+- Libp2p coordination carries only chair-rotation offers, not pull-intent or
+    content-pull requests. Retired protobuf envelope fields are reserved.
+- The `coord_require_chair_assignment` switch is removed; validation is mandatory.
+- Agents discover bootstrap peers from chair Leases, not a full Pod/Node
+    membership watch or endpoint annotations on Pods.

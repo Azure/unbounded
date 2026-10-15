@@ -1,14 +1,13 @@
 ---
 title: "Racer Distributed Cache"
 weight: 4
-description: "How Racer is designed to let nodes share cached object data and reduce repeated reads from its source."
+description: "How Racer lets nodes share cached object data and warm exact versions before a read."
 ---
 
 {{< callout type="note" >}}
-Racer is under development. The `ClusterCache` API, Go SDK, and controller are
-on `main`; the dataplane application and operator deployment integration are
-still pending. This page describes the intended architecture, not a deployment
-available from `main` today.
+Racer is under development. See the [deployment guide]({{< relref "guides/racer" >}})
+for installation and upgrade requirements. Cached data is disposable, not durable
+storage.
 {{< /callout >}}
 
 ## Why Racer?
@@ -33,7 +32,7 @@ another fetch.
 
 ## Architecture
 
-Racer's planned deployment has two components:
+Racer has two components:
 
 **Controller** (`racer-controller`) -- A Deployment with one elected leader:
 
@@ -55,34 +54,32 @@ Racer's planned deployment has two components:
 Apps and origins use the Go SDK (`pkg/racersdk`). It provides a `Client` for
 reads and `ServeOrigin` for origins.
 
-The planned operator integration will deploy the controller and dataplane
-when the first `ClusterCache` is created. Creating a `ClusterCache` on `main`
-does not yet install these workloads.
+The Unbounded operator deploys the controller and dataplane when a
+`ClusterVolume` is created. Use `spec.type: Cache` for Racer.
 
 ## Core Concepts
 
 ### API
 
-A **ClusterCache** represents a logical cache namespace:
+A **ClusterVolume** with type `Cache` represents a logical cache namespace:
 
 ```yaml
 apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
+kind: ClusterVolume
 metadata:
   name: models
+spec:
+  type: Cache
 ```
 
-Each cache uses two Unix domain sockets (UDS) on every participating node:
+Each cache uses two sockets on every participating node:
 
-- `/run/racer/<name>/client/socket` -- The dataplane listens here. Apps connect
-  with `racersdk.Client` to read objects.
-- `/run/racer/<name>/origin/socket` -- The origin listens here with
-  `racersdk.ServeOrigin`. The local dataplane connects to fetch missing data
-  from your storage.
+- `/run/racer/<name>/client/socket` -- Apps read objects here.
+- `/run/racer/<name>/origin/socket` -- The origin listens here.
 
-There is no access list on the `ClusterCache`. A pod needs access to the
+There is no access list on the `ClusterVolume`. A pod needs access to the
 cache's socket directory, normally through a mount, and the required filesystem
-permissions. The `ClusterCache`'s Kubernetes UID is its identity, so deleting
+permissions. The `ClusterVolume`'s Kubernetes UID is its identity, so deleting
 and recreating it gives it a new cache identity.
 
 ### Objects, Keys, and Versions
@@ -92,9 +89,9 @@ and recreating it gives it a new cache identity.
 - **Version** -- One fixed set of bytes for a key, named by a strong **ETag**
   that the origin returns. The bytes of a version must never change. Every page
   of a read comes from the same version.
-- **Expiry** -- The origin must set `ExpiresAt` to define freshness. Pinning a
-  read to an ETag selects that exact version but does not guarantee the version
-  remains available.
+- **Expiry** -- The origin must set `ExpiresAt` to define current-version
+  freshness. An unpinned read refreshes expired metadata. Pinning a read to an
+  ETag selects that exact version but does not guarantee it remains available.
 
 ### Pages
 
@@ -109,7 +106,7 @@ An origin answers two kinds of requests:
 - **GET** -- Returns one page-aligned range of a version.
 
 Origins do not push data into Racer. Any participating node can own a page, so
-the planned deployment runs the origin on each such node, usually as a DaemonSet
+run the origin on each such node, usually as a DaemonSet
 that mounts the cache's origin socket directory.
 
 The client can pass `Metadata` and `Authorization` values with each read. Racer
@@ -123,7 +120,7 @@ the request reaches Racer.
 
 ### Owners and Shares
 
-Each page is intended to have up to **three owner nodes**. Racer picks them
+Each page has up to **three owner nodes**. Racer picks them
 with weighted rendezvous hashing over node IDs. Each node has a weight called
 **shares** (default `4`). A node with more shares owns more pages. Set it with
 the Node annotation `racer.unbounded-cloud.io/shares`.
@@ -136,7 +133,7 @@ To keep a node out of Racer, label it `racer.unbounded-cloud.io/exclude`.
 
 ## How a Read Works
 
-The planned dataplane read path is:
+The dataplane read path is:
 
 1. The app calls `Get` on the cache's client socket.
 2. The local dataplane checks memory, then local disk.
@@ -149,24 +146,60 @@ The planned dataplane read path is:
    Racer confirms the whole range arrived intact.
 
 If many readers on one node want the same page at the same time, the dataplane
-is designed to combine their requests and share the result.
+combines their requests and shares the result.
 
 ### What Stays on Disk
 
-The planned disk policy makes owner pages eligible for retention on the first
+The default disk policy makes owner pages eligible for retention on the first
 read. Other nodes' pages become eligible after a second read. This reduces the
 chance of one-off reads pushing out useful data. This policy is called
 **second-sight**. Eligibility does not guarantee retention: admission limits,
 available capacity, and eviction still apply.
 
-The planned default storage is slab files under `/var/lib/racer/slabs`, with
-raw block devices as an alternative. Checkpoints are intended to let a node
+The default storage is slab files under `/var/lib/racer/slabs`, with
+raw block devices as an alternative. Checkpoints let a node
 recover cached pages after a restart. The cache is not durable storage; keep
 the source available to refill missing pages.
 
+### Warm Before Reading
+
+Call the SDK's `Warm` method to ask the local node to load an exact object version
+and hold its disk pages until a deadline. Warm uses a `HEAD` request with
+`Cache-Control: max-age=<seconds>`. The TTL must be positive and is clamped to
+the configured maximum, 3,600 seconds by default.
+
+The response returns metadata without the object body. A nonzero `RetainUntil`
+means Racer admitted the request, not that loading finished. A zero value means
+Racer refused retention; the metadata can still be used. The TTL starts at HEAD
+admission and runs while pages load, not from the end of the fill.
+
+Warming uses normal page owners, routes, and origin reads. It does not pin copies
+on every node or change topology. Both ordered and unordered reads on the warming
+node can stream pages as the fill publishes them to disk. A read of a later page
+waits for the fill to reach it; it does not jump ahead or start a competing fetch.
+Pin the later `Get` to the ETag returned by `Warm` to consume the warmed version.
+An unpinned read still refreshes expired current-version metadata and may select
+a different version.
+
+Warm holds bypass second-sight and block eviction of completed disk pages until
+the deadline. Admission reserves **one whole segment per page**, even for a short
+page or an existing local copy. This conservative charge protects against
+fragmentation without rewriting existing copies into a separate storage area.
+It can refuse warm requests even when payload bytes appear to fit. If a later
+page fails, completed pages keep their holds and unused reservations are released.
+
+The background job keeps a charged, zeroizing copy of the caller's credentials
+in memory only, with a separate fill timeout of 600 seconds by default. It can
+continue after HEAD returns. Jobs and credentials are not restored after restart.
+Checkpoint v4 can restore unexpired holds for completed disk pages, but neither
+payloads nor checkpoints have an `fsync` durability guarantee. A crash, missing
+key, or storage failure can still lose cached data. Older checkpoints start cold.
+See the [warm reference]({{< relref "reference/racer" >}}#warm-and-hard-retention)
+for limits and SDK usage.
+
 ## Security
 
-The security model combines controller-issued credentials with planned
+The security model combines controller-issued credentials with
 dataplane protections:
 
 - **Enrollment** -- Each dataplane pod proves its identity to the controller
@@ -177,7 +210,7 @@ dataplane protections:
   nodes and on disk. The controller rotates keys every 24 hours by default.
 - **Signed requests** -- Every node signs each request it sends or forwards to
   another node.
-- **Credentials** -- `Authorization` and `Metadata` are intended to be sealed
+- **Credentials** -- `Authorization` and `Metadata` are sealed
   when they cross nodes and kept out of disk storage. They do not authorize
   cache hits; access to the cache socket remains a trust boundary.
 

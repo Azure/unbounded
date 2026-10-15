@@ -21,9 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	racercrd "github.com/Azure/unbounded/api/racer/v1alpha1/crd"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
+	racermanifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -58,6 +58,7 @@ var RequiredCRDNames = [...]string{
 	"sitegatewaypoolassignments.net.unbounded-cloud.io",
 	"sitepeerings.net.unbounded-cloud.io",
 	"gatewaypoolpeerings.net.unbounded-cloud.io",
+	"clustervolumes.racer.unbounded-cloud.io",
 	"clustercaches.racer.unbounded-cloud.io",
 }
 
@@ -66,13 +67,14 @@ var RequiredCRDNames = [...]string{
 // be maintained by applying the operator manifests alone; the reconcile loop no
 // longer applies CRDs.
 func bootstrapManifestSets() []fs.FS {
-	return []fs.FS{machinamanifests.Manifests, netmanifests.Manifests, racercrd.Manifests}
+	return []fs.FS{machinamanifests.Manifests, netmanifests.Manifests, racermanifests.Manifests}
 }
 
 // BootstrapCRDs server-side applies every CustomResourceDefinition embedded in
-// the machina, net, and Racer manifests and waits for each to become Established.
-// It is idempotent and must run before the manager starts, because typed
-// informers cannot sync until their CRDs are served.
+// the machina, net, and racer manifests and waits for each to become Established. It is
+// idempotent (safe to run on every operator start) and must run before the
+// manager starts, because the typed Site informer cannot sync until the Site CRD
+// is served.
 func BootstrapCRDs(ctx context.Context, c client.Client) error {
 	return bootstrapCRDs(ctx, c, CRDBootstrapTimeout)
 }

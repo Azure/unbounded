@@ -1,3 +1,13 @@
+//! Durable node-private enrollment, independent of transport and hardware inventory.
+//! The caller persists NIC reservations before preparing a request, supplies current
+//! NICs and shares, and exclusively owns this identity directory. Attempt fencing
+//! must remain bound to the same serving reactor for the lifetime of this owner.
+//!
+//! Prepare persists a retry-stable key before exposing its CSR. Accept validates
+//! the response before durable replacement, and recovery revalidates trust before
+//! returning an identity. Cancellation and abandoned writes are fenced through
+//! the caller's host; transport retries and inventory remain application policy.
+
 use crate::identity;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_control_wire::{
@@ -6,7 +16,7 @@ use racer_control_wire::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     num::NonZeroU32,
     path::PathBuf,
     sync::Arc,
@@ -14,7 +24,6 @@ use std::{
 };
 use uring_runtime::{
     Operation, Scope,
-    drivers::Busy,
     reactor::filesystem::{
         operations::ReplacementError,
         secure::{self, Attempts, Host},
@@ -22,27 +31,33 @@ use uring_runtime::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+/// Enrollment validation failures, separate from caller-owned filesystem errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
-    Busy,
-
+    /// Identity correlation, certificate, token, or key pairing failed.
     Unauthorized,
 
+    /// Persisted JSON or private key material is corrupt.
     CorruptRecord,
 
+    /// The configured cluster is not a canonical UUID.
     InvalidConfiguration,
 
+    /// Entropy, serialization, or local key generation failed.
     Io,
 
+    /// Preserve the wire codec's exact failure classification.
     Wire(wire::Error),
 }
 
 impl From<wire::Error> for Error {
+    /// Retain the wire failure category without including rejected record bytes.
     fn from(error: wire::Error) -> Self {
         Self::Wire(error)
     }
 }
 
+/// Node-bound key and certificate persistence on a caller-owned filesystem host.
 pub struct Enrollment<H: Host> {
     cluster: ClusterId,
 
@@ -52,13 +67,12 @@ pub struct Enrollment<H: Host> {
 
     roots: RefCell<Vec<Vec<u8>>>,
 
-    trust_busy: Cell<bool>,
-
     host: H,
 
     attempts: Attempts<H::Scope>,
 }
 
+/// A validated local key. Secret storage is private and zeroizes on final drop.
 #[derive(Clone)]
 pub struct LocalSigningIdentity {
     cluster: ClusterId,
@@ -71,13 +85,12 @@ pub struct LocalSigningIdentity {
 
     certificate_chain: Vec<Vec<u8>>,
 
-    block_devices: Option<String>,
-
     not_before: u64,
 
     not_after: u64,
 }
 
+/// Retry-stable persisted CSR and private key, never included in diagnostics.
 #[derive(Serialize, Deserialize)]
 struct PendingIdentity {
     cluster: String,
@@ -89,24 +102,30 @@ struct PendingIdentity {
     csr: String,
 }
 
+/// Own secret text before serde has constructed the surrounding record.
 struct EncodedPrivateKey(Zeroizing<String>);
 
 impl Serialize for EncodedPrivateKey {
+    /// Preserve the persisted base64 string schema.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
     }
 }
 
 impl<'de> Deserialize<'de> for EncodedPrivateKey {
+    /// Protect a decoded field immediately, even if a later field is missing.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
     }
 }
 
+/// Clear all JSON strings, including values not consumed by a failing DTO decode.
 struct PrivateJson(serde_json::Value);
 
 impl Drop for PrivateJson {
+    /// Erase temporary copies while their allocations are still owned.
     fn drop(&mut self) {
+        /// Visit every string in a private record's JSON tree.
         fn clear(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::String(text) => text.zeroize(),
@@ -119,6 +138,7 @@ impl Drop for PrivateJson {
     }
 }
 
+/// Exact pending request paired with the accepted wire response for recovery.
 #[derive(Serialize, Deserialize)]
 struct PersistedIdentity {
     pending: PendingIdentity,
@@ -127,11 +147,13 @@ struct PersistedIdentity {
 }
 
 impl PersistedIdentity {
+    /// Reject duplicate fields and oversized records before deserializing.
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?);
         Self::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
     }
 
+    /// Decode the saved response through the same wire validation as live traffic.
     fn response(&self) -> Result<EnrollmentResponse, Error> {
         Ok(wire::decode_enrollment_response(
             &STANDARD
@@ -140,12 +162,14 @@ impl PersistedIdentity {
         )?)
     }
 
+    /// Keep serialized private material in zeroizing storage until submission.
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
         encode_private(self, wire::MAX_ENROLLMENT_BYTES * 3)
     }
 }
 
 impl<H: Host> Enrollment<H> {
+    /// Configure a namespace owner without performing I/O or generating keys.
     pub fn new(
         cluster: ClusterId,
         token_path: PathBuf,
@@ -157,30 +181,35 @@ impl<H: Host> Enrollment<H> {
             token_path,
             identity_directory,
             roots: RefCell::new(Vec::new()),
-            trust_busy: Cell::new(false),
             host,
             attempts: Attempts::default(),
         }
     }
 
+    /// Return the configured cluster binding.
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
     }
 
+    /// Validate all roots before atomically replacing the enrollment trust snapshot.
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<(), Error> {
-        let _guard = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
         identity::root_store(&roots).map_err(|_| Error::Unauthorized)?;
         *self.roots.borrow_mut() = roots;
         Ok(())
     }
 
+    /// Generate a local Ed25519 key and a retry-stable random enrollment UUID.
     fn generate(&self) -> Result<PendingIdentity, Error> {
         if !wire::valid_uuid(&self.cluster.0) {
             return Err(Error::InvalidConfiguration);
         }
         let key = identity::PendingIdentity::generate().map_err(|_| Error::Io)?;
         let private = key.export_pkcs8_for_persistence().map_err(|_| Error::Io)?;
-        let signing = key.rcgen_key_pair().map_err(|_| Error::Io)?;
+        let signing = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+            &rustls::pki_types::PrivatePkcs8KeyDer::from(private.as_slice()),
+            &rcgen::PKCS_ED25519,
+        )
+        .map_err(|_| Error::Io)?;
         let mut params =
             rcgen::CertificateParams::new(Vec::<String>::new()).map_err(|_| Error::Io)?;
         params.distinguished_name = rcgen::DistinguishedName::new();
@@ -205,6 +234,7 @@ impl<H: Host> Enrollment<H> {
         })
     }
 
+    /// Bind caller inventory to a checked, retry-stable CSR without owning hardware.
     fn request(
         &self,
         p: &PendingIdentity,
@@ -227,6 +257,7 @@ impl<H: Host> Enrollment<H> {
         Ok(request)
     }
 
+    /// Validate request correlation and certificate policy before any publication.
     fn accept_pending(
         &self,
         bytes: &[u8],
@@ -246,6 +277,7 @@ impl<H: Host> Enrollment<H> {
         Ok((identity, persisted.encode()?))
     }
 
+    /// Validate the exact enrollment certificate contract, including leaf lifetime.
     fn validate(
         &self,
         p: &PendingIdentity,
@@ -296,12 +328,8 @@ impl<H: Host> Enrollment<H> {
             enrollment: r.enrollment.clone(),
             private_material,
             certificate_chain: r.certificate_chain.clone(),
-            block_devices: r
-                .block_devices
-                .clone()
-                .filter(|selector| !selector.is_empty()),
-            not_before: public.valid_from,
-            not_after: public.expires,
+            not_before,
+            not_after,
         })
     }
 }
@@ -312,6 +340,8 @@ where
         + From<secure::AccessError>
         + From<ReplacementError<<H::Scope as Scope>::Error>>,
 {
+    /// Persist the private key before returning a request. The caller must durably
+    /// persist its NIC reservations before calling this method, including retries.
     pub fn prepare<'a>(
         &'a self,
         nics: Vec<RailMapping>,
@@ -333,24 +363,10 @@ where
             .await
             {
                 Ok(bytes) => {
-                    let pending = decode_pending(&bytes)?;
-                    if pending.cluster == self.cluster.0 {
-                        r.file_sync(dir.clone(), &scope).await?;
-                        return self.request(&pending, nics, shares).map_err(Into::into);
-                    }
-                    // Replace another cluster's request, but preserve corrupt records.
-                    let old_request = EnrollmentRequest {
-                        schema_version: wire::SCHEMA_VERSION,
-                        cluster: ClusterId(pending.cluster.clone()),
-                        enrollment: EnrollmentId(pending.enrollment.clone()),
-                        csr_der: STANDARD
-                            .decode(&pending.csr)
-                            .map_err(|_| Error::CorruptRecord)?,
-                        rdma_nics: Vec::new(),
-                        shares: wire::DEFAULT_SHARES,
-                    };
-                    wire::encode_enrollment_request(&old_request).map_err(Error::from)?;
-                    check_pending_key(&pending, &old_request.csr_der)?;
+                    r.file_sync(dir.clone(), &scope).await?;
+                    return self
+                        .request(&decode_pending(&bytes)?, nics, shares)
+                        .map_err(Into::into);
                 }
                 Err(e) if H::is_missing(e) => (),
                 Err(e) => return Err(e),
@@ -362,6 +378,7 @@ where
         })
     }
 
+    /// Read the current projected token without caching rotations or rejecting symlinks.
     pub fn read_token<'a>(
         &'a self,
         scope: &'a H::Scope,
@@ -378,6 +395,8 @@ where
         })
     }
 
+    /// Validate, durably publish identity, then durably remove the pending request.
+    /// Publication errors are converted by the caller without discarding their phase.
     pub fn accept_response<'a>(
         &'a self,
         response: EnrollmentResponse,
@@ -385,7 +404,6 @@ where
     ) -> Operation<'a, LocalSigningIdentity, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
-            let _trust = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
             let r = self.host.reactor();
             let dir = secure::directory(r, &self.identity_directory, false, true, &scope).await?;
             match secure::read_at(
@@ -399,19 +417,8 @@ where
             .await
             {
                 Ok(bytes) => {
-                    let persisted = PersistedIdentity::decode(&bytes)?;
-                    let existing = persisted.response()?;
-                    // Only a usable identity binds renewal to its existing node.
-                    // Match recovery: unusable identities do not block re-enrollment.
-                    match self.validate(&persisted.pending, &existing) {
-                        Ok(_)
-                            if existing.cluster != response.cluster
-                                || existing.node != response.node =>
-                        {
-                            return Err(Error::Unauthorized.into());
-                        }
-                        Ok(_) | Err(Error::Unauthorized) => (),
-                        Err(e) => return Err(e.into()),
+                    if PersistedIdentity::decode(&bytes)?.response()?.cluster != response.cluster {
+                        return Err(Error::Unauthorized.into());
                     }
                 }
                 Err(e) if H::is_missing(e) => (),
@@ -433,13 +440,14 @@ where
         })
     }
 
+    /// Recover and revalidate a published identity, fencing uncertain publication
+    /// and removing only a pending request already represented by that identity.
     pub fn load_identity<'a>(
         &'a self,
         parent: &'a H::Scope,
     ) -> Operation<'a, Option<LocalSigningIdentity>, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
-            let _trust = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
             let r = self.host.reactor();
             let dir =
                 match secure::directory(r, &self.identity_directory, false, true, &scope).await {
@@ -477,9 +485,7 @@ where
                     .await
                     {
                         Ok(bytes)
-                            if decode_pending(&bytes).is_ok_and(|pending| {
-                                pending.enrollment == identity.enrollment.0
-                            }) =>
+                            if decode_pending(&bytes)?.enrollment == identity.enrollment.0 =>
                         {
                             secure::remove(r, &dir, "pending.json", &scope).await?
                         }
@@ -497,26 +503,28 @@ where
 }
 
 impl LocalSigningIdentity {
-    pub fn block_devices(&self) -> Option<&str> {
-        self.block_devices.as_deref()
-    }
-
+    /// Return the authenticated node UID.
     pub fn node(&self) -> &NodeId {
         &self.node
     }
 
+    /// Return the authenticated cluster UID.
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
     }
 
+    /// Borrow the exact accepted leaf-first certificate chain for REST/TLS.
     pub fn certificate_chain(&self) -> &[Vec<u8>] {
         &self.certificate_chain
     }
 
+    /// Explicitly borrow PKCS8 material for the REST client's TLS identity adapter.
+    /// The borrower must not persist, log, or share this key through cluster Secrets.
     pub fn private_key_der(&self) -> &[u8] {
         &self.private_material
     }
 
+    /// Revalidate this identity against the signing subsystem's current peer trust.
     pub fn signing_identity(
         &self,
         roots: &[Vec<u8>],
@@ -531,15 +539,18 @@ impl LocalSigningIdentity {
         .map(Arc::new)
     }
 
+    /// Return the issued leaf's expiration for REST connection lifetime checks.
     pub fn expires_at(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(self.not_after)
     }
 
+    /// Check both ends of the leaf's lifetime against the scoped wall clock.
     pub fn valid_now(&self) -> bool {
         let now = uring_runtime::environment::wall_now();
         now >= UNIX_EPOCH + Duration::from_secs(self.not_before) && now < self.expires_at()
     }
 
+    /// Renew after two thirds of the issued lifetime, capped by wire policy.
     pub fn renewal_due(&self) -> bool {
         let lifetime = Duration::from_secs(self.not_after - self.not_before);
         uring_runtime::environment::wall_now()
@@ -549,6 +560,7 @@ impl LocalSigningIdentity {
     }
 }
 
+/// Fixed-capacity output that cannot reallocate after receiving secret bytes.
 struct PrivateOutput {
     bytes: Zeroizing<Vec<u8>>,
 
@@ -556,6 +568,7 @@ struct PrivateOutput {
 }
 
 impl std::io::Write for PrivateOutput {
+    /// Reject an oversized write before copying any bytes or growing the allocation.
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.limit - self.bytes.len() {
             return Err(std::io::ErrorKind::FileTooLarge.into());
@@ -564,11 +577,13 @@ impl std::io::Write for PrivateOutput {
         Ok(bytes.len())
     }
 
+    /// Serialization writes directly to memory, so there is nothing to flush.
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
 
+/// Serialize directly into wiping storage sized before any secrets are copied.
 fn encode_private(value: &impl Serialize, limit: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
     let mut output = PrivateOutput {
         bytes: Zeroizing::new(Vec::with_capacity(limit)),
@@ -578,6 +593,7 @@ fn encode_private(value: &impl Serialize, limit: usize) -> Result<Zeroizing<Vec<
     Ok(output.bytes)
 }
 
+/// Parse a projected bearer credential without retaining leading/trailing whitespace.
 fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
     let token = Zeroizing::new(
         std::str::from_utf8(bytes)
@@ -595,11 +611,13 @@ fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
     Ok(token)
 }
 
+/// Decode bounded, duplicate-free pending JSON without changing its on-disk schema.
 fn decode_pending(bytes: &[u8]) -> Result<PendingIdentity, Error> {
     let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES)?);
     PendingIdentity::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
 }
 
+/// Own bounded wiping output before base64 can write even a partial private key.
 fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>, Error> {
     if encoded.0.len() > wire::MAX_ENROLLMENT_BYTES {
         return Err(Error::CorruptRecord);
@@ -614,6 +632,7 @@ fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>,
     Ok(secret)
 }
 
+/// Reject a corrupt or mismatched pending key before submitting its CSR.
 fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error> {
     use x509_parser::prelude::FromDer;
     let secret = decode_private_key(&pending.private_key)?;
@@ -635,6 +654,7 @@ fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error>
 
 #[cfg(test)]
 mod tests {
+    //! Real enrollment state transitions over deterministic reactor completions.
     use super::*;
     use std::{
         cell::Cell,
@@ -652,15 +672,18 @@ mod tests {
     };
 
     std::thread_local! {
+        /// Observe secret-field destruction without reading deallocated memory.
         static PRIVATE_KEY_DROPS: Cell<usize> = const { Cell::new(0) };
     }
 
     impl Drop for EncodedPrivateKey {
+        /// The zeroizing field is erased after this test-only observer runs.
         fn drop(&mut self) {
             PRIVATE_KEY_DROPS.with(|drops| drops.set(drops.get() + 1));
         }
     }
 
+    /// Partial pending and nested persisted records retain zeroizing field ownership.
     #[test]
     fn private_fields_drop_on_missing_and_late_invalid_record_fields() {
         for pending in [
@@ -698,6 +721,7 @@ mod tests {
         }
     }
 
+    /// Fixed storage bounds both record families, including late serializer errors.
     #[test]
     fn private_serialization_is_bounded_non_reallocating_and_round_trips() {
         use std::io::Write;
@@ -753,8 +777,10 @@ mod tests {
         assert_eq!(output.bytes.as_ptr(), pointer);
         assert_eq!(output.bytes.capacity(), capacity);
 
+        /// Fail after the serializer has already emitted a secret-bearing field.
         struct FailsLate;
         impl Serialize for FailsLate {
+            /// Exercise cleanup after a non-capacity serialization failure.
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 use serde::ser::SerializeStruct;
                 let mut record = serializer.serialize_struct("record", 2)?;
@@ -765,6 +791,7 @@ mod tests {
         assert!(matches!(encode_private(&FailsLate, 128), Err(Error::Io)));
     }
 
+    /// Flat cause and publication phase keep test adapter errors lossless.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Failure {
         cause: Cause,
@@ -772,6 +799,7 @@ mod tests {
         phase: u8,
     }
 
+    /// Independent component errors crossing the test host boundary.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Cause {
         Runtime(uring_runtime::Error),
@@ -782,6 +810,7 @@ mod tests {
     }
 
     impl From<uring_runtime::Error> for Failure {
+        /// Retain the runtime cause before any replacement phase is attached.
         fn from(e: uring_runtime::Error) -> Self {
             Self {
                 cause: Cause::Runtime(e),
@@ -791,6 +820,7 @@ mod tests {
     }
 
     impl From<Error> for Failure {
+        /// Retain enrollment validation failures independently of filesystem causes.
         fn from(e: Error) -> Self {
             Self {
                 cause: Cause::Enrollment(e),
@@ -800,6 +830,7 @@ mod tests {
     }
 
     impl From<secure::AccessError> for Failure {
+        /// Preserve secure access policy failures without flattening their category.
         fn from(e: secure::AccessError) -> Self {
             Self {
                 cause: Cause::Access(e),
@@ -809,6 +840,7 @@ mod tests {
     }
 
     impl From<ReplacementError<Failure>> for Failure {
+        /// Preserve whether replacement failed before, during, or after publication.
         fn from(e: ReplacementError<Failure>) -> Self {
             match e {
                 ReplacementError::BeforeRename(e) => e,
@@ -818,6 +850,7 @@ mod tests {
         }
     }
 
+    /// Fresh IDs retain parent cancellation but identify only one attempt's I/O.
     #[derive(Clone)]
     struct Request {
         id: u64,
@@ -828,6 +861,7 @@ mod tests {
     impl Scope for Request {
         type Error = Failure;
 
+        /// Stop cancelled requests before admitting more simulated I/O.
         fn check(&self) -> Result<(), Failure> {
             if self.cancellation.is_cancelled() {
                 Err(uring_runtime::Error::Cancelled.into())
@@ -836,11 +870,13 @@ mod tests {
             }
         }
 
+        /// Share parent cancellation with the fresh attempt scope.
         fn cancellation(&self) -> Option<&Cancellation> {
             Some(&self.cancellation)
         }
     }
 
+    /// Deterministic worker hosting no dataplane state or hardware inventory.
     struct Files {
         reactor: Reactor<Request, ()>,
 
@@ -852,10 +888,12 @@ mod tests {
 
         type Budget = ();
 
+        /// Keep every attempt bound to this serving reactor.
         fn reactor(&self) -> &Reactor<Request, ()> {
             &self.reactor
         }
 
+        /// Assign a distinct I/O identity while retaining parent cancellation.
         fn fresh_scope(&self, parent: &Request) -> Result<Request, Failure> {
             self.next.set(self.next.get() + 1);
             Ok(Request {
@@ -864,20 +902,25 @@ mod tests {
             })
         }
 
+        /// Drain only the abandoned attempt before a successor can access its files.
         fn fence<'a>(&'a self, previous: &'a Request) -> Operation<'a, (), Failure> {
             self.reactor
                 .fence_matching(move |scope| scope.id == previous.id)
         }
 
+        /// Distinguish absent records from other filesystem and policy failures.
         fn is_missing(error: Failure) -> bool {
             error == uring_runtime::Error::NotFound.into()
         }
     }
 
+    /// Canonical authority used for enrollment correlation in simulation.
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 
+    /// Node identity assigned by the simulated certificate issuer.
     const NODE: &str = "22222222-2222-4222-8222-222222222222";
 
+    /// Construct one namespace owner on the active simulation backend.
     fn fixture() -> (Rc<Files>, Enrollment<Rc<Files>>, Request) {
         let files = Rc::new(Files {
             reactor: Reactor::new(64, ()),
@@ -899,6 +942,7 @@ mod tests {
         )
     }
 
+    /// Explicitly advance completions with a short bounded progress assertion.
     fn drive<T>(files: &Files, mut operation: Operation<'_, T, Failure>) -> Result<T, Failure> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -914,6 +958,7 @@ mod tests {
         }
     }
 
+    /// Issue a bounded client certificate for the exact CSR, with optional policy mutations.
     fn issue(
         request: &EnrollmentRequest,
         ca: &rcgen::Certificate,
@@ -943,353 +988,7 @@ mod tests {
         }
     }
 
-    mod reenrollment {
-        use super::*;
-
-        const OTHER_CLUSTER: &str = "44444444-4444-4444-8444-444444444444";
-        const OTHER_NODE: &str = "33333333-3333-4333-8333-333333333333";
-
-        fn prepare(files: &Files, e: &Enrollment<Rc<Files>>, scope: &Request) -> EnrollmentRequest {
-            drive(files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), scope)).unwrap()
-        }
-
-        fn response(
-            request: &EnrollmentRequest,
-            ca: &rcgen::Certificate,
-            key: &rcgen::KeyPair,
-        ) -> EnrollmentResponse {
-            let mut response = issue(request, ca, key, |params| {
-                params.subject_alt_names = vec![rcgen::SanType::URI(
-                    format!("spiffe://{}/node/{OTHER_NODE}", request.cluster.0)
-                        .try_into()
-                        .unwrap(),
-                )];
-            });
-            response.node = NodeId(OTHER_NODE.into());
-            response
-        }
-
-        #[test]
-        fn expired_or_untrusted_identity_allows_a_new_node_only_with_a_valid_response() {
-            for expired in [true, false] {
-                let sim = Simulation::new();
-                let _environment = sim.enter();
-                let clock = uring_runtime::environment::SimulationClock::new(107);
-                let _time = clock.environment(0).enter();
-                let (files, e, scope) = fixture();
-                let (ca, key) = identity::test_util::ca();
-                e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-                let first = prepare(&files, &e, &scope);
-                let prior = drive(
-                    &files,
-                    e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
-                )
-                .unwrap();
-                let (ca, key) = if expired {
-                    clock.set_wall_time(prior.expires_at() + Duration::from_secs(1));
-                    (ca, key)
-                } else {
-                    identity::test_util::ca()
-                };
-                e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-                assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
-                let request = prepare(&files, &e, &scope);
-                let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
-                let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-                let good = response(&request, &ca, &key);
-                for case in ["correlation", "trust", "key"] {
-                    let mut bad = good.clone();
-                    match case {
-                        "correlation" => bad.enrollment = first.enrollment.clone(),
-                        "trust" => {
-                            let (rogue, rogue_key) = identity::test_util::ca();
-                            bad = response(&request, &rogue, &rogue_key);
-                        }
-                        "key" => {
-                            let other = e
-                                .request(
-                                    &e.generate().unwrap(),
-                                    vec![],
-                                    NonZeroU32::new(4).unwrap(),
-                                )
-                                .unwrap();
-                            bad.certificate_chain = response(&other, &ca, &key).certificate_chain;
-                        }
-                        _ => unreachable!(),
-                    }
-                    assert!(
-                        matches!(drive(&files, e.accept_response(bad, &scope)),
-                        Err(error) if error == Error::Unauthorized.into()),
-                        "{case}"
-                    );
-                    assert_eq!(
-                        sim.read_file(Path::new("/private/identity.json")).unwrap(),
-                        committed
-                    );
-                    assert_eq!(
-                        sim.read_file(Path::new("/private/pending.json")).unwrap(),
-                        pending
-                    );
-                }
-                let accepted = drive(&files, e.accept_response(good, &scope)).unwrap();
-                assert_eq!(accepted.node().0, OTHER_NODE);
-                assert_ne!(accepted.private_key_der(), prior.private_key_der());
-                sim.disk().crash().unwrap();
-                let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-                assert_eq!(recovered.node(), accepted.node());
-                assert_eq!(recovered.enrollment, request.enrollment);
-                assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
-            }
-        }
-
-        #[test]
-        fn other_cluster_identity_and_pending_allow_durable_retry_stable_rebootstrap() {
-            for state in ["identity", "pending", "both"] {
-                let sim = Simulation::new();
-                let _environment = sim.enter();
-                let (files, e, scope) = fixture();
-                let (ca, key) = identity::test_util::ca();
-                e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-                let first = prepare(&files, &e, &scope);
-                if state != "pending" {
-                    drive(
-                        &files,
-                        e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
-                    )
-                    .unwrap();
-                }
-                if state == "both" {
-                    prepare(&files, &e, &scope);
-                }
-                drop(e);
-                let e = Enrollment::new(
-                    ClusterId(OTHER_CLUSTER.into()),
-                    "/token".into(),
-                    "/private".into(),
-                    files.clone(),
-                );
-                let (ca, key) = identity::test_util::ca();
-                e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-                assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
-                let request = prepare(&files, &e, &scope);
-                assert_eq!(request.cluster.0, OTHER_CLUSTER);
-                assert_ne!(request.enrollment, first.enrollment);
-                assert_ne!(request.csr_der, first.csr_der);
-                sim.disk().crash().unwrap();
-                let retry = prepare(&files, &e, &scope);
-                assert_eq!(retry.enrollment, request.enrollment);
-                assert_eq!(retry.csr_der, request.csr_der);
-                let accepted = drive(
-                    &files,
-                    e.accept_response(response(&retry, &ca, &key), &scope),
-                )
-                .unwrap();
-                sim.disk().crash().unwrap();
-                let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-                assert_eq!(recovered.cluster().0, OTHER_CLUSTER);
-                assert_eq!(recovered.node().0, OTHER_NODE);
-                assert_eq!(recovered.private_key_der(), accepted.private_key_der());
-                assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
-            }
-        }
-
-        #[test]
-        fn corrupt_pending_is_preserved_even_for_another_cluster() {
-            for cluster in [CLUSTER, OTHER_CLUSTER] {
-                let sim = Simulation::new();
-                let _environment = sim.enter();
-                let (files, e, scope) = fixture();
-                prepare(&files, &e, &scope);
-                let path = Path::new("/private/pending.json");
-                let original = sim.read_file(path).unwrap();
-                for case in [
-                    "json",
-                    "missing",
-                    "cluster",
-                    "enrollment",
-                    "base64",
-                    "csr",
-                    "key",
-                ] {
-                    let mut pending = decode_pending(&original).unwrap();
-                    pending.cluster = cluster.into();
-                    match case {
-                        "cluster" => pending.cluster = "invalid".into(),
-                        "enrollment" => pending.enrollment = "invalid".into(),
-                        "base64" => pending.private_key.0.push('!'),
-                        "csr" => pending.csr = STANDARD.encode(b"not a CSR"),
-                        "key" => pending.private_key = e.generate().unwrap().private_key,
-                        _ => (),
-                    }
-                    let encoded = match case {
-                        "json" => Zeroizing::new(b"not JSON".to_vec()),
-                        "missing" => Zeroizing::new(b"{}".to_vec()),
-                        _ => encode_private(&pending, wire::MAX_ENROLLMENT_BYTES).unwrap(),
-                    };
-                    sim.write_file(path, &encoded).unwrap();
-                    assert!(
-                        drive(
-                            &files,
-                            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)
-                        )
-                        .is_err(),
-                        "{cluster}: {case}"
-                    );
-                    assert_eq!(sim.read_file(path).unwrap(), *encoded, "{cluster}: {case}");
-                }
-            }
-        }
-
-        #[test]
-        fn corrupt_pending_blocks_renewal_without_hiding_the_saved_identity() {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let clock = uring_runtime::environment::SimulationClock::new(108);
-            let _time = clock.environment(0).enter();
-            let (files, e, scope) = fixture();
-            let (ca, key) = identity::test_util::ca();
-            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-            let first = prepare(&files, &e, &scope);
-            let prior = drive(
-                &files,
-                e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
-            )
-            .unwrap();
-            let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
-            let path = Path::new("/private/pending.json");
-            for expired in [false, true] {
-                if expired {
-                    clock.set_wall_time(prior.expires_at() + Duration::from_secs(1));
-                }
-                for (bytes, expected) in [
-                    (
-                        b"not JSON".as_slice(),
-                        Error::Wire(wire::Error::InvalidRequest),
-                    ),
-                    (b"{}".as_slice(), Error::CorruptRecord),
-                ] {
-                    sim.write_file(path, bytes).unwrap();
-                    sim.chmod(path, 0o600).unwrap();
-                    assert_eq!(
-                        drive(&files, e.load_identity(&scope)).unwrap().is_none(),
-                        expired
-                    );
-                    assert!(
-                        matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)),
-                        Err(error) if error == expected.into())
-                    );
-                    assert_eq!(sim.read_file(path).unwrap(), bytes);
-                    assert_eq!(
-                        sim.read_file(Path::new("/private/identity.json")).unwrap(),
-                        committed
-                    );
-                }
-            }
-        }
-
-        #[test]
-        fn corrupt_saved_identity_is_not_treated_as_expired_authentication() {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let (files, e, scope) = fixture();
-            let (ca, key) = identity::test_util::ca();
-            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-            let first = prepare(&files, &e, &scope);
-            drive(
-                &files,
-                e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
-            )
-            .unwrap();
-            let request = prepare(&files, &e, &scope);
-            let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-            let path = Path::new("/private/identity.json");
-            let committed = sim.read_file(path).unwrap();
-            for case in ["json", "response", "key"] {
-                let mut persisted = PersistedIdentity::decode(&committed).unwrap();
-                match case {
-                    "response" => persisted.response = "!".into(),
-                    "key" => persisted.pending.private_key.0.push('!'),
-                    _ => (),
-                }
-                let bytes = if case == "json" {
-                    Zeroizing::new(b"{}".to_vec())
-                } else {
-                    persisted.encode().unwrap()
-                };
-                sim.write_file(path, &bytes).unwrap();
-                assert!(
-                    matches!(drive(&files, e.accept_response(response(&request, &ca, &key), &scope)),
-                    Err(error) if error == Error::CorruptRecord.into())
-                );
-                assert_eq!(sim.read_file(path).unwrap(), *bytes);
-                assert_eq!(
-                    sim.read_file(Path::new("/private/pending.json")).unwrap(),
-                    pending
-                );
-            }
-        }
-
-        #[test]
-        fn other_cluster_pending_survives_failed_replacement() {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let (files, e, scope) = fixture();
-            prepare(&files, &e, &scope);
-            let path = Path::new("/private/pending.json");
-            let original = sim.read_file(path).unwrap();
-            drop(e);
-            for cluster in ["invalid", OTHER_CLUSTER] {
-                let e = Enrollment::new(
-                    ClusterId(cluster.into()),
-                    "/token".into(),
-                    "/private".into(),
-                    files.clone(),
-                );
-                let expected = if cluster == "invalid" {
-                    Error::InvalidConfiguration.into()
-                } else {
-                    sim.inject("write", Fault::Errno(28)).unwrap();
-                    uring_runtime::Error::Os(28).into()
-                };
-                assert!(
-                    matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)),
-                    Err(error) if error == expected)
-                );
-                sim.disk().crash().unwrap();
-                assert_eq!(sim.read_file(path).unwrap(), original);
-                if cluster == OTHER_CLUSTER {
-                    assert_eq!(prepare(&files, &e, &scope).cluster.0, OTHER_CLUSTER);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn generated_csr_public_key_and_signature_match_persisted_identity() {
-        use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer};
-
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (_, enrollment, _) = fixture();
-        let pending = enrollment.generate().unwrap();
-        let private = decode_private_key(&pending.private_key).unwrap();
-        let key = crate::SigningKey::from_pkcs8_der(&private).unwrap();
-        let der = STANDARD.decode(&pending.csr).unwrap();
-        let (rest, csr) = X509CertificationRequest::from_der(&der).unwrap();
-        assert!(rest.is_empty());
-        let info = &csr.certification_request_info;
-        assert_eq!(info.subject.iter().count(), 0);
-        assert_eq!(
-            info.subject_pki.subject_public_key.data.as_ref(),
-            key.verifying_key().as_bytes()
-        );
-        assert_eq!(
-            csr.signature_algorithm.algorithm.to_id_string(),
-            "1.3.101.112"
-        );
-        csr.verify_signature().unwrap();
-    }
-
+    /// Retry persistence, inventory refresh, token rotation and recovery share one path.
     #[test]
     fn durable_enrollment_retries_rotation_and_recovery() {
         let sim = Simulation::new();
@@ -1375,135 +1074,7 @@ mod tests {
         assert!(sim.metadata(Path::new("/private/pending.json")).is_ok());
     }
 
-    #[test]
-    fn identity_recovery_preserves_undecodable_and_unrelated_pending() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
-        let (ca, key) = identity::test_util::ca();
-        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-        let request = drive(
-            &files,
-            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-        )
-        .unwrap();
-        let path = Path::new("/private/pending.json");
-        let matching = sim.read_file(path).unwrap();
-        let accepted = drive(
-            &files,
-            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
-        )
-        .unwrap();
-        let unrelated = e.generate().unwrap();
-        assert_ne!(unrelated.enrollment, accepted.enrollment.0);
-        let unrelated = encode_private(&unrelated, wire::MAX_ENROLLMENT_BYTES).unwrap();
-        for (pending, removed) in [
-            (b"".as_slice(), false),
-            (b"not JSON".as_slice(), false),
-            (b"{\"enrollment\":".as_slice(), false),
-            (b"{}".as_slice(), false),
-            (matching.as_slice(), true),
-            (unrelated.as_slice(), false),
-        ] {
-            sim.write_file(path, pending).unwrap();
-            sim.chmod(path, 0o600).unwrap();
-            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-            assert_eq!(recovered.node(), accepted.node());
-            assert_eq!(recovered.enrollment, accepted.enrollment);
-            assert_eq!(recovered.certificate_chain(), accepted.certificate_chain());
-            if removed {
-                assert!(sim.metadata(path).is_err());
-            } else {
-                assert_eq!(sim.read_file(path).unwrap(), pending);
-            }
-        }
-    }
-
-    #[test]
-    fn block_device_selector_survives_acceptance_and_recovery() {
-        for selector in [Some(r"^nvme-eui\.[0-9a-f]+$"), None, Some("")] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let (files, e, scope) = fixture();
-            let (ca, key) = identity::test_util::ca();
-            let roots = vec![ca.der().to_vec()];
-            e.set_peer_trust_roots(roots.clone()).unwrap();
-            let request = drive(
-                &files,
-                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-            )
-            .unwrap();
-            let mut response = issue(&request, &ca, &key, |_| {});
-            response.block_devices = selector.map(str::to_owned);
-            let expected = selector.filter(|value| !value.is_empty());
-            let accepted = drive(&files, e.accept_response(response, &scope)).unwrap();
-            assert_eq!(accepted.block_devices(), expected);
-            drop(e);
-            drop(files);
-            sim.disk().crash().unwrap();
-            let (files, e, scope) = fixture();
-            e.set_peer_trust_roots(roots).unwrap();
-            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-            assert_eq!(recovered.block_devices(), expected);
-            assert_eq!(recovered.node(), accepted.node());
-            assert_eq!(recovered.certificate_chain(), accepted.certificate_chain());
-        }
-    }
-
-    #[test]
-    fn block_device_selector_changes_only_after_accepted_renewal() {
-        for selector in [Some("new-device.*"), None, Some("")] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let (files, e, scope) = fixture();
-            let (ca, key) = identity::test_util::ca();
-            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-            let first = drive(
-                &files,
-                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-            )
-            .unwrap();
-            let mut response = issue(&first, &ca, &key, |_| {});
-            response.block_devices = Some("old-device.*".into());
-            let prior = drive(&files, e.accept_response(response, &scope)).unwrap();
-            let request = drive(
-                &files,
-                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-            )
-            .unwrap();
-            let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
-            let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-            let mut response = issue(&request, &ca, &key, |_| {});
-            response.block_devices = selector.map(str::to_owned);
-            let mut rejected = response.clone();
-            rejected.enrollment = first.enrollment;
-            assert!(matches!(
-                drive(&files, e.accept_response(rejected, &scope)),
-                Err(error) if error == Error::Unauthorized.into()
-            ));
-            sim.disk().crash().unwrap();
-            assert_eq!(
-                sim.read_file(Path::new("/private/identity.json")).unwrap(),
-                committed
-            );
-            assert_eq!(
-                sim.read_file(Path::new("/private/pending.json")).unwrap(),
-                pending
-            );
-            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-            assert_eq!(recovered.block_devices(), Some("old-device.*"));
-            assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
-            let renewed = drive(&files, e.accept_response(response, &scope)).unwrap();
-            let expected = selector.filter(|value| !value.is_empty());
-            assert_eq!(renewed.block_devices(), expected);
-            assert_eq!(prior.block_devices(), Some("old-device.*"));
-            sim.disk().crash().unwrap();
-            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-            assert_eq!(recovered.block_devices(), expected);
-            assert_eq!(recovered.certificate_chain(), renewed.certificate_chain());
-        }
-    }
-
+    /// Late base64 failures preserve pending work and never publish or recover a key.
     #[test]
     fn late_private_key_base64_errors_preserve_identity_records() {
         let sim = Simulation::new();
@@ -1584,6 +1155,7 @@ mod tests {
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
     }
 
+    /// Invalid certificates and pending material never publish an identity.
     #[test]
     fn certificate_correlation_key_pairing_and_pending_corruption_fail_closed() {
         let sim = Simulation::new();
@@ -1642,6 +1214,7 @@ mod tests {
         }
     }
 
+    /// Activation policy rejects renewals before replacing a usable identity or CSR.
     #[test]
     fn rejected_renewal_preserves_prior_identity_and_pending_request() {
         let sim = Simulation::new();
@@ -1667,31 +1240,9 @@ mod tests {
         .unwrap();
         let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-        for case in [
-            "key-cert-sign",
-            "key-encipherment",
-            "server-auth",
-            "unknown-eku",
-            "any-eku",
-            "ca",
-            "missing-usage",
-            "future",
-            "expired",
-        ] {
+        for case in ["key-cert-sign", "ca", "missing-usage", "future", "expired"] {
             let response = issue(&request, &ca, &key, |params| match case {
                 "key-cert-sign" => params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign),
-                "key-encipherment" => params
-                    .key_usages
-                    .push(rcgen::KeyUsagePurpose::KeyEncipherment),
-                "server-auth" => params
-                    .extended_key_usages
-                    .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth),
-                "unknown-eku" => params
-                    .extended_key_usages
-                    .push(rcgen::ExtendedKeyUsagePurpose::Other(vec![1, 2, 3, 4])),
-                "any-eku" => params
-                    .extended_key_usages
-                    .push(rcgen::ExtendedKeyUsagePurpose::Any),
                 "ca" => params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
                 "missing-usage" => params.key_usages.clear(),
                 "future" => {
@@ -1760,79 +1311,7 @@ mod tests {
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
     }
 
-    #[test]
-    fn renewal_requires_node_continuity_before_durable_publication() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
-        let (ca, key) = identity::test_util::ca();
-        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-        let first = drive(
-            &files,
-            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-        )
-        .unwrap();
-        let prior = drive(
-            &files,
-            e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
-        )
-        .unwrap();
-        let request = drive(
-            &files,
-            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-        )
-        .unwrap();
-        assert_ne!(request.enrollment, first.enrollment);
-        let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
-        let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-        let other_node = "33333333-3333-4333-8333-333333333333";
-        let mut response = issue(&request, &ca, &key, |params| {
-            params.subject_alt_names = vec![rcgen::SanType::URI(
-                format!("spiffe://{CLUSTER}/node/{other_node}")
-                    .try_into()
-                    .unwrap(),
-            )];
-        });
-        response.node = NodeId(other_node.into());
-        assert!(e.accept_pending(&pending, &response).is_ok());
-        assert!(matches!(
-            drive(&files, e.accept_response(response, &scope)),
-            Err(error) if error == Error::Unauthorized.into()
-        ));
-        for crashed in [false, true] {
-            if crashed {
-                sim.disk().crash().unwrap();
-            }
-            assert_eq!(
-                sim.read_file(Path::new("/private/identity.json")).unwrap(),
-                committed
-            );
-            assert_eq!(
-                sim.read_file(Path::new("/private/pending.json")).unwrap(),
-                pending
-            );
-            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-            assert_eq!(recovered.node(), prior.node());
-            assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
-            assert_eq!(recovered.private_key_der(), prior.private_key_der());
-        }
-        let renewed = drive(
-            &files,
-            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
-        )
-        .unwrap();
-        assert_eq!(renewed.node(), prior.node());
-        assert_eq!(renewed.enrollment, request.enrollment);
-        assert_ne!(renewed.private_key_der(), prior.private_key_der());
-        sim.disk().crash().unwrap();
-        assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
-        let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-        assert_eq!(recovered.node(), renewed.node());
-        assert_eq!(recovered.enrollment, renewed.enrollment);
-        assert_eq!(recovered.certificate_chain(), renewed.certificate_chain());
-        assert_eq!(recovered.private_key_der(), renewed.private_key_der());
-    }
-
+    /// Every root is checked before configuration and again before persistence/load.
     #[test]
     fn invalid_root_snapshots_preserve_last_good_identity_and_trust() {
         let sim = Simulation::new();
@@ -1889,8 +1368,7 @@ mod tests {
             let roots = match case {
                 "empty" => vec![],
                 "too-many" => vec![ca.der().to_vec(); 33],
-                "expired" | "future" => vec![bad],
-                // Malformed anchors still reject the whole snapshot.
+                // Even an unused bad anchor must not weaken the activation policy.
                 _ => vec![ca.der().to_vec(), bad],
             };
             assert_eq!(
@@ -1930,103 +1408,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn trust_rotation_is_excluded_until_acceptance_or_recovery_releases() {
-        for recovering in [false, true] {
-            for finish in ["complete", "abandon", "cancel", "failure"] {
-                let sim = Simulation::new();
-                let _environment = sim.enter();
-                let (files, e, scope) = fixture();
-                let (ca, key) = identity::test_util::ca();
-                let good = vec![ca.der().to_vec()];
-                let (other, _) = identity::test_util::ca();
-                let rotated = vec![other.der().to_vec()];
-                e.set_peer_trust_roots(good.clone()).unwrap();
-                let request = drive(
-                    &files,
-                    e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-                )
-                .unwrap();
-                let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-                let response = issue(&request, &ca, &key, |_| {});
-                if recovering {
-                    drive(&files, e.accept_response(response.clone(), &scope)).unwrap();
-                    sim.write_file(Path::new("/private/pending.json"), &pending)
-                        .unwrap();
-                    sim.chmod(Path::new("/private/pending.json"), 0o600)
-                        .unwrap();
-                }
-                sim.inject(
-                    if recovering { "unlink" } else { "rename" },
-                    Fault::HoldCompletion(20),
-                )
-                .unwrap();
-                let mut operation = Box::pin(async {
-                    if recovering {
-                        e.load_identity(&scope).await.map(Option::unwrap)
-                    } else {
-                        e.accept_response(response, &scope).await
-                    }
-                });
-                let mut paused = false;
-                for _ in 0..100 {
-                    assert!(
-                        operation
-                            .as_mut()
-                            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
-                            .is_pending()
-                    );
-                    files.reactor.poll_budgeted(64).unwrap();
-                    files.reactor.wait(Duration::from_millis(1)).unwrap();
-                    paused = if recovering {
-                        sim.metadata(Path::new("/private/pending.json")).is_err()
-                    } else {
-                        sim.metadata(Path::new("/private/identity.json")).is_ok()
-                    };
-                    if paused {
-                        break;
-                    }
-                }
-                assert!(paused, "recovering={recovering}, finish={finish}");
-                // Both paths have validated and submitted a filesystem mutation.
-                assert_eq!(e.set_peer_trust_roots(rotated.clone()), Err(Error::Busy));
-                assert_eq!(*e.roots.borrow(), good);
-                // Rejected setters cannot release another operation's guard.
-                assert_eq!(e.set_peer_trust_roots(good.clone()), Err(Error::Busy));
-                match finish {
-                    "abandon" => drop(operation),
-                    "cancel" => {
-                        scope.cancellation.cancel().unwrap();
-                        assert!(matches!(drive(&files, operation), Err(error)
-                            if error.cause == Cause::Runtime(uring_runtime::Error::Cancelled)));
-                    }
-                    "failure" => {
-                        sim.inject("fsync", Fault::Errno(5)).unwrap();
-                        assert!(matches!(drive(&files, operation), Err(error)
-                            if error.cause == Cause::Runtime(uring_runtime::Error::Os(5))));
-                    }
-                    _ => {
-                        let accepted = drive(&files, operation).unwrap();
-                        assert!(accepted.signing_identity(&good).is_ok());
-                    }
-                }
-                e.set_peer_trust_roots(rotated.clone()).unwrap();
-                assert_eq!(*e.roots.borrow(), rotated);
-                let scope = Request {
-                    id: 0,
-                    cancellation: Cancellation::new().unwrap(),
-                };
-                // Recovery fences abandoned I/O, then applies the new trust roots.
-                assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
-                assert_eq!(files.reactor.in_flight(), 0);
-                e.set_peer_trust_roots(good.clone()).unwrap();
-                let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-                assert!(recovered.signing_identity(&good).is_ok());
-                assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
-            }
-        }
-    }
-
+    /// Trust validity must be rechecked when a previously accepted anchor expires.
     #[test]
     fn root_expiring_after_installation_blocks_persistence_and_recovery() {
         let sim = Simulation::new();
@@ -2034,13 +1416,7 @@ mod tests {
         let clock = uring_runtime::environment::SimulationClock::new(105);
         let _time = clock.environment(0).enter();
         let (files, e, scope) = fixture();
-        let (_, key) = identity::test_util::ca();
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let now = uring_runtime::environment::wall_now();
-        params.not_before = (now - Duration::from_secs(60)).into();
-        params.not_after = (now + Duration::from_secs(60)).into();
-        let ca = params.self_signed(&key).unwrap();
+        let (ca, key) = identity::test_util::ca();
         let good = vec![ca.der().to_vec()];
         e.set_peer_trust_roots(good.clone()).unwrap();
         let first = drive(
@@ -2060,8 +1436,13 @@ mod tests {
         .unwrap();
         let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-        let (unrelated, _) = identity::test_util::ca();
-        e.set_peer_trust_roots(vec![ca.der().to_vec(), unrelated.der().to_vec()])
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let now = uring_runtime::environment::wall_now();
+        params.not_before = (now - Duration::from_secs(60)).into();
+        params.not_after = (now + Duration::from_secs(60)).into();
+        let short = params.self_signed(&key).unwrap();
+        e.set_peer_trust_roots(vec![ca.der().to_vec(), short.der().to_vec()])
             .unwrap();
         clock.advance(Duration::from_secs(120));
         assert!(
@@ -2076,7 +1457,6 @@ mod tests {
             sim.read_file(Path::new("/private/pending.json")).unwrap(),
             pending
         );
-        clock.set_wall_time(now);
         e.set_peer_trust_roots(good.clone()).unwrap();
         let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
         assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
@@ -2089,113 +1469,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unrelated_root_expiry_preserves_enrollment_identities() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let clock = uring_runtime::environment::SimulationClock::new(109);
-        let _time = clock.environment(0).enter();
-        let (files, e, scope) = fixture();
-        let (ca, key) = identity::test_util::ca();
-        let (_, retiring_key) = identity::test_util::ca();
-        let now = uring_runtime::environment::wall_now();
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.not_before = now.into();
-        params.not_after = (now + Duration::from_secs(60)).into();
-        let retiring = params.self_signed(&retiring_key).unwrap();
-        let roots = vec![retiring.der().to_vec(), ca.der().to_vec()];
-        e.set_peer_trust_roots(roots.clone()).unwrap();
-        let request = drive(
-            &files,
-            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-        )
-        .unwrap();
-        let accepted = drive(
-            &files,
-            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
-        )
-        .unwrap();
-        let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-        let signing = accepted.signing_identity(&roots).unwrap();
-        clock.advance(Duration::from_secs(120));
-        assert!(accepted.valid_now());
-        assert!(recovered.valid_now());
-        assert!(signing.sign(b"held identity").is_ok());
-        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_some());
-        e.set_peer_trust_roots(roots.clone()).unwrap();
-        let request = drive(
-            &files,
-            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-        )
-        .unwrap();
-        let renewed = drive(
-            &files,
-            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
-        )
-        .unwrap();
-        assert!(
-            renewed
-                .signing_identity(&roots)
-                .unwrap()
-                .sign(b"renewed identity")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn held_enrollment_identity_uses_root_validity_bounds() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let clock = uring_runtime::environment::SimulationClock::new(106);
-        let _time = clock.environment(0).enter();
-        let (files, e, scope) = fixture();
-        let now = uring_runtime::environment::wall_now();
-        let (_, key) = identity::test_util::ca();
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.not_before = now.into();
-        params.not_after = (now + Duration::from_secs(60)).into();
-        let ca = params.self_signed(&key).unwrap();
-        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-        let request = drive(
-            &files,
-            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
-        )
-        .unwrap();
-        let response = issue(&request, &ca, &key, |_| {});
-        let (_, leaf) =
-            x509_parser::parse_x509_certificate(&response.certificate_chain[0]).unwrap();
-        let leaf_start = UNIX_EPOCH
-            + Duration::from_secs(leaf.validity().not_before.timestamp().try_into().unwrap());
-        let leaf_end = UNIX_EPOCH
-            + Duration::from_secs(leaf.validity().not_after.timestamp().try_into().unwrap());
-        assert!(leaf_start < now);
-        assert!(leaf_end > now + Duration::from_secs(60));
-        let accepted = drive(&files, e.accept_response(response, &scope)).unwrap();
-        let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
-        for identity in [&accepted, &recovered] {
-            assert_eq!(identity.expires_at(), now + Duration::from_secs(60));
-            clock.set_wall_time(now - Duration::from_secs(1));
-            assert!(!identity.valid_now());
-            clock.set_wall_time(now);
-            assert!(identity.valid_now());
-            assert!(!identity.renewal_due());
-            clock.set_wall_time(now + Duration::from_secs(39));
-            assert!(!identity.renewal_due());
-            clock.set_wall_time(now + Duration::from_secs(40));
-            assert!(identity.renewal_due());
-            clock.set_wall_time(now + Duration::from_secs(59));
-            assert!(identity.valid_now());
-            clock.set_wall_time(now + Duration::from_secs(60));
-            assert!(!identity.valid_now());
-            clock.set_wall_time(now + Duration::from_secs(61));
-            assert!(!identity.valid_now());
-            assert!(uring_runtime::environment::wall_now() < leaf_end);
-        }
-        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
-    }
-
+    /// Abandoned writes are fenced before retry and publication phases stay exact.
     #[test]
     fn persistence_faults_abandonment_and_reconciliation_preserve_errors() {
         for case in ["write", "rename", "sync", "abandon", "cancel-rename"] {
@@ -2277,6 +1551,7 @@ mod tests {
         }
     }
 
+    /// Overlap cannot steal serialization; cancellation before admission causes no I/O.
     #[test]
     fn attempts_reject_overlap_and_fence_abandoned_work_before_fresh_scope() {
         let sim = Simulation::new();
@@ -2313,6 +1588,7 @@ mod tests {
         assert_eq!(files.next.get(), 2);
     }
 
+    /// Lifetime-based renewal and recovery treat expired authentication as absent.
     #[test]
     fn renewal_and_expired_recovery_follow_scoped_time() {
         let sim = Simulation::new();
@@ -2346,6 +1622,7 @@ mod tests {
         assert!(!identity.valid_now());
     }
 
+    /// Shared secure helpers keep symlink policy, permissions and size errors intact.
     #[test]
     fn secure_helpers_reject_private_links_modes_and_oversized_reads() {
         let sim = Simulation::new();

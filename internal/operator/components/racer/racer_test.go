@@ -5,24 +5,27 @@ package racer
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
-	"fmt"
+	"maps"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -30,7 +33,6 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/operator/override"
 	racercore "github.com/Azure/unbounded/internal/racer"
 )
 
@@ -42,11 +44,13 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 	require.NoError(t, racerv1.AddToScheme(scheme))
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithInterceptorFuncs(interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			// The fake API does not allocate server UIDs.
 			obj.SetUID(types.UID(uuid.NewString()))
 			return c.Create(ctx, obj, opts...)
 		},
 		Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-			// Model persistence only; this fake does not enforce admission or RBAC.
+			// Exercise the real plan executor; emulate only SSA persistence. The
+			// envtest suite below exercises actual API defaulting and admission.
 			data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
 			if err != nil {
 				return err
@@ -64,10 +68,6 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 				return err
 			}
 
-			if (obj.GetUID() != "" && obj.GetUID() != current.GetUID()) || (obj.GetResourceVersion() != "" && obj.GetResourceVersion() != current.GetResourceVersion()) {
-				return apierrors.NewConflict(corev1.Resource(obj.GetKind()), obj.GetName(), errors.New("apply precondition failed"))
-			}
-
 			obj.SetResourceVersion(current.GetResourceVersion())
 			obj.SetUID(current.GetUID())
 
@@ -78,8 +78,34 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 	return &component.Env{Client: c, APIReader: c, Scheme: scheme, Namespace: "custom-system", Config: component.Config{ImageRegistry: "mirror.test/unbounded", ImageTag: "v1"}}
 }
 
-func cacheObject(name string) *racerv1.ClusterCache {
-	return &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uuid.NewString())}}
+func volume(name string) *racerv1.ClusterVolume {
+	return &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uuid.NewString())}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
+}
+
+func TestAnyClusterVolumeTriggersInstallation(t *testing.T) {
+	for _, volumeType := range []racerv1.ClusterVolumeType{racerv1.ClusterVolumeTypeCache, "Future", ""} {
+		t.Run(string(volumeType), func(t *testing.T) {
+			v := volume("trigger")
+			v.Spec.Type = volumeType
+			env := testEnv(t, v)
+			listed := false
+			env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*racerv1.ClusterVolumeList); ok {
+						listed = true
+
+						require.EqualValues(t, 1, (&client.ListOptions{}).ApplyOptions(opts).Limit)
+					}
+
+					return c.List(ctx, list, opts...)
+				},
+			})
+			plan := planPass(t, env)
+			require.True(t, listed)
+			require.Positive(t, plan.Len())
+			require.Contains(t, plan.Summary(), "ConfigMap/custom-system/racer-operator-installation")
+		})
+	}
 }
 
 func planPass(t *testing.T, env *component.Env) *component.Plan {
@@ -100,125 +126,185 @@ func persist(t *testing.T, env *component.Env, plan *component.Plan) {
 	}
 }
 
+func configuration(t *testing.T, env *component.Env) racercore.Config {
+	t.Helper()
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+
+	for key, value := range cm.Data {
+		t.Setenv(key, value)
+	}
+
+	t.Setenv("POD_NAMESPACE", env.Namespace)
+
+	cfg, err := racercore.LoadConfig()
+	require.NoError(t, err)
+
+	return cfg
+}
+
 func initialize(t *testing.T, env *component.Env) racercore.Config {
 	t.Helper()
 
-	for range 9 {
+	for range 6 {
 		plan := planPass(t, env)
 		require.NotContains(t, plan.Summary(), "DaemonSet/")
 		persist(t, env, plan)
 	}
 
-	cm := &corev1.ConfigMap{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
-
-	cfg, err := racercore.ConfigFromLookup(func(key string) (string, bool) {
-		if key == "POD_NAMESPACE" {
-			return env.Namespace, true
-		}
-
-		value, ok := cm.Data[key]
-
-		return value, ok
-	})
-	require.NoError(t, err)
+	cfg := configuration(t, env)
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), &appsv1.Deployment{}))
 	require.NoError(t, racercore.Assemble(cfg, env.Client, env.APIReader).Recover(t.Context(), env.Client))
 
 	return cfg
 }
 
-func TestClusterCacheActivationUsesLiveReader(t *testing.T) {
+func TestLifecycleWithoutSites(t *testing.T) {
 	env := testEnv(t)
 	require.Zero(t, planPass(t, env).Len())
-
-	listed := false
-	live := testEnv(t, cacheObject("cache"))
-	env.APIReader = interceptor.NewClient(live.Client.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			_, listed = list.(*racerv1.ClusterCacheList)
-			require.True(t, listed)
-			require.EqualValues(t, 1, (&client.ListOptions{}).ApplyOptions(opts).Limit)
-
-			return c.List(ctx, list, opts...)
-		},
-	})
-	plan := planPass(t, env)
-	require.True(t, listed)
-	require.Len(t, plan.Operations, 1)
-	require.Equal(t, claimName, plan.Operations[0].Object.GetName())
-
-	env.APIReader = interceptor.NewClient(live.Client.(client.WithWatch), interceptor.Funcs{
-		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-			return errors.New("unavailable")
-		},
-	})
-	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-	require.Error(t, err)
-	require.Nil(t, plan)
-}
-
-func TestControllerOnlyLifecycleWithoutSites(t *testing.T) {
-	env := testEnv(t, cacheObject("first"))
+	require.NoError(t, env.Client.Create(t.Context(), volume("first")))
 	cfg := initialize(t, env)
 	plan := planPass(t, env)
+	require.Contains(t, plan.Summary(), "Deployment/custom-system/racer-controller [overridable]")
+	require.Contains(t, plan.Summary(), "DaemonSet/custom-system/racer-dataplane [overridable]")
 	persist(t, env, plan)
-
-	for _, op := range plan.Operations {
-		require.NotEqual(t, "DaemonSet", op.Object.GetKind())
-		require.NotEqual(t, "NetworkPolicy", op.Object.GetKind())
-		require.NotContains(t, op.Object.GetName(), "dataplane")
-		require.Empty(t, op.Object.GetOwnerReferences())
-	}
 
 	deployment := &appsv1.Deployment{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-	require.EqualValues(t, 3, *deployment.Spec.Replicas)
+	require.Equal(t, env.Config.Image(controllerName), deployment.Spec.Template.Spec.Containers[0].Image)
+	require.Equal(t, appsv1.RollingUpdateDeploymentStrategyType, deployment.Spec.Strategy.Type)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxSurge)
 	require.Zero(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue())
 	require.Equal(t, 1, deployment.Spec.Strategy.RollingUpdate.MaxSurge.IntValue())
-	pod := deployment.Spec.Template.Spec
-	require.Equal(t, controllerName, pod.ServiceAccountName)
-	require.True(t, pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken)
-	require.Len(t, pod.Containers, 1)
-	require.Empty(t, pod.InitContainers)
-	container := pod.Containers[0]
-	require.Equal(t, env.Config.Image(controllerName), container.Image)
-	require.Empty(t, container.Args)
-	require.Equal(t, "/readyz", container.ReadinessProbe.HTTPGet.Path)
-	require.Equal(t, "/healthz", container.LivenessProbe.HTTPGet.Path)
-	require.Equal(t, []corev1.ContainerPort{{Name: "https", ContainerPort: 8443}, {Name: "probes", ContainerPort: 8081}, {Name: "metrics", ContainerPort: 8080}}, container.Ports)
-	require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: caBundleKey, Path: "ca.crt"}}, pod.Volumes[0].Secret.Items)
-	token := pod.Volumes[1].Projected.Sources[0].ServiceAccountToken
-	require.Equal(t, racercore.ReplicationAudience, token.Audience)
-	require.EqualValues(t, 3600, *token.ExpirationSeconds)
-	require.EqualValues(t, 0o400, *pod.Volumes[1].Projected.DefaultMode)
-	require.Equal(t, cfg.ReplicationTokenFile, container.VolumeMounts[1].MountPath+"/"+token.Path)
-	require.Equal(t, controllerName+"."+env.Namespace+".svc", cfg.ReplicationServerName)
-	require.EqualValues(t, 8443, cfg.ReplicationPort)
+	require.EqualValues(t, 3, *deployment.Spec.Replicas)
 
 	budget := &policyv1.PodDisruptionBudget{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), budget))
-	require.Nil(t, budget.Spec.MinAvailable)
-	require.NotNil(t, budget.Spec.MaxUnavailable)
-	require.Equal(t, intstr.FromInt32(1), *budget.Spec.MaxUnavailable)
+	require.Equal(t, 2, budget.Spec.MinAvailable.IntValue())
+	require.Nil(t, budget.Spec.MaxUnavailable)
 	require.Equal(t, deployment.Spec.Selector, budget.Spec.Selector)
+	pod := deployment.Spec.Template.Spec
+	controller := pod.Containers[0]
+	require.Equal(t, "/readyz", controller.ReadinessProbe.HTTPGet.Path)
+	require.Equal(t, "/healthz", controller.LivenessProbe.HTTPGet.Path)
+	require.Equal(t, controllerName, pod.ServiceAccountName)
 
 	service := &corev1.Service{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), service))
-	require.Equal(t, deployment.Spec.Template.Labels, service.Spec.Selector)
+	require.True(t, maps.Equal(service.Spec.Selector, deployment.Spec.Template.Labels), "Service must admit every synchronized replica")
 	require.False(t, service.Spec.PublishNotReadyAddresses)
 
-	accounts := &corev1.ServiceAccountList{}
-	require.NoError(t, env.Client.List(t.Context(), accounts))
-	require.Len(t, accounts.Items, 1)
-	require.Equal(t, controllerName, accounts.Items[0].Name)
+	for name, field := range map[string]string{"POD_NAMESPACE": "metadata.namespace", "POD_NAME": "metadata.name", "POD_UID": "metadata.uid"} {
+		require.Contains(t, controller.Env, corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: field}}})
+	}
+
+	require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: caBundleKey, Path: "ca.crt"}}, pod.Volumes[0].Secret.Items)
+	require.Equal(t, cfg.ReplicationTrustFile, controller.VolumeMounts[0].MountPath+"/ca.crt")
+	require.Equal(t, controllerName, cfg.ControllerServiceAccount)
+	require.Equal(t, controllerName+"."+env.Namespace+".svc", cfg.ReplicationServerName)
+	require.EqualValues(t, 8443, cfg.ReplicationPort)
+	require.Equal(t, 30*time.Second, cfg.SnapshotMaxAge)
+
+	projection := pod.Volumes[1].Projected
+	require.NotNil(t, projection)
+	require.EqualValues(t, 0o400, *projection.DefaultMode)
+	require.Len(t, projection.Sources, 1)
+	token := projection.Sources[0].ServiceAccountToken
+	require.NotNil(t, token)
+	require.Equal(t, racercore.ReplicationAudience, token.Audience)
+	require.EqualValues(t, 3600, *token.ExpirationSeconds)
+	require.Equal(t, pod.Volumes[1].Name, controller.VolumeMounts[1].Name)
+	require.True(t, controller.VolumeMounts[1].ReadOnly)
+	require.Empty(t, controller.VolumeMounts[1].SubPath)
+	require.Equal(t, cfg.ReplicationTokenFile, controller.VolumeMounts[1].MountPath+"/"+token.Path)
+
+	for _, item := range deployment.Spec.Template.Spec.Volumes[0].Secret.Items {
+		require.NotEqual(t, "ca.key", item.Key)
+	}
+
+	serving := &corev1.Secret{}
+	trust := &corev1.ConfigMap{}
+
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), serving))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
+	require.Equal(t, string(serving.Data["ca.crt"]), trust.Data["ca.crt"])
+	cert, err := tls.X509KeyPair(serving.Data[corev1.TLSCertKey], serving.Data[corev1.TLSPrivateKeyKey])
+	require.NoError(t, err)
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	require.NoError(t, err)
+
+	roots := x509.NewCertPool()
+	require.True(t, roots.AppendCertsFromPEM([]byte(trust.Data["ca.crt"])))
+	_, err = leaf.Verify(x509.VerifyOptions{DNSName: controllerName + "." + env.Namespace + ".svc", Roots: roots})
+	require.NoError(t, err)
+
+	jobs := &batchv1.JobList{}
+	require.NoError(t, env.Client.List(t.Context(), jobs))
+	require.Empty(t, jobs.Items)
+	require.Empty(t, controller.Args)
+
+	for _, op := range plan.Operations {
+		require.Empty(t, op.Object.GetOwnerReferences())
+	}
+
+	// Use the production controller with precisely the operator's configuration.
+	app := racercore.Assemble(cfg, env.Client, env.APIReader)
+	_, err = app.Keyring.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err)
+
+	ds := &appsv1.DaemonSet{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, "racer-dataplane"), ds))
+	require.Equal(t, env.Config.Image("racer-dataplane"), ds.Spec.Template.Spec.Containers[0].Image)
+	require.Contains(t, ds.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "RACER_CONTROL_ENDPOINT", Value: "https://racer-controller.custom-system.svc:8443"})
+
+	for _, variable := range ds.Spec.Template.Spec.Containers[0].Env {
+		require.NotEqual(t, "RACER_SECRET_DIRECTORY", variable.Name)
+	}
+
+	volumes := map[string]corev1.Volume{}
+
+	for _, volume := range ds.Spec.Template.Spec.Volumes {
+		require.Nil(t, volume.Secret, "dataplane must not mount shared keys")
+
+		volumes[volume.Name] = volume
+		if volume.Projected != nil {
+			for _, source := range volume.Projected.Sources {
+				require.Nil(t, source.Secret)
+			}
+		}
+	}
+
+	require.NotContains(t, volumes, "keyring")
+	require.Equal(t, "racer-control", volumes["token"].Projected.Sources[0].ServiceAccountToken.Audience)
+	require.Equal(t, trustName, volumes["bootstrap"].ConfigMap.Name)
+
+	for _, name := range []string{"identity", "slabs", "sockets"} {
+		require.NotNil(t, volumes[name].HostPath)
+	}
+
+	require.Equal(t, &corev1.HostPathVolumeSource{Path: "/dev/infiniband", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}, volumes["infiniband"].HostPath)
+	require.Contains(t, ds.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true})
+	require.Equal(t, &corev1.HostPathVolumeSource{Path: "/dev", Type: ptr.To(corev1.HostPathDirectory)}, volumes["devices"].HostPath)
+	require.Contains(t, ds.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "devices", MountPath: "/host/dev", ReadOnly: true})
+	require.Contains(t, ds.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "RACER_DEVICE_DIRECTORY", Value: "/host/dev"})
+	require.Equal(t, &corev1.SecurityContext{
+		Privileged: ptr.To(true), AllowPrivilegeEscalation: ptr.To(true), ReadOnlyRootFilesystem: ptr.To(true),
+	}, ds.Spec.Template.Spec.Containers[0].SecurityContext)
+
+	for _, name := range []string{"racer-credentials"} {
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, name), &corev1.Secret{}))
+	}
 
 	before := &corev1.ConfigMap{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, versionName), before))
-	require.NoError(t, env.Client.Delete(t.Context(), cacheObject("first")))
+	require.NoError(t, env.Client.Delete(t.Context(), volume("first")))
 	require.Zero(t, planPass(t, env).Len())
 	require.NoError(t, env.Client.Delete(t.Context(), deployment))
 	require.Zero(t, planPass(t, env).Len())
-	require.NoError(t, env.Client.Create(t.Context(), cacheObject("later")))
+	require.NoError(t, env.Client.Create(t.Context(), volume("later")))
 	persist(t, env, planPass(t, env))
 
 	after := &corev1.ConfigMap{}
@@ -227,278 +313,650 @@ func TestControllerOnlyLifecycleWithoutSites(t *testing.T) {
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
 }
 
-func TestControllerPDBReplicaOverrides(t *testing.T) {
-	for _, replicas := range []int64{0, 1, 2, 3, 5} {
-		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
-			env := testEnv(t, cacheObject("cache"))
-			initialize(t, env)
-			plan := planPass(t, env)
-			entries := []override.SourcedEntry{{
-				Source: override.Source{Key: "racer.yaml", Index: 0},
-				Entry: override.Entry{
-					Component: "racer", Kind: "Deployment",
-					Patch: map[string]any{"spec": map[string]any{"replicas": replicas}},
-				},
-			}}
-			require.NoError(t, override.ValidateErr(entries))
-
-			report := override.Apply(plan, entries, nil)
-			require.NoError(t, report.Err())
-			require.Empty(t, report.Withheld)
-			require.Len(t, report.Workloads, 1)
-			persist(t, env, plan)
-
-			deployment := &appsv1.Deployment{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-			require.EqualValues(t, replicas, *deployment.Spec.Replicas)
-			require.Equal(t, intstr.FromInt32(0), *deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
-			require.Equal(t, intstr.FromInt32(1), *deployment.Spec.Strategy.RollingUpdate.MaxSurge)
-
-			budget := &policyv1.PodDisruptionBudget{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), budget))
-			require.Nil(t, budget.Spec.MinAvailable)
-			require.NotNil(t, budget.Spec.MaxUnavailable)
-			require.Equal(t, intstr.FromInt32(1), *budget.Spec.MaxUnavailable)
-			require.Equal(t, deployment.Spec.Selector, budget.Spec.Selector)
-		})
-	}
-}
-
 func TestDamagedStateFailsClosed(t *testing.T) {
-	for _, target := range []string{claimName, markerName, versionName, tlsName, "wrong-version-binding", "replaced-marker", "corrupt-version"} {
+	for _, target := range []string{claimName, markerName, versionName, tlsName, "corrupt-version", "wrong-binding", "replaced-version", "missing-protocol"} {
 		t.Run(target, func(t *testing.T) {
-			env := testEnv(t, cacheObject("cache"))
+			env := testEnv(t, volume("cache"))
 			initialize(t, env)
 
 			var obj client.Object = &corev1.ConfigMap{}
 
 			key := target
-			switch target {
-			case tlsName:
+			if target == tlsName {
 				obj = &corev1.Secret{}
-			case "wrong-version-binding", "corrupt-version":
+			}
+
+			if target == "corrupt-version" || target == "wrong-binding" || target == "replaced-version" {
 				key = versionName
-			case "replaced-marker":
+			}
+
+			if target == "missing-protocol" {
 				key = markerName
 			}
 
 			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, key), obj))
 
 			switch target {
-			case "wrong-version-binding":
-				obj.SetAnnotations(nil)
-				require.NoError(t, env.Client.Update(t.Context(), obj))
 			case "corrupt-version":
 				obj.(*corev1.ConfigMap).Data["sequence"] = "0"
 				require.NoError(t, env.Client.Update(t.Context(), obj))
+			case "wrong-binding":
+				obj.SetAnnotations(nil)
+				require.NoError(t, env.Client.Update(t.Context(), obj))
+			case "replaced-version":
+				require.NoError(t, env.Client.Delete(t.Context(), obj))
+				obj.SetResourceVersion("")
+				obj.SetUID("")
+				require.NoError(t, env.Client.Create(t.Context(), obj))
+			case "missing-protocol":
+				delete(obj.(*corev1.ConfigMap).Data, "initialization_protocol")
+				require.NoError(t, env.Client.Update(t.Context(), obj))
 			default:
 				require.NoError(t, env.Client.Delete(t.Context(), obj))
-
-				if target == "replaced-marker" {
-					obj.SetResourceVersion("")
-					require.NoError(t, env.Client.Create(t.Context(), obj))
-				}
 			}
 
 			plan, _, err := (Component{}).Plan(t.Context(), env, nil)
 			require.Error(t, err)
-			require.Nil(t, plan)
+			require.Zero(t, plan.Len())
 		})
 	}
 }
 
-func TestExternalWorkloadsAreNotAdoptedOrChanged(t *testing.T) {
-	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Namespace: "custom-system", UID: "external"}}
-	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Namespace: "custom-system", UID: "external"}}
-	env := testEnv(t, cacheObject("cache"), ds, sa)
+func TestPlanningRecoveryNeverWritesStagedState(t *testing.T) {
+	for _, candidateExists := range []bool{false, true} {
+		t.Run(map[bool]string{false: "create", true: "commit"}[candidateExists], func(t *testing.T) {
+			env := testEnv(t, volume("cache"))
+			initialize(t, env)
+
+			before := &corev1.ConfigMap{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, markerName), before))
+
+			markerReads := 0
+			env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if key.Name == versionName && !candidateExists {
+						return apierrors.NewNotFound(corev1.Resource("configmaps"), key.Name)
+					}
+
+					if err := c.Get(ctx, key, obj, opts...); err != nil {
+						return err
+					}
+
+					if key.Name == markerName {
+						markerReads++
+						if markerReads > 1 {
+							marker := obj.(*corev1.ConfigMap)
+							marker.Data["state"] = "fresh"
+							delete(marker.Data, "version_uid")
+							marker.Immutable = ptr.To(false)
+						}
+					}
+
+					return nil
+				},
+			})
+			plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+			require.ErrorIs(t, err, errPlanningWrite)
+			require.Zero(t, plan.Len())
+
+			after := &corev1.ConfigMap{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, markerName), after))
+			require.Equal(t, before, after)
+		})
+	}
+}
+
+func TestControllerDependsOnDisruptionBudget(t *testing.T) {
+	env := testEnv(t, volume("cache"))
+	for range 5 {
+		persist(t, env, planPass(t, env))
+	}
+
+	plan := planPass(t, env)
+	budgetRef := component.RefOf(component.ToUnstructured(&policyv1.PodDisruptionBudget{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: env.Namespace},
+	}))
+	found := false
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() == "Deployment" {
+			require.Contains(t, op.DependsOn, budgetRef)
+
+			found = true
+		}
+	}
+
+	require.True(t, found)
+}
+
+func TestClaimCrashAndConflict(t *testing.T) {
+	for _, failure := range []string{"conflict", "lost-marker-create", "lost-CAS-response"} {
+		t.Run(failure, func(t *testing.T) {
+			env := testEnv(t, volume("cache"))
+			persist(t, env, planPass(t, env))
+			// Preserve coverage of ambiguous legacy claims; new installations use
+			// the separately tested staged protocol.
+			claim := &corev1.ConfigMap{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, claimName), claim))
+			delete(claim.Data, operatorInitialization)
+			require.NoError(t, env.Client.Update(t.Context(), claim))
+			plan := planPass(t, env)
+			require.Len(t, plan.Operations, 2)
+
+			writer := interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if failure == "conflict" {
+						return apierrors.NewConflict(corev1.Resource("configmaps"), claimName, errors.New("concurrent writer"))
+					}
+
+					if failure == "lost-CAS-response" {
+						require.NoError(t, c.Patch(ctx, obj, patch, opts...))
+						return errors.New("response lost after claim consumption")
+					}
+
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+				Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+					return errors.New("lost create")
+				},
+			})
+			executor := *env
+			executor.Client = writer
+			result, err := executor.Execute(t.Context(), plan)
+			require.NoError(t, err)
+			require.Len(t, result.Results, 2)
+			require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, markerName), &corev1.ConfigMap{})))
+
+			if failure == "conflict" {
+				persist(t, env, planPass(t, env))
+			} else {
+				next, _, err := (Component{}).Plan(t.Context(), env, nil)
+				require.Error(t, err)
+				require.Zero(t, next.Len())
+			}
+		})
+	}
+}
+
+func TestStandaloneAndReadFailure(t *testing.T) {
+	env := testEnv(t, volume("cache"), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: "custom-system"}})
+	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorContains(t, err, "standalone")
+	require.Zero(t, plan.Len())
+
+	env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("unavailable")
+		},
+	})
+	plan, _, err = (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorContains(t, err, "unavailable")
+	require.Zero(t, plan.Len())
+}
+
+func TestInitializerDependsOnPrerequisites(t *testing.T) {
+	env := testEnv(t, volume("cache"))
+	for range 5 {
+		persist(t, env, planPass(t, env))
+	}
+
+	plan := planPass(t, env)
+	require.Contains(t, plan.Summary(), "Deployment/")
+
+	env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+		Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+			return errors.New("RBAC forbidden")
+		},
+	})
+	result, err := env.Execute(t.Context(), plan)
+	require.NoError(t, err)
+
+	for _, op := range result.Results {
+		if op.Ref.Name == controllerName && op.Ref.GVK.Kind == "Deployment" {
+			require.Equal(t, component.OpSkipped, op.Status)
+		}
+	}
+
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, controllerName), &appsv1.Deployment{})))
+}
+
+func TestStartupVersionWatch(t *testing.T) {
+	env := testEnv(t)
+	p := startupConfigPredicate(env)
+	version := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}, Data: map[string]string{"sequence": "1"}}
+	require.True(t, p.Create(event.CreateEvent{Object: version}))
+	require.True(t, p.Delete(event.DeleteEvent{Object: version}))
+	next := version.DeepCopy()
+	next.Data["sequence"] = "2"
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: version, ObjectNew: next}))
+	next.Namespace = "foreign"
+	require.False(t, p.Create(event.CreateEvent{Object: next}))
+}
+
+func TestServingTLSRenewal(t *testing.T) {
+	for _, age := range []time.Duration{7 * day, 15 * day} {
+		t.Run(age.String(), func(t *testing.T) {
+			secret, err := newTLS("custom-system", time.Now().Add(-age))
+			require.NoError(t, err)
+			env := testEnv(t, secret)
+			plan := component.NewPlan()
+			result, err := planTLS(t.Context(), env, plan, false)
+			require.NoError(t, err)
+			require.Nil(t, result)
+			persist(t, env, plan)
+			result, err = planTLS(t.Context(), env, component.NewPlan(), false)
+			require.NoError(t, err)
+			require.NotEqual(t, secret.Data["ca.key"], result.Data["ca.key"])
+			pair, err := tls.X509KeyPair(result.Data[corev1.TLSCertKey], result.Data[corev1.TLSPrivateKeyKey])
+			require.NoError(t, err)
+			leaf, err := x509.ParseCertificate(pair.Certificate[0])
+			require.NoError(t, err)
+
+			roots := x509.NewCertPool()
+			require.True(t, roots.AppendCertsFromPEM(secret.Data["ca.crt"]))
+
+			intermediates := x509.NewCertPool()
+
+			for _, der := range pair.Certificate[1:] {
+				cert, err := x509.ParseCertificate(der)
+				require.NoError(t, err)
+				intermediates.AddCert(cert)
+			}
+
+			_, err = leaf.Verify(x509.VerifyOptions{DNSName: controllerName + ".custom-system.svc", Roots: roots, Intermediates: intermediates})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestInitializationFailureStates(t *testing.T) {
+	for _, scenario := range []string{"failed", "foreign", "completed-fresh", "consumed-active", "consumed-missing", "fresh-version"} {
+		t.Run(scenario, func(t *testing.T) {
+			env := testEnv(t, volume("cache"))
+			for range 6 {
+				persist(t, env, planPass(t, env))
+			}
+
+			marker := &corev1.ConfigMap{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, markerName), marker))
+
+			switch scenario {
+			case "failed":
+				// Failure before CAS leaves the fresh marker usable.
+				cfg := configuration(t, env)
+				writer := interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+					Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+						return errors.New("startup denied")
+					},
+				})
+				require.Error(t, racercore.Assemble(cfg, writer, env.APIReader).Recover(t.Context(), writer))
+			case "foreign":
+				marker.Annotations = nil
+				require.NoError(t, env.Client.Update(t.Context(), marker))
+			case "completed-fresh":
+				// A fresh marker cannot coexist with completed version state.
+				require.NoError(t, env.Client.Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}}))
+			case "consumed-active", "consumed-missing":
+				marker.Data["state"] = "consumed"
+				immutable := true
+				marker.Immutable = &immutable
+				require.NoError(t, env.Client.Update(t.Context(), marker))
+			case "fresh-version":
+				require.NoError(t, env.Client.Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}}))
+			}
+
+			plan, result, err := (Component{}).Plan(t.Context(), env, nil)
+			if scenario == "failed" {
+				require.NoError(t, err)
+				require.Positive(t, result.RequeueAfter)
+				require.Contains(t, plan.Summary(), "Deployment/")
+				require.NotContains(t, plan.Summary(), "DaemonSet/")
+			} else {
+				require.Error(t, err)
+				require.Zero(t, plan.Len())
+			}
+		})
+	}
+}
+
+func TestTLSRejectsInvalidCredentials(t *testing.T) {
+	for _, scenario := range []string{"bad-key", "wrong-host", "future", "missing-with-trust"} {
+		t.Run(scenario, func(t *testing.T) {
+			namespace, now := "custom-system", time.Now()
+			if scenario == "wrong-host" {
+				namespace = "elsewhere"
+			}
+
+			if scenario == "future" {
+				now = now.Add(2 * time.Hour)
+			}
+
+			secret, err := newTLS(namespace, now)
+			require.NoError(t, err)
+
+			secret.Namespace = "custom-system"
+			if scenario == "bad-key" {
+				secret.Data[corev1.TLSPrivateKeyKey] = []byte("invalid")
+			}
+
+			env := testEnv(t, secret)
+			if scenario == "missing-with-trust" {
+				require.NoError(t, env.Client.Delete(t.Context(), secret))
+				require.NoError(t, env.Client.Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace}}))
+			}
+
+			plan := component.NewPlan()
+			_, err = planTLS(t.Context(), env, plan, true)
+			require.Error(t, err)
+			require.Zero(t, plan.Len())
+		})
+	}
+}
+
+func TestConfigEditsPersistAndRollWorkloads(t *testing.T) {
+	env := testEnv(t, volume("cache"))
 	initialize(t, env)
 	persist(t, env, planPass(t, env))
 
-	actual := &appsv1.DaemonSet{}
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(ds), actual))
-	require.Equal(t, ds.Spec, actual.Spec)
-	require.Equal(t, ds.UID, actual.UID)
+	for _, test := range []struct {
+		config, workload string
+		object           client.Object
+	}{
+		{configName, controllerName, &appsv1.Deployment{}},
+		{dataplaneConfigName, dataplaneName, &appsv1.DaemonSet{}},
+	} {
+		cm := &corev1.ConfigMap{}
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, test.config), cm))
+		cm.Data["ADMIN_SETTING"] = "preserved"
 
-	account := &corev1.ServiceAccount{}
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(sa), account))
-	require.Equal(t, sa.UID, account.UID)
+		cm.BinaryData = map[string][]byte{"admin.bin": {1, 2, 3}}
+		if test.config == dataplaneConfigName {
+			require.Equal(t, "67108864", cm.Data["RACER_REQUEST_CONTEXT_BYTES"])
+			cm.Data["RACER_MAX_THREADS"] = "2"
+			// Existing tuning, including the old default, remains administrator-owned.
+			cm.Data["RACER_REQUEST_CONTEXT_BYTES"] = "16777216"
+		}
+
+		require.NoError(t, env.Client.Update(t.Context(), cm))
+		want := component.ConfigMapPayloadHash(cm)
+
+		for range 2 {
+			persist(t, env, planPass(t, env))
+		}
+
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, test.config), cm))
+		require.Equal(t, want, component.ConfigMapPayloadHash(cm))
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, test.workload), test.object))
+
+		var annotations map[string]string
+
+		switch obj := test.object.(type) {
+		case *appsv1.Deployment:
+			annotations = obj.Spec.Template.Annotations
+		case *appsv1.DaemonSet:
+			annotations = obj.Spec.Template.Annotations
+			container := obj.Spec.Template.Spec.Containers[0]
+			require.Equal(t, dataplaneConfigName, container.EnvFrom[0].ConfigMapRef.Name)
+
+			for _, variable := range container.Env {
+				require.NotEqual(t, "RACER_REQUEST_CONTEXT_BYTES", variable.Name, "explicit env must not shadow the ConfigMap budget")
+			}
+
+			require.Equal(t, "1Gi", container.Resources.Requests.Memory().String())
+			require.Empty(t, container.Resources.Limits)
+		}
+
+		require.Equal(t, want, annotations["unbounded-cloud.io/racer-config-hash"])
+	}
 }
 
-func TestControllerConfigPreservesTuningAndValidates(t *testing.T) {
-	env := testEnv(t, cacheObject("cache"))
+func TestAdmissionFailureGatesBindingAndWorkloads(t *testing.T) {
+	for _, target := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+		t.Run(target, func(t *testing.T) {
+			env := testEnv(t, volume("cache"))
+			initialize(t, env)
+
+			policy := &unstructured.Unstructured{}
+			policy.SetAPIVersion("admissionregistration.k8s.io/v1")
+			policy.SetKind(target)
+			policy.SetName("racer-runtime-write-restriction")
+			require.NoError(t, env.Client.Delete(t.Context(), policy))
+			plan := planPass(t, env)
+			env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+					data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
+					require.NoError(t, err)
+
+					if data["kind"] == target {
+						return errors.New("policy unavailable")
+					}
+
+					return c.Apply(ctx, cfg, opts...)
+				},
+			})
+			result, err := env.Execute(t.Context(), plan)
+			require.NoError(t, err)
+
+			for _, op := range result.Results {
+				if op.Ref.GVK.Kind == "Deployment" || op.Ref.GVK.Kind == "DaemonSet" || op.Ref.GVK.Kind == "RoleBinding" {
+					require.Equal(t, component.OpSkipped, op.Status, "%s", op.Ref)
+				}
+			}
+		})
+	}
+}
+
+func TestControllerReplicationTokenOwnership(t *testing.T) {
+	env := testEnv(t, volume("cache"))
 	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	pod := deployment.Spec.Template.Spec
+	// Kubelet needs an explicit UID, not just the image USER, to assign ownership
+	// of the owner-readable projected ServiceAccount token.
+	require.NotNil(t, pod.SecurityContext)
+	require.NotNil(t, pod.SecurityContext.RunAsUser)
+	require.EqualValues(t, 65532, *pod.SecurityContext.RunAsUser)
+	require.Nil(t, pod.SecurityContext.FSGroup, "do not widen token access through a volume group")
+	require.Equal(t, controllerName, pod.ServiceAccountName)
+	require.Empty(t, pod.InitContainers)
+	require.Len(t, pod.Containers, 1)
+	controller := pod.Containers[0]
+	require.Equal(t, "controller", controller.Name)
+
+	if controller.SecurityContext != nil {
+		require.Nil(t, controller.SecurityContext.RunAsUser, "controller must inherit the pod token owner")
+	}
+
+	require.Contains(t, controller.VolumeMounts, corev1.VolumeMount{
+		Name: "replication-token", MountPath: "/var/run/secrets/racer-controller", ReadOnly: true,
+	})
+
+	var projection *corev1.ProjectedVolumeSource
+
+	for _, volume := range pod.Volumes {
+		if volume.Name == "replication-token" {
+			projection = volume.Projected
+		}
+	}
+
+	require.NotNil(t, projection)
+	require.NotNil(t, projection.DefaultMode)
+	require.EqualValues(t, 0o400, *projection.DefaultMode)
+	require.Len(t, projection.Sources, 1)
+	token := projection.Sources[0].ServiceAccountToken
+	require.NotNil(t, token)
+	require.Equal(t, "racer-controller-replication", token.Audience)
+	require.Equal(t, "token", token.Path)
+	require.Equal(t, "/var/run/secrets/racer-controller/"+token.Path, configuration(t, env).ReplicationTokenFile)
+}
+
+func TestReplicationWiringUpgradePreservesFreshnessPolicy(t *testing.T) {
+	env := testEnv(t, volume("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
 
 	cm := &corev1.ConfigMap{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
 
-	for _, key := range []string{"RACER_DATAPLANE_IMAGE", "RACER_CONTROL_URL", "RACER_HOST_NETWORK", "RACER_BOOTSTRAP_TRUST_CONFIGMAP", "RACER_DIAGNOSTICS_PORT"} {
-		require.NotContains(t, cm.Data, key)
+	for _, key := range []string{"RACER_CONTROLLER_SERVICE_ACCOUNT", "RACER_REPLICATION_TOKEN_FILE", "RACER_REPLICATION_TRUST_FILE", "RACER_REPLICATION_PORT"} {
+		delete(cm.Data, key)
 	}
 
-	cm.Data["RACER_HANDSHAKE_TIMEOUT"] = "9s"
-	cm.Data["ADMIN_SETTING"] = "keep"
-	cm.Data["RACER_CLUSTER_ID"] = "incorrect"
+	cm.Data["RACER_REPLICATION_SERVER_NAME"] = "wrong-namespace.svc"
+	cm.Data["RACER_SNAPSHOT_MAX_AGE"] = "15s"
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	persist(t, env, planPass(t, env))
+
+	cfg := configuration(t, env)
+	require.Equal(t, controllerName, cfg.ControllerServiceAccount)
+	require.Equal(t, "/var/run/secrets/racer-controller/token", cfg.ReplicationTokenFile)
+	require.Equal(t, "/etc/racer/tls/ca.crt", cfg.ReplicationTrustFile)
+	require.Equal(t, controllerName+"."+env.Namespace+".svc", cfg.ReplicationServerName)
+	require.EqualValues(t, 8443, cfg.ReplicationPort)
+	require.Equal(t, 15*time.Second, cfg.SnapshotMaxAge)
+
+	// An administrator deletion of tuning is preserved, using the runtime default.
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
 	delete(cm.Data, "RACER_SNAPSHOT_MAX_AGE")
 	require.NoError(t, env.Client.Update(t.Context(), cm))
 	persist(t, env, planPass(t, env))
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
-	require.Equal(t, "9s", cm.Data["RACER_HANDSHAKE_TIMEOUT"])
-	require.Equal(t, "keep", cm.Data["ADMIN_SETTING"])
-	require.NotEqual(t, "incorrect", cm.Data["RACER_CLUSTER_ID"])
 	require.NotContains(t, cm.Data, "RACER_SNAPSHOT_MAX_AGE")
-	cm.Data["RACER_HANDSHAKE_TIMEOUT"] = "bad"
-	require.NoError(t, env.Client.Update(t.Context(), cm))
-	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-	require.Error(t, err)
-	require.Nil(t, plan)
 }
 
-func TestPoliciesGateControllerPermissions(t *testing.T) {
-	env := testEnv(t, cacheObject("cache"))
+func TestControllerRotationConfigUsesPreservedConfigMap(t *testing.T) {
+	env := testEnv(t, volume("cache"))
 	initialize(t, env)
-	plan := planPass(t, env)
-	_, err := plan.ExecutionOrder()
-	require.NoError(t, err)
+	persist(t, env, planPass(t, env))
 
-	var policies []component.ObjectRef
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
 
-	for _, op := range plan.Operations {
-		if op.Object.GetKind() == "ValidatingAdmissionPolicy" || op.Object.GetKind() == "ValidatingAdmissionPolicyBinding" {
-			policies = append(policies, op.Ref())
-		}
-
-		if op.Object.GetKind() == "ValidatingAdmissionPolicy" {
-			conditions, _, err := unstructured.NestedSlice(op.Object.Object, "spec", "matchConditions")
-			require.NoError(t, err)
-			require.Equal(t, `request.userInfo.username == "system:serviceaccount:custom-system:racer-controller"`, conditions[0].(map[string]any)["expression"])
-		}
+	for name, value := range map[string]string{
+		"RACER_CERTIFICATE_LIFETIME": "2m", "RACER_ROTATION_INTERVAL": "5m",
+		"RACER_ROTATION_PREPARE_FOR": "1m", "RACER_ROTATION_RETAIN_FOR": "2m",
+	} {
+		cm.Data[name] = value
+		t.Setenv(name, "invalid-operator-process-value")
 	}
 
-	require.Len(t, policies, 2)
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	persist(t, env, planPass(t, env))
 
-	for _, op := range plan.Operations {
-		switch op.Object.GetKind() {
-		case "RoleBinding", "ClusterRoleBinding", "Deployment":
-			for _, policy := range policies {
-				require.Contains(t, op.DependsOn, policy)
-			}
-		}
-	}
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	require.Equal(t, component.ConfigMapPayloadHash(cm), deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-config-hash"])
+	cm.Data["RACER_ROTATION_RETAIN_FOR"] = "119s"
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	// Runtime validation belongs to the controller. Invalid rotation settings
+	// still roll its config, but cannot prevent independent workload construction.
+	persist(t, env, planPass(t, env))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	require.Equal(t, component.ConfigMapPayloadHash(cm), deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-config-hash"])
 
-	role := &rbacv1.Role{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), role))
-
-	for _, rule := range role.Rules {
-		for _, resource := range rule.Resources {
-			if resource == "daemonsets" || resource == "pods" || resource == "serviceaccounts" {
-				require.ElementsMatch(t, []string{"get", "list", "watch"}, rule.Verbs)
-			}
-		}
-	}
-
-	clusterRole := &rbacv1.ClusterRole{}
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: controllerName}, clusterRole))
-	require.Contains(t, clusterRole.Rules, rbacv1.PolicyRule{APIGroups: []string{"racer.unbounded-cloud.io"}, Resources: []string{"clustercaches"}, Verbs: []string{"get", "list", "watch"}})
+	_, err := racercore.ConfigFromLookup(func(key string) (string, bool) { value, ok := cm.Data[key]; return value, ok })
+	require.ErrorContains(t, err, "CertificateLifetime <= RetainFor")
 }
 
-func TestPolicyFailuresSkipBindingsAndStartup(t *testing.T) {
-	for _, policyName := range []string{"racer-runtime-write-restriction", "racer-node-write-restriction"} {
-		for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
-			t.Run(policyName+"/"+kind, func(t *testing.T) {
-				env := testEnv(t, cacheObject("cache"))
-				initialize(t, env)
+func TestDataplaneApplyFailures(t *testing.T) {
+	for _, scenario := range []string{"conflict", "forbidden", "canceled", "canceled-after-read"} {
+		t.Run(scenario, func(t *testing.T) {
+			env := testEnv(t, volume("cache"))
+			initialize(t, env)
 
-				obj := &unstructured.Unstructured{}
-				obj.SetAPIVersion("admissionregistration.k8s.io/v1")
-				obj.SetKind(kind)
-				obj.SetName(policyName)
-
-				if policyName == retiredRuntimeGuard {
-					require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj)))
-					persist(t, env, planPass(t, env))
-					assertControllerBindings(t, env, true)
-					require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), &appsv1.Deployment{}))
-
-					return
+			plan := planPass(t, env)
+			for _, op := range plan.Operations {
+				if op.Object.GetKind() == "DaemonSet" {
+					require.Equal(t, component.OpApply, op.Kind)
+					require.Nil(t, op.Base)
 				}
+			}
 
-				require.NoError(t, env.Client.Delete(t.Context(), obj))
-				containment := planPass(t, env)
-				require.Len(t, containment.Operations, 2)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
 
-				for _, op := range containment.Operations {
-					require.Equal(t, component.OpDelete, op.Kind)
-				}
+			var failure error
 
-				persist(t, env, containment)
-				assertControllerBindings(t, env, false)
-				plan := planPass(t, env)
-				original := env.Client
-				env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
-					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-						if obj.GetObjectKind().GroupVersionKind().Kind == kind && obj.GetName() == policyName {
-							return errors.New("policy unavailable")
-						}
+			switch scenario {
+			case "conflict":
+				failure = apierrors.NewConflict(appsv1.Resource("daemonsets"), dataplaneName, errors.New("concurrent writer"))
+			case "forbidden":
+				failure = apierrors.NewForbidden(appsv1.Resource("daemonsets"), dataplaneName, errors.New("denied"))
+			default:
+				failure = context.Canceled
+			}
 
-						return c.Create(ctx, obj, opts...)
-					},
-					Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
-						data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
-						require.NoError(t, err)
+			if scenario == "canceled" {
+				cancel()
+			}
 
-						if data["kind"] == kind && data["metadata"].(map[string]any)["name"] == policyName {
-							return errors.New("policy unavailable")
-						}
-
-						return c.Apply(ctx, cfg, opts...)
-					},
-				})
-				result, err := env.Execute(t.Context(), plan)
-				require.NoError(t, err)
-				require.Len(t, result.Failed(), 1)
-
-				for _, op := range result.Results {
-					switch op.Ref.GVK.Kind {
-					case "RoleBinding", "ClusterRoleBinding", "Deployment":
-						require.Equal(t, component.OpSkipped, op.Status)
+			applies := 0
+			executor := *env
+			executor.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					err := c.Get(ctx, key, obj, opts...)
+					if obj.GetObjectKind().GroupVersionKind().Kind == "DaemonSet" && scenario == "canceled-after-read" {
+						cancel()
 					}
-				}
 
-				assertControllerBindings(t, env, false)
-				env.Client = original
-				persist(t, env, planPass(t, env))
-				assertControllerBindings(t, env, true)
+					return err
+				},
+				Apply: func(ctx context.Context, _ client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+					obj := cfg.(interface{ GetKind() string })
+					if obj.GetKind() != "DaemonSet" {
+						return nil
+					}
+
+					applies++
+
+					options := &client.ApplyOptions{}
+					for _, opt := range opts {
+						opt.ApplyToApply(options)
+					}
+
+					require.Equal(t, component.FieldOwner, options.FieldManager)
+					require.NotNil(t, options.Force)
+					require.True(t, *options.Force)
+
+					if errors.Is(failure, context.Canceled) {
+						// The production client receives the canceled context; the
+						// executor reports its error rather than inventing a retry.
+						require.ErrorIs(t, ctx.Err(), context.Canceled)
+						return ctx.Err()
+					}
+
+					return failure
+				},
 			})
-		}
-	}
-}
+			result, err := executor.Execute(ctx, plan)
+			require.NoError(t, err)
+			require.Equal(t, 1, applies)
 
-func TestStartupWatchIgnoresCounterUpdates(t *testing.T) {
-	env := testEnv(t)
-	predicate := startupConfigPredicate(env)
-	version := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}, Data: map[string]string{"sequence": "1"}}
-	next := version.DeepCopy()
-	next.Data["sequence"] = "2"
-	require.False(t, predicate.Update(event.UpdateEvent{ObjectOld: version, ObjectNew: next}))
-	require.True(t, predicate.Create(event.CreateEvent{Object: version}))
-	require.True(t, predicate.Delete(event.DeleteEvent{Object: version}))
-	marker := version.DeepCopy()
-	marker.Name = markerName
-	changed := marker.DeepCopy()
-	changed.Data["state"] = "consumed"
-	require.True(t, predicate.Update(event.UpdateEvent{ObjectOld: marker, ObjectNew: changed}))
-}
-
-func TestInactiveAtEveryInstallationBoundary(t *testing.T) {
-	for phase := range 6 {
-		t.Run(time.Duration(phase).String(), func(t *testing.T) {
-			env := testEnv(t, cacheObject("cache"))
-			for range phase {
+			if scenario == "conflict" {
+				require.NoError(t, result.Err())
+				require.Len(t, result.DeferredResults(), 1)
+				require.Equal(t, dataplaneName, result.Deferred[0].Name)
+				require.ErrorIs(t, result.DeferredResults()[0].Err, failure)
+				// A new plan consumes current configuration after the lost write.
+				cm := &corev1.ConfigMap{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+				cm.Data["RACER_PEER_PORT"] = "7443"
+				require.NoError(t, env.Client.Update(t.Context(), cm))
 				persist(t, env, planPass(t, env))
-			}
 
-			require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
-			require.Zero(t, planPass(t, env).Len())
+				ds := &appsv1.DaemonSet{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+				require.Equal(t, int32(7443), ds.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
+			} else {
+				require.ErrorIs(t, result.Err(), failure)
+				require.Len(t, result.Failed(), 1)
+				require.Equal(t, dataplaneName, result.Failed()[0].Ref.Name)
+				require.Empty(t, result.Deferred)
+			}
 		})
 	}
 }

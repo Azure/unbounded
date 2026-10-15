@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: racer-object-example
+  labels:
+    app.kubernetes.io/name: racer-object-example
+spec:
+  automountServiceAccountToken: false
+  nodeSelector:
+    kubernetes.io/os: linux
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: racer.unbounded-cloud.io/exclude
+                operator: DoesNotExist
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: curlimages/curl:8.20.0
+      command: ["sleep", "infinity"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        privileged: false
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+    - name: sidecar
+      image: racer-object:dev
+      imagePullPolicy: IfNotPresent
+      args:
+        - sidecar
+        - --volume=racer-object
+        - --namespace=example-store
+        - --bucket=example-bucket
+        - --listen=127.0.0.1:8080
+        - --request-timeout=5m
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        runAsNonRoot: false
+        privileged: false
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: "1"
+          memory: 256Mi
+      volumeMounts:
+        - name: client
+          mountPath: /run/racer/racer-object/client
+          readOnly: true
+  volumes:
+    - name: client
+      hostPath:
+        path: /run/racer/racer-object/client
+        type: Directory

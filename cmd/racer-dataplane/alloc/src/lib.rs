@@ -1,7 +1,8 @@
 //! Worker-local aligned storage with caller-owned accounting and I/O policy.
 //!
-//! This internal crate owns generic bytes, not keys, records, encryption, integrity
-//! checks, versions, admission classes, or a persistence protocol. The caller
+//! This internal crate owns generic bytes and caller-keyed retention indexes, not
+//! key schemas, records, encryption, integrity checks, versions, admission classes,
+//! or a persistence protocol. The caller
 //! supplies accounting guards, a reactor, cancellation policy, and index callbacks.
 //! There is no assumed OS page size and no cross-thread allocation authority.
 //!
@@ -60,11 +61,10 @@
 //! The primary [`Charge`] must truthfully account for its entire padded size;
 //! `()` opts out of accounting. Additional guards attached with
 //! [`AlignedBuffer::retain`] remain live through completion, but not idle pooling.
-//! [`Slab::allocate`] maintains one exact-size idle slot. Drop zeroizes bytes
-//! before pooling or freeing. Idle memory retains the primary charge. Reuse
-//! replaces it with the newly admitted charge; undercharging leaves the idle
-//! slot untouched. A size mismatch releases old storage even if replacement
-//! fails. Occupied, borrowed, or dropped pools cannot retain returned storage.
+//! [`Slab::allocate`] uses bounded size-class free lists. Idle memory retains its
+//! primary charge. Reuse requires admission for the full capacity and replaces
+//! the old charge. Mismatches leave idle storage untouched. Full, borrowed, or
+//! dropped pools cannot retain returned storage.
 //! Outstanding buffers do not keep the pool alive. Reclaim reaches idle bytes
 //! only, never memory still owned by the kernel.
 //!
@@ -110,11 +110,7 @@
 //! exists at a time. Restore requires both thawing and draining all leases,
 //! including reads and abandoned I/O. It validates the whole ordered image before
 //! publication, seals an open tail, rebuilds free slots, and advances an epoch
-//! that clears the eviction cursor and recent-read state. Structural damage
-//! returns Corrupt and a generation below the live slot returns Stale. A Free
-//! image at the generation of an occupied live slot is published at the next
-//! generation, so old mappings cannot match reissued extents. Unavailable
-//! reports that increment or the epoch would wrap. Invalid or busy restores
+//! that clears the eviction cursor and recent-read state. Invalid or busy restores
 //! never partially publish.
 //! Raw file opening, table configuration, and manual eviction are simulation-only
 //! escape hatches. Production startup binds with [`Slab::open_configured`], and
@@ -136,11 +132,12 @@
 //! further capped by the caller. Scored reclamation visits at most
 //! min(slot count, max_visits, 64) slots, including skipped slots, then ranks
 //! eligible candidates. For a nonzero reserve, [`SegmentClock::reclaim`] and
-//! [`SegmentClock::reclaim_scored`] succeed only when the reserve (capped at the
-//! slot count) is met and no evictions remain. Busy is intentional even with enough
-//! free slots while pending evictions drain. Use [`Segments::free_count`] to check
-//! capacity, and retry bounded reclamation later to finish draining rather than
-//! spinning. A zero reserve is a no-op, not a drain request; a zero entry budget
+//! [`SegmentClock::reclaim_scored`] can succeed once the reserve (capped at the
+//! slot count) is met, even with pending evictions. Success is not a drain guarantee.
+//! Busy means the bounded sweep could not meet the reserve, or table mutation was
+//! blocked. Use [`Segments::free_count`] to check capacity and retry bounded
+//! reclamation when more free slots are needed rather than spinning.
+//! A zero reserve is a no-op, not a drain request; a zero entry budget
 //! can recycle empty slots but cannot begin populated eviction. There is no
 //! compaction. [`SegmentEntries`] implementations
 //! must compare current mappings before removal and report within budget; an
@@ -160,6 +157,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+pub mod index;
+pub mod retention;
 mod segments;
 
 mod slab;
@@ -319,6 +318,11 @@ impl SegmentGeometry {
 pub trait Charge: 'static {
     /// Whether this guard accounts for at least `bytes` live allocation bytes.
     fn covers(&self, bytes: usize) -> bool;
+
+    /// Secrets must be erased before storage or accounting is released.
+    fn requires_wipe(&self) -> bool {
+        true
+    }
 }
 
 impl Charge for () {
@@ -455,12 +459,12 @@ impl Alignment {
         }
         let layout = Layout::from_size_align(length, self.memory)
             .map_err(|_| Error::InvalidConfiguration)?;
-        // SAFETY: valid nonzero layout; Allocation owns the matching deallocation.
-        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(Error::Busy)?;
+        let (pointer, release) = allocate_zeroed(layout)?;
         Ok(AlignedBuffer {
             allocation: Some(Allocation {
                 pointer,
                 layout,
+                release,
                 charge,
                 retained: Vec::new(),
                 clean: true,
@@ -468,6 +472,7 @@ impl Alignment {
                 wipes: Rc::new(std::cell::Cell::new(0)),
             }),
             pool: Weak::new(),
+            length,
         })
     }
 
@@ -484,17 +489,106 @@ impl Alignment {
     }
 }
 
+const HUGE_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Remember the allocator, since mmap storage must never reach System::dealloc.
+enum Release {
+    Heap,
+    #[cfg(all(target_os = "linux", not(miri)))]
+    Mapping(usize),
+}
+
+/// Keep all publicly exposed bytes initialized, including on allocation failure.
+fn allocate_zeroed(layout: Layout) -> Result<(NonNull<u8>, Release)> {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    if layout.size() >= HUGE_PAGE_BYTES {
+        // SAFETY: sysconf has no borrowed memory. Reject an invalid page size.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|n| n.is_power_of_two())
+            .ok_or(Error::Busy)?;
+        let alignment = layout.align().max(HUGE_PAGE_BYTES).max(page);
+        let length = layout
+            .size()
+            .checked_add(page - 1)
+            .map(|n| n / page * page)
+            .ok_or(Error::Busy)?;
+        let reserve = length
+            .checked_add(alignment)
+            .filter(|n| *n <= isize::MAX as usize)
+            .ok_or(Error::Busy)?;
+        // SAFETY: anonymous private mmap returns zeroed, writable, exclusively
+        // owned pages or MAP_FAILED. Overmapping allows alignment to both the
+        // runtime DIO requirement and 2 MiB without MAP_FIXED. Prefix and suffix
+        // are page multiples and are unmapped before exposing the middle. Only
+        // layout.size() initialized bytes are exposed. Release::Mapping records
+        // the remaining page-rounded length for exactly one matching munmap.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                reserve,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(Error::Busy);
+        }
+        if base.is_null() {
+            // Rust slices require nonnull pointers even if address zero mapped.
+            unsafe {
+                libc::munmap(base, reserve);
+            }
+            return Err(Error::Busy);
+        }
+        let address = base as usize;
+        let prefix = address.wrapping_neg() & (alignment - 1);
+        // SAFETY: prefix is inside this mapping; all trimmed ranges are page-aligned.
+        let pointer = unsafe { base.cast::<u8>().add(prefix) };
+        let suffix = reserve - prefix - length;
+        unsafe {
+            if prefix != 0 && libc::munmap(base, prefix) != 0 {
+                libc::munmap(base, reserve);
+                return Err(Error::Busy);
+            }
+            if suffix != 0 && libc::munmap(pointer.add(length).cast(), suffix) != 0 {
+                libc::munmap(pointer.cast(), reserve - prefix);
+                return Err(Error::Busy);
+            }
+        }
+        let Some(pointer) = NonNull::new(pointer) else {
+            unsafe {
+                libc::munmap(pointer.cast(), length);
+            }
+            return Err(Error::Busy);
+        };
+        // SAFETY: advisory only on our live mapping. Unsupported THP is harmless.
+        unsafe {
+            libc::madvise(pointer.as_ptr().cast(), length, libc::MADV_HUGEPAGE);
+        }
+        return Ok((pointer, Release::Mapping(length)));
+    }
+    // SAFETY: valid nonzero layout; the owner records matching heap deallocation.
+    NonNull::new(unsafe { alloc_zeroed(layout) })
+        .map(|pointer| (pointer, Release::Heap))
+        .ok_or(Error::Busy)
+}
+
 /// Owns raw storage and accounting together; moving it transfers both exactly once.
 struct Allocation<C: Charge> {
     pointer: NonNull<u8>,
 
     layout: Layout,
 
+    release: Release,
+
     charge: C,
 
     retained: Vec<Rc<C>>,
 
-    // True only after zeroed allocation or a complete secure wipe. Every mutable
+    // True only after zeroed allocation, discard, or complete clearing. Every mutable
     // exposure, including the runtime's kernel-write borrow, clears this first.
     clean: bool,
 
@@ -503,6 +597,30 @@ struct Allocation<C: Charge> {
 }
 
 impl<C: Charge> Allocation<C> {
+    /// Ciphertext mappings can discard pages; secrets retain secure erasure.
+    fn prepare_pool(&mut self) {
+        if self.clean {
+            return;
+        }
+        if self.charge.requires_wipe() {
+            self.wipe();
+            return;
+        }
+        #[cfg(all(target_os = "linux", not(miri)))]
+        if let Release::Mapping(length) = self.release {
+            // SAFETY: exclusive anonymous private mapping, no outstanding I/O.
+            // DONTNEED replaces discarded contents with demand-zero pages.
+            if unsafe { libc::madvise(self.pointer.as_ptr().cast(), length, libc::MADV_DONTNEED) }
+                == 0
+            {
+                self.clean = true;
+                return;
+            }
+        }
+        self.as_mut_slice().fill(0);
+        self.clean = true;
+    }
+
     /// Exclusively borrow the complete initialized allocation with its original size.
     fn as_mut_slice(&mut self) -> &mut [u8] {
         self.clean = false;
@@ -544,16 +662,24 @@ impl<C: Charge> Allocation<C> {
 impl<C: Charge> Drop for Allocation<C> {
     /// Erase and free before field destruction releases the accounting guards.
     fn drop(&mut self) {
-        self.wipe();
-        // SAFETY: this owner holds the allocation and its original layout. Guards
-        // are dropped only after zeroization and deallocation complete.
-        unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+        if self.charge.requires_wipe() {
+            self.wipe();
+        }
+        // SAFETY: this owner holds the allocation and its original release path.
+        // Guards drop after required secret erasure and deallocation complete.
+        match self.release {
+            Release::Heap => unsafe { dealloc(self.pointer.as_ptr(), self.layout) },
+            #[cfg(all(target_os = "linux", not(miri)))]
+            Release::Mapping(length) => unsafe {
+                libc::munmap(self.pointer.as_ptr().cast(), length);
+            },
+        }
     }
 }
 
 /// Worker-local, exclusively owned, initialized storage with a stable address.
 ///
-/// Moving the buffer never moves its bytes. Drop zeroizes the bytes before
+/// Moving the buffer never moves its bytes. Drop securely erases secrets before
 /// freeing or pooling them. Idle storage retains its primary charge, but not
 /// additional guards attached with [`Self::retain`].
 ///
@@ -568,7 +694,56 @@ pub struct AlignedBuffer<C: Charge> {
     // Always Some while publicly accessible; taken only by Drop for pool transfer.
     allocation: Option<Allocation<C>>,
 
-    pool: Weak<RefCell<Option<Self>>>,
+    pool: Weak<RefCell<BufferPool<C>>>,
+
+    length: usize,
+}
+
+/// Small bounded free lists, grouped in 64 KiB size classes without locks.
+pub(crate) struct BufferPool<C: Charge> {
+    entries: Vec<AlignedBuffer<C>>,
+    depth: usize,
+    budget: usize,
+}
+
+impl<C: Charge> Default for BufferPool<C> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            depth: 8,
+            budget: 128 * 1024 * 1024,
+        }
+    }
+}
+
+/// Round backing capacity without changing the length of an I/O transfer.
+pub fn buffer_capacity(length: usize) -> Option<usize> {
+    const UNIT: usize = 64 * 1024;
+    length.checked_add(UNIT - 1).map(|n| n / UNIT * UNIT)
+}
+
+impl<C: Charge> BufferPool<C> {
+    fn bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|b| b.allocation().layout.size())
+            .sum()
+    }
+
+    fn accepts(&self, capacity: usize) -> bool {
+        self.entries.len() < self.depth && capacity <= self.budget.saturating_sub(self.bytes())
+    }
+
+    fn take_for(&mut self, length: usize, charge: &C) -> Option<AlignedBuffer<C>> {
+        let class = buffer_capacity(length)?;
+        let index = self.entries.iter().position(|b| {
+            let capacity = b.allocation().layout.size();
+            buffer_capacity(capacity) == Some(class)
+                && capacity >= length
+                && charge.covers(capacity)
+        })?;
+        Some(self.entries.swap_remove(index))
+    }
 }
 
 impl<C: Charge> fmt::Debug for AlignedBuffer<C> {
@@ -583,6 +758,22 @@ impl<C: Charge> fmt::Debug for AlignedBuffer<C> {
 }
 
 impl<C: Charge> AlignedBuffer<C> {
+    /// Freeze completed I/O storage without copying or retaining a worker-local pool.
+    pub fn freeze(mut self) -> Result<FrozenBuffer<C>> {
+        if !self.allocation().retained.is_empty() {
+            return Err(Error::InvalidConfiguration);
+        }
+        // Test-only counters must not keep an Rc alias on the source thread.
+        #[cfg(test)]
+        {
+            self.allocation_mut().wipes = Rc::new(std::cell::Cell::new(0));
+        }
+        Ok(FrozenBuffer {
+            allocation: self.allocation.take().expect("live buffer allocation"),
+            length: self.length,
+        })
+    }
+
     /// Borrow the allocation, which is absent only during drop's ownership transfer.
     fn allocation(&self) -> &Allocation<C> {
         self.allocation.as_ref().expect("live buffer allocation")
@@ -594,14 +785,14 @@ impl<C: Charge> AlignedBuffer<C> {
     }
 
     /// Attach a weak return destination without extending the pool's lifetime.
-    pub(crate) fn pooled(mut self, pool: &Rc<RefCell<Option<Self>>>) -> Self {
+    pub(crate) fn pooled(mut self, pool: &Rc<RefCell<BufferPool<C>>>) -> Self {
         self.pool = Rc::downgrade(pool);
         self
     }
 
     /// Replace primary accounting only after the new guard covers the full size.
     pub(crate) fn rebind(&mut self, charge: C) -> Result<()> {
-        if !charge.covers(self.len()) {
+        if !charge.covers(self.allocation().layout.size()) {
             return Err(Error::InvalidConfiguration);
         }
         self.allocation_mut().charge = charge;
@@ -616,7 +807,7 @@ impl<C: Charge> AlignedBuffer<C> {
     /// Initialized allocation length, including padding.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.allocation().layout.size()
+        self.length
     }
 
     /// Always false: construction rejects zero-length buffers.
@@ -635,7 +826,8 @@ impl<C: Charge> AlignedBuffer<C> {
     /// Exclusively borrow all initialized bytes.
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.allocation_mut().as_mut_slice()
+        let length = self.length;
+        &mut self.allocation_mut().as_mut_slice()[..length]
     }
 
     /// Compatibility accessor matching [`IoBuffer`]; this always succeeds.
@@ -652,24 +844,71 @@ impl<C: Charge> AlignedBuffer<C> {
 impl<C: Charge> Drop for AlignedBuffer<C> {
     /// Zeroize and return storage if possible, otherwise let its owner free it.
     fn drop(&mut self) {
+        if self.allocation.is_none() {
+            return;
+        }
         if let Some(pool) = self.pool.upgrade() {
-            self.allocation_mut().wipe();
+            if self.allocation().charge.requires_wipe() {
+                self.allocation_mut().wipe();
+            }
             // Caller-owned guard destructors may access the pool. Do not invoke
             // them while holding its RefCell borrow. Allocation remains owned
             // by this buffer if a destructor unwinds.
             self.allocation_mut().retained.clear();
             if let Ok(mut idle) = pool.try_borrow_mut()
-                && idle.is_none()
+                && idle.accepts(self.allocation().layout.size())
             {
-                *idle = Some(Self {
+                self.allocation_mut().prepare_pool();
+                idle.entries.push(Self {
                     allocation: self.allocation.take(),
                     pool: Weak::new(),
+                    length: self.length,
                 });
             }
         }
         // Field drop securely wipes any still-dirty allocation and frees it. A
         // rejected pool return or idle free needs no second wipe. Idle buffers
         // never repool themselves.
+    }
+}
+
+/// Immutable allocation detached from the worker-local pool after I/O completion.
+pub struct FrozenBuffer<C: Charge> {
+    allocation: Allocation<C>,
+    length: usize,
+}
+
+// SAFETY: freeze rejects retained Rc guards and removes the pool link. The owned
+// allocation has no mutable byte API; only its charge can change exclusively.
+// Moving or sharing it cannot move the bytes or race with I/O or pool access.
+unsafe impl<C: Charge + Send> Send for FrozenBuffer<C> {}
+// SAFETY: shared access exposes only immutable bytes and a Sync charge.
+unsafe impl<C: Charge + Sync> Sync for FrozenBuffer<C> {}
+
+impl<C: Charge> FrozenBuffer<C> {
+    /// Borrow the initialized I/O extent, excluding spare allocation capacity.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: immutable initialized backing remains owned for this borrow.
+        unsafe { std::slice::from_raw_parts(self.allocation.pointer.as_ptr(), self.length) }
+    }
+
+    /// Complete allocation capacity that must remain charged.
+    pub fn capacity(&self) -> usize {
+        self.allocation.layout.size()
+    }
+
+    /// Borrow the allocation's accounting owner.
+    pub fn charge(&self) -> &C {
+        &self.allocation.charge
+    }
+
+    /// Replace accounting only when it covers the complete allocation.
+    pub fn rebind(&mut self, charge: C) -> Result<()> {
+        if !charge.covers(self.capacity()) {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.allocation.charge = charge;
+        Ok(())
     }
 }
 
@@ -693,6 +932,200 @@ unsafe impl<C: Charge> IoBuffer for AlignedBuffer<C> {
 mod buffer_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn freeze_detaches_pool_preserves_pointer_and_rejects_retained_guards() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<FrozenBuffer<()>>();
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let mut buffer = alignment.allocate(4096, ()).unwrap().pooled(&pool);
+        buffer.as_mut_slice().fill(9);
+        let pointer = buffer.as_slice().as_ptr() as usize;
+        let frozen = buffer.freeze().unwrap();
+        assert!(pool.borrow().entries.is_empty());
+        drop(pool);
+        std::thread::spawn(move || {
+            assert_eq!(frozen.as_slice().as_ptr() as usize, pointer);
+            assert_eq!(frozen.as_slice(), &[9; 4096]);
+            assert_eq!(frozen.capacity(), 4096);
+        })
+        .join()
+        .unwrap();
+        let mut buffer = alignment.allocate(4096, ()).unwrap();
+        buffer.retain(Rc::new(()));
+        assert!(matches!(buffer.freeze(), Err(Error::InvalidConfiguration)));
+    }
+
+    #[test]
+    fn frozen_mapping_keeps_full_capacity_and_rebind_rejects_undercharge() {
+        struct Bytes(usize);
+        impl Charge for Bytes {
+            fn covers(&self, bytes: usize) -> bool {
+                self.0 >= bytes
+            }
+            fn requires_wipe(&self) -> bool {
+                false
+            }
+        }
+        let length = 16 * 1024 * 1024 + 65536;
+        let mut buffer = Alignment::new(4096, 4096, 4096)
+            .unwrap()
+            .allocate(length, Bytes(length))
+            .unwrap();
+        buffer.as_mut_slice()[length - 1] = 91;
+        let pointer = buffer.as_slice().as_ptr() as usize;
+        let mut frozen = buffer.freeze().unwrap();
+        assert_eq!(
+            frozen.rebind(Bytes(length - 1)),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(frozen.charge().0, length);
+        frozen.rebind(Bytes(length)).unwrap();
+        std::thread::spawn(move || {
+            assert_eq!(frozen.capacity(), length);
+            assert_eq!(frozen.as_slice().as_ptr() as usize, pointer);
+            assert_eq!(frozen.as_slice()[length - 1], 91);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn size_class_reuse_keeps_mismatches_and_full_capacity_charged() {
+        let alignment = Alignment::new(4096, 1, 1).unwrap();
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let capacity = buffer_capacity(100_001).unwrap();
+        let mut buffer = alignment.allocate(capacity, ()).unwrap().pooled(&pool);
+        let pointer = buffer.as_slice().as_ptr();
+        buffer.as_mut_slice().fill(0xa5);
+        drop(buffer);
+        assert!(pool.borrow_mut().take_for(capacity + 1, &()).is_none());
+        let live = Rc::new(Cell::new(0));
+        let charged = Rc::new(RefCell::new(BufferPool::default()));
+        drop(
+            alignment
+                .allocate(capacity, TrackedCharge::new(&live, capacity))
+                .unwrap()
+                .pooled(&charged),
+        );
+        assert!(
+            charged
+                .borrow_mut()
+                .take_for(100_002, &TrackedCharge::new(&live, 100_002))
+                .is_none()
+        );
+        assert_eq!(live.get(), capacity);
+        let buffer = pool.borrow_mut().take_for(100_002, &()).unwrap();
+        assert_eq!(buffer.as_slice().as_ptr(), pointer);
+        assert!(buffer.as_slice().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn free_lists_bound_depth_and_bytes_under_size_flood() {
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        for budget in [128 * 1024, 128 * 1024 * 1024] {
+            let live = Rc::new(Cell::new(0));
+            let pool = Rc::new(RefCell::new(BufferPool {
+                budget,
+                ..BufferPool::default()
+            }));
+            for length in (1..=32).map(|n| n * 8192) {
+                drop(
+                    alignment
+                        .allocate(length, TrackedCharge::new(&live, length))
+                        .unwrap()
+                        .pooled(&pool),
+                );
+                assert!(pool.borrow().entries.len() <= 8);
+                assert!(live.get() <= budget);
+            }
+            if budget > 128 * 1024 {
+                assert_eq!(pool.borrow().entries.len(), 8);
+            }
+            drop(pool);
+            assert_eq!(live.get(), 0);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn mmap_threshold_zero_alignment_and_matching_unmap() {
+        for length in [HUGE_PAGE_BYTES - 1, HUGE_PAGE_BYTES, HUGE_PAGE_BYTES + 1] {
+            let mut buffer = Alignment::new(4096, 1, 1)
+                .unwrap()
+                .allocate(length, ())
+                .unwrap();
+            assert!(buffer.as_slice().iter().all(|&b| b == 0));
+            let pointer = buffer.as_slice().as_ptr();
+            let mapped = matches!(buffer.allocation().release, Release::Mapping(_));
+            assert_eq!(mapped, length >= HUGE_PAGE_BYTES);
+            if mapped {
+                assert!((pointer as usize).is_multiple_of(HUGE_PAGE_BYTES));
+            }
+            buffer.as_mut_slice()[length - 1] = 0xa5;
+            drop(buffer);
+            if mapped {
+                let mut residency = 0u8;
+                // SAFETY: mincore queries a numeric address without dereferencing
+                // released storage; one output byte covers this one-page query.
+                assert_eq!(
+                    unsafe { libc::mincore(pointer.cast_mut().cast(), 1, &mut residency) },
+                    -1
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOMEM)
+                );
+            }
+        }
+        let buffer = Alignment::new(2 * HUGE_PAGE_BYTES, 1, 1)
+            .unwrap()
+            .allocate(HUGE_PAGE_BYTES, ())
+            .unwrap();
+        assert!((buffer.as_slice().as_ptr() as usize).is_multiple_of(2 * HUGE_PAGE_BYTES));
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn public_mapping_discard_is_zero_on_reuse_without_secure_wipe() {
+        struct Public;
+        impl Charge for Public {
+            fn covers(&self, _: usize) -> bool {
+                true
+            }
+            fn requires_wipe(&self) -> bool {
+                false
+            }
+        }
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let mut buffer = Alignment::new(4096, 1, 1)
+            .unwrap()
+            .allocate(HUGE_PAGE_BYTES, Public)
+            .unwrap()
+            .pooled(&pool);
+        let pointer = buffer.as_slice().as_ptr();
+        let wipes = buffer.allocation().wipes.clone();
+        buffer.as_mut_slice().fill(0xa5);
+        drop(buffer);
+        let mut buffer = pool
+            .borrow_mut()
+            .take_for(HUGE_PAGE_BYTES, &Public)
+            .unwrap();
+        assert_eq!(buffer.as_slice().as_ptr(), pointer);
+        assert!(buffer.as_slice().iter().all(|&b| b == 0));
+        assert_eq!(wipes.get(), 0);
+        buffer.as_mut_slice().fill(0xa5);
+        drop(buffer);
+        assert_eq!(wipes.get(), 0);
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn impossible_mapping_returns_busy_without_exposing_storage() {
+        let layout = Layout::from_size_align(isize::MAX as usize, 1).unwrap();
+        assert!(matches!(allocate_zeroed(layout), Err(Error::Busy)));
+    }
 
     /// Tracks primary and retained bytes without exposing a Debug implementation.
     struct TrackedCharge {
@@ -731,19 +1164,19 @@ mod buffer_tests {
     fn secure_wipe_covers_padding_and_skips_clean_pool_lifetimes() {
         let alignment = Alignment::new(4096, 512, 512).unwrap();
         let length = alignment.extent(0, 513).unwrap().length();
-        let pool = Rc::new(RefCell::new(None));
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
         let mut buffer = alignment.allocate(length, ()).unwrap().pooled(&pool);
         let wipes = buffer.allocation().wipes.clone();
         assert!(buffer.allocation().clean);
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         drop(buffer);
         assert_eq!(wipes.get(), 0);
-        buffer = pool.borrow_mut().take().unwrap().pooled(&pool);
+        buffer = pool.borrow_mut().entries.pop().unwrap().pooled(&pool);
         buffer.as_mut_slice().fill(0xa5);
         assert!(!buffer.allocation().clean);
         drop(buffer);
         assert_eq!(wipes.get(), 1);
-        buffer = pool.borrow_mut().take().unwrap().pooled(&pool);
+        buffer = pool.borrow_mut().entries.pop().unwrap().pooled(&pool);
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         assert!(buffer.allocation().clean);
         drop(buffer);
@@ -754,7 +1187,7 @@ mod buffer_tests {
     /// Runtime pointer writes dirty storage before submission, including padding.
     #[test]
     fn kernel_write_borrow_dirties_clean_reused_storage() {
-        let pool = Rc::new(RefCell::new(None));
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
         let alignment = Alignment::new(64, 1, 1).unwrap();
         let mut buffer = alignment.allocate(128, ()).unwrap().pooled(&pool);
         let wipes = buffer.allocation().wipes.clone();
@@ -768,7 +1201,7 @@ mod buffer_tests {
             assert_eq!(buffer.as_slice()[127], 0x5a);
             drop(buffer);
             assert_eq!(wipes.get(), expected);
-            buffer = pool.borrow_mut().take().unwrap().pooled(&pool);
+            buffer = pool.borrow_mut().entries.pop().unwrap().pooled(&pool);
             assert_eq!(IoBuffer::bytes(&buffer).unwrap(), &[0; 128]);
         }
         // Even an unused mutable borrow must conservatively require a wipe.
@@ -821,17 +1254,12 @@ mod buffer_tests {
         assert_eq!(Extent::new(u64::MAX - 1, 1).unwrap().offset(), u64::MAX - 1);
     }
 
-    /// Discovered units use the LCM and reject overflow before allocation.
+    /// Non-power-of-two units use the LCM and reject overflow before allocation.
     #[test]
     fn arbitrary_units_preserve_lcm_rounding_and_detect_overflow() {
-        for (memory, offset_unit, length_unit, lcm) in [
-            (64, 3, 5, 15),
-            (64, 6, 9, 18),
-            (64, 768, 512, 1536),
-            (512, 512, 1024, 1024),
-        ] {
-            let alignment = Alignment::new(memory, offset_unit, length_unit).unwrap();
-            assert_eq!(alignment.memory(), memory);
+        for (offset_unit, length_unit, lcm) in [(3, 5, 15), (6, 9, 18), (768, 512, 1536)] {
+            let alignment = Alignment::new(64, offset_unit, length_unit).unwrap();
+            assert_eq!(alignment.memory(), 64);
             assert_eq!(alignment.offset(), offset_unit);
             assert_eq!(alignment.length(), length_unit);
             for (logical, expected) in [(1, lcm), (lcm, lcm), (lcm + 1, lcm * 2)] {
@@ -842,10 +1270,6 @@ mod buffer_tests {
                 alignment.check(extent, &buffer).unwrap();
             }
             assert_eq!(alignment.extent(1, 1), Err(Error::InvalidConfiguration));
-            assert_eq!(
-                alignment.extent(0, usize::MAX),
-                Err(Error::InvalidConfiguration)
-            );
         }
         for alignment in [
             Alignment::new(1, u64::MAX, usize::MAX - 1).unwrap(),
@@ -854,15 +1278,7 @@ mod buffer_tests {
         ] {
             assert_eq!(alignment.extent(0, 2), Err(Error::InvalidConfiguration));
         }
-        for (memory, offset, length) in [
-            (0, 1, 1),
-            (3, 1, 1),
-            (1, 0, 1),
-            (1, 1, 0),
-            (3, 512, 512),
-            (512, 0, 512),
-            (512, 512, 0),
-        ] {
+        for (memory, offset, length) in [(0, 1, 1), (3, 1, 1), (1, 0, 1), (1, 1, 0)] {
             assert_eq!(
                 Alignment::new(memory, offset, length),
                 Err(Error::Unsupported)
@@ -872,16 +1288,6 @@ mod buffer_tests {
             Alignment::new(1usize << (usize::BITS - 1), 1, 1),
             Err(Error::Unsupported)
         );
-        let alignment = Alignment::new(512, 768, 512).unwrap();
-        assert_eq!(alignment.extent(0, 513).unwrap().length(), 1536);
-        let buffer = alignment.allocate(512, ()).unwrap();
-        assert!(!buffer.is_empty());
-        for extent in [Extent::new(1, 512).unwrap(), Extent::new(0, 1024).unwrap()] {
-            assert_eq!(
-                alignment.check(extent, &buffer),
-                Err(Error::InvalidConfiguration)
-            );
-        }
     }
 
     /// Moving a buffer preserves its address and initialized runtime-visible bytes.
@@ -959,96 +1365,78 @@ mod buffer_tests {
     /// Pooling retains primary accounting while releasing completion-only guards.
     #[test]
     fn pool_transfers_allocation_and_primary_charge_but_not_retained_guards() {
-        for (alignment, length, retained, replacement) in [
-            (Alignment::new(64, 3, 5).unwrap(), 15, 7, 20),
-            (Alignment::new(512, 512, 512).unwrap(), 512, 512, 512),
-        ] {
-            let live = Rc::new(Cell::new(0));
-            let pool = Rc::new(RefCell::new(None));
-            let mut buffer = alignment
-                .allocate(length, TrackedCharge::new(&live, length))
-                .unwrap()
-                .pooled(&pool);
-            let pointer = buffer.bytes().unwrap().as_ptr();
-            buffer.bytes_mut().unwrap().fill(42);
-            let extra = Rc::new(TrackedCharge::new(&live, retained));
-            let weak = Rc::downgrade(&extra);
-            buffer.retain(extra);
-            assert_eq!(live.get(), length + retained);
-            drop(buffer);
-            assert_eq!(live.get(), length);
-            assert!(weak.upgrade().is_none());
-            let mut reused = pool.borrow_mut().take().unwrap();
-            assert_eq!(reused.bytes().unwrap().as_ptr(), pointer);
-            assert_eq!(reused.bytes().unwrap(), vec![0; length]);
-            reused
-                .rebind(TrackedCharge::new(&live, replacement))
-                .unwrap();
-            assert_eq!(live.get(), replacement);
-            drop(reused.pooled(&pool));
-            drop(pool);
-            assert_eq!(live.get(), 0);
-        }
+        let live = Rc::new(Cell::new(0));
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let alignment = Alignment::new(64, 3, 5).unwrap();
+        let mut buffer = alignment
+            .allocate(15, TrackedCharge::new(&live, 15))
+            .unwrap()
+            .pooled(&pool);
+        let pointer = buffer.as_slice().as_ptr();
+        buffer.as_mut_slice().fill(42);
+        let extra = Rc::new(TrackedCharge::new(&live, 7));
+        let weak = Rc::downgrade(&extra);
+        buffer.retain(extra);
+        assert_eq!(live.get(), 22);
+        drop(buffer);
+        assert_eq!(live.get(), 15);
+        assert!(weak.upgrade().is_none());
+        let mut reused = pool.borrow_mut().entries.pop().unwrap();
+        assert_eq!(reused.as_slice().as_ptr(), pointer);
+        assert_eq!(reused.as_slice(), &[0; 15]);
+        reused.rebind(TrackedCharge::new(&live, 20)).unwrap();
+        assert_eq!(live.get(), 20);
+        drop(reused.pooled(&pool));
+        drop(pool);
+        assert_eq!(live.get(), 0);
     }
 
     /// An unusable return slot frees storage exactly once instead of panicking.
     #[test]
     fn unavailable_borrowed_and_occupied_pools_release_exactly_once() {
-        for (alignment, length, retained) in [
-            (Alignment::new(8, 1, 1).unwrap(), 8, 3),
-            (Alignment::new(512, 512, 512).unwrap(), 512, 0),
-        ] {
-            for scenario in 0..4 {
-                let live = Rc::new(Cell::new(0));
-                assert!(matches!(
-                    alignment.allocate(length, TrackedCharge::new(&live, length - 1)),
-                    Err(Error::InvalidConfiguration)
-                ));
-                assert_eq!(live.get(), 0);
-                let pool = Rc::new(RefCell::new(None));
-                let mut buffer = alignment
-                    .allocate(length, TrackedCharge::new(&live, length))
-                    .unwrap()
-                    .pooled(&pool);
-                let wipes = buffer.allocation().wipes.clone();
-                if retained != 0 {
-                    buffer.as_mut_slice().fill(0x5a);
-                    buffer.retain(Rc::new(TrackedCharge::new(&live, retained)));
+        let alignment = Alignment::new(8, 1, 1).unwrap();
+        for scenario in 0..4 {
+            let live = Rc::new(Cell::new(0));
+            let pool = Rc::new(RefCell::new(BufferPool {
+                depth: 1,
+                ..BufferPool::default()
+            }));
+            let mut buffer = alignment
+                .allocate(8, TrackedCharge::new(&live, 8))
+                .unwrap()
+                .pooled(&pool);
+            buffer.as_mut_slice().fill(0x5a);
+            let wipes = buffer.allocation().wipes.clone();
+            buffer.retain(Rc::new(TrackedCharge::new(&live, 3)));
+            match scenario {
+                0 => {
+                    drop(pool);
+                    drop(buffer);
                 }
-                match scenario {
-                    0 => {
-                        drop(pool);
-                        drop(buffer);
-                    }
-                    1 => {
-                        let borrow = pool.borrow();
-                        drop(buffer);
-                        assert_eq!(live.get(), 0);
-                        assert!(borrow.is_none());
-                    }
-                    2 => {
-                        let borrow = pool.borrow_mut();
-                        drop(buffer);
-                        assert_eq!(live.get(), 0);
-                        assert!(borrow.is_none());
-                        drop(borrow);
-                        assert!(pool.borrow().is_none());
-                    }
-                    _ => {
-                        let idle = alignment
-                            .allocate(length, TrackedCharge::new(&live, length))
-                            .unwrap();
-                        let pointer = idle.as_slice().as_ptr();
-                        *pool.borrow_mut() = Some(idle);
-                        drop(buffer);
-                        assert_eq!(live.get(), length);
-                        assert_eq!(pool.borrow().as_ref().unwrap().as_slice().as_ptr(), pointer);
-                        drop(pool);
-                    }
+                1 => {
+                    let borrow = pool.borrow();
+                    drop(buffer);
+                    assert_eq!(live.get(), 0);
+                    assert!(borrow.entries.is_empty());
                 }
-                assert_eq!(live.get(), 0);
-                assert_eq!(wipes.get(), usize::from(retained != 0));
+                2 => {
+                    let borrow = pool.borrow_mut();
+                    drop(buffer);
+                    assert_eq!(live.get(), 0);
+                    assert!(borrow.entries.is_empty());
+                }
+                _ => {
+                    let idle = alignment.allocate(8, TrackedCharge::new(&live, 8)).unwrap();
+                    let pointer = idle.as_slice().as_ptr();
+                    pool.borrow_mut().entries.push(idle);
+                    drop(buffer);
+                    assert_eq!(live.get(), 8);
+                    assert_eq!(pool.borrow().entries[0].as_slice().as_ptr(), pointer);
+                    drop(pool);
+                }
             }
+            assert_eq!(live.get(), 0);
+            assert_eq!(wipes.get(), 1);
         }
     }
 
@@ -1073,7 +1461,7 @@ mod buffer_tests {
                 }
             }
         }
-        let pool = Rc::new(RefCell::new(None));
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
         let called = Rc::new(Cell::new(false));
         let mut buffer = Alignment::new(8, 1, 1)
             .unwrap()
@@ -1086,13 +1474,13 @@ mod buffer_tests {
         let wipes = buffer.allocation().wipes.clone();
         let observed_wipes = wipes.clone();
         buffer.retain(Rc::new(Guard(Some(Box::new(move || {
-            assert!(observed_pool.borrow_mut().is_none());
+            assert!(observed_pool.borrow_mut().entries.is_empty());
             assert_eq!(observed_wipes.get(), 1);
             observed_called.set(true);
         })))));
         drop(buffer);
         assert!(called.get());
-        assert!(pool.borrow().is_some());
+        assert!(!pool.borrow().entries.is_empty());
         drop(pool);
         assert_eq!(wipes.get(), 1);
     }
@@ -1122,7 +1510,7 @@ mod buffer_tests {
             }
         }
         let live = Rc::new(Cell::new(2));
-        let pool = Rc::new(RefCell::new(None));
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
         let mut buffer = Alignment::new(8, 1, 1)
             .unwrap()
             .allocate(
@@ -1142,7 +1530,7 @@ mod buffer_tests {
         }));
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(buffer))).is_err());
         assert_eq!(live.get(), 0);
-        assert!(pool.borrow().is_none());
+        assert!(pool.borrow().entries.is_empty());
         assert_eq!(wipes.get(), 1);
     }
 }

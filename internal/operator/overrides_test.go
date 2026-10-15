@@ -477,6 +477,46 @@ func TestDropOverridableOperationsKeepsEverythingElse(t *testing.T) {
 	}
 }
 
+func TestNamelessRacerDaemonSetOverrideIsQuarantined(t *testing.T) {
+	env := &component.Env{
+		Client: fake.NewClientBuilder().WithScheme(newReconcilerTestScheme(t)).WithObjects(overridesConfigMap(map[string]string{
+			"racer.yaml": "apiVersion: " + override.APIVersion + "\noverrides:\n  - component: racer\n    kind: DaemonSet\n    extraArgs:\n      dataplane: [--must-not-apply]\n",
+		})).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	snapshot := loadOverrides(t.Context(), env)
+	if snapshot.usable() || len(snapshot.entries) != 0 {
+		t.Fatalf("invalid nameless override must not reach Apply: %+v", snapshot)
+	}
+
+	if err := snapshot.failure(); err == nil || !strings.Contains(err.Error(), "name is required for Racer DaemonSet overrides") {
+		t.Fatalf("expected explicit-name rejection, got %v", err)
+	}
+
+	plan := component.NewPlan()
+	for _, name := range []string{"racer-dataplane", "racer-dataplane-podnet"} {
+		plan.Add(component.Operation{Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", name), Component: "racer", Overridable: true})
+	}
+
+	controller := component.Operation{Kind: component.OpApply, Object: unstructuredOf("apps/v1", "Deployment", "racer-controller"), Component: "racer", Overridable: true}
+	gantry := component.Operation{Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "gantry"), Component: "gantry", Overridable: true}
+	plan.Add(controller, gantry)
+
+	withheld := dropOverridableOperations(plan, snapshot.quarantine())
+	if len(withheld) != 2 || len(plan.Operations) != 2 {
+		t.Fatalf("expected both Racer DaemonSets withheld, got withheld=%v plan=%v", withheld, plan.Operations)
+	}
+
+	if plan.Operations[0].Ref() != controller.Ref() || plan.Operations[1].Ref() != gantry.Ref() {
+		t.Fatal("invalid Racer DaemonSet override must not withhold the controller or Gantry")
+	}
+
+	if report := override.Apply(plan, snapshot.entries, nil); report.Err() != nil || len(report.Workloads) != 0 {
+		t.Fatalf("rejected override must not be applied to any workload: %+v", report)
+	}
+}
+
 func unstructuredOf(apiVersion, kind, name string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": apiVersion,

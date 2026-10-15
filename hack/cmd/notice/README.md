@@ -1,8 +1,10 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod`, `frontend/package.json`, and `cmd/racer-dataplane/Cargo.toml` plus
-the pinned libfabric and OpenSSL source versions in `Makefile`, when present.
+`go.mod`, `frontend/package.json`, `cmd/racer-dataplane/Cargo.toml`, its
+workspace members, and
+`cmd/racer-loadgen/performance/Cargo.toml` plus
+any paired libfabric and OpenSSL source pins in `Makefile` (currently absent).
 
 ## Usage
 
@@ -48,14 +50,14 @@ hack/cmd/notice/
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
-### Retained Racer scaffolding
+### Cargo workspaces and native sources
 
-Cargo and native collectors remain registered for the replacement Racer
-implementation. Cargo collection is inactive when neither `Cargo.toml` nor
-`Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is
+Each Cargo root is inactive when neither `Cargo.toml` nor
+`Cargo.lock` exists; no Cargo registry cache is
 required for a workspace without direct registry dependencies. The collector reads
 the root package and its explicitly declared workspace members using the root
-lockfile; no future members or load generator are required.
+lockfile. The standalone performance crate uses its own lockfile. Neither
+future members nor an absent load generator are required.
 Native collection is inactive when neither native version pin is declared in
 `Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
 
@@ -100,8 +102,9 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
   reads license files from the local Cargo registry source cache for direct
-  dependencies. When the Racer crate has dependencies, populate it with
-  `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
+  dependencies. Populate it with
+  `cargo fetch --manifest-path <crate>/Cargo.toml --locked` for the dataplane
+  and performance roots listed above.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included. Local path dependencies must be declared
   workspace members, including paths in development and target-specific
@@ -117,7 +120,8 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   is parsed by the existing pinned Go TOML library.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
-  `OPENSSL_VERSION` in `Makefile`.
+  `OPENSSL_VERSION` in `Makefile`. With both legacy source pins removed, no native
+  entries are emitted; a partial pair is still rejected.
 - License URL forge dispatch (GitHub, GitLab, cs.opensource.google, Bitbucket)
   lives in `license.BuildURL` as a switch on URL prefix. Add a case here when a
   new forge is needed.

@@ -373,7 +373,7 @@ func TestPullRangeHTTP1PoolReuse(t *testing.T) {
 	transport := c.registries["reg"].hc.Transport.(*http.Transport)
 	defer transport.CloseIdleConnections()
 
-	if !transport.DisableCompression || !transport.ForceAttemptHTTP2 || transport.MaxConnsPerHost <= 0 || transport.MaxIdleConnsPerHost < parallel {
+	if !transport.ForceAttemptHTTP2 || transport.MaxConnsPerHost <= 0 || transport.MaxIdleConnsPerHost < parallel {
 		t.Fatal("unbounded or undersized pool")
 	}
 

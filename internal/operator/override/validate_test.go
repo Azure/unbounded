@@ -29,23 +29,6 @@ func validateFragment(t *testing.T, fragment string) error {
 	return ValidateErr([]SourcedEntry{entryFrom(t, fragment)})
 }
 
-func TestRacerOverrideIsControllerOnly(t *testing.T) {
-	for _, tc := range []struct {
-		name, fragment string
-		wantErr        bool
-	}{
-		{name: "controller", fragment: "component: racer\nkind: Deployment"},
-		{name: "no dataplane", fragment: "component: racer\nkind: DaemonSet", wantErr: true},
-		{name: "no Sites", fragment: "component: racer\nkind: Deployment\nsites: [west]", wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := validateFragment(t, tc.fragment+"\npatch:\n  spec:\n    replicas: 3"); (err != nil) != tc.wantErr {
-				t.Fatalf("validation error = %v", err)
-			}
-		})
-	}
-}
-
 func TestValidateAcceptsRealisticEntries(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -257,6 +240,43 @@ func TestValidateRejectsProtectedPaths(t *testing.T) {
 	}
 }
 
+func TestRacerHostNetworkOverrideRemainsProtected(t *testing.T) {
+	err := validateFragment(t, "component: racer\nkind: DaemonSet\nname: racer-dataplane\npatch:\n  spec:\n    template:\n      spec:\n        hostNetwork: true\n")
+	if err == nil || !strings.Contains(err.Error(), "spec.template.spec.hostNetwork is protected") {
+		t.Fatalf("Racer must opt in through its configuration, not generic overrides: %v", err)
+	}
+}
+
+func TestRacerDaemonSetOverrideRequiresName(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		component string
+		kind      string
+		target    string
+		wantError bool
+	}{
+		{name: "omitted", component: "racer", kind: "DaemonSet", wantError: true},
+		{name: "explicit-empty", component: "racer", kind: "DaemonSet", target: "name: ''\n", wantError: true},
+		{name: "host", component: "racer", kind: "DaemonSet", target: "name: racer-dataplane\n"},
+		{name: "podnet", component: "racer", kind: "DaemonSet", target: "name: racer-dataplane-podnet\n"},
+		{name: "deployment-name-optional", component: "racer", kind: "Deployment"},
+		{name: "other-component-name-optional", component: "gantry", kind: "DaemonSet"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fragment := "component: " + tc.component + "\nkind: " + tc.kind + "\n" + tc.target + "patch:\n  spec:\n    template:\n      metadata:\n        labels:\n          test: value\n"
+
+			err := validateFragment(t, fragment)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "name is required for Racer DaemonSet overrides") {
+					t.Fatalf("expected explicit-name rejection, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
 // TestValidateRejectsDirectivesAtEveryDepth covers directive smuggling. An
 // earlier revision of the design restricted only $patch and $setElementOrder,
 // which was incomplete: the directive namespace is open.
@@ -314,7 +334,7 @@ func TestValidateRejectsExplicitNulls(t *testing.T) {
 
 // TestValidateRejectsReservedMetadataPrefix guards override visibility: a patch
 // that could write the operator's own annotations could hide the fact that an
-// override is in effect, or forge a config hash the reaper gates on.
+// override is in effect, or forge a config hash that suppresses a rollout.
 func TestValidateRejectsReservedMetadataPrefix(t *testing.T) {
 	cases := map[string]string{
 		"workload annotations":     "patch:\n  metadata:\n    annotations:\n      unbounded-cloud.io/override-hash: forged\n",

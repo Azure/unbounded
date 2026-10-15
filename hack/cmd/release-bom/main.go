@@ -39,6 +39,7 @@ var releaseImageNames = []string{
 	"netboot",
 	"orca",
 	"racer-controller",
+	"racer-dataplane",
 	"token-refresher",
 	"unbounded-net-controller",
 	"unbounded-net-node",

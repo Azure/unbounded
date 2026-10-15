@@ -15,7 +15,11 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func (c *blobCatalog) handler() http.Handler {
+func (img *syntheticImage) handler() http.Handler {
+	return catalogFromImages([]*syntheticImage{img}).handler()
+}
+
+func (c *imageCatalog) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 

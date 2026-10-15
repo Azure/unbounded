@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Reuse the parent file without importing the Gantry-specific Services.
+# Rendering requires --load-restrictor LoadRestrictionsNone (see README).
+resources:
+  - ../daemonset.yaml
+  - volume.yaml
+  - service-metrics.yaml
+
+patches:
+  - path: daemonset-patch.yaml
+  # Scope only the workload; ClusterVolume must remain cluster-scoped.
+  - patch: |-
+      - op: add
+        path: /metadata/namespace
+        value: unbounded-system
+    target:
+      group: apps
+      version: v1
+      kind: DaemonSet
+      name: racer-loadgen
+
+images:
+  - name: racer-loadgen
+    newTag: dev

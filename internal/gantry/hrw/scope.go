@@ -3,7 +3,7 @@
 
 // Topology-aware HRW candidate selection (the design doc, the design doc open question).
 //
-// HRW core (TopK / Score / RankOf) is topology-agnostic. This file adds
+// HRW core (TopK / Score) is topology-agnostic. This file adds
 // the candidate-set filter that, depending on configuration, returns
 // either the full cluster view or a single-zone slice.
 

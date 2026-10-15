@@ -10,9 +10,8 @@
 // - Endpoints: GET /v2/, GET /v2/<repo>/blobs/<digest>,
 // GET /v2/<repo>/manifests/<digest>.
 // - Auth: request-scoped delegated Basic/Bearer authorization takes precedence
-// and is used without caching or identity fallback. Without configured shared
-// credentials, the client discovers the upstream /v2/ challenge for containerd.
-// An optional "username:password" file retains the legacy shared-identity flow.
+// and is used without caching or identity fallback. The client discovers the
+// upstream /v2/ challenge for containerd and supports anonymous Bearer exchange.
 // - Failure classification: maps HTTP status and network errors to
 // ifaces.FailureClass for the design doc propagation. Tag-resolution requests are
 // not handled here (the mirror returns 503 on tag manifests so
@@ -35,7 +34,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,10 +51,9 @@ import (
 // Client is the concrete OriginPuller. It fans out to one *registry per
 // configured upstream and routes calls by OriginRef.Registry.
 type Client struct {
-	logger                   *slog.Logger
-	registries               map[string]*registry // keyed by both Name and NSAlias
-	metrics                  metricsHooks
-	delegatedCredentialsOnly bool
+	logger     *slog.Logger
+	registries map[string]*registry // keyed by both Name and NSAlias
+	metrics    metricsHooks
 }
 
 // metricsHooks lets the origin client emit counters without importing the
@@ -84,13 +81,6 @@ type metricsHooks struct {
 
 // Option configures a Client.
 type Option func(*Client)
-
-// WithDelegatedCredentialsOnly disables configured shared credentials, including
-// endpoint user information. Anonymous Bearer exchange remains available.
-// Request-scoped credentials are never replaced with a shared identity.
-func WithDelegatedCredentialsOnly() Option {
-	return func(c *Client) { c.delegatedCredentialsOnly = true }
-}
 
 // WithLogger plumbs a structured logger.
 func WithLogger(l *slog.Logger) Option {
@@ -152,8 +142,7 @@ func (t meteredTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// New builds a Client from the operator config. Unless shared credentials are
-// disabled, it returns an error if an upstream credentials file cannot be read.
+// New builds a Client from the operator config, validating upstream endpoints.
 func New(cfg *config.Config, opts ...Option) (*Client, error) {
 	if cfg == nil || len(cfg.UpstreamRegistries) == 0 {
 		return nil, errors.New("origin: at least one upstream registry required")
@@ -168,17 +157,9 @@ func New(cfg *config.Config, opts ...Option) (*Client, error) {
 	}
 
 	for _, ur := range cfg.UpstreamRegistries {
-		if c.delegatedCredentialsOnly {
-			ur.CredentialsPath = ""
-		}
-
 		r, err := newRegistry(ur, c.logger)
 		if err != nil {
 			return nil, fmt.Errorf("origin: registry %q: %w", ur.Name, err)
-		}
-
-		if c.delegatedCredentialsOnly {
-			r.base.User = nil
 		}
 
 		if c.metrics.onRequest != nil {
@@ -418,22 +399,37 @@ var (
 // ---------------------------------------------------------------------------
 
 type registry struct {
-	name     string
-	base     *url.URL // root of the OCI Distribution v2 API
-	username string
-	password string
-	hc       *http.Client
-	logger   *slog.Logger
+	name   string
+	base   *url.URL // root of the OCI Distribution v2 API
+	hc     *http.Client
+	logger *slog.Logger
 
 	// keeps a single most-recent token per registry. OCI registries
 	// usually issue tokens whose scope covers an entire repo's pulls, so one
 	// token serves manifest + config + many layer requests. A per-scope map
 	// lands when the design doc retries make that worthwhile.
-	tokMu sync.Mutex
-	token *cachedToken
+	tokMu        sync.Mutex
+	token        *cachedToken
+	tokenRefresh *tokenRefresh
 
-	challengeMu sync.Mutex
-	challenge   *cachedAuthenticationChallenge
+	challengeMu     sync.Mutex
+	challenge       *cachedAuthenticationChallenge
+	challengeFlight *challengeFlight
+	challengeErr    error
+	challengeRetry  time.Time
+}
+
+type challengeFlight struct {
+	done    chan struct{}
+	cancel  context.CancelFunc
+	waiters int
+}
+
+type tokenRefresh struct {
+	challenge string
+	done      chan struct{}
+	token     string
+	err       error
 }
 
 type cachedToken struct {
@@ -448,15 +444,18 @@ type cachedAuthenticationChallenge struct {
 }
 
 const (
-	authenticationChallengeTTL  = 30 * time.Minute
-	anonymousRegistryTTL        = time.Minute
-	originDialTimeout           = 30 * time.Second
-	originTLSHandshakeTimeout   = 10 * time.Second
-	originResponseHeaderTimeout = 30 * time.Second
-	originIdleConnTimeout       = 90 * time.Second
+	authenticationChallengeTTL   = 30 * time.Minute
+	anonymousRegistryTTL         = time.Minute
+	originDialTimeout            = 30 * time.Second
+	originTLSHandshakeTimeout    = 10 * time.Second
+	originResponseHeaderTimeout  = 30 * time.Second
+	originIdleConnTimeout        = 90 * time.Second
+	authenticationFailureBackoff = time.Second
 )
 
 func newRegistryHTTPClient() *http.Client {
+	// Registries and token realms are external services. Preserve Go's secure
+	// TLS defaults rather than requiring the owned chair transport's TLS 1.3.
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: originDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
@@ -477,16 +476,11 @@ func newRegistryHTTPClient() *http.Client {
 func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
 	u, err := url.Parse(ur.Endpoint)
 	if err != nil {
-		// Parse errors can include credentials in both the URL and the cause.
-		return nil, errors.New("parse endpoint: invalid URL")
+		return nil, fmt.Errorf("parse endpoint: %w", err)
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, errors.New("endpoint: scheme must be http or https")
-	}
-
-	if u.Hostname() == "" {
-		return nil, errors.New("endpoint: hostname is required")
+		return nil, fmt.Errorf("endpoint %q: scheme must be http or https", ur.Endpoint)
 	}
 
 	r := &registry{
@@ -495,39 +489,11 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 		hc:     newRegistryHTTPClient(),
 		logger: logger.With(slog.String("registry", ur.Name)),
 	}
-	if ur.CredentialsPath != "" {
-		b, err := os.ReadFile(ur.CredentialsPath) //#nosec G304 -- operator-supplied path
-		if err != nil {
-			return nil, fmt.Errorf("read credentials %q: %w", ur.CredentialsPath, err)
-		}
-
-		line := strings.TrimSpace(string(b))
-
-		idx := strings.IndexByte(line, ':')
-		if idx <= 0 || idx == len(line)-1 {
-			return nil, fmt.Errorf("credentials %q: want \"username:password\"", ur.CredentialsPath)
-		}
-
-		r.username = line[:idx]
-		r.password = line[idx+1:]
-	}
 
 	return r, nil
 }
 
 func (r *registry) authenticationChallenge(ctx context.Context) (string, bool, error) {
-	r.challengeMu.Lock()
-	defer r.challengeMu.Unlock()
-
-	if r.challenge != nil && time.Now().Before(r.challenge.expiresAt) {
-		return r.challenge.value, r.challenge.required, nil
-	}
-	// An explicitly configured credential opts into the legacy shared-identity
-	// mode. In that mode Gantry authenticates to origin itself and containerd
-	// does not need to negotiate a requester credential with the mirror.
-	if r.username != "" {
-		return "", false, nil
-	}
 	// Challenge discovery and delegated credentials are HTTPS-only. Reporting
 	// no challenge preserves anonymous HTTP registries; private HTTP registries
 	// cannot use requester-delegated authentication.
@@ -535,43 +501,122 @@ func (r *registry) authenticationChallenge(ctx context.Context) (string, bool, e
 		return "", false, nil
 	}
 
-	u := r.urlWithPath("/v2/")
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", false, err
+		}
+
+		r.challengeMu.Lock()
+		if r.challenge != nil && time.Now().Before(r.challenge.expiresAt) {
+			cached := *r.challenge
+			r.challengeMu.Unlock()
+
+			return cached.value, cached.required, nil
+		}
+
+		if r.challengeErr != nil && time.Now().Before(r.challengeRetry) {
+			err := r.challengeErr
+			r.challengeMu.Unlock()
+
+			return "", false, err
+		}
+
+		flight := r.challengeFlight
+		if flight == nil {
+			// Discovery has no requester credentials or values. Its lifetime is
+			// bounded independently, and the last departing waiter cancels it.
+			probeCtx, cancel := context.WithTimeout(context.Background(), originResponseHeaderTimeout)
+			flight = &challengeFlight{done: make(chan struct{}), cancel: cancel}
+
+			r.challengeFlight = flight
+			go r.refreshAuthenticationChallenge(probeCtx, flight)
+		}
+
+		flight.waiters++
+		r.challengeMu.Unlock()
+
+		select {
+		case <-ctx.Done():
+		case <-flight.done:
+		}
+
+		r.challengeMu.Lock()
+
+		flight.waiters--
+		if flight.waiters == 0 && r.challengeFlight == flight {
+			r.challengeFlight = nil
+
+			flight.cancel()
+		}
+		r.challengeMu.Unlock()
+	}
+}
+
+func (r *registry) refreshAuthenticationChallenge(ctx context.Context, flight *challengeFlight) {
+	defer flight.cancel()
+
+	cached, err := r.probeAuthenticationChallenge(ctx)
+	r.challengeMu.Lock()
+	defer r.challengeMu.Unlock()
+	defer close(flight.done)
+	// A canceled flight must not overwrite a newer probe or its result.
+	if r.challengeFlight != flight {
+		return
+	}
+
+	r.challengeFlight = nil
+	// A resource request may have learned a newer challenge during discovery.
+	if r.challenge != nil && time.Now().Before(r.challenge.expiresAt) {
+		return
+	}
+
+	if err == nil {
+		r.challenge = cached
+		r.challengeErr = nil
+		r.challengeRetry = time.Time{}
+	} else {
+		r.challengeErr = err
+		r.challengeRetry = time.Now().Add(authenticationFailureBackoff)
+	}
+}
+
+func (r *registry) probeAuthenticationChallenge(ctx context.Context) (*cachedAuthenticationChallenge, error) {
+	u := *r.base
 	u.User = nil
+	u.Path = strings.TrimRight(u.Path, "/") + "/v2/"
+	u.RawQuery = ""
+	u.Fragment = ""
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
 
 	resp, err := r.hc.Do(req)
 	if err != nil {
-		return "", false, fmt.Errorf("probe registry authentication: %w", err)
+		return nil, fmt.Errorf("probe registry authentication: %w", err)
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		r.challenge = &cachedAuthenticationChallenge{
+		return &cachedAuthenticationChallenge{
 			expiresAt: time.Now().Add(anonymousRegistryTTL),
-		}
-
-		return "", false, nil
+		}, nil
 	case http.StatusUnauthorized:
 		challenge, err := validatedAuthenticationChallenge(resp)
 		if err != nil {
-			return "", false, err
+			return nil, err
 		}
 
-		r.challenge = &cachedAuthenticationChallenge{
+		return &cachedAuthenticationChallenge{
 			value:     challenge,
 			required:  true,
 			expiresAt: time.Now().Add(authenticationChallengeTTL),
-		}
-
-		return challenge, true, nil
+		}, nil
 	default:
-		return "", false, fmt.Errorf("registry authentication probe returned %s", resp.Status)
+		return nil, r.classify(ifaces.OriginRef{Registry: r.name}, resp)
 	}
 }
 
@@ -586,6 +631,8 @@ func (r *registry) rememberAuthenticationChallenge(challenge string) {
 		required:  true,
 		expiresAt: time.Now().Add(authenticationChallengeTTL),
 	}
+	r.challengeErr = nil
+	r.challengeRetry = time.Time{}
 	r.challengeMu.Unlock()
 }
 
@@ -650,12 +697,12 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 			// Transport error on the manifest fallback (DNS, RST, ctx
 			// deadline). Must not poison the cluster-wide negative cache
 			// with a definitive NotFound based on a transient blip.
-			return nil, 0, &ifaces.OriginError{Ref: ref, Class: classOf(mErr), StatusCode: statusOf(mErr), Err: mErr}
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: mErr}
 		}
 
 		// Both blob and manifest returned 404 - classify as not-found
 		// without re-issuing the original request.
-		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, StatusCode: http.StatusNotFound, Err: fmt.Errorf("origin: %s not found (blob 404, manifest 404)", ref.Digest)}
+		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin: %s not found (blob 404, manifest 404)", ref.Digest)}
 	}
 
 	if ref.Offset > 0 {
@@ -750,10 +797,10 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 		} else if mErr != nil {
 			// Transport error on the manifest fallback HEAD. Must not
 			// classify as NotFound from a transient failure.
-			return 0, "", &ifaces.OriginError{Ref: ref, Class: classOf(mErr), StatusCode: statusOf(mErr), Err: mErr}
+			return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: mErr}
 		}
 
-		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, StatusCode: http.StatusNotFound, Err: fmt.Errorf("origin HEAD: %s not found (blob 404, manifest 404)", ref.Digest)}
+		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin HEAD: %s not found (blob 404, manifest 404)", ref.Digest)}
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
@@ -775,34 +822,19 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 
 // urlFor returns the full URL for an OriginRef.
 func (r *registry) urlFor(ref ifaces.OriginRef) string {
-	resource := "blobs"
-
 	switch ref.Kind {
 	case ifaces.KindManifest:
-		resource = "manifests"
+		return r.base.String() + "/v2/" + ref.Repository + "/manifests/" + ref.Digest.String()
+	default:
+		return r.base.String() + "/v2/" + ref.Repository + "/blobs/" + ref.Digest.String()
 	}
-
-	u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
-
-	return u.String()
-}
-
-func (r *registry) urlWithPath(path string) url.URL {
-	u := *r.base
-	suffix := url.URL{Path: path}
-	u.RawPath = strings.TrimRight(u.EscapedPath(), "/") + suffix.EscapedPath()
-	u.Path, _ = url.PathUnescape(u.RawPath) //nolint:errcheck // Both parts come from EscapedPath, so unescaping cannot fail.
-	u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
-	u.ForceQuery = false
-
-	return u
 }
 
 // do issues a request, preferring request-scoped delegated Basic/Bearer auth. A
 // delegated credential is used exactly as supplied and is never cached; if it
 // is rejected, the 401 is returned rather than silently changing identity to
-// this node's configured credentials. Without delegated auth, the legacy
-// credentials-file bearer-token flow remains available.
+// another identity. Without delegated auth, anonymous Bearer exchange remains
+// available for public registries that require a token.
 func (r *registry) do(ctx context.Context, method, urlStr string, offset int64) (*http.Response, error) {
 	rangeValue := ""
 	if offset > 0 {
@@ -881,7 +913,7 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 	_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
 	if cachedTok != "" {
-		r.clearToken()
+		r.clearToken(cachedTok)
 	}
 
 	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
@@ -891,19 +923,13 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 			return nil, err
 		}
 
-		if r.canSendBasicAuth() && r.username != "" {
-			retry.SetBasicAuth(r.username, r.password)
-		}
-
 		return r.hc.Do(retry)
 	}
 
-	tok, ttl, err := r.fetchBearerToken(ctx, challenge)
+	tok, err := r.refreshBearerToken(ctx, challenge)
 	if err != nil {
 		return nil, err
 	}
-
-	r.setToken(tok, ttl)
 
 	req2, err := build("Bearer " + tok)
 	if err != nil {
@@ -911,6 +937,64 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 	}
 
 	return r.hc.Do(req2)
+}
+
+// Keep one refresh in flight per registry, not an unbounded map of scopes.
+// Different scopes wait and then negotiate independently. Delegated credentials
+// never enter this path. Every waiter can abandon its wait via its own context.
+func (r *registry) refreshBearerToken(ctx context.Context, challenge string) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
+		r.tokMu.Lock()
+
+		flight := r.tokenRefresh
+		if flight == nil {
+			flight = &tokenRefresh{challenge: challenge, done: make(chan struct{})}
+			r.tokenRefresh = flight
+			// No caller owns the shared exchange. Bound the complete exchange,
+			// including reading the token body, independently of caller lifetime.
+			go r.runTokenRefresh(flight)
+		}
+		r.tokMu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-flight.done:
+		}
+
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
+		if flight.challenge == challenge {
+			return flight.token, flight.err
+		}
+	}
+}
+
+func (r *registry) runTokenRefresh(flight *tokenRefresh) {
+	ctx, cancel := context.WithTimeout(context.Background(), originResponseHeaderTimeout)
+	defer cancel()
+
+	token, ttl, err := r.fetchBearerToken(ctx, flight.challenge)
+	r.tokMu.Lock()
+	defer r.tokMu.Unlock()
+	defer close(flight.done)
+
+	flight.token, flight.err = token, err
+	if r.tokenRefresh != flight {
+		return
+	}
+
+	if err == nil {
+		r.setTokenLocked(token, ttl)
+	}
+
+	r.tokenRefresh = nil
 }
 
 func parseOriginContentRange(value string) (start, end, size int64, ok bool) {
@@ -987,10 +1071,6 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realmURL.String(), nil)
 	if err != nil {
 		return "", 0, err
-	}
-
-	if r.canSendBasicAuth() && r.username != "" {
-		req.SetBasicAuth(r.username, r.password)
 	}
 
 	resp, err := r.hc.Do(req)
@@ -1081,6 +1161,11 @@ func (r *registry) cachedToken() string {
 func (r *registry) setToken(value string, ttl time.Duration) {
 	r.tokMu.Lock()
 	defer r.tokMu.Unlock()
+
+	r.setTokenLocked(value, ttl)
+}
+
+func (r *registry) setTokenLocked(value string, ttl time.Duration) {
 	// Honor the server-advertised TTL (Docker token endpoints emit
 	// expires_in as seconds; OAuth2 the design doc). Apply a 30s safety margin
 	// so requests in flight don't get caught by a token expiring
@@ -1105,11 +1190,13 @@ func (r *registry) setToken(value string, ttl time.Duration) {
 	r.token = &cachedToken{value: value, expiresAt: time.Now().Add(effective)}
 }
 
-func (r *registry) clearToken() {
+func (r *registry) clearToken(rejected string) {
 	r.tokMu.Lock()
 	defer r.tokMu.Unlock()
 
-	r.token = nil
+	if r.token != nil && r.token.value == rejected {
+		r.token = nil
+	}
 }
 
 // classify maps an HTTP status to a the design doc FailureClass and preserves

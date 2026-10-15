@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer-loadgen
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        racer.unbounded-cloud.io/benchmark: zipf-16t-v3
+    spec:
+      nodeSelector:
+        agentpool: ddsv6
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: racer-loadgen
+          args:
+            - --backend=uds
+            - --volume=racer-loadgen
+            - --metrics-listen=:9090
+            - --catalog-blobs=16384
+            - --blob-bytes=1073741824
+            - --catalog-workers=32
+            - --seed=zipf-balanced-v2
+            - --profile=zipf
+            - --zipf-exponent=1.1
+            - --concurrency=16
+            - --concurrency-file=/etc/racer-loadgen-control/concurrency
+            - --blob-concurrency=1
+            - --pull-timeout=2m
+            - --retry-delay=1s
+            - --interval=0s
+            - --verify=false
+            - --start-delay=10s
+            - --startup-timeout=120m
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 780
+          volumeMounts:
+            - name: load-control
+              mountPath: /etc/racer-loadgen-control
+              readOnly: true
+      volumes:
+        - name: load-control
+          configMap:
+            name: racer-loadgen-control
