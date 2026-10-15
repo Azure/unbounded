@@ -134,13 +134,13 @@ func TestBadRequests(t *testing.T) {
 	}))
 
 	for _, test := range []struct{ method, path, header, value string }{
-		{"POST", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Racer-Page-Credits", "0"},
-		{"POST", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Racer-Byte-Credits", "1"},
-		{"POST", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Range", "bytes=-1"},
+		{"POST", wire.ObjectPrefix + strings.Repeat("0", 64), "Racer-Page-Credits", "0"},
+		{"POST", wire.ObjectPrefix + strings.Repeat("0", 64), "Racer-Byte-Credits", "1"},
+		{"POST", wire.ObjectPrefix + strings.Repeat("0", 64), "Range", "bytes=-1"},
 		{"HEAD", "/invalid", "", ""},
-		{"HEAD", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Cache-Control", "max-age=1, max-age=2"},
-		{"HEAD", wire.ClientObjectPrefix + strings.Repeat("0", 64), "Cache-Control", "max-age=bad"},
-		{"GET", wire.ClientObjectPrefix + strings.Repeat("0", 64), "", ""},
+		{"HEAD", wire.ObjectPrefix + strings.Repeat("0", 64), "Cache-Control", "max-age=1, max-age=2"},
+		{"HEAD", wire.ObjectPrefix + strings.Repeat("0", 64), "Cache-Control", "max-age=bad"},
+		{"GET", wire.ObjectPrefix + strings.Repeat("0", 64), "", ""},
 	} {
 		t.Run(test.method+test.path+test.header, func(t *testing.T) {
 			r := httptest.NewRequest(test.method, "http://racer"+test.path, nil)
@@ -221,7 +221,7 @@ func TestOriginResponses(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				if _, err := fmt.Fprintf(conn, "%s %s%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: Bearer test\r\nRacer-Metadata: opaque\r\n\r\n", method, wire.ClientObjectPrefix, strings.Repeat("0", 64)); err != nil {
+				if _, err := fmt.Fprintf(conn, "%s %s%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: Bearer test\r\nRacer-Metadata: opaque\r\n\r\n", method, wire.ObjectPrefix, strings.Repeat("0", 64)); err != nil {
 					t.Fatal(err)
 				}
 
@@ -462,7 +462,7 @@ func TestCopySlice(t *testing.T) {
 }
 
 func TestSubscriptionWithoutHijacker(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPost, "http://racer"+wire.ClientObjectPrefix+strings.Repeat("0", 64), nil)
+	r := httptest.NewRequest(http.MethodPost, "http://racer"+wire.ObjectPrefix+strings.Repeat("0", 64), nil)
 	r.RequestURI = r.URL.Path
 	r.Header.Set("Content-Length", "0")
 	NewHandler(roundTripFunc(func(*http.Request) (*http.Response, error) {

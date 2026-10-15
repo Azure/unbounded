@@ -22,15 +22,14 @@ import (
 )
 
 const (
-	MaxHeadBytes            = 32 * 1024
-	MaxFieldBytes           = 8192
-	ObjectPrefix            = "/v1/objects/"
-	ClientObjectPrefix      = "/v2/objects/"
-	PageSize                = 16 * 1024 * 1024
-	FrameSize               = 21
-	CreditSize              = 12
-	PageFrame          byte = 1
-	CompleteFrame      byte = 2
+	MaxHeadBytes       = 32 * 1024
+	MaxFieldBytes      = 8192
+	ObjectPrefix       = "/v1/objects/"
+	PageSize           = 16 * 1024 * 1024
+	FrameSize          = 21
+	CreditSize         = 12
+	PageFrame     byte = 1
+	CompleteFrame byte = 2
 )
 
 // ErrorKind classifies wire failures. The SDK maps kinds to its public
@@ -878,26 +877,26 @@ func RequestHeaders(r Request) http.Header {
 
 // RequestHead validates and serializes an origin operation as HTTP/1.1.
 func RequestHead(r Request) ([]byte, error) {
-	return requestHeadAt(r, ObjectPrefix)
+	return requestHead(r, false)
 }
 
-// ClientHead uses the v2 HEAD endpoint without changing origin callbacks.
+// ClientHead serializes a client-socket HEAD, including any retention request.
 func ClientHead(r Request) ([]byte, error) {
 	if r.Operation != OperationHead {
 		return nil, failure(ErrorInvalidArgument, "client HEAD", nil)
 	}
 
-	return requestHeadAt(r, ClientObjectPrefix)
+	return requestHead(r, true)
 }
 
-// ParseClientHead translates the v2 HEAD endpoint without changing origin parsing.
+// ParseClientHead parses a client-socket HEAD, including its retention request.
 func ParseClientHead(r *http.Request) (Request, error) {
-	if r.Method != http.MethodHead || !strings.HasPrefix(r.RequestURI, ClientObjectPrefix) {
+	if r.Method != http.MethodHead || !strings.HasPrefix(r.RequestURI, ObjectPrefix) {
 		return Request{}, failure(ErrorInvalidArgument, "request", nil)
 	}
 
 	var raw bytes.Buffer
-	raw.WriteString(r.Method + " " + ObjectPrefix + strings.TrimPrefix(r.RequestURI, ClientObjectPrefix) + " HTTP/1.1\r\nHost: " + r.Host + "\r\n")
+	raw.WriteString(r.Method + " " + r.RequestURI + " HTTP/1.1\r\nHost: " + r.Host + "\r\n")
 
 	if err := r.Header.Write(&raw); err != nil {
 		return Request{}, err
@@ -915,7 +914,7 @@ func ParseClientHead(r *http.Request) (Request, error) {
 	return request, err
 }
 
-func requestHeadAt(r Request, prefix string) ([]byte, error) {
+func requestHead(r Request, client bool) ([]byte, error) {
 	if err := ValidateRequest(r); err != nil {
 		return nil, err
 	}
@@ -926,7 +925,7 @@ func requestHeadAt(r Request, prefix string) ([]byte, error) {
 	}
 
 	var b strings.Builder
-	b.WriteString(method + " " + prefix + hex.EncodeToString(r.Key[:]) + " HTTP/1.1\r\nHost: racer\r\n")
+	b.WriteString(method + " " + ObjectPrefix + hex.EncodeToString(r.Key[:]) + " HTTP/1.1\r\nHost: racer\r\n")
 
 	if r.Range.Present {
 		b.WriteString("Range: " + RangeValue(r.Range) + "\r\n")
@@ -936,7 +935,7 @@ func requestHeadAt(r Request, prefix string) ([]byte, error) {
 		b.WriteString("If-Match: " + r.Pin + "\r\n")
 	}
 
-	if prefix == ClientObjectPrefix && r.Operation == OperationHead && r.RetainSeconds != 0 {
+	if client && r.Operation == OperationHead && r.RetainSeconds != 0 {
 		b.WriteString("Cache-Control: max-age=" + strconv.FormatUint(r.RetainSeconds, 10) + "\r\n")
 	}
 
@@ -969,7 +968,7 @@ func ParseResponseHead(head []byte, request Request, snapshot *Metadata) (Respon
 	return parseResponseHead(head, request, snapshot, "HEAD, GET")
 }
 
-// ParseClientHeadResponse validates the client-v2 HEAD response, not origin-v1.
+// ParseClientHeadResponse validates a client-socket HEAD response, not an origin one.
 func ParseClientHeadResponse(head []byte, request Request) (Response, error) {
 	if request.Operation != OperationHead {
 		return Response{}, failure(ErrorProtocol, "response", nil)
@@ -1219,7 +1218,7 @@ type SubscriptionOptions struct {
 	Metadata             *Metadata
 }
 
-// SubscriptionHead builds the v2 POST envelope after SDK option validation.
+// SubscriptionHead builds the client POST envelope after SDK option validation.
 func SubscriptionHead(r Request, o SubscriptionOptions) ([]byte, error) {
 	var b strings.Builder
 
@@ -1228,9 +1227,9 @@ func SubscriptionHead(r Request, o SubscriptionOptions) ([]byte, error) {
 		ordered = 1
 	}
 
-	fmt.Fprintf(&b, "POST /v2/objects/%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"+
+	fmt.Fprintf(&b, "POST %s%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"+
 		"Racer-Page-Credits: %d\r\nRacer-Byte-Credits: %d\r\nRacer-Ordered: %d\r\n",
-		hex.EncodeToString(r.Key[:]), o.PageCredits, o.ByteCredits, ordered)
+		ObjectPrefix, hex.EncodeToString(r.Key[:]), o.PageCredits, o.ByteCredits, ordered)
 
 	if o.Offset != 0 || o.Length != 0 {
 		fmt.Fprintf(&b, "Range: bytes=%d-", o.Offset)
@@ -1391,7 +1390,7 @@ func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
 	s := SubscriptionRequest{End: math.MaxInt64, PageCredits: 2, ByteCredits: 2 * PageSize}
 	bad := failure(ErrorInvalidArgument, "fake subscription", nil)
 
-	const prefix = ClientObjectPrefix
+	const prefix = ObjectPrefix
 	if r.Method != http.MethodPost || r.Proto != "HTTP/1.1" || r.Host != "racer" ||
 		len(r.RequestURI) != len(prefix)+64 || !strings.HasPrefix(r.RequestURI, prefix) ||
 		r.Header.Get("Content-Length") != "0" || len(r.TransferEncoding) != 0 || ForbiddenHeaders(r.Header) {
@@ -1636,7 +1635,7 @@ func PageCount(first, end uint64) uint64 {
 }
 
 // Accept checks page identity, shape, uniqueness, ordering, and terminal totals.
-// The operation is supplied to preserve the two SDK consumers' historical diagnostics.
+// The operation names the SDK consumer in diagnostics.
 func (s *Sequence) Accept(f Frame, operation string) error {
 	bad := failure(ErrorProtocol, operation, nil)
 	if s.complete {

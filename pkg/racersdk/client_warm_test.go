@@ -34,7 +34,7 @@ func TestWarmRequestAndResult(t *testing.T) {
 		t.Run(tt.ttl.String(), func(t *testing.T) {
 			c := rawServer(t, func(conn net.Conn, _ *bufio.Reader, head []byte) {
 				h := wire.HeadHeaders(head)
-				if !strings.HasPrefix(string(head), "HEAD /v2/objects/") || h.Get("Cache-Control") != "max-age="+tt.seconds || h.Get("If-Match") != `"v"` || h.Get("Authorization") != "secret" || h.Get("Racer-Metadata") != "opaque" {
+				if !strings.HasPrefix(string(head), "HEAD /v1/objects/") || h.Get("Cache-Control") != "max-age="+tt.seconds || h.Get("If-Match") != `"v"` || h.Get("Authorization") != "secret" || h.Get("Racer-Metadata") != "opaque" {
 					t.Error("wrong warm request")
 				}
 

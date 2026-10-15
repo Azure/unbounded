@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package fakeracer implements a sequential, noncaching v2 Racer test daemon.
-// It fetches whole pages from a v1 origin and is not a compatibility oracle for
+// Package fakeracer implements a sequential, noncaching Racer test daemon.
+// It fetches whole pages from an origin and is not a compatibility oracle for
 // the real Racer runtime. Socket ownership belongs to the caller.
 package fakeracer
 
@@ -15,15 +15,15 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
-// NewHandler serves v2 HEAD and subscriptions through transport, which must
-// reach a v1 origin at http://racer. The caller owns transport and server lifetime,
+// NewHandler serves client-socket HEAD and subscriptions through transport, which
+// must reach an origin at http://racer. Client and origin requests share one
+// object path, so the caller must expose this handler only on the client socket. The caller owns transport and server lifetime,
 // including canceling request contexts to close hijacked subscription sockets.
 func NewHandler(transport http.RoundTripper) http.Handler {
 	return NewHandlerWithWarm(transport, nil)
@@ -36,7 +36,7 @@ type WarmPolicy func(context.Context, wire.Request, wire.Metadata) (time.Time, e
 // NewHandlerWithWarm adds a scripted warming policy. Nil refuses all retention.
 func NewHandlerWithWarm(transport http.RoundTripper, warm WarmPolicy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && strings.HasPrefix(r.RequestURI, wire.ClientObjectPrefix) {
+		if r.Method == http.MethodPost {
 			serveSubscription(w, r, transport)
 			return
 		}
