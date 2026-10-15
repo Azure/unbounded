@@ -4275,6 +4275,40 @@ def wait_for_nspawn_machine(machine: str, timeout_secs: int = 300) -> None:
     die(f"timed out waiting for nspawn machine '{machine}' after host reboot")
 
 
+def wait_for_machine_shell_success(
+    machine: str,
+    command: str,
+    description: str,
+    timeout_secs: int = 180,
+    interval_secs: int = 3,
+) -> None:
+    """Poll *command* inside *machine* until it succeeds or the deadline passes."""
+
+    log(f"Waiting until {description} (timeout: {timeout_secs}s)...")
+    deadline = time.monotonic() + timeout_secs
+    attempt = 0
+    last_error = ""
+    while True:
+        attempt += 1
+        result = machine_shell_quiet(machine, command)
+        if result.returncode == 0:
+            log(f"Confirmed {description} after {attempt} attempt(s)")
+            return
+        last_error = (
+            f"exit {result.returncode}; stdout={result.stdout.strip()!r}; "
+            f"stderr={result.stderr.strip()!r}"
+        )
+        log(f"  attempt {attempt}: {description} not yet true ({last_error})")
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval_secs)
+
+    die(
+        f"timed out after {timeout_secs}s and {attempt} attempt(s) waiting until "
+        f"{description} in nspawn machine '{machine}'; last error: {last_error}"
+    )
+
+
 def validate_device_refresh_after_host_reboot() -> None:
     """Verify a device appearing during host boot is usable inside nspawn."""
 
@@ -4346,10 +4380,15 @@ EOF
 
     # The manager property verifies the service-level permission was reloaded;
     # reading the device verifies that the refreshed bind is usable in nspawn.
-    machine_shell(
+    # `machinectl show` succeeds as soon as nspawn registers the machine, and
+    # the node's Ready condition can still be the stale pre-reboot value, so
+    # the container's init may not accept `machinectl shell` yet. Poll the
+    # in-container check instead of running it once.
+    wait_for_machine_shell_success(
         machine,
         f"test -c {DEVICE_REFRESH_PATH} && "
         f"dd if={DEVICE_REFRESH_PATH} of=/dev/null bs=1 count=1 status=none",
+        "refreshed device is usable inside nspawn",
     )
 
     log("Device discovery refresh after VM host reboot validated")
