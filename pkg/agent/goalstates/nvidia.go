@@ -368,10 +368,67 @@ const (
 	driDir            = "/dev/dri"
 	nvidiaDevPrefix   = "nvidia"
 
-	nvidiaIMEXQualificationPath = "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json"
+	azureLinuxNVIDIAQualificationProfile         = "hillsboro-gb200-gpu-operator-ready"
+	azureLinuxNVIDIAQualificationProfileVersion  = "v2026.10.14-1"
+	azureLinuxNVIDIAQualificationContractVersion = "hillsboro.nvidia-host-capabilities/v1"
+	azureLinuxNVIDIAQualificationResultVersion   = "hillsboro-gb200-acceptance/v1"
+	azureLinuxNVIDIAQualificationPath            = "/etc/unbounded/host-capabilities/nvidia-gpu-operator.json"
 )
 
+type nvidiaQualificationContract struct {
+	profile         string
+	profileVersion  string
+	contractVersion string
+	artifactPath    string
+	validateFields  func([]byte) error
+	validate        func(*NVIDIAIMEXQualification, NvidiaHost, string) error
+}
+
+type nvidiaQualificationContractKey struct {
+	profile        string
+	profileVersion string
+}
+
+var azureLinuxNVIDIAQualificationContract = nvidiaQualificationContract{
+	profile:         azureLinuxNVIDIAQualificationProfile,
+	profileVersion:  azureLinuxNVIDIAQualificationProfileVersion,
+	contractVersion: azureLinuxNVIDIAQualificationContractVersion,
+	artifactPath:    azureLinuxNVIDIAQualificationPath,
+	validateFields:  validateRequiredAzureLinuxNVIDIAQualificationFields,
+	validate:        validateAzureLinuxNVIDIAQualificationContract,
+}
+
+var nvidiaQualificationContracts = map[nvidiaQualificationContractKey]nvidiaQualificationContract{
+	{
+		profile:        azureLinuxNVIDIAQualificationProfile,
+		profileVersion: azureLinuxNVIDIAQualificationProfileVersion,
+	}: azureLinuxNVIDIAQualificationContract,
+}
+
+func nvidiaQualificationContractFor(profile, profileVersion string) (nvidiaQualificationContract, error) {
+	contract, ok := nvidiaQualificationContracts[nvidiaQualificationContractKey{
+		profile:        profile,
+		profileVersion: profileVersion,
+	}]
+	if ok {
+		return contract, nil
+	}
+
+	return nvidiaQualificationContract{}, fmt.Errorf(
+		"unsupported NVIDIA host qualification profile %s/%s",
+		profile,
+		profileVersion,
+	)
+}
+
 func resolveNVIDIAIMEXQualification(path string) (*NVIDIAIMEXQualification, error) {
+	return resolveNVIDIAIMEXQualificationForContract(azureLinuxNVIDIAQualificationContract, path)
+}
+
+func resolveNVIDIAIMEXQualificationForContract(
+	contract nvidiaQualificationContract,
+	path string,
+) (*NVIDIAIMEXQualification, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read NVIDIA host qualification %s: %w", path, err)
@@ -389,7 +446,7 @@ func resolveNVIDIAIMEXQualification(path string) (*NVIDIAIMEXQualification, erro
 		)
 	}
 
-	if err := validateRequiredNVIDIAQualificationFields(canonical); err != nil {
+	if err := contract.validateFields(canonical); err != nil {
 		return nil, fmt.Errorf("decode NVIDIA host qualification %s: %w", path, err)
 	}
 
@@ -404,6 +461,21 @@ func resolveNVIDIAIMEXQualification(path string) (*NVIDIAIMEXQualification, erro
 
 	if err := ensureJSONEOF(decoder); err != nil {
 		return nil, fmt.Errorf("decode NVIDIA host qualification %s: %w", path, err)
+	}
+
+	if qualification.Profile != contract.profile ||
+		qualification.ProfileVersion != contract.profileVersion ||
+		qualification.ContractVersion != contract.contractVersion {
+		return nil, fmt.Errorf(
+			"NVIDIA host qualification %s identity is %s/%s contract %s, expected %s/%s contract %s",
+			path,
+			qualification.Profile,
+			qualification.ProfileVersion,
+			qualification.ContractVersion,
+			contract.profile,
+			contract.profileVersion,
+			contract.contractVersion,
+		)
 	}
 
 	digest := fmt.Sprintf("%x", sha256.Sum256(canonical))
@@ -457,7 +529,7 @@ func canonicalQualificationJSON(data []byte) ([]byte, error) {
 	return result, nil
 }
 
-func validateRequiredNVIDIAQualificationFields(data []byte) error {
+func validateRequiredAzureLinuxNVIDIAQualificationFields(data []byte) error {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(data, &root); err != nil {
 		return fmt.Errorf("decode qualification object: %w", err)
@@ -943,11 +1015,16 @@ func configureNVIDIAIMEX(
 		return NvidiaHost{}, fmt.Errorf("unsupported NVIDIA IMEX mode %q", imex.Mode)
 	}
 
+	contract, err := nvidiaQualificationContractFor(imex.HostProfile, imex.HostProfileVersion)
+	if err != nil {
+		return NvidiaHost{}, err
+	}
+
 	qualification := nvidia.IMEXQualification
 	if qualification == nil {
 		return NvidiaHost{}, fmt.Errorf(
 			"NVIDIA IMEX DRA mode requires host qualification evidence at %s",
-			nvidiaIMEXQualificationPath,
+			contract.artifactPath,
 		)
 	}
 
@@ -959,13 +1036,16 @@ func configureNVIDIAIMEX(
 	}
 
 	if qualification.Profile != imex.HostProfile ||
-		qualification.ProfileVersion != imex.HostProfileVersion {
+		qualification.ProfileVersion != imex.HostProfileVersion ||
+		qualification.ContractVersion != contract.contractVersion {
 		return NvidiaHost{}, fmt.Errorf(
-			"NVIDIA IMEX DRA host qualification is %s/%s, expected %s/%s",
+			"NVIDIA IMEX DRA host qualification is %s/%s contract %s, expected %s/%s contract %s",
 			qualification.Profile,
 			qualification.ProfileVersion,
+			qualification.ContractVersion,
 			imex.HostProfile,
 			imex.HostProfileVersion,
+			contract.contractVersion,
 		)
 	}
 
@@ -977,7 +1057,7 @@ func configureNVIDIAIMEX(
 		)
 	}
 
-	if err := validateNVIDIAQualificationContract(qualification, nvidia, hostDistro); err != nil {
+	if err := contract.validate(qualification, nvidia, hostDistro); err != nil {
 		return NvidiaHost{}, err
 	}
 
@@ -1029,15 +1109,12 @@ func configureNVIDIAIMEX(
 	return nvidia, nil
 }
 
-func validateNVIDIAQualificationContract(
+func validateAzureLinuxNVIDIAQualificationContract(
 	qualification *NVIDIAIMEXQualification,
 	nvidia NvidiaHost,
 	hostDistro string,
 ) error {
 	const (
-		profileName          = "hillsboro-gb200-gpu-operator-ready"
-		contractVersion      = "hillsboro.nvidia-host-capabilities/v1"
-		resultVersion        = "hillsboro-gb200-acceptance/v1"
 		driverVersion        = "580.159.04"
 		driverPackage        = "cuda-open-hwe-580.159.04-2_6.18.48.1.1.azl3.aarch64"
 		fabricManagerPackage = "nvidia-fabric-manager-580.159.04-1.azl3.aarch64"
@@ -1046,8 +1123,9 @@ func validateNVIDIAQualificationContract(
 	)
 
 	if qualification.SchemaVersion != 1 ||
-		qualification.Profile != profileName ||
-		qualification.ContractVersion != contractVersion {
+		qualification.Profile != azureLinuxNVIDIAQualificationProfile ||
+		qualification.ProfileVersion != azureLinuxNVIDIAQualificationProfileVersion ||
+		qualification.ContractVersion != azureLinuxNVIDIAQualificationContractVersion {
 		return fmt.Errorf("NVIDIA IMEX DRA qualification schema, profile, or contract version is unsupported")
 	}
 
@@ -1173,8 +1251,8 @@ func validateNVIDIAQualificationContract(
 		}
 	}
 
-	if qualification.Acceptance.ContractVersion != contractVersion ||
-		qualification.Acceptance.ResultVersion != resultVersion ||
+	if qualification.Acceptance.ContractVersion != azureLinuxNVIDIAQualificationContractVersion ||
+		qualification.Acceptance.ResultVersion != azureLinuxNVIDIAQualificationResultVersion ||
 		qualification.Acceptance.Status != "qualified" ||
 		qualification.Acceptance.QualifiedAt == nil ||
 		strings.TrimSpace(*qualification.Acceptance.QualifiedAt) == "" ||
@@ -1197,7 +1275,7 @@ func validateNVIDIAQualificationContract(
 		return fmt.Errorf("NVIDIA IMEX DRA qualification requires four GPUs and healthy verified local NVLink")
 	}
 
-	if qualification.Integrity.ArtifactPath != nvidiaIMEXQualificationPath ||
+	if qualification.Integrity.ArtifactPath != azureLinuxNVIDIAQualificationPath ||
 		qualification.Integrity.Canonicalization != "RFC8785-JCS" ||
 		qualification.Integrity.Encoding != "UTF-8-without-BOM" ||
 		qualification.Integrity.TrailingNewline ||

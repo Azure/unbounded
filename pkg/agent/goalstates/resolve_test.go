@@ -80,6 +80,31 @@ func TestValidateNVIDIAIMEXKubernetesVersion(t *testing.T) {
 	}
 }
 
+func TestResolveNSpawnConfigRejectsUnknownNVIDIAProfileBeforeArtifactRead(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{Version: "1.34.3"},
+		NVIDIA: &config.NVIDIAConfig{
+			IMEX: &config.NVIDIAIMEXConfig{
+				Mode:               config.NVIDIAIMEXModeDRA,
+				HostProfile:        "unknown-profile",
+				HostProfileVersion: "v1",
+				HostProfileDigest:  testNVIDIAQualificationDigest,
+			},
+		},
+	}
+
+	_, err := resolveNSpawnConfig(
+		cfg,
+		NSpawnMachineKube1,
+		func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
+	)
+	require.ErrorIs(t, err, ErrNVIDIAHostUnqualified)
+	require.ErrorContains(t, err, "unsupported NVIDIA host qualification profile unknown-profile/v1")
+	require.NotContains(t, err.Error(), "read NVIDIA host qualification")
+}
+
 func TestResolveKubeletAddsIMEXModeLabelWithoutMutatingConfig(t *testing.T) {
 	t.Parallel()
 

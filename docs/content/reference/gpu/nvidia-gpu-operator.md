@@ -157,6 +157,13 @@ Unbounded consumer must not adopt that path or new contract constants until
 the producer commits the final closed schema, canonical qualified artifact,
 sidecar format, digest, and attestation semantics.
 
+The consumer maintains an explicit registry keyed by exact profile and profile
+version. Each entry binds one contract version, canonical artifact path,
+closed-field decoder, and semantic validator. It does not select a contract
+from the detected OS. The existing Azure Linux entry remains supported; the
+Ubuntu profile intentionally has no registry entry until its final contract is
+published.
+
 The prior Azure Linux blocked artifact and digest remain useful only as
 decoder regression fixtures. They do not qualify any Hillsboro node and are
 not the selected rollout contract.

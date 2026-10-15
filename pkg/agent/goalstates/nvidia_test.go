@@ -100,7 +100,7 @@ func validTestNVIDIAQualification() NVIDIAIMEXQualification {
 			FailClosedReasons: []string{},
 		},
 		Integrity: NVIDIAQualificationIntegrity{
-			ArtifactPath:     nvidiaIMEXQualificationPath,
+			ArtifactPath:     azureLinuxNVIDIAQualificationPath,
 			Canonicalization: "RFC8785-JCS",
 			Encoding:         "UTF-8-without-BOM",
 			DigestAlgorithm:  "sha256",
@@ -209,6 +209,48 @@ func TestResolveNVIDIAIMEXQualification(t *testing.T) {
 	require.Equal(t, "580.159.04", got.Driver.Version)
 	require.Equal(t, "nvidia-imex-580.159.04-1.azl3.aarch64", *got.IMEX.Package)
 	require.True(t, validSHA256Digest(got.DocumentDigest))
+}
+
+func TestNVIDIAQualificationContractForRequiresExactProfileAndVersion(t *testing.T) {
+	t.Parallel()
+
+	contract, err := nvidiaQualificationContractFor(
+		azureLinuxNVIDIAQualificationProfile,
+		azureLinuxNVIDIAQualificationProfileVersion,
+	)
+	require.NoError(t, err)
+	require.Equal(t, azureLinuxNVIDIAQualificationContractVersion, contract.contractVersion)
+	require.Equal(t, azureLinuxNVIDIAQualificationPath, contract.artifactPath)
+
+	_, err = nvidiaQualificationContractFor("unknown-profile", azureLinuxNVIDIAQualificationProfileVersion)
+	require.ErrorContains(t, err, "unsupported NVIDIA host qualification profile")
+
+	_, err = nvidiaQualificationContractFor(azureLinuxNVIDIAQualificationProfile, "unknown-version")
+	require.ErrorContains(t, err, "unsupported NVIDIA host qualification profile")
+}
+
+func TestResolveNVIDIAIMEXQualificationRejectsCrossContractSubstitution(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "qualification.json")
+	qualification := validTestNVIDIAQualification()
+	qualification.DocumentDigest = ""
+	encoded, err := json.Marshal(qualification)
+	require.NoError(t, err)
+	data, err := canonicalQualificationJSON(encoded)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	digest := fmt.Sprintf("%x", sha256.Sum256(data))
+	require.NoError(t, os.WriteFile(path+".sha256", []byte(digest+"  "+filepath.Base(path)+"\n"), 0o600))
+
+	otherContract := azureLinuxNVIDIAQualificationContract
+	otherContract.profile = "other-profile"
+	otherContract.profileVersion = "v1"
+	otherContract.contractVersion = "other.contract/v1"
+
+	_, err = resolveNVIDIAIMEXQualificationForContract(otherContract, path)
+	require.ErrorContains(t, err, "identity is")
+	require.ErrorContains(t, err, "expected other-profile/v1 contract other.contract/v1")
 }
 
 func TestResolveNVIDIAIMEXQualificationRejectsUnknownFields(t *testing.T) {
@@ -437,12 +479,29 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		mutate  func(*NvidiaHost)
-		distro  string
-		wantErr string
+		name         string
+		mutate       func(*NvidiaHost)
+		mutateConfig func(*config.NVIDIAIMEXConfig)
+		distro       string
+		wantErr      string
 	}{
 		{name: "supported", distro: hostDistroAzureLinux3},
+		{
+			name: "unsupported profile",
+			mutateConfig: func(imex *config.NVIDIAIMEXConfig) {
+				imex.HostProfile = "unknown-profile"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "unsupported NVIDIA host qualification profile",
+		},
+		{
+			name: "unsupported profile version",
+			mutateConfig: func(imex *config.NVIDIAIMEXConfig) {
+				imex.HostProfileVersion = "unknown-version"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "unsupported NVIDIA host qualification profile",
+		},
 		{
 			name: "missing binaries",
 			mutate: func(host *NvidiaHost) {
@@ -556,12 +615,28 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 			wantErr: "expected hillsboro-gb200-gpu-operator-ready/v2026.10.14-1",
 		},
 		{
+			name: "contract substitution",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.ContractVersion = "other.contract/v1"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "expected hillsboro-gb200-gpu-operator-ready/v2026.10.14-1 contract hillsboro.nvidia-host-capabilities/v1",
+		},
+		{
 			name: "qualification digest mismatch",
 			mutate: func(host *NvidiaHost) {
 				host.IMEXQualification.DocumentDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 			},
 			distro:  hostDistroAzureLinux3,
 			wantErr: "qualification digest",
+		},
+		{
+			name: "artifact path substitution",
+			mutate: func(host *NvidiaHost) {
+				host.IMEXQualification.Integrity.ArtifactPath = "/etc/unbounded/host-capabilities/other.json"
+			},
+			distro:  hostDistroAzureLinux3,
+			wantErr: "integrity contract is unsupported",
 		},
 		{
 			name: "invalid image digest",
@@ -717,7 +792,12 @@ func TestConfigureNVIDIAIMEXDRA(t *testing.T) {
 				tt.mutate(&host)
 			}
 
-			got, err := configureNVIDIAIMEX(host, imex, tt.distro)
+			testIMEX := *imex
+			if tt.mutateConfig != nil {
+				tt.mutateConfig(&testIMEX)
+			}
+
+			got, err := configureNVIDIAIMEX(host, &testIMEX, tt.distro)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				return

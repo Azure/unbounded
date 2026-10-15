@@ -103,6 +103,10 @@ them while the producer status is `not-generated-unqualified`. This remains a
 strict, read-only capability gate. Goal-state resolution occurs before normal
 host preparation and fails unless all of the following are true:
 
+- The configured profile and version select one exact registered contract,
+  which binds its own contract version, artifact path, closed-field decoder,
+  and semantic validator. Host OS detection never selects or substitutes a
+  qualification contract.
 - The final producer artifact records the expected schema, profile and version,
   contract/result versions, immutable image identity, authenticity
   attestation, OS, architecture, exact kernel and kernel-devel, driver branch
