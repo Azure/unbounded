@@ -24,7 +24,7 @@ type diagnosticTargetConfig struct {
 	Target, Namespace                         string
 	Image                                     imageOptions
 	ImageIndices                              []int
-	Iterations, BlobConcurrency              int
+	Iterations, BlobConcurrency               int
 	StartupTimeout, PullTimeout, TotalTimeout string
 }
 
