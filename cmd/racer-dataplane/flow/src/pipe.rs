@@ -800,7 +800,7 @@ mod tests {
 
     /// Consume the head before callbacks can borrow or notify the same queue.
     #[test]
-    fn review_regression_pipe_waker_front_reentry() {
+    fn pipe_waker_front_reentry() {
         let entry = Rc::new(RefCell::new(Some(waker_callbacks::waker())));
         let queue: Waiters = Rc::new(RefCell::new(VecDeque::from([entry.clone()])));
         let callback_queue = queue.clone();
@@ -827,7 +827,7 @@ mod tests {
 
     /// Dropping a replaced registration may synchronously notify the new target.
     #[test]
-    fn review_regression_pipe_waker_replacement_reentry() {
+    fn pipe_waker_replacement_reentry() {
         let pool = new_pool(admission(1));
         let held = pool.acquire().unwrap();
         let mut wait = acquire_wait(&pool);
@@ -856,7 +856,7 @@ mod tests {
 
     /// Consumed notifications rearm on each poll and preserve FIFO progress.
     #[test]
-    fn review_regression_pipe_waker_rearms_and_advances_fifo() {
+    fn pipe_waker_rearms_and_advances_fifo() {
         let quotas = admission(1);
         let pool = new_pool(quotas.clone());
         let held = pool.acquire().unwrap();
@@ -996,7 +996,7 @@ mod tests {
 
     /// Reservation callbacks cannot let an outer wait overfill a reentered queue.
     #[test]
-    fn review_regression_waiter_limit_after_reserve_reentry() {
+    fn waiter_limit_after_reserve_reentry() {
         let quotas = admission(1);
         let pool = Rc::new(PipePool::new(
             quotas.clone(),
@@ -1047,7 +1047,7 @@ mod tests {
 
     /// Subscription sees its own queue slot before it tries a nested acquisition.
     #[test]
-    fn review_regression_waiter_limit_during_subscribe_reentry() {
+    fn waiter_limit_during_subscribe_reentry() {
         let quotas = admission(1);
         let pool = PipePool::new(
             quotas.clone(),
@@ -1084,7 +1084,7 @@ mod tests {
 
     /// Unwinding a subscription removes its published slot and releases its charge.
     #[test]
-    fn review_regression_subscription_panic_rolls_back_waiting() {
+    fn subscription_panic_rolls_back_waiting() {
         let quotas = admission(1);
         let pool = new_pool(quotas.clone());
         let _held = pool.acquire().unwrap();
@@ -1363,7 +1363,7 @@ mod tests {
 
     /// Stop observation drains idle owners but leaves active work and waiters owned.
     #[test]
-    fn review_regression_stop_drains_idle_on_all_acquisition_paths() {
+    fn stop_drains_idle_on_all_acquisition_paths() {
         use std::io::Read;
 
         for path in 0..3 {
@@ -1453,7 +1453,7 @@ mod tests {
 
     /// Charge destruction may reenter a stopped pool after its idle list is detached.
     #[test]
-    fn review_regression_stop_drain_charge_destructor_reentry() {
+    fn stop_drain_charge_destructor_reentry() {
         let quotas = admission(2);
         let pool = Rc::new(new_pool(quotas.clone()));
         let first = pool.acquire().unwrap();
@@ -1493,7 +1493,7 @@ mod tests {
 
     /// Head and tail cancellation keep allocated queue storage within live charges.
     #[test]
-    fn review_regression_canceled_waiter_storage_remains_charged() {
+    fn canceled_waiter_storage_remains_charged() {
         const WAITERS: usize = 1024;
         for keep_tail in [false, true] {
             let quotas = admission(1);

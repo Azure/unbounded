@@ -621,7 +621,7 @@ mod circuit {
 
         /// Failed key cloning must not leave an exclusive probe without an owner.
         #[test]
-        fn review_regression_probe_clone_panic_allows_acquisition_after_timeout() {
+        fn probe_clone_panic_allows_acquisition_after_timeout() {
             use std::{
                 panic::{AssertUnwindSafe, catch_unwind},
                 sync::atomic::{AtomicUsize, Ordering},

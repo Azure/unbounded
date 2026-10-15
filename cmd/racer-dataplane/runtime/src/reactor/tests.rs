@@ -2736,7 +2736,7 @@ mod retry_regressions {
     }
 }
 
-mod review_regressions {
+mod reentrancy_panics_and_shutdown {
     //! Reentrant callbacks, panic isolation, driver failures, and bounded shutdown contracts.
     use super::*;
 

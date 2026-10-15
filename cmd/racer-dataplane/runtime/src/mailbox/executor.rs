@@ -216,7 +216,7 @@ impl<V, B, S: ExecutionScope> Drop for Executor<V, B, S> {
     }
 }
 
-/// Scheduling and fence regressions moved from the application dispatch driver.
+/// Scheduling and fence regression tests for the mailbox executor.
 #[cfg(test)]
 mod tests {
     use super::*;
