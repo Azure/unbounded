@@ -135,21 +135,74 @@ jobs:
           if-no-files-found: ignore
 
   # ---------- Racer Rust workspace ----------
-  racer-rust:
-    name: Racer Rust Workspace
-    # Library real-I/O tests need a VM rather than a seccomp-restricted container.
+  # Lint, the two workspace feature sets, and the production gates run as
+  # separate jobs so they build and test concurrently. Lint runs no tests, so
+  # formatting and Clippy failures report within minutes.
+  racer-rust-lint:
+    name: Racer Rust Lint
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
-      CARGO_BUILD_JOBS: "2"
-      RUST_TEST_THREADS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pinned Rust
         run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+
+      - name: Cache Cargo dependencies and artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
+
+      - name: Check Rust formatting
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check
+
+      - name: Strict runtime Clippy
+        run: |
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --all-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --no-default-features -- -D warnings
+
+      # Keep allocator invocations separate from runtime/workspace builds:
+      # runtime test features must not enable simulation in the production
+      # allocator gate. Clippy also type-checks every allocator target.
+      - name: Strict allocator Clippy
+        run: |
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features --features simulation -- -D warnings
+
+  racer-rust:
+    name: Racer Rust Workspace (${{ matrix.suite }})
+    # Library real-I/O tests need a VM rather than a seccomp-restricted container.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: default features
+            key: default
+            features: ""
+          - suite: all features
+            key: all-features
+            features: --all-features
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
+      RUST_TEST_THREADS: "4"
+      FEATURES: ${{ matrix.features }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Rust
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
 
       - name: Enable io_uring
         run: timeout --signal=TERM --kill-after=10s 300s sudo sysctl -w kernel.io_uring_disabled=0
@@ -161,62 +214,64 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-workspace-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-workspace-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
+            racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
 
-      - name: Check Rust formatting
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check
-
-      - name: Check default features
-        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-targets
+      - name: Check
+        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-targets $FEATURES
 
       # Compile test binaries separately: a cold build of the dataplane test
       # targets takes far longer than running any single step's tests.
-      - name: Build default-feature tests
-        run: timeout --signal=TERM --kill-after=10s 1800s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --no-run
+      - name: Build tests
+        run: timeout --signal=TERM --kill-after=10s 1800s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace $FEATURES --no-run
 
-      - name: Test default features
-        run: timeout --signal=TERM --kill-after=10s 1500s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace
+      - name: Test
+        run: timeout --signal=TERM --kill-after=10s 1500s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace $FEATURES
 
-      - name: Check all features
-        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-targets --all-features
+  racer-rust-gates:
+    name: Racer Rust Production Gates
+    # Real io_uring and direct I/O need a VM rather than a seccomp-restricted container.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
+      RUST_TEST_THREADS: "4"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Build all-feature tests
-        run: timeout --signal=TERM --kill-after=10s 1800s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-features --no-run
+      - name: Set up pinned Rust
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
 
-      - name: Test all features
-        run: timeout --signal=TERM --kill-after=10s 1500s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-features
+      - name: Enable io_uring
+        run: timeout --signal=TERM --kill-after=10s 300s sudo sysctl -w kernel.io_uring_disabled=0
 
-      - name: Strict runtime Clippy
-        run: |
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --all-features -- -D warnings
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --no-default-features -- -D warnings
+      - name: Cache Cargo dependencies and artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
 
       - name: Runtime production real I/O (no simulation)
         env:
           RUNTIME_REQUIRE_IO_URING: "1"
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --no-default-features
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --no-default-features
 
       # Keep allocator invocations separate from runtime/workspace tests: runtime
       # test features must not enable simulation in the production allocator gate.
-      - name: Check allocator production and simulation
-        run: |
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features --features simulation
-
-      - name: Strict allocator Clippy
-        run: |
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features -- -D warnings
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features --features simulation -- -D warnings
-
       - name: Allocator production real I/O (no simulation)
         env:
           PAGE_ALLOC_REQUIRE_REAL_IO: "1"
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features
 
       - name: Test allocator simulation
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features --features simulation
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features --features simulation
 
   racer-verbs:
     name: Racer Verbs (${{ matrix.configuration }})
