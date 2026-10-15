@@ -338,6 +338,21 @@ async fn start_control(
     }
 }
 
+/// Name the worker stage whose error is about to end the worker group. The
+/// process exit message carries only the error, so without this line a fatal
+/// failure cannot be attributed. Cancellation is the normal stop path.
+fn stage_result<T>(worker: WorkerId, stage: &str, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result
+        && *error != Error::Cancelled
+    {
+        eprintln!(
+            "racer-dataplane: worker={} stage={stage} fatal error={error:?}",
+            worker.0
+        );
+    }
+    result
+}
+
 /// A serving listener must stay pending; shutdown permits scoped termination.
 fn listener_completion(
     result: Result<()>,
@@ -353,6 +368,10 @@ fn listener_completion(
             );
         }
         result?;
+        eprintln!(
+            "racer-dataplane: worker={} stage={stage} fatal error=listener exited while serving",
+            worker.0
+        );
         return Err(Error::Unavailable);
     }
     match result {
@@ -1396,6 +1415,8 @@ impl WorkerApplication {
     }
 
     /// Advance bounded service work under this worker's environment and driver queue.
+    /// Any error here ends the worker group and the process, so each stage names
+    /// itself in the log before the error propagates.
     fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
@@ -1405,23 +1426,25 @@ impl WorkerApplication {
         if let Some(hedges) = self.node.hedges.get().filter(|hedges| hedges.enabled()) {
             hedges.poll();
         }
+        let worker = self.worker;
         let budget = work_budget.min(64);
-        self.poll_native(cx)?;
+        stage_result(worker, "native", self.poll_native(cx))?;
         let now = uring_runtime::environment::now();
         if !self.stopping
             && now >= self.placement_retry
             && let Ok(snapshot) = self.snapshots.current()
         {
             let status = self.placement.maintain(&snapshot.membership);
-            self.observe_placement_maintenance(status, now, cx)?;
+            let observed = self.observe_placement_maintenance(status, now, cx);
+            stage_result(worker, "placement-maintenance", observed)?;
         }
         // Independent of placement.maintain being Idle: recovered residents and
         // changed membership need periodic refresh even without foreground reads.
         self.ownership_maintenance.poll(now, self.stopping, || {
             self.candidates.refresh_ownership(self.store.writer.index())
         });
-        self.poll_checkpoint(cx)?;
-        self.poll_ingress(cx, budget)?;
+        stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
+        stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
         self.http.poll_waiters(budget);
         if let Some(gate) = self.node.peer_receive.get() {
             gate.poll_deadlines(budget);
@@ -1430,17 +1453,19 @@ impl WorkerApplication {
         self.metadata
             .poll_deadlines(uring_runtime::environment::now(), budget);
         if !self.stopping {
-            self.poll_cache_preparation(cx)?;
+            let prepared = self.poll_cache_preparation(cx);
+            stage_result(worker, "cache-preparation", prepared)?;
         }
         self.poll_listeners(cx, budget)?;
-        self.poll_writer(cx)?;
+        stage_result(worker, "writer", self.poll_writer(cx))?;
         if !self.stopping {
-            self.poll_control(cx)?;
-            self.refresh_snapshot(&scope(self.timeout)?)?;
+            stage_result(worker, "control", self.poll_control(cx))?;
+            let refreshed = scope(self.timeout).and_then(|turn| self.refresh_snapshot(&turn));
+            stage_result(worker, "snapshot-refresh", refreshed)?;
         }
         let now = uring_runtime::environment::now();
         if now >= self.next_health {
-            self.observe_health()?;
+            stage_result(worker, "health", self.observe_health())?;
             self.next_health = now + Duration::from_millis(100);
         }
         Ok(())
@@ -1548,7 +1573,11 @@ impl WorkerApplication {
                 );
             })?;
         }
-        self.flights.poll_with_context(cx, budget)?;
+        stage_result(
+            self.worker,
+            "read-flights",
+            self.flights.poll_with_context(cx, budget),
+        )?;
         self.clients
             .poll_budgeted(cx, budget)
             .inspect_err(|error| {
@@ -1558,7 +1587,7 @@ impl WorkerApplication {
                 );
             })?;
         if let Some(rdma) = &self.rdma {
-            rdma.progress()?;
+            stage_result(self.worker, "rdma-progress", rdma.progress())?;
         }
         if let Some(result) = poll_task(&mut self.peer_task, cx) {
             listener_completion(result, self.stopping, self.worker, "peer-listener")?;

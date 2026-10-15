@@ -651,7 +651,12 @@ impl uring_runtime::group::Service<RequestScope> for PageCryptoEngine {
         Box::pin(self.environment.scope(async move { scope.check() }))
     }
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        self.drive(cx, work_budget)
+        // A helper error ends the worker group; name it before the process exits.
+        self.drive(cx, work_budget).inspect_err(|error| {
+            if *error != Error::Cancelled {
+                eprintln!("racer-dataplane: stage=crypto-helper fatal error={error:?}");
+            }
+        })
     }
     fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(futures::future::poll_fn(move |cx| {

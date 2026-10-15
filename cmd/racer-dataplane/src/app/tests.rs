@@ -4508,6 +4508,47 @@ mod lifecycle {
         assert_eq!(observations.health.state(), Ok(State::Ready));
     }
 
+    /// Stage attribution only logs: values and every error pass through unchanged.
+    #[test]
+    fn stage_result_passes_values_and_errors_through() {
+        assert_eq!(stage_result(WorkerId(3), "health", Ok(7)), Ok(7));
+        assert_eq!(
+            stage_result::<()>(WorkerId(3), "health", Err(Error::Unavailable)),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(
+            stage_result::<()>(WorkerId(3), "writer", Err(Error::Cancelled)),
+            Err(Error::Cancelled)
+        );
+    }
+
+    /// A serving listener that returns, even successfully, is a fatal failure;
+    /// during shutdown scoped termination is accepted.
+    #[test]
+    fn listener_completion_rejects_exit_while_serving() {
+        let worker = WorkerId(0);
+        assert_eq!(
+            listener_completion(Ok(()), false, worker, "peer-listener"),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(
+            listener_completion(Err(Error::Io), false, worker, "peer-listener"),
+            Err(Error::Io)
+        );
+        assert_eq!(
+            listener_completion(Ok(()), true, worker, "peer-listener"),
+            Ok(())
+        );
+        assert_eq!(
+            listener_completion(Err(Error::Cancelled), true, worker, "peer-listener"),
+            Ok(())
+        );
+        assert_eq!(
+            listener_completion(Err(Error::Io), true, worker, "peer-listener"),
+            Err(Error::Io)
+        );
+    }
+
     /// A worker that observes after another worker began draining keeps the
     /// absorbing lifecycle and reports success rather than a fatal error.
     #[test]

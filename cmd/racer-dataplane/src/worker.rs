@@ -479,6 +479,14 @@ fn drive_local<'a>(
     )
 }
 
+/// Attribute a runtime error that is about to end the worker group. The process
+/// exit message carries only the error, so name the failing stage first.
+fn log_fatal(stage: &str, error: Error) {
+    if error != Error::Cancelled {
+        eprintln!("racer-dataplane: stage={stage} fatal error={error:?}");
+    }
+}
+
 fn lifecycle_scope() -> Result<RequestScope> {
     Ok(RequestScope {
         body_deadlines: None,
@@ -737,12 +745,15 @@ impl Service<RequestScope> for IoService {
     }
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         self.runtime.crypto.register_driver(cx.waker());
-        poll_runtime(&self.runtime)?;
+        poll_runtime(&self.runtime).inspect_err(|error| log_fatal("io-runtime-poll", *error))?;
         if let Ok(service) = &mut self.built {
             service.poll_budgeted(cx, budget)?;
         }
         // Even a zero wait submits SQEs queued during the service turn.
-        self.runtime.reactor.wait(self.wait_timeout(IDLE_WAIT))?;
+        self.runtime
+            .reactor
+            .wait(self.wait_timeout(IDLE_WAIT))
+            .inspect_err(|error| log_fatal("io-reactor-wait", *error))?;
         thread::current().unpark();
         Ok(())
     }
