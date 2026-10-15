@@ -1524,121 +1524,126 @@ fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
     assert_eq!(budget.deadline(), f.scope.deadline.0);
 }
 
+/// In-process peer mesh recording source, destination, and route budgets.
+struct Mesh {
+    signing: Vec<Forwarding>,
+
+    nodes: RefCell<Vec<Rc<crate::read::Coordinator>>>,
+
+    // Keep the recorded wire facts directly comparable in fixture assertions.
+    #[allow(clippy::type_complexity)]
+    calls: RefCell<Vec<(NodeId, NodeId, bool, u32, u8)>>,
+
+    unavailable: RefCell<Vec<NodeId>>,
+
+    admissions: Vec<Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>>,
+}
+struct Peer {
+    mesh: Rc<Mesh>,
+    local: usize,
+}
+impl Peer {
+    fn direct_hedge_available(
+        &self,
+        _: &std::sync::Arc<crate::topology::Membership>,
+        _: &NodeId,
+    ) -> bool {
+        true
+    }
+    fn request_direct<'a>(
+        &'a self,
+        r: PeerRequest,
+        m: std::sync::Arc<crate::topology::Membership>,
+        s: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        self.request(r, m, s)
+    }
+    fn request<'a>(
+        &'a self,
+        request: PeerRequest,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async move {
+            let destination = request.route.destination.clone();
+            let copy = matches!(
+                request.operation,
+                PeerOperation::Page {
+                    mode: FetchMode::CopyOnly,
+                    ..
+                }
+            );
+            self.mesh.calls.borrow_mut().push((
+                node(self.local),
+                destination.clone(),
+                copy,
+                request.route.remaining_attempts,
+                request.route.remaining_links,
+            ));
+            let remote = (0..4).find(|i| node(*i) == destination).unwrap();
+            let (signed, binding) = self.mesh.signing[self.local].sign_request(request)?;
+            let admitted = self.mesh.signing[remote].verify_request(signed)?;
+            let reply_binding = admitted.binding().clone();
+            if self.mesh.calls.borrow().len() == 1 {
+                let mut polls = 0;
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    if polls >= 4 {
+                        Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            let response = if self.mesh.unavailable.borrow().contains(&destination) {
+                PeerResponse::Unavailable
+            } else {
+                let coordinator = self.mesh.nodes.borrow()[remote].clone();
+                crate::peer::server::LocalPageService::serve_peer(
+                    &*coordinator,
+                    admitted,
+                    membership,
+                    scope,
+                )
+                .await?
+            };
+            // Match wire reception: the requester owns ciphertext admission,
+            // not the destination's allocation from this in-process mesh.
+            let response = match response {
+                PeerResponse::Page {
+                    metadata,
+                    ciphertext,
+                } => {
+                    let admission = &self.mesh.admissions[self.local];
+                    let copy = crate::memory::BufferPool::new(admission.clone()).ciphertext(
+                        admission.reserve(
+                            Some(&metadata.version.object.cache),
+                            ResourceClass::Ciphertext,
+                            ciphertext.bytes().len(),
+                        )?,
+                        ciphertext.envelope().clone(),
+                        ciphertext.bytes().to_vec(),
+                    )?;
+                    PeerResponse::Page {
+                        metadata,
+                        ciphertext: copy,
+                    }
+                }
+                other => other,
+            };
+            let response = self.mesh.signing[remote].sign_response(&reply_binding, response);
+            let response = response?;
+            self.mesh.signing[self.local].verify_response(response, &binding)
+        })
+    }
+}
+
 #[test]
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    use crate::peer::server::LocalPageService;
-    use crate::read::Coordinator;
-    /// In-process peer mesh recording source, destination, and route budgets.
-    struct Mesh {
-        signing: Vec<Forwarding>,
-
-        nodes: RefCell<Vec<Rc<Coordinator>>>,
-
-        // Keep the recorded wire facts directly comparable in fixture assertions.
-        #[allow(clippy::type_complexity)]
-        calls: RefCell<Vec<(NodeId, NodeId, bool, u32, u8)>>,
-
-        unavailable: RefCell<Vec<NodeId>>,
-
-        admissions: Vec<Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>>,
-    }
-    struct Peer {
-        mesh: Rc<Mesh>,
-        local: usize,
-    }
-    impl Peer {
-        fn direct_hedge_available(
-            &self,
-            _: &std::sync::Arc<crate::topology::Membership>,
-            _: &NodeId,
-        ) -> bool {
-            true
-        }
-        fn request_direct<'a>(
-            &'a self,
-            r: PeerRequest,
-            m: std::sync::Arc<crate::topology::Membership>,
-            s: &'a RequestScope,
-        ) -> Operation<'a, VerifiedResponse> {
-            self.request(r, m, s)
-        }
-        fn request<'a>(
-            &'a self,
-            request: PeerRequest,
-            membership: std::sync::Arc<crate::topology::Membership>,
-            scope: &'a RequestScope,
-        ) -> Operation<'a, VerifiedResponse> {
-            Box::pin(async move {
-                let destination = request.route.destination.clone();
-                let copy = matches!(
-                    request.operation,
-                    PeerOperation::Page {
-                        mode: FetchMode::CopyOnly,
-                        ..
-                    }
-                );
-                self.mesh.calls.borrow_mut().push((
-                    node(self.local),
-                    destination.clone(),
-                    copy,
-                    request.route.remaining_attempts,
-                    request.route.remaining_links,
-                ));
-                let remote = (0..4).find(|i| node(*i) == destination).unwrap();
-                let (signed, binding) = self.mesh.signing[self.local].sign_request(request)?;
-                let admitted = self.mesh.signing[remote].verify_request(signed)?;
-                let reply_binding = admitted.binding().clone();
-                if self.mesh.calls.borrow().len() == 1 {
-                    let mut polls = 0;
-                    std::future::poll_fn(|cx| {
-                        polls += 1;
-                        if polls >= 4 {
-                            Poll::Ready(())
-                        } else {
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                    })
-                    .await;
-                }
-                let response = if self.mesh.unavailable.borrow().contains(&destination) {
-                    PeerResponse::Unavailable
-                } else {
-                    let coordinator = self.mesh.nodes.borrow()[remote].clone();
-                    coordinator.serve_peer(admitted, membership, scope).await?
-                };
-                // Match wire reception: the requester owns ciphertext admission,
-                // not the destination's allocation from this in-process mesh.
-                let response = match response {
-                    PeerResponse::Page {
-                        metadata,
-                        ciphertext,
-                    } => {
-                        let admission = &self.mesh.admissions[self.local];
-                        let copy = crate::memory::BufferPool::new(admission.clone()).ciphertext(
-                            admission.reserve(
-                                Some(&metadata.version.object.cache),
-                                ResourceClass::Ciphertext,
-                                ciphertext.bytes().len(),
-                            )?,
-                            ciphertext.envelope().clone(),
-                            ciphertext.bytes().to_vec(),
-                        )?;
-                        PeerResponse::Page {
-                            metadata,
-                            ciphertext: copy,
-                        }
-                    }
-                    other => other,
-                };
-                let response = self.mesh.signing[remote].sign_response(&reply_binding, response);
-                let response = response?;
-                self.mesh.signing[self.local].verify_response(response, &binding)
-            })
-        }
-    }
     for target_rank in [1usize, 2] {
         let hedge_metrics = crate::telemetry::Metrics::default();
         let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
@@ -2533,4 +2538,159 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
     assert_eq!(budget.deadline(), deadline);
     assert_eq!(f.origin.calls.get(), 0);
     assert_unpublished(&f);
+}
+
+/// A non-owner in `Spread` mode sends its first Acquire to the owner chosen by
+/// its visiting order. A non-primary owner then checks its local copy, probes
+/// its predecessors CopyOnly, and fills from origin. `Primary` mode keeps the
+/// legacy primary-first order.
+#[test]
+fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
+    use crate::read::candidates::ReplicaSelection;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for selection in [ReplicaSelection::Primary, ReplicaSelection::Spread] {
+        let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
+        let (_, ordered) = install_peers(&mut fixtures[0], None);
+        let membership = fixtures[0].membership.clone();
+        let source = (0..4).find(|i| !ordered.contains(&node(*i))).unwrap();
+        let mesh = Rc::new(Mesh {
+            signing: network(4).into_iter().map(Forwarding::new).collect(),
+            nodes: RefCell::new(Vec::new()),
+            calls: RefCell::new(Vec::new()),
+            unavailable: RefCell::new(Vec::new()),
+            admissions: fixtures
+                .iter()
+                .map(|f| f.fill.dependencies.admission.clone())
+                .collect(),
+        });
+        let mut endpoints = Vec::new();
+        let mut first_rank = None;
+        for (i, f) in fixtures.iter_mut().enumerate() {
+            f.membership = membership.clone();
+            let peers = Rc::new(Peer {
+                mesh: mesh.clone(),
+                local: i,
+            });
+            let policy = CandidatePolicy::new(
+                node(i),
+                Rc::new(Placement::new(16)),
+                Requester::scripted(
+                    peers.clone(),
+                    Peer::direct_hedge_available,
+                    Peer::request,
+                    Peer::request_direct,
+                ),
+                f.fill.dependencies.credentials.clone(),
+                Arc::new(controlplane::Published::new(
+                    crate::control::Snapshot::retention(2),
+                )),
+            )
+            .with_replica_selection(selection);
+            if i == source {
+                let candidates = policy
+                    .candidates(membership.clone(), &f.context.object, f.page.number)
+                    .unwrap();
+                first_rank = policy
+                    .visit_order(&candidates, &f.context.object, f.page.number)
+                    .get(0);
+            }
+            let mut deps = f.fill.dependencies.clone();
+            deps.candidates = Rc::new(policy);
+            f.fill = Fill::new(deps);
+            let (coordinator, endpoint, _) = f.read_graph(
+                Rc::new(f.fill.clone()),
+                &membership,
+                ReadGraphSettings {
+                    name: "replica-selection",
+                    snapshots: 4,
+                    metadata: 16,
+                    window: 1,
+                    stall: Duration::from_secs(10),
+                    seed: None,
+                },
+            );
+            endpoints.push(endpoint);
+            mesh.nodes.borrow_mut().push(coordinator);
+        }
+        let first_rank = first_rank.unwrap();
+        match selection {
+            ReplicaSelection::Primary => assert_eq!(first_rank, 0),
+            // Fixed fixture identities make this deterministic; the spread
+            // case must exercise a non-primary first owner.
+            ReplicaSelection::Spread => assert_ne!(first_rank, 0),
+        }
+        let target = (0..4).find(|i| node(*i) == ordered[first_rank]).unwrap();
+        let mut budget = AcquisitionBudget::new(fixtures[source].scope.deadline.0, 32, 96);
+        let source_fill = fixtures[source].fill.clone();
+        let page = fixtures[source].page.clone();
+        let context = OriginContext {
+            object: fixtures[source].context.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let scope = fixtures[source].scope.clone();
+        let mut read =
+            Box::pin(source_fill.acquire(page, membership.clone(), &context, &scope, &mut budget));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut result = None;
+        for _ in 0..512 {
+            uring_runtime::drivers::poll(&mut cx, 64);
+            for f in &mut fixtures {
+                uring_runtime::group::Service::poll_budgeted(
+                    &mut f.engine,
+                    &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                    64,
+                )
+                .unwrap();
+                f.crypto.poll_budgeted(64).unwrap();
+            }
+            if let Poll::Ready(done) = read.as_mut().poll(&mut cx) {
+                result = Some(done);
+                break;
+            }
+        }
+        assert_eq!(
+            result
+                .expect("bounded replica-selection read")
+                .unwrap_or_else(|e| panic!(
+                    "{selection:?} failed {e:?}; calls={:?}",
+                    mesh.calls.borrow()
+                ))
+                .plaintext
+                .bytes(),
+            b"abc"
+        );
+        drop(read);
+        let calls = mesh.calls.borrow();
+        let from_source: Vec<_> = calls
+            .iter()
+            .filter(|(from, ..)| *from == node(source))
+            .collect();
+        // Exactly one remote attempt: the first visited owner serves the page.
+        assert_eq!(from_source.len(), 1, "{calls:?}");
+        let (_, to, copy, attempts, links) = from_source[0];
+        assert_eq!(*to, ordered[first_rank]);
+        assert!(!copy, "a non-owner sends Acquire");
+        if first_rank > 0 {
+            // Funded by canonical rank: sender, one probe per predecessor, origin.
+            assert_eq!(*attempts, first_rank as u32 + 1);
+            assert_eq!(*links, 8);
+        }
+        // The serving owner probes exactly its predecessors, CopyOnly, in rank order.
+        let probes: Vec<_> = calls
+            .iter()
+            .filter(|(from, ..)| *from == node(target))
+            .map(|(_, to, copy, ..)| {
+                assert!(copy, "an owner never forwards acquisition");
+                to.clone()
+            })
+            .collect();
+        assert_eq!(probes, ordered[..first_rank].to_vec());
+        for (i, f) in fixtures.iter().enumerate() {
+            assert_eq!(f.origin.calls.get(), usize::from(i == target));
+        }
+        drop(calls);
+        drop(endpoints);
+    }
 }
