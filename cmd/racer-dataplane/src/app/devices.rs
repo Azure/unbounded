@@ -444,7 +444,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
             );
         }
         let mut hash = Sha256::new();
-        hash.update(b"racer-raw-layout-v2\0");
+        hash.update(b"racer-raw-layout-v1\0");
         hash.update(GUARD_BYTES.to_le_bytes());
         hash.update(GUARD_BYTES.to_le_bytes());
         let mut placements = Vec::with_capacity(count as usize);
@@ -522,8 +522,7 @@ fn lcm(a: u64, b: u64) -> Result<u64> {
 }
 
 #[cfg(test)]
-pub(super) fn recovery_layout_fixture()
--> Vec<(crate::store::checkpoint::CheckpointGeometry, [u8; 32])> {
+pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::CheckpointGeometry> {
     let c = crate::test_support::cluster::config(false);
     let bytes = 6 * c.segment_bytes + 2 * GUARD_BYTES;
     let devices: Vec<_> = ["cache-a", "cache-b"]
@@ -538,16 +537,7 @@ pub(super) fn recovery_layout_fixture()
     let p = plan(devices, &c, 2).unwrap();
     p.workers
         .into_iter()
-        .zip(["cache-a", "cache-b"])
-        .map(|(worker, id)| {
-            let mut legacy = Sha256::new();
-            legacy.update(b"racer-raw-layout-v1\0");
-            for k in 0..6u64 {
-                legacy.update((id.len() as u64).to_le_bytes());
-                legacy.update(id.as_bytes());
-                legacy.update(bytes.to_le_bytes());
-                legacy.update((k * c.segment_bytes).to_le_bytes());
-            }
+        .map(|worker| {
             assert_eq!(worker.placements.len(), 6);
             let mut geometry = crate::store::checkpoint::CheckpointGeometry::new(
                 6 * c.segment_bytes,
@@ -557,7 +547,7 @@ pub(super) fn recovery_layout_fixture()
             )
             .unwrap();
             geometry.layout_digest = worker.digest;
-            (geometry, legacy.finalize().into())
+            geometry
         })
         .collect()
 }
@@ -892,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn every_worker_stays_inside_each_devices_guards_and_v2_digest() {
+    fn every_worker_stays_inside_each_devices_guards_and_digest() {
         let c = config();
         let s = c.segment_bytes;
         let devices = vec![device("a", 5, s), device("b", 6, s)];
@@ -903,12 +893,10 @@ mod tests {
         let p = plan(devices, &c, 3).unwrap();
         let mut used = HashSet::new();
         for worker in &p.workers {
-            let mut v1 = Sha256::new();
-            v1.update(b"racer-raw-layout-v1\0");
-            let mut v2 = Sha256::new();
-            v2.update(b"racer-raw-layout-v2\0");
-            v2.update(GUARD_BYTES.to_le_bytes());
-            v2.update(GUARD_BYTES.to_le_bytes());
+            let mut digest = Sha256::new();
+            digest.update(b"racer-raw-layout-v1\0");
+            digest.update(GUARD_BYTES.to_le_bytes());
+            digest.update(GUARD_BYTES.to_le_bytes());
             for placement in &worker.placements {
                 let (file, bytes, id) = files
                     .iter()
@@ -918,15 +906,12 @@ mod tests {
                 assert!(placement.offset + s <= bytes - GUARD_BYTES);
                 assert_eq!((placement.offset - GUARD_BYTES) % s, 0);
                 assert!(used.insert((file.as_raw_fd(), placement.offset)));
-                for hash in [&mut v1, &mut v2] {
-                    hash.update((id.len() as u64).to_le_bytes());
-                    hash.update(id.as_bytes());
-                    hash.update(bytes.to_le_bytes());
-                    hash.update(placement.offset.to_le_bytes());
-                }
+                digest.update((id.len() as u64).to_le_bytes());
+                digest.update(id.as_bytes());
+                digest.update(bytes.to_le_bytes());
+                digest.update(placement.offset.to_le_bytes());
             }
-            assert_eq!(worker.digest, <[u8; 32]>::from(v2.finalize()));
-            assert_ne!(worker.digest, <[u8; 32]>::from(v1.finalize()));
+            assert_eq!(worker.digest, <[u8; 32]>::from(digest.finalize()));
         }
         assert_eq!(used.len(), 11);
     }

@@ -852,18 +852,19 @@ mod tests {
         }
     }
     #[test]
-    fn guarded_layout_rejects_both_legacy_cuts_and_one_mismatched_worker() {
+    fn layout_digest_rejects_mismatched_cuts_and_one_mismatched_worker() {
         let node = NodeState::default();
         let keys = crate::test_support::security::keys();
         let ids = [WorkerId(0), WorkerId(1)];
         let layouts = super::super::devices::recovery_layout_fixture();
-        let legacy = [layouts[0].1, layouts[1].1];
-        let guarded = [layouts[0].0.layout_digest, layouts[1].0.layout_digest];
-        assert_ne!(legacy, guarded);
+        let guarded = [layouts[0].layout_digest, layouts[1].layout_digest];
+        let mismatched = [[0xa5; 32], [0x5a; 32]];
+        assert_ne!(mismatched[0], guarded[0]);
+        assert_ne!(mismatched[1], guarded[1]);
         let candidate = |sequence, digests: [[u8; 32]; 2]| {
             let mut cut = image(sequence, &ids);
             for (i, shard) in cut.shards.iter_mut().enumerate() {
-                shard.geometry = layouts[i].0;
+                shard.geometry = layouts[i];
                 shard.geometry.layout_digest = digests[i];
                 let segments = Segments::new(shard.geometry.segment_bytes);
                 segments
@@ -881,7 +882,7 @@ mod tests {
             ids.into_iter()
                 .enumerate()
                 .map(|(i, id)| {
-                    let mut g = layouts[i].0;
+                    let mut g = layouts[i];
                     g.layout_digest = digests[i];
                     (id, g)
                 })
@@ -891,12 +892,12 @@ mod tests {
             select(cuts, geometry, &node.workers, (4, 4), &keys, &caches())
         };
         let g = live(guarded);
-        assert!(choose(vec![candidate(2, legacy), candidate(1, legacy)], &g).is_none());
+        assert!(choose(vec![candidate(2, mismatched), candidate(1, mismatched)], &g).is_none());
         let mut mixed = candidate(3, guarded);
-        mixed.shards[1].geometry.layout_digest = legacy[1];
+        mixed.shards[1].geometry.layout_digest = mismatched[1];
         assert!(choose(vec![mixed], &g).is_none());
         let mut mixed = candidate(3, guarded);
-        mixed.shards[1].geometry.layout_digest = legacy[1];
+        mixed.shards[1].geometry.layout_digest = mismatched[1];
         assert_eq!(
             choose(vec![mixed, candidate(2, guarded)], &g)
                 .unwrap()
@@ -1317,7 +1318,7 @@ mod tests {
             cut
         };
         // Real mismatch: page capacity admits two descriptors but the live
-        // catalog admits only one. Previously selection succeeded, install failed.
+        // catalog admits only one. Selection must pick a cut that installs.
         let chosen = select(
             vec![candidate(2, 2), candidate(1, 1)],
             &geometry,
