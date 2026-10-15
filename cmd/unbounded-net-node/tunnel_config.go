@@ -7,8 +7,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/vishvananda/netlink"
@@ -502,6 +504,13 @@ func configureTunnelPeers(
 		// LAN. The host CIDR is a longest-prefix match so it overrides the
 		// supernet ECMP without disturbing pod-CIDR traffic.
 		addPeerBPFEntries(bpfEntries, gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs), underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
+
+		// A gateway without pod CIDRs is health-checked at its own IP through
+		// the tunnel (see gatewayHealthTarget). Pin that IP in the BPF map when
+		// localCidrs keep it out: only probes sent out of unbounded0 explicitly
+		// use this entry, so no kernel route is added and the GENEVE outer
+		// packet still takes the underlay.
+		addPeerBPFEntries(bpfEntries, gatewayProbePins(gwPeer, state.siteRouting.localCIDRs, state.nodePodCIDRs), underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
 	}
 
 	// Store entries for deferred reconcile (after VXLAN and WG entries are added).
@@ -555,6 +564,63 @@ func gatewayPeerReadyForTunnel(gwPeer gatewayPeerInfo) bool {
 	}
 
 	return gwPeer.UnmanagedCNISite && len(gwPeer.RoutedCidrs) > 0
+}
+
+// gatewayHealthTarget returns the address to health-check a shared-tunnel
+// gateway peer at, and the interface the probes must leave through ("" for
+// normal routing). Gateways with pod CIDRs answer on their overlay address.
+// A gateway in a Site with manageCniPlugin=false has none, so it is probed at
+// its internal IPv4 address out of unbounded0: the eBPF program sends the
+// probe through the tunnel, where firewalls between Sites already allow the
+// encapsulation, instead of over the underlay on the health-check port.
+//
+// That needs an IPv4 overlay address on this node (localPodCIDRs) as the probe
+// source, so the reply also comes back through the tunnel. IPv6 has no on-link
+// fallback without a route through unbounded0, so IPv6-only gateways are not
+// probed this way.
+func gatewayHealthTarget(gwPeer gatewayPeerInfo, localPodCIDRs []string) (string, string) {
+	if ip := getHealthIPFromPodCIDRs(gwPeer.PodCIDRs); ip != "" {
+		return ip, ""
+	}
+
+	if gwPeer.TunnelProtocol == "WireGuard" || !gatewayPeerReadyForTunnel(gwPeer) || !hasIPv4CIDR(localPodCIDRs) {
+		return "", ""
+	}
+
+	for _, raw := range gwPeer.InternalIPs {
+		if ip := net.ParseIP(raw); ip != nil && ip.To4() != nil {
+			return ip.String(), unbounded0DeviceName
+		}
+	}
+
+	return "", ""
+}
+
+// gatewayProbePins returns the host CIDR to pin in the BPF map for a gateway
+// probed through the tunnel, unless gatewayBPFPrefixes already includes it
+// (a second nexthop on the same key would make the entry health-filtered).
+func gatewayProbePins(gwPeer gatewayPeerInfo, localCIDRs []netip.Prefix, localPodCIDRs []string) []string {
+	ip, viaIf := gatewayHealthTarget(gwPeer, localPodCIDRs)
+	if viaIf == "" {
+		return nil
+	}
+
+	pin := ipsToHostCIDRs([]string{ip})
+	if slices.Contains(gatewayBPFPrefixes(gwPeer, localCIDRs), pin[0]) {
+		return nil
+	}
+
+	return pin
+}
+
+func hasIPv4CIDR(cidrs []string) bool {
+	for _, cidr := range cidrs {
+		if prefix, err := netip.ParsePrefix(cidr); err == nil && prefix.Addr().Is4() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // addPeerBPFEntries adds LPM trie entries for a set of CIDRs pointing to a

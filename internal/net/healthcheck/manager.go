@@ -118,6 +118,13 @@ func (m *Manager) Stop() {
 // AddPeer registers a new peer for health checking. If the manager is
 // already running, the session starts immediately.
 func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings HealthCheckSettings) error {
+	return m.AddPeerVia(peerHostname, overlayIP, "", settings)
+}
+
+// AddPeerVia registers a peer whose probes leave through the named interface
+// regardless of the routing table, for example a tunnel device whose eBPF
+// program forwards them to the peer. An empty viaIf routes probes normally.
+func (m *Manager) AddPeerVia(peerHostname string, overlayIP net.IP, viaIf string, settings HealthCheckSettings) error {
 	if err := settings.validate(); err != nil {
 		return err
 	}
@@ -127,7 +134,7 @@ func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings Health
 
 	m.mu.Lock()
 	if existing, exists := m.sessions[peerHostname]; exists {
-		if existing.overlayIP.Equal(overlayIP) {
+		if existing.overlayIP.Equal(overlayIP) && existing.viaIf == viaIf {
 			existing.updateSettings(settings)
 			m.mu.Unlock()
 
@@ -146,6 +153,7 @@ func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings Health
 	s := newSession(sessionConfig{
 		peerHostname:  peerHostname,
 		overlayIP:     overlayIP,
+		viaIf:         viaIf,
 		port:          m.port,
 		localHostname: m.localHostname,
 		settings:      settings,
@@ -161,7 +169,12 @@ func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings Health
 	}
 
 	updatePeerGauges(m.sessions)
-	klog.Infof("healthcheck: added peer %s (%s)", peerHostname, overlayIP)
+
+	if viaIf != "" {
+		klog.Infof("healthcheck: added peer %s (%s via %s)", peerHostname, overlayIP, viaIf)
+	} else {
+		klog.Infof("healthcheck: added peer %s (%s)", peerHostname, overlayIP)
+	}
 
 	return nil
 }
