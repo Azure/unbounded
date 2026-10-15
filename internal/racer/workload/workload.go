@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package workload builds dataplane workloads for the operator.
-// The controller observes workloads but does not deploy them.
+// Package workload builds dataplane workloads. The Unbounded operator deploys
+// them; the controller only observes and authenticates them.
 package workload
 
 import (

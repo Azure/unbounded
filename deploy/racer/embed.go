@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer embeds the controller-only Racer templates applied by the
-// operator. Manifests are rendered in memory with template defaults.
+// Package racer embeds the Racer controller and dataplane templates applied by
+// the operator. Manifests are rendered in memory with template defaults.
 package racer
 
 import (
@@ -17,14 +17,15 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
-// Dataplane workloads and their bootstrap inputs are not operator-managed, so
-// their templates are deliberately excluded.
+// The dataplane DaemonSet is built in Go (internal/racer/workload). Bootstrap
+// trust, installation, and create-restriction state are written by the
+// operator directly, so those templates are excluded.
 //
-//go:embed config.yaml.tmpl controller.yaml.tmpl controller-pdb.yaml.tmpl node-restriction.yaml.tmpl rbac.yaml.tmpl
+//go:embed config.yaml.tmpl controller.yaml.tmpl dataplane-config.yaml.tmpl controller-pdb.yaml.tmpl node-restriction.yaml.tmpl rbac.yaml.tmpl
 var sources embed.FS
 
 // Manifests exposes the embedded templates as rendered flat *.yaml names. It
-// contains no dataplane workloads or generated CRDs. The controller image
+// contains no DaemonSet or generated CRDs. The controller image
 // defaults to the binary version; the operator replaces it with its configured
 // registry and tag before applying resources.
 var Manifests fs.FS = manifestFS{}

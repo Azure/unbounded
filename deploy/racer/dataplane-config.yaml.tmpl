@@ -33,8 +33,7 @@ data:
   # RACER_IO_WORKERS: "20"
   # RACER_CRYPTO_HELPERS: "20"
   # The operator preserves administrator data and hashes edits for managed rollout.
-  # Rebuild the operator to ship embedded defaults; regenerate standalone manifests
-  # with make racer-manifests instead of editing generated output.
+  # These defaults are embedded in the operator and only seed a missing ConfigMap.
   # Proposed during authenticated enrollment; explicit Node shares take precedence.
   RACER_SHARES: "4"
   # Independent node-wide catalog, page-index and checkpoint working-set budgets.

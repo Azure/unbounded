@@ -25,7 +25,7 @@ data:
   RACER_REPLICATION_SERVER_NAME: {{ printf "racer-controller.%s.svc" (.Namespace | default "unbounded-system") | quote }}
   RACER_REPLICATION_PORT: "8443"
   RACER_SNAPSHOT_MAX_AGE: "30s"
-  # Read-only discovery and authentication of externally managed workloads.
+  # Discovery and authentication of the operator-managed dataplane workload.
   RACER_DATAPLANE_SERVICE_ACCOUNT: "racer-dataplane"
   RACER_DAEMONSET_NAME: "racer-dataplane"
   RACER_CREDENTIALS_SECRET_NAME: {{ .CredentialsSecretName | default "racer-credentials" | quote }}

@@ -477,7 +477,7 @@ also require matching Services, probes, network policy, and monitoring configura
 | `RACER_PEER_PORT` | `8082` | Managed dataplane peer listener and membership publication; 1024..65535 |
 | `RACER_DIAGNOSTICS_PORT` | Unset | Managed dataplane defaults to 9090, or 9091 if peer port is 9090; explicit port must be 1024..65535 and distinct |
 | `RACER_HOST_NETWORK` | `false` | Explicit Racer host-network opt-in; not implied by RDMA |
-| `RACER_POD_NETWORK_NODES` | Unset | JSON array of node names kept on pod networking when host networking is enabled; operator drains before moving between workloads |
+| `RACER_POD_NETWORK_NODES` | Unset | Not supported by operator-managed installations; the controller only enrolls Pods of DaemonSet `racer-dataplane`, so a nonempty value fails reconciliation |
 | `RACER_SNAPSHOT_MAX_AGE` | `30s` | Maximum replicated snapshot age |
 | `RACER_CERTIFICATE_LIFETIME` | `24h` | Dataplane leaf lifetime; 2 minutes..24 hours |
 | `RACER_ROTATION_INTERVAL` / `RACER_ROTATION_PREPARE_FOR` / `RACER_ROTATION_RETAIN_FOR` | `24h` / `1h` / `48h` | Issuer/key rotation policy; interval must cover preparation and retention must cover leaf lifetime |
@@ -523,6 +523,24 @@ consuming the next element. Validation does not retain a generic JSON tree.
 Buffers, individual tokens, base64 validation, typed collections, and subsequent
 semantic validation still allocate memory; the byte cap is not a process memory
 budget or a substitute for concurrency limits.
+
+### Operator-managed dataplane
+
+When any `ClusterCache` exists, the operator applies ServiceAccount `racer-dataplane`,
+ConfigMap `racer-dataplane-config` (created with defaults only when absent), and
+DaemonSet `racer-dataplane`. The DaemonSet uses image `racer-dataplane` from the
+operator's registry and tag, connects to `https://racer-controller.<namespace>.svc:8443`,
+mounts `racer-bootstrap-trust`, and imports `racer-dataplane-config` with `envFrom`.
+A pod-template annotation carries the ConfigMap payload hash, so edits roll out.
+Existing resources with these names that the operator did not create are not
+adopted; reconciliation fails until they are removed. Deleting the last
+`ClusterCache` leaves the controller and dataplane installed.
+
+Workload overrides may target `{component: racer, kind: DaemonSet}` to set, for
+example, `nodeSelector`, tolerations, `updateStrategy`, annotations, resources, or
+additional container `env` entries. Overrides cannot change or remove the
+operator-wired `env` entries, `envFrom`, volumes, or service account of the
+`dataplane` container.
 
 The operator owns identity/wiring: cluster UUID, URL, images, service accounts, trust,
 replication identity, and durable resource names. These are not tuning keys. Node identity
