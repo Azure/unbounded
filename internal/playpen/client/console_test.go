@@ -6,6 +6,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -93,4 +95,67 @@ func TestConsoleStreamURL(t *testing.T) {
 	if got != "wss://10.88.0.1:8443/redfish/v1/Systems/1/Oem/Unbounded/SerialConsole/Stream" {
 		t.Fatalf("url = %q", got)
 	}
+}
+
+func TestConsoleTLSRequiresTLS13(t *testing.T) {
+	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+		server.TLS = &tls.Config{MinVersion: version, MaxVersion: version}
+		server.StartTLS()
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+		client := redfishWebSocketHTTPClient(map[string]string{"certPEM": string(certPEM)})
+		client.Timeout = 5 * time.Second
+
+		response, err := client.Get(server.URL)
+		if response != nil {
+			response.Body.Close()
+		}
+
+		client.CloseIdleConnections()
+		server.Close()
+
+		if (err == nil) != (version == tls.VersionTLS13) {
+			t.Fatalf("TLS %x: %v", version, err)
+		}
+	}
+
+	for _, metadata := range []map[string]string{nil, {"certPEM": "invalid"}} {
+		client := redfishWebSocketHTTPClient(metadata)
+
+		transport := client.Transport.(*http.Transport)
+		if transport.TLSClientConfig.MinVersion != tls.VersionTLS13 {
+			t.Fatal("missing or invalid PEM lowered TLS baseline")
+		}
+	}
+}
+
+func TestConsoleTLSDoesNotInheritWeakerDefault(t *testing.T) {
+	original := http.DefaultTransport
+
+	t.Cleanup(func() { http.DefaultTransport = original })
+
+	weak := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+	http.DefaultTransport = weak
+
+	client := redfishWebSocketHTTPClient(nil)
+	if client.Transport.(*http.Transport).TLSClientConfig.MinVersion != tls.VersionTLS13 {
+		t.Fatal("cloned default weakened TLS baseline")
+	}
+
+	if weak.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatal("mutated shared default TLS config")
+	}
+
+	http.DefaultTransport = consoleRoundTripper{}
+
+	client = redfishWebSocketHTTPClient(nil)
+	if client.Transport.(*http.Transport).TLSClientConfig.MinVersion != tls.VersionTLS13 {
+		t.Fatal("custom default bypassed TLS baseline")
+	}
+}
+
+type consoleRoundTripper struct{}
+
+func (consoleRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, io.ErrUnexpectedEOF
 }

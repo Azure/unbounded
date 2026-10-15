@@ -17,8 +17,6 @@ const (
 	mssClampChain = "UNBOUNDED-MSS-CLAMP"
 	// mssClampComment identifies rules created by this manager.
 	mssClampComment = "unbounded-net: clamp TCP MSS to fabric MTU"
-	// legacyMSSClampComment identifies the previous WireGuard-only rules.
-	legacyMSSClampComment = "unbounded-net: clamp TCP MSS to PMTU on WireGuard interfaces"
 )
 
 // MSSClampManager installs iptables mangle rules that clamp TCP MSS on SYN
@@ -28,8 +26,6 @@ type MSSClampManager struct {
 	ipt4 iptablesClient
 	ipt6 iptablesClient
 	mu   sync.Mutex
-	// legacyWGPrefix is retained to remove rules created by older versions.
-	legacyWGPrefix string
 	// installedMTU is the fabric MTU represented by the current rules.
 	installedMTU int
 }
@@ -45,9 +41,7 @@ type iptablesClient interface {
 }
 
 // NewMSSClampManager creates a manager and ensures the mangle chain exists.
-// wgPrefix is the configured WireGuard interface prefix (typically
-// cfg.WireGuardInterfacePrefix); it must be non-empty.
-func NewMSSClampManager(wgPrefix string) (*MSSClampManager, error) {
+func NewMSSClampManager() (*MSSClampManager, error) {
 	ipt4, err := iptables.New()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize IPv4 iptables: %w", err)
@@ -57,14 +51,14 @@ func NewMSSClampManager(wgPrefix string) (*MSSClampManager, error) {
 	if err != nil {
 		klog.Warningf("Failed to initialize IPv6 iptables (IPv6 MSS clamping will be disabled): %v", err)
 
-		return newMSSClampManager(wgPrefix, ipt4, nil)
+		return newMSSClampManager(ipt4, nil)
 	}
 
-	return newMSSClampManager(wgPrefix, ipt4, ipt6)
+	return newMSSClampManager(ipt4, ipt6)
 }
 
-func newMSSClampManager(wgPrefix string, ipt4, ipt6 iptablesClient) (*MSSClampManager, error) {
-	m := &MSSClampManager{ipt4: ipt4, ipt6: ipt6, legacyWGPrefix: wgPrefix}
+func newMSSClampManager(ipt4, ipt6 iptablesClient) (*MSSClampManager, error) {
+	m := &MSSClampManager{ipt4: ipt4, ipt6: ipt6}
 
 	if err := m.ensureChain(ipt4, "IPv4"); err != nil {
 		return nil, fmt.Errorf("failed to create IPv4 MSS clamp chain: %w", err)
@@ -112,11 +106,6 @@ func (m *MSSClampManager) ensureChain(ipt iptablesClient, family string) error {
 		klog.V(2).Infof("Created %s chain %s in mangle table", family, mssClampChain)
 	}
 
-	legacyJumpRule := []string{"-m", "comment", "--comment", legacyMSSClampComment, "-j", mssClampChain}
-	if err := ipt.DeleteIfExists("mangle", "FORWARD", legacyJumpRule...); err != nil {
-		return fmt.Errorf("failed to remove legacy jump rule: %w", err)
-	}
-
 	jumpRule := []string{"-m", "comment", "--comment", mssClampComment, "-j", mssClampChain}
 
 	exists, err = ipt.Exists("mangle", "FORWARD", jumpRule...)
@@ -139,11 +128,6 @@ func (m *MSSClampManager) detachChain(ipt iptablesClient, family string) error {
 	jumpRule := []string{"-m", "comment", "--comment", mssClampComment, "-j", mssClampChain}
 	if err := ipt.DeleteIfExists("mangle", "FORWARD", jumpRule...); err != nil {
 		return fmt.Errorf("failed to remove %s MSS clamp jump rule: %w", family, err)
-	}
-
-	legacyJumpRule := []string{"-m", "comment", "--comment", legacyMSSClampComment, "-j", mssClampChain}
-	if err := ipt.DeleteIfExists("mangle", "FORWARD", legacyJumpRule...); err != nil {
-		return fmt.Errorf("failed to remove legacy %s MSS clamp jump rule: %w", family, err)
 	}
 
 	return nil
@@ -212,12 +196,6 @@ func (m *MSSClampManager) ensureRulesForFamily(
 		}
 	}
 
-	if m.legacyWGPrefix != "" {
-		if err := ipt.DeleteIfExists("mangle", mssClampChain, legacyMSSClampRule(m.legacyWGPrefix)...); err != nil {
-			return fmt.Errorf("failed to remove legacy %s MSS clamp rule: %w", family, err)
-		}
-	}
-
 	return nil
 }
 
@@ -234,15 +212,6 @@ func mssClampRule(fabricMTU int, ipv6 bool) []string {
 		"-m", "tcpmss", "--mss", strconv.Itoa(mss+1) + ":65535",
 		"-m", "comment", "--comment", mssClampComment,
 		"-j", "TCPMSS", "--set-mss", strconv.Itoa(mss),
-	}
-}
-
-func legacyMSSClampRule(wgPrefix string) []string {
-	return []string{
-		"-o", wgPrefix + "+",
-		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-		"-m", "comment", "--comment", legacyMSSClampComment,
-		"-j", "TCPMSS", "--clamp-mss-to-pmtu",
 	}
 }
 
@@ -282,11 +251,6 @@ func (m *MSSClampManager) cleanupFamily(ipt iptablesClient, family string) error
 	jumpRule := []string{"-m", "comment", "--comment", mssClampComment, "-j", mssClampChain}
 	if err := ipt.DeleteIfExists("mangle", "FORWARD", jumpRule...); err != nil {
 		klog.Warningf("Failed to remove %s MSS clamp jump rule: %v", family, err)
-	}
-
-	legacyJumpRule := []string{"-m", "comment", "--comment", legacyMSSClampComment, "-j", mssClampChain}
-	if err := ipt.DeleteIfExists("mangle", "FORWARD", legacyJumpRule...); err != nil {
-		klog.Warningf("Failed to remove legacy %s MSS clamp jump rule: %v", family, err)
 	}
 
 	exists, err := ipt.ChainExists("mangle", mssClampChain)

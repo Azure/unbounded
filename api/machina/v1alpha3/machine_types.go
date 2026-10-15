@@ -110,18 +110,11 @@ const (
 )
 
 // MachineSpec defines the desired state of a Machine.
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
-// +kubebuilder:validation:XValidation:rule="!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))",message="host ownership cannot be combined with legacy pxe, provider, or providerID fields"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.
 	// +optional
 	SSH *SSHSpec `json:"ssh,omitempty"`
-
-	// PXE contains legacy PXE boot configuration for the machine. New callers
-	// should use Host.Netboot.
-	// +optional
-	PXE *PXESpec `json:"pxe,omitempty"`
 
 	// Kubernetes contains Kubernetes-specific configuration.
 	// +optional
@@ -131,24 +124,8 @@ type MachineSpec struct {
 	// +optional
 	Agent *AgentSpec `json:"agent,omitempty"`
 
-	// Provider identifies the legacy external control provider for this machine.
-	// New callers should use Host.External.Provider or Host.Azure.
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	Provider string `json:"provider,omitempty"`
-
-	// ProviderID identifies the underlying infrastructure resource for this
-	// machine, using a Kubernetes-style provider ID such as
-	// azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
-	//
-	// This is a legacy field. New callers should use Host.External.ProviderID,
-	// Host.External.MachineRef, or Host.Azure.ResourceID.
-	// +optional
-	ProviderID string `json:"providerID,omitempty"`
-
 	// Host contains desired host settings and exactly one optional host owner.
-	// New Machines should set one of Netboot, Azure, or External. Image alone
-	// may be used with deprecated ownership fields during migration.
+	// Host operations require one of Netboot, Azure, or External.
 	// +optional
 	Host *HostSpec `json:"host,omitempty"`
 
@@ -194,9 +171,9 @@ type HostSpec struct {
 	Image string `json:"image,omitempty"`
 
 	// ProvisioningFormat declares the first-boot format for the desired host
-	// image. When preserving an image, omission falls back to the installed
-	// observation, then CloudInit for legacy hosts. Image identifiers are opaque;
-	// an explicit replacement image on a known Ignition host requires a format.
+	// image. When preserving an image, omission uses the installed observation
+	// if available. An explicit replacement image requires a declared format;
+	// image identifiers are opaque. Unknown formats are not inferred.
 	// +optional
 	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
 
@@ -222,16 +199,6 @@ const (
 	ProvisioningFormatCloudInit ProvisioningFormat = "CloudInit"
 	ProvisioningFormatIgnition  ProvisioningFormat = "Ignition"
 )
-
-// ProvisioningFormatOrDefault returns the declared format or the legacy default.
-// Replacement resolution also considers template declarations and observations.
-func (s *HostSpec) ProvisioningFormatOrDefault() ProvisioningFormat {
-	if s == nil || s.ProvisioningFormat == "" {
-		return ProvisioningFormatCloudInit
-	}
-
-	return s.ProvisioningFormat
-}
 
 // AzureHostSpec identifies one Azure virtual machine.
 // +kubebuilder:validation:XValidation:rule="self.resourceID == oldSelf.resourceID",message="resourceID is immutable"
@@ -263,18 +230,13 @@ type ExternalHostSpec struct {
 	MachineRef *ProviderMachineReference `json:"machineRef,omitempty"`
 }
 
-// Netboot returns the canonical network boot configuration, falling back to
-// the released spec.pxe field for existing Machines.
+// Netboot returns the host's network boot configuration.
 func (s *MachineSpec) Netboot() *PXESpec {
-	if s == nil {
+	if s == nil || s.Host == nil {
 		return nil
 	}
 
-	if s.Host != nil && s.Host.Netboot != nil {
-		return s.Host.Netboot
-	}
-
-	return s.PXE
+	return s.Host.Netboot
 }
 
 // External provider names.

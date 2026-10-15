@@ -523,9 +523,12 @@ func siteUnstructured(t *testing.T, site unboundedv1alpha3.Site) *unstructured.U
 	return &unstructured.Unstructured{Object: object}
 }
 
-// legacySiteUnstructured builds a minimal pre-migration net-group Site object
-// (net.unbounded-cloud.io/v1alpha1) for orphan-cleanup tests that exercise the
-// migration guard.
+// Retired resources exist only as negative test fixtures.
+var legacySiteGVR = schema.GroupVersionResource{Group: "net.unbounded-cloud.io", Version: "v1alpha1", Resource: "sites"}
+
+const deprecatedSiteLabelKey = "net.unbounded-cloud.io/site"
+
+// legacySiteUnstructured builds an unsupported net-group Site object.
 func legacySiteUnstructured(name string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{
@@ -538,8 +541,7 @@ func legacySiteUnstructured(name string) *unstructured.Unstructured {
 	return obj
 }
 
-// TestNodeSiteLabelFallback verifies the canonical-first, deprecated-fallback
-// read of a Node's site membership.
+// TestNodeSiteLabelFallback verifies that only the canonical label is read.
 func TestNodeSiteLabelFallback(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -547,7 +549,7 @@ func TestNodeSiteLabelFallback(t *testing.T) {
 		want   string
 	}{
 		{name: "canonical", labels: map[string]string{canonicalSiteLabelKey: "s1"}, want: "s1"},
-		{name: "deprecated only", labels: map[string]string{deprecatedSiteLabelKey: "s2"}, want: "s2"},
+		{name: "deprecated only", labels: map[string]string{deprecatedSiteLabelKey: "s2"}, want: ""},
 		{name: "both", labels: map[string]string{canonicalSiteLabelKey: "s3", deprecatedSiteLabelKey: "old"}, want: "s3"},
 		{name: "none", labels: map[string]string{}, want: ""},
 		{name: "nil labels", labels: nil, want: ""},
@@ -563,9 +565,7 @@ func TestNodeSiteLabelFallback(t *testing.T) {
 	}
 }
 
-// TestNodeSiteLabelsCurrent verifies dual-write convergence: a Node is only
-// up-to-date when it carries the site under BOTH keys, so a node labeled only
-// with the deprecated key by an older controller is re-labeled.
+// TestNodeSiteLabelsCurrent verifies canonical desired-state repair.
 func TestNodeSiteLabelsCurrent(t *testing.T) {
 	deprecatedOnly := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{deprecatedSiteLabelKey: "s1"}}}
 	if nodeSiteLabelsCurrent(deprecatedOnly, "s1") {
@@ -575,6 +575,11 @@ func TestNodeSiteLabelsCurrent(t *testing.T) {
 	both := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{canonicalSiteLabelKey: "s1", deprecatedSiteLabelKey: "s1"}}}
 	if !nodeSiteLabelsCurrent(both, "s1") {
 		t.Fatalf("node carrying both keys must be current")
+	}
+
+	canonicalOnly := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{canonicalSiteLabelKey: "s1"}}}
+	if !nodeSiteLabelsCurrent(canonicalOnly, "s1") {
+		t.Fatal("canonical label alone must be current")
 	}
 
 	unlabeled := &corev1.Node{ObjectMeta: metav1.ObjectMeta{}}
@@ -587,7 +592,7 @@ func TestNodeSiteLabelsCurrent(t *testing.T) {
 	}
 }
 
-// TestSiteLabelPatches verifies the add/remove patch builders cover both keys.
+// TestSiteLabelPatches verifies the add/remove patch builders cover only the canonical key.
 func TestSiteLabelPatches(t *testing.T) {
 	add, err := siteLabelAddMergePatch("s1")
 	if err != nil {
@@ -609,6 +614,10 @@ func TestSiteLabelPatches(t *testing.T) {
 		if !strings.Contains(string(remove), key) {
 			t.Fatalf("remove patch missing key %q: %s", key, remove)
 		}
+	}
+
+	if strings.Contains(string(add), deprecatedSiteLabelKey) || strings.Contains(string(remove), deprecatedSiteLabelKey) {
+		t.Fatal("patch must not write the deprecated label")
 	}
 }
 
@@ -1331,11 +1340,8 @@ func TestCleanupOrphanSiteNodeSlicesSkipsWhenNoSitesPresent(t *testing.T) {
 	}
 }
 
-// TestCleanupOrphanSiteNodeSlicesKeepsSliceForUntranslatedLegacySite covers a
-// partially-migrated cluster: at least one Site has been translated into the
-// machina group, but this slice references a Site that is still only in the
-// legacy net group. It is not an orphan and must be preserved.
-func TestCleanupOrphanSiteNodeSlicesKeepsSliceForUntranslatedLegacySite(t *testing.T) {
+// Old net-group Sites must not prevent canonical orphan cleanup.
+func TestCleanupOrphanSiteNodeSlicesIgnoresLegacySite(t *testing.T) {
 	translated := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "translated", UID: "translated-uid"}}
 
 	const legacyName = "legacy-site"
@@ -1371,28 +1377,23 @@ func TestCleanupOrphanSiteNodeSlicesKeepsSliceForUntranslatedLegacySite(t *testi
 		t.Fatalf("cleanupOrphanSiteNodeSlices: %v", err)
 	}
 
-	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); err != nil {
-		t.Fatalf("slice for untranslated legacy Site was deleted: %v", err)
+	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphan slice was not deleted: %v", err)
 	}
 
 	for _, action := range dynamicClient.Actions() {
-		if _, ok := action.(clienttesting.DeleteAction); ok && action.GetResource() == siteNodeSliceGVR {
-			t.Fatalf("unexpected slice delete for an untranslated legacy Site")
+		if action.GetResource() == legacySiteGVR {
+			t.Fatal("must not query retired Site API")
 		}
 	}
 }
 
-// TestCleanupOrphanSiteNodeSlicesPreservesSliceOnLegacySiteLookupError asserts
-// that if the legacy net-group Site lookup is denied (e.g. the net controller is
-// missing the read grant on net.unbounded-cloud.io/sites), cleanup preserves the
-// slice rather than deleting it. The check is safe-by-default: a lookup error is
-// never read as "the Site is gone".
-func TestCleanupOrphanSiteNodeSlicesPreservesSliceOnLegacySiteLookupError(t *testing.T) {
+// Cleanup must not depend on permission to read a retired API.
+func TestCleanupOrphanSiteNodeSlicesDoesNotReadLegacySite(t *testing.T) {
 	// A translated Site exists so the empty-source guard does not short-circuit.
 	present := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "present", UID: "present-uid"}}
 
-	// This slice references a Site absent from the machina group, so cleanup
-	// consults the legacy group - which is denied below.
+	// This slice references a Site absent from the canonical group.
 	slice := (&SiteController{}).buildSliceObject(present, "untranslated-0", 0, nil)
 	slice.Object["siteName"] = "untranslated"
 	slice.SetUID("slice-uid")
@@ -1430,12 +1431,12 @@ func TestCleanupOrphanSiteNodeSlicesPreservesSliceOnLegacySiteLookupError(t *tes
 	}
 
 	err := sc.cleanupOrphanSiteNodeSlices(context.Background())
-	if err == nil || !apierrors.IsForbidden(err) {
-		t.Fatalf("cleanupOrphanSiteNodeSlices error = %v, want forbidden", err)
+	if err != nil {
+		t.Fatalf("cleanupOrphanSiteNodeSlices: %v", err)
 	}
 
-	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); err != nil {
-		t.Fatalf("slice was deleted after legacy Site lookup was denied: %v", err)
+	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphan slice was not deleted: %v", err)
 	}
 }
 

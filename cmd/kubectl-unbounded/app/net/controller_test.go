@@ -78,11 +78,10 @@ func TestControllerStatusJSONPreservesSummary(t *testing.T) {
 	}
 }
 
-func TestControllerStatusJSONLegacyCompatibility(t *testing.T) {
+func TestControllerStatusJSONSummaryMetadata(t *testing.T) {
 	for _, fixture := range []string{
-		strings.Replace(legacyOverviewFixture, `"seq":7`, `"buildInfo":{"commit":"old"},"futureMetadata":42,"seq":7`, 1),
-		`{"nodeSummaries":[{"name":"current","futureNodeField":42}],"nodeCount":1,"nodes":"ignored legacy details"}`,
-		`{"nodes":[]}`,
+		strings.Replace(summaryOverviewFixture, `"seq":7`, `"buildInfo":{"commit":"current"},"futureMetadata":42,"seq":7`, 1),
+		`{"nodeSummaries":[{"name":"current","futureNodeField":42}],"nodeCount":1}`,
 		`{"nodeSummaries":[],"nodeCount":0}`,
 	} {
 		for _, pretty := range []bool{true, false} {
@@ -136,12 +135,12 @@ func TestControllerStatusJSONLegacyCompatibility(t *testing.T) {
 						t.Fatal(err)
 					}
 
-					if build["commit"] != "old" || string(fields["futureMetadata"]) != "42" {
-						t.Fatalf("lost legacy metadata: %s", out.String())
+					if build["commit"] != "current" || string(fields["futureMetadata"]) != "42" {
+						t.Fatalf("lost metadata: %s", out.String())
 					}
 				}
 
-				if strings.Contains(fixture, `"current"`) && !strings.Contains(out.String(), `"futureNodeField"`) {
+				if strings.Contains(fixture, `"futureNodeField"`) && !strings.Contains(out.String(), `"futureNodeField"`) {
 					t.Fatalf("lost current summary field: %s", out.String())
 				}
 			})
@@ -160,6 +159,7 @@ func TestControllerStatusJSONFailures(t *testing.T) {
 		{name: "null", body: `null`},
 		{name: "invalid summaries", body: `{"nodeSummaries":"bad"}`},
 		{name: "invalid legacy nodes", body: `{"nodes":"bad"}`},
+		{name: "unsupported full response", body: `{"nodes":[]}`},
 		{name: "unauthorized", status: http.StatusUnauthorized, body: "Unauthorized"},
 		{name: "forbidden", status: http.StatusForbidden, body: "Forbidden"},
 		{name: "server error", status: http.StatusInternalServerError, body: "controller failed"},

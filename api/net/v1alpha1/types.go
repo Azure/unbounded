@@ -9,16 +9,6 @@ import (
 )
 
 const (
-	// SiteLabelKey identifies the site a Node belongs to.
-	//
-	// NOTE: this is the legacy site label. It is superseded by
-	// unbounded-cloud.io/site (machina v1alpha3 MachineSiteLabelKey). The net
-	// controller still dual-writes this key on Nodes and reads it as a fallback
-	// during the deprecation window; a future release will remove it. It is not
-	// marked with the godoc Deprecated: convention because it is still written
-	// and read intentionally until then.
-	SiteLabelKey = "net.unbounded-cloud.io/site"
-
 	// NodeDiscoveredPublicIPAnnotation contains the translated source IP
 	// discovered by the node agent. It does not prove that the WireGuard port is
 	// reachable through symmetric NAT or CGNAT.

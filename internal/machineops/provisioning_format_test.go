@@ -52,7 +52,7 @@ func TestReplacementPairUsesOneVersionSelection(t *testing.T) {
 			c := &changingVersionClient{Client: fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).Build()}
 			r := &MachineOperationReconciler{Client: c}
 			m := newExternalMachine("worker", api.ExternalProviderAzureVM)
-			m.Spec.Host = &api.HostSpec{Image: image}
+			m.Spec.Host.Image = image
 			m.Spec.ConfigurationRef = &api.MachineConfigurationRef{Name: "worker"}
 			m.Status.ObservedProvisioningFormat = observed
 			input, err := r.resolveOperationTargetInput(t.Context(), newMachineOperation("replace", "worker", api.OperationHostReplace), m)
@@ -74,11 +74,13 @@ func TestReplacementFormatPrecedence(t *testing.T) {
 		want     api.ProvisioningFormat
 		wantErr  bool
 	}{
-		{name: "legacy", want: api.ProvisioningFormatCloudInit},
+		{name: "unknown installed format", wantErr: true},
 		{name: "observed ignition preserve image", observed: api.ProvisioningFormatIgnition, want: api.ProvisioningFormatIgnition},
 		{name: "observed cloud-init", observed: api.ProvisioningFormatCloudInit, want: api.ProvisioningFormatCloudInit},
 		{name: "explicit migration", host: &api.HostSpec{Image: "new", ProvisioningFormat: api.ProvisioningFormatCloudInit}, observed: api.ProvisioningFormatIgnition, want: api.ProvisioningFormatCloudInit},
 		{name: "unknown target format", host: &api.HostSpec{Image: "new"}, observed: api.ProvisioningFormatIgnition, wantErr: true},
+		{name: "cloud-init observation does not describe new image", host: &api.HostSpec{Image: "new"}, observed: api.ProvisioningFormatCloudInit, wantErr: true},
+		{name: "new image without observation", host: &api.HostSpec{Image: "new"}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -111,8 +113,9 @@ func TestReplacementSnapshotAndImageOverride(t *testing.T) {
 	input, err := r.resolveOperationTargetInput(t.Context(), op, m)
 	require.NoError(t, err)
 
-	m.Spec.Host = &api.HostSpec{Image: " other-image ", ProvisioningFormat: api.ProvisioningFormatCloudInit}
-	_, err = r.operationRequest(t.Context(), op, m, &api.MachineOperationTargetStatus{Input: input}, m.Spec.ProviderID, nil, true)
+	m.Spec.Host.Image = " other-image "
+	m.Spec.Host.ProvisioningFormat = api.ProvisioningFormatCloudInit
+	_, err = r.operationRequest(t.Context(), op, m, &api.MachineOperationTargetStatus{Input: input}, m.Spec.Host.External.ProviderID, nil, true)
 	require.ErrorContains(t, err, "cannot generate Ignition")
 	input, err = r.resolveOperationTargetInput(t.Context(), op, m)
 	require.NoError(t, err)
@@ -140,17 +143,23 @@ func TestReplacementVersionReadFailureRemainsRetryable(t *testing.T) {
 	require.False(t, errors.As(err, &permanent))
 }
 
-func TestLegacyReplacementSnapshotHonorsKnownFormat(t *testing.T) {
+func TestReplacementSnapshotRequiresFrozenFormat(t *testing.T) {
 	t.Parallel()
 
 	r := &MachineOperationReconciler{}
 	m := newExternalMachine("worker", api.ExternalProviderAzureVM)
-	m.Status.ObservedProvisioningFormat = api.ProvisioningFormatIgnition
 
 	op := newMachineOperation("replace", m.Name, api.OperationHostReplace)
-	for _, input := range []*api.MachineOperationTargetInput{nil, {}} {
-		_, err := r.operationRequest(t.Context(), op, m, &api.MachineOperationTargetStatus{Input: input}, m.Spec.ProviderID, nil, true)
-		require.ErrorContains(t, err, "cannot generate Ignition")
+	for _, format := range []api.ProvisioningFormat{"", api.ProvisioningFormatCloudInit, api.ProvisioningFormatIgnition} {
+		m.Spec.Host.ProvisioningFormat = format
+		m.Status.ObservedProvisioningFormat = format
+
+		for _, input := range []*api.MachineOperationTargetInput{nil, {}, {HostImage: "image"}} {
+			for _, includeUserData := range []bool{false, true} {
+				_, err := r.operationRequest(t.Context(), op, m, &api.MachineOperationTargetStatus{Input: input}, m.Spec.Host.External.ProviderID, nil, includeUserData)
+				require.ErrorContains(t, err, "snapshotted provisioningFormat")
+			}
+		}
 	}
 }
 
@@ -162,14 +171,16 @@ func TestFrozenCloudInitPairSurvivesDesiredEdit(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem}, Data: map[string][]byte{"token-id": []byte("abc123"), "token-secret": []byte("secret456")}}
 	r := &MachineOperationReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build(), ClusterInfo: testClusterInfo()}
 	m := newExternalMachine("worker", api.ExternalProviderAzureVM)
-	m.Spec.Host = &api.HostSpec{Image: "original-image", ProvisioningFormat: api.ProvisioningFormatCloudInit}
+	m.Spec.Host.Image = "original-image"
+	m.Spec.Host.ProvisioningFormat = api.ProvisioningFormatCloudInit
 	m.Spec.Kubernetes = &api.KubernetesSpec{BootstrapTokenRef: &api.LocalObjectReference{Name: secret.Name}}
 	op := newMachineOperation("replace", m.Name, api.OperationHostReplace)
 	input, err := r.resolveOperationTargetInput(t.Context(), op, m)
 	require.NoError(t, err)
 
-	m.Spec.Host = &api.HostSpec{Image: "new-ignition-image", ProvisioningFormat: api.ProvisioningFormatIgnition}
-	request, err := r.operationRequest(t.Context(), op, m, &api.MachineOperationTargetStatus{Input: input}, m.Spec.ProviderID, nil, true)
+	m.Spec.Host.Image = "new-ignition-image"
+	m.Spec.Host.ProvisioningFormat = api.ProvisioningFormatIgnition
+	request, err := r.operationRequest(t.Context(), op, m, &api.MachineOperationTargetStatus{Input: input}, m.Spec.Host.External.ProviderID, nil, true)
 	require.NoError(t, err)
 	require.Equal(t, "original-image", request.HostImage)
 	require.Contains(t, request.ReplaceUserData, "#cloud-config")
@@ -181,7 +192,7 @@ func TestMachineFormatOverridesTemplateFormat(t *testing.T) {
 	r := &MachineOperationReconciler{Client: c}
 	m := newExternalMachine("worker", api.ExternalProviderAzureVM)
 	m.Spec.ConfigurationRef = &api.MachineConfigurationRef{Name: "worker"}
-	m.Spec.Host = &api.HostSpec{ProvisioningFormat: api.ProvisioningFormatCloudInit}
+	m.Spec.Host.ProvisioningFormat = api.ProvisioningFormatCloudInit
 	host, err := r.resolveReplacementHost(t.Context(), m)
 	require.NoError(t, err)
 	require.Equal(t, "ignition-image", host.Image)
@@ -207,7 +218,7 @@ func TestHostReplaceRefusesUnsupportedFormatBeforeProvider(t *testing.T) {
 
 			switch declaration {
 			case "desired":
-				m.Spec.Host = &api.HostSpec{ProvisioningFormat: api.ProvisioningFormatIgnition}
+				m.Spec.Host.ProvisioningFormat = api.ProvisioningFormatIgnition
 			case "observed":
 				m.Status.ObservedProvisioningFormat = api.ProvisioningFormatIgnition
 			case "template":

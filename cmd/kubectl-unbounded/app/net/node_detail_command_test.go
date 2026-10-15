@@ -123,8 +123,8 @@ func TestNodeShowRequestsNamedDetails(t *testing.T) {
 
 func TestNodeShowOverviewConsistency(t *testing.T) {
 	for _, tc := range []struct {
-		name, ready, cni         string
-		old, missingInfo, legacy bool
+		name, ready, cni string
+		old, missingInfo bool
 	}{
 		{name: "unenriched diagnostics", ready: "Ready", cni: "Healthy"},
 		{name: "older diagnostics", ready: "Ready", cni: "Healthy", old: true},
@@ -135,7 +135,6 @@ func TestNodeShowOverviewConsistency(t *testing.T) {
 		{name: "route mismatch", ready: "Ready", cni: "Route mismatch"},
 		{name: "missing metadata", ready: "Ready", cni: "Healthy", missingInfo: true, old: true},
 		{name: "missing health", missingInfo: true, old: true},
-		{name: "legacy overview", ready: "Ready", cni: "Healthy", legacy: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			result := detailResultFixture()
@@ -175,10 +174,7 @@ func TestNodeShowOverviewConsistency(t *testing.T) {
 				result.Details.Status.NodeErrors = []statusv1alpha1.NodeError{{Message: "old diagnostic error"}}
 			}
 
-			var overview any = clusterSummary{NodeSummaries: []nodeSummary{entry}}
-			if tc.legacy {
-				overview = clusterStatusResponse{Nodes: []statusv1alpha1.NodeStatusResponse{entry.statusMetadata()}}
-			}
+			overview := clusterSummary{NodeSummaries: []nodeSummary{entry}}
 
 			var summaries, details atomic.Int32
 
@@ -276,7 +272,7 @@ func TestNodeShowOverviewFailures(t *testing.T) {
 		status     int
 	}{
 		{body: `{"nodeSummaries":[]}`, want: "not found in cluster overview"},
-		{body: `{}`, want: "missing nodeSummaries or nodes"},
+		{body: `{}`, want: "missing nodeSummaries"},
 		{body: `{`, want: "decode cluster overview"},
 		{body: "forbidden", status: http.StatusForbidden, want: "failed"},
 	} {

@@ -173,9 +173,6 @@ type PeerTunnelStatus struct {
 	LastHandshake time.Time `json:"lastHandshake,omitempty"`
 }
 
-// WireGuardPeerLinkStatus is a deprecated alias for PeerTunnelStatus.
-type WireGuardPeerLinkStatus = PeerTunnelStatus
-
 // PeerStatus contains information about a tunnel peer.
 type PeerStatus struct {
 	Name              string                 `json:"name"`
@@ -188,9 +185,3 @@ type PeerStatus struct {
 	RouteDestinations []string               `json:"routeDestinations,omitempty"`
 	HealthCheck       *HealthCheckPeerStatus `json:"healthCheck,omitempty"`
 }
-
-// Deprecated aliases for backward compatibility during transition.
-// These will be removed in a future version.
-
-// WireGuardPeerStatus is a deprecated alias for PeerStatus.
-type WireGuardPeerStatus = PeerStatus

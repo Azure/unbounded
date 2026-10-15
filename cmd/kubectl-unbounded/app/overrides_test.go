@@ -225,7 +225,7 @@ func TestOverridesStatusReportsApplied(t *testing.T) {
 			ObservedResourceVersion: "12",
 			Workloads: []v1alpha3.OverriddenWorkload{{
 				Kind: "DaemonSet", Name: "unbounded-net-node",
-				DesiredHash: "abc", AppliedHash: "abc",
+				DesiredHash: "abc", AppliedHash: "abc", State: v1alpha3.OverrideStateApplied,
 			}},
 		})).
 		Build()
@@ -253,7 +253,7 @@ func TestOverridesStatusReportsStaleAndDegraded(t *testing.T) {
 			Message:                 "overrides.yaml[0]: patch targets container \"typo\"",
 			Workloads: []v1alpha3.OverriddenWorkload{{
 				Kind: "DaemonSet", Name: "unbounded-net-node",
-				DesiredHash: "want", AppliedHash: "have",
+				DesiredHash: "want", AppliedHash: "have", State: v1alpha3.OverrideStatePending,
 			}},
 		})).
 		Build()
@@ -266,7 +266,7 @@ func TestOverridesStatusReportsStaleAndDegraded(t *testing.T) {
 		t.Fatal("a Degraded Site must make status exit non-zero")
 	}
 
-	for _, want := range []string{"Degraded", "stale", "Degraded Sites:", "leaves the affected workloads"} {
+	for _, want := range []string{"Degraded", "pending", "Degraded Sites:", "leaves the affected workloads"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("output = %q, want it to contain %q", out.String(), want)
 		}
@@ -809,9 +809,8 @@ func TestOverridesStatusLabelsFailedAndWithheld(t *testing.T) {
 	}
 }
 
-// TestOverridesStatusFallsBackWhenStateIsAbsent covers a status written by an
-// operator that predates the state field, or one a lagging CRD pruned it from.
-func TestOverridesStatusFallsBackWhenStateIsAbsent(t *testing.T) {
+// Missing state must not be inferred from matching hashes.
+func TestOverridesStatusUnknownWhenStateIsAbsent(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(overridesScheme(t)).
 		WithObjects(siteWithOverrideStatus("edge", &v1alpha3.OverrideStatus{
@@ -827,8 +826,31 @@ func TestOverridesStatusFallsBackWhenStateIsAbsent(t *testing.T) {
 		t.Fatalf("status: %v", err)
 	}
 
-	if !strings.Contains(out.String(), "yes") {
-		t.Fatalf("output = %q, want the hash comparison to still answer", out.String())
+	if !strings.Contains(out.String(), "unknown") || strings.Contains(out.String(), "yes") {
+		t.Fatalf("output = %q, want unknown without hash inference", out.String())
+	}
+}
+
+func TestDescribeAppliedRequiresState(t *testing.T) {
+	for _, workload := range []v1alpha3.OverriddenWorkload{
+		{},
+		{DesiredHash: "a"},
+		{DesiredHash: "a", AppliedHash: "a"},
+		{DesiredHash: "a", AppliedHash: "b"},
+		{State: "future"},
+	} {
+		if got := describeApplied(workload); got != "unknown" {
+			t.Fatalf("describeApplied(%+v) = %q", workload, got)
+		}
+	}
+
+	for state, want := range map[string]string{
+		v1alpha3.OverrideStateApplied: "yes", v1alpha3.OverrideStatePending: "pending",
+		v1alpha3.OverrideStateFailed: "failed", v1alpha3.OverrideStateWithheld: "withheld",
+	} {
+		if got := describeApplied(v1alpha3.OverriddenWorkload{State: state}); got != want {
+			t.Fatalf("state %q = %q, want %q", state, got, want)
+		}
 	}
 }
 

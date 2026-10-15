@@ -13,7 +13,6 @@ type fakeIPTables struct {
 	clearChainErr      error
 	deleteJumpErr      error
 	deletedCurrentJump bool
-	deletedLegacyJump  bool
 }
 
 func (f *fakeIPTables) Append(_, _ string, _ ...string) error {
@@ -37,10 +36,6 @@ func (f *fakeIPTables) DeleteIfExists(_, _ string, rulespec ...string) error {
 		f.deletedCurrentJump = true
 
 		return f.deleteJumpErr
-	}
-
-	if slices.Contains(rulespec, legacyMSSClampComment) {
-		f.deletedLegacyJump = true
 	}
 
 	return nil
@@ -97,7 +92,7 @@ func TestNewMSSClampManagerDetachesIPv6JumpWhenClearFails(t *testing.T) {
 	ipt4 := &fakeIPTables{}
 	ipt6 := &fakeIPTables{clearChainErr: errors.New("clear failed")}
 
-	manager, err := newMSSClampManager("wg", ipt4, ipt6)
+	manager, err := newMSSClampManager(ipt4, ipt6)
 	if err != nil {
 		t.Fatalf("newMSSClampManager() returned error: %v", err)
 	}
@@ -106,7 +101,7 @@ func TestNewMSSClampManagerDetachesIPv6JumpWhenClearFails(t *testing.T) {
 		t.Fatal("newMSSClampManager() left IPv6 reconciliation enabled")
 	}
 
-	if !ipt6.deletedCurrentJump || !ipt6.deletedLegacyJump {
+	if !ipt6.deletedCurrentJump {
 		t.Fatal("newMSSClampManager() did not detach IPv6 MSS clamp jumps")
 	}
 }
@@ -118,7 +113,7 @@ func TestNewMSSClampManagerFailsIfIPv6JumpCannotBeDetached(t *testing.T) {
 		deleteJumpErr: errors.New("delete failed"),
 	}
 
-	if _, err := newMSSClampManager("wg", ipt4, ipt6); err == nil {
+	if _, err := newMSSClampManager(ipt4, ipt6); err == nil {
 		t.Fatal("newMSSClampManager() returned nil error when IPv6 jump remained active")
 	}
 }

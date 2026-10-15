@@ -128,9 +128,8 @@ func newControllerStatusJSONCommand(rt *pluginRuntime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status-json",
 		Short: "Dump summary JSON from the controller",
-		Long: "Export /status/json, preserving controller metadata and summary fields. " +
-			"Legacy full-node responses are projected into summaries without diagnostic arrays.",
-		Args: cobra.NoArgs,
+		Long:  "Export /status/json, preserving controller metadata and summary fields.",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			opts := nodeStatusFetchFromCommand(cmd).merged(fetch)
 
@@ -166,35 +165,12 @@ func newControllerStatusJSONCommand(rt *pluginRuntime) *cobra.Command {
 	return cmd
 }
 
-// clusterSummaryJSON preserves unknown fields while removing legacy node details.
+// clusterSummaryJSON validates the summary response while preserving unknown fields.
 func clusterSummaryJSON(raw []byte) (json.RawMessage, error) {
-	summary, err := decodeClusterSummary(raw)
+	_, err := decodeClusterSummary(raw)
 	if err != nil {
 		return nil, err
 	}
 
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return nil, err
-	}
-
-	if _, legacy := fields["nodes"]; !legacy {
-		return raw, nil
-	}
-
-	delete(fields, "nodes")
-
-	if _, current := fields["nodeSummaries"]; !current {
-		fields["nodeSummaries"], err = json.Marshal(summary.NodeSummaries)
-		if err != nil {
-			return nil, err
-		}
-
-		fields["nodeCount"], err = json.Marshal(summary.NodeCount)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return json.Marshal(fields)
+	return raw, nil
 }

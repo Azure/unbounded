@@ -278,19 +278,16 @@ func (r *MachineOperationReconciler) operationRequest(
 		format = target.Input.ProvisioningFormat
 	}
 
-	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace || !includeReplaceUserData {
+	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace {
 		return request, nil
 	}
 
 	if format == "" {
-		// Older operation snapshots have no format. Honor declarations and
-		// observations instead of silently treating a known Ignition host as legacy.
-		var err error
+		return OperationRequest{}, fmt.Errorf("HostReplace target input requires a snapshotted provisioningFormat")
+	}
 
-		format, err = replacementProvisioningFormat(machine, request.HostImage)
-		if err != nil {
-			return OperationRequest{}, err
-		}
+	if !includeReplaceUserData {
+		return request, nil
 	}
 
 	userData, err := r.buildReplaceUserData(ctx, machine, format)
@@ -321,11 +318,7 @@ func (r *MachineOperationReconciler) applyOperationResult(
 			return err
 		}
 
-		if machine.Spec.Host != nil && machine.Spec.Host.External != nil {
-			machine.Spec.Host.External.ProviderID = result.ProviderID
-		} else {
-			machine.Spec.ProviderID = result.ProviderID
-		}
+		machine.Spec.Host.External.ProviderID = result.ProviderID
 
 		machine.Generation = updatedGeneration
 	}
@@ -352,7 +345,7 @@ func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context
 		} else if latest.Spec.Host != nil && latest.Spec.Host.Azure != nil {
 			return fmt.Errorf("patch Machine providerID: Azure resourceID is immutable")
 		} else {
-			latest.Spec.ProviderID = providerID
+			return fmt.Errorf("patch Machine providerID: host.external is required")
 		}
 
 		if err := r.Patch(ctx, &latest, patch); err != nil {

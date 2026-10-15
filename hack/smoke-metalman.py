@@ -1218,21 +1218,23 @@ def main() -> None:
             "labels": {f"{API_GROUP}/site": SITE},
         },
         "spec": {
-            "pxe": {
-                "image": IMAGE_NAME,
-                "redfish": {
-                    "url": redfish_url,
-                    "username": "",
-                    "deviceID": VM_NAME,
-                    "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
+            "host": {
+                "netboot": {
+                    "image": IMAGE_NAME,
+                    "redfish": {
+                        "url": redfish_url,
+                        "username": "",
+                        "deviceID": VM_NAME,
+                        "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
+                    },
+                    "dhcpLeases": [{
+                        "mac": MAC_ADDRESS,
+                        "ipv4": NODE_IP,
+                        "subnetMask": "255.255.255.0",
+                        "gateway": GATEWAY,
+                        "dns": [DNS_SERVER],
+                    }],
                 },
-                "dhcpLeases": [{
-                    "mac": MAC_ADDRESS,
-                    "ipv4": NODE_IP,
-                    "subnetMask": "255.255.255.0",
-                    "gateway": GATEWAY,
-                    "dns": [DNS_SERVER],
-                }],
             },
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,

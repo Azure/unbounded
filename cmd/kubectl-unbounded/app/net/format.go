@@ -65,12 +65,6 @@ func isTunnelKind(kind string) bool {
 	return kind == "Tunnel peer" || kind == "Tunnel gateway"
 }
 
-// isWireguardKind reports whether the route kind is a tunnel route.
-// Kept for backward compatibility; delegates to isTunnelKind.
-func isWireguardKind(kind string) bool {
-	return isTunnelKind(kind)
-}
-
 // joinOrDash joins values or returns "-".
 func joinOrDash(values []string) string {
 	if len(values) == 0 {

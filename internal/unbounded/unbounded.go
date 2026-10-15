@@ -47,20 +47,3 @@ func SystemNamespace() string {
 // allowlist and the workload watch predicates need it, and the override package
 // already depends on the component package that holds those predicates.
 const ReservedPrefix = "unbounded-cloud.io/"
-
-const (
-	// LegacyKubeNamespace is where machina and metalman ran before
-	// the consolidation onto SystemNamespace().
-	LegacyKubeNamespace = "unbounded-kube"
-
-	// LegacyNetNamespace is where unbounded-net ran before the consolidation.
-	LegacyNetNamespace = "unbounded-net"
-)
-
-// IsLegacyNamespace reports whether ns is one of the pre-consolidation
-// namespaces the operator's migration reaper drains and deletes. Installing
-// unbounded into one of these is unsafe: the reaper would delete the very
-// namespace it just migrated into.
-func IsLegacyNamespace(ns string) bool {
-	return ns == LegacyKubeNamespace || ns == LegacyNetNamespace
-}

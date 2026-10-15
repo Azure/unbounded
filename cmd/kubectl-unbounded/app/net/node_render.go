@@ -183,7 +183,7 @@ func printNodePeerings(w io.Writer, status clusterStatusResponse, node statusv1a
 	headers := []string{"DESTINATION NODE", "TYPE", "SITE", "POOL", "PROTOCOL", "K8S", "HEALTH", "ENDPOINT", "ALLOWED IPS", "ROUTES"}
 	rows := [][]string{}
 
-	var selected *statusv1alpha1.WireGuardPeerStatus
+	var selected *statusv1alpha1.PeerStatus
 
 	for i := range node.Peers {
 		peer := node.Peers[i]
@@ -307,7 +307,7 @@ func printNodeRoutes(w io.Writer, node statusv1alpha1.NodeStatusResponse, useCol
 			expText := fmt.Sprintf("%t", expected)
 			preText := fmt.Sprintf("%t", present)
 
-			if !isWireguardKind(kind) {
+			if !isTunnelKind(kind) {
 				expText = "n/a"
 				preText = "n/a"
 			}
@@ -338,7 +338,7 @@ func printNodeRoutes(w io.Writer, node statusv1alpha1.NodeStatusResponse, useCol
 				info = "-"
 			}
 
-			if useColor && isWireguardKind(kind) {
+			if useColor && isTunnelKind(kind) {
 				if expected == present {
 					expText = colorize(expText, "green")
 					preText = colorize(preText, "green")
@@ -477,10 +477,10 @@ func buildNodeRows(status clusterStatusResponse) []nodeListRow {
 			pool = p
 		}
 
-		peerOnline, peerTotal := countPeers(node.Peers, func(p statusv1alpha1.WireGuardPeerStatus) bool {
+		peerOnline, peerTotal := countPeers(node.Peers, func(p statusv1alpha1.PeerStatus) bool {
 			return p.PeerType != "gateway"
 		})
-		gwOnline, gwTotal := countPeers(node.Peers, func(p statusv1alpha1.WireGuardPeerStatus) bool {
+		gwOnline, gwTotal := countPeers(node.Peers, func(p statusv1alpha1.PeerStatus) bool {
 			return p.PeerType == "gateway"
 		})
 
@@ -605,7 +605,7 @@ func shouldUseColor(out io.Writer, mode string) bool {
 }
 
 // countPeers returns online and total counts for peers matching a predicate.
-func countPeers(peers []statusv1alpha1.WireGuardPeerStatus, include func(statusv1alpha1.WireGuardPeerStatus) bool) (int, int) {
+func countPeers(peers []statusv1alpha1.PeerStatus, include func(statusv1alpha1.PeerStatus) bool) (int, int) {
 	total := 0
 	online := 0
 
@@ -625,7 +625,7 @@ func countPeers(peers []statusv1alpha1.WireGuardPeerStatus, include func(statusv
 }
 
 // peerOnline evaluates frontend-equivalent online status for one peer.
-func peerOnline(p statusv1alpha1.WireGuardPeerStatus) bool {
+func peerOnline(p statusv1alpha1.PeerStatus) bool {
 	hcEnabled := (p.HealthCheck != nil && p.HealthCheck.Enabled) || (p.HealthCheck != nil && strings.TrimSpace(strings.ToLower(p.HealthCheck.Status)) != "")
 	if hcEnabled {
 		return p.HealthCheck != nil && strings.EqualFold(strings.TrimSpace(p.HealthCheck.Status), "up")

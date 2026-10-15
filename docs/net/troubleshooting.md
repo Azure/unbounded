@@ -186,11 +186,11 @@ procedure.
 3. Check WG handshake on gateway: SSH to gateway, check `sudo wg show`
 4. Verify supernet routes on workers: `ip route show dev unbounded0` should include remote site CIDRs
 5. Check forwarding on gateways: `cat /proc/sys/net/ipv4/ip_forward` (must be 1)
-6. Check FORWARD ACCEPT rules on gateways: `iptables -L FORWARD -v -n` should show per-interface ACCEPT rules for `geneve0`, `wg*` gateway interfaces
+6. Check gateway forwarding: `iptables -L FORWARD -v -n` should show per-interface jumps to `UNBOUNDED-FORWARD`; that chain should accept managed destination interfaces.
 
-> **Note:** Policy-based routing (PBR) is deprecated. If `enablePolicyRouting`
-> is `false` (the new default), FORWARD ACCEPT rules handle transit forwarding.
-> You should not need fwmark/connmark/ip-rule configuration.
+> **Note:** Gateway connmark PBR is removed. `UNBOUNDED-FORWARD` handles
+> tunnel-to-tunnel forwarding. The managed route-table rule is still current;
+> it is not the retired per-gateway fwmark/connmark implementation.
 
 ### Tunnel protocol not taking effect
 

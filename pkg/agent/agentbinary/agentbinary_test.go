@@ -146,7 +146,7 @@ func TestEnsureDaemonBinaryLinks_InitializesFromBlue(t *testing.T) {
 	assertSymlinkTarget(t, paths.BinaryPath, paths.BluePath)
 }
 
-func TestEnsureDaemonBinaryLinks_SeedsBlueFromLegacyBinary(t *testing.T) {
+func TestEnsureDaemonBinaryLinks_SeedsBlueFromBootstrapBinary(t *testing.T) {
 	paths := setupDaemonBinaryTestPaths(t)
 	require.NoError(t, os.WriteFile(paths.BinaryPath, []byte("legacy"), 0o755))
 

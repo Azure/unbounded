@@ -250,7 +250,7 @@ API from a browser or curl on localhost.`,
 				deployName: deployName,
 				remotePort: remotePort,
 				tlsConfig: &tls.Config{
-					MinVersion: tls.VersionTLS12,
+					MinVersion: tls.VersionTLS13,
 					RootCAs:    caPool,
 					ServerName: fmt.Sprintf("%s.%s.svc", deployName, ns),
 				},

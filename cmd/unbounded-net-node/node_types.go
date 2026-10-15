@@ -62,7 +62,6 @@ type wireGuardState struct {
 	// Key is the interface name (wg<port>, e.g. wg51822)
 	gatewayLinkManagers      map[string]*unboundednetnetlink.LinkManager
 	gatewayWireguardManagers map[string]*unboundednetnetlink.WireGuardManager
-	gatewayPolicyManager     *unboundednetnetlink.GatewayPolicyManager //nolint:staticcheck // intentional use of deprecated type for backward compat
 
 	// Gateway metadata for status
 	gatewayHealthEndpoints         map[string]string                          // interface name -> overlay IP (used for healthcheck matching)
@@ -251,11 +250,8 @@ type NodeError = statusv1alpha1.NodeError
 // PeerTunnelStatus aliases shared tunnel link status details.
 type PeerTunnelStatus = statusv1alpha1.PeerTunnelStatus
 
-// WireGuardPeerLinkStatus aliases shared WireGuard link status details.
-type WireGuardPeerLinkStatus = statusv1alpha1.WireGuardPeerLinkStatus
-
 // WireGuardPeerStatus aliases shared WireGuard peer status details.
-type WireGuardPeerStatus = statusv1alpha1.WireGuardPeerStatus
+type WireGuardPeerStatus = statusv1alpha1.PeerStatus
 
 // BpfEntry aliases shared BPF trie entry details.
 type BpfEntry = statusv1alpha1.BpfEntry

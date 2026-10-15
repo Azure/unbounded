@@ -18,7 +18,7 @@ func TestHTTPStatusTransportDirectFirst(t *testing.T) {
 	t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 
-	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModeNever} {
 		t.Run(mode, func(t *testing.T) {
 			tests := []struct {
 				name          string

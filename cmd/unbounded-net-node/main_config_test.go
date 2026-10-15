@@ -29,7 +29,6 @@ func newNodeConfigTestCommand(cfg *config) *cobra.Command {
 	flags.StringVar(&cfg.BridgeName, "bridge-name", "cbr0", "")
 	flags.StringVar(&cfg.WireGuardDir, "wireguard-dir", "/etc/wireguard", "")
 	flags.IntVar(&cfg.WireGuardPort, "wireguard-port", 51820, "")
-	flags.BoolVar(&cfg.EnablePolicyRouting, "enable-policy-routing", true, "")
 	flags.IntVar(&cfg.MTU, "mtu", 0, "")
 	flags.IntVar(&cfg.HealthPort, "health-port", 9998, "")
 	flags.BoolVar(&cfg.StatusPushEnabled, "status-push-enabled", true, "")
@@ -45,9 +44,7 @@ func newNodeConfigTestCommand(cfg *config) *cobra.Command {
 	flags.DurationVar(&cfg.StatusWSAPIServerStartupDelay, "status-ws-apiserver-startup-delay", 60*time.Second, "")
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "")
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "")
-	flags.BoolVar(&cfg.RemoveWireGuardOnShutdown, "shutdown-remove-wireguard-configuration", false, "")
-	flags.BoolVar(&cfg.CleanupNetlinkOnShutdown, "shutdown-remove-ip-routes", false, "")
-	flags.BoolVar(&cfg.RemoveMasqueradeOnShutdown, "shutdown-remove-masquerade-rules", false, "")
+	flags.BoolVar(&cfg.RemoveConfigurationOnShutdown, "remove-configuration-on-shutdown", false, "")
 	flags.DurationVar(&cfg.CriticalDeltaEvery, "status-critical-interval", time.Second, "")
 	flags.DurationVar(&cfg.StatsDeltaEvery, "status-stats-interval", 15*time.Second, "")
 
@@ -69,7 +66,6 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		BridgeName:                    "cbr0",
 		WireGuardDir:                  "/etc/wireguard",
 		WireGuardPort:                 51820,
-		EnablePolicyRouting:           true,
 		MTU:                           0,
 		HealthPort:                    9998,
 		StatusPushEnabled:             true,
@@ -105,7 +101,6 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		"  bridgeName: cbr-test\n" +
 		"  wireGuardDir: /tmp/wg\n" +
 		"  wireGuardPort: 51888\n" +
-		"  enablePolicyRouting: false\n" +
 		"  mtu: 1450\n" +
 		"  healthPort: 10001\n" +
 		"  statusPushEnabled: false\n" +
@@ -120,9 +115,7 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		"  statusWebsocketApiserverStartupDelay: 75s\n" +
 		"  statusWebsocketKeepaliveInterval: 0s\n" +
 		"  statusWsKeepaliveFailureCount: 3\n" +
-		"  shutdownRemoveWireGuardConfiguration: true\n" +
-		"  shutdownRemoveIPRoutes: true\n" +
-		"  shutdownRemoveMasqueradeRules: true\n" +
+		"  removeConfigurationOnShutdown: true\n" +
 		"  criticalDeltaEvery: 2s\n" +
 		"  statsDeltaEvery: 30s\n")
 	if err := os.WriteFile(tmpPath, runtimeYAML, 0o644); err != nil {
@@ -146,8 +139,8 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		t.Fatalf("expected CNI settings from runtime config, got dir=%q file=%q bridge=%q", cfg.CNIConfDir, cfg.CNIConfFile, cfg.BridgeName)
 	}
 
-	if cfg.WireGuardDir != "/tmp/wg" || cfg.WireGuardPort != 51888 || cfg.EnablePolicyRouting {
-		t.Fatalf("expected wireguard settings from runtime config, got dir=%q port=%d policy=%v", cfg.WireGuardDir, cfg.WireGuardPort, cfg.EnablePolicyRouting)
+	if cfg.WireGuardDir != "/tmp/wg" || cfg.WireGuardPort != 51888 {
+		t.Fatalf("expected wireguard settings from runtime config, got dir=%q port=%d", cfg.WireGuardDir, cfg.WireGuardPort)
 	}
 
 	if cfg.MTU != 1450 || cfg.HealthPort != 10001 {
@@ -186,8 +179,8 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		t.Fatalf("expected status websocket keepalive failure count 3 from runtime config, got %d", cfg.StatusWSKeepaliveFailureCount)
 	}
 
-	if !cfg.RemoveWireGuardOnShutdown || !cfg.CleanupNetlinkOnShutdown || !cfg.RemoveMasqueradeOnShutdown {
-		t.Fatalf("expected shutdown cleanup toggles true from runtime config, got wireguard=%v routes=%v masquerade=%v", cfg.RemoveWireGuardOnShutdown, cfg.CleanupNetlinkOnShutdown, cfg.RemoveMasqueradeOnShutdown)
+	if !cfg.RemoveConfigurationOnShutdown {
+		t.Fatal("expected consolidated shutdown cleanup from runtime config")
 	}
 }
 

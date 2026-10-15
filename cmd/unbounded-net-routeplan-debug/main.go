@@ -137,7 +137,7 @@ func main() {
 
 	requestedPeer := strings.TrimSpace(*peerFilter)
 
-	selectedPeers := make([]statusv1alpha1.WireGuardPeerStatus, 0, len(target.Peers))
+	selectedPeers := make([]statusv1alpha1.PeerStatus, 0, len(target.Peers))
 	for _, peer := range target.Peers {
 		if requestedPeer != "" && !strings.EqualFold(strings.TrimSpace(peer.Name), requestedPeer) {
 			continue

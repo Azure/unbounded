@@ -29,10 +29,10 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			r:    &OCIReconciler{DefaultNetbootRef: "ghcr.io/test/default-netboot:v1"},
 			machine: &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-explicit"},
-				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+				Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 					Image:        "ghcr.io/test/machine:v1",
 					NetbootImage: "ghcr.io/test/netboot:v1",
-				}},
+				}}},
 			},
 			wantReqs: []imagePullRequest{
 				{Architecture: v1alpha3.DefaultPXEArchitecture, ImageRef: "ghcr.io/test/machine:v1"},
@@ -44,9 +44,9 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			r:    &OCIReconciler{DefaultNetbootRef: "ghcr.io/test/default-netboot:v1"},
 			machine: &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-default"},
-				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+				Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 					Image: "ghcr.io/test/machine:v1",
-				}},
+				}}},
 			},
 			wantReqs: []imagePullRequest{
 				{Architecture: v1alpha3.DefaultPXEArchitecture, ImageRef: "ghcr.io/test/machine:v1"},
@@ -61,10 +61,10 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			},
 			machine: &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-secrets"},
-				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+				Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 					Image:         "ghcr.io/test/machine:v1",
 					PullSecretRef: secretRef("tenant-a", "machine-image"),
-				}},
+				}}},
 			},
 			wantReqs: []imagePullRequest{
 				{Architecture: v1alpha3.DefaultPXEArchitecture, ImageRef: "ghcr.io/test/machine:v1", PullSecretRef: secretRef("tenant-a", "machine-image")},
@@ -79,11 +79,11 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			},
 			machine: &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-explicit-netboot-secret"},
-				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+				Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 					Image:                "ghcr.io/test/machine:v1",
 					NetbootImage:         "ghcr.io/test/netboot:v1",
 					NetbootPullSecretRef: secretRef("tenant-a", "netboot-image"),
-				}},
+				}}},
 			},
 			wantReqs: []imagePullRequest{
 				{Architecture: v1alpha3.DefaultPXEArchitecture, ImageRef: "ghcr.io/test/machine:v1"},
@@ -95,10 +95,10 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			r:    &OCIReconciler{DefaultNetbootRef: "ghcr.io/test/default-netboot:v1"},
 			machine: &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-arm64"},
-				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+				Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 					Image:        "ghcr.io/test/machine:v1",
 					Architecture: v1alpha3.PXEArchitectureARM64,
-				}},
+				}}},
 			},
 			wantReqs: []imagePullRequest{
 				{Architecture: v1alpha3.PXEArchitectureARM64, ImageRef: "ghcr.io/test/machine:v1"},
@@ -110,9 +110,9 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			r:    &OCIReconciler{DefaultNetbootRef: "ghcr.io/test/machine:v1"},
 			machine: &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-dedupe"},
-				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+				Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 					Image: "ghcr.io/test/machine:v1",
-				}},
+				}}},
 			},
 			wantReqs: []imagePullRequest{{Architecture: v1alpha3.DefaultPXEArchitecture, ImageRef: "ghcr.io/test/machine:v1"}},
 		},
@@ -121,10 +121,10 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			r:    &OCIReconciler{DefaultNetbootRef: "ghcr.io/test/machine:v1", DefaultNetbootPullSecretRef: secretRef("tenant-a", "netboot")},
 			machine: &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-different-secrets"},
-				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+				Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 					Image:         "ghcr.io/test/machine:v1",
 					PullSecretRef: secretRef("tenant-a", "machine"),
-				}},
+				}}},
 			},
 			wantReqs: []imagePullRequest{
 				{Architecture: v1alpha3.DefaultPXEArchitecture, ImageRef: "ghcr.io/test/machine:v1", PullSecretRef: secretRef("tenant-a", "machine")},

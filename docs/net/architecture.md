@@ -499,7 +499,7 @@ sequenceDiagram
 Node agents publish summaries by default. The controller separates observed
 overview facts from expiring, explicitly requested diagnostic payloads.
 Routine cluster APIs and broadcasts contain only summaries, including when
-legacy agents publish full status. The diagram illustrates the HTTP path;
+agents are configured to publish full status. The diagram illustrates the HTTP path;
 agents can also publish over authenticated WebSockets.
 
 ```mermaid
@@ -525,7 +525,7 @@ sequenceDiagram
 
 **Key Design Decisions:**
 - The controller Service has **no selector** -- the leader manages its own EndpointSlice, ensuring only the leader receives pushes
-- On leader election, the controller cleans up stale `v1/Endpoints` resources left by previous controller versions to prevent kube-proxy routing to dead pods
+- The leader publishes only EndpointSlices, with a Pod target reference, and periodically repairs deleted or edited slices. It does not publish or migrate v1 Endpoints.
 - HTTP POST is sent asynchronously with an atomic in-flight guard to prevent ticker drift
 - Status collection uses a snapshot-and-release pattern to minimize lock hold time
 - Summary inspection preserves observed peer health, route counts/mismatches,
@@ -597,7 +597,7 @@ graph TD
         D1[Overview Cache<br/>node -> metadata and counts]
         D2[Pod Informer<br/>unbounded-net-node pods]
         D3[WebSocket Broadcaster<br/>summary updates and history]
-        D4[Detail Cache<br/>UID-bound payload and legacy base with TTL]
+        D4[Detail Cache<br/>UID-bound payload and full-publication base with TTL]
         D5[Detail Requests<br/>IDs, deadlines, and lifecycle metadata]
     end
 
@@ -681,7 +681,6 @@ graph TD
         CR7[EndpointSlices: get, create, update, delete]
         CR8[Pods: get, list, watch]
         CR9[TokenReviews: create]
-        CR10[Endpoints: delete - cleanup stale v1 resources]
         CR11[SitePeerings: get, list, watch + status]
         CR12[SiteGatewayPoolAssignments: get, list, watch]
         CR13[GatewayPoolPeerings: get, list, watch]
@@ -824,8 +823,7 @@ has a `TUNNEL_F_HEALTHY` flag updated by the health check system; unhealthy
 nexthops are skipped by the BPF program. Healthcheck probes (UDP 9997) are
 always forwarded regardless of health state to enable recovery detection.
 
-> **Note:** Policy-based routing (PBR) using connmark/fwmark/ip-rule is
-> deprecated. Cross-site transit forwarding now uses per-interface iptables
-> FORWARD ACCEPT rules (`iptables -I FORWARD 1 -i <iface> -j ACCEPT`) on
-> tunnel and WireGuard gateway interfaces. The `enablePolicyRouting` option
-> defaults to `false` and is retained only for backward compatibility.
+> **Note:** Gateway connmark PBR and its `enablePolicyRouting` option are removed.
+> Current forwarding uses per-source FORWARD jumps into `UNBOUNDED-FORWARD`,
+> whose per-destination rules accept only tunnel-to-tunnel traffic. The managed
+> route table remains supported independently of the retired PBR mode.

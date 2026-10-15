@@ -24,7 +24,7 @@ func TestStatusQueueRecordsServerMilestones(t *testing.T) {
 	machine := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 7},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"}},
 		},
 	}
 	op := testOperation("op-queue", v1alpha3.OperationHostReplace)

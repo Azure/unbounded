@@ -12,12 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -61,12 +63,46 @@ func waitNodeAuthCondition(t *testing.T, condition func() bool) {
 	}
 }
 
+func nodeAuthTestWatchBarrier(client *k8sfake.Clientset) func() bool {
+	reactors := append([]k8stesting.WatchReactor(nil), client.WatchReactionChain...)
+	registered := make([]*atomic.Bool, 0, 2)
+
+	for _, resource := range []string{"pods", "serviceaccounts"} {
+		ready := &atomic.Bool{}
+		registered = append(registered, ready)
+
+		client.PrependWatchReactor(resource, func(action k8stesting.Action) (bool, watch.Interface, error) {
+			for _, reactor := range reactors {
+				if !reactor.Handles(action) {
+					continue
+				}
+
+				handled, watcher, err := reactor.React(action)
+				if handled {
+					if err == nil && watcher != nil {
+						ready.Store(true)
+					}
+
+					return handled, watcher, err
+				}
+			}
+
+			return false, nil, nil
+		})
+	}
+
+	return func() bool {
+		return registered[0].Load() && registered[1].Load()
+	}
+}
+
 func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuthInformers, context.CancelFunc) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
+	watchesReady := nodeAuthTestWatchBarrier(client)
 	caches := newNodeAuthInformers(ctx, client, "unbounded-system", 0)
 	caches.start()
 	t.Cleanup(func() {
@@ -75,8 +111,123 @@ func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuth
 		caches.saFactory.Shutdown()
 	})
 	waitNodeAuthCondition(t, caches.ready)
+	// Initial cache sync can finish before watches start. The fake client cannot
+	// replay a deletion that happens before its watch is registered.
+	waitNodeAuthCondition(t, watchesReady)
 
 	return caches, cancel
+}
+
+func TestNodeAuthTestWatchBarrier(t *testing.T) {
+	for _, resource := range []string{"pods", "serviceaccounts"} {
+		t.Run(resource, func(t *testing.T) {
+			client := k8sfake.NewClientset()
+			entered := make(chan struct{})
+			release := make(chan struct{})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			client.PrependWatchReactor(resource, func(k8stesting.Action) (bool, watch.Interface, error) {
+				close(entered)
+
+				select {
+				case <-release:
+					return false, nil, nil
+				case <-ctx.Done():
+					return true, nil, ctx.Err()
+				}
+			})
+			ready := nodeAuthTestWatchBarrier(client)
+
+			other := "pods"
+			if resource == other {
+				other = "serviceaccounts"
+			}
+
+			otherWatch, err := client.InvokesWatch(k8stesting.NewWatchAction(corev1.SchemeGroupVersion.WithResource(other), "unbounded-system", metav1.ListOptions{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer otherWatch.Stop()
+
+			done := make(chan error, 1)
+
+			go func() {
+				watcher, err := client.InvokesWatch(k8stesting.NewWatchAction(corev1.SchemeGroupVersion.WithResource(resource), "unbounded-system", metav1.ListOptions{}))
+				if watcher != nil {
+					watcher.Stop()
+				}
+
+				done <- err
+			}()
+
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("watch reactor was not entered")
+			}
+
+			if ready() {
+				t.Error("watch barrier passed before registration completed")
+			}
+
+			close(release)
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("watch registration did not finish")
+			}
+
+			if !ready() {
+				t.Fatal("watch barrier did not pass after both registrations")
+			}
+		})
+	}
+}
+
+func TestNodeAuthTestWatchBarrierFailedRegistration(t *testing.T) {
+	client := k8sfake.NewClientset()
+	fail := true
+
+	client.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
+		if fail {
+			return true, nil, errors.New("watch unavailable")
+		}
+
+		return false, nil, nil
+	})
+	ready := nodeAuthTestWatchBarrier(client)
+
+	saWatch, err := client.CoreV1().ServiceAccounts("unbounded-system").Watch(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer saWatch.Stop()
+
+	if _, err := client.CoreV1().Pods("unbounded-system").Watch(t.Context(), metav1.ListOptions{}); err == nil {
+		t.Fatal("expected watch registration failure")
+	}
+
+	if ready() {
+		t.Fatal("failed watch registration passed the barrier")
+	}
+
+	fail = false
+
+	podWatch, err := client.CoreV1().Pods("unbounded-system").Watch(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer podWatch.Stop()
+
+	if !ready() {
+		t.Fatal("successful retry did not pass the barrier")
+	}
 }
 
 func assertNodeAuthProbes(t *testing.T, caches *nodeAuthInformers, client *k8sfake.Clientset, verifier serviceAccountTokenVerifier, ready bool) {

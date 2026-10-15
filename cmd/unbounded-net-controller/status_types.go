@@ -129,14 +129,11 @@ type HealthCheckStatus = statusv1alpha1.HealthCheckStatus
 // PeerTunnelStatus aliases shared tunnel link status details.
 type PeerTunnelStatus = statusv1alpha1.PeerTunnelStatus
 
-// WireGuardPeerLinkStatus aliases shared WireGuard link status schema.
-type WireGuardPeerLinkStatus = statusv1alpha1.WireGuardPeerLinkStatus
-
 // NodeError aliases the shared node error schema.
 type NodeError = statusv1alpha1.NodeError
 
 // WireGuardPeerStatus aliases the shared WireGuard peer status schema.
-type WireGuardPeerStatus = statusv1alpha1.WireGuardPeerStatus
+type WireGuardPeerStatus = statusv1alpha1.PeerStatus
 
 // BpfEntry aliases the shared BPF trie entry schema.
 type BpfEntry = statusv1alpha1.BpfEntry

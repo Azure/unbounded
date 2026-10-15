@@ -36,9 +36,8 @@ func TestInstallIgnoresObsoleteRacerGate(t *testing.T) {
 					require.NoError(t, err)
 
 					want := map[string]string{
-						"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
-						"UNBOUNDED_REAP_LEGACY_RESOURCES": "false",
-						"UNBOUNDED_IMAGE_REGISTRY":        "registry.example.test/components",
+						"UNBOUNDED_API_SERVER_ENDPOINT": "https://api.example.test:6443",
+						"UNBOUNDED_IMAGE_REGISTRY":      "registry.example.test/components",
 					}
 					require.Equal(t, want, data)
 					require.NotContains(t, data, key)

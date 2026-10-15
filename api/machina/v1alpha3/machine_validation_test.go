@@ -25,10 +25,15 @@ func TestMachineProviderOwnershipSchema(t *testing.T) {
 	}
 
 	specSchema := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
-	assertSchemaValidations(t, specSchema, map[string]string{
-		"!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)":                                                                                   "provider is immutable once set",
-		"!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))": "host ownership cannot be combined with legacy pxe, provider, or providerID fields",
-	})
+	for _, field := range []string{"pxe", "provider", "providerID"} {
+		if _, exists := specSchema.Properties[field]; exists {
+			t.Errorf("deprecated spec.%s must not be in the schema", field)
+		}
+	}
+
+	if len(specSchema.XValidations) != 0 {
+		t.Errorf("unexpected spec fallback validations: %v", specSchema.XValidations)
+	}
 
 	hostSchema := specSchema.Properties["host"]
 	assertSchemaValidations(t, hostSchema, map[string]string{

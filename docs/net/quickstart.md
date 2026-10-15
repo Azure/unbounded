@@ -8,7 +8,7 @@ multi-site or AKS deployments.
 
 ## Prerequisites
 
-- **Kubernetes cluster** (v1.27+) with WireGuard kernel module support on nodes
+- **Kubernetes cluster** (v1.34+) with WireGuard kernel module support on nodes
 - **kubectl** configured for your cluster
 - **Go toolchain** (if building from source or using `make -C hack/net deploy`)
 - For **AKS**: Azure CLI (`az`), a subscription with permissions to create

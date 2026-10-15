@@ -414,10 +414,8 @@ func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site u
 		return err
 	}
 
-	// spec.selector is immutable. When it differs (e.g. the site label moved
-	// from the deprecated key to the canonical unbounded-cloud.io/site), the
-	// DaemonSet cannot be updated in place; delete and recreate it. This is a
-	// one-time, per-site kube-proxy blip during the label migration.
+	// spec.selector is immutable. Repair selector drift by recreating the
+	// DaemonSet rather than attempting an invalid in-place update.
 	if !equalLabelSelector(existing.Spec.Selector, want.Spec.Selector) {
 		if err := c.clientset.AppsV1().DaemonSets(c.options.Namespace).Delete(ctx, existing.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return err

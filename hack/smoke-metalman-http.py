@@ -292,7 +292,7 @@ def start_metalman_and_replace() -> None:
         "apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Machine",
         "metadata": {"name": NODE, "labels": {"unbounded-cloud.io/site": SITE}},
         "spec": {
-            "pxe": {
+            "host": {"netboot": {
                 "image": HOST_IMAGE, "netbootImage": NETBOOT_IMAGE, "bootProtocol": "HTTP",
                 "targetDisk": "/dev/vda",
                 "dhcpLeases": [{"mac": MAC, "ipv4": NODE_IP, "subnetMask": "255.255.255.0",
@@ -302,7 +302,7 @@ def start_metalman_and_replace() -> None:
                              "namespace": "default", "key": "password"}},
                 "cloudInit": {"userDataConfigMapRef": {"name": "http-smoke-user-data",
                                                         "namespace": "default", "key": "user-data"}},
-            },
+            }},
             "agent": {"image": AGENT_IMAGE_VM,
                       "url": f"http://{SERVER_IP}:{AGENT_PORT}/unbounded-agent-linux-amd64.tar.gz"},
         },

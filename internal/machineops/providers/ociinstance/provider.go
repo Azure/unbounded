@@ -29,7 +29,6 @@ const (
 )
 
 const (
-	parameterImageID           = "imageID"
 	parameterSSHAuthorizedKeys = "sshAuthorizedKeys"
 
 	tagMachine       = "unbounded_machine"

@@ -181,15 +181,16 @@ func replacementProvisioningFormat(machine *unboundedv1alpha3.Machine, image str
 	}
 
 	observed := machine.Status.ObservedProvisioningFormat
-	if image != "" && observed == unboundedv1alpha3.ProvisioningFormatIgnition {
-		return "", fmt.Errorf("HostReplace with an explicit image on an Ignition host requires an explicit target provisioningFormat")
+
+	if image != "" {
+		return "", fmt.Errorf("HostReplace with an explicit image requires an explicit target provisioningFormat")
 	}
 
 	if observed != "" {
 		return observed, nil
 	}
 
-	return unboundedv1alpha3.ProvisioningFormatCloudInit, nil
+	return "", fmt.Errorf("HostReplace requires an explicit target provisioningFormat or an installed observation when preserving the current image")
 }
 
 func (r *MachineOperationReconciler) snapshotProviderMachine(
