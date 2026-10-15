@@ -25,9 +25,11 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact images)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           orca, gantry, host-ubuntu2404, host-azurelinux3,
-#                           host-azurelinux3-nvidia, inventory-aggregator,
-#                           inventory-inspector, inventory-viewer)
+#                           token-refresher, orca, gantry, racer-controller,
+#                           racer-dataplane, racer-object, host-ubuntu2404,
+#                           host-azurelinux3, host-azurelinux3-nvidia,
+#                           inventory-aggregator, inventory-inspector,
+#                           inventory-viewer)
 #         -> gantry-chart  (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> finalize          (attach extras + krew manifest)
@@ -867,6 +869,14 @@ jobs:
             trivy: true
           - name: racer-controller
             file: images/racer-controller/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: racer-dataplane
+            file: images/racer-dataplane/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: racer-object
+            file: images/racer-object/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: host-ubuntu2404
