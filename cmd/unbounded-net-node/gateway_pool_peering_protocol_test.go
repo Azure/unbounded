@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -142,6 +143,7 @@ func TestPinnedGatewayPoolAcknowledgmentWaitsForTaint(t *testing.T) {
 type poolPeeringProtocolFixture struct {
 	peerings       cache.SharedIndexInformer
 	pools          cache.SharedIndexInformer
+	nodes          cache.SharedIndexInformer
 	state          *wireGuardState
 	update         func() error
 	configureCalls int
@@ -226,6 +228,7 @@ func newPoolPeeringProtocolFixture(t *testing.T, gateway bool) *poolPeeringProto
 	gatewayNodes := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
 		ObjectMeta: metav1.ObjectMeta{Name: "remote"},
 	}))
+	f.nodes = gatewayNodes
 	cfg := &config{NodeName: "self", WireGuardPort: 51820, WireGuardInterfacePrefix: "gpp-test-wg", MTU: 576, PreferredPrivateEncap: "WireGuard"}
 	f.update = func() error {
 		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, f.pools,
@@ -459,6 +462,36 @@ func TestGatewayPoolPeeringProtocolConflictsAndScope(t *testing.T) {
 
 		f.checkGateway(t, "None", "")
 	})
+}
+
+func TestPublishedForwardingMTUWorkerOnly(t *testing.T) {
+	for _, gateway := range []bool{false, true} {
+		t.Run(fmt.Sprintf("gateway=%v", gateway), func(t *testing.T) {
+			f := newPoolPeeringProtocolFixture(t, gateway)
+			f.putPeering(t, "connect", "local-a", nil, true)
+
+			node := &unboundednetv1alpha1.GatewayPoolNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+				Status:     unboundednetv1alpha1.GatewayNodeStatus{ForwardingMTU: ptrInt32(500)},
+			}
+			if err := f.nodes.GetStore().Update(toUnstructured(t, node)); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := f.update(); err != nil {
+				t.Fatal(err)
+			}
+
+			want := 500
+			if gateway {
+				want = 0
+			}
+
+			if len(f.gateways) != 1 || f.gateways[0].TransitTunnelMTU != want {
+				t.Fatalf("gateway=%v consumed published cap unexpectedly: %+v", gateway, f.gateways)
+			}
+		})
+	}
 }
 
 func TestGatewayPoolPeeringProtocolFailureRetries(t *testing.T) {

@@ -13,6 +13,94 @@ import (
 	vishnetlink "github.com/vishvananda/netlink"
 )
 
+func TestGatewayPolicyReactivationAfterFailedRemoval(t *testing.T) {
+	oldList, oldDelete, oldAdd, oldFlush := netlinkRuleList, netlinkRuleDel, netlinkRuleAdd, flushGatewayRouteTable
+	oldEnsure, oldTables := ensureGatewayInterfacePolicy, rtTablesPath
+
+	t.Cleanup(func() {
+		netlinkRuleList, netlinkRuleDel, netlinkRuleAdd, flushGatewayRouteTable = oldList, oldDelete, oldAdd, oldFlush
+		ensureGatewayInterfacePolicy, rtTablesPath = oldEnsure, oldTables
+	})
+
+	rtTablesPath = filepath.Join(t.TempDir(), "rt_tables")
+	if err := os.WriteFile(rtTablesPath, []byte("1001 wg51821\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &GatewayPolicyManager{
+		wireguardBasePort: 51820, gatewayTableBase: 1000,
+		configuredIfaces: map[string]int{"wg51821": 1001},
+	}
+	rules := map[int][]vishnetlink.Rule{
+		vishnetlink.FAMILY_V4: {{Table: 1001, Mark: 1, Family: vishnetlink.FAMILY_V4}},
+		vishnetlink.FAMILY_V6: {{Table: 1001, Mark: 1, Family: vishnetlink.FAMILY_V6}},
+	}
+	netlinkRuleList = func(family int) ([]vishnetlink.Rule, error) { return rules[family], nil }
+	netlinkRuleDel = func(rule *vishnetlink.Rule) error {
+		rules[rule.Family] = nil
+		return nil
+	}
+	netlinkRuleAdd = func(rule *vishnetlink.Rule) error {
+		family := rule.Family
+		if family == 0 {
+			family = vishnetlink.FAMILY_V4
+		}
+
+		rules[family] = append(rules[family], *rule)
+
+		return nil
+	}
+	injected := errors.New("table flush failed")
+	flushGatewayRouteTable = func(int) error { return injected }
+
+	if err := m.RemoveInterface("wg51821"); !errors.Is(err, injected) {
+		t.Fatalf("removal error=%v", err)
+	}
+
+	if len(rules[vishnetlink.FAMILY_V4])+len(rules[vishnetlink.FAMILY_V6]) != 0 {
+		t.Fatal("fixture did not remove policy rules before failed flush")
+	}
+
+	flushGatewayRouteTable = func(int) error { return nil }
+	ensureCalls := 0
+	ensureErr := errors.New("policy installation failed")
+	ensureGatewayInterfacePolicy = func(manager *GatewayPolicyManager, _ string, table int) error {
+		ensureCalls++
+
+		if ensureErr != nil {
+			return ensureErr
+		}
+
+		return manager.ensureIPRule(table)
+	}
+
+	if err := m.ConfigureInterface("wg51821", 1001); !errors.Is(err, ensureErr) {
+		t.Fatalf("installation error=%v", err)
+	}
+
+	if !m.pendingCleanup["wg51821"] {
+		t.Fatal("failed reinstallation marked interface healthy")
+	}
+
+	if err := m.ReconcileExpectedInterfaces(map[string]int{"wg51821": 1001}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !m.pendingCleanup["wg51821"] {
+		t.Fatal("expected-interface reconciliation masked failed installation")
+	}
+
+	ensureErr = nil
+
+	if err := m.ConfigureInterface("wg51821", 1001); err != nil {
+		t.Fatal(err)
+	}
+
+	if ensureCalls != 2 || len(rules[vishnetlink.FAMILY_V4]) != 1 || len(rules[vishnetlink.FAMILY_V6]) != 1 || m.pendingCleanup["wg51821"] {
+		t.Fatalf("reactivation did not restore policy routing: calls=%d rules=%v pending=%v", ensureCalls, rules, m.pendingCleanup)
+	}
+}
+
 func TestRemoveGatewayPolicyInterfaceRetriesFailedCleanup(t *testing.T) {
 	oldList, oldDelete, oldFlush, oldTables := netlinkRuleList, netlinkRuleDel, flushGatewayRouteTable, rtTablesPath
 	oldDiscovery := discoverGatewayInterfaceTable

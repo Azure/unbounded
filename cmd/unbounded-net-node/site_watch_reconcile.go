@@ -835,7 +835,8 @@ func shouldReconcileGatewayNodeUpdate(oldObj, newObj interface{}) bool {
 		return true
 	}
 
-	if !reflect.DeepEqual(oldGatewayNode.Spec, newGatewayNode.Spec) {
+	if !reflect.DeepEqual(oldGatewayNode.Spec, newGatewayNode.Spec) ||
+		!reflect.DeepEqual(oldGatewayNode.Status.ForwardingMTU, newGatewayNode.Status.ForwardingMTU) {
 		return true
 	}
 
@@ -1927,6 +1928,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 	}
 
+	publishGatewayStatus := func(int, []meshPeerInfo, []gatewayPeerInfo) error { return nil }
+
 	if isGatewayNode && dynamicClient != nil && len(localGatewayPools) > 0 {
 		selectedPoolName := localGatewayPools[0]
 		selectedPool := gatewayPoolMap[selectedPoolName]
@@ -1944,8 +1947,16 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			state.lastGatewayAdvertSummary = summary
 		}
 
-		if err := syncGatewayNodeRoutesStatus(ctx, dynamicClient, gatewayNodeInformer, cfg.NodeName, routes); err != nil {
-			klog.Warningf("Failed to publish GatewayNode routes for node %s: %v", cfg.NodeName, err)
+		publishGatewayStatus = func(forwardingMTU int, mesh []meshPeerInfo, gateways []gatewayPeerInfo) error {
+			if err := verifyActiveTunnelMTUs(cfg, forwardingMTU, mesh, gateways); err != nil {
+				return fmt.Errorf("verify gateway forwarding MTU before publication: %w", err)
+			}
+
+			if err := syncGatewayNodeRoutesStatus(ctx, dynamicClient, gatewayNodeInformer, cfg.NodeName, routes, forwardingMTU); err != nil {
+				return fmt.Errorf("publish GatewayNode routes and forwarding MTU for %s: %w", cfg.NodeName, err)
+			}
+
+			return nil
 		}
 	} else if isGatewayNode {
 		summary := gatewayAdvertSummary{
@@ -2082,6 +2093,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		siteTunnelProtocols, peeringSiteTunnelProtocols,
 		assignmentPoolTunnelProtocols, poolTunnelProtocols)
 	localPoolMTU := localGatewayPoolTunnelMTU(localGatewayPools, poolTunnelMTUs)
+
+	if !isGatewayNode {
+		applyPublishedGatewayMTUs(gatewayPeers, gatewayPoolMap, gatewayNodeMap)
+	}
+
 	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, isGatewayNode, localPoolMTU, peeredSites, networkPeeredSites,
 		siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 		assignmentPoolTunnelMTUs, poolTunnelMTUs, state.netlinkCache)
@@ -2178,7 +2194,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		state.mu.Unlock()
 		syncMasqueradeRules(state, nonMasqCIDRs)
 
-		return nil
+		return publishGatewayStatus(fabricMTU, peers, gatewayPeers)
 	}
 
 	// Log added and removed peers
@@ -2305,9 +2321,13 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		return err
 	}
 
-	if sharedTunnelErr != nil && (fabricMTUIncreased || errors.Is(sharedTunnelErr, errRegisterHealthChecks)) {
+	if sharedTunnelErr != nil && (isGatewayNode || fabricMTUIncreased || errors.Is(sharedTunnelErr, errRegisterHealthChecks)) {
 		if errors.Is(sharedTunnelErr, errRegisterHealthChecks) {
 			return sharedTunnelErr
+		}
+
+		if isGatewayNode {
+			return fmt.Errorf("cannot publish gateway status while tunnel reconciliation is incomplete: %w", sharedTunnelErr)
 		}
 
 		return fmt.Errorf("cannot raise fabric MTU while tunnel reconciliation is incomplete: %w", sharedTunnelErr)
@@ -2371,6 +2391,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		} else {
 			state.notrackManager.Cleanup()
 		}
+	}
+
+	if err := publishGatewayStatus(fabricMTU, peers, gatewayPeers); err != nil {
+		return err
 	}
 
 	// Phase 3: Update state fields that getNodeStatus() reads (brief lock).

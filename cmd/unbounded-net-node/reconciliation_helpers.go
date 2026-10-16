@@ -406,6 +406,38 @@ func sitePeeringEdgeTunnelMTUs(peerings []unboundednetv1alpha1.SitePeering) map[
 	return result
 }
 
+func applyPublishedGatewayMTUs(peers []gatewayPeerInfo, pools map[string]*unboundednetv1alpha1.GatewayPool, nodes map[string]*unboundednetv1alpha1.GatewayPoolNode) {
+	nodeMTU := func(name string) int {
+		if node := nodes[name]; node != nil && node.Status.ForwardingMTU != nil {
+			return int(*node.Status.ForwardingMTU)
+		}
+
+		return 0
+	}
+
+	poolMTUs := make(map[string]int, len(pools))
+	for name, pool := range pools {
+		for _, node := range pool.Status.Nodes {
+			poolMTUs[name] = resolveTunnelMTU(poolMTUs[name], nodeMTU(node.Name))
+		}
+	}
+
+	for i := range peers {
+		mtu := nodeMTU(peers[i].Name)
+		for _, route := range peers[i].LearnedRoutes {
+			for _, path := range route.Paths {
+				for _, hop := range path {
+					if hop.Type == "GatewayPool" && hop.Name != peers[i].PoolName {
+						mtu = resolveTunnelMTU(mtu, poolMTUs[hop.Name])
+					}
+				}
+			}
+		}
+
+		peers[i].TransitTunnelMTU = resolveTunnelMTU(peers[i].TransitTunnelMTU, mtu)
+	}
+}
+
 func gatewayMeshTransitTunnelMTU(
 	peerPool, peerSite string,
 	routes map[string]unboundednetv1alpha1.GatewayNodeRoute,
