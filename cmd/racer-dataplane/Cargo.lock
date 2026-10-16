@@ -899,6 +899,7 @@ dependencies = [
  "futures",
  "libc",
  "uring-runtime",
+ "uring-runtime-sim",
  "zeroize",
 ]
 
@@ -1290,6 +1291,15 @@ dependencies = [
  "libc",
  "sha2",
  "zeroize",
+]
+
+[[package]]
+name = "uring-runtime-sim"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "uring-runtime",
 ]
 
 [[package]]

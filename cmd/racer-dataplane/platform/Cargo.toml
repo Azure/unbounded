@@ -11,10 +11,12 @@ uring = { package = "uring-runtime", path = "../../../crates/uring-runtime" }
 futures = "0.3"
 zeroize = "1"
 libc = "0.2"
+uring-runtime-sim = { path = "../../../crates/uring-runtime-sim", optional = true }
 
 [features]
 default = []
 # Shared wake instrumentation for downstream tests.
 test-util = []
-# Ambient simulated clock and entropy (the seam the simulation backend plugs into).
-simulation = []
+# Deterministic simulation: ambient simulated clock and entropy, the
+# `simulation` facade over uring-runtime-sim, and the simulated backend.
+simulation = ["dep:uring-runtime-sim"]

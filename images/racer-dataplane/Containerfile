@@ -36,6 +36,10 @@ COPY cmd/racer-dataplane/platform/src ./platform/src
 COPY crates/Cargo.toml crates/Cargo.lock /src/crates/
 COPY crates/uring-runtime/Cargo.toml /src/crates/uring-runtime/Cargo.toml
 COPY crates/uring-runtime/src /src/crates/uring-runtime/src
+# Optional simulation backend of racer-platform: unused by the production
+# build, but cargo needs its manifest and sources to resolve the lockfile.
+COPY crates/uring-runtime-sim/Cargo.toml /src/crates/uring-runtime-sim/Cargo.toml
+COPY crates/uring-runtime-sim/src /src/crates/uring-runtime-sim/src
 COPY cmd/racer-dataplane/alloc/Cargo.toml ./alloc/Cargo.toml
 COPY cmd/racer-dataplane/alloc/src ./alloc/src
 COPY cmd/racer-dataplane/flow/Cargo.toml ./flow/Cargo.toml
