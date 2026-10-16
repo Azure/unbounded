@@ -723,7 +723,11 @@ Delegated IPAM does not provide inter-node routing. If the third-party CNI
 does not install those routes, set `node.manageSameSitePodRoutes: true` to
 have Unbounded manage same-site PodCIDR routes without managing the CNI
 configuration. The default remains false for unmanaged CNI sites. A Site
-with `tunnelProtocol: None` uses direct routes to peers on the same underlay.
+with `tunnelProtocol: None` requires an underlay that routes unencapsulated
+PodCIDR traffic between peers. Otherwise, select an encapsulated transport.
+For delegated Cilium with Unbounded-managed routes, limit Cilium's managed
+devices to its underlay interface (for example, Helm `devices=eth0`), so it
+does not replace the TC programs on Unbounded's tunnel interfaces.
 
 **Migration:** The allocation gate only applies after the runtime loads a
 conflist that invokes `unbounded-ipam`. Install the binary, replace the active
