@@ -484,7 +484,10 @@ func (h *harness) enableArtifactStreaming(ctx context.Context, caPEM []byte) {
 func patchConfigMapForArtifactStreamingE2E(raw string) (string, error) {
 	const (
 		enabledFrom = "    artifact_streaming_enabled: false"
-		enabledTo   = "    artifact_streaming_enabled: true"
+		// These tests repeat one range to observe source transitions. A local
+		// range cache would satisfy subsequent requests before peer discovery or
+		// stale-provider fallback runs, so cache behavior is covered separately.
+		enabledTo = "    artifact_streaming_enabled: true\n    range_cache_dir: \"\""
 	)
 
 	if strings.Count(raw, enabledFrom) != 1 {
