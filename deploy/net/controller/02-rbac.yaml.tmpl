@@ -13,8 +13,9 @@ rules:
   # Nodes: read, patch, and update for CIDR assignment and site labeling.
   # Cannot be further scoped -- the controller must operate on any node in the cluster.
   # Fields restricted by ValidatingAdmissionPolicy (09-vap.yaml.tmpl):
-  #   labels/annotations: only net.unbounded-cloud.io/* prefix
-  #   spec: only podCIDR and podCIDRs (Kubernetes enforces immutability after initial set)
+  #   labels: only net.unbounded-cloud.io/* and the canonical Site label
+  #   annotations: only net.unbounded-cloud.io/*
+  #   spec: only pod CIDRs, plus the node agent's exact gateway taint
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch", "update"]
@@ -186,10 +187,12 @@ rules:
     resources: ["services"]
     resourceNames: ["unbounded-net-controller"]
     verbs: ["get"]
-  # Pods: dashboard status and local OIDC bound-object validation.
+  # Pods: dashboard status, local OIDC bound-object validation, and targeted
+  # replacement of node-agent Pods after acknowledged assignment changes.
+  # ValidatingAdmissionPolicy restricts delete to DaemonSet-owned node Pods.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "delete"]
   # ServiceAccounts: local OIDC bound-object validation (controller namespace only).
   - apiGroups: [""]
     resources: ["serviceaccounts"]
