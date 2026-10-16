@@ -7,11 +7,11 @@ publish = false
 description = "Policy-driven quotas, keyed coalescing, completion-owned flights, and bounded I/O resources"
 
 [features]
-simulation = ["uring-runtime/simulation"]
+simulation = ["racer-platform/simulation"]
 
 [dependencies]
 futures = "0.3"
 libc = "0.2"
 zeroize = "1"
 page-alloc = { path = "../alloc" }
-uring-runtime = { package = "uring-runtime-legacy", path = "../runtime" }
+racer-platform = { path = "../platform" }

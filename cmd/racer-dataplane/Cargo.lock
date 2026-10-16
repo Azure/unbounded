@@ -425,7 +425,7 @@ dependencies = [
  "futures",
  "libc",
  "page-alloc",
- "uring-runtime-legacy",
+ "racer-platform",
  "zeroize",
 ]
 
