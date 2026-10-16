@@ -104,6 +104,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "socket syscalls are not supported by Miri")]
     fn clones_share_and_last_drop_closes() {
         let (a, mut b) = UnixStream::pair().unwrap();
         let fd = Fd::from(a);
@@ -124,6 +125,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "file and socket syscalls are not supported by Miri isolation"
+    )]
     fn debug_and_as_fd() {
         let file = File::open("/dev/null").unwrap();
         let fd = Fd::from(file);
