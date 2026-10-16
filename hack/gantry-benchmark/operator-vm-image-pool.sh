@@ -507,16 +507,17 @@ if [[ -s "$progress_file" ]]; then
   jq -r '"run_id=\(.run_id // "")\nstage=\(.stage // "")\nstage_started_at=\(.stage_started_at // "")\nmessage=\(.message // "")"' "$progress_file"
   run_id=$(jq -r '.run_id // empty' "$progress_file")
   if [[ -n "$run_id" ]]; then
-    build_dir=${BENCHMARK_REPO_ROOT:-/opt/gantry-benchmark/unbounded}/tmp/gantry-benchmark/$run_id/build/shared-payload
+    build_root=${BENCHMARK_REPO_ROOT:-/opt/gantry-benchmark/unbounded}/tmp/gantry-benchmark/$run_id/build
+    build_dir=$build_root/gantry-only-fresh
+    [[ -d "$build_dir" ]] || build_dir=$build_root/shared-payload
     payload_files=0
     payload_bytes=0
     if [[ -d "$build_dir" ]]; then
       payload_files=$(find "$build_dir" -maxdepth 1 -type f -name 'payload*.bin' | wc -l)
-      payload_bytes=$(du -sb "$build_dir" | awk '{print $1}')
+      payload_bytes=$(find "$build_dir" -maxdepth 1 -type f -name 'payload*.bin' -printf '%s\n' | awk '{sum += $1} END {printf "%.0f\n", sum}')
     fi
-    image_operation=$(pgrep -af 'podman (build|push)' 2>/dev/null | awk '
-      /podman build/ {print "build"; exit}
-      /podman push/ {print "push"; exit}
+    image_operation=$(ps -C podman -o args= 2>/dev/null | awk '
+      $2 == "build" || $2 == "push" {print $2; exit}
     ') || true
     printf 'payload_files=%s\npayload_bytes=%s\nimage_operation=%s\n' \
       "$payload_files" "$payload_bytes" "${image_operation:-none}"
