@@ -45,7 +45,7 @@ func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPee
 		return nil
 	}
 
-	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers)
+	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers, state.manageCniPlugin || cfg.ManageSameSitePodRoutes)
 	for _, cidr := range extraSupernets {
 		supernets[cidr] = true
 	}
@@ -611,11 +611,13 @@ func resolveTunnelPeerTarget(protocol string, geneveIfIdx, ipipIfIdx, vxlanIfIdx
 // allGatewayPeers includes ALL gateway peers (GENEVE, VXLAN, and WG) so that
 // cross-site supernet routes are created regardless of the tunnel protocol
 // used for the gateway link.
-func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers, allGatewayPeers []gatewayPeerInfo) map[string]bool {
+func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers, allGatewayPeers []gatewayPeerInfo, manageLocalPodRoutes bool) map[string]bool {
 	supernets := make(map[string]bool)
 	// Site pod CIDR assignment pools (supernets covering all node podCIDRs).
-	for _, cidr := range state.sitePodCIDRPools {
-		supernets[cidr] = true
+	if manageLocalPodRoutes {
+		for _, cidr := range state.sitePodCIDRPools {
+			supernets[cidr] = true
+		}
 	}
 	// Gateway pool RoutedCidrs (cross-site supernets).
 	for _, cidr := range state.sitePodCIDRs {

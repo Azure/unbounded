@@ -390,7 +390,7 @@ func validateSiteSpec(site unboundedv1alpha3.Site) error {
 	ipv6Mask := 0
 
 	for i, assignment := range site.Spec.PodCidrAssignments {
-		if !assignmentEnabled(assignment.AssignmentEnabled) {
+		if !site.Spec.PodCIDRAssignmentEnabled(assignment) {
 			continue
 		}
 
@@ -608,7 +608,7 @@ func collectPodCIDRs(sites []unboundedv1alpha3.Site) ([]cidrEntry, error) {
 
 	for _, site := range sites {
 		for i, assignment := range site.Spec.PodCidrAssignments {
-			if !assignmentEnabled(assignment.AssignmentEnabled) {
+			if !site.Spec.PodCIDRAssignmentEnabled(assignment) {
 				continue
 			}
 
@@ -661,14 +661,6 @@ func ipFamily(cidr *net.IPNet) string {
 	}
 
 	return "ipv6"
-}
-
-func assignmentEnabled(enabled *bool) bool {
-	if enabled == nil {
-		return true
-	}
-
-	return *enabled
 }
 
 func decodeSiteFromRequest(req *admissionv1.AdmissionRequest) (unboundedv1alpha3.Site, error) {

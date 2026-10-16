@@ -459,7 +459,7 @@ func siteKubeProxyClusterCIDR(site unboundedv1alpha3.Site) (string, bool) {
 	var ipv4, ipv6 string
 
 	for _, assignment := range site.Spec.PodCidrAssignments {
-		if !assignmentEnabled(assignment.AssignmentEnabled) {
+		if !site.Spec.PodCIDRAssignmentEnabled(assignment) {
 			continue
 		}
 
