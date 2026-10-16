@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -81,14 +82,20 @@ func (p Plugin) Add(args *skel.CmdArgs) (returnErr error) {
 		}
 	}
 
-	var runtimeConfig map[string]json.RawMessage
-	if raw, ok := input["runtimeConfig"]; ok {
+	for field, raw := range input {
+		if !strings.EqualFold(field, "runtimeConfig") {
+			continue
+		}
+
+		var runtimeConfig map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &runtimeConfig); err != nil {
 			return err
 		}
 
-		if _, exists := runtimeConfig["ipRanges"]; exists {
-			return errors.New("runtimeConfig.ipRanges cannot override verified Node PodCIDRs")
+		for option := range runtimeConfig {
+			if strings.EqualFold(option, "ipRanges") {
+				return errors.New("runtimeConfig.ipRanges cannot override verified Node PodCIDRs")
+			}
 		}
 	}
 

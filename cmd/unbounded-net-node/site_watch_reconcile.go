@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -87,25 +88,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	state.routeManager = routeManager
 	state.routeTableID = cfg.RouteTableID
 
-	// Set preferred source IPs for routes based on node's podCIDRs.
-	// Collect both address families before calling SetPreferredSourceIPs
-	// to avoid one family overwriting the other with nil.
-	var preferredSrcIPv4, preferredSrcIPv6 net.IP
-
-	for _, cidr := range nodePodCIDRs {
-		gwIP := getGatewayIPFromCIDR(cidr)
-		if gwIP == nil {
-			continue
-		}
-
-		if gwIP.To4() != nil {
-			preferredSrcIPv4 = gwIP
-		} else {
-			preferredSrcIPv6 = gwIP
-		}
-	}
-
-	routeManager.SetPreferredSourceIPs(preferredSrcIPv4, preferredSrcIPv6)
+	setPodCIDRPreferredSources(routeManager, nodePodCIDRs)
 
 	// Initialize healthcheck manager for peer health monitoring.
 	healthCheckMgr, err := healthcheck.NewManager(cfg.NodeName, cfg.HealthCheckPort, func(peerHostname string, newState, oldState healthcheck.SessionState) {
@@ -1974,6 +1957,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// netlink operations so getNodeStatus() is not blocked.
 	state.mu.Lock()
 
+	prevNodePodCIDRs := state.nodePodCIDRs
+	nodePodCIDRs := prevNodePodCIDRs
+
+	if state.healthState != nil {
+		if verified := state.healthState.verifiedIPAMAssignment(); len(verified) > 0 {
+			nodePodCIDRs = verified
+		}
+	}
+
 	prevIsGatewayNode := state.isGatewayNode
 	prevMyGatewayPort := state.myGatewayPort
 	prevLocalGatewayPools := append([]string(nil), state.localGatewayPools...)
@@ -1985,7 +1977,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		!strSliceEqual(prevLocalGatewayPools, localGatewayPools)
 
 	// Check if tunnel configuration needs to change
-	wgChanged := roleChanged ||
+	wgChanged := !slices.Equal(prevNodePodCIDRs, nodePodCIDRs) || roleChanged ||
 		!reflect.DeepEqual(state.siteRouting, siteRouting) ||
 		!meshPeersEqual(state.peers, peers) ||
 		!strSliceEqual(state.sitePodCIDRs, sitePodCIDRs) ||
@@ -2036,8 +2028,13 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.sitePodCIDRPools = append([]string(nil), sitePodCIDRPools...)
 	state.sitePodCIDRs = append([]string(nil), sitePodCIDRs...)
 	state.siteRouting = siteRouting
+	state.nodePodCIDRs = nodePodCIDRs
 
 	state.mu.Unlock()
+
+	if state.routeManager != nil {
+		setPodCIDRPreferredSources(state.routeManager, nodePodCIDRs)
+	}
 
 	committed := false
 
@@ -2055,7 +2052,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		state.sitePodCIDRPools = prevSitePodCIDRPools
 		state.sitePodCIDRs = prevSitePodCIDRs
 		state.siteRouting = prevSiteRouting
+		state.nodePodCIDRs = prevNodePodCIDRs
 		state.mu.Unlock()
+
+		if state.routeManager != nil {
+			setPodCIDRPreferredSources(state.routeManager, prevNodePodCIDRs)
+		}
 	}()
 
 	// Phase 2: Expensive network operations (lock-free).
