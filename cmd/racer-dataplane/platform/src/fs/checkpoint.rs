@@ -319,3 +319,161 @@ impl Read for CandidateFile {
         }
     }
 }
+
+#[cfg(all(test, feature = "simulation"))]
+mod simulation_tests {
+    //! Slot scans and publication against the simulated filesystem.
+    use super::*;
+    use crate::simulation::{Fault, Simulation};
+
+    const SLOTS: Slots<8> = Slots {
+        names: ["a", "b"],
+        minimum_bytes: 9,
+        maximum_bytes: 64,
+    };
+
+    /// A deliberately tiny schema keeps filesystem tests independent of Racer.
+    fn image(sequence: u64) -> Vec<u8> {
+        let mut bytes = sequence.to_le_bytes().to_vec();
+        bytes.push(42);
+        bytes
+    }
+
+    /// Read the test schema's untrusted ordering hint.
+    fn hint(bytes: &[u8]) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+    }
+
+    /// Reject corrupt bodies and enforce an independent decoded memory budget.
+    fn decode(bytes: &[u8], budget: usize) -> io::Result<u64> {
+        if bytes != image(hint(bytes)?) || budget < 16 {
+            return Err(io::Error::other("invalid test image"));
+        }
+        hint(bytes)
+    }
+
+    /// A read failure on the newest slot falls back to the older one.
+    #[test]
+    fn candidate_read_failure_tries_older_slot() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let path = Path::new("/recovery-budget-test");
+        sim.write_file(&path.join("a"), &image(1)).unwrap();
+        sim.write_file(&path.join("b"), &image(2)).unwrap();
+        let mut scan = SLOTS.candidates(path, 64, hint, decode).unwrap();
+        sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
+        assert_eq!(scan.next(), Some((0, 1)));
+        assert_eq!(scan.next(), None);
+    }
+
+    /// Publishing replaces the stale slot and keeps the older valid one.
+    #[test]
+    fn publication_preserves_older_valid_slot_and_rejects_sequence_overflow() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let path = Path::new("/alternating");
+        sim.write_file(&path.join("a"), &image(1)).unwrap();
+        sim.write_file(&path.join("b"), b"torn").unwrap();
+        let newest = SLOTS.candidates(path, 64, hint, decode).unwrap().next();
+        let (slot, sequence) = SLOTS.next_publication(newest).unwrap();
+        assert_eq!((slot, sequence), (1, 2));
+        SLOTS.publish(path, slot, &image(sequence)).unwrap();
+        assert_eq!(
+            SLOTS
+                .candidates(path, 64, hint, decode)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![(1, 2), (0, 1)]
+        );
+        assert_eq!(SLOTS.next_publication(Some((1, u64::MAX))), None);
+        assert_eq!(SLOTS.next_publication(None), Some((0, 1)));
+        assert_eq!(SLOTS.next_publication(Some((2, 7))), None);
+        assert!(SLOTS.publish(path, 2, &image(1)).is_err());
+    }
+
+    /// Budgets, corrupt images and a missing directory all fall back cleanly.
+    #[test]
+    fn budgets_decode_failure_and_missing_directory_fall_back() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let path = Path::new("/budget");
+        assert!(
+            SLOTS
+                .candidates(path, 64, hint, decode)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        sim.write_file(&path.join("a"), &image(1)).unwrap();
+        let mut corrupt = image(2);
+        corrupt[8] = 0;
+        sim.write_file(&path.join("b"), &corrupt).unwrap();
+        assert_eq!(
+            SLOTS.candidates(path, 64, hint, decode).unwrap().next(),
+            Some((0, 1))
+        );
+        for budget in [0, 8, 9, 15] {
+            assert!(
+                SLOTS
+                    .candidates(path, budget, hint, decode)
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+        assert!(SLOTS.candidates(&path.join("a"), 64, hint, decode).is_err());
+        let invalid = Slots::<8> {
+            minimum_bytes: 7,
+            ..SLOTS
+        };
+        assert!(invalid.candidates(path, 64, hint, decode).is_err());
+    }
+
+    /// A candidate that changed after probing never grows the read buffer.
+    #[test]
+    fn growth_and_truncation_after_probe_never_expand_the_read_buffer() {
+        // Cursor-backed candidates exercise the exact bounded read path without
+        // relying on whether a simulated write replaces or mutates an inode.
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let path = Path::new("/changed");
+        for body in [vec![42, 99], vec![]] {
+            let mut changed = 2u64.to_le_bytes().to_vec();
+            changed.extend_from_slice(&body);
+            sim.write_file(&path.join("a"), &image(1)).unwrap();
+            sim.write_file(&path.join("b"), &changed).unwrap();
+            let mut file = CandidateFile::open(&path.join("b"), false).unwrap();
+            let mut header = [0; 8];
+            file.read_exact(&mut header).unwrap();
+            let mut scan = SLOTS.candidates(path, 64, hint, decode).unwrap();
+            scan.slots.retain(|candidate| candidate.slot == 0);
+            scan.slots.push(Candidate {
+                slot: 1,
+                sequence: 2,
+                file,
+                length: 9,
+                header,
+            });
+            assert_eq!(scan.next(), Some((0, 1)));
+            assert_eq!(scan.next(), None);
+        }
+    }
+
+    /// Publication stage names come from the world's deterministic sequence.
+    #[test]
+    fn simulated_stage_names_are_deterministic() {
+        let names = || {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let path = Path::new("/deterministic");
+            sim.write_file(&path.join(".checkpoint.1.tmp"), b"occupied")
+                .unwrap();
+            SLOTS.publish(path, 0, &image(1)).unwrap();
+            assert_eq!(sim.read_file(&path.join("a")).unwrap(), image(1));
+            // publish_new validates all 128 candidate names up front.
+            assert_eq!(sim.next_sequence(), 129);
+            sim.trace()
+        };
+        assert_eq!(names(), names());
+    }
+}
