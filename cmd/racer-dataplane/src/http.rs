@@ -1984,10 +1984,25 @@ pub(crate) mod tests {
             endpoint: &Endpoint,
             listener: &Listener,
         ) -> (ConnectionLease, ConnectionLease) {
+            exchanged(pool, reactor, admission, endpoint, listener, true)
+        }
+        /// Complete one real exchange through an ordinary or metadata checkout.
+        fn exchanged(
+            pool: &HttpPool,
+            reactor: &Rc<Reactor>,
+            admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+            endpoint: &Endpoint,
+            listener: &Listener,
+            metadata: bool,
+        ) -> (ConnectionLease, ConnectionLease) {
             let scope = scope();
             let io = new_io(reactor.clone(), Codec::new(4096), admission.clone(), 16);
             let client = async {
-                let connection = pool.checkout_metadata(endpoint, &scope).await?;
+                let connection = if metadata {
+                    pool.checkout_metadata(endpoint, &scope).await?
+                } else {
+                    pool.checkout_wait(endpoint, &scope).await?
+                };
                 let request = MessageHead {
                     start: StartLine::Request {
                         method: "GET".into(),
@@ -2277,6 +2292,59 @@ pub(crate) mod tests {
                 .prepare_connection(&a)
                 .expect("page admitted once an ordinary slot frees");
             drop((lease, pages, peer));
+            pool.close();
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+        #[test]
+        fn ordinary_checkout_reuses_page_sockets_beneath_idle_metadata_socket() {
+            let (admission, reactor, mut pool) = setup();
+            let outbound = admission.limit(ResourceClass::OutboundConnection);
+            assert!(outbound >= 2, "test needs a metadata reserve");
+            pool.config_mut().secondary_cap = outbound;
+            let (listener, endpoint) = Listener::origin();
+            let Endpoint::Unix(path) = endpoint else {
+                unreachable!()
+            };
+            let origin = Endpoint::Origin {
+                cache: racer_control_wire::CacheId("cache".into()),
+                path,
+            };
+            let ordinary = outbound - crate::admission::METADATA_OUTBOUND_RESERVE;
+            // Real page connections fill the ordinary quota.
+            let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
+                .map(|_| exchanged(&pool, &reactor, &admission, &origin, &listener, false))
+                .unzip();
+            let (metadata, peer) = held(&pool, &reactor, &admission, &origin, &listener);
+            peers.push(peer);
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
+            // Pages return idle before the metadata socket, which lands on top.
+            drop(pages);
+            drop(metadata);
+            assert_eq!(pool.snapshot().entries[&origin].1, outbound);
+            // Every page socket beneath the metadata socket is reused at once.
+            let reused: Vec<_> = (0..ordinary)
+                .map(|_| {
+                    let (lease, address) = pool
+                        .prepare_connection(&origin)
+                        .expect("idle page socket reused beneath metadata socket");
+                    assert!(address.is_none(), "page reused an idle socket");
+                    lease
+                })
+                .collect();
+            assert_eq!(
+                admission.used(ResourceClass::OrdinaryOutboundConnection),
+                ordinary
+            );
+            // Only the metadata socket remains, still pooled for metadata.
+            assert_eq!(pool.snapshot().entries[&origin], (ordinary, 1));
+            assert!(matches!(
+                pool.prepare_connection(&origin),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(pool.snapshot().entries[&origin], (ordinary, 1));
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
+            drop(reused);
+            drop(peers);
             pool.close();
             assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
