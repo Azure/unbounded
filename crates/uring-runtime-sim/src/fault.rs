@@ -10,7 +10,7 @@
 //! [`Host`](uring_runtime::Host) methods and the fixture helpers on
 //! [`World`](crate::World) and [`SimFd`](crate::SimFd)) are matched by
 //! [`SyncOp`] when called. The two never steal each other's faults, except
-//! through [`FaultTarget::Any`].
+//! through [`FaultTarget::Any`] or [`FaultTarget::Either`].
 //!
 //! ```
 //! use uring_runtime::backend::OpKind;
@@ -106,11 +106,21 @@ pub enum FaultTarget {
     Op(OpKind),
     /// The next synchronous call of this kind.
     Sync(SyncOp),
+    /// Whichever comes first: the next asynchronous operation of the
+    /// [`OpKind`] or the next synchronous call of the [`SyncOp`] (for
+    /// example a send issued either through the reactor or directly).
+    Either(OpKind, SyncOp),
 }
 
 impl FaultTarget {
     fn matches(self, site: FaultTarget) -> bool {
-        self == FaultTarget::Any || self == site
+        match self {
+            FaultTarget::Any => true,
+            FaultTarget::Either(op, sync) => {
+                site == FaultTarget::Op(op) || site == FaultTarget::Sync(sync)
+            }
+            target => target == site,
+        }
     }
 }
 
@@ -175,6 +185,25 @@ mod tests {
         assert_eq!(
             queue.take(FaultTarget::Op(OpKind::Write)),
             Some(Fault::Short(3))
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn either_targets_match_the_first_async_or_sync_site() {
+        let mut queue = FaultQueue::default();
+        let either = FaultTarget::Either(OpKind::Send, SyncOp::Send);
+        queue.push(either, Fault::Short(1)).unwrap();
+        queue.push(either, Fault::Short(2)).unwrap();
+        assert_eq!(queue.take(FaultTarget::Op(OpKind::Recv)), None);
+        assert_eq!(queue.take(FaultTarget::Sync(SyncOp::Recv)), None);
+        assert_eq!(
+            queue.take(FaultTarget::Sync(SyncOp::Send)),
+            Some(Fault::Short(1))
+        );
+        assert_eq!(
+            queue.take(FaultTarget::Op(OpKind::Send)),
+            Some(Fault::Short(2))
         );
         assert_eq!(queue.len(), 0);
     }

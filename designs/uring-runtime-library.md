@@ -534,7 +534,8 @@ listeners, datagrams, pipes, readiness, partitions), `fault` (`Fault`,
   Fixtures created outside a backend can be labeled explicitly with
   `World::{labeled_socket, labeled_listen, labeled_connect}`.
   `SimFd::socket_type()` mirrors `getsockopt(SO_TYPE)`.
-- Faults: `World::inject(FaultTarget::{Any, Op(OpKind), Sync(SyncOp)},
+- Faults: `World::inject(FaultTarget::{Any, Op(OpKind), Sync(SyncOp),
+  Either(OpKind, SyncOp)},
   Fault::{Errno, Short, Delay, HoldCompletion})`, FIFO, consumed once.
   Asynchronous operations match `Op` targets at push; synchronous `Host`
   calls and fixtures match `Sync` targets. Knobs: `reject_submissions`
