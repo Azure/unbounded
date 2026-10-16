@@ -52,10 +52,10 @@ func TestOptionsDefaults(t *testing.T) {
 			}
 
 			if mode == "origin" {
-				if o.requestTimeout != time.Minute || o.metadataTTL != 30*time.Second || !o.pathStyle || o.endpoint != "" || o.region != "" {
+				if o.requestTimeout != time.Minute || o.metadataTTL != 30*time.Second || !o.pathStyle || o.endpoint != "" || o.region != "" || o.maxRequests != 512 {
 					t.Fatalf("unexpected origin defaults: %+v", o)
 				}
-			} else if o.listen != "127.0.0.1:8080" || o.requestTimeout != 5*time.Minute {
+			} else if o.listen != "127.0.0.1:8080" || o.requestTimeout != 5*time.Minute || o.maxConnections != 128 {
 				t.Fatalf("unexpected sidecar defaults: %+v", o)
 			}
 		})
@@ -68,6 +68,16 @@ func TestOptionsDefaults(t *testing.T) {
 
 	if strings.Join(o.buckets, ",") != "one,two" || o.cache != "custom" || o.metadataTTL != 0 || o.pathStyle || o.region != "us-west-2" || o.requestTimeout != 2*time.Second {
 		t.Fatalf("flags not applied: %+v", o)
+	}
+
+	o, err = parseOptions([]string{"origin", "--namespace=store", "--max-concurrent-requests=1"}, io.Discard)
+	if err != nil || o.maxRequests != 1 {
+		t.Fatalf("origin concurrency not applied: %+v, %v", o, err)
+	}
+
+	o, err = parseOptions([]string{"sidecar", "--namespace=store", "--max-connections=65536"}, io.Discard)
+	if err != nil || o.maxConnections != 65536 {
+		t.Fatalf("sidecar connections not applied: %+v, %v", o, err)
 	}
 }
 
@@ -116,6 +126,12 @@ func TestOptionsErrors(t *testing.T) {
 		{"sidecar", "--namespace=store", "--region=us-east-1"},
 		{"sidecar", "--namespace=store", "extra"},
 		{"sidecar", "--namespace=store", "--listen=0.0.0.0:8080"},
+		{"origin", "--namespace=store", "--max-concurrent-requests=0"},
+		{"origin", "--namespace=store", "--max-concurrent-requests=65537"},
+		{"origin", "--namespace=store", "--max-connections=128"},
+		{"sidecar", "--namespace=store", "--max-connections=0"},
+		{"sidecar", "--namespace=store", "--max-connections=-1"},
+		{"sidecar", "--namespace=store", "--max-concurrent-requests=512"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := parseOptions(args, io.Discard); err == nil {
@@ -337,7 +353,7 @@ func startTestSidecar(t *testing.T, handler http.Handler, timeout time.Duration)
 
 	done := make(chan error, 1)
 
-	go func() { done <- serveSidecar(ctx, l, handler, timeout) }()
+	go func() { done <- serveSidecar(ctx, l, handler, timeout, 128) }()
 
 	return "http://" + l.Addr().String(), cancel, done
 }
@@ -468,7 +484,7 @@ func TestSidecarListenerErrors(t *testing.T) {
 
 	l.Close()
 
-	if err := serveSidecar(context.Background(), l, http.NotFoundHandler(), time.Second); err == nil {
+	if err := serveSidecar(context.Background(), l, http.NotFoundHandler(), time.Second, 128); err == nil {
 		t.Fatal("lost listener failure")
 	}
 
@@ -552,5 +568,23 @@ func TestSidecarShutdownReleasesSDKStream(t *testing.T) {
 	case <-body.closed:
 	case <-time.After(3 * time.Second):
 		t.Fatal("origin stream body not closed")
+	}
+}
+
+func TestOriginHTTPClientPoolsUpstreamConnections(t *testing.T) {
+	first := originHTTPClient(options{requestTimeout: 3 * time.Second, maxRequests: 512})
+	second := originHTTPClient(options{requestTimeout: time.Second, maxRequests: 1})
+
+	transport, ok := first.Transport.(*http.Transport)
+	if !ok || first.Timeout != 3*time.Second || transport.MaxIdleConns != 512 || transport.MaxIdleConnsPerHost != 512 {
+		t.Fatalf("unexpected origin client: %+v", first)
+	}
+
+	if transport == http.DefaultTransport || transport == second.Transport {
+		t.Fatal("origin clients must not share or mutate the default transport")
+	}
+
+	if http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost != 0 {
+		t.Fatal("default transport was mutated")
 	}
 }

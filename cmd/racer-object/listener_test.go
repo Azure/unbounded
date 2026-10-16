@@ -108,7 +108,7 @@ func sidecarStreamFixture(tb testing.TB, size int, hideReaderFrom bool) (*http.C
 		}
 	})
 
-	go func() { done <- serveSidecar(ctx, listener, handler, 10*time.Second) }()
+	go func() { done <- serveSidecar(ctx, listener, handler, 10*time.Second, 128) }()
 
 	tb.Cleanup(func() {
 		cancel()
