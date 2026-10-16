@@ -1062,7 +1062,15 @@ func emptyDynamicInformer() cache.SharedIndexInformer {
 // Unless same-site routing is explicitly enabled, unmanaged non-gateway nodes skip same-site peers but
 // directly peered remote-site peers are still included for podCIDR routing.
 // Sites that are directly peered via SitePeering objects are treated as if they were the same site
-func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interface, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer, cfg *config, mySiteName, privKey, myPubKey string, manageCniPlugin bool, state *wireGuardState) error {
+func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interface, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer, cfg *config, mySiteName, privKey, myPubKey string, manageCniPlugin bool, state *wireGuardState) (reconcileErr error) {
+	defer func() {
+		if reconcileErr != nil {
+			state.mu.Lock()
+			state.dataplaneDirty = true
+			state.mu.Unlock()
+		}
+	}()
+
 	if gatewayPoolInformer == nil {
 		gatewayPoolInformer = emptyDynamicInformer()
 	}
@@ -1943,7 +1951,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 
 		publishGatewayStatus = func(forwardingMTU int, mesh []meshPeerInfo, gateways []gatewayPeerInfo) error {
-			if err := verifyActiveTunnelMTUs(cfg, forwardingMTU, mesh, gateways); err != nil {
+			if err := verifyActiveTunnelMTUsFunc(cfg, forwardingMTU, mesh, gateways); err != nil {
 				return fmt.Errorf("verify gateway forwarding MTU before publication: %w", err)
 			}
 
@@ -2107,11 +2115,23 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	fabricMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 		unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
-	previousFabricMTU := state.cniMTU
-	fabricMTUChanged := fabricMTU > 0 && fabricMTU != previousFabricMTU
+	state.mu.Lock()
+
+	previousFabricMTU := state.appliedFabricMTU
+	if previousFabricMTU == 0 {
+		previousFabricMTU = state.cniMTU
+	}
+
+	fabricMTUChanged := fabricMTU > 0 && (fabricMTU != previousFabricMTU || state.dataplaneDirty)
+	state.mu.Unlock()
+
 	fabricMTUIncreased := fabricMTUChanged && previousFabricMTU > 0 && fabricMTU > previousFabricMTU
 
 	applyFabricMTU := func() error {
+		state.mu.Lock()
+		state.appliedFabricMTU = fabricMTU
+		state.mu.Unlock()
+
 		if manageCniPlugin && state.cniConfigWritten {
 			if managedCNIWriteRequired(fabricMTUChanged, state.healthState) {
 				cniCfg := *cfg
@@ -2358,7 +2378,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	// Relax the edge only after every tunnel has accepted the larger MTU.
 	if fabricMTUIncreased {
-		if err := verifyActiveTunnelMTUs(cfg, fabricMTU, peers, gatewayPeers); err != nil {
+		if err := verifyActiveTunnelMTUsFunc(cfg, fabricMTU, peers, gatewayPeers); err != nil {
 			return fmt.Errorf("cannot raise fabric MTU: %w", err)
 		}
 
