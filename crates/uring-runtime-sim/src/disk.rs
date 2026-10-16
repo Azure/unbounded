@@ -649,7 +649,7 @@ mod tests {
                 state.fs.durable.watch(vec![]),
             )
         };
-        for _ in 0..4100 {
+        for _ in 0..if cfg!(miri) { 20 } else { 4100 } {
             world.disk().crash_under("/unused").unwrap();
         }
         assert!(affected.crashed());
