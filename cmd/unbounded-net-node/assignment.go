@@ -297,6 +297,10 @@ func waitForNodeAssignment(ctx context.Context, clientset kubernetes.Interface, 
 		}
 
 		watcher.Stop()
+
+		if err := waitForAssignmentRetry(ctx); err != nil {
+			return nodeAssignment{}, err
+		}
 	}
 }
 
