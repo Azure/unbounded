@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +31,13 @@ type testInformer struct {
 
 func (f *testInformer) GetStore() cache.Store { return f.store }
 func (f *testInformer) HasSynced() bool       { return true }
+
+func TestMissingGatewayNodeHasNoFallbackRoutes(t *testing.T) {
+	routes, distances, learned := routedCIDRsForGatewayPeer(nil, []string{"10.0.0.0/16"}, "local", nil, nil, time.Time{}, time.Minute)
+	if len(routes) != 0 || len(distances) != 0 || len(learned) != 0 {
+		t.Fatalf("missing gateway retained routes: %v %v %v", routes, distances, learned)
+	}
+}
 
 func TestClearGatewayNodeRoutesStatusWithoutCache(t *testing.T) {
 	node := &unstructured.Unstructured{Object: map[string]interface{}{

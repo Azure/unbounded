@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -376,12 +375,43 @@ func learnedGatewayTransitTunnelMTU(
 	return result
 }
 
+type sitePairMTUKey struct {
+	a string
+	b string
+}
+
+func sitePeeringEdgeTunnelMTUs(peerings []unboundednetv1alpha1.SitePeering) map[sitePairMTUKey]int {
+	result := make(map[sitePairMTUKey]int)
+
+	for _, peering := range peerings {
+		if !unboundednetv1alpha1.SpecEnabled(peering.Spec.Enabled) {
+			continue
+		}
+
+		mtu := tunnelMTUFromSpec(peering.Spec.TunnelMTU)
+		if mtu == 0 {
+			continue
+		}
+
+		for _, a := range peering.Spec.Sites {
+			for _, b := range peering.Spec.Sites {
+				if a < b {
+					key := sitePairMTUKey{a: a, b: b}
+					result[key] = resolveTunnelMTU(result[key], mtu)
+				}
+			}
+		}
+	}
+
+	return result
+}
+
 func gatewayMeshTransitTunnelMTU(
 	peerPool, peerSite string,
 	routes map[string]unboundednetv1alpha1.GatewayNodeRoute,
 	pools map[string]*unboundednetv1alpha1.GatewayPool,
 	siteMTUs map[string]int,
-	peerings []unboundednetv1alpha1.SitePeering,
+	peeringMTUs map[sitePairMTUKey]int,
 ) int {
 	result := 0
 
@@ -426,11 +456,12 @@ func gatewayMeshTransitTunnelMTU(
 						continue
 					}
 
-					for _, peering := range peerings {
-						if slices.Contains(peering.Spec.Sites, gatewaySite) && slices.Contains(peering.Spec.Sites, site.Name) {
-							result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
-						}
+					a, b := gatewaySite, site.Name
+					if a > b {
+						a, b = b, a
 					}
+
+					result = resolveTunnelMTU(result, peeringMTUs[sitePairMTUKey{a: a, b: b}])
 				}
 			}
 		}
