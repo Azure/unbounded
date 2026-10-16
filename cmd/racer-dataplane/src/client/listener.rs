@@ -1246,6 +1246,29 @@ fn directory_error(error: std::io::Error) -> Error {
     }
 }
 
+/// Create or repair `<cache>/origin` for the unprivileged origin user. Origins
+/// do not create this directory; their pods wait until it exists.
+pub(super) fn prepare_origin_directory(cache: &File) -> Result<()> {
+    super::origin_directory::prepare(cache, origin_owner())
+        .map(|_| ())
+        .map_err(directory_error)
+}
+
+#[cfg(not(test))]
+fn origin_owner() -> super::origin_directory::Owner {
+    super::origin_directory::Owner::ORIGIN
+}
+
+/// Unit tests run unprivileged, so assign the directory to the test user.
+#[cfg(test)]
+fn origin_owner() -> super::origin_directory::Owner {
+    // SAFETY: geteuid/getegid have no preconditions.
+    super::origin_directory::Owner {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    }
+}
+
 pub(super) fn prepare_client_directory(directory: &File) -> Result<()> {
     uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)
 }
@@ -1278,6 +1301,7 @@ fn bind(
     }
     let root = open_directory(root)?;
     let cache = child_directory(&root, definition.name.as_bytes())?;
+    prepare_origin_directory(&cache)?;
     let directory = child_directory(&cache, b"client")?;
     prepare_client_directory(&directory)?;
     let owner = match previous.and_then(|listener| listener.owner.as_ref()) {

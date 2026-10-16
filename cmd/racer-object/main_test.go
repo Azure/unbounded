@@ -250,9 +250,77 @@ func TestAWSRegionAndCredentialChain(t *testing.T) {
 	}
 }
 
-func TestPrepareOriginDirectory(t *testing.T) {
-	for _, scenario := range []string{"create", "existing", "symlink", "writable", "file", "traversal"} {
-		t.Run(scenario, func(t *testing.T) {
+func TestCheckOriginDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   func(t *testing.T, cache string) []string
+		missing bool
+		ok      bool
+	}{
+		{name: "existing", ok: true, setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+			mkdir(t, filepath.Join(cache, "origin"), 0o700)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "missing leaf", missing: true, setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "missing parent", missing: true, setup: func(t *testing.T, cache string) []string {
+			return []string{"cache", "origin"}
+		}},
+		{name: "writable leaf", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+			mkdir(t, filepath.Join(cache, "origin"), 0o777)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "writable parent", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o777)
+			mkdir(t, filepath.Join(cache, "origin"), 0o700)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "symlink leaf", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+
+			target := t.TempDir()
+			if err := os.Chmod(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Symlink(target, filepath.Join(cache, "origin")); err != nil {
+				t.Fatal(err)
+			}
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "symlink parent", setup: func(t *testing.T, cache string) []string {
+			target := t.TempDir()
+			mkdir(t, filepath.Join(target, "origin"), 0o700)
+
+			if err := os.Symlink(target, cache); err != nil {
+				t.Fatal(err)
+			}
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "file leaf", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+
+			if err := os.WriteFile(filepath.Join(cache, "origin"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "traversal", setup: func(t *testing.T, cache string) []string {
+			return []string{"..", "escape"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0o700); err != nil {
 				t.Fatal(err)
@@ -264,61 +332,65 @@ func TestPrepareOriginDirectory(t *testing.T) {
 			}
 			defer parent.Close()
 
-			path := filepath.Join(dir, "cache")
-			parts := []string{"cache", "origin"}
+			cache := filepath.Join(dir, "cache")
+			parts := tc.setup(t, cache)
 
-			switch scenario {
-			case "existing", "writable":
-				if err := os.Mkdir(path, 0o700); err != nil {
-					t.Fatal(err)
-				}
+			before, _ := os.Lstat(cache)
 
-				if scenario == "writable" {
-					if err := os.Chmod(path, 0o777); err != nil {
-						t.Fatal(err)
-					}
-				}
-			case "symlink":
-				if err := os.Symlink(t.TempDir(), path); err != nil {
-					t.Fatal(err)
-				}
-			case "file":
-				if err := os.WriteFile(path, nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			case "traversal":
-				parts = []string{"..", "escape"}
+			err = checkOriginDirectory(parent, parts)
+			if tc.ok != (err == nil) {
+				t.Fatalf("ok=%v, err=%v", tc.ok, err)
 			}
 
-			err = prepareOriginDirectory(parent, parts)
-			if scenario != "create" && scenario != "existing" {
-				if err == nil {
-					t.Fatal("accepted unsafe directory")
-				}
-
-				return
+			if tc.missing != errors.Is(err, errOriginDirectoryMissing) {
+				t.Fatalf("missing=%v, err=%v", tc.missing, err)
 			}
 
-			if err != nil {
-				t.Fatal(err)
+			// The origin never creates or repairs directories.
+			after, _ := os.Lstat(cache)
+			if (before == nil) != (after == nil) || (before != nil && before.Mode() != after.Mode()) {
+				t.Fatal("changed the directory tree")
 			}
 
-			if err := prepareOriginDirectory(parent, parts); err != nil {
-				t.Fatal("not idempotent", err)
-			}
-
-			info, err := os.Stat(filepath.Join(path, "origin"))
-			if err != nil || !info.IsDir() || info.Mode().Perm()&0o022 != 0 {
-				t.Fatal("unsafe created directory")
-			}
-
-			if scenario == "existing" {
-				info, err := os.Stat(path)
-				if err != nil || info.Mode().Perm() != 0o700 {
-					t.Fatal("changed existing permissions")
-				}
+			if _, statErr := os.Lstat(filepath.Join(cache, "origin")); tc.missing && !os.IsNotExist(statErr) {
+				t.Fatal("created the origin directory")
 			}
 		})
+	}
+}
+
+func TestCheckOriginDirectoryRejectsForeignLeaf(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to chown")
+	}
+
+	dir := t.TempDir()
+	mkdir(t, filepath.Join(dir, "origin"), 0o700)
+
+	if err := os.Chown(filepath.Join(dir, "origin"), originUID, originUID); err != nil {
+		t.Fatal(err)
+	}
+
+	parent, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+
+	if err := checkOriginDirectory(parent, []string{"origin"}); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("accepted origin directory owned by another user: %v", err)
+	}
+}
+
+func mkdir(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+
+	if err := os.Mkdir(path, mode); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
 	}
 }
 

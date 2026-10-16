@@ -32,5 +32,5 @@ func TestContainerRuntimeUserSupportsUDS(t *testing.T) {
 	}
 
 	require.Equal(t, "scratch", base)
-	require.Equal(t, "0:0", user, "UDS startup needs the default root-owned /run/racer layout and an origin socket accessible to the root dataplane")
+	require.Equal(t, "65532:65532", user, "the UDS origin must run as the owner racer-dataplane assigns to /run/racer/<cache>/origin")
 }

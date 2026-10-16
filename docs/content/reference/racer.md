@@ -60,8 +60,15 @@ runs a privileged UID 0 container with these host paths:
 Do not turn off cluster-wide admission protections. Authorize these workloads
 narrowly. RDMA is optional; see [RDMA](#rdma).
 
-Racer origins run as UID/GID 0 to match the root dataplane's `0600` socket. They
-do not need privileged mode. Run exactly one origin owner per cache on every
+Racer origins run as the non-root UID/GID 65532 and do not need privileged mode.
+For each cache, the dataplane creates `/run/racer/<name>/origin` owned by
+UID/GID 65532 with mode `0700`, and repairs its owner and mode on every cache
+setup. Origins do not create this directory: mount it with hostPath type
+`Directory`, so origin pods wait until the dataplane has created it. The origin
+creates its socket with mode `0600`; the privileged dataplane can still connect.
+When the dataplane takes over a directory left by an older root origin, it
+re-owns that origin's leftover lock, socket, and staging entries to UID/GID 65532
+instead of deleting them, so the new origin can recover them. Run exactly one origin owner per cache on every
 eligible node that can supply origin reads, not only on nodes that read. A
 DaemonSet with the same placement and tolerations as Racer does this. Every
 origin must return the same bytes for the same key and version. Never delete a
@@ -709,7 +716,7 @@ for server limits, partial failures, and restart behavior.
 | Socket | Path |
 |--------|------|
 | Client | `/run/racer/<name>/client/socket` |
-| Origin | `/run/racer/<name>/origin/socket`, mode `0600` |
+| Origin | `/run/racer/<name>/origin/socket`, mode `0600`, in a dataplane-created directory owned by UID/GID 65532 with mode `0700` |
 
 For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
 noncaching fake Racer. It does not test distributed or RDMA behavior.

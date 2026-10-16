@@ -147,9 +147,10 @@ registers cleanup with the test. These tests are not evidence of real Racer
 compatibility or performance.
 
 Use a dedicated cache, not a cache whose origin socket Gantry already owns. The
-origin directory must be owned by loadgen's UID and must not be group/world
-writable. Existing directory permissions are not changed; missing directories
-are created if permitted. The SDK provides exclusive ownership, stale-socket
+racer-dataplane creates the origin directory owned by UID/GID 65532 with mode
+`0700`, and the loadgen image runs as that user. Loadgen creates no directories
+and changes no permissions: it fails at startup if the origin directory is
+missing, is not owned by its effective UID, or is group/world writable. The SDK provides exclusive ownership, stale-socket
 recovery, and shutdown cleanup. See the
 [standalone Kubernetes example](../../deploy/racer-loadgen/direct/README.md).
 

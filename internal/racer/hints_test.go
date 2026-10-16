@@ -357,7 +357,7 @@ func TestRecoveryHintCancellationOverridesConflict(t *testing.T) {
 }
 
 func TestHandshakeTimeoutConfiguration(t *testing.T) {
-	values := map[string]string{"RACER_CLUSTER_ID": testOtherUID}
+	values := map[string]string{"RACER_CLUSTER_ID": testOtherUID, "RACER_OBJECT_IMAGE": "example.com/racer-object:test"}
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 	cfg, err := ConfigFromLookup(lookup)
 	require.NoError(t, err)
