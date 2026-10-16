@@ -87,6 +87,7 @@ pub mod net;
 pub mod scope;
 pub mod task;
 pub mod time;
+pub mod uring;
 
 pub use backend::{Backend, Host};
 pub use buf::{BufResult, IoBuf, IoBufMut};
@@ -98,3 +99,4 @@ pub use net::{SockAddr, SocketAddress};
 pub use scope::{Scope, Unscoped};
 pub use task::{JoinHandle, LocalExecutor, Spawner};
 pub use time::{Sleep, Timers};
+pub use uring::Uring;
