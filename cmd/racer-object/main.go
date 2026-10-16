@@ -56,7 +56,20 @@ type options struct {
 	requestTimeout  time.Duration
 	listen          string
 	debugListen     string
+	maxRequests     int
+	maxConnections  int
 }
+
+const (
+	// defaultOriginRequests is sized for remote object stores: at roughly
+	// 30 MB/s per connection, filling a 40 Gb/s NIC takes a few hundred
+	// concurrent 16 MiB page fetches.
+	defaultOriginRequests = 512
+	// defaultSidecarConnections bounds both accepted client connections and
+	// concurrent Racer reads.
+	defaultSidecarConnections = 128
+	maxConcurrencyFlag        = 65536
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -114,10 +127,12 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		fs.BoolVar(&o.pathStyle, "path-style", true, "Use path-style upstream addressing")
 		fs.DurationVar(&o.metadataTTL, "metadata-ttl", 30*time.Second, "Metadata lifetime; zero expires immediately")
 		fs.DurationVar(&o.requestTimeout, "request-timeout", time.Minute, "Positive origin request timeout")
+		fs.IntVar(&o.maxRequests, "max-concurrent-requests", defaultOriginRequests, "Concurrent page requests served to Racer and pooled upstream connections; 1..65536")
 	} else {
 		fs.StringVar(&o.api, "api", "s3", "Sidecar API: s3 or azure")
 		fs.StringVar(&o.listen, "listen", "127.0.0.1:8080", "Loopback IP literal and port")
 		fs.DurationVar(&o.requestTimeout, "request-timeout", 5*time.Minute, "Positive sidecar request timeout")
+		fs.IntVar(&o.maxConnections, "max-connections", defaultSidecarConnections, "Concurrent client connections and Racer reads; 1..65536")
 	}
 
 	if err := fs.Parse(args[1:]); err != nil {
@@ -160,6 +175,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	if o.mode == "origin" {
+		if o.maxRequests < 1 || o.maxRequests > maxConcurrencyFlag {
+			return o, errors.New("--max-concurrent-requests must be between 1 and 65536")
+		}
+
 		if err := validateProviderOptions(o, fs); err != nil {
 			return o, err
 		}
@@ -172,6 +191,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 			return o, err
 		}
 	} else {
+		if o.maxConnections < 1 || o.maxConnections > maxConcurrencyFlag {
+			return o, errors.New("--max-connections must be between 1 and 65536")
+		}
+
 		if o.api != "s3" && o.api != "azure" {
 			return o, errors.New("--api must be s3 or azure")
 		}
@@ -269,7 +292,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 
 func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
 	load := []func(*config.LoadOptions) error{
-		config.WithHTTPClient(&http.Client{Timeout: o.requestTimeout}),
+		config.WithHTTPClient(originHTTPClient(o)),
 		config.WithLogger(logging.NewStandardLogger(io.Discard)),
 	}
 	if o.region != "" {
@@ -286,6 +309,21 @@ func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// originHTTPClient returns the upstream HTTP client. Its idle pool matches
+// the origin's request limit so steady page fetches reuse warm TLS
+// connections instead of reconnecting once more than two are in flight.
+func originHTTPClient(o options) *http.Client {
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	}
+
+	transport.MaxIdleConns = o.maxRequests
+	transport.MaxIdleConnsPerHost = o.maxRequests
+
+	return &http.Client{Timeout: o.requestTimeout, Transport: transport}
 }
 
 func createOrigin(ctx context.Context, o options) (racersdk.Origin, error) {
@@ -347,7 +385,7 @@ func runOrigin(ctx context.Context, o options) error {
 	}
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
-		Cache: o.cache, RecoverStaleSocket: true,
+		Cache: o.cache, RecoverStaleSocket: true, MaxConcurrentRequests: o.maxRequests,
 	}, origin)
 	if ctx.Err() != nil {
 		return nil
@@ -406,7 +444,7 @@ func prepareOriginDirectory(parent *os.File, parts []string) error {
 }
 
 func runSidecar(ctx context.Context, o options) error {
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.cache})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.cache, MaxConnections: o.maxConnections})
 	if err != nil {
 		return errors.New("could not configure Racer client")
 	}
@@ -422,7 +460,7 @@ func runSidecar(ctx context.Context, o options) error {
 		return err
 	}
 
-	return serveSidecar(ctx, listener, handler, o.requestTimeout)
+	return serveSidecar(ctx, listener, handler, o.requestTimeout, o.maxConnections)
 }
 
 func createSidecar(client *racersdk.Client, o options) (http.Handler, error) {
@@ -449,7 +487,7 @@ func listenSidecar(ctx context.Context, address string) (net.Listener, error) {
 	return l, nil
 }
 
-func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handler, requestTimeout time.Duration) error {
+func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handler, requestTimeout time.Duration, maxConnections int) error {
 	lifetime, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -470,7 +508,7 @@ func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handl
 
 	finished := make(chan error, 1)
 
-	go func() { finished <- server.Serve(limitSidecarListener(listener, 128)) }()
+	go func() { finished <- server.Serve(limitSidecarListener(listener, maxConnections)) }()
 
 	select {
 	case err := <-finished:

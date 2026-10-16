@@ -59,6 +59,7 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 | `--azure-credential` | `default` | Azure only. `default` or `anonymous`. |
 | `--metadata-ttl` | `30s` | How long upstream metadata stays valid. Zero expires immediately. |
 | `--request-timeout` | `1m` | Upstream request timeout. Must be positive. |
+| `--max-concurrent-requests` | `512` | Page requests served to Racer at once, and the size of the idle upstream connection pool. Requests beyond the limit are rejected as overloaded. 1 to 65536. |
 
 S3 and Azure flags are mutually exclusive. Setting `--region`, `--endpoint`, or
 `--path-style` with `--provider=azure` is an error, and so is setting
@@ -71,8 +72,7 @@ S3 and Azure flags are mutually exclusive. Setting `--region`, `--endpoint`, or
 | `--api` | `s3` | Client-facing API: `s3` or `azure`. Independent of the origin's `--provider`. |
 | `--listen` | `127.0.0.1:8080` | Loopback IP literal and port. Non-loopback addresses are rejected. |
 | `--request-timeout` | `5m` | Request timeout. Note the different default from the origin. |
-
-The sidecar accepts at most 128 concurrent connections.
+| `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer. 1 to 65536. |
 
 ## Upstream Providers
 

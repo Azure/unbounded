@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -92,7 +91,7 @@ func validateAzureAccountURL(value, credential string) error {
 
 func originAzureClientOptions(o options) azcore.ClientOptions {
 	return azcore.ClientOptions{
-		Transport: &http.Client{Timeout: o.requestTimeout},
+		Transport: originHTTPClient(o),
 		Telemetry: policy.TelemetryOptions{ApplicationID: "racer-object"},
 	}
 }
