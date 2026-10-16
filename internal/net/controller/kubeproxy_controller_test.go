@@ -116,6 +116,16 @@ func TestSiteKubeProxyClusterCIDR(t *testing.T) {
 	if !ok || got != "100.125.0.0/16,fd00:1::/64" {
 		t.Fatalf("siteKubeProxyClusterCIDR() = %q,%v", got, ok)
 	}
+
+	site.Spec.ManageCniPlugin = new(false)
+	if got, ok := siteKubeProxyClusterCIDR(site); ok || got != "" {
+		t.Fatalf("unmanaged omitted assignment supplied cluster CIDRs: %q, %v", got, ok)
+	}
+
+	site.Spec.PodCidrAssignments[1].AssignmentEnabled = new(true)
+	if got, ok := siteKubeProxyClusterCIDR(site); !ok || got != "100.125.0.0/16,fd00:1::/64" {
+		t.Fatalf("explicit unmanaged assignment lost cluster CIDRs: %q, %v", got, ok)
+	}
 }
 
 func TestDaemonSetForSite(t *testing.T) {
