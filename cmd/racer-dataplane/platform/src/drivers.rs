@@ -19,7 +19,7 @@ use std::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
-use uring::{backend::RemoteWaker, group::FailureReporter};
+use uring::group::FailureReporter;
 
 /// A local task. The caller must handle its outcome before returning unit.
 type Task = Pin<Box<dyn Future<Output = ()> + 'static>>;
@@ -473,9 +473,10 @@ pub async fn poll_scoped<S: Scope, T, E: Into<S::Error>>(
 /// Wake this thread and, optionally, interrupt its reactor wait. No thread is spawned.
 ///
 /// This is [`uring::group::thread_waker`]; pass the reactor's
-/// [`RemoteWaker`] to interrupt its wait.
-pub fn thread_waker(reactor: Option<RemoteWaker>) -> Waker {
-    uring::group::thread_waker(reactor)
+/// [`ReactorWake`](crate::reactor::ReactorWake) (from
+/// [`Reactor::waker`](crate::reactor::Reactor::waker)) to interrupt its wait.
+pub fn thread_waker(reactor: Option<crate::reactor::ReactorWake>) -> Waker {
+    uring::group::thread_waker(reactor.and_then(crate::reactor::ReactorWake::into_remote))
 }
 
 /// Drive resource completions while a local operation borrows its service graph.
@@ -1562,6 +1563,19 @@ mod scheduler_tests {
                 Poll::Ready(result)
             );
         }
+    }
+
+    /// A reactor wake handle is interrupted along with the creating thread.
+    #[test]
+    fn thread_waker_interrupts_reactor_wait() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = count.clone();
+        let wake =
+            crate::reactor::ReactorWake::from_remote(uring::backend::RemoteWaker::new(move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }));
+        thread_waker(Some(wake)).wake_by_ref();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     /// Cross-thread notification unparks the thread that created the waker.
