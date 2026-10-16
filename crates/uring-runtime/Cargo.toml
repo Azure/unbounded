@@ -1,0 +1,24 @@
+[package]
+name = "uring-runtime"
+description = "A small, explicitly driven, thread-per-core io_uring runtime for Linux"
+readme = "README.md"
+keywords = ["io-uring", "async", "runtime", "linux"]
+categories = ["asynchronous", "network-programming", "filesystem", "os::linux-apis"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+io-uring.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
