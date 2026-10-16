@@ -3,13 +3,12 @@
 //! Production reads the host clock and the kernel entropy source directly:
 //! without the `simulation` feature [`now`] is exactly [`Instant::now`] and
 //! touches no thread-local state. With the feature, a thread may select a
-//! simulated [`Environment`] whose clock and entropy come from a
-//! [`Simulated`] source; that is the seam the deterministic simulation backend
-//! plugs into. Deadline registries are explicitly driven by their owner;
-//! neither registering a deadline nor reading a clock starts a timer.
+//! simulated [`Environment`] (usually from [`SimulationClock::environment`])
+//! whose clock is a world's [`SimClock`] and whose entropy is a role's
+//! replayable [`SimEntropy`] stream. Deadline registries are explicitly driven
+//! by their owner; neither registering a deadline nor reading a clock starts a
+//! timer.
 use crate::{Error, Result};
-#[cfg(feature = "simulation")]
-use std::sync::Arc;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -21,45 +20,42 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(feature = "simulation")]
+use uring::Clock as _;
 use uring::{Entropy as _, SystemEntropy};
+
+#[cfg(feature = "simulation")]
+pub use uring_runtime_sim::{DEFAULT_ENTROPY_DOMAIN, SimClock, SimEntropy};
 
 /// Time and entropy selection retained by a worker role across individual polls.
 ///
 /// Without the `simulation` feature this is a zero-sized handle for the host.
+/// A simulated environment is `Send` (a role can move to its group thread)
+/// and its clones share one entropy cursor.
 #[derive(Clone, Debug, Default)]
 pub struct Environment {
     #[cfg(feature = "simulation")]
-    simulated: Option<Arc<dyn Simulated>>,
+    simulated: Option<Simulated>,
 }
 
-/// A simulated role's clock and entropy stream.
-///
-/// The simulation backend provides the implementation; Racer only selects it
-/// per thread through [`Environment`].
-///
-/// TODO(sim): implement this for the `uring-runtime-sim` `SimClock` and
-/// `SimEntropy` (as a `SimulationClock` with `new(seed)`, `environment(stream)`,
-/// `advance`, `checked_advance`, `elapsed` and `set_wall_time`). Pass the old
-/// entropy domain `b"uring-runtime.entropy.v1\0"` so existing replay corpora
-/// keep producing the same bytes.
+/// A world's clock and a role's shared entropy cursor.
 #[cfg(feature = "simulation")]
-pub trait Simulated: Send + Sync + std::fmt::Debug {
-    /// Current simulated monotonic time.
-    fn now(&self) -> Instant;
+#[derive(Clone, Debug)]
+struct Simulated {
+    clock: SimClock,
 
-    /// Current simulated wall time, including simulated corrections.
-    fn wall_now(&self) -> SystemTime;
-
-    /// The world's stable `(monotonic, wall)` mapping anchor. Every role of a
-    /// world must return the same anchor, unaffected by wall corrections.
-    fn clock_anchor(&self) -> (Instant, SystemTime);
-
-    /// Fill bytes from this role's replayable entropy stream.
-    fn fill_random(&self, bytes: &mut [u8]) -> Result<()>;
-
-    /// The simulated world's seed.
-    fn seed(&self) -> u64;
+    entropy: SimEntropy,
 }
+
+/// One clock per simulated world. Give each node/worker/role a stable, unique
+/// stream ID and retain its [`Environment`]; cloning a role shares its entropy
+/// cursor.
+///
+/// A thin wrapper over the library's [`SimClock`] that keeps the old Racer
+/// constructor names and [`Error`] results.
+#[cfg(feature = "simulation")]
+#[derive(Clone, Debug)]
+pub struct SimulationClock(SimClock);
 
 /// An absolute monotonic deadline, mapped to wire time through a stable anchor.
 #[derive(Clone, Copy, Debug)]
@@ -132,12 +128,26 @@ impl Environment {
         Self::default()
     }
 
-    /// An environment that reads time and entropy from a simulated role.
+    /// An environment that reads time from `clock` and entropy from
+    /// `entropy`. Usually created with [`SimulationClock::environment`].
     #[cfg(feature = "simulation")]
-    pub fn simulated(source: Arc<dyn Simulated>) -> Self {
+    pub fn simulated(clock: SimClock, entropy: SimEntropy) -> Self {
         Self {
-            simulated: Some(source),
+            simulated: Some(Simulated { clock, entropy }),
         }
+    }
+
+    /// The simulated world clock, or `None` for the host environment.
+    #[cfg(feature = "simulation")]
+    pub fn sim_clock(&self) -> Option<&SimClock> {
+        self.simulated.as_ref().map(|simulated| &simulated.clock)
+    }
+
+    /// The role's simulated entropy stream (shared with clones), or `None`
+    /// for the host environment.
+    #[cfg(feature = "simulation")]
+    pub fn sim_entropy(&self) -> Option<&SimEntropy> {
+        self.simulated.as_ref().map(|simulated| &simulated.entropy)
     }
 
     /// Whether this environment uses a simulated source.
@@ -216,17 +226,21 @@ impl<F> Drop for Scoped<F> {
 #[cfg(feature = "simulation")]
 /// Return the active simulated world's seed, or None for a host environment.
 pub fn simulation_seed() -> Option<u64> {
-    Environment::current()
-        .simulated
-        .map(|simulated| simulated.seed())
+    CURRENT.with(|current| {
+        current
+            .borrow()
+            .simulated
+            .as_ref()
+            .map(|simulated| simulated.clock.seed())
+    })
 }
 
 /// Read monotonic time from the selected environment.
 #[inline]
 pub fn now() -> Instant {
     #[cfg(feature = "simulation")]
-    if let Some(simulated) = selected_simulation() {
-        return simulated.now();
+    if let Some(now) = with_simulation(|simulated| simulated.clock.now()) {
+        return now;
     }
     Instant::now()
 }
@@ -235,8 +249,8 @@ pub fn now() -> Instant {
 #[inline]
 pub fn wall_now() -> SystemTime {
     #[cfg(feature = "simulation")]
-    if let Some(simulated) = selected_simulation() {
-        return simulated.wall_now();
+    if let Some(wall) = with_simulation(|simulated| simulated.clock.wall_now()) {
+        return wall;
     }
     SystemTime::now()
 }
@@ -245,8 +259,10 @@ pub fn wall_now() -> SystemTime {
 /// of a simulated world use the same anchor, including after nested world scopes.
 pub fn clock_anchor() -> (Instant, SystemTime) {
     #[cfg(feature = "simulation")]
-    if let Some(simulated) = selected_simulation() {
-        return simulated.clock_anchor();
+    if let Some(anchor) =
+        with_simulation(|simulated| (simulated.clock.origin(), simulated.clock.wall_origin()))
+    {
+        return anchor;
     }
 
     static ANCHOR: OnceLock<(Instant, SystemTime)> = OnceLock::new();
@@ -256,21 +272,95 @@ pub fn clock_anchor() -> (Instant, SystemTime) {
 /// Fill bytes from the host entropy source or the selected replayable role stream.
 pub fn fill_random(bytes: &mut [u8]) -> Result<()> {
     #[cfg(feature = "simulation")]
-    if let Some(simulated) = selected_simulation() {
-        return simulated.fill_random(bytes);
+    if let Some(result) = with_simulation(|simulated| simulated.entropy.fill(bytes)) {
+        return result.map_err(Error::from);
     }
     SystemEntropy.fill(bytes).map_err(Error::from)
 }
 
-/// Select the simulated role, rejecting host fallback inside a strict scope.
+/// Run `read` against the selected simulated role without cloning it, or
+/// return `None` for the host, rejecting host fallback inside a strict scope.
 #[cfg(feature = "simulation")]
-fn selected_simulation() -> Option<Arc<dyn Simulated>> {
-    let simulated = Environment::current().simulated;
-    if simulated.is_none() {
+fn with_simulation<T>(read: impl FnOnce(&Simulated) -> T) -> Option<T> {
+    let result = CURRENT.with(|current| current.borrow().simulated.as_ref().map(read));
+    if result.is_none() {
         REQUIRE_SIMULATED
             .with(|required| assert!(!required.get(), "DST escaped into host time/entropy"));
     }
-    simulated
+    result
+}
+
+#[cfg(feature = "simulation")]
+impl SimulationClock {
+    /// Create a world with the process monotonic origin and a fixed wall epoch
+    /// (`1_800_000_000` seconds after the Unix epoch).
+    pub fn new(seed: u64) -> Self {
+        Self(SimClock::new(seed))
+    }
+
+    /// Create a world with explicit monotonic and wall-clock anchors.
+    pub fn new_at(seed: u64, monotonic: Instant, wall: SystemTime) -> Self {
+        Self(SimClock::new_at(seed, monotonic, wall))
+    }
+
+    /// Wrap an existing library clock (clones share its time).
+    pub fn from_sim_clock(clock: SimClock) -> Self {
+        Self(clock)
+    }
+
+    /// The library clock, for building simulated backends.
+    pub fn sim_clock(&self) -> &SimClock {
+        &self.0
+    }
+
+    /// The world's seed.
+    pub fn seed(&self) -> u64 {
+        self.0.seed()
+    }
+
+    /// Creates a fresh entropy stream. Call once per role incarnation and retain
+    /// the result; calling again with the same ID intentionally replays its bytes.
+    /// The default domain is [`DEFAULT_ENTROPY_DOMAIN`]
+    /// (`b"uring-runtime.entropy.v1\0"`). Applications with persisted replay
+    /// corpora should own an explicit, versioned domain instead.
+    pub fn environment(&self, stream: u64) -> Environment {
+        self.environment_with_entropy_domain(stream, DEFAULT_ENTROPY_DOMAIN)
+    }
+
+    /// Creates a stream in a caller-selected domain. Bytes are SHA-256 blocks of
+    /// domain || seed_le64 || stream_le64 || counter_le64, starting at counter 0.
+    /// Chunking reads and cloning environments do not change the byte stream.
+    pub fn environment_with_entropy_domain(
+        &self,
+        stream: u64,
+        domain: impl AsRef<[u8]>,
+    ) -> Environment {
+        Environment::simulated(
+            self.0.clone(),
+            SimEntropy::new(domain, self.0.seed(), stream),
+        )
+    }
+
+    /// Advance both clocks, panicking on overflow without poisoning the clock.
+    pub fn advance(&self, duration: Duration) {
+        self.0.advance(duration);
+    }
+
+    /// Advance atomically or leave both clocks unchanged on overflow
+    /// ([`Error::InvalidInput`]).
+    pub fn checked_advance(&self, duration: Duration) -> Result<()> {
+        self.0.checked_advance(duration).map_err(Error::from)
+    }
+
+    /// Return the total monotonic time advanced since world creation.
+    pub fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+
+    /// Correct wall time without changing elapsed time or the stable anchor.
+    pub fn set_wall_time(&self, wall: SystemTime) {
+        self.0.set_wall_time(wall);
+    }
 }
 
 impl Deadline {
@@ -727,78 +817,25 @@ mod clock_observer_tests {
     }
 }
 
-/// The simulation seam: a selected source replaces host time and entropy.
+/// Deterministic clock, entropy, and nested environment ownership regressions.
 #[cfg(all(test, feature = "simulation"))]
 mod simulation_tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// A minimal manually advanced source standing in for the simulation backend.
-    #[derive(Debug)]
-    struct Fake {
-        anchor: (Instant, SystemTime),
-        elapsed: Mutex<Duration>,
-        wall: Mutex<SystemTime>,
-        seed: u64,
-    }
-
-    impl Fake {
-        fn new(seed: u64) -> Arc<Self> {
-            let wall = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-            Arc::new(Self {
-                anchor: (Instant::now(), wall),
-                elapsed: Mutex::new(Duration::ZERO),
-                wall: Mutex::new(wall),
-                seed,
-            })
-        }
-
-        fn advance(&self, duration: Duration) {
-            *self.elapsed.lock().unwrap() += duration;
-            *self.wall.lock().unwrap() += duration;
-        }
-    }
-
-    impl Simulated for Fake {
-        fn now(&self) -> Instant {
-            self.anchor.0 + *self.elapsed.lock().unwrap()
-        }
-
-        fn wall_now(&self) -> SystemTime {
-            *self.wall.lock().unwrap()
-        }
-
-        fn clock_anchor(&self) -> (Instant, SystemTime) {
-            self.anchor
-        }
-
-        fn fill_random(&self, bytes: &mut [u8]) -> Result<()> {
-            bytes.fill(self.seed as u8);
-            Ok(())
-        }
-
-        fn seed(&self) -> u64 {
-            self.seed
-        }
-    }
-
-    /// Entering selects the source for clock, entropy and seed, and nests.
+    /// Entering selects the world clock, role entropy and seed, and nests.
     #[test]
     fn selected_source_drives_ambient_reads_and_nests() {
-        let fake = Fake::new(7);
+        let clock = SimulationClock::new(7);
         assert!(!Environment::current().is_simulated());
         assert_eq!(simulation_seed(), None);
-        let environment = Environment::simulated(fake.clone());
+        let environment = clock.environment(0);
         {
             let _role = environment.enter();
             assert!(Environment::current().is_simulated());
             let before = now();
-            fake.advance(Duration::from_secs(5));
+            clock.advance(Duration::from_secs(5));
             assert_eq!(now() - before, Duration::from_secs(5));
             assert_eq!(simulation_seed(), Some(7));
-            let mut bytes = [0; 4];
-            fill_random(&mut bytes).unwrap();
-            assert_eq!(bytes, [7; 4]);
             {
                 let _host = Environment::host().enter();
                 assert_eq!(simulation_seed(), None);
@@ -808,15 +845,234 @@ mod simulation_tests {
         assert_eq!(simulation_seed(), None);
     }
 
+    /// Environments are `Send` and moving one to another thread keeps sharing
+    /// the entropy cursor with the clones left behind.
+    #[test]
+    fn environment_is_send_and_moved_clones_share_the_cursor() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Environment>();
+        let clock = SimulationClock::new(5);
+        let mut expected = [0; 16];
+        {
+            let _role = clock.environment(3).enter();
+            fill_random(&mut expected).unwrap();
+        }
+        let role = clock.environment(3);
+        let moved = role.clone();
+        let first = std::thread::spawn(move || {
+            let _role = moved.enter();
+            let mut bytes = [0; 8];
+            fill_random(&mut bytes).unwrap();
+            bytes
+        })
+        .join()
+        .unwrap();
+        let _role = role.enter();
+        let mut second = [0; 8];
+        fill_random(&mut second).unwrap();
+        assert_eq!([first, second].concat(), expected);
+    }
+
+    /// Overflow leaves both clocks unchanged and does not poison later advances.
+    #[test]
+    fn checked_clock_overflow_is_atomic_and_unchecked_panic_does_not_poison() {
+        let clock = SimulationClock::new(9);
+        let _role = clock.environment(0).enter();
+        let before = (now(), wall_now(), clock.elapsed());
+        assert_eq!(
+            clock.checked_advance(Duration::MAX),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!((now(), wall_now(), clock.elapsed()), before);
+        assert!(std::panic::catch_unwind(|| clock.advance(Duration::MAX)).is_err());
+        assert_eq!((now(), wall_now(), clock.elapsed()), before);
+        clock.checked_advance(Duration::from_secs(1)).unwrap();
+        assert_eq!(clock.elapsed(), Duration::from_secs(1));
+    }
+
+    /// Explicit entropy domains preserve replay independently of read chunk sizes.
+    #[test]
+    fn domains_and_multiblock_chunking_are_explicit_and_replayable() {
+        let clock = SimulationClock::new(7);
+        let mut default = [0; 99];
+        {
+            let _role = clock.environment(11).enter();
+            fill_random(&mut default).unwrap();
+        }
+        let role = clock.environment_with_entropy_domain(11, &b"uring-runtime.entropy.v1\0"[..]);
+        let mut replay = [0; 99];
+        for chunk in replay.chunks_mut(7) {
+            let _role = role.clone().enter();
+            fill_random(chunk).unwrap();
+        }
+        assert_eq!(default, replay);
+        let _role = clock
+            .environment_with_entropy_domain(11, &b"test.entropy.v1\0"[..])
+            .enter();
+        fill_random(&mut replay).unwrap();
+        assert_ne!(default, replay);
+    }
+
+    /// Empty reads do not advance the stream.
+    #[test]
+    fn empty_entropy_reads_do_not_advance_the_stream() {
+        let clock = SimulationClock::new(1);
+        let mut expected = [0; 4];
+        {
+            let _role = clock.environment(0).enter();
+            fill_random(&mut expected).unwrap();
+        }
+        let _role = clock.environment(0).enter();
+        fill_random(&mut []).unwrap();
+        let mut bytes = [0; 4];
+        fill_random(&mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    /// Cloned roles consume one shared, domain-separated entropy stream with
+    /// the old runtime's exact bytes.
+    #[test]
+    fn entropy_domain_and_cloned_cursor_remain_stable() {
+        let clock = SimulationClock::new(7);
+        let role = clock.environment(11);
+        let clone = role.clone();
+        let mut bytes = [0; 40];
+        {
+            let _role = role.enter();
+            assert_eq!(simulation_seed(), Some(7));
+            fill_random(&mut bytes[..3]).unwrap();
+        }
+        {
+            let _clone = clone.enter();
+            fill_random(&mut bytes[3..]).unwrap();
+        }
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        // SHA-256(b"uring-runtime.entropy.v1\0" || 7 || 11 || counter), as the
+        // legacy runtime computed it.
+        assert_eq!(
+            hex,
+            "5eb0f6598c0f2d9c3ea6f15f9019d7a1defa575d5d1fe54b8cb95f87e7bc5b82627c66322c311609"
+        );
+    }
+
+    /// Nested strict guards restore the surrounding host-access requirement.
+    #[test]
+    fn nested_strict_guards_restore_previous_requirement() {
+        let _host = Environment::default().enter();
+        assert_eq!(simulation_seed(), None);
+        {
+            let _strict = require_simulated();
+            {
+                let _nested = require_simulated();
+            }
+            assert!(std::panic::catch_unwind(now).is_err());
+            let clock = SimulationClock::new(19);
+            let _role = clock.environment(0).enter();
+            assert_eq!(simulation_seed(), Some(19));
+            assert_eq!(now(), clock_anchor().0);
+        }
+        assert!(std::panic::catch_unwind(now).is_ok());
+    }
+
+    /// Every host time and entropy entry point rejects strict simulation fallback.
+    #[test]
+    fn strict_simulation_rejects_real_role_fallback() {
+        let _strict = require_simulated();
+        let _real = Environment::default().enter();
+        let reads: [fn(); 4] = [
+            || {
+                let _ = now();
+            },
+            || {
+                let _ = wall_now();
+            },
+            || {
+                let _ = clock_anchor();
+            },
+            || {
+                let _ = fill_random(&mut [0; 1]);
+            },
+        ];
+        for read in reads {
+            assert!(std::panic::catch_unwind(read).is_err());
+        }
+    }
+
+    /// Pending and dropped scoped futures restore the caller's independent stream.
+    #[test]
+    fn streams_are_independent_and_scoped_futures_restore_on_pending_and_drop() {
+        let clock = SimulationClock::new(42);
+        let a = clock.environment(1);
+        let b = clock.environment(2);
+        let mut expected = [0; 8];
+        {
+            let _guard = clock.environment(1).enter();
+            fill_random(&mut expected).unwrap();
+        }
+        let _outer = b.enter();
+        let mut future = Box::pin(a.scope(async {
+            let mut bytes = [0; 8];
+            fill_random(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+            std::future::pending::<()>().await;
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(future);
+        let mut actual = [0; 8];
+        fill_random(&mut actual).unwrap();
+        assert_ne!(actual, expected);
+        let _guard = clock.environment(2).enter();
+        fill_random(&mut expected).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    /// Destructors observe their captured environment, even when scopes unwind.
+    #[test]
+    fn scoped_drop_and_unwind_restore_the_callers_environment() {
+        /// Checks that destruction occurs under the expected wall clock.
+        struct OnDrop(SystemTime);
+
+        impl Drop for OnDrop {
+            /// Compare the selected wall clock with the captured expectation.
+            fn drop(&mut self) {
+                assert_eq!(wall_now(), self.0);
+            }
+        }
+        let outer = SimulationClock::new(1);
+        let inner = SimulationClock::new(2);
+        inner.advance(Duration::from_secs(5));
+        let _outer = outer.environment(0).enter();
+        let wall = wall_now();
+        let role = inner.environment(0);
+        let dropped = OnDrop(wall + Duration::from_secs(5));
+        let future = role.scope(async move {
+            let _dropped = dropped;
+            std::future::pending::<()>().await;
+        });
+        drop(future);
+        assert_eq!(wall_now(), wall);
+        let result = std::panic::catch_unwind(|| {
+            let _inner = role.enter();
+            panic!("injected worker panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(wall_now(), wall);
+    }
+
     /// Wall corrections never renew an existing monotonic deadline.
     #[test]
     fn deadline_mapping_is_stable_across_simulated_time_and_wall_jumps() {
-        let fake = Fake::new(17);
-        let _environment = Environment::simulated(fake.clone()).enter();
+        let clock = SimulationClock::new(17);
+        let _environment = clock.environment(0).enter();
         let deadline = Deadline(now() + Duration::from_secs(30));
         let encoded = deadline.to_unix_millis().unwrap();
-        fake.advance(Duration::from_secs(60));
-        *fake.wall.lock().unwrap() += Duration::from_secs(100);
+        clock.advance(Duration::from_secs(60));
+        clock.set_wall_time(wall_now() + Duration::from_secs(100));
         assert_eq!(deadline.to_unix_millis(), Ok(encoded));
         assert_eq!(
             Deadline::from_unix_millis(encoded)
@@ -829,23 +1085,14 @@ mod simulation_tests {
     /// Scoped futures see their environment only while polled or dropped.
     #[test]
     fn scoped_future_enters_only_while_polled() {
-        let fake = Fake::new(3);
+        let clock = SimulationClock::new(3);
         let mut future = std::pin::pin!(
-            Environment::simulated(fake)
-                .scope(std::future::poll_fn(|_| { Poll::Ready(simulation_seed()) }))
+            clock
+                .environment(0)
+                .scope(std::future::poll_fn(|_| Poll::Ready(simulation_seed())))
         );
         let mut cx = Context::from_waker(Waker::noop());
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Some(3)));
         assert_eq!(simulation_seed(), None);
-    }
-
-    /// Strict scopes reject host fallback.
-    #[test]
-    fn require_simulated_rejects_host_reads() {
-        let strict = require_simulated();
-        assert!(std::panic::catch_unwind(now).is_err());
-        let _role = Environment::simulated(Fake::new(1)).enter();
-        let _ = now();
-        drop(strict);
     }
 }
