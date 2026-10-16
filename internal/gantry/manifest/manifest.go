@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
@@ -48,10 +49,36 @@ type schema struct {
 }
 
 type descriptor struct {
-	MediaType string   `json:"mediaType"`
-	Digest    string   `json:"digest"`
-	Size      int64    `json:"size"`
-	URLs      []string `json:"urls"`
+	MediaType   string            `json:"mediaType"`
+	Digest      string            `json:"digest"`
+	Size        int64             `json:"size"`
+	URLs        []string          `json:"urls"`
+	Annotations map[string]string `json:"annotations"`
+}
+
+const (
+	overlayBDBlobDigestAnnotation = "containerd.io/snapshot/overlaybd/blob-digest"
+	overlayBDBlobSizeAnnotation   = "containerd.io/snapshot/overlaybd/blob-size"
+)
+
+// IsOverlayBDStreamingManifest reports whether every layer is an ACR
+// Artifact Streaming descriptor. Requiring matching digest and size
+// annotations keeps ordinary OCI manifests on the existing pull path and makes
+// partially annotated manifests fail closed.
+func IsOverlayBDStreamingManifest(body []byte) bool {
+	var m schema
+	if err := json.Unmarshal(body, &m); err != nil || len(m.Layers) == 0 {
+		return false
+	}
+
+	for _, layer := range m.Layers {
+		if len(layer.URLs) > 0 || layer.Annotations[overlayBDBlobDigestAnnotation] != layer.Digest ||
+			layer.Annotations[overlayBDBlobSizeAnnotation] != strconv.FormatInt(layer.Size, 10) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // DetectContentType returns the OCI/Docker Content-Type described by a

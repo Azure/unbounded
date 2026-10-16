@@ -574,7 +574,16 @@ func runAgent(args []string) error {
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, layerSeed, indexPrefetch, logger, layerProgress.observeManifest)
+		var streamingReconciler *streamingLayerReconciler
+		if c.ArtifactStreamingEnabled {
+			streamingReconciler = newStreamingLayerReconciler(streamingLayerReconcilerOptions{
+				Resolver: realResolver,
+				Store:    cstore,
+				Seeder:   layerSeed,
+				Logger:   logger,
+			})
+		}
+		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, layerSeed, streamingReconciler, indexPrefetch, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chair_count", c.ChairCount),
 			slog.Int("seed_count", c.ChairSeedCount),
@@ -584,7 +593,7 @@ func runAgent(args []string) error {
 	}
 
 	if layerPrefetcher == nil {
-		layerPrefetcher = newLayerPrefetcher(nil, cstore, layerSeed, indexPrefetch, logger, layerProgress.observeManifest)
+		layerPrefetcher = newLayerPrefetcher(nil, cstore, layerSeed, nil, indexPrefetch, logger, layerProgress.observeManifest)
 	}
 
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
@@ -1504,16 +1513,23 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 // The implementation runs in a goroutine spawned by the mirror; it
 // MUST NOT panic. All errors are logged at DEBUG.
 type layerPrefetchAdapter struct {
-	resolver   manifestPrefetchResolver
-	cache      ifaces.LocalContentStore
-	seeder     *layerSeeder
-	indexes    *indexPrefetcher
-	logger     *slog.Logger
-	onManifest func(digest.Digest, []manifest.TypedChild)
+	resolver            manifestPrefetchResolver
+	cache               ifaces.LocalContentStore
+	seeder              *layerSeeder
+	streamingReconciler *streamingLayerReconciler
+	indexes             *indexPrefetcher
+	logger              *slog.Logger
+	onManifest          func(digest.Digest, []manifest.TypedChild)
 }
 
 type manifestPrefetchResolver interface {
 	PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []coldstart.ChildDigest, registry, repository string) error
+}
+
+func isACRRegistry(registry string) bool {
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(registry), "."))
+
+	return strings.HasSuffix(host, ".azurecr.io") && len(host) > len(".azurecr.io")
 }
 
 // maxManifestBytes caps the size of a manifest body the prefetcher
@@ -1576,17 +1592,19 @@ func newLayerPrefetcher(
 	r manifestPrefetchResolver,
 	cache ifaces.LocalContentStore,
 	seeder *layerSeeder,
+	streamingReconciler *streamingLayerReconciler,
 	indexes *indexPrefetcher,
 	logger *slog.Logger,
 	onManifest func(digest.Digest, []manifest.TypedChild),
 ) mirror.LayerPrefetcher {
 	return &layerPrefetchAdapter{
-		resolver:   r,
-		cache:      cache,
-		seeder:     seeder,
-		indexes:    indexes,
-		logger:     logger.With(slog.String("subsystem", "prefetch")),
-		onManifest: onManifest,
+		resolver:            r,
+		cache:               cache,
+		seeder:              seeder,
+		streamingReconciler: streamingReconciler,
+		indexes:             indexes,
+		logger:              logger.With(slog.String("subsystem", "prefetch")),
+		onManifest:          onManifest,
 	}
 }
 
@@ -1717,6 +1735,18 @@ func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registr
 	}
 
 	if len(pending) == 0 {
+		return
+	}
+
+	if isACRRegistry(registry) && manifest.IsOverlayBDStreamingManifest(body) && p.streamingReconciler != nil {
+		streamingLayers := make([]coldstart.ChildDigest, 0, len(pending))
+		for _, child := range pending {
+			if child.Kind == ifaces.KindBlob {
+				streamingLayers = append(streamingLayers, child)
+			}
+		}
+		p.streamingReconciler.Start(baseCtx, registry, repository, manifestDigest, streamingLayers)
+
 		return
 	}
 
