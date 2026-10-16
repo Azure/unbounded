@@ -517,9 +517,10 @@ listeners, datagrams, pipes, readiness, partitions), `fault` (`Fault`,
   timeout). `cancel` removes an unexecuted target (`-ECANCELED` plus `0`,
   ordered by `World::set_cancel_first`) or completes `-ENOENT`.
 - `Accept` and `OpenAt2` complete with the new resource id as the result
-  (like a descriptor number). `SimBackend::adopt_fd(result)` /
+  (like a descriptor number). `SimBackend::try_adopt(result)` /
   `World::adopt(result)` turns it into a `SimFd`; `World::close_raw` closes an
-  unadopted one. The reactor needs a matching backend hook to adopt results.
+  unadopted one. The reactor adopts results itself through `Backend::adopt_fd`,
+  which yields an always-`EBADF` handle for an id that is not unadopted.
 - Endpoint labels for partitions are per backend
   (`SimBackend::set_endpoint`), replacing the old thread-local scope.
 - Faults: `World::inject(FaultTarget::{Any, Op(OpKind), Sync(SyncOp)},

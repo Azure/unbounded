@@ -349,8 +349,8 @@ fn accept_connect_and_adopt_through_host() {
     assert_eq!(run(&mut client, 1), 0);
     let raw = run(&mut server, 1);
     assert!(raw > 0);
-    let accepted = server.adopt_fd(raw).unwrap();
-    assert!(server.adopt_fd(raw).is_err());
+    let accepted = server.try_adopt(raw).unwrap();
+    assert!(server.try_adopt(raw).is_err());
     assert_eq!(peer.decode().unwrap(), client.local_addr(&socket).unwrap());
     assert_eq!(server.peer_addr(&accepted).unwrap(), peer.decode().unwrap());
 
@@ -451,7 +451,7 @@ fn namespace_operations_and_open_adoption() {
     let open_how = how(libc::O_RDONLY | libc::O_DIRECTORY, 0);
     push(&mut backend, 3, &open_op(&dir_path, &open_how));
     let raw = run(&mut backend, 3);
-    let dir = backend.adopt_fd(raw).unwrap();
+    let dir = backend.try_adopt(raw).unwrap();
     let name = CString::new("a").unwrap();
     let create = how(libc::O_CREAT | libc::O_RDWR | libc::O_EXCL, 0o640);
     let open = Op::OpenAt2 {
@@ -461,7 +461,7 @@ fn namespace_operations_and_open_adoption() {
     };
     push(&mut backend, 4, &open);
     let raw = run(&mut backend, 4);
-    let file = backend.adopt_fd(raw).unwrap();
+    let file = backend.try_adopt(raw).unwrap();
     push(&mut backend, 5, &open);
     assert_eq!(run(&mut backend, 5), -libc::EEXIST);
     let bad_mode = how(libc::O_RDONLY, 0o600);
@@ -697,7 +697,7 @@ fn scenario(seed: u64) -> (Vec<Event>, Vec<u8>, Vec<i32>) {
     let read_only = how(libc::O_RDONLY, 0);
     push(&mut backend, 1, &open_op(&path, &read_only));
     let raw = run(&mut backend, 1);
-    let fd = backend.adopt_fd(raw).unwrap();
+    let fd = backend.try_adopt(raw).unwrap();
     world
         .inject(FaultTarget::Op(OpKind::Read), Fault::Errno(libc::EIO))
         .unwrap();
@@ -740,4 +740,15 @@ fn replay_is_deterministic() {
     assert_ne!(first.1, scenario(43).1);
     assert!(first.2.contains(&-libc::ETIME));
     assert!(first.2.contains(&-libc::EIO));
+}
+
+#[test]
+fn trait_adopt_fd_of_unknown_result_is_inert() {
+    let (world, _clock, mut backend) = setup();
+    let before = world.live_handles();
+    // SAFETY: the sim backend never dereferences raw descriptors.
+    let fd = unsafe { backend.adopt_fd(1234) };
+    assert_eq!(world.live_handles(), before);
+    drop(fd);
+    assert_eq!(world.live_handles(), before);
 }
