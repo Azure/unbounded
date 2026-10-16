@@ -3225,9 +3225,17 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     let mut timing = PageTiming::new(&metrics);
     timing.active = true;
     timing.begin();
-    clock.advance(Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
+    // The library clock refuses to pass u64::MAX nanoseconds, so saturation is
+    // unreachable in DST; check the largest representable span converts exactly.
+    assert!(
+        clock
+            .checked_advance(Duration::from_secs(u64::MAX / 1_000_000_000 + 1))
+            .is_err()
+    );
+    let span = Duration::from_secs(500 * 365 * 86_400);
+    clock.advance(span);
     timing.end(0);
-    assert_eq!(timing.durations[0], u64::MAX);
+    assert_eq!(u128::from(timing.durations[0]), span.as_nanos());
     timing.start = Some(now() + Duration::from_secs(1));
     timing.end(1);
     assert_eq!(timing.durations[1], 0);

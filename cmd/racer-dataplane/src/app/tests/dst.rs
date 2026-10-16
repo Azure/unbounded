@@ -1581,8 +1581,13 @@ mod traffic {
                     } else {
                         "recv"
                     };
+                    // Target the reactor operation: the harness's own
+                    // fixture sockets must not consume the fault.
                     self.sim
-                        .inject(operation, Fault::Short(1 + self.rng.pick(128)))
+                        .inject_at(
+                            reactor_fault(operation),
+                            Fault::Short(1 + self.rng.pick(128)),
+                        )
                         .unwrap();
                     *self.coverage.injected.entry(operation.into()).or_default() += 1;
                     self.coverage.action("short-io");
@@ -1590,7 +1595,7 @@ mod traffic {
                 }
                 Action::ConnectFailure => {
                     self.sim
-                        .inject("connect", Fault::Errno(libc::ECONNREFUSED))
+                        .inject_at(reactor_fault("connect"), Fault::Errno(libc::ECONNREFUSED))
                         .unwrap();
                     *self.coverage.injected.entry("connect".into()).or_default() += 1;
                     // A new version forces an origin connection despite warm peers.
@@ -1953,6 +1958,16 @@ impl Eq for ReplayTrace {}
 
 fn handle(fd: &Descriptor) -> &racer_platform::simulation::SimFd {
     fd.as_sim().expect("DST escaped into host I/O")
+}
+/// Library faults named like `connect` also match synchronous fixture calls;
+/// the legacy simulator only failed reactor operations, so target those.
+fn reactor_fault(name: &str) -> racer_platform::simulation::FaultTarget {
+    match racer_platform::simulation::fault_target(name).unwrap() {
+        racer_platform::simulation::FaultTarget::Either(op, _) => {
+            racer_platform::simulation::FaultTarget::Op(op)
+        }
+        target => target,
+    }
 }
 fn would_block(error: &racer_platform::uring::Error) -> bool {
     error.is_would_block()
@@ -3198,7 +3213,7 @@ fn dst_refused_peer_connect_preserves_candidate_fallback() {
         // origin. Raw ECONNREFUSED must retain the same fallback as synthetic Io.
         harness
             .sim
-            .inject("connect", Fault::Errno(libc::ECONNREFUSED))
+            .inject_at(reactor_fault("connect"), Fault::Errno(libc::ECONNREFUSED))
             .unwrap();
         let client = harness.request_on(2, false, false, requester);
         harness.exchange(client, false);

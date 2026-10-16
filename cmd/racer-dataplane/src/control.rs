@@ -502,7 +502,9 @@ pub(crate) mod tests {
             let expected = match case {
                 "write" => Err(Error::Os(libc::ENOSPC)),
                 "rename" => Err(Error::RenameUncertain(PublicationCause::Os(libc::EIO))),
-                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Cancelled)),
+                // The kernel's rename result wins over the late cancel, so the
+                // rename is known to be published and the canceled step is the sync.
+                "cancel-rename" => Err(Error::PublishedNotDurable(PublicationCause::Cancelled)),
                 "sync" => Err(Error::PublishedNotDurable(PublicationCause::Os(libc::EIO))),
                 _ => Ok(()),
             };
