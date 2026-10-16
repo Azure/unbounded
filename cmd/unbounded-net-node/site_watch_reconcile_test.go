@@ -15,11 +15,63 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
+
+func TestDeletedNodeForcesTransitionCleanup(t *testing.T) {
+	oldCleanup := cleanupNodeNetworkingOnShutdownFunc
+
+	t.Cleanup(func() { cleanupNodeNetworkingOnShutdownFunc = oldCleanup })
+
+	called := false
+	cleanupNodeNetworkingOnShutdownFunc = func(_ *config, _ *wireGuardState, force bool) {
+		called = true
+
+		if !force {
+			t.Error("Node deletion did not force networking cleanup")
+		}
+	}
+	nodeClient := fake.NewClientset()
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": gatewayNodeGVR.GroupVersion().String(), "kind": "GatewayPoolNode",
+		"metadata": map[string]any{"name": "deleted"},
+		"status":   map[string]any{"routes": map[string]any{"10.0.0.0/24": map[string]any{"type": "NodeCidr"}}},
+	}})
+	state := &wireGuardState{
+		clientset: nodeClient, nodeName: "deleted", manageCniPlugin: true,
+		adoptedAssignment: nodeAssignment{site: "old", gatewayPool: "pool-g", nodeUID: "old-uid"},
+	}
+	cleanupForAssignmentTransition(&config{}, state, client, nil)
+
+	if !called {
+		t.Fatal("network cleanup was not invoked")
+	}
+
+	for _, action := range nodeClient.Actions() {
+		if action.GetVerb() != "get" {
+			t.Fatalf("mutated missing Node: %v", action)
+		}
+	}
+
+	for _, action := range client.Actions() {
+		if action.GetResource() != gatewayNodeGVR {
+			t.Fatalf("looked up destination after Node deletion: %v", action)
+		}
+	}
+
+	got, err := client.Resource(gatewayNodeGVR).Get(t.Context(), "deleted", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, found, err := unstructured.NestedMap(got.Object, "status", "routes"); err != nil || found {
+		t.Fatalf("deleted Node still advertises routes: %v err=%v", got.Object, err)
+	}
+}
 
 func TestDisableCNIForAssignmentTransition(t *testing.T) {
 	for _, tc := range []struct {
