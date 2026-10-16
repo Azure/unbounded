@@ -85,7 +85,7 @@ jobs:
           cat workflow-artifacts/metadata/aks-metadata.env >> "$GITHUB_ENV"
 
       - name: Upload metadata artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aks-quickstart-metadata
           path: workflow-artifacts/metadata/aks-metadata.env
@@ -255,21 +255,21 @@ jobs:
           cp .tmp/aks-ssh/id_ed25519.pub workflow-artifacts/ssh/id_ed25519.pub
 
       - name: Upload kubeconfig artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aks-kubeconfig
           path: workflow-artifacts/kubeconfig/aks-quickstart.kubeconfig
           retention-days: 1
 
       - name: Upload SSH material artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aks-ssh-material
           path: workflow-artifacts/ssh/
           retention-days: 1
 
       - name: Upload agent artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aks-unbounded-agent
           path: workflow-artifacts/agent/unbounded-agent-linux-amd64.tar.gz
@@ -336,25 +336,25 @@ jobs:
           done
 
       - name: Download kubeconfig artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: aks-kubeconfig
           path: workflow-artifacts/kubeconfig
 
       - name: Download SSH material artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: aks-ssh-material
           path: workflow-artifacts/ssh
 
       - name: Download metadata artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: aks-quickstart-metadata
           path: workflow-artifacts/metadata
 
       - name: Download agent artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: aks-unbounded-agent
           path: workflow-artifacts/agent
@@ -538,7 +538,7 @@ jobs:
 
       - name: Upload diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aks-ssh-quickstart-logs
           path: logs/
@@ -556,7 +556,7 @@ jobs:
     steps:
       - name: Download metadata artifact
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: aks-quickstart-metadata
           path: workflow-artifacts/metadata
