@@ -261,38 +261,50 @@ func mergeLowestTunnelMTU(tunnelMTUs map[string]int, scope string, mtu int) {
 	}
 }
 
-func gatewayPoolPeeringTunnelMTU(
-	localPools []string,
-	remotePool string,
-	poolPeerings []unboundednetv1alpha1.GatewayPoolPeering,
-) int {
-	localPoolSet := make(map[string]bool, len(localPools))
-	for _, poolName := range localPools {
-		if poolName = strings.TrimSpace(poolName); poolName != "" {
-			localPoolSet[poolName] = true
-		}
+type poolPairMTUKey struct {
+	a string
+	b string
+}
+
+func canonicalPoolPair(a, b string) poolPairMTUKey {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if b < a {
+		a, b = b, a
 	}
 
-	result := 0
-	remotePool = strings.TrimSpace(remotePool)
+	return poolPairMTUKey{a: a, b: b}
+}
 
-	for _, peering := range poolPeerings {
+func gatewayPoolPeeringEdgeTunnelMTUs(peerings []unboundednetv1alpha1.GatewayPoolPeering) map[poolPairMTUKey]int {
+	result := make(map[poolPairMTUKey]int)
+
+	for _, peering := range peerings {
 		if !unboundednetv1alpha1.SpecEnabled(peering.Spec.Enabled) {
 			continue
 		}
 
-		hasLocal := false
-		hasRemote := false
-
-		for _, poolName := range peering.Spec.GatewayPools {
-			poolName = strings.TrimSpace(poolName)
-			hasLocal = hasLocal || localPoolSet[poolName]
-			hasRemote = hasRemote || poolName == remotePool
+		mtu := tunnelMTUFromSpec(peering.Spec.TunnelMTU)
+		if mtu == 0 {
+			continue
 		}
 
-		if hasLocal && hasRemote {
-			result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+		for i, a := range peering.Spec.GatewayPools {
+			for _, b := range peering.Spec.GatewayPools[i+1:] {
+				key := canonicalPoolPair(a, b)
+				if key.a != "" && key.a != key.b {
+					result[key] = resolveTunnelMTU(result[key], mtu)
+				}
+			}
 		}
+	}
+
+	return result
+}
+
+func gatewayPoolPeeringTunnelMTU(localPools []string, remotePool string, edgeMTUs map[poolPairMTUKey]int) int {
+	result := 0
+	for _, pool := range localPools {
+		result = resolveTunnelMTU(result, edgeMTUs[canonicalPoolPair(pool, remotePool)])
 	}
 
 	return result
@@ -331,7 +343,7 @@ func learnedGatewayTransitTunnelMTU(
 	learnedRoutes map[string]unboundednetv1alpha1.GatewayNodeRoute,
 	siteMTUs, poolMTUs map[string]int,
 	assignmentMTUs map[sitePoolMTUKey]int,
-	poolPeerings []unboundednetv1alpha1.GatewayPoolPeering,
+	poolPeeringMTUs map[poolPairMTUKey]int,
 ) int {
 	result := 0
 
@@ -353,7 +365,7 @@ func learnedGatewayTransitTunnelMTU(
 				// identify a forwarding edge; co-occurrence is not enough.
 				previous := path[index-1]
 				if previous.Type == "GatewayPool" && hop.Type == "GatewayPool" {
-					result = resolveTunnelMTU(result, gatewayPoolPeeringTunnelMTU([]string{previous.Name}, hop.Name, poolPeerings))
+					result = resolveTunnelMTU(result, poolPeeringMTUs[canonicalPoolPair(previous.Name, hop.Name)])
 
 					continue
 				}

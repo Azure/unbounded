@@ -144,6 +144,7 @@ type poolPeeringProtocolFixture struct {
 	peerings       cache.SharedIndexInformer
 	pools          cache.SharedIndexInformer
 	nodes          cache.SharedIndexInformer
+	assignments    cache.SharedIndexInformer
 	state          *wireGuardState
 	update         func() error
 	configureCalls int
@@ -224,6 +225,7 @@ func newPoolPeeringProtocolFixture(t *testing.T, gateway bool) *poolPeeringProto
 			TunnelProtocol: new(unboundednetv1alpha1.TunnelProtocolNone),
 		},
 	}))
+	f.assignments = assignmentInformer
 	empty := newInformerWithObjects()
 	gatewayNodes := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
 		ObjectMeta: metav1.ObjectMeta{Name: "remote"},
@@ -491,6 +493,54 @@ func TestPublishedForwardingMTUWorkerOnly(t *testing.T) {
 				t.Fatalf("gateway=%v consumed published cap unexpectedly: %+v", gateway, f.gateways)
 			}
 		})
+	}
+}
+
+func TestGatewayPolicyFailureRetriesAfterAssignmentReactivation(t *testing.T) {
+	f := newPoolPeeringProtocolFixture(t, false)
+	f.putPeering(t, "connect", "local-a", nil, true)
+
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	assignment, exists, err := f.assignments.GetStore().GetByKey("local-to-remote")
+	if err != nil || !exists {
+		t.Fatalf("assignment exists=%v err=%v", exists, err)
+	}
+
+	if err := f.assignments.GetStore().Delete(assignment); err != nil {
+		t.Fatal(err)
+	}
+
+	f.configureErr = errors.New("policy table flush failed")
+	if err := f.update(); !errors.Is(err, f.configureErr) {
+		t.Fatalf("cleanup error=%v", err)
+	}
+
+	if !f.state.dataplaneDirty || len(f.state.gatewayPeers) != 1 {
+		t.Fatal("failed cleanup was not retained as incomplete programming")
+	}
+
+	if err := f.assignments.GetStore().Add(assignment); err != nil {
+		t.Fatal(err)
+	}
+
+	f.configureErr = nil
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.configureCalls != 3 || len(f.gateways) != 1 || f.state.dataplaneDirty {
+		t.Fatalf("reactivated assignment skipped policy repair: calls=%d peers=%v dirty=%v", f.configureCalls, f.gateways, f.state.dataplaneDirty)
+	}
+
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.configureCalls != 3 {
+		t.Fatal("successful repair did not restore no-op reconciliation")
 	}
 }
 

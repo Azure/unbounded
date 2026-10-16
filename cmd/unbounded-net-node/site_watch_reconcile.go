@@ -478,20 +478,13 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 	})
 
-	assignmentReg, err := assignmentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+	assignmentReg, err := assignmentInformer.AddEventHandler(gatewayAssignmentEventHandler(
+		adoptedAssignment.site,
+		func() {
 			gatewayInformers.setRequired(gatewayCachesRequired(adoptedAssignment, adoptedAssignment.site, assignmentInformer))
-			requestUpdate()
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			gatewayInformers.setRequired(gatewayCachesRequired(adoptedAssignment, adoptedAssignment.site, assignmentInformer))
-			requestUpdate()
-		},
-		DeleteFunc: func(obj interface{}) {
-			gatewayInformers.setRequired(gatewayCachesRequired(adoptedAssignment, adoptedAssignment.site, assignmentInformer))
-			requestUpdate()
-		},
-	})
+		requestUpdate,
+	))
 	if err != nil {
 		return fmt.Errorf("failed to add site gateway pool assignment event handler: %w", err)
 	}
@@ -1825,6 +1818,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	assignmentEdgeMTUs := assignmentEdgeTunnelMTUs(assignments)
 	peeringEdgeMTUs := sitePeeringEdgeTunnelMTUs(sitePeerings)
+	poolPeeringEdgeMTUs := gatewayPoolPeeringEdgeTunnelMTUs(poolPeerings)
 	{
 		var poolsToIterate map[string]*unboundednetv1alpha1.GatewayPool
 		if isGatewayNode {
@@ -1892,12 +1886,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				}, siteRouting.localCIDRs)
 				routedCidrs, routeDistances, learnedRoutes = filteredRoutes.RoutedCidrs, filteredRoutes.RouteDistances, filteredRoutes.LearnedRoutes
 
-				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignmentEdgeMTUs, poolPeerings)
+				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignmentEdgeMTUs, poolPeeringEdgeMTUs)
 
 				transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU,
 					gatewayMeshTransitTunnelMTU(pool.Name, gwNode.SiteName, learnedRoutes, gatewayPoolMap, siteTunnelMTUs, peeringEdgeMTUs))
 				if isGatewayNode {
-					transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU, gatewayPoolPeeringTunnelMTU(localGatewayPools, pool.Name, poolPeerings))
+					transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU, gatewayPoolPeeringTunnelMTU(localGatewayPools, pool.Name, poolPeeringEdgeMTUs))
 				}
 
 				peeringTunnelProtocol := poolPeeringTunnelProtocols[pool.Name]
@@ -2165,7 +2159,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		!strSliceEqual(prevLocalGatewayPools, localGatewayPools)
 
 	// Check if tunnel configuration needs to change
-	wgChanged := roleChanged ||
+	wgChanged := state.dataplaneDirty || roleChanged ||
 		!reflect.DeepEqual(state.siteRouting, siteRouting) ||
 		!meshPeersEqual(state.peers, peers) ||
 		!strSliceEqual(state.sitePodCIDRs, sitePodCIDRs) ||
@@ -2196,6 +2190,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 		return publishGatewayStatus(fabricMTU, peers, gatewayPeers)
 	}
+
+	state.dataplaneDirty = true
 
 	// Log added and removed peers
 	logMeshPeerChanges(state.peers, peers)
@@ -2420,6 +2416,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.assignmentPoolTunnelProtocols = copyStringMap(assignmentPoolTunnelProtocols)
 	state.poolTunnelProtocols = copyStringMap(poolTunnelProtocols)
 	state.cniMTU = fabricMTU
+	state.dataplaneDirty = false
 	state.reconcileCount++
 	state.mu.Unlock()
 

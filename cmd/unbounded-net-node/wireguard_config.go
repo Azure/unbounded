@@ -496,8 +496,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		// This ensures return traffic leaves via the same interface it arrived on
 		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
 			if err := state.gatewayPolicyManager.ConfigureInterface(gwIfaceName, gwPort); err != nil {
-				klog.Warningf("Failed to configure policy routing for %s: %v", gwIfaceName, err)
-				// Continue - policy routing is not critical
+				return fmt.Errorf("configure policy routing for %s: %w", gwIfaceName, err)
 			}
 		}
 

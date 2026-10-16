@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
@@ -157,6 +158,49 @@ func TestGatewayInformerLifecycleLateEventHandler(t *testing.T) {
 
 	if got := watchActionCount(client); got != 3 {
 		t.Fatalf("watch actions=%d, want unchanged generation with three watches", got)
+	}
+}
+
+func TestGatewayAssignmentEventsLimitSynchronousScans(t *testing.T) {
+	refreshes, requests := 0, 0
+	handler := gatewayAssignmentEventHandler("local", func() { refreshes++ }, func() { requests++ })
+
+	remote := toUnstructuredSiteWatch(t, &unboundednetv1alpha1.SiteGatewayPoolAssignment{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+		Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+			Sites: []string{"remote"}, GatewayPools: []string{"pool"},
+		},
+	})
+	for range 1000 {
+		handler.OnUpdate(remote, remote.DeepCopy())
+	}
+
+	if refreshes != 0 || requests != 0 {
+		t.Fatalf("resync caused work: scans=%d requests=%d", refreshes, requests)
+	}
+
+	changed := remote.DeepCopy()
+	changed.SetResourceVersion("2")
+	handler.OnAdd(remote, false)
+	handler.OnUpdate(remote, changed)
+	handler.OnDelete(cache.DeletedFinalStateUnknown{Obj: changed})
+
+	if refreshes != 0 || requests != 3 {
+		t.Fatalf("remote events must be coalesced without synchronous scans: scans=%d requests=%d", refreshes, requests)
+	}
+
+	local := changed.DeepCopy()
+	if err := unstructured.SetNestedStringSlice(local.Object, []string{"local"}, "spec", "sites"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler.OnAdd(local, false)
+	handler.OnUpdate(local, changed)
+	handler.OnUpdate(changed, local)
+	handler.OnDelete(cache.DeletedFinalStateUnknown{Obj: local})
+
+	if refreshes != 4 || requests != 7 {
+		t.Fatalf("local membership changes did not refresh requirements immediately: scans=%d requests=%d", refreshes, requests)
 	}
 }
 

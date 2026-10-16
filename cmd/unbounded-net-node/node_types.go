@@ -30,6 +30,7 @@ type wireGuardState struct {
 	manageCniPlugin  bool // Whether this node's site manages CNI plugin and full podCIDR mesh routes
 	cniMTU           int  // Last MTU written to the managed CNI configuration
 	cniConfigWritten bool // Whether this process has written the managed CNI configuration
+	dataplaneDirty   bool // A failed programming attempt must not take the unchanged-state fast path.
 	mu               sync.Mutex
 
 	// Kubernetes client for tainting nodes
