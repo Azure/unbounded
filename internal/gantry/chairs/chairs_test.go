@@ -212,10 +212,7 @@ func testHolder(peerID ifaces.NodeID) chairs.Holder {
 	}
 }
 
-// A holder that stopped renewing is gone: dialing it fails peer-identity
-// verification, and counting it as healthy keeps live nodes from reclaiming
-// the seat.
-func TestRankAndSelectableCountExcludeExpiredHolders(t *testing.T) {
+func TestRankActiveExcludesExpiredHoldersWithoutChangingRegularRank(t *testing.T) {
 	now := time.Unix(2_000_000, 0)
 	snapshot := chairs.Snapshot{Epoch: 4, FetchedAt: now}
 
@@ -236,14 +233,20 @@ func TestRankAndSelectableCountExcludeExpiredHolders(t *testing.T) {
 		snapshot.Chairs = append(snapshot.Chairs, chair)
 	}
 
-	want := chairs.Count / 2
-	if got := snapshot.SelectableCount(); got != want {
-		t.Fatalf("SelectableCount = %d, want %d live holders", got, want)
+	if got := snapshot.SelectableCount(); got != chairs.Count {
+		t.Fatalf("SelectableCount = %d, want %d selectable holders", got, chairs.Count)
 	}
 
-	ranked := chairs.Rank(snapshot, digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), chairs.DefaultCount)
+	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	if got := len(chairs.Rank(snapshot, d, chairs.DefaultCount)); got != chairs.Count {
+		t.Fatalf("regular ranked chairs = %d, want %d", got, chairs.Count)
+	}
+
+	want := chairs.Count / 2
+
+	ranked := chairs.RankActive(snapshot, d, chairs.DefaultCount)
 	if len(ranked) != want {
-		t.Fatalf("ranked chairs = %d, want %d", len(ranked), want)
+		t.Fatalf("active ranked chairs = %d, want %d", len(ranked), want)
 	}
 
 	for _, chair := range ranked {
@@ -256,8 +259,8 @@ func TestRankAndSelectableCountExcludeExpiredHolders(t *testing.T) {
 	stale := snapshot
 	stale.Stale = true
 
-	if got := stale.SelectableCount(); got != chairs.Count {
-		t.Fatalf("stale SelectableCount = %d, want %d", got, chairs.Count)
+	if got := len(chairs.RankActive(stale, d, chairs.DefaultCount)); got != chairs.Count {
+		t.Fatalf("stale active ranked chairs = %d, want %d", got, chairs.Count)
 	}
 }
 

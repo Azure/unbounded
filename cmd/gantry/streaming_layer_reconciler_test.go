@@ -26,17 +26,19 @@ type streamingReconcileResolverStub struct {
 	invoked       chan struct{}
 }
 
-func (s *streamingReconcileResolverStub) PrefetchManifestChildren(_ context.Context, _ digest.Digest, children []coldstart.ChildDigest, _, _ string) error {
+func (s *streamingReconcileResolverStub) PrefetchStreamingManifestChildren(_ context.Context, _ digest.Digest, children []coldstart.ChildDigest, _, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.calls++
+
 	s.children = append([]coldstart.ChildDigest(nil), children...)
 	if s.completeAfter > 0 && s.calls == s.completeAfter {
 		for _, child := range children {
 			s.store.Put(child.Digest, []byte("complete"))
 		}
 	}
+
 	if s.invoked != nil {
 		select {
 		case s.invoked <- struct{}{}:
@@ -58,10 +60,12 @@ func waitStreamingReconciler(t *testing.T, reconciler *streamingLayerReconciler)
 	t.Helper()
 
 	deadline := time.After(time.Second)
+
 	for {
 		reconciler.mu.Lock()
 		active := len(reconciler.active)
 		reconciler.mu.Unlock()
+
 		if active == 0 {
 			return
 		}
@@ -98,9 +102,11 @@ func TestStreamingLayerReconcilerRetriesUntilCompleteAndDeduplicates(t *testing.
 	if calls != 2 {
 		t.Fatalf("resolver calls = %d, want 2 retries without duplicate reconcile", calls)
 	}
+
 	if len(gotChildren) != len(children) {
 		t.Fatalf("last dispatch children = %d, want %d", len(gotChildren), len(children))
 	}
+
 	for _, child := range children {
 		if present, err := store.Has(t.Context(), child.Digest); err != nil || !present {
 			t.Fatalf("child %s present = %t, %v", child.Digest, present, err)
@@ -124,6 +130,7 @@ func TestLayerPrefetchAdapterRoutesOnlyOverlayBDManifestToReconciler(t *testing.
 		DispatchTimeout: time.Second,
 	})
 	regularResolver := &manifestPrefetchResolverStub{}
+
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -140,9 +147,11 @@ func TestLayerPrefetchAdapterRoutesOnlyOverlayBDManifestToReconciler(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("streaming reconciler was not invoked")
 	}
+
 	if len(regularResolver.children) != 0 {
 		t.Fatalf("regular resolver received streaming children: %+v", regularResolver.children)
 	}
+
 	_, streamingChildren := streamingResolver.snapshot()
 	if len(streamingChildren) != 2 {
 		t.Fatalf("streaming children = %d, want only 2 layers", len(streamingChildren))
@@ -156,6 +165,7 @@ func TestLayerPrefetchAdapterRoutesOnlyOverlayBDManifestToReconciler(t *testing.
 		streamingReconciler: reconciler,
 	}
 	nonACRAdapter.OnManifestServed(t.Context(), "registry.example.com", "team/app", testDigest(t, "f"))
+
 	if len(nonACRResolver.children) != 3 {
 		t.Fatalf("annotated non-ACR resolver children = %d, want existing config+layers path", len(nonACRResolver.children))
 	}
@@ -168,6 +178,7 @@ func TestLayerPrefetchAdapterRoutesOnlyOverlayBDManifestToReconciler(t *testing.
 		streamingReconciler: reconciler,
 	}
 	regularAdapter.OnManifestServed(t.Context(), "app.azurecr.io", "team/app", testDigest(t, "e"))
+
 	if len(regularResolver.children) != 2 {
 		t.Fatalf("regular resolver children = %d, want existing config+layer path", len(regularResolver.children))
 	}
@@ -189,6 +200,7 @@ func TestPumpedManifestActivatesOnlyStreamingReconciler(t *testing.T) {
 		DispatchTimeout: time.Second,
 	})
 	regularResolver := &manifestPrefetchResolverStub{}
+
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -205,6 +217,7 @@ func TestPumpedManifestActivatesOnlyStreamingReconciler(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("pumped streaming manifest did not activate the reconciler")
 	}
+
 	if len(regularResolver.children) != 0 {
 		t.Fatalf("regular resolver received pumped streaming children: %+v", regularResolver.children)
 	}
@@ -217,9 +230,11 @@ func TestPumpedManifestActivatesOnlyStreamingReconciler(t *testing.T) {
 		streamingReconciler: reconciler,
 	}
 	regularAdapter.OnStreamingManifestCommitted(ctx, "app.azurecr.io", "team/app", testDigest(t, "2"))
+
 	if len(regularResolver.children) != 0 {
 		t.Fatalf("regular resolver received pumped regular-manifest children: %+v", regularResolver.children)
 	}
+
 	if calls, _ := streamingResolver.snapshot(); calls != 1 {
 		t.Fatalf("streaming resolver calls = %d, want 1 after regular ACR manifest", calls)
 	}

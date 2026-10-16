@@ -73,6 +73,7 @@ func (s *boundedChairCoordStub) PleasePullChair(_ context.Context, _ ifaces.Peer
 	}
 
 	s.started <- struct{}{}
+
 	<-s.release
 
 	outcomes := make([]ifaces.PleasePullOutcome, 0, len(digests))
@@ -286,12 +287,14 @@ func TestChairPrefetchUsesDeterministicCoordinators(t *testing.T) {
 	childDigest := digest.MustParse("sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
 	snapshot := fullChairSnapshot(5)
 	coordinators := chairs.Rank(snapshot, manifestDigest, chairs.Count)[:3]
+
 	coordinatorSet := make(map[ifaces.NodeID]struct{}, len(coordinators))
 	for _, chair := range coordinators {
 		coordinatorSet[chair.Holder.PeerID] = struct{}{}
 	}
 
 	callers := 0
+
 	for _, chair := range snapshot.Chairs {
 		coord := &chairCoordStub{}
 		resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
@@ -306,11 +309,11 @@ func TestChairPrefetchUsesDeterministicCoordinators(t *testing.T) {
 			PrefetchCoordinatorReplicas: 3,
 		})
 
-		if err := resolver.PrefetchManifestChildren(context.Background(), manifestDigest, []coldstart.ChildDigest{{
+		if err := resolver.PrefetchStreamingManifestChildren(context.Background(), manifestDigest, []coldstart.ChildDigest{{
 			Digest: childDigest,
 			Kind:   ifaces.KindBlob,
 		}}, "registry.example.com", "repo/image"); err != nil {
-			t.Fatalf("PrefetchManifestChildren for %s: %v", chair.Holder.PeerID, err)
+			t.Fatalf("PrefetchStreamingManifestChildren for %s: %v", chair.Holder.PeerID, err)
 		}
 
 		coord.mu.Lock()
@@ -320,6 +323,7 @@ func TestChairPrefetchUsesDeterministicCoordinators(t *testing.T) {
 		_, coordinator := coordinatorSet[chair.Holder.PeerID]
 		if coordinator {
 			callers++
+
 			if calls != chairs.SeedCount {
 				t.Fatalf("coordinator %s calls = %d, want %d", chair.Holder.PeerID, calls, chairs.SeedCount)
 			}
@@ -330,6 +334,40 @@ func TestChairPrefetchUsesDeterministicCoordinators(t *testing.T) {
 
 	if callers != 3 {
 		t.Fatalf("coordinator callers = %d, want 3", callers)
+	}
+}
+
+func TestRegularChairPrefetchIgnoresStreamingCoordinatorLimit(t *testing.T) {
+	manifestDigest := digest.MustParse("sha256:edededededededededededededededededededededededededededededededed")
+	childDigest := digest.MustParse("sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+	coord := &chairCoordStub{}
+	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+		Chairs:                      &chairSnapshotStub{snapshot: fullChairSnapshot(5)},
+		Discovery:                   &stubDisco{},
+		Coord:                       coord,
+		Inflight:                    inflight.New(inflight.DefaultStalls(), nil),
+		SelfPeerID:                  "not-a-chair-holder",
+		CurrentEpoch:                func() int64 { return 5 },
+		ChairCount:                  chairs.Count,
+		SeedCount:                   chairs.SeedCount,
+		PrefetchCoordinatorReplicas: 1,
+		PrefetchMaxConcurrentGroups: 1,
+		PrefetchDispatchJitter:      time.Hour,
+	})
+
+	if err := resolver.PrefetchManifestChildren(context.Background(), manifestDigest, []coldstart.ChildDigest{{
+		Digest: childDigest,
+		Kind:   ifaces.KindBlob,
+	}}, "registry.example.com", "repo/image"); err != nil {
+		t.Fatalf("PrefetchManifestChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	calls := len(coord.calls)
+	coord.mu.Unlock()
+
+	if calls != chairs.SeedCount {
+		t.Fatalf("regular chair calls = %d, want %d", calls, chairs.SeedCount)
 	}
 }
 
@@ -355,7 +393,7 @@ func TestChairPrefetchBoundsConcurrentGroups(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- resolver.PrefetchManifestChildren(context.Background(), manifestDigest, []coldstart.ChildDigest{{
+		done <- resolver.PrefetchStreamingManifestChildren(context.Background(), manifestDigest, []coldstart.ChildDigest{{
 			Digest: childDigest,
 			Kind:   ifaces.KindBlob,
 		}}, "registry.example.com", "repo/image")
@@ -368,14 +406,17 @@ func TestChairPrefetchBoundsConcurrentGroups(t *testing.T) {
 			t.Fatal("timed out waiting for bounded prefetch groups")
 		}
 	}
+
 	if got := coord.maximum.Load(); got != 2 {
 		t.Fatalf("maximum concurrent groups = %d, want 2", got)
 	}
 
 	close(coord.release)
+
 	if err := <-done; err != nil {
-		t.Fatalf("PrefetchManifestChildren: %v", err)
+		t.Fatalf("PrefetchStreamingManifestChildren: %v", err)
 	}
+
 	if got := coord.maximum.Load(); got > 2 {
 		t.Fatalf("maximum concurrent groups = %d, want <= 2", got)
 	}
