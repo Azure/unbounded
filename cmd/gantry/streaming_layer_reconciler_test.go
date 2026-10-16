@@ -172,3 +172,55 @@ func TestLayerPrefetchAdapterRoutesOnlyOverlayBDManifestToReconciler(t *testing.
 		t.Fatalf("regular resolver children = %d, want existing config+layer path", len(regularResolver.children))
 	}
 }
+
+func TestPumpedManifestActivatesOnlyStreamingReconciler(t *testing.T) {
+	streamingBody, err := os.ReadFile("testdata/acr-streaming-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := fakes.NewCache()
+	streamingResolver := &streamingReconcileResolverStub{store: store, invoked: make(chan struct{}, 1)}
+	reconciler := newStreamingLayerReconciler(streamingLayerReconcilerOptions{
+		Resolver:        streamingResolver,
+		Store:           store,
+		Logger:          slog.Default(),
+		Interval:        time.Hour,
+		DispatchTimeout: time.Second,
+	})
+	regularResolver := &manifestPrefetchResolverStub{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	streamingAdapter := &layerPrefetchAdapter{
+		cache:               &delayedManifestStore{body: string(streamingBody), ready: true},
+		logger:              slog.Default(),
+		resolver:            regularResolver,
+		streamingReconciler: reconciler,
+	}
+	streamingAdapter.OnStreamingManifestCommitted(ctx, "app.azurecr.io", "team/app", testDigest(t, "1"))
+
+	select {
+	case <-streamingResolver.invoked:
+	case <-time.After(time.Second):
+		t.Fatal("pumped streaming manifest did not activate the reconciler")
+	}
+	if len(regularResolver.children) != 0 {
+		t.Fatalf("regular resolver received pumped streaming children: %+v", regularResolver.children)
+	}
+
+	regularBody := `{"schemaVersion":2,"config":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"layers":[{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}`
+	regularAdapter := &layerPrefetchAdapter{
+		cache:               &delayedManifestStore{body: regularBody, ready: true},
+		logger:              slog.Default(),
+		resolver:            regularResolver,
+		streamingReconciler: reconciler,
+	}
+	regularAdapter.OnStreamingManifestCommitted(ctx, "app.azurecr.io", "team/app", testDigest(t, "2"))
+	if len(regularResolver.children) != 0 {
+		t.Fatalf("regular resolver received pumped regular-manifest children: %+v", regularResolver.children)
+	}
+	if calls, _ := streamingResolver.snapshot(); calls != 1 {
+		t.Fatalf("streaming resolver calls = %d, want 1 after regular ACR manifest", calls)
+	}
+}

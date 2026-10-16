@@ -404,6 +404,7 @@ func runAgent(args []string) error {
 	// outstanding goroutines so graceful shutdown can let the final
 	// advertise path flush before disco.Close fires.
 	pullerPumpGate := newPullerPumpGate()
+	var pumpedManifestAdapter atomic.Pointer[layerPrefetchAdapter]
 
 	leaseHooks := leaseMetricHooks{
 		onCreated:  func() { p9.containerdLeaseCreated.Inc() },
@@ -433,6 +434,14 @@ func runAgent(args []string) error {
 	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks, pumpMetricHooks{
 		OnQueueWait:    func(kind string, seconds float64) { inst.originPullQueueWait.WithLabelValues(kind).Observe(seconds) },
 		OnPullDuration: func(kind string, seconds float64) { inst.originPullDuration.WithLabelValues(kind).Observe(seconds) },
+		OnContentReady: func(contentCtx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) {
+			if kind != ifaces.KindManifest || !isACRRegistry(registry) {
+				return
+			}
+			if adapter := pumpedManifestAdapter.Load(); adapter != nil {
+				adapter.OnStreamingManifestCommitted(contentCtx, registry, repository, d)
+			}
+		},
 	})
 
 	// Every node that is served a manifest pulls that image's layers into its
@@ -583,7 +592,11 @@ func runAgent(args []string) error {
 				Logger:   logger,
 			})
 		}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, layerSeed, streamingReconciler, indexPrefetch, logger, layerProgress.observeManifest)
+		adapter := newLayerPrefetcher(realResolver, cstore, layerSeed, streamingReconciler, indexPrefetch, logger, layerProgress.observeManifest)
+		layerPrefetcher = adapter
+		if streamingReconciler != nil {
+			pumpedManifestAdapter.Store(adapter)
+		}
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chair_count", c.ChairCount),
 			slog.Int("seed_count", c.ChairSeedCount),
@@ -1596,7 +1609,7 @@ func newLayerPrefetcher(
 	indexes *indexPrefetcher,
 	logger *slog.Logger,
 	onManifest func(digest.Digest, []manifest.TypedChild),
-) mirror.LayerPrefetcher {
+) *layerPrefetchAdapter {
 	return &layerPrefetchAdapter{
 		resolver:            r,
 		cache:               cache,
@@ -1646,7 +1659,19 @@ func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest
 }
 
 func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registry, repository string, manifestDigest digest.Digest) {
-	if p.resolver == nil && p.onManifest == nil && p.seeder == nil {
+	p.onManifestServed(baseCtx, registry, repository, manifestDigest, false)
+}
+
+func (p *layerPrefetchAdapter) OnStreamingManifestCommitted(baseCtx context.Context, registry, repository string, manifestDigest digest.Digest) {
+	p.onManifestServed(baseCtx, registry, repository, manifestDigest, true)
+}
+
+func (p *layerPrefetchAdapter) onManifestServed(baseCtx context.Context, registry, repository string, manifestDigest digest.Digest, streamingOnly bool) {
+	if streamingOnly {
+		if p.streamingReconciler == nil || !isACRRegistry(registry) {
+			return
+		}
+	} else if p.resolver == nil && p.onManifest == nil && p.seeder == nil {
 		return
 	}
 	// Use a fresh deadline so the prefetch survives the request
@@ -1697,8 +1722,12 @@ func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registr
 
 		return
 	}
+	streamingManifest := isACRRegistry(registry) && manifest.IsOverlayBDStreamingManifest(body) && p.streamingReconciler != nil
+	if streamingOnly && !streamingManifest {
+		return
+	}
 
-	if p.onManifest != nil {
+	if !streamingOnly && p.onManifest != nil {
 		p.onManifest(manifestDigest, children)
 	}
 
@@ -1709,7 +1738,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registr
 
 	// Warm the mount-critical regions first. Everything below moves whole
 	// layers, which the container does not wait on.
-	if p.indexes != nil {
+	if !streamingOnly && p.indexes != nil {
 		go p.indexes.Prefetch(baseCtx, registry, repository, children)
 	}
 
@@ -1738,7 +1767,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registr
 		return
 	}
 
-	if isACRRegistry(registry) && manifest.IsOverlayBDStreamingManifest(body) && p.streamingReconciler != nil {
+	if streamingManifest {
 		streamingLayers := make([]coldstart.ChildDigest, 0, len(pending))
 		for _, child := range pending {
 			if child.Kind == ifaces.KindBlob {
@@ -1868,6 +1897,7 @@ func (g *pullerPumpGate) Wait() {
 type pumpMetricHooks struct {
 	OnQueueWait    func(kind string, seconds float64)
 	OnPullDuration func(kind string, seconds float64)
+	OnContentReady func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind)
 }
 
 // pullAdmissionMultiplier sets how many pulls a node accepts relative to the
@@ -2053,7 +2083,17 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 
 			pullStartedAt := time.Now()
 
-			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, originPullProgressTimeout, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
+			successHook := onOriginSuccess
+			if pumpHooks.OnContentReady != nil {
+				successHook = func(kindLabel string, bytes int64) {
+					if onOriginSuccess != nil {
+						onOriginSuccess(kindLabel, bytes)
+					}
+					pumpHooks.OnContentReady(pullCtx, registry, repository, d, kind)
+				}
+			}
+
+			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, originPullProgressTimeout, markPresent, successHook, onDownstreamFailure, leaseHooks)
 
 			if pumpHooks.OnPullDuration != nil {
 				pumpHooks.OnPullDuration(kind.MetricLabel(), time.Since(pullStartedAt).Seconds())
