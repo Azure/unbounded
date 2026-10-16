@@ -1282,18 +1282,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uring-runtime-legacy"
-version = "0.1.0"
-dependencies = [
- "futures",
- "getrandom",
- "io-uring",
- "libc",
- "sha2",
- "zeroize",
-]
-
-[[package]]
 name = "uring-runtime-sim"
 version = "0.1.0"
 dependencies = [
