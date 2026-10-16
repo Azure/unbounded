@@ -1,7 +1,7 @@
 //! Racer's platform layer over the `uring-runtime` library.
 //!
 //! The library is policy free. This crate recreates the ergonomic surface the
-//! Racer crates used from the old internal runtime (`cmd/racer-dataplane/runtime`)
+//! Racer crates used from the old internal runtime crate (since removed)
 //! and holds the Racer policy the library intentionally does not own: a `Copy`
 //! error type, ambient clock and entropy, bounded channels and mailboxes,
 //! offload queues, explicitly polled driver queues, retry and hedging, and CPU
