@@ -26,7 +26,8 @@
 //! | `inject(&str, Fault)` | same names, mapped by [`fault_target`]; unknown names now fail with `EINVAL`. Typed form: [`inject_at`](Simulation::inject_at) |
 //! | `Fault::{Errno, Short, Delay, HoldCompletion}` | same ([`Fault`]) |
 //! | `trace()`/`take_trace() -> Vec<Event { operation: String, .. }>` | `Vec<`[`Event`]`>` with a typed [`EventKind`] instead of `operation` |
-//! | `live_handles`, `reject_submissions`, `set_stream_capacity`, `set_cancel_first`, `set_max_chunk` | same |
+//! | `live_handles`, `set_stream_capacity`, `set_cancel_first`, `set_max_chunk` | same |
+//! | `reject_submissions(n)` | same meaning (the next `n` operations are rejected); doubled into backend push rejections because the library retries a full push once |
 //! | `next_sequence` | same, but a separate per-world counter (no longer shared with resource ids) |
 //! | `create_dir_all`, `mkdir`, `symlink`, `write_file`, `read_file`, `chmod`, `rename`, `unlink` | same |
 //! | `metadata(path) -> (inode, mode)` | same; full [`Metadata`] through [`world`](Simulation::world) |
@@ -294,9 +295,18 @@ impl Simulation {
         self.0.world.live_handles()
     }
 
-    /// Reject the next `count` submissions at push.
+    /// Reject the publication of the next `count` reactor operations.
+    ///
+    /// The library reactor retries a push that reports a full queue once
+    /// after submitting, so each rejected operation consumes two backend
+    /// rejections; this doubles `count` (at most `MAX_REJECTIONS / 2`). Use
+    /// [`World::reject_submissions`] through [`world`](Self::world) to count
+    /// raw pushes instead.
     pub fn reject_submissions(&self, count: usize) -> io::Result<()> {
-        io(self.0.world.reject_submissions(count))
+        let pushes = count
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        io(self.0.world.reject_submissions(pushes))
     }
 
     /// Set the receive queue capacity of every stream.
