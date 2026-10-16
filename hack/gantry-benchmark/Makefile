@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-status-snapshot-start operator-vm-status-snapshot-result operator-vm-status-snapshot-cleanup operator-vm-verify-streaming-layers operator-vm-verify-streaming-layers-status operator-vm-verify-streaming-layers-cleanup operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-sync-benchmark-source operator-vm-sync-benchmark-source-status operator-vm-sync-benchmark-source-cleanup operator-vm-status-snapshot-start operator-vm-status-snapshot-result operator-vm-status-snapshot-cleanup operator-vm-verify-streaming-layers operator-vm-verify-streaming-layers-status operator-vm-verify-streaming-layers-cleanup operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
 
 help: ## Show benchmark targets
 	@echo ""
@@ -32,6 +32,9 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-deploy-runtime-watch  Follow fixed Gantry deployment progress"
 	@echo "  operator-vm-deploy-runtime-fast  Raise active Gantry rollout parallelism"
 	@echo "  operator-vm-image-pool-status  Show operator-VM pool builder and entries"
+	@echo "  operator-vm-sync-benchmark-source  Submit validated benchmark source sync"
+	@echo "  operator-vm-sync-benchmark-source-status  Read benchmark source sync status"
+	@echo "  operator-vm-sync-benchmark-source-cleanup  Delete benchmark source sync resource"
 	@echo "  operator-vm-status-snapshot-start  Submit a nonblocking persisted operator status snapshot"
 	@echo "  operator-vm-status-snapshot-result  Read the persisted operator status snapshot"
 	@echo "  operator-vm-status-snapshot-cleanup  Delete the persisted operator status snapshot"
@@ -166,6 +169,15 @@ operator-vm-deploy-runtime-fast: operator-vm-check
 
 operator-vm-image-pool-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status
+
+operator-vm-sync-benchmark-source: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh sync-benchmark-source
+
+operator-vm-sync-benchmark-source-status: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh sync-benchmark-source-status
+
+operator-vm-sync-benchmark-source-cleanup: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh sync-benchmark-source-cleanup
 
 operator-vm-status-snapshot-start: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status-snapshot-start

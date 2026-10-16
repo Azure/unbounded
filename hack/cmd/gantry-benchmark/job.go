@@ -65,68 +65,33 @@ type podList struct {
 func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase proxyPhase, image string) (jobObservation, error) {
 	phaseLabel := strings.ReplaceAll(string(phase), "_", "-")
 
-	jobName := "gantry-benchmark-" + phaseLabel + "-" + state.RunID
-	if len(jobName) > 63 {
-		return jobObservation{}, fmt.Errorf("generated Job name %q exceeds 63 characters", jobName)
+	jobName := "gantry-pull-" + phaseLabel + "-" + state.RunID
+	if len(jobName)+len("-00000") > 63 {
+		return jobObservation{}, fmt.Errorf("generated pull workload name %q leaves no room for a pod index", jobName)
 	}
 
 	platformParts := strings.SplitN(b.config.ImagePlatform, "/", 2)
 	if len(platformParts) != 2 || platformParts[0] == "" || platformParts[1] == "" {
 		return jobObservation{}, fmt.Errorf("image platform BENCHMARK_IMAGE_PLATFORM=%q must have os/architecture form", b.config.ImagePlatform)
 	}
+	nodes, err := b.targetNodes(ctx)
+	if err != nil {
+		return jobObservation{}, err
+	}
+	sort.Strings(nodes)
 
 	podLabels := map[string]string{
 		"app.kubernetes.io/name":           "gantry-benchmark-pull",
 		"app.kubernetes.io/part-of":        "gantry-benchmark",
 		"gantry.unbounded-cloud.io/run-id": state.RunID,
 		"gantry.unbounded-cloud.io/phase":  phaseLabel,
+		"job-name":                         jobName,
 	}
-	job := map[string]any{
-		"apiVersion": "batch/v1",
-		"kind":       "Job",
-		"metadata": map[string]any{
-			"name":      jobName,
-			"namespace": b.config.Namespace,
-			"labels":    podLabels,
-		},
-		"spec": map[string]any{
-			"completions":             b.config.NodeCount,
-			"parallelism":             b.config.NodeCount,
-			"backoffLimit":            0,
-			"ttlSecondsAfterFinished": 86400,
-			"activeDeadlineSeconds":   int64(b.config.JobTimeout.Seconds()),
-			"template": map[string]any{
-				"metadata": map[string]any{"labels": podLabels},
-				"spec": map[string]any{
-					"restartPolicy": "Never",
-					"nodeSelector":  b.config.nodeSelector(),
-					"tolerations":   []any{map[string]any{"operator": "Exists"}},
-					"affinity": map[string]any{
-						"podAntiAffinity": map[string]any{
-							"requiredDuringSchedulingIgnoredDuringExecution": []any{
-								map[string]any{
-									"labelSelector": map[string]any{
-										"matchLabels": map[string]string{
-											"gantry.unbounded-cloud.io/run-id": state.RunID,
-											"gantry.unbounded-cloud.io/phase":  phaseLabel,
-										},
-									},
-									"topologyKey": "kubernetes.io/hostname",
-								},
-							},
-						},
-					},
-					"containers": []any{
-						pullContainer(image),
-					},
-				},
-			},
-		},
-	}
+	pods := pullPodManifest(b.config.Namespace, jobName, image, b.config.nodeSelector(), podLabels, nodes)
 
 	phaseStartedAt := time.Now().UTC()
 
-	if err := b.applyObject(ctx, job); err != nil {
+	if err := b.applyObject(ctx, pods); err != nil {
 		return jobObservation{}, err
 	}
 
@@ -139,7 +104,8 @@ func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase 
 		waitContext,
 		nil,
 		"kubectl", "-n", b.config.Namespace,
-		"wait", "--for=condition=complete", "job/"+jobName,
+		"wait", "--for=jsonpath={.status.phase}=Succeeded", "pod",
+		"-l", "job-name="+jobName,
 		"--timeout", b.config.JobTimeout.String(),
 	)
 
@@ -173,6 +139,35 @@ func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase 
 	observation.PhaseFinishedAt = phaseFinishedAt
 
 	return observation, nil
+}
+
+func pullPodManifest(namespace, workloadName, image string, nodeSelector, labels map[string]string, nodes []string) map[string]any {
+	items := make([]any, 0, len(nodes))
+
+	for index, node := range nodes {
+		items = append(items, map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]any{
+				"name":      fmt.Sprintf("%s-%05d", workloadName, index),
+				"namespace": namespace,
+				"labels":    labels,
+			},
+			"spec": map[string]any{
+				"nodeName":      node,
+				"nodeSelector":  nodeSelector,
+				"restartPolicy": "Never",
+				"tolerations":   []any{map[string]any{"operator": "Exists"}},
+				"containers":    []any{pullContainer(image)},
+			},
+		})
+	}
+
+	return map[string]any{
+		"apiVersion": "v1",
+		"kind":       "List",
+		"items":      items,
+	}
 }
 
 func pullContainer(image string) map[string]any {

@@ -65,6 +65,41 @@ func TestParseJobObservationRejectsDuplicateNode(t *testing.T) {
 	}
 }
 
+func TestPullPodListBindsExactlyOnePodPerNode(t *testing.T) {
+	nodes := []string{"node-a", "node-b"}
+	manifest := pullPodManifest(
+		"benchmark",
+		"gantry-pull-test-run",
+		"registry.example/image:tag",
+		map[string]string{"kubernetes.io/os": "linux"},
+		map[string]string{"job-name": "gantry-pull-test-run"},
+		nodes,
+	)
+
+	items, ok := manifest["items"].([]any)
+	if !ok || len(items) != len(nodes) {
+		t.Fatalf("items = %#v, want %d pods", manifest["items"], len(nodes))
+	}
+
+	seen := map[string]bool{}
+	for index, item := range items {
+		pod := item.(map[string]any)
+		metadata := pod["metadata"].(map[string]any)
+		spec := pod["spec"].(map[string]any)
+		node := spec["nodeName"].(string)
+
+		if seen[node] {
+			t.Fatalf("node %q received multiple pods", node)
+		}
+		seen[node] = true
+
+		wantName := fmt.Sprintf("gantry-pull-test-run-%05d", index)
+		if metadata["name"] != wantName || node != nodes[index] {
+			t.Fatalf("pod %d name/node = %q/%q, want %q/%q", index, metadata["name"], node, wantName, nodes[index])
+		}
+	}
+}
+
 func TestBenchmarkJobManifestKeepsContainerRunningForAudit(t *testing.T) {
 	container := pullContainer("registry.example/image:tag")
 
