@@ -21,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -765,26 +764,24 @@ func run(cfg *config) (resultErr error) {
 
 	klog.Info("Node annotated with WireGuard public key")
 
-	informerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, cfg.InformerResyncPeriod)
+	informerFactory := newNodeDynamicInformerFactory(dynamicClient, cfg.InformerResyncPeriod)
 	sliceInformer := informerFactory.ForResource(siteNodeSliceGVR).Informer()
 	siteInformer := informerFactory.ForResource(siteGVR).Informer()
-	gatewayPoolInformer := informerFactory.ForResource(gatewayPoolGVR).Informer()
-	gatewayNodeInformer := informerFactory.ForResource(gatewayNodeGVR).Informer()
 	sitePeeringInformer := informerFactory.ForResource(sitePeeringGVR).Informer()
 	assignmentInformer := informerFactory.ForResource(siteGatewayPoolAssignmentGVR).Informer()
-	poolPeeringInformer := informerFactory.ForResource(gatewayPoolPeeringGVR).Informer()
+
+	gatewayInformers := newGatewayInformerLifecycle(dynamicClient, cfg.InformerResyncPeriod)
+	defer gatewayInformers.close()
 
 	healthState := &nodeHealthState{
 		nodeName: cfg.NodeName,
 		informersSynced: []cache.InformerSynced{
 			sliceInformer.HasSynced,
 			siteInformer.HasSynced,
-			gatewayPoolInformer.HasSynced,
-			gatewayNodeInformer.HasSynced,
 			sitePeeringInformer.HasSynced,
 			assignmentInformer.HasSynced,
-			poolPeeringInformer.HasSynced,
 		},
+		gatewayInformersReady: gatewayInformers.readiness,
 	}
 	if cfg.HealthPort > 0 {
 		go startHealthServer(cfg.HealthPort, healthState)
@@ -836,11 +833,13 @@ func run(cfg *config) (resultErr error) {
 	// Wait for caches to sync
 	klog.Info("Waiting for informer caches to sync")
 
-	if !cache.WaitForCacheSync(ctx.Done(), sliceInformer.HasSynced, siteInformer.HasSynced, gatewayPoolInformer.HasSynced, gatewayNodeInformer.HasSynced, sitePeeringInformer.HasSynced, assignmentInformer.HasSynced, poolPeeringInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), sliceInformer.HasSynced, siteInformer.HasSynced, sitePeeringInformer.HasSynced, assignmentInformer.HasSynced) {
 		return fmt.Errorf("failed to sync informer caches")
 	}
 
 	klog.Info("Informer caches synced")
+
+	gatewayInformers.setRequired(gatewayCachesRequired(adoptedAssignment, adoptedAssignment.site, assignmentInformer))
 
 	// Start the netlink cache (read-only network state snapshot).
 	netlinkCache := unboundednetnetlink.NewNetlinkCache(cfg.NetlinkResyncPeriod)
@@ -925,5 +924,5 @@ func run(cfg *config) (resultErr error) {
 		return fmt.Errorf("POD_NAME, POD_NAMESPACE, and POD_UID are required for effective assignment acknowledgment")
 	}
 
-	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, adoptedAssignment, podNamespace, podName, podUID, startupWatch, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
+	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, adoptedAssignment, podNamespace, podName, podUID, startupWatch, siteInformer, sliceInformer, sitePeeringInformer, assignmentInformer, gatewayInformers)
 }

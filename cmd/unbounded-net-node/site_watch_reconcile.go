@@ -36,12 +36,12 @@ import (
 
 // watchSitesAndConfigureWireGuard watches SiteNodeSlice objects and configures WireGuard peers for nodes in the same site
 // Gateway nodes can operate without being assigned to a site - they will still configure themselves to accept connections
-// The informers are passed in from run() and are already started and synced.
-func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, myPubKey string, nodePodCIDRs []string, manageCniPlugin bool, initialCNIConfigMTU int, healthState *nodeHealthState, netlinkCache *unboundednetnetlink.NetlinkCache, adoptedAssignment nodeAssignment, podNamespace, podName string, podUID types.UID, startupWatch *startupAssignmentWatch, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer) error {
+// The discovery informers are passed in from run() and are already started and synced.
+func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, myPubKey string, nodePodCIDRs []string, manageCniPlugin bool, initialCNIConfigMTU int, healthState *nodeHealthState, netlinkCache *unboundednetnetlink.NetlinkCache, adoptedAssignment nodeAssignment, podNamespace, podName string, podUID types.UID, startupWatch *startupAssignmentWatch, siteInformer, sliceInformer, sitePeeringInformer, assignmentInformer cache.SharedIndexInformer, gatewayInformers *gatewayInformerLifecycle) error {
 	ctx, stopWorkers := context.WithCancel(ctx)
 	defer stopWorkers()
 
-	klog.Info("Watching Site, SiteNodeSlice, GatewayPool, GatewayPoolNode, SitePeering, SiteGatewayPoolAssignment, and GatewayPoolPeering objects for changes")
+	klog.Info("Watching Site, SiteNodeSlice, SitePeering, and SiteGatewayPoolAssignment objects for topology discovery")
 
 	// Read private key for WireGuard configuration
 	privKeyPath := filepath.Join(cfg.WireGuardDir, "server.priv")
@@ -221,7 +221,9 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 	}
 
-	defer cleanupForAssignmentTransition(cfg, state, dynamicClient, gatewayNodeInformer)
+	defer func() {
+		cleanupForAssignmentTransition(cfg, state, dynamicClient, gatewayInformers.snapshot().nodes)
+	}()
 
 	// Networking writes do not observe cancellation, so reconciliation and
 	// heartbeat workers must finish before transition cleanup runs, including
@@ -242,8 +244,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		clientset:           clientset,
 		siteInformer:        siteInformer,
 		sliceInformer:       sliceInformer,
-		gatewayPoolInformer: gatewayPoolInformer,
 		sitePeeringInformer: sitePeeringInformer,
+		gatewayInformers:    gatewayInformers,
 	}
 	healthState.setStatusServer(statusSrv)
 	klog.Info("Status server registered with health server")
@@ -257,6 +259,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	fatalCh := make(chan error, 1)
 	acknowledged := false
 
+	var requestUpdate func()
+
 	reconcileUpdate := func() {
 		// Don't reconcile until all informer caches are synced. Event handlers
 		// fire during the initial cache population, but the data from other
@@ -264,11 +268,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		for _, synced := range []cache.InformerSynced{
 			sliceInformer.HasSynced,
 			siteInformer.HasSynced,
-			gatewayPoolInformer.HasSynced,
-			gatewayNodeInformer.HasSynced,
 			sitePeeringInformer.HasSynced,
 			assignmentInformer.HasSynced,
-			poolPeeringInformer.HasSynced,
 		} {
 			if !synced() {
 				klog.V(4).Info("Skipping reconcile: informer caches not fully synced")
@@ -279,6 +280,40 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		start := time.Now()
 		mySiteName := adoptedAssignment.site
 
+		var (
+			gatewaySnapshot        gatewayInformerSnapshot
+			retireGatewayInformers bool
+			gatewayStateStable     bool
+			err                    error
+		)
+
+		for range 3 {
+			gatewayRequired := gatewayCachesRequired(adoptedAssignment, mySiteName, assignmentInformer)
+
+			gatewaySnapshot, retireGatewayInformers, err = gatewayInformers.prepare(ctx, gatewayRequired)
+			if err != nil {
+				if ctx.Err() == nil {
+					klog.Errorf("Failed to prepare required gateway informer caches: %v", err)
+					nodeReconciliationTotal.WithLabelValues("error").Inc()
+				}
+
+				return
+			}
+
+			if gatewayRequired == gatewayCachesRequired(adoptedAssignment, mySiteName, assignmentInformer) {
+				gatewayStateStable = true
+
+				break
+			}
+		}
+
+		if !gatewayStateStable {
+			klog.Warning("Gateway dependency changed repeatedly while preparing informer caches; retrying reconciliation")
+			requestUpdate()
+
+			return
+		}
+
 		// Store the site name for status endpoint
 		state.mu.Lock()
 		state.siteName = mySiteName
@@ -288,7 +323,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		// Running this in reconcile ties checks to informer updates and resync events.
 		refreshNodeConfigurationProblems(siteInformer, mySiteName, state, cfg.InformerResyncPeriod)
 
-		if err := updateWireGuardFromSlices(ctx, dynamicClient, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer, cfg, mySiteName, privKey, myPubKey, manageCniPlugin, state); err != nil {
+		if err := updateWireGuardFromSlices(ctx, dynamicClient, siteInformer, sliceInformer, gatewaySnapshot.pools, gatewaySnapshot.nodes, sitePeeringInformer, assignmentInformer, gatewaySnapshot.poolPeerings, cfg, mySiteName, privKey, myPubKey, manageCniPlugin, state); err != nil {
 			var guardErr *cniGuardError
 			if errors.As(err, &guardErr) {
 				klog.V(4).Infof("Tunnel reconciliation waiting for CNI safety: %v", err)
@@ -299,6 +334,11 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 			nodeReconciliationTotal.WithLabelValues("error").Inc()
 		} else {
 			nodeReconciliationTotal.WithLabelValues("success").Inc()
+
+			if retireGatewayInformers {
+				gatewayInformers.retire(gatewaySnapshot.generation)
+				klog.Info("Stopped gateway-specific informer caches after dependent routes and peers were removed")
+			}
 
 			if !acknowledged {
 				if err := acknowledgeEffectiveAssignment(ctx, clientset, podNamespace, podName, podUID, cfg.NodeName, adoptedAssignment); err != nil {
@@ -330,7 +370,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	var updateMu sync.Mutex
 
 	updatePending := false
-	requestUpdate := func() {
+	requestUpdate = func() {
 		updateMu.Lock()
 		updatePending = true
 		updateMu.Unlock()
@@ -340,6 +380,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		default:
 		}
 	}
+	gatewayInformers.setEventHandler(requestUpdate)
 
 	workers.Go(func() {
 		for {
@@ -421,42 +462,6 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 	})
 
-	// Set up event handlers for GatewayPools (to detect gateway node and routedCidrs changes)
-	poolReg, err := gatewayPoolInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { requestUpdate() },
-		UpdateFunc: func(oldObj, newObj interface{}) { requestUpdate() },
-		DeleteFunc: func(obj interface{}) { requestUpdate() },
-	})
-	if err != nil {
-		return fmt.Errorf("failed to add gateway pool event handler: %w", err)
-	}
-
-	handlerCleanups = append(handlerCleanups, func() {
-		if err := gatewayPoolInformer.RemoveEventHandler(poolReg); err != nil {
-			klog.V(4).Infof("Failed to remove gateway pool event handler: %v", err)
-		}
-	})
-
-	// Set up event handlers for GatewayNodes (future route advertisement source).
-	gwNodeReg, err := gatewayNodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) { requestUpdate() },
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			if shouldReconcileGatewayNodeUpdate(oldObj, newObj) {
-				requestUpdate()
-			}
-		},
-		DeleteFunc: func(obj interface{}) { requestUpdate() },
-	})
-	if err != nil {
-		return fmt.Errorf("failed to add gateway node event handler: %w", err)
-	}
-
-	handlerCleanups = append(handlerCleanups, func() {
-		if err := gatewayNodeInformer.RemoveEventHandler(gwNodeReg); err != nil {
-			klog.V(4).Infof("Failed to remove gateway node event handler: %v", err)
-		}
-	})
-
 	// Set up event handlers for SitePeerings (to detect direct site peering changes)
 	peeringReg, err := sitePeeringInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { requestUpdate() },
@@ -473,11 +478,13 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 	})
 
-	assignmentReg, err := assignmentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { requestUpdate() },
-		UpdateFunc: func(oldObj, newObj interface{}) { requestUpdate() },
-		DeleteFunc: func(obj interface{}) { requestUpdate() },
-	})
+	assignmentReg, err := assignmentInformer.AddEventHandler(gatewayAssignmentEventHandler(
+		adoptedAssignment.site,
+		func() {
+			gatewayInformers.setRequired(gatewayCachesRequired(adoptedAssignment, adoptedAssignment.site, assignmentInformer))
+		},
+		requestUpdate,
+	))
 	if err != nil {
 		return fmt.Errorf("failed to add site gateway pool assignment event handler: %w", err)
 	}
@@ -485,21 +492,6 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	handlerCleanups = append(handlerCleanups, func() {
 		if err := assignmentInformer.RemoveEventHandler(assignmentReg); err != nil {
 			klog.V(4).Infof("Failed to remove assignment event handler: %v", err)
-		}
-	})
-
-	poolPeeringReg, err := poolPeeringInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { requestUpdate() },
-		UpdateFunc: func(oldObj, newObj interface{}) { requestUpdate() },
-		DeleteFunc: func(obj interface{}) { requestUpdate() },
-	})
-	if err != nil {
-		return fmt.Errorf("failed to add gateway pool peering event handler: %w", err)
-	}
-
-	handlerCleanups = append(handlerCleanups, func() {
-		if err := poolPeeringInformer.RemoveEventHandler(poolPeeringReg); err != nil {
-			klog.V(4).Infof("Failed to remove pool peering event handler: %v", err)
 		}
 	})
 
@@ -836,7 +828,8 @@ func shouldReconcileGatewayNodeUpdate(oldObj, newObj interface{}) bool {
 		return true
 	}
 
-	if !reflect.DeepEqual(oldGatewayNode.Spec, newGatewayNode.Spec) {
+	if !reflect.DeepEqual(oldGatewayNode.Spec, newGatewayNode.Spec) ||
+		!reflect.DeepEqual(oldGatewayNode.Status.ForwardingMTU, newGatewayNode.Status.ForwardingMTU) {
 		return true
 	}
 
@@ -1064,6 +1057,15 @@ func getManageCniPluginFromCRDs(siteInformer cache.SharedIndexInformer, siteName
 
 var configureWireGuardFunc = configureWireGuard
 
+func emptyDynamicInformer() cache.SharedIndexInformer {
+	return cache.NewSharedIndexInformer(
+		&cache.ListWatch{},
+		&unstructured.Unstructured{},
+		0,
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+	)
+}
+
 // updateWireGuardFromSlices reads Site and SiteNodeSlices from the informer caches and configures WireGuard
 // It uses per-node podCIDRs from slices and gateway pools for routing
 // It also looks up gateway pools referenced by the site and adds gateway peers with all remote sites' CIDRs
@@ -1071,7 +1073,27 @@ var configureWireGuardFunc = configureWireGuard
 // When manageCniPlugin is false on non-gateway nodes, same-site peers are skipped but
 // directly peered remote-site peers are still included for podCIDR routing.
 // Sites that are directly peered via SitePeering objects are treated as if they were the same site
-func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interface, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer, cfg *config, mySiteName, privKey, myPubKey string, manageCniPlugin bool, state *wireGuardState) error {
+func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interface, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer, cfg *config, mySiteName, privKey, myPubKey string, manageCniPlugin bool, state *wireGuardState) (reconcileErr error) {
+	defer func() {
+		if reconcileErr != nil {
+			state.mu.Lock()
+			state.dataplaneDirty = true
+			state.mu.Unlock()
+		}
+	}()
+
+	if gatewayPoolInformer == nil {
+		gatewayPoolInformer = emptyDynamicInformer()
+	}
+
+	if gatewayNodeInformer == nil {
+		gatewayNodeInformer = emptyDynamicInformer()
+	}
+
+	if poolPeeringInformer == nil {
+		poolPeeringInformer = emptyDynamicInformer()
+	}
+
 	// Parse all sites
 	var allSites []unboundedv1alpha3.Site
 
@@ -1338,17 +1360,9 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			assignmentSiteHealthCheckSourceAssignment,
 		)
 
-		// Collect assignment-level tunnelMTU overrides per site and per pool.
-		if v := tunnelMTUFromSpec(assignment.Spec.TunnelMTU); v > 0 {
-			for _, siteName := range assignment.Spec.Sites {
-				siteName = strings.TrimSpace(siteName)
-				if siteName == "" || siteName == mySiteName {
-					continue
-				}
-
-				mergeLowestTunnelMTU(assignmentSiteTunnelMTUs, siteName, v)
-			}
-
+		// Worker-to-pool caps follow this Site's assignments. Gateway-to-Site
+		// caps are collected separately below using only local pool matches.
+		if v := tunnelMTUFromSpec(assignment.Spec.TunnelMTU); v > 0 && state.adoptedAssignment.gatewayPool == "" {
 			for _, poolName := range assignment.Spec.GatewayPools {
 				poolName = strings.TrimSpace(poolName)
 				if poolName == "" {
@@ -1437,13 +1451,6 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		if pool.Spec.TunnelProtocol != nil {
 			poolTunnelProtocols[pool.Name] = string(*pool.Spec.TunnelProtocol)
 		}
-	}
-
-	// A pool peering is a downstream transit path for every participating
-	// pool. Propagate its MTU cap to each pool so nodes assigned to that pool
-	// send packets small enough for the complete path, not only the first hop.
-	for _, peering := range poolPeerings {
-		mergeGatewayPoolPeeringTunnelMTU(poolTunnelMTUs, peering)
 	}
 
 	gatewayNodeMap := make(map[string]*unboundednetv1alpha1.GatewayPoolNode)
@@ -1660,7 +1667,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			if v := tunnelMTUFromSpec(assignment.Spec.TunnelMTU); v > 0 {
 				for _, siteName := range assignment.Spec.Sites {
 					siteName = strings.TrimSpace(siteName)
-					if siteName == "" || siteName == mySiteName {
+					if siteName == "" {
 						continue
 					}
 
@@ -1721,17 +1728,6 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			}
 		}
 	}
-
-	siteTopologyMTU := resolveSiteTopologyTunnelMTU(
-		mySiteName,
-		siteTunnelMTUs,
-		poolTunnelMTUs,
-		sitePeerings,
-		assignments,
-		poolPeerings,
-		localGatewayPools,
-	)
-	mergeLowestTunnelMTU(siteTunnelMTUs, mySiteName, siteTopologyMTU)
 
 	if klog.V(4).Enabled() {
 		profileNames := make([]string, 0, len(healthCheckProfiles))
@@ -1827,6 +1823,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// Non-gateway nodes: connect to pools from peerings involving their site
 	// Gateway nodes: connect only to peered pools (other pools in the same Peering)
 	var gatewayPeers []gatewayPeerInfo
+
+	var (
+		assignmentEdgeMTUs  map[sitePoolMTUKey]int
+		peeringEdgeMTUs     *peeringMTUIndex
+		poolPeeringEdgeMTUs *peeringMTUIndex
+	)
 	{
 		var poolsToIterate map[string]*unboundednetv1alpha1.GatewayPool
 		if isGatewayNode {
@@ -1881,16 +1883,42 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				}
 
 				peerGatewayNode := gatewayNodeMap[gwNode.Name]
+				if peerGatewayNode == nil {
+					klog.V(3).Infof("Skipping gateway peer %s: GatewayPoolNode is not present", gwNode.Name)
+					continue
+				}
+
 				// Never install NodeCidr routes from network-peered sites via gateways.
 				excludedNodeCIDRSites := networkPeeredSites
 				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
+				filteredRoutes := excludeLocalGatewayRoutes(gatewayPeerInfo{
+					RoutedCidrs: routedCidrs, RouteDistances: routeDistances, LearnedRoutes: learnedRoutes,
+				}, siteRouting.localCIDRs)
+				routedCidrs, routeDistances, learnedRoutes = filteredRoutes.RoutedCidrs, filteredRoutes.RouteDistances, filteredRoutes.LearnedRoutes
+
+				if len(learnedRoutes) > 0 && peeringEdgeMTUs == nil {
+					assignmentEdgeMTUs = assignmentEdgeTunnelMTUs(assignments)
+					peeringEdgeMTUs = sitePeeringEdgeTunnelMTUs(sitePeerings)
+				}
+
+				if poolPeeringEdgeMTUs == nil && (isGatewayNode || len(learnedRoutes) > 0) {
+					poolPeeringEdgeMTUs = gatewayPoolPeeringEdgeTunnelMTUs(poolPeerings)
+				}
+
+				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignmentEdgeMTUs, poolPeeringEdgeMTUs)
+
+				transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU,
+					gatewayMeshTransitTunnelMTU(pool.Name, gwNode.SiteName, learnedRoutes, gatewayPoolMap, siteTunnelMTUs, peeringEdgeMTUs))
+				if isGatewayNode {
+					transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU, gatewayPoolPeeringTunnelMTU(localGatewayPools, pool.Name, poolPeeringEdgeMTUs))
+				}
 
 				peeringTunnelProtocol := poolPeeringTunnelProtocols[pool.Name]
 				if samePoolGatewayKeys[gwNode.WireGuardPublicKey] {
 					peeringTunnelProtocol = ""
 				}
 
-				gatewayPeers = append(gatewayPeers, excludeLocalGatewayRoutes(gatewayPeerInfo{
+				gatewayPeers = append(gatewayPeers, gatewayPeerInfo{
 					Name:                   gwNode.Name,
 					SiteName:               gwNode.SiteName,
 					PoolName:               pool.Name,
@@ -1907,10 +1935,13 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					LearnedRoutes:          learnedRoutes,
 					PodCIDRs:               gwNode.PodCIDRs,
 					SkipPodCIDRRoutes:      !manageCniPlugin && !isGatewayNode && gwNode.SiteName == mySiteName,
-				}, siteRouting.localCIDRs))
+					TransitTunnelMTU:       transitTunnelMTU,
+				})
 			}
 		}
 	}
+
+	publishGatewayStatus := func(int, []meshPeerInfo, []gatewayPeerInfo) error { return nil }
 
 	if isGatewayNode && dynamicClient != nil && len(localGatewayPools) > 0 {
 		selectedPoolName := localGatewayPools[0]
@@ -1929,8 +1960,16 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			state.lastGatewayAdvertSummary = summary
 		}
 
-		if err := syncGatewayNodeRoutesStatus(ctx, dynamicClient, gatewayNodeInformer, cfg.NodeName, routes); err != nil {
-			klog.Warningf("Failed to publish GatewayNode routes for node %s: %v", cfg.NodeName, err)
+		publishGatewayStatus = func(forwardingMTU int, mesh []meshPeerInfo, gateways []gatewayPeerInfo) error {
+			if err := verifyActiveTunnelMTUsFunc(cfg, forwardingMTU, mesh, gateways); err != nil {
+				return fmt.Errorf("verify gateway forwarding MTU before publication: %w", err)
+			}
+
+			if err := syncGatewayNodeRoutesStatus(ctx, dynamicClient, gatewayNodeInformer, cfg.NodeName, routes, forwardingMTU); err != nil {
+				return fmt.Errorf("publish GatewayNode routes and forwarding MTU for %s: %w", cfg.NodeName, err)
+			}
+
+			return nil
 		}
 	} else if isGatewayNode {
 		summary := gatewayAdvertSummary{
@@ -2066,17 +2105,37 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		cfg.PreferredPrivateEncap, cfg.PreferredPublicEncap,
 		siteTunnelProtocols, peeringSiteTunnelProtocols,
 		assignmentPoolTunnelProtocols, poolTunnelProtocols)
-	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, peeredSites, networkPeeredSites,
+	localPoolMTU := localGatewayPoolTunnelMTU(localGatewayPools, poolTunnelMTUs)
+	meshComponentMTU := directMeshComponentTunnelMTU(mySiteName, siteMap, sitePeerings)
+	localScopeMTU := resolveTunnelMTU(siteTunnelMTUs[mySiteName], localPoolMTU, meshComponentMTU)
+
+	if !isGatewayNode {
+		applyPublishedGatewayMTUs(gatewayPeers, gatewayPoolMap, gatewayNodeMap)
+	}
+
+	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, isGatewayNode, localScopeMTU, peeredSites, networkPeeredSites,
 		siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 		assignmentPoolTunnelMTUs, poolTunnelMTUs, state.netlinkCache)
 
-	fabricMTU := resolveCNIConfigMTU(cfg.MTU, siteTunnelMTUs[mySiteName], peers, gatewayPeers,
+	fabricMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 		unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
-	previousFabricMTU := state.cniMTU
-	fabricMTUChanged := fabricMTU > 0 && fabricMTU != previousFabricMTU
+	state.mu.Lock()
+
+	previousFabricMTU := state.appliedFabricMTU
+	if previousFabricMTU == 0 {
+		previousFabricMTU = state.cniMTU
+	}
+
+	fabricMTUChanged := fabricMTU > 0 && (fabricMTU != previousFabricMTU || state.dataplaneDirty)
+	state.mu.Unlock()
+
 	fabricMTUIncreased := fabricMTUChanged && previousFabricMTU > 0 && fabricMTU > previousFabricMTU
 
 	applyFabricMTU := func() error {
+		state.mu.Lock()
+		state.appliedFabricMTU = fabricMTU
+		state.mu.Unlock()
+
 		if manageCniPlugin && state.cniConfigWritten {
 			if managedCNIWriteRequired(fabricMTUChanged, state.healthState) {
 				cniCfg := *cfg
@@ -2132,7 +2191,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		!strSliceEqual(prevLocalGatewayPools, localGatewayPools)
 
 	// Check if tunnel configuration needs to change
-	wgChanged := roleChanged ||
+	wgChanged := state.dataplaneDirty || roleChanged ||
 		!reflect.DeepEqual(state.siteRouting, siteRouting) ||
 		!meshPeersEqual(state.peers, peers) ||
 		!strSliceEqual(state.sitePodCIDRs, sitePodCIDRs) ||
@@ -2161,8 +2220,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		state.mu.Unlock()
 		syncMasqueradeRules(state, nonMasqCIDRs)
 
-		return nil
+		return publishGatewayStatus(fabricMTU, peers, gatewayPeers)
 	}
+
+	state.dataplaneDirty = true
 
 	// Log added and removed peers
 	logMeshPeerChanges(state.peers, peers)
@@ -2256,7 +2317,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			klog.Warningf("Tunnel configuration failed (WireGuard will still be configured): %v", sharedTunnelErr)
 		}
 
-		unboundedMTU := resolveCNIConfigMTU(cfg.MTU, siteTunnelMTUs[mySiteName], peers, gatewayPeers,
+		unboundedMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 			unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
 		if unboundedMTU > 0 {
 			unboundedLinkManager := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
@@ -2288,9 +2349,13 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		return err
 	}
 
-	if sharedTunnelErr != nil && (fabricMTUIncreased || errors.Is(sharedTunnelErr, errRegisterHealthChecks)) {
+	if sharedTunnelErr != nil && (isGatewayNode || fabricMTUIncreased || errors.Is(sharedTunnelErr, errRegisterHealthChecks)) {
 		if errors.Is(sharedTunnelErr, errRegisterHealthChecks) {
 			return sharedTunnelErr
+		}
+
+		if isGatewayNode {
+			return fmt.Errorf("cannot publish gateway status while tunnel reconciliation is incomplete: %w", sharedTunnelErr)
 		}
 
 		return fmt.Errorf("cannot raise fabric MTU while tunnel reconciliation is incomplete: %w", sharedTunnelErr)
@@ -2298,7 +2363,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	// Relax the edge only after every tunnel has accepted the larger MTU.
 	if fabricMTUIncreased {
-		if err := verifyActiveTunnelMTUs(cfg, fabricMTU, peers, gatewayPeers); err != nil {
+		if err := verifyActiveTunnelMTUsFunc(cfg, fabricMTU, peers, gatewayPeers); err != nil {
 			return fmt.Errorf("cannot raise fabric MTU: %w", err)
 		}
 
@@ -2356,6 +2421,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 	}
 
+	if err := publishGatewayStatus(fabricMTU, peers, gatewayPeers); err != nil {
+		return err
+	}
+
 	// Phase 3: Update state fields that getNodeStatus() reads (brief lock).
 	state.mu.Lock()
 	state.peers = peers
@@ -2379,6 +2448,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.assignmentPoolTunnelProtocols = copyStringMap(assignmentPoolTunnelProtocols)
 	state.poolTunnelProtocols = copyStringMap(poolTunnelProtocols)
 	state.cniMTU = fabricMTU
+	state.dataplaneDirty = false
 	state.reconcileCount++
 	state.mu.Unlock()
 

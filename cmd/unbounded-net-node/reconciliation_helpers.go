@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -260,152 +261,342 @@ func mergeLowestTunnelMTU(tunnelMTUs map[string]int, scope string, mtu int) {
 	}
 }
 
-func mergeGatewayPoolPeeringTunnelMTU(tunnelMTUs map[string]int, peering unboundednetv1alpha1.GatewayPoolPeering) {
-	mtu := tunnelMTUFromSpec(peering.Spec.TunnelMTU)
-	for _, poolName := range peering.Spec.GatewayPools {
-		mergeLowestTunnelMTU(tunnelMTUs, poolName, mtu)
-	}
-}
+func gatewayPoolPeeringEdgeTunnelMTUs(peerings []unboundednetv1alpha1.GatewayPoolPeering) *peeringMTUIndex {
+	result := newPeeringMTUIndex()
 
-func resolveSiteTopologyTunnelMTU(
-	mySiteName string,
-	siteTunnelMTUs, poolTunnelMTUs map[string]int,
-	sitePeerings []unboundednetv1alpha1.SitePeering,
-	assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment,
-	poolPeerings []unboundednetv1alpha1.GatewayPoolPeering,
-	localGatewayPools []string,
-) int {
-	const (
-		sitePrefix = "site/"
-		poolPrefix = "pool/"
-	)
-
-	adjacency := make(map[string]map[string]bool)
-	scopeTunnelMTUs := make(map[string]int)
-
-	addScope := func(scope string, mtu int) {
-		if scope == "" {
-			return
-		}
-
-		if adjacency[scope] == nil {
-			adjacency[scope] = make(map[string]bool)
-		}
-
-		mergeLowestTunnelMTU(scopeTunnelMTUs, scope, mtu)
-	}
-
-	connectScopes := func(scopes []string, mtu int) {
-		unique := make([]string, 0, len(scopes))
-		seen := make(map[string]bool, len(scopes))
-
-		for _, scope := range scopes {
-			scope = strings.TrimSpace(scope)
-			if scope == "" || seen[scope] {
-				continue
-			}
-
-			seen[scope] = true
-			unique = append(unique, scope)
-			addScope(scope, mtu)
-		}
-
-		if len(unique) < 2 {
-			return
-		}
-
-		first := unique[0]
-		for _, scope := range unique[1:] {
-			adjacency[first][scope] = true
-			adjacency[scope][first] = true
-		}
-	}
-
-	for siteName, mtu := range siteTunnelMTUs {
-		addScope(sitePrefix+siteName, mtu)
-	}
-
-	for poolName, mtu := range poolTunnelMTUs {
-		addScope(poolPrefix+poolName, mtu)
-	}
-
-	for _, peering := range sitePeerings {
-		scopes := make([]string, 0, len(peering.Spec.Sites))
-		for _, siteName := range peering.Spec.Sites {
-			if siteName = strings.TrimSpace(siteName); siteName != "" {
-				scopes = append(scopes, sitePrefix+siteName)
-			}
-		}
-
-		connectScopes(scopes, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
-	}
-
-	for _, assignment := range assignments {
-		scopes := make([]string, 0, len(assignment.Spec.Sites)+len(assignment.Spec.GatewayPools))
-		for _, siteName := range assignment.Spec.Sites {
-			if siteName = strings.TrimSpace(siteName); siteName != "" {
-				scopes = append(scopes, sitePrefix+siteName)
-			}
-		}
-
-		for _, poolName := range assignment.Spec.GatewayPools {
-			if poolName = strings.TrimSpace(poolName); poolName != "" {
-				scopes = append(scopes, poolPrefix+poolName)
-			}
-		}
-
-		connectScopes(scopes, tunnelMTUFromSpec(assignment.Spec.TunnelMTU))
-	}
-
-	for _, peering := range poolPeerings {
-		scopes := make([]string, 0, len(peering.Spec.GatewayPools))
-		for _, poolName := range peering.Spec.GatewayPools {
-			if poolName = strings.TrimSpace(poolName); poolName != "" {
-				scopes = append(scopes, poolPrefix+poolName)
-			}
-		}
-
-		connectScopes(scopes, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
-	}
-
-	mySiteName = strings.TrimSpace(mySiteName)
-	start := sitePrefix + mySiteName
-
-	queue := make([]string, 0, 1+len(localGatewayPools))
-	if mySiteName != "" && adjacency[start] != nil {
-		queue = append(queue, start)
-	}
-
-	for _, poolName := range localGatewayPools {
-		poolName = strings.TrimSpace(poolName)
-
-		scope := poolPrefix + poolName
-		if poolName != "" && adjacency[scope] != nil {
-			queue = append(queue, scope)
-		}
-	}
-
-	if len(queue) == 0 {
-		return 0
-	}
-
-	result := 0
-	visited := make(map[string]bool)
-
-	for len(queue) > 0 {
-		scope := queue[0]
-		queue = queue[1:]
-
-		if visited[scope] {
+	for _, peering := range peerings {
+		if !unboundednetv1alpha1.SpecEnabled(peering.Spec.Enabled) {
 			continue
 		}
 
-		visited[scope] = true
-		result = resolveTunnelMTU(result, scopeTunnelMTUs[scope])
+		result.add(peering.Spec.GatewayPools, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+	}
 
-		for adjacent := range adjacency[scope] {
-			if !visited[adjacent] {
-				queue = append(queue, adjacent)
+	return result
+}
+
+func gatewayPoolPeeringTunnelMTU(localPools []string, remotePool string, edgeMTUs *peeringMTUIndex) int {
+	result := 0
+	for _, pool := range localPools {
+		result = resolveTunnelMTU(result, edgeMTUs.between(pool, remotePool))
+	}
+
+	return result
+}
+
+type sitePoolMTUKey struct {
+	site string
+	pool string
+}
+
+func assignmentEdgeTunnelMTUs(assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment) map[sitePoolMTUKey]int {
+	result := make(map[sitePoolMTUKey]int)
+
+	for _, assignment := range assignments {
+		if !unboundednetv1alpha1.SpecEnabled(assignment.Spec.Enabled) {
+			continue
+		}
+
+		mtu := tunnelMTUFromSpec(assignment.Spec.TunnelMTU)
+		if mtu == 0 {
+			continue
+		}
+
+		for _, site := range assignment.Spec.Sites {
+			for _, pool := range assignment.Spec.GatewayPools {
+				key := sitePoolMTUKey{site: site, pool: pool}
+				result[key] = resolveTunnelMTU(result[key], mtu)
+			}
+		}
+	}
+
+	return result
+}
+
+func learnedGatewayTransitTunnelMTU(
+	learnedRoutes map[string]unboundednetv1alpha1.GatewayNodeRoute,
+	siteMTUs, poolMTUs map[string]int,
+	assignmentMTUs map[sitePoolMTUKey]int,
+	poolPeeringMTUs *peeringMTUIndex,
+) int {
+	result := 0
+
+	for _, route := range learnedRoutes {
+		for _, path := range route.Paths {
+			for index, hop := range path {
+				switch hop.Type {
+				case "Site":
+					result = resolveTunnelMTU(result, siteMTUs[hop.Name])
+				case "GatewayPool":
+					result = resolveTunnelMTU(result, poolMTUs[hop.Name])
+				}
+
+				if index == 0 {
+					continue
+				}
+
+				// Paths run from origin to advertiser. Only adjacent hops
+				// identify a forwarding edge; co-occurrence is not enough.
+				previous := path[index-1]
+				if previous.Type == "GatewayPool" && hop.Type == "GatewayPool" {
+					result = resolveTunnelMTU(result, poolPeeringMTUs.between(previous.Name, hop.Name))
+
+					continue
+				}
+
+				site, pool := previous, hop
+				if site.Type == "GatewayPool" && pool.Type == "Site" {
+					site, pool = pool, site
+				}
+
+				if site.Type != "Site" || pool.Type != "GatewayPool" {
+					continue
+				}
+
+				result = resolveTunnelMTU(result, assignmentMTUs[sitePoolMTUKey{site: site.Name, pool: pool.Name}])
+			}
+		}
+	}
+
+	return result
+}
+
+type peeringMTUPair struct {
+	a string
+	b string
+}
+
+type peeringMTUScope struct {
+	members map[string]bool
+	mtu     int
+}
+
+type peeringMTUIndex struct {
+	byMember map[string][]*peeringMTUScope
+	pairs    map[peeringMTUPair]int
+}
+
+func newPeeringMTUIndex() *peeringMTUIndex {
+	return &peeringMTUIndex{
+		byMember: make(map[string][]*peeringMTUScope),
+		pairs:    make(map[peeringMTUPair]int),
+	}
+}
+
+func (index *peeringMTUIndex) add(members []string, mtu int) {
+	if mtu <= 0 {
+		return
+	}
+
+	scope := &peeringMTUScope{members: make(map[string]bool, len(members)), mtu: mtu}
+	for _, member := range members {
+		if member = strings.TrimSpace(member); member != "" {
+			scope.members[member] = true
+		}
+	}
+
+	for member := range scope.members {
+		index.byMember[member] = append(index.byMember[member], scope)
+	}
+}
+
+func sitePeeringEdgeTunnelMTUs(peerings []unboundednetv1alpha1.SitePeering) *peeringMTUIndex {
+	result := newPeeringMTUIndex()
+
+	for _, peering := range peerings {
+		if !unboundednetv1alpha1.SpecEnabled(peering.Spec.Enabled) {
+			continue
+		}
+
+		result.add(peering.Spec.Sites, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+	}
+
+	return result
+}
+
+func (index *peeringMTUIndex) between(a, b string) int {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if index == nil || a == b {
+		return 0
+	}
+
+	if b < a {
+		a, b = b, a
+	}
+
+	key := peeringMTUPair{a: a, b: b}
+	if mtu, exists := index.pairs[key]; exists {
+		return mtu
+	}
+
+	scopes := index.byMember[a]
+
+	other := b
+	if len(index.byMember[b]) < len(scopes) {
+		scopes, other = index.byMember[b], a
+	}
+
+	result := 0
+
+	for _, scope := range scopes {
+		if scope.members[other] {
+			result = resolveTunnelMTU(result, scope.mtu)
+		}
+	}
+
+	index.pairs[key] = result
+
+	return result
+}
+
+func applyPublishedGatewayMTUs(peers []gatewayPeerInfo, pools map[string]*unboundednetv1alpha1.GatewayPool, nodes map[string]*unboundednetv1alpha1.GatewayPoolNode) {
+	nodeMTU := func(name string) int {
+		if node := nodes[name]; node != nil && node.Status.ForwardingMTU != nil {
+			return int(*node.Status.ForwardingMTU)
+		}
+
+		return 0
+	}
+
+	poolMTUs := make(map[string]int, len(pools))
+	for name, pool := range pools {
+		for _, node := range pool.Status.Nodes {
+			poolMTUs[name] = resolveTunnelMTU(poolMTUs[name], nodeMTU(node.Name))
+		}
+	}
+
+	for i := range peers {
+		mtu := nodeMTU(peers[i].Name)
+		for _, route := range peers[i].LearnedRoutes {
+			for _, path := range route.Paths {
+				for _, hop := range path {
+					if hop.Type == "GatewayPool" && hop.Name != peers[i].PoolName {
+						mtu = resolveTunnelMTU(mtu, poolMTUs[hop.Name])
+					}
+				}
+			}
+		}
+
+		peers[i].TransitTunnelMTU = resolveTunnelMTU(peers[i].TransitTunnelMTU, mtu)
+	}
+}
+
+func directMeshComponentTunnelMTU(siteName string, sites map[string]*unboundedv1alpha3.Site, peerings []unboundednetv1alpha1.SitePeering) int {
+	if sites[siteName] == nil {
+		return 0
+	}
+
+	edges := make(map[string][]int)
+
+	for index, peering := range peerings {
+		if !unboundednetv1alpha1.SpecEnabled(peering.Spec.Enabled) || (peering.Spec.MeshNodes != nil && !*peering.Spec.MeshNodes) {
+			continue
+		}
+
+		members := make(map[string]bool)
+
+		for _, name := range peering.Spec.Sites {
+			if sites[name] != nil {
+				members[name] = true
+			}
+		}
+
+		if len(members) < 2 {
+			continue
+		}
+
+		for name := range members {
+			edges[name] = append(edges[name], index)
+		}
+	}
+
+	visitedSites := map[string]bool{siteName: true}
+	visitedPeerings := make(map[int]bool)
+	queue := []string{siteName}
+	result := 0
+
+	// Shared pod and tunnel interfaces couple MTU constraints across a mesh
+	// component even when routing itself is not transitive.
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		result = resolveTunnelMTU(result, tunnelMTUFromSpec(sites[current].Spec.TunnelMTU))
+
+		for _, index := range edges[current] {
+			if visitedPeerings[index] {
+				continue
+			}
+
+			visitedPeerings[index] = true
+			peering := peerings[index]
+			result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+
+			for _, name := range peering.Spec.Sites {
+				if sites[name] == nil || visitedSites[name] {
+					continue
+				}
+
+				visitedSites[name] = true
+				queue = append(queue, name)
+			}
+		}
+	}
+
+	return result
+}
+
+func gatewayMeshTransitTunnelMTU(
+	peerPool, peerSite string,
+	routes map[string]unboundednetv1alpha1.GatewayNodeRoute,
+	pools map[string]*unboundednetv1alpha1.GatewayPool,
+	siteMTUs map[string]int,
+	peeringMTUs *peeringMTUIndex,
+) int {
+	result := 0
+
+	for _, route := range routes {
+		for _, path := range route.Paths {
+			for _, hop := range path {
+				if hop.Type != "GatewayPool" {
+					continue
+				}
+
+				if hop.Name == peerPool {
+					result = resolveTunnelMTU(result, siteMTUs[peerSite])
+				} else if pool := pools[hop.Name]; pool != nil {
+					for _, node := range pool.Status.Nodes {
+						result = resolveTunnelMTU(result, siteMTUs[node.SiteName])
+					}
+				}
+			}
+
+			for i := 1; i < len(path); i++ {
+				site, pool := path[i-1], path[i]
+				if site.Type != "Site" || pool.Type != "GatewayPool" {
+					continue
+				}
+
+				gatewaySites := []string{peerSite}
+				if pool.Name != peerPool {
+					// Intermediate pool paths identify a pool, not a specific
+					// gateway. Honor every candidate mesh edge in that pool.
+					gatewaySites = nil
+
+					if downstream := pools[pool.Name]; downstream != nil {
+						for _, node := range downstream.Status.Nodes {
+							gatewaySites = append(gatewaySites, node.SiteName)
+						}
+					}
+				}
+
+				for _, gatewaySite := range gatewaySites {
+					result = resolveTunnelMTU(result, siteMTUs[gatewaySite])
+					if gatewaySite == site.Name || gatewaySite == "" {
+						continue
+					}
+
+					result = resolveTunnelMTU(result, peeringMTUs.between(gatewaySite, site.Name))
+				}
 			}
 		}
 	}
@@ -437,13 +628,15 @@ func resolveTunnelMTU(globalMTU int, mtuValues ...int) int {
 func resolveMeshPeerTunnelMTU(globalMTU int, peer meshPeerInfo, mySiteName string,
 	siteTunnelMTUs, peeringSiteTunnelMTUs map[string]int,
 	assignmentSiteTunnelMTUs map[string]int,
+	includeAssignmentMTU bool,
 ) int {
-	values := []int{siteTunnelMTUs[mySiteName]}
+	values := []int{siteTunnelMTUs[mySiteName], siteTunnelMTUs[peer.SiteName]}
 	if peer.SiteName != mySiteName {
-		values = append(values,
-			peeringSiteTunnelMTUs[peer.SiteName],
-			assignmentSiteTunnelMTUs[peer.SiteName],
-		)
+		values = append(values, peeringSiteTunnelMTUs[peer.SiteName])
+	}
+
+	if includeAssignmentMTU {
+		values = append(values, assignmentSiteTunnelMTUs[peer.SiteName])
 	}
 
 	return resolveTunnelMTU(globalMTU, values...)
@@ -458,8 +651,10 @@ func resolveGatewayPeerTunnelMTU(globalMTU int, mySiteName string, peer gatewayP
 ) int {
 	return resolveTunnelMTU(globalMTU,
 		siteTunnelMTUs[mySiteName],
+		siteTunnelMTUs[peer.SiteName],
 		assignmentPoolTunnelMTUs[peer.PoolName],
 		poolTunnelMTUs[peer.PoolName],
+		peer.TransitTunnelMTU,
 	)
 }
 
@@ -754,7 +949,12 @@ func strSliceEqual(a, b []string) bool {
 	return true
 }
 
-func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desiredGatewayIfaces map[string]bool, meshIface string) {
+var (
+	listWireGuardLinks  = netlink.LinkList
+	deleteWireGuardLink = netlink.LinkDel
+)
+
+func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desiredGatewayIfaces map[string]bool, meshIface string) error {
 	desired := make(map[string]bool, len(desiredGatewayIfaces)+1)
 
 	desired[meshIface] = true
@@ -762,11 +962,12 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 		desired[name] = true
 	}
 
-	links, err := netlink.LinkList()
+	links, err := listWireGuardLinks()
 	if err != nil {
-		klog.Warningf("Failed to list links for WireGuard ownership reconciliation: %v", err)
-		return
+		return fmt.Errorf("list links for WireGuard ownership reconciliation: %w", err)
 	}
+
+	var cleanupErr error
 
 	for _, link := range links {
 		name := link.Attrs().Name
@@ -785,12 +986,13 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 
 		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
 			if err := state.gatewayPolicyManager.RemoveInterface(name); err != nil {
-				klog.V(3).Infof("Policy cleanup skipped for unmanaged interface %s: %v", name, err)
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove policy for %s: %w", name, err))
+				continue
 			}
 		}
 
-		if err := netlink.LinkDel(link); err != nil {
-			klog.Warningf("Failed to delete unmanaged WireGuard interface %s: %v", name, err)
+		if err := deleteWireGuardLink(link); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete unmanaged WireGuard interface %s: %w", name, err))
 			continue
 		}
 
@@ -814,6 +1016,8 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 		delete(state.gatewayNames, name)
 		delete(state.gatewaySiteNames, name)
 	}
+
+	return cleanupErr
 }
 
 // removeStaleWireGuardInterfaces deletes kernel-resident WireGuard

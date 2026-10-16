@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -19,9 +20,106 @@ import (
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
+func TestUpdateWireGuardFromSlices_DirectMeshComponentMTU(t *testing.T) {
+	sites, slices := newInformerWithObjects(), newInformerWithObjects()
+
+	for i, name := range []string{"a", "b", "c"} {
+		site := &unboundedv1alpha3.Site{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       unboundedv1alpha3.SiteSpec{TunnelProtocol: new(unboundednetv1alpha1.TunnelProtocolNone)},
+		}
+		if err := sites.GetStore().Add(toUnstructured(t, site)); err != nil {
+			t.Fatal(err)
+		}
+
+		slice := &unboundednetv1alpha1.SiteNodeSlice{
+			ObjectMeta: metav1.ObjectMeta{Name: name}, SiteName: name,
+			Nodes: []unboundednetv1alpha1.NodeInfo{{
+				Name: name, WireGuardPublicKey: "key-" + name, PodCIDRs: []string{fmt.Sprintf("10.244.%d.0/24", i)},
+				InternalIPs: []string{fmt.Sprintf("192.0.2.%d", i+1)},
+			}},
+		}
+		if err := slices.GetStore().Add(toUnstructured(t, slice)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	peerings := newInformerWithObjects(
+		toUnstructured(t, &unboundednetv1alpha1.SitePeering{
+			ObjectMeta: metav1.ObjectMeta{Name: "a-b"},
+			Spec:       unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"a", "b"}, TunnelMTU: ptrInt32(1200)},
+		}),
+		toUnstructured(t, &unboundednetv1alpha1.SitePeering{
+			ObjectMeta: metav1.ObjectMeta{Name: "a-c"},
+			Spec:       unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"a", "c"}, TunnelMTU: ptrInt32(1400)},
+		}),
+	)
+	original := configureWireGuardFunc
+
+	t.Cleanup(func() { configureWireGuardFunc = original })
+
+	configureWireGuardFunc = func(context.Context, *config, string, []meshPeerInfo, []gatewayPeerInfo, string, map[string]bool, map[string]bool, map[string]bool, map[string]string, map[string]string, map[string]string, map[string]string, map[string]string, map[string]int, map[string]int, map[string]int, map[string]int, map[string]int, []unboundednetnetlink.DesiredRoute, map[string]bool, *wireGuardState, map[string]healthcheck.HealthCheckSettings) error {
+		return nil
+	}
+	empty := newInformerWithObjects()
+
+	for _, name := range []string{"a", "b", "c"} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &config{NodeName: name, MTU: 1420, WireGuardPort: 51820}
+
+			state := &wireGuardState{nodeName: name, clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})}
+			if err := updateWireGuardFromSlices(t.Context(), nil, sites, slices, empty, empty, peerings, empty, empty,
+				cfg, name, "private", "key-"+name, true, state); err != nil {
+				t.Fatal(err)
+			}
+
+			if state.cniMTU != 1200 {
+				t.Fatalf("Site %s fabric MTU=%d, want common 1200", name, state.cniMTU)
+			}
+
+			wantPeers := 1
+			if name == "a" {
+				wantPeers = 2
+			}
+
+			if len(state.peers) != wantPeers {
+				t.Fatalf("Site %s gained transitive peers: %+v", name, state.peers)
+			}
+
+			for _, peer := range state.peers {
+				if peer.TunnelMTU != 1200 || (name != "a" && peer.SiteName != "a") {
+					t.Fatalf("Site %s peer is not a capped direct neighbor: %+v", name, peer)
+				}
+			}
+		})
+	}
+}
+
 func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "local"}}
+
 	siteInformer := newInformerWithObjects(toUnstructured(t, site))
+	if err := siteInformer.GetStore().Add(toUnstructured(t, &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "origin"},
+		Spec:       unboundedv1alpha3.SiteSpec{TunnelMTU: ptrInt32(1200)},
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	gatewayNodes := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway"},
+		Status: unboundednetv1alpha1.GatewayNodeStatus{
+			LastUpdated: metav1.Now(),
+			Routes: map[string]unboundednetv1alpha1.GatewayNodeRoute{
+				"192.168.0.0/16": {
+					Type: "RoutedCidr",
+					Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{{
+						{Type: "Site", Name: "origin"}, {Type: "GatewayPool", Name: "pool"},
+					}},
+				},
+			},
+		},
+	}))
 	poolInformer := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool"},
 		Spec: unboundednetv1alpha1.GatewayPoolSpec{
@@ -40,7 +138,7 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 		},
 	}))
 	empty := newInformerWithObjects()
-	cfg := &config{NodeName: "self", WireGuardPort: 51820, PreferredPrivateEncap: "WireGuard"}
+	cfg := &config{NodeName: "self", WireGuardPort: 51820, MTU: 576, PreferredPrivateEncap: "WireGuard"}
 	state := &wireGuardState{
 		nodeName: "self", clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "self"}}),
 	}
@@ -60,7 +158,7 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 	t.Cleanup(func() { configureWireGuardFunc = original })
 
 	update := func() error {
-		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, poolInformer, empty,
+		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, poolInformer, gatewayNodes,
 			empty, assignments, empty, cfg, "local", "priv", "pub-self", true, state)
 	}
 
@@ -92,6 +190,15 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 				t.Fatalf("gateway routes=%+v, want %v", gotGatewayPeers, tt.want)
 			}
 
+			wantTransitMTU := 1200
+			if len(tt.want) == 0 {
+				wantTransitMTU = 0
+			}
+
+			if gotGatewayPeers[0].TransitTunnelMTU != wantTransitMTU {
+				t.Fatalf("retained path MTU=%d, want %d", gotGatewayPeers[0].TransitTunnelMTU, wantTransitMTU)
+			}
+
 			if gotGatewayPeers[0].WireGuardPublicKey != "pub-gateway" || !slices.Equal(gotGatewayPeers[0].PodCIDRs, []string{"10.245.0.0/24"}) {
 				t.Fatal("local exclusions changed gateway identity")
 			}
@@ -104,6 +211,35 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 				t.Fatal("unchanged exclusions caused another update")
 			}
 		})
+	}
+
+	gatewayObject, exists, err := gatewayNodes.GetStore().GetByKey("gateway")
+	if err != nil || !exists {
+		t.Fatalf("get gateway: exists=%v err=%v", exists, err)
+	}
+
+	if err := gatewayNodes.GetStore().Delete(gatewayObject); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gotGatewayPeers) != 0 || len(state.gatewayPeers) != 0 {
+		t.Fatal("missing GatewayPoolNode retained a route destination")
+	}
+
+	if err := gatewayNodes.GetStore().Add(gatewayObject); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gotGatewayPeers) != 1 {
+		t.Fatal("restored GatewayPoolNode did not restore route destination")
 	}
 }
 

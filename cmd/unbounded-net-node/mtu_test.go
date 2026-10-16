@@ -24,6 +24,73 @@ type fakeCNIBridgeLinkManager struct {
 	cache          *unboundednetnetlink.NetlinkCache
 }
 
+func TestGatewayLocalForwardingMTUCaps(t *testing.T) {
+	cfg := &config{MTU: 1420, TunnelIPFamily: "IPv4"}
+	pools := map[string]int{"local": 1200, "remote": 1400, "unrelated": 900}
+
+	localMTU := localGatewayPoolTunnelMTU([]string{"local"}, pools)
+	if localMTU != 1200 {
+		t.Fatalf("local pool MTU=%d, want 1200", localMTU)
+	}
+
+	mesh := []meshPeerInfo{{SiteName: "same"}}
+	gateways := []gatewayPeerInfo{{PoolName: "remote", SiteName: "other"}}
+	resolvePeerTunnelMTUs(cfg, mesh, gateways, "same", true, localMTU, nil, nil,
+		map[string]int{"same": 1420}, nil, nil, nil, pools, nil)
+
+	if mesh[0].TunnelMTU != 1200 || gateways[0].TunnelMTU != 1200 {
+		t.Fatalf("local pool cap missing: mesh=%d gateway=%d", mesh[0].TunnelMTU, gateways[0].TunnelMTU)
+	}
+
+	if got := resolveCNIConfigMTU(cfg.MTU, resolveTunnelMTU(1420, localMTU), nil, nil, 1500); got != 1200 {
+		t.Fatalf("idle gateway fabric MTU=%d, want 1200", got)
+	}
+
+	for _, gateway := range []bool{false, true} {
+		got := resolveMeshPeerTunnelMTU(1420, meshPeerInfo{SiteName: "same"}, "same",
+			map[string]int{"same": 1420}, nil, map[string]int{"same": 1100}, gateway)
+
+		want := 1420
+		if gateway {
+			want = 1100
+		}
+
+		if got != want {
+			t.Fatalf("same-Site assignment MTU gateway=%v: got=%d want=%d", gateway, got, want)
+		}
+	}
+}
+
+func TestWorkerGatewayFirstHopPeeringMTU(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		site        string
+		gateway     bool
+		peeringCaps map[string]int
+		want        int
+	}{
+		{name: "worker mesh edge", site: "site-b", peeringCaps: map[string]int{"site-b": 1200}, want: 1200},
+		{name: "unrelated peering", site: "site-b", peeringCaps: map[string]int{"site-c": 900}, want: 1250},
+		{name: "same Site", site: "site-a", peeringCaps: map[string]int{"site-a": 1200}, want: 1250},
+		{name: "pool transit is not mesh", site: "site-b", gateway: true, peeringCaps: map[string]int{"site-b": 1200}, want: 1250},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config{MTU: 1250, TunnelIPFamily: "IPv4"}
+			peers := []gatewayPeerInfo{{SiteName: tc.site, PoolName: "pool-g"}}
+			resolvePeerTunnelMTUs(cfg, nil, peers, "site-a", tc.gateway, 0, nil, nil,
+				nil, tc.peeringCaps, nil, nil, nil, nil)
+
+			if peers[0].TunnelMTU != tc.want {
+				t.Fatalf("gateway peer MTU=%d, want %d", peers[0].TunnelMTU, tc.want)
+			}
+
+			if got := resolveCNIConfigMTU(cfg.MTU, 0, nil, peers, 1500); got != tc.want {
+				t.Fatalf("CNI MTU=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func (f *fakeCNIBridgeLinkManager) Exists() bool {
 	return f.exists
 }
