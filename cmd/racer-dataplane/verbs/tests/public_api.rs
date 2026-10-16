@@ -687,24 +687,30 @@ mod scoped {
         task::{Wake, Waker},
     };
 
-    use uring_runtime::{
-        Operation, Scope,
+    use racer_platform::{
+        Cancellation, Operation,
         drivers::poll_scoped,
-        environment::Cancellation,
         group::{FailureReporter, Service},
     };
 
     /// Preserve runtime and verbs failures as distinct observable outcomes.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Failure {
-        Runtime(uring_runtime::Error),
+        Runtime(racer_platform::Error),
 
         Verbs(Error),
     }
 
-    impl From<uring_runtime::Error> for Failure {
+    impl From<racer_platform::uring::Error> for Failure {
+        /// Library errors take the Racer runtime mapping.
+        fn from(error: racer_platform::uring::Error) -> Self {
+            racer_platform::Error::from(error).into()
+        }
+    }
+
+    impl From<racer_platform::Error> for Failure {
         /// Preserve runtime cancellation as a distinct failure source.
-        fn from(e: uring_runtime::Error) -> Self {
+        fn from(e: racer_platform::Error) -> Self {
             Self::Runtime(e)
         }
     }
@@ -720,13 +726,13 @@ mod scoped {
     #[derive(Clone)]
     struct TestScope(Option<Cancellation>);
 
-    impl Scope for TestScope {
+    impl racer_platform::scope::LibraryScope for TestScope {
         type Error = Failure;
 
         /// Reject canceled scopes without introducing a clock dependency.
         fn check(&self) -> Result<(), Failure> {
-            if self.0.as_ref().is_some_and(|c| c.is_cancelled()) {
-                Err(uring_runtime::Error::Cancelled.into())
+            if self.0.as_ref().is_some_and(|c| c.is_canceled()) {
+                Err(racer_platform::Error::Canceled.into())
             } else {
                 Ok(())
             }
@@ -862,7 +868,7 @@ mod scoped {
     #[cfg(feature = "simulation")]
     #[test]
     fn canceled_one_shot_bind_preserves_native_ownership() {
-        let clock = uring_runtime::environment::SimulationClock::new(17);
+        let clock = racer_platform::environment::SimulationClock::new(17);
         let _clock = clock.environment(0).enter();
         let (sim, io, mut native) = fixture(1);
         configure(&io, vec![Arc::new(())]);
@@ -872,11 +878,11 @@ mod scoped {
         io.activation().unwrap().unwrap();
         let qp = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
         let region = ready(Region::poll_acquire(&qp, 17));
-        let scope = TestScope(Some(Cancellation::new().unwrap()));
-        scope.0.as_ref().unwrap().cancel().unwrap();
+        let scope = TestScope(Some(Cancellation::new()));
+        scope.0.as_ref().unwrap().cancel();
         assert!(matches!(
             futures::executor::block_on(rdma_verbs::Transfer::new(qp.clone()).bind(region, &scope)),
-            Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+            Err(Failure::Runtime(racer_platform::Error::Canceled))
         ));
         assert!(!qp.stopped());
         sim.reject(simulation::Operation::Stop, Some(qp.endpoint.qpn), true);
@@ -896,7 +902,7 @@ mod scoped {
     /// Cancellation wakes the waiter and takes precedence over another operation poll.
     #[test]
     fn scoped_wait_wakes_and_checks_cancellation_before_operation() {
-        let scope = TestScope(Some(Cancellation::new().unwrap()));
+        let scope = TestScope(Some(Cancellation::new()));
         let calls = std::cell::Cell::new(0);
         let mut future = Box::pin(poll_scoped(&scope, |_| -> Poll<Result<(), Error>> {
             calls.set(calls.get() + 1);
@@ -906,11 +912,11 @@ mod scoped {
         let waker = Waker::from(count.clone());
         let mut cx = Context::from_waker(&waker);
         assert!(future.as_mut().poll(&mut cx).is_pending());
-        scope.0.as_ref().unwrap().cancel().unwrap();
+        scope.0.as_ref().unwrap().cancel();
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
         assert_eq!(
             future.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Cancelled)))
+            Poll::Ready(Err(Failure::Runtime(racer_platform::Error::Canceled)))
         );
         assert_eq!(calls.get(), 1);
         assert_eq!(
@@ -927,16 +933,16 @@ mod scoped {
         for cancel in [false, true] {
             let (io, port) = pair(1).unwrap();
             let mut native = NativeService::new(port);
-            let scope = TestScope(Some(Cancellation::new().unwrap()));
+            let scope = TestScope(Some(Cancellation::new()));
             let (guard, observer) = guard();
             let mut future = Box::pin(io.activate(config(guard), &scope));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(future.as_mut().poll(&mut cx).is_pending());
             if cancel {
-                scope.0.as_ref().unwrap().cancel().unwrap();
+                scope.0.as_ref().unwrap().cancel();
                 assert_eq!(
                     future.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Cancelled)))
+                    Poll::Ready(Err(Failure::Runtime(racer_platform::Error::Canceled)))
                 );
             }
             drop(future);
@@ -1009,7 +1015,7 @@ mod scoped {
         }
 
         /// Assert unchanged budget forwarding and record the polling turn.
-        fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<(), Failure> {
+        fn poll(&mut self, _: &mut Context<'_>, budget: usize) -> Result<(), Failure> {
             assert_eq!(budget, 7);
             self.calls.borrow_mut().push("poll");
             Ok(())
@@ -1077,14 +1083,14 @@ mod scoped {
             },
             port,
         );
-        let scope = TestScope(Some(Cancellation::new().unwrap()));
+        let scope = TestScope(Some(Cancellation::new()));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(service.waker().unwrap().will_wake(&wake));
         service.register_driver(cx.waker());
         futures::executor::block_on(service.start(&scope)).unwrap();
-        service.poll_budgeted(&mut cx, 7).unwrap();
+        service.poll(&mut cx, 7).unwrap();
         service.stop_admission().unwrap();
-        scope.0.as_ref().unwrap().cancel().unwrap();
+        scope.0.as_ref().unwrap().cancel();
         let mut drain = service.drain(&scope);
         assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
         drop(drain);
@@ -1150,7 +1156,7 @@ mod scoped {
 
     /// Run a reporting service through a real one-lane group and check its result.
     fn reported_failure(error: Error, name: &str) {
-        use uring_runtime::group::{Factory, Group, Lane, Plan};
+        use racer_platform::group::{Factory, Group, GroupConfig, GroupError, Plan};
 
         /// Inner service that reports the selected failure on its first poll.
         struct Reporting {
@@ -1171,7 +1177,7 @@ mod scoped {
             }
 
             /// Report the configured failure through the installed group reporter.
-            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
+            fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
                 self.reporter
                     .as_ref()
                     .expect("forwarded reporter")
@@ -1207,20 +1213,20 @@ mod scoped {
             }
         }
 
-        let cpu = *uring_runtime::group::affinity::current_cpus()
+        let cpu = racer_platform::group::affinity::current_cpus()
             .unwrap()
             .first()
             .unwrap();
-        let mut group = Group::new(Plan {
-            lanes: vec![Lane {
-                name: name.into(),
-                cpu,
-            }],
-            helpers: vec![],
-            max_threads: 1,
-        });
+        let plan = Plan::builder()
+            .lane(name, cpu)
+            .max_threads(1)
+            .build()
+            .unwrap();
+        let mut group = Group::new(plan, GroupConfig::default()).unwrap();
         assert_eq!(
-            group.run(&Recipe(error), &TestScope(None)),
+            group
+                .run(&Recipe(error), &TestScope(None))
+                .map_err(GroupError::into_error),
             Err(Failure::Verbs(error))
         );
         assert_eq!(group.stats().done, 1);
@@ -1237,7 +1243,7 @@ mod scoped {
     #[test]
     fn wrapper_drain_and_fence_retry_native_failure_despite_cancellation() {
         for fence in [false, true] {
-            let clock = uring_runtime::environment::SimulationClock::new(17);
+            let clock = racer_platform::environment::SimulationClock::new(17);
             let _clock = clock.environment(0).enter();
             let sim = simulation::Simulation::new()
                 .with_devices(vec![simulation::Device::new("sim0", [1; 16])])
@@ -1265,13 +1271,13 @@ mod scoped {
             }))
             .unwrap();
             let mut cx = Context::from_waker(Waker::noop());
-            service.poll_budgeted(&mut cx, 7).unwrap();
-            service.poll_budgeted(&mut cx, 7).unwrap();
+            service.poll(&mut cx, 7).unwrap();
+            service.poll(&mut cx, 7).unwrap();
             io.activation().unwrap().unwrap();
             // Public wrapper polling also drives the inner service during setup.
             calls.borrow_mut().clear();
-            let scope = TestScope(Some(Cancellation::new().unwrap()));
-            scope.0.as_ref().unwrap().cancel().unwrap();
+            let scope = TestScope(Some(Cancellation::new()));
+            scope.0.as_ref().unwrap().cancel();
             sim.reject(simulation::Operation::Stop, None, true);
             let mut operation = if fence {
                 service.fence(&scope)

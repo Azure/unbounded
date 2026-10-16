@@ -1683,7 +1683,7 @@ mod tests {
     fn expiry_is_inclusive_but_not_a_remote_fence_and_faults_are_ordered() {
         use std::time::Duration;
 
-        use uring_runtime::environment::{SimulationClock, now};
+        use racer_platform::environment::{SimulationClock, now};
 
         for failed_stop in [false, true] {
             let clock = SimulationClock::new(7);

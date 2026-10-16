@@ -191,7 +191,7 @@ pub struct NativePort {
 ///
 /// Poll it from that thread's runtime. It is not `Send`.
 pub struct NativeService {
-    environment: uring_runtime::environment::Environment,
+    environment: racer_platform::environment::Environment,
 
     port: NativePort,
 
@@ -519,8 +519,8 @@ use std::{
     task::{Context, Poll, Waker, ready},
 };
 
-use uring_runtime::{
-    Operation, Scope,
+use racer_platform::{
+    CancellationExt, Operation, Scope,
     drivers::poll_scoped,
     group::{FailureReporter, Service},
 };
@@ -833,7 +833,7 @@ impl QueuePairHandle {
         if self
             .expires
             .get()
-            .is_some_and(|d| uring_runtime::environment::now() >= d)
+            .is_some_and(|d| racer_platform::environment::now() >= d)
             && !self.stopped()
         {
             self.failure.set(Some(Error::DeadlineExceeded));
@@ -1133,7 +1133,7 @@ impl IoPort {
             port: self,
             completed: false,
         };
-        let cancel = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        let cancel = scope.cancellation().map(CancellationExt::subscribe);
         let mappings = std::future::poll_fn(|cx| {
             self.register_driver(cx.waker());
             if let Some(cancel) = &cancel {
@@ -1328,7 +1328,7 @@ impl NativeService {
     pub fn new(port: NativePort) -> Self {
         let resources = (0..port.shared.slots.len()).map(|_| None).collect();
         Self {
-            environment: uring_runtime::environment::Environment::current(),
+            environment: racer_platform::environment::Environment::current(),
             port,
             resources,
             device_quotas: Vec::new(),
@@ -1597,7 +1597,7 @@ impl NativeService {
         if resource.stopping {
             if resource
                 .next_retry
-                .is_some_and(|at| uring_runtime::environment::now() < at)
+                .is_some_and(|at| racer_platform::environment::now() < at)
             {
                 return;
             }
@@ -1605,7 +1605,7 @@ impl NativeService {
                 && qp.stop().is_err()
             {
                 resource.next_retry =
-                    Some(uring_runtime::environment::now() + std::time::Duration::from_millis(10));
+                    Some(racer_platform::environment::now() + std::time::Duration::from_millis(10));
                 return; // Keep everything; retry later.
             }
             // Peers may have written into the region; copy it out for reads.
@@ -1664,7 +1664,7 @@ impl NativeService {
                 }
                 Err(_) => {
                     resource.next_retry = Some(
-                        uring_runtime::environment::now() + std::time::Duration::from_millis(100),
+                        racer_platform::environment::now() + std::time::Duration::from_millis(100),
                     );
                     slot.state.store(RETIRED, Ordering::Release);
                     return;
@@ -1854,12 +1854,8 @@ where
     }
 
     /// Poll the inner service, then the native side, each with `budget`.
-    fn poll_budgeted(
-        &mut self,
-        cx: &mut Context<'_>,
-        budget: usize,
-    ) -> std::result::Result<(), S::Error> {
-        self.inner.poll_budgeted(cx, budget)?;
+    fn poll(&mut self, cx: &mut Context<'_>, budget: usize) -> std::result::Result<(), S::Error> {
+        self.inner.poll(cx, budget)?;
         self.native.poll_budgeted(budget).map_err(Into::into)
     }
 

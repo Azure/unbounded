@@ -637,7 +637,7 @@ impl NativeQueuePair {
         let simulated = false;
         if simulated {
             psn = qpn.to_be_bytes();
-        } else if uring_runtime::environment::fill_random(&mut psn).is_err() {
+        } else if racer_platform::environment::fill_random(&mut psn).is_err() {
             if unsafe { (device.api.qp_free)(raw.as_ptr()) } != 0 {
                 quota.quarantine();
                 std::mem::forget(quota);
@@ -856,7 +856,7 @@ impl NativeQueuePair {
         if self
             .expires
             .get()
-            .is_some_and(|deadline| uring_runtime::environment::now() >= deadline)
+            .is_some_and(|deadline| racer_platform::environment::now() >= deadline)
         {
             self.stop()?;
             return Err(Error::DeadlineExceeded);

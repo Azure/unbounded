@@ -932,8 +932,8 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "libc",
+ "racer-platform",
  "serde_json",
- "uring-runtime-legacy",
 ]
 
 [[package]]
