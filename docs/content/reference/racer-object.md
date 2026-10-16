@@ -144,12 +144,15 @@ Requirements:
   skip nodes labeled `racer.unbounded-cloud.io/exclude`. Match any custom Racer
   selectors, affinity, and tolerations.
 - **Socket mount.** Mount `/run/racer/<cache>/origin` from the host, writable,
-  with hostPath type `DirectoryOrCreate`. See [Socket Mounts](#socket-mounts).
-- **Security context.** Run as UID/GID 0, with no privilege escalation, all
-  capabilities dropped, `RuntimeDefault` seccomp, and a read-only root filesystem.
-  The origin must own its socket directory, which the kubelet creates as root, so
-  set `runAsUser: 0`, `runAsGroup: 0`, and `runAsNonRoot: false` explicitly. The
-  image's default user is the non-root UID 65532.
+  with hostPath type `Directory`. The Racer dataplane creates this directory,
+  owned by UID/GID 65532 with mode `0700`, when it sets up the cache on the node.
+  Until then the pod waits in `ContainerCreating`. The origin never creates it.
+  See [Socket Mounts](#socket-mounts).
+- **Security context.** Run as UID/GID 65532, the image's default user, with
+  `runAsNonRoot: true`, no privilege escalation, all capabilities dropped,
+  `RuntimeDefault` seccomp, and a read-only root filesystem. The origin refuses
+  to start unless the origin directory is owned by its UID, so other UIDs,
+  including 0, do not work.
 - **Credentials.** Supply upstream credentials to the origin pods only. See
   [Upstream Providers](#upstream-providers).
 - **Arguments.** Set `--cache`, `--namespace`, and `--bucket` to match the
@@ -176,9 +179,9 @@ spec:
                   - key: racer.unbounded-cloud.io/exclude
                     operator: DoesNotExist
       securityContext:
-        runAsUser: 0
-        runAsGroup: 0
-        runAsNonRoot: false
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -206,7 +209,7 @@ spec:
         - name: origin
           hostPath:
             path: /run/racer/racer-object/origin
-            type: DirectoryOrCreate
+            type: Directory
 ```
 
 For Azure Blob, replace the S3 arguments with `--provider=azure`,
@@ -530,13 +533,15 @@ the object read permissions it needs, including version reads if you use them.
 
 | Container | Host path and container mount path | hostPath type | Access |
 |-----------|------------------------------------|---------------|--------|
-| Origin | `/run/racer/<cache>/origin` | `DirectoryOrCreate` | Writable |
+| Origin | `/run/racer/<cache>/origin` | `Directory` | Writable |
 | Sidecar | `/run/racer/<cache>/client` | `Directory` | Read-only |
 
 The sidecar runs as the non-root UID/GID 65532. Racer creates client sockets with
 mode `0666`, so access is controlled by which directory the pod mounts, not by the
-process UID. The origin runs as UID/GID 0 because it must own its socket
-directory, which the kubelet creates as root. Both drop all capabilities, disable
+process UID. The origin also runs as UID/GID 65532. The Racer dataplane creates
+the origin directory owned by UID/GID 65532 with mode `0700` and repairs its
+owner and mode if they drift. The origin creates its socket there with mode
+`0600`; the privileged dataplane can still connect to it. Both drop all capabilities, disable
 privilege escalation, use the `RuntimeDefault` seccomp profile, and have read-only
 root filesystems. The adapter
 does not need privileged mode.

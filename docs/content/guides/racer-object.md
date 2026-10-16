@@ -53,7 +53,7 @@ see the [racer-object reference]({{< relref "reference/racer-object" >}}).
   - **Azure Blob**: a storage account, a container of block blobs, and an Azure
     identity with **Storage Blob Data Reader** on that account or container.
 - Permission to create cluster-scoped ClusterCaches, and to run pods with
-  hostPath mounts and a UID 0 origin container. The sidecar runs as non-root. The adapter does not need privileged mode.
+  hostPath mounts. The origin and sidecar both run as the non-root UID/GID 65532. The adapter does not need privileged mode.
 
 Examples use the default operator namespace, `unbounded-system`. Substitute your
 installation namespace if different.
@@ -145,9 +145,9 @@ spec:
                   - key: racer.unbounded-cloud.io/exclude
                     operator: DoesNotExist
       securityContext:
-        runAsUser: 0
-        runAsGroup: 0
-        runAsNonRoot: false
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -175,9 +175,14 @@ spec:
         - name: origin
           hostPath:
             path: /run/racer/racer-object/origin
-            type: DirectoryOrCreate
+            type: Directory
 EOF
 ```
+
+The Racer dataplane creates `/run/racer/racer-object/origin` on each node, owned
+by UID/GID 65532 with mode `0700`, once it sets up the cache. Until then the
+origin pods wait in `ContainerCreating`. The origin must run as UID 65532; it
+refuses to start if it does not own that directory.
 
 | Argument | Set it to |
 |----------|-----------|

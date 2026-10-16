@@ -52,9 +52,9 @@ ENV PATH="/unbounded/bin:${PATH}"
 WORKDIR /unbounded
 
 # The sidecar needs no root: Racer client sockets are mode 0666 and access is
-# controlled by which hostPath directory the pod mounts. Origin mode must run as
-# root explicitly via the pod securityContext because it requires owning its
-# hostPath directory.
+# controlled by which hostPath directory the pod mounts. Origin mode also runs
+# as 65532: the racer-dataplane creates /run/racer/<cache>/origin owned by
+# 65532:65532 with mode 0700, and the origin requires owning that directory.
 USER 65532:65532
 
 ENTRYPOINT ["/unbounded/bin/racer-object"]
