@@ -30,6 +30,14 @@
 //! simplest scope; applications typically implement [`Scope`] for their own
 //! request or connection context.
 //!
+//! # Tasks and time
+//!
+//! [`LocalExecutor`] runs a bounded set of `!Send` tasks on the current
+//! thread with a wake-driven ready queue, and [`Timers`] is a deadline queue
+//! that fires [`Sleep`] futures when the application passes it the current
+//! time. Both are driven explicitly from the application's loop; see the
+//! [`task`] module for how they fit together with a reactor.
+//!
 //! # Kernel requirements
 //!
 //! Linux 5.6 or newer for the core operations, and 5.15 for
@@ -65,6 +73,7 @@ pub mod fd;
 pub mod net;
 pub mod scope;
 pub mod task;
+pub mod time;
 
 pub use backend::{Backend, Host};
 pub use buf::{BufResult, IoBuf, IoBufMut};
@@ -75,3 +84,4 @@ pub use fd::Fd;
 pub use net::{SockAddr, SocketAddress};
 pub use scope::{Scope, Unscoped};
 pub use task::{JoinHandle, LocalExecutor, Spawner};
+pub use time::{Sleep, Timers};
