@@ -9,9 +9,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -231,6 +233,43 @@ func TestInvalidCallerConfiguration(t *testing.T) {
 	entries, err := os.ReadDir(plugin.DataDir)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("invalid input created reservations: %v, %v", entries, err)
+	}
+}
+
+func TestCallerRangeCaseVariantsCannotAllocate(t *testing.T) {
+	path := startTestServer(t, func() (*ipamproto.Config, error) {
+		return testConfig(t, "10.244.0.0/24"), nil
+	})
+
+	for _, field := range []string{"runtimeConfig", "RuntimeConfig", "RUNTIMECONFIG"} {
+		for _, option := range []string{"ipRanges", "IPRanges", "IPRANGES"} {
+			t.Run(field+"/"+option, func(t *testing.T) {
+				plugin := Plugin{DataDir: t.TempDir()}
+				args := testArgs(t, path, "net", "pod")
+
+				var input map[string]json.RawMessage
+				if err := json.Unmarshal(args.StdinData, &input); err != nil {
+					t.Fatal(err)
+				}
+
+				input[field] = json.RawMessage(fmt.Sprintf(`{%q:[[{"subnet":"10.99.0.0/24"}]]}`, option))
+
+				data, err := json.Marshal(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				args.StdinData = data
+				if err := plugin.Add(args); err == nil || !strings.Contains(err.Error(), "cannot override") {
+					t.Fatalf("caller allocation range was not rejected: %v", err)
+				}
+
+				entries, err := os.ReadDir(plugin.DataDir)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("rejected input created reservations: %v, %v", entries, err)
+				}
+			})
+		}
 	}
 }
 
