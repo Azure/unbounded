@@ -421,7 +421,8 @@ impl State {
             return Err(errno(libc::EINVAL));
         }
         if resolve & RESOLVE_CACHED != 0
-            && flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_TMPFILE) != 0
+            && (flags & (libc::O_CREAT | libc::O_TRUNC) != 0
+                || flags & libc::O_TMPFILE == libc::O_TMPFILE)
         {
             return Err(errno(libc::EAGAIN));
         }

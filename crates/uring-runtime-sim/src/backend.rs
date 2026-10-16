@@ -656,14 +656,14 @@ impl SimBackend {
     }
 
     /// Create a listener labeled with this backend's endpoint.
-    pub fn listen(&self, address: impl Into<SocketAddress>) -> Result<SimFd> {
+    pub fn listen_on(&self, address: impl Into<SocketAddress>) -> Result<SimFd> {
         self.world
             .labeled_listen(&address.into(), self.endpoint.as_ref())
     }
 
     /// Synchronously connect a stream labeled with this backend's endpoint
     /// (`EAGAIN` instead of waiting when partitioned).
-    pub fn connect(&self, address: impl Into<SocketAddress>) -> Result<SimFd> {
+    pub fn connect_to(&self, address: impl Into<SocketAddress>) -> Result<SimFd> {
         self.world
             .labeled_connect(&address.into(), self.endpoint.as_ref())
     }
@@ -963,11 +963,12 @@ impl Host for SimBackend {
     /// Like `poll(2)`: an `O_PATH` file reports `POLLNVAL`.
     fn poll_now(&self, fd: &SimFd, events: i16) -> Result<i16> {
         let id = self.world.id_of(fd)?;
-        match self.world.state().ready(id, events as u16 as u32) {
+        let state = self.world.state();
+        match state.ready(id, events as u16 as u32) {
             Ok(ready) => Ok(ready as u16 as i16),
             Err(error)
                 if error.raw_os_error() == Some(libc::EBADF)
-                    && self.world.state().resources.contains_key(&id) =>
+                    && state.resources.contains_key(&id) =>
             {
                 Ok(libc::POLLNVAL)
             }

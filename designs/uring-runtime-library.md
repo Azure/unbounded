@@ -493,17 +493,64 @@ impl<S: Scope + Send> Group<S> where S::Error: Clone + Send {
 
 ## Crate: `uring-runtime-sim`
 
-- `SimBackend` implements `Backend + Host` with `Fd = SimFd`,
-  `Clock = SimClock`, `Entropy = SimEntropy`.
-- `World` (shared `Rc` handle): network (streams, listeners, datagrams, pipes,
-  partitions), disk (volatile and durable images, `crash`, `crash_under`,
-  `corrupt`), typed fault injection (`Fault` + `OpKind` instead of strings),
-  bounded trace.
-- `SimClock`: deterministic monotonic and wall time from a seed; single-thread
-  counters, no `Arc<Mutex>` on the read path. `SimEntropy`: SHA-256 counter
-  stream; the domain string is a constructor argument (Racer passes the old
-  `"uring-runtime.entropy.v1\0"` to keep replay corpora stable).
-- The Linux differential tests live in `tests/` and are Linux-only.
+Modules: `world` (`World`, `SimFd`), `fs` and `disk` (namespace, `openat2`
+resolution, sparse inodes, durability, `Disk`, `DiskState`), `net` (streams,
+listeners, datagrams, pipes, readiness, partitions), `fault` (`Fault`,
+`FaultTarget`, `SyncOp`), `trace` (`Event`, `EventKind`), `clock`
+(`SimClock`), `entropy` (`SimEntropy`), `backend` (`SimBackend`).
+
+- `World` is a cheap single-thread `Rc` handle to the simulated OS. Several
+  `SimBackend`s (one per simulated worker or node) share one world. Resources
+  are identified by small, never reused integer ids; `SimFd` is an `Rc`
+  handle that closes its resource on last drop (deferred to the world's next
+  use if the world is borrowed at that moment, so `Drop` never panics).
+- `SimBackend::new(&World, SimClock, SimEntropy)` implements
+  `Backend + Host` with `Fd = SimFd`, `Clock = SimClock`,
+  `Entropy = SimEntropy`. Pushed operations copy what they may (paths, `how`,
+  decoded addresses, `SimFd` clones) and keep raw buffer/output pointers.
+  Each `submit` and `wait` runs one turn: every submitted operation executes
+  once in push order; an operation that would block (recv without data,
+  partitioned send/connect, accept without a connection, poll not ready,
+  timeout before its deadline) is retried next turn. `pop` also completes
+  expired timeouts. `wait` never sleeps; with `set_auto_advance(true)` an idle
+  `wait` advances the clock to the next timeout deadline (at most by the wait
+  timeout). `cancel` removes an unexecuted target (`-ECANCELED` plus `0`,
+  ordered by `World::set_cancel_first`) or completes `-ENOENT`.
+- `Accept` and `OpenAt2` complete with the new resource id as the result
+  (like a descriptor number). `SimBackend::adopt_fd(result)` /
+  `World::adopt(result)` turns it into a `SimFd`; `World::close_raw` closes an
+  unadopted one. The reactor needs a matching backend hook to adopt results.
+- Endpoint labels for partitions are per backend
+  (`SimBackend::set_endpoint`), replacing the old thread-local scope.
+- Faults: `World::inject(FaultTarget::{Any, Op(OpKind), Sync(SyncOp)},
+  Fault::{Errno, Short, Delay, HoldCompletion})`, FIFO, consumed once.
+  Asynchronous operations match `Op` targets at push; synchronous `Host`
+  calls and fixtures match `Sync` targets. Knobs: `reject_submissions`
+  (push returns `PushError::Full`), `set_stream_capacity`, `set_max_chunk`,
+  `set_cancel_first`; test hooks `SimBackend::{inject_completion,
+  reorder_completions, queued_completions, in_flight}`.
+- Disk: `World::disk() -> Disk { sync, sync_all, crash, crash_under, read,
+  corrupt }`; file fsync persists data and length, directory fsync persists
+  its immediate entries. Reported owner, link count and umask are
+  configurable (`set_owner`, `set_link_count`, `set_umask`).
+  `RESOLVE_NO_XDEV`/`RESOLVE_NO_MAGICLINKS` always succeed (one mount, no magic
+  links); `RESOLVE_CACHED` fails with `EAGAIN` only with `O_CREAT`, `O_TRUNC`
+  or `O_TMPFILE`, as on Linux. `O_TMPFILE` is unsupported.
+- `SimClock`: `Send + Sync` (`Arc` of atomics; reads are one atomic load,
+  writers take a lock) so racer's multi-thread groups can share one world
+  clock. `new(seed)` uses a process-global monotonic origin and wall time
+  `1_800_000_000` s; `new_at`, `advance`, `checked_advance`, `elapsed`,
+  `set_wall_time`, `seed`.
+- `SimEntropy::new(domain, seed, stream)`: SHA-256 over
+  `domain || seed_le || stream_le || counter_le`, byte-compatible with the old
+  runtime (`DEFAULT_ENTROPY_DOMAIN = b"uring-runtime.entropy.v1\0"`); clones
+  share one cursor; `!Send`.
+- Trace: bounded (16384, oldest half dropped) `Event { sequence, kind:
+  EventKind, resource, result }`.
+- Tests: unit tests per module, `tests/backend.rs` drives the `Backend` trait
+  directly (including a replay-determinism test), and the Linux-only
+  `tests/differential.rs` compares against the host kernel (openat2, memfd,
+  flock, pipes, poll, Unix sockets) using `CARGO_TARGET_TMPDIR`.
 
 ## What moves to Racer
 
