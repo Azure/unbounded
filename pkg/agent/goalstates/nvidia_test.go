@@ -26,6 +26,15 @@ func TestNVIDIAStateAvailable(t *testing.T) {
 	}))
 }
 
+func TestAzureLinuxUsesNVIDIACDIRuntime(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, useNVIDIACDIRuntime(hostDistroAzureLinux3))
+	require.False(t, useNVIDIACDIRuntime(hostDistroUbuntu2404))
+	require.False(t, useNVIDIACDIRuntime(hostDistroUbuntu2604))
+	require.False(t, useNVIDIACDIRuntime(""))
+}
+
 func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	t.Parallel()
 

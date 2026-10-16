@@ -5,6 +5,7 @@ package nodestart
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -34,6 +35,72 @@ func TestReconcileNVIDIANonGPUIsNoop(t *testing.T) {
 		slog.New(slog.DiscardHandler),
 		&goalstates.NodeStart{MachineName: "kube1"},
 	).Do(context.Background()))
+}
+
+func TestConfigureNVIDIAContainerRuntime(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		enabled bool
+		runErr  error
+		wantErr string
+		wantRun bool
+	}{
+		{name: "Azure Linux uses CDI", enabled: true, wantRun: true},
+		{name: "Ubuntu remains automatic", enabled: false},
+		{
+			name:    "configuration failure is explicit",
+			enabled: true,
+			runErr:  errors.New("exit status 1"),
+			wantErr: "configure NVIDIA container runtime CDI mode",
+			wantRun: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotArgs []string
+
+			task := &setupNVIDIA{
+				log: slog.New(slog.DiscardHandler),
+				goalState: &goalstates.NodeStart{
+					MachineName: "kube1",
+					Nvidia: goalstates.NvidiaHost{
+						UseCDIRuntime: tt.enabled,
+					},
+				},
+				run: func(_ context.Context, _ *slog.Logger, machine string, args ...string) (string, error) {
+					require.Equal(t, "kube1", machine)
+
+					gotArgs = slices.Clone(args)
+
+					return "", tt.runErr
+				},
+			}
+
+			err := task.configureContainerRuntime(context.Background())
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			if tt.wantRun {
+				require.Equal(t, []string{
+					goalstates.NvidiaCTKPath,
+					"config",
+					"--set",
+					"nvidia-container-runtime.mode=cdi",
+					"--in-place",
+				}, gotArgs)
+			} else {
+				require.Empty(t, gotArgs)
+			}
+		})
+	}
 }
 
 func TestNVIDIAContainerLibDirCommands(t *testing.T) {
