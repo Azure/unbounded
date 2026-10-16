@@ -21,7 +21,29 @@ import (
 
 func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "local"}}
+
 	siteInformer := newInformerWithObjects(toUnstructured(t, site))
+	if err := siteInformer.GetStore().Add(toUnstructured(t, &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "origin"},
+		Spec:       unboundedv1alpha3.SiteSpec{TunnelMTU: ptrInt32(1200)},
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	gatewayNodes := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway"},
+		Status: unboundednetv1alpha1.GatewayNodeStatus{
+			LastUpdated: metav1.Now(),
+			Routes: map[string]unboundednetv1alpha1.GatewayNodeRoute{
+				"192.168.0.0/16": {
+					Type: "RoutedCidr",
+					Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{{
+						{Type: "Site", Name: "origin"}, {Type: "GatewayPool", Name: "pool"},
+					}},
+				},
+			},
+		},
+	}))
 	poolInformer := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool"},
 		Spec: unboundednetv1alpha1.GatewayPoolSpec{
@@ -40,7 +62,7 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 		},
 	}))
 	empty := newInformerWithObjects()
-	cfg := &config{NodeName: "self", WireGuardPort: 51820, PreferredPrivateEncap: "WireGuard"}
+	cfg := &config{NodeName: "self", WireGuardPort: 51820, MTU: 576, PreferredPrivateEncap: "WireGuard"}
 	state := &wireGuardState{
 		nodeName: "self", clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "self"}}),
 	}
@@ -60,7 +82,7 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 	t.Cleanup(func() { configureWireGuardFunc = original })
 
 	update := func() error {
-		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, poolInformer, empty,
+		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, poolInformer, gatewayNodes,
 			empty, assignments, empty, cfg, "local", "priv", "pub-self", true, state)
 	}
 
@@ -90,6 +112,15 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 
 			if len(gotGatewayPeers) != 1 || !slices.Equal(gotGatewayPeers[0].RoutedCidrs, tt.want) {
 				t.Fatalf("gateway routes=%+v, want %v", gotGatewayPeers, tt.want)
+			}
+
+			wantTransitMTU := 1200
+			if len(tt.want) == 0 {
+				wantTransitMTU = 0
+			}
+
+			if gotGatewayPeers[0].TransitTunnelMTU != wantTransitMTU {
+				t.Fatalf("retained path MTU=%d, want %d", gotGatewayPeers[0].TransitTunnelMTU, wantTransitMTU)
 			}
 
 			if gotGatewayPeers[0].WireGuardPublicKey != "pub-gateway" || !slices.Equal(gotGatewayPeers[0].PodCIDRs, []string{"10.245.0.0/24"}) {

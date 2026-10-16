@@ -312,6 +312,29 @@ func TestIntermediateGatewaySiteMTUCaps(t *testing.T) {
 	}
 }
 
+func TestAssignmentEdgeTunnelMTUs(t *testing.T) {
+	assignments := []unboundednetv1alpha1.SiteGatewayPoolAssignment{
+		{Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+			Sites: []string{"a", "b"}, GatewayPools: []string{"g", "h"}, TunnelMTU: ptrInt32(1400),
+		}},
+		{Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+			Sites: []string{"b"}, GatewayPools: []string{"g"}, TunnelMTU: ptrInt32(1200),
+		}},
+		{Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+			Sites: []string{"a"}, GatewayPools: []string{"g"}, TunnelMTU: ptrInt32(900), Enabled: new(false),
+		}},
+		{Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+			Sites: []string{"unused"}, GatewayPools: []string{"g"},
+		}},
+	}
+
+	got := assignmentEdgeTunnelMTUs(assignments)
+	if len(got) != 4 || got[sitePoolMTUKey{"a", "g"}] != 1400 ||
+		got[sitePoolMTUKey{"b", "g"}] != 1200 || got[sitePoolMTUKey{"b", "h"}] != 1400 {
+		t.Fatalf("unexpected enabled edge minima: %v", got)
+	}
+}
+
 func TestLearnedGatewayTransitPathCaps(t *testing.T) {
 	path := []unboundednetv1alpha1.GatewayNodePathHop{
 		{Type: "Site", Name: "site-b"},
@@ -347,7 +370,7 @@ func TestLearnedGatewayTransitPathCaps(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := learnedGatewayTransitTunnelMTU(routes, tc.sites, tc.pools, tc.assignments, tc.peerings)
+			got := learnedGatewayTransitTunnelMTU(routes, tc.sites, tc.pools, assignmentEdgeTunnelMTUs(tc.assignments), tc.peerings)
 			if got != tc.want {
 				t.Fatalf("transit MTU=%d want=%d", got, tc.want)
 			}

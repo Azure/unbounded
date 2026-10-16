@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -298,10 +299,39 @@ func gatewayPoolPeeringTunnelMTU(
 	return result
 }
 
+type sitePoolMTUKey struct {
+	site string
+	pool string
+}
+
+func assignmentEdgeTunnelMTUs(assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment) map[sitePoolMTUKey]int {
+	result := make(map[sitePoolMTUKey]int)
+
+	for _, assignment := range assignments {
+		if !unboundednetv1alpha1.SpecEnabled(assignment.Spec.Enabled) {
+			continue
+		}
+
+		mtu := tunnelMTUFromSpec(assignment.Spec.TunnelMTU)
+		if mtu == 0 {
+			continue
+		}
+
+		for _, site := range assignment.Spec.Sites {
+			for _, pool := range assignment.Spec.GatewayPools {
+				key := sitePoolMTUKey{site: site, pool: pool}
+				result[key] = resolveTunnelMTU(result[key], mtu)
+			}
+		}
+	}
+
+	return result
+}
+
 func learnedGatewayTransitTunnelMTU(
 	learnedRoutes map[string]unboundednetv1alpha1.GatewayNodeRoute,
 	siteMTUs, poolMTUs map[string]int,
-	assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment,
+	assignmentMTUs map[sitePoolMTUKey]int,
 	poolPeerings []unboundednetv1alpha1.GatewayPoolPeering,
 ) int {
 	result := 0
@@ -338,13 +368,7 @@ func learnedGatewayTransitTunnelMTU(
 					continue
 				}
 
-				for _, assignment := range assignments {
-					if unboundednetv1alpha1.SpecEnabled(assignment.Spec.Enabled) &&
-						slices.Contains(assignment.Spec.Sites, site.Name) &&
-						slices.Contains(assignment.Spec.GatewayPools, pool.Name) {
-						result = resolveTunnelMTU(result, tunnelMTUFromSpec(assignment.Spec.TunnelMTU))
-					}
-				}
+				result = resolveTunnelMTU(result, assignmentMTUs[sitePoolMTUKey{site: site.Name, pool: pool.Name}])
 			}
 		}
 	}
@@ -761,7 +785,12 @@ func strSliceEqual(a, b []string) bool {
 	return true
 }
 
-func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desiredGatewayIfaces map[string]bool, meshIface string) {
+var (
+	listWireGuardLinks  = netlink.LinkList
+	deleteWireGuardLink = netlink.LinkDel
+)
+
+func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desiredGatewayIfaces map[string]bool, meshIface string) error {
 	desired := make(map[string]bool, len(desiredGatewayIfaces)+1)
 
 	desired[meshIface] = true
@@ -769,11 +798,12 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 		desired[name] = true
 	}
 
-	links, err := netlink.LinkList()
+	links, err := listWireGuardLinks()
 	if err != nil {
-		klog.Warningf("Failed to list links for WireGuard ownership reconciliation: %v", err)
-		return
+		return fmt.Errorf("list links for WireGuard ownership reconciliation: %w", err)
 	}
+
+	var cleanupErr error
 
 	for _, link := range links {
 		name := link.Attrs().Name
@@ -792,12 +822,13 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 
 		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
 			if err := state.gatewayPolicyManager.RemoveInterface(name); err != nil {
-				klog.V(3).Infof("Policy cleanup skipped for unmanaged interface %s: %v", name, err)
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove policy for %s: %w", name, err))
+				continue
 			}
 		}
 
-		if err := netlink.LinkDel(link); err != nil {
-			klog.Warningf("Failed to delete unmanaged WireGuard interface %s: %v", name, err)
+		if err := deleteWireGuardLink(link); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete unmanaged WireGuard interface %s: %w", name, err))
 			continue
 		}
 
@@ -821,6 +852,8 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 		delete(state.gatewayNames, name)
 		delete(state.gatewaySiteNames, name)
 	}
+
+	return cleanupErr
 }
 
 // removeStaleWireGuardInterfaces deletes kernel-resident WireGuard

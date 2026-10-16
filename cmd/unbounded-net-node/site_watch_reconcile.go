@@ -1810,6 +1810,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// Non-gateway nodes: connect to pools from peerings involving their site
 	// Gateway nodes: connect only to peered pools (other pools in the same Peering)
 	var gatewayPeers []gatewayPeerInfo
+
+	assignmentEdgeMTUs := assignmentEdgeTunnelMTUs(assignments)
 	{
 		var poolsToIterate map[string]*unboundednetv1alpha1.GatewayPool
 		if isGatewayNode {
@@ -1867,8 +1869,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				// Never install NodeCidr routes from network-peered sites via gateways.
 				excludedNodeCIDRSites := networkPeeredSites
 				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
+				filteredRoutes := excludeLocalGatewayRoutes(gatewayPeerInfo{
+					RoutedCidrs: routedCidrs, RouteDistances: routeDistances, LearnedRoutes: learnedRoutes,
+				}, siteRouting.localCIDRs)
+				routedCidrs, routeDistances, learnedRoutes = filteredRoutes.RoutedCidrs, filteredRoutes.RouteDistances, filteredRoutes.LearnedRoutes
 
-				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignments, poolPeerings)
+				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignmentEdgeMTUs, poolPeerings)
 
 				transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU,
 					gatewayMeshTransitTunnelMTU(pool.Name, gwNode.SiteName, learnedRoutes, gatewayPoolMap, siteTunnelMTUs, sitePeerings))
@@ -1881,7 +1887,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					peeringTunnelProtocol = ""
 				}
 
-				gatewayPeers = append(gatewayPeers, excludeLocalGatewayRoutes(gatewayPeerInfo{
+				gatewayPeers = append(gatewayPeers, gatewayPeerInfo{
 					Name:                   gwNode.Name,
 					SiteName:               gwNode.SiteName,
 					PoolName:               pool.Name,
@@ -1900,7 +1906,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					SkipPodCIDRRoutes:      !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode && gwNode.SiteName == mySiteName,
 					UnmanagedCNISite:       siteHasUnmanagedCNI(siteMap[gwNode.SiteName]),
 					TransitTunnelMTU:       transitTunnelMTU,
-				}, siteRouting.localCIDRs))
+				})
 			}
 		}
 	}
