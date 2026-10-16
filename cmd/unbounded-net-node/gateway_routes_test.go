@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -65,15 +66,41 @@ func TestGatewayForwardingMTUPublishedAfterConfiguration(t *testing.T) {
 	empty := newInformerWithObjects()
 	state := &wireGuardState{
 		nodeName: "self", clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "self"}}),
+		cniConfigWritten: true, nodePodCIDRs: []string{"10.244.1.0/24"},
 	}
-	cfg := &config{NodeName: "self", WireGuardPort: 51820, MTU: 576}
+	cfg := newCNISafetyTestConfig(t)
+	cfg.NodeName, cfg.WireGuardPort, cfg.MTU = "self", 51820, 1200
 	configureErr := errors.New("programming failed")
-	original := configureWireGuardFunc
+	original, originalBridge, originalVerify := configureWireGuardFunc, ensureCNIBridgeMTUFunc, verifyActiveTunnelMTUsFunc
 
-	t.Cleanup(func() { configureWireGuardFunc = original })
+	t.Cleanup(func() {
+		configureWireGuardFunc, ensureCNIBridgeMTUFunc, verifyActiveTunnelMTUsFunc = original, originalBridge, originalVerify
+	})
+
+	configureCalls := 0
+
+	var programmingOrder []string
 
 	configureWireGuardFunc = func(context.Context, *config, string, []meshPeerInfo, []gatewayPeerInfo, string, map[string]bool, map[string]bool, map[string]bool, map[string]string, map[string]string, map[string]string, map[string]string, map[string]string, map[string]int, map[string]int, map[string]int, map[string]int, map[string]int, []unboundednetnetlink.DesiredRoute, map[string]bool, *wireGuardState, map[string]healthcheck.HealthCheckSettings) error {
+		configureCalls++
+
+		programmingOrder = append(programmingOrder, "tunnels")
+
 		return configureErr
+	}
+
+	var bridgeErr, verifyErr error
+
+	bridgeMTU, repairedPods := 0, false
+	ensureCNIBridgeMTUFunc = func(_ string, mtu int, _ *unboundednetnetlink.NetlinkCache, pods bool) error {
+		bridgeMTU, repairedPods = mtu, pods
+
+		programmingOrder = append(programmingOrder, "fabric")
+
+		return bridgeErr
+	}
+	verifyActiveTunnelMTUsFunc = func(*config, int, []meshPeerInfo, []gatewayPeerInfo) error {
+		return verifyErr
 	}
 
 	update := func() error {
@@ -101,12 +128,125 @@ func TestGatewayForwardingMTUPublishedAfterConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if mtu, ok, err := unstructured.NestedInt64(got.Object, "status", "forwardingMTU"); err != nil || !ok || mtu != 576 {
+	if mtu, ok, err := unstructured.NestedInt64(got.Object, "status", "forwardingMTU"); err != nil || !ok || mtu != 1200 {
 		t.Fatalf("successful configuration did not publish effective MTU: %v err=%v", got.Object, err)
 	}
 
 	if err := update(); err != nil {
 		t.Fatalf("unchanged reconciliation did not refresh advertisement: %v", err)
+	}
+
+	beforeCalls, beforeActions := configureCalls, len(client.Actions())
+
+	verifyErr = errors.New("tunnel MTU drift")
+	if err := update(); !errors.Is(err, verifyErr) {
+		t.Fatalf("verification error=%v", err)
+	}
+
+	if !state.dataplaneDirty || configureCalls != beforeCalls {
+		t.Fatal("unchanged-state verification failure did not request dataplane repair")
+	}
+
+	for _, action := range client.Actions()[beforeActions:] {
+		if action.GetVerb() == "patch" {
+			t.Fatal("failed verification published gateway status")
+		}
+	}
+
+	verifyErr = nil
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if state.dataplaneDirty || configureCalls != beforeCalls+1 {
+		t.Fatal("verification drift did not trigger programming on retry")
+	}
+
+	publicationErr := errors.New("status PATCH failed")
+	failPublication := false
+
+	client.PrependReactor("patch", "gatewaypoolnodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		if failPublication {
+			return true, nil, publicationErr
+		}
+
+		return false, nil, nil
+	})
+
+	for _, failure := range []string{"status publication", "partial fabric write"} {
+		t.Run(failure, func(t *testing.T) {
+			cfg.MTU = 1400
+			failPublication = failure == "status publication"
+			wantErr := publicationErr
+
+			if !failPublication {
+				bridgeErr = errors.New("pod MTU update failed")
+				wantErr = bridgeErr
+			}
+
+			if err := update(); !errors.Is(err, wantErr) {
+				t.Fatalf("expected failure after fabric writes, got %v", err)
+			}
+
+			if state.cniMTU != 1200 || state.appliedFabricMTU != 1400 || !state.dataplaneDirty {
+				t.Fatalf("lost in-flight MTU: committed=%d attempted=%d dirty=%v", state.cniMTU, state.appliedFabricMTU, state.dataplaneDirty)
+			}
+
+			current, err := client.Resource(gatewayNodeGVR).Get(t.Context(), "self", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if mtu, _, err := unstructured.NestedInt64(current.Object, "status", "forwardingMTU"); err != nil || mtu != 1200 {
+				t.Fatalf("failed reconcile advertised uncommitted fabric: %v err=%v", current.Object, err)
+			}
+
+			cfg.MTU, failPublication, bridgeErr = 1200, false, nil
+
+			if err := update(); err != nil {
+				t.Fatal(err)
+			}
+
+			if bridgeMTU != 1200 || !repairedPods || state.dataplaneDirty || state.appliedFabricMTU != 1200 {
+				t.Fatalf("fabric reversion skipped repair: bridge=%d pods=%v attempted=%d dirty=%v", bridgeMTU, repairedPods, state.appliedFabricMTU, state.dataplaneDirty)
+			}
+
+			data, err := os.ReadFile(cniConfigPath(cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var cni CNIConfig
+			if err := json.Unmarshal(data, &cni); err != nil {
+				t.Fatal(err)
+			}
+
+			if len(cni.Plugins) == 0 || cni.Plugins[0].MTU != 1200 {
+				t.Fatalf("CNI config retained raised MTU: %s", data)
+			}
+		})
+	}
+
+	cfg.MTU = 1400
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.MTU, bridgeErr = 1200, errors.New("lowering pod MTU failed")
+	if err := update(); !errors.Is(err, bridgeErr) {
+		t.Fatalf("expected partial lowering error, got %v", err)
+	}
+
+	cfg.MTU, bridgeErr, programmingOrder = 1400, nil, nil
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(programmingOrder) != 2 || programmingOrder[0] != "tunnels" || programmingOrder[1] != "fabric" {
+		t.Fatalf("reversion raised fabric before repairing tunnels: %v", programmingOrder)
 	}
 }
 

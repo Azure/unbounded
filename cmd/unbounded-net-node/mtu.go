@@ -24,8 +24,9 @@ type cniBridgeLinkManager interface {
 }
 
 var (
-	ensureCNIBridgeMTUFunc    = ensureCNIBridgeMTU
-	newCNIBridgeLinkManagerFn = func(bridgeName string) cniBridgeLinkManager {
+	ensureCNIBridgeMTUFunc     = ensureCNIBridgeMTU
+	verifyActiveTunnelMTUsFunc = verifyActiveTunnelMTUs
+	newCNIBridgeLinkManagerFn  = func(bridgeName string) cniBridgeLinkManager {
 		return unboundednetnetlink.NewLinkManager(bridgeName)
 	}
 )
