@@ -9,7 +9,7 @@
 //! - The native thread runs the command and owns every RDMA resource.
 //!
 //! This crate spawns no threads and runs no executor. Time and randomness come
-//! from the current `uring-runtime` environment.
+//! from the current `racer-platform` environment.
 //!
 //! # Basics
 //!
