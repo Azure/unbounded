@@ -402,6 +402,30 @@ func TestShouldReconcileGatewayNodeUpdate_HeartbeatOnlyChange(t *testing.T) {
 }
 
 // TestShouldReconcileGatewayNodeUpdate_RoutesChange tests ShouldReconcileGatewayNodeUpdate_RoutesChange.
+func TestShouldReconcileGatewayNodeUpdate_ForwardingMTUChange(t *testing.T) {
+	oldNode := &unboundednetv1alpha1.GatewayPoolNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway"},
+	}
+	newNode := oldNode.DeepCopy()
+
+	newNode.Status.ForwardingMTU = ptrInt32(1200)
+	if !shouldReconcileGatewayNodeUpdate(gatewayNodeToUnstructured(t, oldNode), gatewayNodeToUnstructured(t, newNode)) {
+		t.Fatal("new forwarding MTU did not trigger reconciliation")
+	}
+
+	oldNode = newNode.DeepCopy()
+
+	newNode.Status.ForwardingMTU = ptrInt32(1400)
+	if !shouldReconcileGatewayNodeUpdate(gatewayNodeToUnstructured(t, oldNode), gatewayNodeToUnstructured(t, newNode)) {
+		t.Fatal("raised forwarding MTU did not trigger reconciliation")
+	}
+
+	newNode.Status.ForwardingMTU = nil
+	if !shouldReconcileGatewayNodeUpdate(gatewayNodeToUnstructured(t, oldNode), gatewayNodeToUnstructured(t, newNode)) {
+		t.Fatal("removed forwarding MTU did not trigger reconciliation")
+	}
+}
+
 func TestShouldReconcileGatewayNodeUpdate_RoutesChange(t *testing.T) {
 	now := time.Now().UTC()
 	oldNode := &unboundednetv1alpha1.GatewayPoolNode{

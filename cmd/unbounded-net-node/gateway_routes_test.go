@@ -6,21 +6,26 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/healthcheck"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
 // testInformer is a minimal cache.SharedIndexInformer for tests that only need GetStore().
@@ -31,6 +36,79 @@ type testInformer struct {
 
 func (f *testInformer) GetStore() cache.Store { return f.store }
 func (f *testInformer) HasSynced() bool       { return true }
+
+func TestGatewayForwardingMTURejectsInvalidValue(t *testing.T) {
+	for _, mtu := range []int{0, -1, 65536} {
+		client := fakeGatewayDynamic()
+		if err := syncGatewayNodeRoutesStatus(t.Context(), client, nil, "self", nil, mtu); err == nil {
+			t.Fatalf("invalid MTU %d was accepted", mtu)
+		}
+
+		if len(client.Actions()) != 0 {
+			t.Fatal("invalid MTU reached the API server")
+		}
+	}
+}
+
+func TestGatewayForwardingMTUPublishedAfterConfiguration(t *testing.T) {
+	self := &unboundednetv1alpha1.GatewayPoolNode{ObjectMeta: metav1.ObjectMeta{Name: "self"}}
+	client := fakeGatewayDynamic(toUnstructured(t, self))
+	gatewayNodes := newInformerWithObjects(toUnstructured(t, self))
+	sites := newInformerWithObjects(toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "local"}}))
+	pools := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool"},
+		Spec:       unboundednetv1alpha1.GatewayPoolSpec{Type: "Internal"},
+		Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{
+			Name: "self", SiteName: "local", WireGuardPublicKey: "pub-self", GatewayWireguardPort: 51821,
+		}}},
+	}))
+	empty := newInformerWithObjects()
+	state := &wireGuardState{
+		nodeName: "self", clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "self"}}),
+	}
+	cfg := &config{NodeName: "self", WireGuardPort: 51820, MTU: 576}
+	configureErr := errors.New("programming failed")
+	original := configureWireGuardFunc
+
+	t.Cleanup(func() { configureWireGuardFunc = original })
+
+	configureWireGuardFunc = func(context.Context, *config, string, []meshPeerInfo, []gatewayPeerInfo, string, map[string]bool, map[string]bool, map[string]bool, map[string]string, map[string]string, map[string]string, map[string]string, map[string]string, map[string]int, map[string]int, map[string]int, map[string]int, map[string]int, []unboundednetnetlink.DesiredRoute, map[string]bool, *wireGuardState, map[string]healthcheck.HealthCheckSettings) error {
+		return configureErr
+	}
+
+	update := func() error {
+		return updateWireGuardFromSlices(t.Context(), client, sites, empty, pools, gatewayNodes, empty, empty, empty,
+			cfg, "local", "private", "pub-self", true, state)
+	}
+	if err := update(); !errors.Is(err, configureErr) {
+		t.Fatalf("expected failed dataplane configuration, got %v", err)
+	}
+
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "patch" {
+			t.Fatal("failed configuration advertised a forwarding MTU or routes")
+		}
+	}
+
+	configureErr = nil
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := client.Resource(gatewayNodeGVR).Get(t.Context(), "self", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if mtu, ok, err := unstructured.NestedInt64(got.Object, "status", "forwardingMTU"); err != nil || !ok || mtu != 576 {
+		t.Fatalf("successful configuration did not publish effective MTU: %v err=%v", got.Object, err)
+	}
+
+	if err := update(); err != nil {
+		t.Fatalf("unchanged reconciliation did not refresh advertisement: %v", err)
+	}
+}
 
 func TestMissingGatewayNodeHasNoFallbackRoutes(t *testing.T) {
 	routes, distances, learned := routedCIDRsForGatewayPeer(nil, []string{"10.0.0.0/16"}, "local", nil, nil, time.Time{}, time.Minute)
@@ -45,8 +123,9 @@ func TestClearGatewayNodeRoutesStatusWithoutCache(t *testing.T) {
 		"kind":       "GatewayPoolNode",
 		"metadata":   map[string]interface{}{"name": "gateway-a"},
 		"status": map[string]interface{}{
-			"routes":    map[string]interface{}{"10.0.0.0/16": map[string]interface{}{"type": "NodeCidr"}},
-			"publicKey": "keep",
+			"routes":        map[string]interface{}{"10.0.0.0/16": map[string]interface{}{"type": "NodeCidr"}},
+			"publicKey":     "keep",
+			"forwardingMTU": int64(1200),
 		},
 	}}
 
@@ -66,6 +145,10 @@ func TestClearGatewayNodeRoutesStatusWithoutCache(t *testing.T) {
 
 	if value, _, _ := unstructured.NestedString(got.Object, "status", "publicKey"); value != "keep" {
 		t.Fatalf("unrelated status removed: %v", got.Object)
+	}
+
+	if _, found, err := unstructured.NestedInt64(got.Object, "status", "forwardingMTU"); err != nil || found {
+		t.Fatalf("forwarding MTU remains after clear: %v, err=%v", got.Object, err)
 	}
 }
 
@@ -245,11 +328,11 @@ func TestResolveGatewayPoolSiteName(t *testing.T) {
 
 // TestSyncGatewayNodeRoutesStatusEarlyReturn tests SyncGatewayNodeRoutesStatusEarlyReturn.
 func TestSyncGatewayNodeRoutesStatusEarlyReturn(t *testing.T) {
-	if err := syncGatewayNodeRoutesStatus(context.TODO(), nil, nil, "node-a", nil); err != nil {
+	if err := syncGatewayNodeRoutesStatus(context.TODO(), nil, nil, "node-a", nil, 1400); err != nil {
 		t.Fatalf("expected nil client to no-op, got %v", err)
 	}
 
-	if err := syncGatewayNodeRoutesStatus(context.TODO(), nil, nil, "", nil); err != nil {
+	if err := syncGatewayNodeRoutesStatus(context.TODO(), nil, nil, "", nil, 1400); err != nil {
 		t.Fatalf("expected empty node name to no-op, got %v", err)
 	}
 }
@@ -367,7 +450,7 @@ func TestSyncGatewayNodeRoutesStatus(t *testing.T) {
 	routes := map[string]unboundednetv1alpha1.GatewayNodeRoute{
 		"10.244.0.0/16": {Type: "RoutedCidr"},
 	}
-	if err := syncGatewayNodeRoutesStatus(context.Background(), dyn, nil, "gw-a", routes); err != nil {
+	if err := syncGatewayNodeRoutesStatus(context.Background(), dyn, nil, "gw-a", routes, 1200); err != nil {
 		t.Fatalf("syncGatewayNodeRoutesStatus() error = %v", err)
 	}
 
@@ -382,6 +465,10 @@ func TestSyncGatewayNodeRoutesStatus(t *testing.T) {
 
 	if _, ok, _ := unstructured.NestedMap(got.Object, "status", "routes"); !ok {
 		t.Fatalf("expected status.routes to be set")
+	}
+
+	if mtu, ok, err := unstructured.NestedInt64(got.Object, "status", "forwardingMTU"); err != nil || !ok || mtu != 1200 {
+		t.Fatalf("forwardingMTU=%d present=%v err=%v", mtu, ok, err)
 	}
 }
 
@@ -421,7 +508,7 @@ func TestSyncGatewayNodeRoutesStatusRemovesStaleRoutes(t *testing.T) {
 	newRoutes := map[string]unboundednetv1alpha1.GatewayNodeRoute{
 		"10.244.0.0/16": {Type: "PodCidr"},
 	}
-	if err := syncGatewayNodeRoutesStatus(context.Background(), dyn, fakeInf, "gw-a", newRoutes); err != nil {
+	if err := syncGatewayNodeRoutesStatus(context.Background(), dyn, fakeInf, "gw-a", newRoutes, 1400); err != nil {
 		t.Fatalf("syncGatewayNodeRoutesStatus() error = %v", err)
 	}
 

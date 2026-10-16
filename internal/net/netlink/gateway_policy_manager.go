@@ -51,6 +51,7 @@ type GatewayPolicyManager struct {
 
 	// Track which interfaces have been configured
 	configuredIfaces map[string]int // interface name -> table number
+	pendingCleanup   map[string]bool
 
 	// Track if the global OUTPUT rule has been added
 	outputRuleAdded bool
@@ -289,7 +290,7 @@ func (m *GatewayPolicyManager) ConfigureInterface(ifaceName string, tableNum int
 
 	// Check if already configured with the same table number
 	if existingTable, exists := m.configuredIfaces[ifaceName]; exists {
-		if existingTable == tableNum {
+		if existingTable == tableNum && !m.pendingCleanup[ifaceName] {
 			klog.V(3).Infof("Gateway policy routing already configured for %s (table %d)", ifaceName, tableNum)
 			return nil
 		}
@@ -299,10 +300,36 @@ func (m *GatewayPolicyManager) ConfigureInterface(ifaceName string, tableNum int
 		if err := m.removeInterfaceRulesLocked(ifaceName, existingTable); err != nil {
 			return err
 		}
+
+		delete(m.configuredIfaces, ifaceName)
 	}
 
 	klog.V(2).Infof("Configuring gateway policy routing for %s (table %d)", ifaceName, tableNum)
 
+	if m.configuredIfaces == nil {
+		m.configuredIfaces = make(map[string]int)
+	}
+
+	if m.pendingCleanup == nil {
+		m.pendingCleanup = make(map[string]bool)
+	}
+
+	m.configuredIfaces[ifaceName] = tableNum
+	m.pendingCleanup[ifaceName] = true
+
+	if err := ensureGatewayInterfacePolicy(m, ifaceName, tableNum); err != nil {
+		return err
+	}
+
+	delete(m.pendingCleanup, ifaceName)
+	klog.Infof("Gateway policy routing configured for %s (table %d)", ifaceName, tableNum)
+
+	return nil
+}
+
+var ensureGatewayInterfacePolicy = (*GatewayPolicyManager).ensureInterfacePolicyLocked
+
+func (m *GatewayPolicyManager) ensureInterfacePolicyLocked(ifaceName string, tableNum int) error {
 	// 1. Add route table entry if not exists
 	if err := EnsureRtTablesEntry(tableNum, ifaceName); err != nil {
 		return fmt.Errorf("failed to ensure route table for %s: %w", ifaceName, err)
@@ -331,9 +358,6 @@ func (m *GatewayPolicyManager) ConfigureInterface(ifaceName string, tableNum int
 
 		m.outputRuleAdded = true
 	}
-
-	m.configuredIfaces[ifaceName] = tableNum
-	klog.Infof("Gateway policy routing configured for %s (table %d)", ifaceName, tableNum)
 
 	return nil
 }
@@ -567,6 +591,7 @@ func (m *GatewayPolicyManager) RemoveInterface(ifaceName string) error {
 	}
 
 	delete(m.configuredIfaces, ifaceName)
+	delete(m.pendingCleanup, ifaceName)
 
 	return nil
 }
@@ -589,6 +614,7 @@ func (m *GatewayPolicyManager) ReconcileExpectedInterfaces(expected map[string]i
 		}
 
 		delete(m.configuredIfaces, iface)
+		delete(m.pendingCleanup, iface)
 	}
 
 	if err := m.cleanupLegacyOutputSourceRulesLocked(); err != nil {
@@ -621,6 +647,12 @@ var flushGatewayRouteTable = FlushRouteTable
 
 // removeInterfaceRulesLocked removes rules for an interface (must hold lock)
 func (m *GatewayPolicyManager) removeInterfaceRulesLocked(ifaceName string, tableNum int) error {
+	if m.pendingCleanup == nil {
+		m.pendingCleanup = make(map[string]bool)
+	}
+
+	m.pendingCleanup[ifaceName] = true
+
 	ingressMark, err := m.gatewayPolicyIngressMark(tableNum)
 	if err != nil {
 		klog.V(3).Infof("Continuing gateway policy cleanup for %s despite mark derivation failure for table %d: %v", ifaceName, tableNum, err)
@@ -684,6 +716,7 @@ func (m *GatewayPolicyManager) removeInterfaceRulesLocked(ifaceName string, tabl
 	}
 
 	klog.V(2).Infof("Removed policy routing rules for %s (table %d)", ifaceName, tableNum)
+	delete(m.pendingCleanup, ifaceName)
 
 	return nil
 }

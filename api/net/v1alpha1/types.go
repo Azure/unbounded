@@ -339,6 +339,15 @@ type GatewayNodeSpec struct {
 // GatewayNodeStatus defines the advertised routes and lease heartbeat for a gateway node.
 // +k8s:deepcopy-gen=true
 type GatewayNodeStatus struct {
+	// ForwardingMTU is the effective local forwarding MTU after a successful
+	// dataplane reconciliation. Workers use this cap for accepted gateway paths.
+	// Gateways do not consume it, avoiding feedback between advertised minima.
+	// Absent values identify agents that have not published a forwarding limit.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	ForwardingMTU *int32 `json:"forwardingMTU,omitempty"`
+
 	// LastUpdated is the heartbeat timestamp updated by the node agent.
 	// +optional
 	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`

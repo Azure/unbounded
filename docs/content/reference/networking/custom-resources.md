@@ -234,7 +234,15 @@ advertisements and heartbeat timestamps.
 | `spec.gatewayPool` | `string` | Yes | Parent GatewayPool. |
 | `spec.site` | `string` | No | Site name (from node labels). |
 | `status.lastUpdated` | `string` | -- | Last heartbeat timestamp. |
+| `status.forwardingMTU` | `integer` | No | Effective local forwarding MTU in bytes after successful dataplane reconciliation. |
 | `status.routes` | `map[string]GatewayNodeRoute` | -- | Route advertisements keyed by CIDR. |
+
+Workers honor this MTU on the next-hop gateway and candidate gateways in
+intermediate pools on accepted paths. Gateways do not consume other gateways'
+published MTUs, avoiding feedback between advertised minima. Install the updated
+CRD before upgrading agents; older gateways without the field retain
+topology-derived caps but do not provide this additional shared-interface limit.
+Gateways without a GatewayPoolNode object are not used as route destinations.
 
 ---
 

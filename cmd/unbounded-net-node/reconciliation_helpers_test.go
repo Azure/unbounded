@@ -312,6 +312,66 @@ func TestIntermediateGatewaySiteMTUCaps(t *testing.T) {
 	}
 }
 
+func TestPublishedGatewayForwardingMTUs(t *testing.T) {
+	mesh := []meshPeerInfo{
+		{SiteName: "b", TunnelProtocol: "WireGuard", TunnelMTU: 1200},
+		{SiteName: "d", TunnelProtocol: "WireGuard", TunnelMTU: 1400},
+	}
+
+	sharedMTU := protocolInterfaceMTU(1420, 0, 1500, "WireGuard", mesh, nil)
+	if sharedMTU != 1200 {
+		t.Fatalf("shared mesh MTU=%d, want 1200", sharedMTU)
+	}
+
+	nodes := map[string]*unboundednetv1alpha1.GatewayPoolNode{
+		"g":         {Status: unboundednetv1alpha1.GatewayNodeStatus{ForwardingMTU: ptrInt32(int32(sharedMTU))}},
+		"h":         {Status: unboundednetv1alpha1.GatewayNodeStatus{ForwardingMTU: ptrInt32(1100)}},
+		"unrelated": {Status: unboundednetv1alpha1.GatewayNodeStatus{ForwardingMTU: ptrInt32(900)}},
+	}
+
+	pools := map[string]*unboundednetv1alpha1.GatewayPool{
+		"pool-g": {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{Name: "g"}, {Name: "unrelated"}}}},
+		"pool-h": {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{Name: "h"}}}},
+	}
+	for _, intermediate := range []bool{false, true} {
+		path := []unboundednetv1alpha1.GatewayNodePathHop{{Type: "Site", Name: "d"}}
+		if intermediate {
+			path = append(path, unboundednetv1alpha1.GatewayNodePathHop{Type: "GatewayPool", Name: "pool-h"})
+		}
+
+		path = append(path, unboundednetv1alpha1.GatewayNodePathHop{Type: "GatewayPool", Name: "pool-g"})
+		peers := []gatewayPeerInfo{{Name: "g", PoolName: "pool-g", LearnedRoutes: map[string]unboundednetv1alpha1.GatewayNodeRoute{
+			"10.0.0.0/24": {Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{path}},
+		}}}
+		applyPublishedGatewayMTUs(peers, pools, nodes)
+
+		want := 1200
+		if intermediate {
+			want = 1100
+		}
+
+		if peers[0].TransitTunnelMTU != want {
+			t.Fatalf("intermediate=%v: cap=%d, want %d", intermediate, peers[0].TransitTunnelMTU, want)
+		}
+	}
+
+	nodes["g"].Status.ForwardingMTU = ptrInt32(1400)
+	peers := []gatewayPeerInfo{{Name: "g", PoolName: "pool-g"}}
+	applyPublishedGatewayMTUs(peers, pools, nodes)
+
+	if peers[0].TransitTunnelMTU != 1400 {
+		t.Fatalf("raised local cap remained pinned: %d", peers[0].TransitTunnelMTU)
+	}
+
+	nodes["g"].Status.ForwardingMTU = nil
+	peers = []gatewayPeerInfo{{Name: "g", PoolName: "pool-g", TransitTunnelMTU: 1300}}
+	applyPublishedGatewayMTUs(peers, pools, nodes)
+
+	if peers[0].TransitTunnelMTU != 1300 {
+		t.Fatal("legacy gateway without published MTU discarded topology cap")
+	}
+}
+
 func TestSitePeeringEdgeTunnelMTUs(t *testing.T) {
 	peerings := []unboundednetv1alpha1.SitePeering{
 		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"c", "b", "a"}, TunnelMTU: ptrInt32(1400)}},
