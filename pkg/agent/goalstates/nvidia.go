@@ -138,7 +138,7 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	hostDistro := detectHostDistro()
+	hostDistro, useCDIRuntime := detectNVIDIAHostOS()
 	initDeps := defaultNvidiaDeviceInitDeps()
 	initDeps.hostDistro = func() string { return hostDistro }
 
@@ -150,7 +150,7 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
-		UseCDIRuntime:     useNVIDIACDIRuntime(hostDistro),
+		UseCDIRuntime:     useCDIRuntime,
 		GPUDevicePaths:    devices,
 		ContainerLibDir:   archInfo.libDir,
 		LibMappings:       libraries.libMappings,
@@ -164,8 +164,26 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}, nil
 }
 
-func useNVIDIACDIRuntime(hostDistro string) bool {
-	return hostDistro == hostDistroAzureLinux3
+func detectNVIDIAHostOS() (string, bool) {
+	data, err := os.ReadFile(hostOSReleasePath)
+	if err != nil {
+		return "", false
+	}
+
+	values := osReleaseValues(data)
+
+	return hostDistroFromOSReleaseValues(values), useNVIDIACDIRuntime(values)
+}
+
+func useNVIDIACDIRuntime(osRelease map[string]string) bool {
+	if isAzureContainerLinux(osRelease) {
+		return false
+	}
+
+	id := normalizeOSReleaseID(osRelease["ID"])
+
+	return (id == "azurelinux" || id == "azlinux") &&
+		strings.HasPrefix(osRelease["VERSION_ID"], "3")
 }
 
 const (
