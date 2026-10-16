@@ -9,7 +9,8 @@
 //! future is abandoned. Drain the reactor before releasing worker resources.
 //!
 //! Each server permits one listener, four concurrent connections, 1024 request
-//! bytes, 64KiB response buffers, and two-second connection deadlines. [`Scope`]
+//! bytes, 64KiB text buffers, and two-second text/header deadlines. An optional
+//! binary producer has separate prepaid capacity and a bounded extended deadline. [`Scope`]
 //! must narrow the caller's deadline while preserving cancellation and metadata.
 //! Only HTTP/1.1 GET with one nonempty Host and no body is accepted; each connection
 //! closes after one response. Headers are scrubbed before dispatch, never echoed.
@@ -47,6 +48,33 @@ pub const RESERVED_BYTES: usize = (MAX_CONNECTIONS + 1) * (MAX_RESPONSE_BYTES + 
 
 /// Prepaid submissions for one accept and one operation per connection.
 pub const CONTROL_SLOTS: usize = MAX_CONNECTIONS + 1;
+
+/// Extra prepaid waits for one binary producer and its socket disconnect watch.
+pub const BINARY_CONTROL_SLOTS: usize = 2;
+/// One binary result, allocated only by the admitted producer.
+pub const MAX_BINARY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Fixed errors selected by the application, never raw operating-system messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinaryError {
+    NotFound,
+    BadRequest,
+    Busy,
+    Unavailable(&'static str),
+}
+
+/// Nonblocking producer. Drop must cancel; the owner survives through send fences.
+pub trait BinarySession {
+    fn completion_fd(&self) -> Result<Descriptor, BinaryError>;
+    fn result(&self) -> Option<Result<Vec<u8>, BinaryError>>;
+    fn cancel(&self);
+}
+
+/// A bounded capture duration and its admitted, type-erased producer.
+pub struct BinaryResponse {
+    pub duration: Duration,
+    pub session: Box<dyn BinarySession>,
+}
 
 /// A runtime scope that can narrow the deadline for a single exchange.
 pub trait Scope: uring_runtime::Scope {
@@ -97,6 +125,11 @@ pub trait Handler {
     /// Write only trusted output. NotFound discards output and uses a fixed body.
     fn get(&self, path: &str, out: &mut dyn Write) -> Result<Response, fmt::Error>;
 
+    /// None preserves the synchronous text route without allocating a session.
+    fn binary(&self, _path: &str) -> Option<Result<BinaryResponse, BinaryError>> {
+        None
+    }
+
     /// Record a fixed event without retaining untrusted request content.
     fn observe(&self, event: Event);
 }
@@ -105,7 +138,36 @@ pub trait Handler {
 pub struct Server {
     resources: Rc<Resources>,
 
+    binary: Option<Rc<BinaryResources>>,
+
     serving: Cell<bool>,
+}
+
+struct BinaryResources {
+    submissions: Rc<SubmissionCapacity>,
+    _memory: Box<dyn std::any::Any>,
+    active: Cell<bool>,
+}
+
+struct BinaryGuard {
+    session: Box<dyn BinarySession>,
+    resources: Rc<BinaryResources>,
+}
+
+impl Drop for BinaryGuard {
+    fn drop(&mut self) {
+        self.session.cancel();
+        self.resources.active.set(false);
+    }
+}
+
+struct CancelBinary(Rc<BinaryGuard>);
+
+impl Drop for CancelBinary {
+    fn drop(&mut self) {
+        // Request stop immediately; fenced owners keep the busy lease afterward.
+        self.0.session.cancel();
+    }
 }
 
 /// Reservations retained by every connection buffer through its final fence.
@@ -128,7 +190,22 @@ impl Server {
                 active: Cell::new(0),
             }),
             serving: Cell::new(false),
+            binary: None,
         }
+    }
+
+    /// Reserve binary capacity separately; ordinary text-only owners stay unchanged.
+    pub fn with_binary<C: 'static>(
+        mut self,
+        submissions: Rc<SubmissionCapacity>,
+        memory: C,
+    ) -> Self {
+        self.binary = Some(Rc::new(BinaryResources {
+            submissions,
+            _memory: Box::new(memory),
+            active: Cell::new(false),
+        }));
+        self
     }
 
     /// Admit one connection and allocate its fixed, completion-owned buffer.
@@ -144,6 +221,7 @@ impl Server {
             pending: 0..MAX_REQUEST_BYTES,
             resources: self.resources.clone(),
             _connection: connection,
+            binary: None,
         })
     }
 
@@ -281,6 +359,14 @@ impl Server {
                 Route::TooLarge => Route::TooLarge,
             };
             buffer.bytes.as_mut_slice().zeroize();
+            if let Route::Get(value) = route
+                && let Some(response) = handler.binary(value)
+            {
+                path.zeroize();
+                return self
+                    .binary_exchange(reactor, fd, buffer, parent, &scope, response)
+                    .await;
+            }
             let length = respond(handler, route, &mut buffer.bytes).map_err(|_| Error::Io)?;
             path.zeroize();
             buffer.pending = 0..length;
@@ -298,6 +384,146 @@ impl Server {
             }
             Ok(())
         })
+    }
+
+    async fn binary_exchange<S: Scope, B: Budget, C: 'static>(
+        &self,
+        reactor: &Reactor<S, B>,
+        fd: Rc<Descriptor>,
+        mut buffer: Buffer<C>,
+        parent: &S,
+        header_scope: &S,
+        response: Result<BinaryResponse, BinaryError>,
+    ) -> Result<(), S::Error> {
+        let mut scope = header_scope.clone();
+        let response = match response {
+            Ok(response) => {
+                if response.duration < Duration::from_secs(1)
+                    || response.duration > Duration::from_secs(60)
+                {
+                    Err(BinaryError::BadRequest)
+                } else if let Some(resources) = &self.binary {
+                    if resources.active.replace(true) {
+                        Err(BinaryError::Busy)
+                    } else {
+                        let guard = Rc::new(BinaryGuard {
+                            session: response.session,
+                            resources: resources.clone(),
+                        });
+                        let _cancel = CancelBinary(guard.clone());
+                        buffer.binary = Some(guard.clone());
+                        scope = parent.with_deadline(
+                            environment::now()
+                                .checked_add(response.duration + Duration::from_secs(15))
+                                .ok_or(Error::InvalidInput)?,
+                        );
+                        match guard.session.completion_fd() {
+                            Err(error) => Err(error),
+                            Ok(completion) => {
+                                let mut ready = reactor.readiness_reserved(
+                                    Rc::new(completion),
+                                    1,
+                                    guard.clone(),
+                                    resources.submissions.clone(),
+                                    &scope,
+                                );
+                                // POLLHUP | POLLERR, deliberately not POLLRDHUP: shutdown(Write) is legal.
+                                let mut disconnected = reactor.readiness_reserved(
+                                    fd.clone(),
+                                    0x18,
+                                    guard.clone(),
+                                    resources.submissions.clone(),
+                                    &scope,
+                                );
+                                let mut half_closed = false;
+                                std::future::poll_fn(|cx| {
+                                    // Some kernels report RDHUP even when it was not requested.
+                                    // Do not rearm that level-triggered event or reject a legal FIN.
+                                    if !half_closed {
+                                        if let Poll::Ready(result) = disconnected.as_mut().poll(cx)
+                                        {
+                                            match result {
+                                                Err(error) => return Poll::Ready(Err(error)),
+                                                Ok(flags) if flags & 0x18 != 0 => {
+                                                    return Poll::Ready(Err(Error::Io.into()));
+                                                }
+                                                Ok(_) => half_closed = true,
+                                            }
+                                        }
+                                    } else if fd.peer_disconnected() {
+                                        return Poll::Ready(Err(Error::Io.into()));
+                                    }
+                                    ready.as_mut().poll(cx)
+                                })
+                                .await?;
+                                // Notification must follow result publication; never spin on a broken producer.
+                                guard
+                                    .session
+                                    .result()
+                                    .unwrap_or(Err(BinaryError::Unavailable("backend_protocol")))
+                            }
+                        }
+                    }
+                } else {
+                    Err(BinaryError::Unavailable("resource_limit"))
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let response = response.and_then(|bytes| {
+            if bytes.len() > MAX_BINARY_BYTES {
+                Err(BinaryError::Unavailable("resource_limit"))
+            } else {
+                Ok(bytes)
+            }
+        });
+        let (status, body, binary) = match response {
+            Ok(bytes) => ("200 OK", bytes, true),
+            Err(BinaryError::NotFound) => ("404 Not Found", b"not found\n".to_vec(), false),
+            Err(BinaryError::BadRequest) => ("400 Bad Request", b"invalid query\n".to_vec(), false),
+            Err(BinaryError::Busy) => ("409 Conflict", b"busy\n".to_vec(), false),
+            Err(BinaryError::Unavailable(code)) => (
+                "503 Service Unavailable",
+                format!("{code}\n").into_bytes(),
+                false,
+            ),
+        };
+        let content_type = if binary {
+            "application/octet-stream"
+        } else {
+            "text/plain; charset=utf-8"
+        };
+        let mut head = Output {
+            bytes: &mut buffer.bytes,
+            used: 0,
+        };
+        write!(head, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n", body.len()).map_err(|_| Error::Io)?;
+        if binary {
+            head.write_str("Content-Disposition: attachment; filename=\"profile.pb\"\r\n")
+                .map_err(|_| Error::Io)?;
+        }
+        head.write_str("\r\n").map_err(|_| Error::Io)?;
+        buffer.pending = 0..head.used;
+        // Send the small head separately to avoid copying the 16MiB result on I/O.
+        for body in [None, Some(body)] {
+            if let Some(body) = body {
+                buffer.bytes = body;
+                buffer.pending = 0..buffer.bytes.len();
+            }
+            while !buffer.pending.is_empty() {
+                let completed = reactor
+                    .send_reserved(
+                        fd.clone(),
+                        buffer,
+                        self.resources.submissions.clone(),
+                        &scope,
+                    )
+                    .await?;
+                buffer = completed.buffer;
+                buffer.advance(completed.bytes)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -321,6 +547,8 @@ struct Buffer<C: 'static> {
     resources: Rc<Resources>,
 
     _connection: C,
+
+    binary: Option<Rc<BinaryGuard>>,
 }
 
 impl<C> Buffer<C> {
@@ -487,6 +715,409 @@ fn respond(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::os::fd::OwnedFd;
+
+    struct Producer {
+        fd: OwnedFd,
+        body_bytes: usize,
+        ready: Rc<Cell<bool>>,
+        live: Rc<Cell<usize>>,
+        cancelled: Rc<Cell<bool>>,
+    }
+
+    impl BinarySession for Producer {
+        fn completion_fd(&self) -> Result<Descriptor, BinaryError> {
+            Ok(self.fd.try_clone().unwrap().into())
+        }
+        fn result(&self) -> Option<Result<Vec<u8>, BinaryError>> {
+            self.ready.replace(false).then(|| {
+                Ok(if self.body_bytes == 4 {
+                    vec![0, 255, 10, 13]
+                } else {
+                    vec![7; self.body_bytes]
+                })
+            })
+        }
+        fn cancel(&self) {
+            self.cancelled.set(true);
+        }
+    }
+
+    impl Drop for Producer {
+        fn drop(&mut self) {
+            self.cancel();
+            self.live.set(self.live.get() - 1);
+        }
+    }
+
+    struct BinaryRoutes {
+        routes: Routes,
+        producer: RefCell<Option<Producer>>,
+    }
+
+    struct SimProducer {
+        fd: RefCell<Option<Descriptor>>,
+        live: Rc<Cell<usize>>,
+        cancelled: Rc<Cell<bool>>,
+    }
+    impl BinarySession for SimProducer {
+        fn completion_fd(&self) -> Result<Descriptor, BinaryError> {
+            Ok(self.fd.borrow_mut().take().unwrap())
+        }
+        fn result(&self) -> Option<Result<Vec<u8>, BinaryError>> {
+            Some(Ok(vec![7; MAX_BINARY_BYTES]))
+        }
+        fn cancel(&self) {
+            self.cancelled.set(true);
+        }
+    }
+    impl Drop for SimProducer {
+        fn drop(&mut self) {
+            self.live.set(self.live.get() - 1);
+        }
+    }
+
+    #[test]
+    fn binary_small_window_abandonment_retains_output_and_session_until_fence() {
+        use std::task::{Context, Waker};
+        use uring_runtime::reactor::simulation::Simulation;
+        let sim = Simulation::new();
+        sim.set_stream_capacity(32).unwrap();
+        let _sim = sim.enter();
+        let reactor = Reactor::<TestScope, ()>::new(12, ());
+        let submissions = reactor
+            .reserve_submissions(CONTROL_SLOTS + BINARY_CONTROL_SLOTS, ())
+            .unwrap();
+        let owner = Server::new(submissions.clone(), ()).with_binary(submissions, ());
+        let scope = TestScope {
+            deadline: environment::now() + Duration::from_secs(100),
+            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+        };
+        let (fd, peer) = sim.socket_pair();
+        let (completion, signal) = sim.socket_pair();
+        signal.try_send(&[1]).unwrap();
+        let live = Rc::new(Cell::new(1));
+        let cancelled = Rc::new(Cell::new(false));
+        let response = BinaryResponse {
+            duration: Duration::from_secs(1),
+            session: Box::new(SimProducer {
+                fd: RefCell::new(Some(completion)),
+                live: live.clone(),
+                cancelled: cancelled.clone(),
+            }),
+        };
+        let mut task = Box::pin(owner.binary_exchange(
+            &reactor,
+            Rc::new(fd),
+            owner.buffer(&Routes::default()).unwrap(),
+            &scope,
+            &scope,
+            Ok(response),
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut header = Vec::new();
+        for _ in 0..256 {
+            assert!(task.as_mut().poll(&mut cx).is_pending());
+            reactor.poll_budgeted(32).unwrap();
+            let mut bytes = [0; 32];
+            if let Ok(n) = peer.try_recv(&mut bytes) {
+                header.extend_from_slice(&bytes[..n]);
+            }
+            if header.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(header.windows(4).any(|w| w == b"\r\n\r\n"));
+        for _ in 0..16 {
+            assert!(task.as_mut().poll(&mut cx).is_pending());
+            reactor.poll_budgeted(32).unwrap();
+        }
+        assert_eq!(live.get(), 1);
+        drop(task);
+        assert_eq!(live.get(), 1);
+        assert!(owner.binary.as_ref().unwrap().active.get());
+        let mut drain = reactor.drain();
+        let mut done = false;
+        for _ in 0..32 {
+            reactor.poll_budgeted(32).unwrap();
+            if let Poll::Ready(result) = drain.as_mut().poll(&mut cx) {
+                result.unwrap();
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(live.get(), 0);
+        assert!(cancelled.get());
+        assert_eq!(owner.resources.active.get(), 0);
+    }
+
+    impl Handler for BinaryRoutes {
+        type Connection = ();
+        fn connect(&self) -> Option<()> {
+            Some(())
+        }
+        fn get(&self, path: &str, out: &mut dyn Write) -> Result<Response, fmt::Error> {
+            self.routes.get(path, out)
+        }
+        fn observe(&self, event: Event) {
+            self.routes.observe(event);
+        }
+        fn binary(&self, path: &str) -> Option<Result<BinaryResponse, BinaryError>> {
+            if path != "/profile" {
+                return None;
+            }
+            Some(
+                self.producer
+                    .borrow_mut()
+                    .take()
+                    .map(|session| BinaryResponse {
+                        duration: Duration::from_secs(30),
+                        session: Box::new(session),
+                    })
+                    .ok_or(BinaryError::Busy),
+            )
+        }
+    }
+
+    #[test]
+    fn binary_wait_preserves_text_progress_half_close_and_fenced_ownership() {
+        use std::{
+            io::{Read, Write as _},
+            net::{Shutdown, TcpListener, TcpStream},
+            os::unix::net::UnixStream,
+            task::{Context, Waker},
+        };
+        use uring_runtime::environment::SimulationClock;
+        for outcome in [
+            "success",
+            "timeout",
+            "disconnect",
+            "abandon",
+            "parent",
+            "fin",
+            "protocol",
+            "backpressure",
+        ] {
+            let now = Instant::now();
+            let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+            let _clock = clock.environment(0).enter();
+            let reactor = Reactor::<TestScope, ()>::new(12, ());
+            let submissions = reactor
+                .reserve_submissions(CONTROL_SLOTS + BINARY_CONTROL_SLOTS, ())
+                .unwrap();
+            let binary = submissions.clone();
+            let owner = Server::new(submissions, ()).with_binary(binary, ());
+            let scope = TestScope {
+                deadline: now + Duration::from_secs(if outcome == "parent" { 4 } else { 100 }),
+                cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            };
+            let (completion, mut signal) = UnixStream::pair().unwrap();
+            completion.set_nonblocking(true).unwrap();
+            let ready = Rc::new(Cell::new(false));
+            let live = Rc::new(Cell::new(1));
+            let cancelled = Rc::new(Cell::new(false));
+            let handler = BinaryRoutes {
+                routes: Routes::default(),
+                producer: RefCell::new(Some(Producer {
+                    fd: completion.into(),
+                    body_bytes: if outcome == "backpressure" {
+                        MAX_BINARY_BYTES
+                    } else {
+                        4
+                    },
+                    ready: ready.clone(),
+                    live: live.clone(),
+                    cancelled: cancelled.clone(),
+                })),
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
+            if outcome == "disconnect" {
+                // Closing a TCP client with unread server data sends RST.
+                socket.write_all(b"unread").unwrap();
+            }
+            socket.set_nonblocking(true).unwrap();
+            client
+                .write_all(b"GET /profile HTTP/1.1\r\nHost: local\r\n\r\n")
+                .unwrap();
+            client.set_nonblocking(true).unwrap();
+            let mut exchange = owner.exchange(
+                &reactor,
+                &handler,
+                Rc::new(OwnedFd::from(socket).into()),
+                owner.buffer(&handler).unwrap(),
+                &scope,
+            );
+            let mut cx = Context::from_waker(Waker::noop());
+            for _ in 0..16 {
+                assert!(exchange.as_mut().poll(&mut cx).is_pending());
+                reactor.poll_budgeted(32).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            assert!(handler.producer.borrow().is_none());
+            clock.advance(Duration::from_secs(3));
+            assert!(exchange.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(live.get(), 1);
+            let (socket, mut busy) = UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            busy.write_all(b"GET /profile HTTP/1.1\r\nHost: local\r\n\r\n")
+                .unwrap();
+            busy.set_nonblocking(true).unwrap();
+            let mut rejected = owner.exchange(
+                &reactor,
+                &handler,
+                Rc::new(OwnedFd::from(socket).into()),
+                owner.buffer(&handler).unwrap(),
+                &scope,
+            );
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Poll::Ready(result) = rejected.as_mut().poll(&mut cx) {
+                    result.unwrap();
+                    break;
+                }
+                assert!(Instant::now() < until);
+                reactor.poll_budgeted(32).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            let mut bytes = [0; 512];
+            let n = busy.read(&mut bytes).unwrap();
+            assert!(bytes[..n].starts_with(b"HTTP/1.1 409 Conflict\r\n"));
+            assert!(!cancelled.get());
+            drop(rejected);
+            // Saturate ordinary capacity: both capture waits must use prepaid slots.
+            let (idle, _idle_peer) = UnixStream::pair().unwrap();
+            idle.set_nonblocking(true).unwrap();
+            let idle = Rc::new(Descriptor::from(OwnedFd::from(idle)));
+            let mut pressure: Vec<_> = (0..5)
+                .map(|_| reactor.readiness(idle.clone(), 1, &scope))
+                .collect();
+            for wait in &mut pressure {
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+            }
+            // Three ordinary HTTP exchanges still fit while the profile owns slot four.
+            for _ in 0..3 {
+                let (socket, mut text) = UnixStream::pair().unwrap();
+                socket.set_nonblocking(true).unwrap();
+                text.write_all(b"GET /live HTTP/1.1\r\nHost: local\r\n\r\n")
+                    .unwrap();
+                text.set_nonblocking(true).unwrap();
+                let mut request = owner.exchange(
+                    &reactor,
+                    &handler,
+                    Rc::new(OwnedFd::from(socket).into()),
+                    owner.buffer(&handler).unwrap(),
+                    &scope,
+                );
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Poll::Ready(result) = request.as_mut().poll(&mut cx) {
+                        result.unwrap();
+                        break;
+                    }
+                    assert!(Instant::now() < until);
+                    reactor.poll_budgeted(32).unwrap();
+                    reactor.wait(Duration::from_millis(1)).unwrap();
+                }
+                let mut bytes = [0; 256];
+                let n = text.read(&mut bytes).unwrap();
+                assert!(bytes[..n].ends_with(b"\r\n\r\nok\n"));
+            }
+            match outcome {
+                "success" | "backpressure" => {
+                    client.shutdown(Shutdown::Write).unwrap();
+                    for _ in 0..4 {
+                        reactor.poll_budgeted(32).unwrap();
+                        let result = exchange.as_mut().poll(&mut cx);
+                        assert!(result.is_pending(), "half-close: {result:?}");
+                    }
+                    assert!(!cancelled.get());
+                    ready.set(true);
+                    signal.write_all(&[1]).unwrap();
+                }
+                "timeout" => clock.advance(Duration::from_secs(43)),
+                "parent" => clock.advance(Duration::from_secs(1)),
+                "disconnect" => {
+                    drop(client);
+                    client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                }
+                "fin" => {
+                    drop(client);
+                    client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                    clock.advance(Duration::from_secs(43));
+                }
+                "protocol" => {
+                    signal.write_all(&[1]).unwrap();
+                }
+                "abandon" => (),
+                _ => unreachable!(),
+            }
+            if outcome == "backpressure" {
+                for _ in 0..32 {
+                    assert!(exchange.as_mut().poll(&mut cx).is_pending());
+                    reactor.poll_budgeted(32).unwrap();
+                    reactor.wait(Duration::from_millis(1)).unwrap();
+                }
+                assert_eq!(live.get(), 1);
+                assert!(owner.binary.as_ref().unwrap().active.get());
+            } else if outcome != "abandon" {
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Poll::Ready(result) = exchange.as_mut().poll(&mut cx) {
+                        match outcome {
+                            "success" | "protocol" => assert_eq!(result, Ok(())),
+                            "timeout" | "parent" | "fin" => {
+                                assert_eq!(result, Err(Error::DeadlineExceeded))
+                            }
+                            _ => assert_eq!(result, Err(Error::Io)),
+                        }
+                        break;
+                    }
+                    assert!(Instant::now() < until, "{outcome}");
+                    reactor.poll_budgeted(32).unwrap();
+                    reactor.wait(Duration::from_millis(1)).unwrap();
+                }
+                if outcome == "success" {
+                    let mut bytes = [0; 512];
+                    let n = client.read(&mut bytes).unwrap();
+                    assert!(bytes[..n].ends_with(&[0, 255, 10, 13]));
+                    let text = String::from_utf8_lossy(&bytes[..n - 4]);
+                    assert!(text.contains("Content-Length: 4\r\n"));
+                    assert!(text.contains("X-Content-Type-Options: nosniff\r\n"));
+                    assert!(text.contains("Cache-Control: no-store\r\n"));
+                }
+                if outcome == "protocol" {
+                    let mut bytes = [0; 512];
+                    let n = client.read(&mut bytes).unwrap();
+                    assert!(bytes[..n].ends_with(b"backend_protocol\n"));
+                }
+            }
+            drop(exchange);
+            if outcome == "abandon" || outcome == "backpressure" {
+                assert!(cancelled.get());
+                assert_eq!(live.get(), 1, "readiness leases must survive until fenced");
+                assert!(owner.binary.as_ref().unwrap().active.get());
+            }
+            drop(pressure);
+            let mut drain = reactor.drain();
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Poll::Ready(result) = drain.as_mut().poll(&mut cx) {
+                    result.unwrap();
+                    break;
+                }
+                assert!(Instant::now() < until);
+                reactor.poll_budgeted(32).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            assert_eq!(live.get(), 0);
+            assert!(cancelled.get());
+            assert!(!owner.binary.as_ref().unwrap().active.get());
+            assert_eq!(owner.resources.active.get(), 0);
+        }
+    }
 
     /// Reserve runtime bookkeeping for every prepaid slot in addition to buffers.
     #[test]
@@ -565,6 +1196,10 @@ mod tests {
             "X: a\r\n".repeat(16)
         );
         assert_eq!(parse(many.as_bytes()), Route::BadRequest);
+        assert_eq!(
+            parse(b"POST /debug/pprof/profile?seconds=1 HTTP/1.1\r\nHost: a\r\n\r\n"),
+            Route::Method
+        );
         assert_eq!(
             parse(b"POST /live HTTP/1.1\r\nHost: a\r\n\r\n"),
             Route::Method

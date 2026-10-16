@@ -1,0 +1,12 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+{{- if .BootstrapCA }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .BootstrapTrustConfigMap | default "racer-bootstrap-trust" | quote }}
+  namespace: {{ .Namespace | default "unbounded-system" }}
+data:
+  ca.crt: |
+{{ .BootstrapCA | indent 4 }}
+{{- end }}

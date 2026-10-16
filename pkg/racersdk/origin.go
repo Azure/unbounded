@@ -69,7 +69,7 @@ func (r OriginRequest) Format(s fmt.State, _ rune) {
 	_, _ = fmt.Fprintf(s, "OriginRequest{%v, Head: %t, ETag: %q, Offset: %d, Length: %d}", r.Request, r.Head, r.ETag, r.Offset, r.Length) //nolint:errcheck // See above.
 }
 
-// OriginConfig configures [ServeOrigin]. Only Cache is required.
+// OriginConfig configures [ServeOrigin].
 type OriginConfig struct {
 	// Cache names the Racer cache. The origin listens on
 	// /run/racer/<Cache>/origin/socket. The directory must already exist and
@@ -110,7 +110,7 @@ type originLimits struct {
 }
 
 func (c OriginConfig) limits() (originLimits, error) {
-	if err := validateCache(c.Cache); err != nil {
+	if _, err := cacheName(c.Cache); err != nil {
 		return originLimits{}, err
 	}
 
@@ -157,7 +157,12 @@ func (c OriginConfig) limits() (originLimits, error) {
 // it, so the Racer dataplane must run as the same user as the origin or with
 // that capability.
 func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error {
-	return serveOrigin(ctx, config, origin, "/run/racer/"+config.Cache+"/origin/socket")
+	name, err := cacheName(config.Cache)
+	if err != nil {
+		return err
+	}
+
+	return serveOrigin(ctx, config, origin, "/run/racer/"+name+"/origin/socket")
 }
 
 type originConnKey struct{}

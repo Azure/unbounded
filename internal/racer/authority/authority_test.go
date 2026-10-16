@@ -352,7 +352,7 @@ const (
 	testOtherUID = "22222222-2222-4222-8222-222222222222"
 )
 
-// Legacy names exist exclusively inside whitebox tests, never the package API.
+// These short aliases exist only inside whitebox tests, never the package API.
 type (
 	Trust                = trustStore
 	Publications         = publicationStore
@@ -647,10 +647,10 @@ func TestIdentityAndServingHandleProvenance(t *testing.T) {
 func TestKeyringHandleCannotBorrowRecoveredTrust(t *testing.T) {
 	f := newServingFixture(t)
 	a := f.a.authority
-	legacy, stopLegacy, err := a.AdmitTrust(t.Context())
+	earlier, stopEarlier, err := a.AdmitTrust(t.Context())
 	require.NoError(t, err)
 
-	defer stopLegacy()
+	defer stopEarlier()
 
 	old, err := a.Keyring()
 	require.NoError(t, err)
@@ -660,7 +660,7 @@ func TestKeyringHandleCannotBorrowRecoveredTrust(t *testing.T) {
 	defer stop()
 
 	a.trust.invalidate()
-	require.ErrorIs(t, legacy.Check(t.Context()), context.Canceled)
+	require.ErrorIs(t, earlier.Check(t.Context()), context.Canceled)
 	require.NoError(t, a.Observe(t.Context()))
 	require.ErrorIs(t, guard.Check(t.Context()), context.Canceled)
 	fresh, stopFresh, err := a.AdmitTrust(t.Context())
@@ -1032,7 +1032,7 @@ func TestCatalogCapacityRejectsBeforeInitializationClaim(t *testing.T) {
 	}
 }
 
-func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
+func TestCatalogAdmissionOvercommitDoesNotEvict(t *testing.T) {
 	r, now := testKeyring(t)
 	runKeys(t, r)
 	shared, b, state, _ := keyState(t, r)
@@ -1055,8 +1055,8 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Model the older controller's active-only admission without removing the
-	// planner's independent final wire-size check.
+	// Model state committed under a larger capacity policy with active-only
+	// admission, keeping the planner's independent final wire-size check.
 	b, state, _, err = planRotation(r.Config.Rotation, b, state, catalog, *now, nextGeneration(b.Generation))
 	if err != nil {
 		t.Fatal(err)
@@ -1075,12 +1075,12 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 	}
 
 	if _, err := r.operations().ReconcileCredentials(t.Context()); !errors.Is(err, wire.TooLarge) || trustReady(r.Trust) {
-		t.Fatalf("legacy overcommit silently accepted: %v", err)
+		t.Fatalf("overcommit silently accepted: %v", err)
 	}
 
 	after, preserved, _, _ := keyState(t, r)
 	if after.ResourceVersion != shared.ResourceVersion || len(keyedCaches(preserved)) != capacity+1 {
-		t.Fatal("legacy overcommit evicted durable credentials")
+		t.Fatal("overcommit evicted durable credentials")
 	}
 }
 

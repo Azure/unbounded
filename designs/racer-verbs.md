@@ -152,7 +152,7 @@ Rust.
 Because the link is dynamic, the compiler cannot check the ABI. Three checks
 stand in for it:
 
-- The adapter reports ABI version 4 and Rust refuses any other
+- The adapter reports ABI version 1 and Rust refuses any other
   (`native/verbs.c:51-52`, `src/ffi.rs:174-235`).
 - `_Static_assert`s in C (`native/verbs.c:37-44`) and a Rust test check the
   same struct sizes, offsets, and opcode values.

@@ -101,7 +101,7 @@ impl Simulation {
 
     /// Creates a fixture pipe after clamping its capacity to the supported range.
     pub fn pipe(&self, capacity: usize) -> (Descriptor, Descriptor) {
-        // Compatibility fixture API; use try_pipe for untrusted capacities.
+        // Convenience fixture API; use try_pipe for untrusted capacities.
         self.try_pipe(capacity.clamp(1, MAX_ALLOCATION))
             .expect("bounded pipe")
     }

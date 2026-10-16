@@ -137,7 +137,7 @@ func TestPrepareRacerOriginDirectory(t *testing.T) {
 				}
 			}
 
-			// Concurrent startup may race with another creator of the volume path.
+			// Concurrent startup may race with another creator of the cache path.
 			var workers sync.WaitGroup
 			for range 8 {
 				workers.Go(func() {

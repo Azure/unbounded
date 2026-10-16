@@ -366,7 +366,7 @@ func TestRustSubscriptionInterop(t *testing.T) {
 		t.Run("Stat/"+strconv.FormatInt(size, 10), func(t *testing.T) {
 			metadata, err := client.Stat(ctx, Request{Key: Key{byte(key)}})
 			if err != nil || metadata.Size != size {
-				t.Fatal("v2 HEAD metadata", metadata, err)
+				t.Fatal("client HEAD metadata", metadata, err)
 			}
 		})
 

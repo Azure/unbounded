@@ -85,24 +85,24 @@ func TestMixedNetworkConfiguration(t *testing.T) {
 
 func TestMixedNetworkBuilders(t *testing.T) {
 	cfg := workloadConfig(t)
-	legacy, err := testutil.DesiredDaemonSet(cfg)
+	single, err := testutil.DesiredDaemonSet(cfg)
 	require.NoError(t, err)
 	sets, err := testutil.DesiredDaemonSets(cfg)
 	require.NoError(t, err)
-	require.Equal(t, []*appsv1.DaemonSet{legacy}, sets)
+	require.Equal(t, []*appsv1.DaemonSet{single}, sets)
 
 	cfg.HostNetwork = true
 	cfg.PeerPort, cfg.DiagnosticsPort = 18082, 19090
 	cfg.PodNetworkNodes = []string{"node-b", "node-a"}
 	_, err = testutil.DesiredDaemonSet(cfg)
-	require.ErrorIs(t, err, wire.InvalidRequest, "legacy planner must fail closed")
+	require.ErrorIs(t, err, wire.InvalidRequest, "single-workload helper must reject mixed networking")
 	sets, err = testutil.DesiredDaemonSets(cfg)
 	require.NoError(t, err)
 	require.Len(t, sets, 2)
 	host, pod := sets[0], sets[1]
 	require.Equal(t, DataplaneDaemonSetName, host.Name)
 	require.Equal(t, PodNetworkDaemonSetName, pod.Name)
-	require.Equal(t, legacy.Spec.Selector, host.Spec.Selector)
+	require.Equal(t, single.Spec.Selector, host.Spec.Selector)
 	require.True(t, host.Spec.Template.Spec.HostNetwork)
 	require.False(t, pod.Spec.Template.Spec.HostNetwork)
 	require.Equal(t, corev1.DNSClusterFirst, pod.Spec.Template.Spec.DNSPolicy)

@@ -32,7 +32,7 @@ func (p *puller) acquireHTTP(ctx context.Context, kind string, desc ocispec.Desc
 		resource = "manifests"
 	}
 
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v2/" + p.repository + "/" + resource + "/" + desc.Digest.String()
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v2/" + p.img.repository + "/" + resource + "/" + desc.Digest.String()
 
 	endpoint.RawPath = ""
 	if p.opts.Namespace != "" {
@@ -58,7 +58,7 @@ func sdkClientConfig(opts pullOptions, capacity int) racersdk.ClientConfig {
 	// Never let the SDK's zero/default 64 silently cap the configured workload.
 	limit := max(1, capacity*opts.BlobConcurrency)
 
-	return racersdk.ClientConfig{Cache: opts.Volume, MaxConnections: limit}
+	return racersdk.ClientConfig{Cache: opts.Cache, MaxConnections: limit}
 }
 
 func (p *puller) configureUDS(capacity int) error {

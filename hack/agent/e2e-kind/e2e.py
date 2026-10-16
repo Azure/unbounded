@@ -1685,7 +1685,6 @@ ACL_IMAGE_VERSION = os.environ.get("ACL_IMAGE_VERSION", "")
 ACL_IMAGE_RESOURCE_GROUP = os.environ.get("ACL_IMAGE_RESOURCE_GROUP", "")
 ACL_IMAGE_SUBSCRIPTION = os.environ.get("ACL_IMAGE_SUBSCRIPTION", "")
 ACL_GALLERY_IMAGE_PATTERN = re.compile(r"/SharedGalleries/([^/]+)/Images/([^/]+)")
-ACL_SHARED_GALLERY_API_VERSION = "2024-03-03"
 
 # The manifest source.
 ACL_IMAGE_MANIFEST_URL = os.environ.get(
@@ -1751,6 +1750,11 @@ def acl_image_source() -> str:
     return ACL_IMAGE_SOURCE
 
 
+# Compute api-version for sharedGalleries lookups, pinned to one Azure lists as
+# supported in every region rather than whatever the runner's az CLI defaults to.
+ACL_SHARED_GALLERY_API_VERSION = "2024-03-03"
+
+
 def acl_gallery_image() -> tuple[str, str]:
     """Return the gallery's unique name and the image definition."""
     match = ACL_GALLERY_IMAGE_PATTERN.fullmatch(ACL_IMAGE_GALLERY_IMAGE)
@@ -1770,19 +1774,19 @@ def acl_gallery_version() -> str:
     version = ACL_IMAGE_VERSION
     if not version:
         gallery, image = acl_gallery_image()
-        subscription = acl_az(["account", "show", "--query", "id", "-o", "tsv"])
-        url = (
-            "https://management.azure.com/subscriptions/"
-            f"{urllib.parse.quote(subscription, safe='')}/providers/Microsoft.Compute/locations/"
-            f"{urllib.parse.quote(ACL_IMAGE_GALLERY_LOCATION, safe='')}/sharedGalleries/"
-            f"{urllib.parse.quote(gallery, safe='')}/images/"
-            f"{urllib.parse.quote(image, safe='')}/versions/latest"
-            f"?api-version={ACL_SHARED_GALLERY_API_VERSION}"
-        )
+        # az rest with a pinned api-version, not az sig image-version
+        # show-shared: newer az CLIs call an api-version that Azure has not
+        # rolled out for sharedGalleries in every region, which fails with
+        # NoRegisteredProviderFound. The service resolves "latest" itself.
+        subscription = urllib.parse.quote(ACL_IMAGE_SUBSCRIPTION, safe="") or "{subscriptionId}"
+        path = "/".join(urllib.parse.quote(part, safe="") for part in (
+            ACL_IMAGE_GALLERY_LOCATION, "sharedGalleries", gallery, "images", image, "versions", "latest"))
         version = acl_az([
-            "rest", "--method", "get", "--url", url,
+            "rest", "--method", "get",
+            "--url", f"https://management.azure.com/subscriptions/{subscription}/providers/"
+                     f"Microsoft.Compute/locations/{path}?api-version={ACL_SHARED_GALLERY_API_VERSION}",
             "--query", "name", "-o", "tsv",
-        ])
+        ], subscription=False)
         log(f"Azure Container Linux gallery version {version} is the latest of {ACL_IMAGE_GALLERY_IMAGE}")
 
     _check_acl_build_id(version, "ACL_IMAGE_VERSION" if ACL_IMAGE_VERSION else "the gallery's latest version")
@@ -1790,18 +1794,21 @@ def acl_gallery_version() -> str:
     return version
 
 
-def acl_az(args: list[str]) -> str:
+def acl_az(args: list[str], subscription: bool = True) -> str:
     """Run az for the gallery source and return its output. A failure reports
     az's own error, which never holds a SAS: only grant-access prints one, to
     stdout."""
     try:
-        return capture(_acl_az_command(args))
+        return capture(_acl_az_command(args, subscription))
     except subprocess.CalledProcessError as exc:
         die(f"az {' '.join(args[:3])} failed (exit {exc.returncode}): {(exc.stderr or '').strip()[-2000:]}")
         raise AssertionError("unreachable") from exc
 
 
-def _acl_az_command(args: list[str]) -> list[str]:
+def _acl_az_command(args: list[str], subscription: bool = True) -> list[str]:
+    """az rest takes no --subscription; its URL names the subscription."""
+    if not subscription:
+        return ["az", *args, "--only-show-errors"]
     subscription = ["--subscription", ACL_IMAGE_SUBSCRIPTION] if ACL_IMAGE_SUBSCRIPTION else []
     return ["az", *args, *subscription, "--only-show-errors"]
 
@@ -4268,6 +4275,40 @@ def wait_for_nspawn_machine(machine: str, timeout_secs: int = 300) -> None:
     die(f"timed out waiting for nspawn machine '{machine}' after host reboot")
 
 
+def wait_for_machine_shell_success(
+    machine: str,
+    command: str,
+    description: str,
+    timeout_secs: int = 180,
+    interval_secs: int = 3,
+) -> None:
+    """Poll *command* inside *machine* until it succeeds or the deadline passes."""
+
+    log(f"Waiting until {description} (timeout: {timeout_secs}s)...")
+    deadline = time.monotonic() + timeout_secs
+    attempt = 0
+    last_error = ""
+    while True:
+        attempt += 1
+        result = machine_shell_quiet(machine, command)
+        if result.returncode == 0:
+            log(f"Confirmed {description} after {attempt} attempt(s)")
+            return
+        last_error = (
+            f"exit {result.returncode}; stdout={result.stdout.strip()!r}; "
+            f"stderr={result.stderr.strip()!r}"
+        )
+        log(f"  attempt {attempt}: {description} not yet true ({last_error})")
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval_secs)
+
+    die(
+        f"timed out after {timeout_secs}s and {attempt} attempt(s) waiting until "
+        f"{description} in nspawn machine '{machine}'; last error: {last_error}"
+    )
+
+
 def validate_device_refresh_after_host_reboot() -> None:
     """Verify a device appearing during host boot is usable inside nspawn."""
 
@@ -4339,10 +4380,15 @@ EOF
 
     # The manager property verifies the service-level permission was reloaded;
     # reading the device verifies that the refreshed bind is usable in nspawn.
-    machine_shell(
+    # `machinectl show` succeeds as soon as nspawn registers the machine, and
+    # the node's Ready condition can still be the stale pre-reboot value, so
+    # the container's init may not accept `machinectl shell` yet. Poll the
+    # in-container check instead of running it once.
+    wait_for_machine_shell_success(
         machine,
         f"test -c {DEVICE_REFRESH_PATH} && "
         f"dd if={DEVICE_REFRESH_PATH} of=/dev/null bs=1 count=1 status=none",
+        "refreshed device is usable inside nspawn",
     )
 
     log("Device discovery refresh after VM host reboot validated")

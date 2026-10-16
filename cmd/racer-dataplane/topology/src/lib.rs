@@ -46,7 +46,7 @@
 //! assert_eq!(a, 0); // Sorted by ID, not by input order.
 //!
 //! let placement = Placement::new(16);
-//! let owners = placement.rank(&members, b"opaque application key")?;
+//! let owners = placement.rank(&members, b"opaque application key");
 //! assert_eq!(owners.len(), 2); // Up to three owners, never repeated.
 //! assert!(owners.contains(&a) && owners.contains(&b));
 //!
@@ -120,7 +120,7 @@
 //!
 //! - Changing a domain changes the hashes; placement and routes may move.
 //! - Hash formats are versioned (`/slot/v1`, `/hrw/v1`,
-//!   `/placement-identity/v1`, `/next-hop/v5`, and ring `v1`). Changing one
+//!   `/placement-identity/v1`, `/next-hop/v1`, and ring `v1`). Changing one
 //!   needs a planned cluster-wide rollout. Nothing here detects a mismatch.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -463,6 +463,14 @@ impl<M: Member> Membership<M> {
         self.neighbor_slice(position).to_vec()
     }
 
+    /// Whether two members share an overlay edge. Allocation-free: neighbor
+    /// lists are sorted, so this is one binary search. False when either
+    /// position is out of range or both positions are the same member.
+    #[must_use]
+    pub fn is_neighbor(&self, position: usize, other: usize) -> bool {
+        self.neighbor_slice(position).binary_search(&other).is_ok()
+    }
+
     /// Like [`Self::neighbors`], but borrows instead of copying.
     fn neighbor_slice(&self, position: usize) -> &[usize] {
         self.graph.get(position).map_or(&[], Vec::as_slice)
@@ -522,7 +530,7 @@ fn validate_id_length(length: usize) -> Result<(), Error> {
 }
 
 /// SHA-256 helpers. Hash output must never change, so edit with care.
-mod hash {
+pub mod hash {
     use crate::Member;
 
     use sha2::{Digest, Sha256};
@@ -535,7 +543,7 @@ mod hash {
     }
 
     /// Start a hash with exactly these bytes.
-    fn named_domain(name: &[u8]) -> Sha256 {
+    pub fn named_domain(name: &[u8]) -> Sha256 {
         let mut hash = Sha256::new();
         hash.update(name);
         hash
@@ -543,8 +551,15 @@ mod hash {
 
     /// Add a value, preceded by its length as a big-endian u32.
     pub(super) fn bytes(hash: &mut Sha256, value: &[u8]) {
+        try_bytes(hash, value).expect("topology hash fields must fit the u32 length schema");
+    }
+
+    /// Append a u32-length-prefixed field, rejecting oversized input before mutation.
+    pub fn try_bytes(hash: &mut Sha256, value: &[u8]) -> Result<(), crate::Error> {
+        crate::validate_id_length(value.len())?;
         hash.update(field_length(value.len()).to_be_bytes());
         hash.update(value);
+        Ok(())
     }
 
     /// Convert a length to u32. Panics if it does not fit.
@@ -553,7 +568,7 @@ mod hash {
     }
 
     /// Finish the hash.
-    pub(super) fn finish(hash: Sha256) -> [u8; 32] {
+    pub fn finish(hash: Sha256) -> [u8; 32] {
         hash.finalize().into()
     }
 
@@ -566,10 +581,28 @@ mod hash {
         #[test]
         fn length_prefix_checks_without_allocating_gigabytes() {
             assert_eq!(field_length(0), 0);
+            assert_eq!(crate::validate_id_length(0), Ok(()));
             assert_eq!(field_length(u32::MAX as usize), u32::MAX);
+            assert_eq!(crate::validate_id_length(u32::MAX as usize), Ok(()));
             if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
                 assert!(std::panic::catch_unwind(|| field_length(overflow)).is_err());
+                assert_eq!(
+                    crate::validate_id_length(overflow),
+                    Err(crate::Error::InvalidMember)
+                );
             }
+        }
+
+        /// Public checked fields preserve the internal schema, including empty values.
+        #[test]
+        fn checked_fields_preserve_exact_schema() {
+            let mut checked = named_domain(b"racer/link-backoff/v1\0");
+            try_bytes(&mut checked, b"node").unwrap();
+            try_bytes(&mut checked, b"").unwrap();
+            checked.update(3u32.to_be_bytes());
+            let expected: [u8; 32] =
+                Sha256::digest(b"racer/link-backoff/v1\0\0\0\0\x04node\0\0\0\0\0\0\0\x03").into();
+            assert_eq!(finish(checked), expected);
         }
 
         /// The helpers produce exactly the expected bytes.
@@ -757,6 +790,28 @@ mod overlay {
             }
         }
 
+        /// `is_neighbor` agrees with the neighbor lists and rejects bad positions.
+        #[test]
+        fn is_neighbor_matches_neighbor_lists() {
+            for count in [0, 1, 2, 3, 32, 100, 257] {
+                let members = membership(count);
+                let count = count as usize;
+                for position in 0..count {
+                    let neighbors = members.neighbors(position);
+                    for other in 0..count {
+                        assert_eq!(
+                            members.is_neighbor(position, other),
+                            neighbors.contains(&other)
+                        );
+                    }
+                    assert!(!members.is_neighbor(position, position));
+                    assert!(!members.is_neighbor(position, count));
+                    assert!(!members.is_neighbor(count, position));
+                }
+                assert!(!members.is_neighbor(usize::MAX, 0));
+            }
+        }
+
         /// A join or leave only changes edges next to that member.
         #[test]
         fn joins_and_leaves_change_only_local_id_edges() {
@@ -875,7 +930,7 @@ mod tests {
             hash::finish(hash::domain::<Adversarial>(b"/placement-identity/v1\0"))
         );
         let placement = crate::Placement::new(2);
-        assert_eq!(placement.rank(&members, b"key").unwrap(), vec![0]);
+        assert_eq!(placement.rank(&members, b"key"), vec![0]);
         assert_eq!(
             Membership::<Adversarial>::new(vec![]).unwrap_err(),
             Error::InvalidDomain
@@ -1065,9 +1120,9 @@ mod tests {
         );
     }
 
-    /// Placement hash is unchanged from v1; graph hash ignores weights.
+    /// Placement identity matches a fixed vector; graph hash ignores weights.
     #[test]
-    fn placement_identity_preserves_v1_and_topology_ignores_weights() {
+    fn placement_identity_matches_vector_and_topology_ignores_weights() {
         let old = Membership::new(vec![member(b"b", 9), member(b"a", 1)]).unwrap();
         let expected: [u8; 32] = sha2::Sha256::digest(
             b"binary-store/placement-identity/v1\0\0\0\0\x01a\0\0\0\x01\0\0\0\x01b\0\0\0\x09",

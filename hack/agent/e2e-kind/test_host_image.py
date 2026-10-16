@@ -400,29 +400,26 @@ class TestGalleryVersion(unittest.TestCase):
 
     def test_latest_is_resolved_where_the_image_is_replicated(self):
         with patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", "sub"), \
-                patch.object(
-                    e2e,
-                    "capture",
-                    side_effect=["00000000-0000-0000-0000-000000000000", "3.20261007.1021"],
-                ) as az:
+                patch.object(e2e, "capture", return_value="3.20261007.1021") as az:
             self.assertEqual(e2e.acl_gallery_version(), "3.20261007.1021")
 
-        account_args = az.call_args_list[0].args[0]
-        self.assertEqual(account_args[:3], ["az", "account", "show"])
-        self.assertEqual(account_args[account_args.index("--subscription") + 1], "sub")
-
-        rest_args = az.call_args_list[1].args[0]
-        self.assertEqual(rest_args[:4], ["az", "rest", "--method", "get"])
-        url = rest_args[rest_args.index("--url") + 1]
+        args = az.call_args.args[0]
+        self.assertEqual(args[:4], ["az", "rest", "--method", "get"])
+        self.assertNotIn("--subscription", args)
         self.assertEqual(
-            url,
-            "https://management.azure.com/subscriptions/"
-            "00000000-0000-0000-0000-000000000000/providers/Microsoft.Compute/locations/"
-            "westus2/sharedGalleries/b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL/images/"
-            "acl-1es-eval/versions/latest?api-version=2024-03-03",
-        )
-        self.assertNotIn("show-shared", rest_args)
-        self.assertEqual(rest_args[rest_args.index("--subscription") + 1], "sub")
+            args[args.index("--url") + 1],
+            "https://management.azure.com/subscriptions/sub/providers/Microsoft.Compute/locations/"
+            f"{e2e.ACL_IMAGE_GALLERY_LOCATION}/sharedGalleries/b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL/"
+            "images/acl-1es-eval/versions/latest?api-version=2024-03-03")
+        self.assertEqual(args[args.index("--query") + 1], "name")
+
+    def test_latest_without_a_subscription_uses_the_az_default(self):
+        with patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", ""), \
+                patch.object(e2e, "capture", return_value="3.1") as az:
+            self.assertEqual(e2e.acl_gallery_version(), "3.1")
+
+        url = az.call_args.args[0][az.call_args.args[0].index("--url") + 1]
+        self.assertIn("/subscriptions/{subscriptionId}/providers/", url)
 
     def test_a_pinned_version_is_not_looked_up(self):
         with patch.object(e2e, "ACL_IMAGE_VERSION", "3.1"), \

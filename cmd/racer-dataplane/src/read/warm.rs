@@ -1,0 +1,1267 @@
+//! Node-wide warm jobs. Progress means disk publication, not writer queue admission.
+
+use super::dispatch::WorkerDirectory;
+use crate::error::{Error, Result};
+use crate::model::{ObjectMetadata, ObjectVersion, PAGE_BYTES, PageId, PageNumber, RequestId};
+use crate::runtime::RequestScope;
+use crate::security::ChargedOriginContext;
+use crate::telemetry::{Metrics, WarmEvent};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, SystemTime};
+
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    pub max_ttl: Duration,
+    pub fill_timeout: Duration,
+    pub max_jobs: usize,
+    pub window: usize,
+    pub retained_percent: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_ttl: Duration::from_secs(3600),
+            fill_timeout: Duration::from_secs(600),
+            max_jobs: 16,
+            window: 2,
+            retained_percent: 50,
+        }
+    }
+}
+
+impl Config {
+    pub fn validate(self) -> Result<()> {
+        if self.max_ttl.is_zero()
+            || self.max_ttl > Duration::from_secs(86400)
+            || self.fill_timeout.is_zero()
+            || self.fill_timeout > Duration::from_secs(86400)
+            || !(1..=1024).contains(&self.max_jobs)
+            || !(1..=64).contains(&self.window)
+            || !(1..=100).contains(&self.retained_percent)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
+
+struct Progress {
+    runners: BTreeMap<u64, Waker>,
+    next_runner: u64,
+    revision: u64,
+    admissions: usize,
+    running: bool,
+    until: Option<SystemTime>,
+    frontier: u64,
+    stopped: bool,
+    waiters: BTreeMap<u64, (Waker, std::time::Instant)>,
+    sequence: u64,
+}
+
+pub(crate) struct Job {
+    previous_until: Option<SystemTime>,
+    metrics: Metrics,
+    version: ObjectVersion,
+    scope: RequestScope,
+    admission: futures::lock::Mutex<()>,
+    progress: Mutex<Progress>,
+}
+
+pub struct WarmRegistry {
+    metrics: std::sync::OnceLock<Metrics>,
+    config: Mutex<Config>,
+    jobs: Mutex<BTreeMap<ObjectVersion, Arc<Job>>>,
+    waiter_limit: usize,
+    draining: std::sync::atomic::AtomicBool,
+    releases: Mutex<BTreeMap<u16, ReleaseQueue>>,
+}
+type ReleaseQueue = (Option<Waker>, std::collections::BTreeSet<ObjectVersion>);
+
+impl WarmRegistry {
+    pub(crate) fn new(waiter_limit: usize) -> Self {
+        Self {
+            metrics: std::sync::OnceLock::new(),
+            config: Mutex::new(Config::default()),
+            jobs: Mutex::new(BTreeMap::new()),
+            waiter_limit,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            releases: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn configure(&self, config: Config) -> Result<()> {
+        config.validate()?;
+        if !self.jobs.lock().unwrap().is_empty() {
+            return Err(Error::InvalidConfiguration);
+        }
+        *self.config.lock().unwrap() = config;
+        Ok(())
+    }
+
+    pub fn config(&self) -> Config {
+        *self.config.lock().unwrap()
+    }
+
+    pub(super) fn attach_metrics(&self, metrics: &Metrics) {
+        self.metrics.get_or_init(|| metrics.clone());
+    }
+
+    fn metrics(&self) -> Metrics {
+        self.metrics.get().cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn contains(&self, version: &ObjectVersion) -> bool {
+        self.jobs.lock().unwrap().contains_key(version)
+    }
+
+    pub(crate) fn drained(&self, worker: crate::model::WorkerId) -> bool {
+        !self.jobs.lock().unwrap().values().any(|job| {
+            let p = job.progress.lock().unwrap();
+            p.running || p.admissions != 0
+        }) && self
+            .releases
+            .lock()
+            .unwrap()
+            .get(&worker.0)
+            .is_none_or(|(_, versions)| versions.is_empty())
+    }
+
+    fn wake_workers(&self) {
+        let wake = self
+            .releases
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|(waker, _)| waker.clone())
+            .collect::<Vec<_>>();
+        for waker in wake {
+            waker.wake();
+        }
+    }
+
+    pub(crate) fn poll_releases(
+        &self,
+        worker: crate::model::WorkerId,
+        index: &crate::store::catalog::Index,
+        cx: &mut Context<'_>,
+    ) -> Result<()> {
+        self.poll_releases_with(worker, cx, |version| index.release_hold(version))
+    }
+
+    fn poll_releases_with(
+        &self,
+        worker: crate::model::WorkerId,
+        cx: &mut Context<'_>,
+        mut release: impl FnMut(&ObjectVersion) -> Result<()>,
+    ) -> Result<()> {
+        let versions = {
+            let mut releases = self.releases.lock().unwrap();
+            let (waker, versions) = releases.entry(worker.0).or_default();
+            *waker = Some(cx.waker().clone());
+            versions.iter().cloned().collect::<Vec<_>>()
+        };
+        for version in versions {
+            if let Err(error) = release(&version) {
+                // Retry on the next worker turn, never self-wake or lose the tail.
+                return if error == Error::Overloaded {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
+            self.releases
+                .lock()
+                .unwrap()
+                .entry(worker.0)
+                .or_default()
+                .1
+                .remove(&version);
+        }
+        Ok(())
+    }
+
+    fn release(&self, version: &ObjectVersion, workers: &[crate::model::WorkerId]) {
+        let wake = {
+            let mut releases = self.releases.lock().unwrap();
+            workers
+                .iter()
+                .filter_map(|worker| {
+                    let (waker, versions) = releases.entry(worker.0).or_default();
+                    versions.insert(version.clone());
+                    waker.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        for waker in wake {
+            waker.wake();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn begin(&self, version: &ObjectVersion) -> Result<(Arc<Job>, bool)> {
+        self.begin_selected(version, false)
+    }
+
+    pub(super) fn begin_selected(
+        &self,
+        version: &ObjectVersion,
+        selecting: bool,
+    ) -> Result<(Arc<Job>, bool)> {
+        use std::sync::atomic::Ordering;
+        if self.draining.load(Ordering::Acquire) {
+            return Err(Error::Unavailable);
+        }
+        let config = self.config();
+        let mut jobs = self.jobs.lock().unwrap();
+        let mut previous_until = None;
+        jobs.retain(|_, job| {
+            let progress = job.progress.lock().unwrap();
+            let expired = progress
+                .until
+                .is_some_and(|until| until <= uring_runtime::environment::wall_now());
+            progress.running || progress.admissions != 0 || (!expired && !progress.stopped)
+        });
+        if let Some(job) = jobs.get(version) {
+            let mut progress = job.progress.lock().unwrap();
+            if progress.stopped || progress.admissions >= self.waiter_limit {
+                return Err(Error::Overloaded);
+            }
+            if progress.running {
+                job.scope.check()?;
+                progress.admissions += 1;
+                return Ok((job.clone(), false));
+            }
+            if progress.admissions != 0 {
+                return Err(Error::Overloaded);
+            }
+            previous_until = progress.until;
+        }
+        if selecting {
+            return Err(Error::Overloaded);
+        }
+        if (!jobs.contains_key(version) && jobs.len() >= config.max_jobs)
+            || self
+                .releases
+                .lock()
+                .unwrap()
+                .values()
+                .any(|(_, versions)| !versions.is_empty())
+        {
+            return Err(Error::Overloaded);
+        }
+        let mut request = [0; 16];
+        uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
+        let job = Arc::new(Job {
+            previous_until,
+            metrics: self.metrics(),
+            version: version.clone(),
+            scope: RequestScope::new(
+                RequestId(request),
+                uring_runtime::environment::now() + config.fill_timeout,
+            )?,
+            admission: futures::lock::Mutex::new(()),
+            progress: Mutex::new(Progress {
+                runners: BTreeMap::new(),
+                next_runner: 0,
+                revision: 0,
+                admissions: 1,
+                running: true,
+                until: None,
+                frontier: 0,
+                stopped: false,
+                waiters: BTreeMap::new(),
+                sequence: 0,
+            }),
+        });
+        jobs.insert(version.clone(), job.clone());
+        Ok((job, true))
+    }
+
+    pub(crate) fn stop(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        let jobs = self
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for job in jobs {
+            let _ = job.scope.cancel();
+        }
+    }
+
+    pub(crate) fn poll_deadlines(&self) {
+        let now = uring_runtime::environment::now();
+        let wall = uring_runtime::environment::wall_now();
+        let mut jobs = self.jobs.lock().unwrap();
+        let mut cancel = Vec::new();
+        let mut wake = Vec::new();
+        jobs.retain(|_, job| {
+            let mut progress = job.progress.lock().unwrap();
+            let expired = progress.until.is_some_and(|until| until <= wall);
+            if progress.running
+                && ((expired && progress.admissions <= 1) || job.scope.deadline.0 <= now)
+            {
+                cancel.push(job.clone());
+            }
+            let remove = !progress.running && progress.admissions == 0 && expired;
+            if remove {
+                progress.stopped = true;
+            }
+            wake.extend(
+                progress
+                    .waiters
+                    .values()
+                    .filter(|(_, deadline)| *deadline <= now || remove)
+                    .map(|(waker, _)| waker.clone()),
+            );
+            !remove
+        });
+        drop(jobs);
+        for job in cancel {
+            let _ = job.scope.cancel();
+        }
+        for waker in wake {
+            waker.wake();
+        }
+    }
+
+    /// Wait even for pages outside the current warm window. A miss permits normal Fill.
+    pub(crate) async fn wait(&self, page: &PageId, scope: &RequestScope) -> Result<bool> {
+        let job = self.jobs.lock().unwrap().get(&page.version).cloned();
+        let Some(job) = job else {
+            return Ok(false);
+        };
+        let mut waiter = Waiter {
+            job,
+            id: None,
+            limit: self.waiter_limit,
+            deadline: scope.deadline.0,
+        };
+        let cancellation = scope.cancellation.subscribe()?;
+        let result = std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            waiter.poll(cx, page.number.0)
+        })
+        .await;
+        waiter.finish(match result {
+            Ok(true) => WarmEvent::WaitCompleted,
+            Ok(false) => WarmEvent::WaitFallback,
+            Err(_) => WarmEvent::WaitFailed,
+        });
+        result
+    }
+
+    fn remove(&self, job: &Arc<Job>) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs
+            .get(&job.version)
+            .is_some_and(|old| Arc::ptr_eq(old, job))
+        {
+            jobs.remove(&job.version);
+        }
+    }
+
+    pub fn snapshot(&self) -> (usize, usize) {
+        let jobs = self.jobs.lock().unwrap();
+        (
+            jobs.len(),
+            jobs.values()
+                .map(|job| job.progress.lock().unwrap().waiters.len())
+                .sum(),
+        )
+    }
+}
+
+impl Job {
+    fn update(&self, change: impl FnOnce(&mut Progress)) {
+        let wake = {
+            let mut progress = self.progress.lock().unwrap();
+            change(&mut progress);
+            progress
+                .waiters
+                .values()
+                .map(|(waker, _)| waker.clone())
+                .collect::<Vec<_>>()
+        };
+        for waker in wake {
+            waker.wake();
+        }
+    }
+    pub(super) fn stop(&self) {
+        self.update(|progress| {
+            progress.stopped = true;
+            progress.running = false;
+        });
+    }
+}
+
+struct Waiter {
+    job: Arc<Job>,
+    id: Option<u64>,
+    limit: usize,
+    deadline: std::time::Instant,
+}
+impl Waiter {
+    fn finish(&mut self, event: WarmEvent) {
+        if let Some(id) = self.id.take() {
+            self.job.progress.lock().unwrap().waiters.remove(&id);
+            self.job.metrics.warm_event(event);
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>, number: u64) -> Poll<Result<bool>> {
+        let mut progress = self.job.progress.lock().unwrap();
+        if progress.stopped
+            || (!progress.running
+                && progress
+                    .until
+                    .is_some_and(|until| until <= uring_runtime::environment::wall_now()))
+        {
+            return Poll::Ready(Ok(false));
+        }
+        if number < progress.frontier {
+            return Poll::Ready(Ok(true));
+        }
+        let id = match self.id {
+            Some(id) => id,
+            None => {
+                if progress.waiters.len() >= self.limit {
+                    return Poll::Ready(Err(Error::Overloaded));
+                }
+                progress.sequence = progress.sequence.checked_add(1).ok_or(Error::Overloaded)?;
+                self.id = Some(progress.sequence);
+                self.job.metrics.warm_event(WarmEvent::WaitStarted);
+                progress.sequence
+            }
+        };
+        progress
+            .waiters
+            .insert(id, (cx.waker().clone(), self.deadline));
+        Poll::Pending
+    }
+}
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.finish(WarmEvent::WaitFailed);
+    }
+}
+
+/// A decision survives caller cancellation when moved into the detached driver.
+struct Outcome {
+    metrics: Metrics,
+    event: WarmEvent,
+}
+impl Drop for Outcome {
+    fn drop(&mut self) {
+        self.metrics.warm_event(self.event);
+    }
+}
+
+struct JobGuard {
+    directory: Arc<WorkerDirectory>,
+    job: Arc<Job>,
+    complete: bool,
+}
+struct Runner {
+    job: Arc<Job>,
+    id: u64,
+}
+impl Runner {
+    fn new(job: Arc<Job>) -> Result<Self> {
+        let mut progress = job.progress.lock().unwrap();
+        progress.next_runner = progress
+            .next_runner
+            .checked_add(1)
+            .ok_or(Error::Overloaded)?;
+        let id = progress.next_runner;
+        drop(progress);
+        Ok(Self { job, id })
+    }
+}
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.job.progress.lock().unwrap().runners.remove(&self.id);
+    }
+}
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        let runners = {
+            let mut progress = self.job.progress.lock().unwrap();
+            progress.admissions -= 1;
+            std::mem::take(&mut progress.runners)
+        };
+        for runner in runners.into_values() {
+            runner.wake();
+        }
+        if !self.complete {
+            let _ = self.job.scope.cancel();
+            self.job.stop();
+        }
+        let progress = self.job.progress.lock().unwrap();
+        let remove = progress.stopped && progress.admissions == 0;
+        drop(progress);
+        if remove {
+            self.directory.warm.remove(&self.job);
+        }
+        self.directory.warm.wake_workers();
+    }
+}
+
+/// Admission runs under an owned driver so a disconnected HEAD cannot leak a partial hold.
+pub(crate) async fn admit(
+    directory: Arc<WorkerDirectory>,
+    metadata: ObjectMetadata,
+    membership: Arc<crate::topology::Membership>,
+    context: ChargedOriginContext,
+    ttl: Duration,
+    caller: &RequestScope,
+) -> Result<SystemTime> {
+    let mut admission = Outcome {
+        metrics: directory.warm.metrics(),
+        event: WarmEvent::Refused,
+    };
+    caller.check()?;
+    let config = directory.warm.config();
+    if ttl.is_zero() {
+        return Err(Error::InvalidRequest);
+    }
+    let until = uring_runtime::environment::wall_now()
+        .checked_add(ttl.min(config.max_ttl))
+        .ok_or(Error::InvalidRequest)?;
+    let permit = uring_runtime::drivers::reserve()?;
+    let (job, fresh) = directory
+        .subscriptions
+        .admit_warm(&metadata.version, &directory.warm)?;
+    let (send, receive) = futures::channel::oneshot::channel();
+    permit.submit_detached(Box::pin(async move {
+        let mut guard = JobGuard {
+            directory: directory.clone(),
+            job: job.clone(),
+            complete: !fresh,
+        };
+        // The first caller owns startup, even if another worker polls its
+        // coalesced admission first. Do not extend a reservation not yet admitted.
+        if !fresh {
+            let runner = Runner::new(job.clone())?;
+            let cancellation = job.scope.cancellation.subscribe()?;
+            std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                job.scope.check()?;
+                let mut progress = job.progress.lock().unwrap();
+                if progress.stopped {
+                    return Poll::Ready(Err(Error::Unavailable));
+                }
+                if progress.until.is_some() {
+                    return Poll::Ready(Ok(()));
+                }
+                progress.runners.insert(runner.id, cx.waker().clone());
+                Poll::Pending
+            })
+            .await?;
+        }
+        let lock = job.admission.lock().await;
+        if job.progress.lock().unwrap().stopped {
+            let _ = send.send(Err(Error::Unavailable));
+            return Ok::<(), Error>(());
+        }
+        let old = job.progress.lock().unwrap().until.or(job.previous_until);
+        let target = old.map_or(until, |old| old.max(until));
+        let pages = metadata.length.div_ceil(PAGE_BYTES);
+        // Every reservation pass can cross expiry on an untouched owner. Hide
+        // the old frontier before yielding and reverify all pages afterward.
+        let revision = {
+            let mut progress = job.progress.lock().unwrap();
+            progress.revision = progress.revision.checked_add(1).ok_or(Error::Overloaded)?;
+            progress.frontier = 0;
+            progress.revision
+        };
+        let reservation_scope = if fresh {
+            job.scope.clone()
+        } else {
+            RequestScope::new(
+                job.scope.request,
+                uring_runtime::environment::now() + config.fill_timeout,
+            )?
+        };
+        let mut fresh_workers = Vec::new();
+        let admitted = directory
+            .reserve_warm(
+                &metadata.version,
+                pages,
+                target,
+                &reservation_scope,
+                &mut fresh_workers,
+            )
+            .await
+            .and_then(|accepted| {
+                job.scope.check()?;
+                if directory
+                    .warm
+                    .draining
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(accepted)
+                }
+            });
+        let target = match admitted {
+            Ok(target) => target,
+            Err(error) => {
+                if fresh {
+                    directory.warm.release(&metadata.version, &fresh_workers);
+                    job.stop();
+                }
+                let _ = send.send(Err(error));
+                return Ok::<(), Error>(());
+            }
+        };
+        job.update(|progress| progress.until = Some(target));
+        let runners = std::mem::take(&mut job.progress.lock().unwrap().runners);
+        for runner in runners.into_values() {
+            runner.wake();
+        }
+        admission.event = WarmEvent::Accepted;
+        drop(admission);
+        drop(lock);
+        let _ = send.send(Ok(target));
+        if !fresh {
+            return Ok(());
+        }
+        let mut outcome = Outcome {
+            metrics: job.metrics.clone(),
+            event: WarmEvent::Failed,
+        };
+        let result = run(
+            &directory,
+            &job,
+            &metadata,
+            membership,
+            &context,
+            config.window,
+            revision,
+        )
+        .await;
+        if result.is_err() {
+            let _lock = job.admission.lock().await;
+            directory.warm.release(&metadata.version, &fresh_workers);
+            job.stop();
+        } else {
+            guard.complete = true;
+            outcome.event = WarmEvent::Completed;
+        }
+        Ok(())
+    }));
+    let mut receive = Box::pin(receive);
+    let cancellation = caller.cancellation.subscribe()?;
+    std::future::poll_fn(|cx| {
+        cancellation.register(cx.waker());
+        caller.check()?;
+        use std::future::Future;
+        receive.as_mut().poll(cx).map(|result| {
+            result
+                .map_err(|_| Error::Unavailable)
+                .and_then(|result| result)
+        })
+    })
+    .await
+}
+
+async fn run(
+    directory: &Arc<WorkerDirectory>,
+    job: &Arc<Job>,
+    metadata: &ObjectMetadata,
+    membership: Arc<crate::topology::Membership>,
+    context: &ChargedOriginContext,
+    window: usize,
+    mut revision: u64,
+) -> Result<()> {
+    use futures::{StreamExt, stream::FuturesOrdered};
+    let count = metadata.length.div_ceil(PAGE_BYTES);
+    let mut pending = FuturesOrdered::new();
+    let mut next = 0;
+    let mut failure = None;
+    loop {
+        while failure.is_none() && next < count && pending.len() < window {
+            if let Err(error) = job.scope.check() {
+                failure = Some(error);
+                break;
+            }
+            if job
+                .progress
+                .lock()
+                .unwrap()
+                .until
+                .is_none_or(|until| until <= uring_runtime::environment::wall_now())
+            {
+                let _lock = job.admission.lock().await;
+                if job
+                    .progress
+                    .lock()
+                    .unwrap()
+                    .until
+                    .is_none_or(|until| until <= uring_runtime::environment::wall_now())
+                {
+                    failure = Some(Error::DeadlineExceeded);
+                    break;
+                }
+            }
+            let page = PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(next),
+            };
+            pending.push_back(directory.warm_page(
+                page,
+                metadata.immutable(),
+                membership.clone(),
+                context,
+                &job.scope,
+            ));
+            next += 1;
+        }
+        if failure.is_some() {
+            let _ = job.scope.cancel();
+        }
+        let Some(result) = pending.next().await else {
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            let runner = Runner::new(job.clone())?;
+            std::future::poll_fn(|cx| {
+                let mut progress = job.progress.lock().unwrap();
+                if progress.admissions <= 1 {
+                    Poll::Ready(())
+                } else {
+                    progress.runners.insert(runner.id, cx.waker().clone());
+                    Poll::Pending
+                }
+            })
+            .await;
+            let _lock = job.admission.lock().await;
+            let mut progress = job.progress.lock().unwrap();
+            if progress.admissions > 1 {
+                continue;
+            }
+            if progress.revision != revision {
+                revision = progress.revision;
+                progress.frontier = 0;
+                next = 0;
+                continue;
+            }
+            progress.running = false;
+            return Ok(());
+        };
+        match result {
+            Ok(()) if failure.is_none() => job.update(|progress| {
+                if progress.revision == revision {
+                    progress.frontier += 1;
+                }
+            }),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::Event;
+    use std::future::Future;
+
+    #[test]
+    fn admission_and_job_metrics_survive_caller_drop_and_count_coalescing_once() {
+        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(
+                    super::super::dispatch::WorkerMap::new(vec![crate::model::WorkerId(0)])
+                        .unwrap(),
+                ),
+                vec![crate::model::WorkerId(0)],
+                8,
+            )
+            .unwrap(),
+        );
+        let metrics = Metrics::default();
+        directory.warm.attach_metrics(&metrics);
+        let mut endpoint = directory
+            .install(crate::model::WorkerId(0), local.clone())
+            .unwrap();
+        let caller = scope();
+        let origin = crate::security::OriginContext {
+            object: version("metrics").object,
+            metadata: None,
+            authorization: None,
+        };
+        let membership = Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let metadata = ObjectMetadata {
+            version: version("metrics"),
+            length: 0,
+            content_type: None,
+            expires_at: crate::model::ExpiresAt::from_system_time(SystemTime::UNIX_EPOCH).unwrap(),
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut admission = Box::pin(admit(
+            directory.clone(),
+            metadata.clone(),
+            membership.clone(),
+            local.credentials.local_context(&origin, &caller).unwrap(),
+            Duration::from_secs(60),
+            &caller,
+        ));
+        assert!(admission.as_mut().poll(&mut cx).is_pending());
+        drop(admission);
+        caller.cancel().unwrap();
+        for _ in 0..32 {
+            queue.poll(&mut cx, 64);
+            endpoint.poll(&mut cx, 64).unwrap();
+            if queue.pending() == 0 {
+                break;
+            }
+        }
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(metrics.count(Event::WarmAccepted), 1);
+        assert_eq!(metrics.count(Event::WarmCompleted), 1);
+        assert_eq!(metrics.count(Event::WarmRefused), 0);
+        let caller = scope();
+        for ttl in [Duration::from_secs(60), Duration::ZERO] {
+            let mut admission = Box::pin(admit(
+                directory.clone(),
+                metadata.clone(),
+                membership.clone(),
+                local.credentials.local_context(&origin, &caller).unwrap(),
+                ttl,
+                &caller,
+            ));
+            let mut result = None;
+            for _ in 0..32 {
+                if let Poll::Ready(value) = admission.as_mut().poll(&mut cx) {
+                    result = Some(value);
+                    break;
+                }
+                queue.poll(&mut cx, 64);
+                endpoint.poll(&mut cx, 64).unwrap();
+            }
+            assert_eq!(result.unwrap().is_ok(), !ttl.is_zero());
+        }
+        assert_eq!(metrics.count(Event::WarmAccepted), 2);
+        assert_eq!(
+            metrics.count(Event::WarmCompleted),
+            2,
+            "completed HEAD starts one new verification driver"
+        );
+        assert_eq!(metrics.count(Event::WarmRefused), 1);
+        assert_eq!(metrics.count(Event::WarmFailed), 0);
+
+        let mut refused = Box::pin(admit(
+            directory.clone(),
+            ObjectMetadata {
+                version: version("too-large"),
+                length: 100 * PAGE_BYTES,
+                ..metadata.clone()
+            },
+            membership.clone(),
+            local.credentials.local_context(&origin, &caller).unwrap(),
+            Duration::from_secs(60),
+            &caller,
+        ));
+        let mut result = None;
+        for _ in 0..32 {
+            if let Poll::Ready(value) = refused.as_mut().poll(&mut cx) {
+                result = Some(value);
+                break;
+            }
+            queue.poll(&mut cx, 64);
+            endpoint.poll(&mut cx, 64).unwrap();
+        }
+        assert_eq!(result.unwrap(), Err(Error::Overloaded));
+        drop(refused);
+        endpoint.poll(&mut cx, 64).unwrap();
+        assert_eq!(metrics.count(Event::WarmRefused), 2);
+        assert_eq!(
+            metrics.count(Event::WarmFailed),
+            0,
+            "unadmitted jobs are refusals"
+        );
+
+        let metadata = ObjectMetadata {
+            version: version("failed"),
+            length: 3,
+            ..metadata
+        };
+        let mut admission = Box::pin(admit(
+            directory.clone(),
+            metadata,
+            membership,
+            local.credentials.local_context(&origin, &caller).unwrap(),
+            Duration::from_secs(60),
+            &caller,
+        ));
+        assert!(admission.as_mut().poll(&mut cx).is_pending());
+        queue.poll(&mut cx, 64);
+        endpoint.poll(&mut cx, 64).unwrap();
+        queue.poll(&mut cx, 64);
+        assert!(matches!(
+            admission.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(admission);
+        directory.warm.stop();
+        for _ in 0..32 {
+            endpoint.poll(&mut cx, 64).unwrap();
+            queue.poll(&mut cx, 64);
+            if queue.pending() == 0 {
+                break;
+            }
+        }
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(metrics.count(Event::WarmAccepted), 3);
+        assert_eq!(metrics.count(Event::WarmCompleted), 2);
+        assert_eq!(metrics.count(Event::WarmFailed), 1);
+        assert_eq!(metrics.count(Event::WarmRefused), 2);
+    }
+
+    #[test]
+    fn wait_metrics_count_registration_and_one_terminal_outcome() {
+        let registry = WarmRegistry::new(1);
+        let metrics = Metrics::default();
+        registry.attach_metrics(&metrics);
+        let page = PageId {
+            version: version("metrics"),
+            number: PageNumber(0),
+        };
+        let (job, _) = registry.begin(&page.version).unwrap();
+        let scope = scope();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        for _ in 0..3 {
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(metrics.count(Event::WarmWaitStarted), 1);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Err(Error::Overloaded)
+        );
+        job.update(|p| p.frontier = 1);
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(true)));
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitCompleted), 1);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 0);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Ok(true)
+        );
+        let page = PageId {
+            number: PageNumber(1),
+            ..page
+        };
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 1);
+        let canceled = self::scope();
+        let mut waiting = Box::pin(registry.wait(&page, &canceled));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        canceled.cancel().unwrap();
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        );
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 2);
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        job.stop();
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(false)));
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitFallback), 1);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Ok(false)
+        );
+        registry.remove(&job);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Ok(false)
+        );
+        assert_eq!(metrics.count(Event::WarmWaitStarted), 4);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 2);
+    }
+
+    fn version(etag: &str) -> ObjectVersion {
+        ObjectVersion {
+            object: crate::model::ObjectId {
+                cache: racer_control_wire::CacheId(crate::test_support::security::CACHE.into()),
+                key: crate::model::CacheKey([31; 32]),
+            },
+            etag: crate::model::StrongEtag::test_value(etag),
+        }
+    }
+    fn scope() -> RequestScope {
+        RequestScope::new(
+            RequestId([7; 16]),
+            uring_runtime::environment::now() + Duration::from_secs(30),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retryable_release_preserves_the_entire_queue_without_self_waking() {
+        let registry = WarmRegistry::new(4);
+        let worker = crate::model::WorkerId(0);
+        registry.release(&version("a"), &[worker]);
+        registry.release(&version("b"), &[worker]);
+        let wakes = Arc::new(crate::test_support::WakeCounter::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut calls = 0;
+        registry
+            .poll_releases_with(worker, &mut cx, |_| {
+                calls += 1;
+                Err(Error::Overloaded)
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(wakes.count(), 0);
+        assert!(!registry.drained(worker));
+        let mut released = Vec::new();
+        registry
+            .poll_releases_with(worker, &mut cx, |version| {
+                released.push(version.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![version("a"), version("b")]);
+        assert!(registry.drained(worker));
+    }
+
+    #[test]
+    fn expired_completed_job_cannot_replace_active_provider_selection() {
+        let registry = WarmRegistry::new(4);
+        let version = version("a");
+        let (job, _) = registry.begin(&version).unwrap();
+        job.update(|p| {
+            p.running = false;
+            p.admissions = 0;
+            p.until = Some(SystemTime::UNIX_EPOCH);
+        });
+        let scheduler = super::super::range_stream::Scheduler::new(4);
+        let range = crate::model::ByteRange::From(0).resolve(3).unwrap();
+        let mut demand = scheduler
+            .register(version.clone(), range, 1, PAGE_BYTES, false)
+            .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok(super::super::range_stream::Next::Select(selection))) =
+            demand.poll_next(&mut cx)
+        else {
+            panic!("selection");
+        };
+        assert!(matches!(
+            scheduler.admit_warm(&version, &registry),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(registry.snapshot().0, 0);
+        drop(selection);
+        assert!(scheduler.admit_warm(&version, &registry).unwrap().1);
+    }
+
+    #[test]
+    fn failed_job_keeps_queued_admissions_visible_until_their_guards_drop() {
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(
+                    super::super::dispatch::WorkerMap::new(vec![crate::model::WorkerId(0)])
+                        .unwrap(),
+                ),
+                vec![crate::model::WorkerId(0)],
+                4,
+            )
+            .unwrap(),
+        );
+        let version = version("a");
+        let (job, _) = directory.warm.begin(&version).unwrap();
+        directory.warm.begin(&version).unwrap();
+        let owner = JobGuard {
+            directory: directory.clone(),
+            job: job.clone(),
+            complete: false,
+        };
+        let extension = JobGuard {
+            directory: directory.clone(),
+            job: job.clone(),
+            complete: true,
+        };
+        drop(owner);
+        assert_eq!(directory.warm.snapshot().0, 1);
+        assert!(!directory.warm.drained(crate::model::WorkerId(0)));
+        assert!(matches!(
+            directory.warm.begin(&version),
+            Err(Error::Overloaded)
+        ));
+        drop(extension);
+        assert_eq!(directory.warm.snapshot().0, 0);
+        assert!(directory.warm.drained(crate::model::WorkerId(0)));
+    }
+
+    #[test]
+    fn future_pages_wait_for_disk_frontier_and_cleanup_on_drop() {
+        let registry = WarmRegistry::new(2);
+        let version = version("a");
+        let (job, fresh) = registry.begin(&version).unwrap();
+        assert!(fresh);
+        let (same, fresh) = registry.begin(&version).unwrap();
+        assert!(!fresh);
+        assert!(Arc::ptr_eq(&job, &same));
+        let scope = scope();
+        let page = PageId {
+            version,
+            number: PageNumber(7),
+        };
+        let wakes = Arc::new(crate::test_support::WakeCounter::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(registry.snapshot(), (1, 1));
+        job.update(|progress| progress.frontier = 7);
+        assert!(wakes.count() > 0);
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        job.update(|progress| progress.frontier = 8);
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(true)));
+        drop(waiting);
+        assert_eq!(registry.snapshot(), (1, 0));
+    }
+
+    #[test]
+    fn cancellation_is_not_a_completion_fence_and_failure_wakes_fallback() {
+        let registry = WarmRegistry::new(2);
+        let version = version("a");
+        let (job, _) = registry.begin(&version).unwrap();
+        let scope = scope();
+        let page = PageId {
+            version: version.clone(),
+            number: PageNumber(99),
+        };
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        registry.stop();
+        assert!(job.scope.cancellation.is_cancelled());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(registry.begin(&version), Err(Error::Unavailable)));
+        job.stop();
+        registry.remove(&job);
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(false)));
+        assert_eq!(registry.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn waiter_limit_deadline_and_exact_version_are_enforced() {
+        let registry = WarmRegistry::new(1);
+        let version = version("a");
+        let (_job, _) = registry.begin(&version).unwrap();
+        let scope = scope();
+        let page = PageId {
+            version,
+            number: PageNumber(1),
+        };
+        let mut first = Box::pin(registry.wait(&page, &scope));
+        let mut second = Box::pin(registry.wait(&page, &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            second.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        );
+        drop(second);
+        scope.cancel().unwrap();
+        assert_eq!(
+            first.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        );
+        drop(first);
+        assert_eq!(registry.snapshot(), (1, 0));
+        let expired =
+            RequestScope::new(RequestId([1; 16]), uring_runtime::environment::now()).unwrap();
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &expired)),
+            Err(Error::DeadlineExceeded)
+        );
+        let mut other = page;
+        other.version.etag = crate::model::StrongEtag::test_value("b");
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&other, &scope)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn empty_jobs_expire_and_registry_bounds_versions() {
+        let registry = WarmRegistry::new(1);
+        registry
+            .configure(Config {
+                max_jobs: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        let (job, _) = registry.begin(&version("a")).unwrap();
+        assert!(matches!(
+            registry.begin(&version("b")),
+            Err(Error::Overloaded)
+        ));
+        job.update(|progress| {
+            progress.running = false;
+            progress.admissions = 0;
+            progress.until = Some(SystemTime::UNIX_EPOCH);
+        });
+        registry.poll_deadlines();
+        assert_eq!(registry.snapshot(), (0, 0));
+        assert!(registry.begin(&version("b")).unwrap().1);
+        let restarted = WarmRegistry::new(1);
+        assert_eq!(restarted.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn invalid_warm_limits_fail_closed() {
+        for config in [
+            Config {
+                window: 0,
+                ..Default::default()
+            },
+            Config {
+                max_jobs: 0,
+                ..Default::default()
+            },
+            Config {
+                retained_percent: 101,
+                ..Default::default()
+            },
+            Config {
+                fill_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+            Config {
+                max_ttl: Duration::ZERO,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        }
+        Config::default().validate().unwrap();
+    }
+}
