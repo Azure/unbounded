@@ -352,6 +352,55 @@ func learnedGatewayTransitTunnelMTU(
 	return result
 }
 
+func gatewayMeshTransitTunnelMTU(
+	peerPool, peerSite string,
+	routes map[string]unboundednetv1alpha1.GatewayNodeRoute,
+	pools map[string]*unboundednetv1alpha1.GatewayPool,
+	siteMTUs map[string]int,
+	peerings []unboundednetv1alpha1.SitePeering,
+) int {
+	result := 0
+
+	for _, route := range routes {
+		for _, path := range route.Paths {
+			for i := 1; i < len(path); i++ {
+				site, pool := path[i-1], path[i]
+				if site.Type != "Site" || pool.Type != "GatewayPool" {
+					continue
+				}
+
+				gatewaySites := []string{peerSite}
+				if pool.Name != peerPool {
+					// Intermediate pool paths identify a pool, not a specific
+					// gateway. Honor every candidate mesh edge in that pool.
+					gatewaySites = nil
+
+					if downstream := pools[pool.Name]; downstream != nil {
+						for _, node := range downstream.Status.Nodes {
+							gatewaySites = append(gatewaySites, node.SiteName)
+						}
+					}
+				}
+
+				for _, gatewaySite := range gatewaySites {
+					result = resolveTunnelMTU(result, siteMTUs[gatewaySite])
+					if gatewaySite == site.Name || gatewaySite == "" {
+						continue
+					}
+
+					for _, peering := range peerings {
+						if slices.Contains(peering.Spec.Sites, gatewaySite) && slices.Contains(peering.Spec.Sites, site.Name) {
+							result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return result
+}
+
 // resolveTunnelMTU returns the effective tunnel MTU for a given scope,
 // taking the minimum of the global MTU and any CRD-specified MTU values.
 // Zero values in mtuValues are ignored (meaning "no override").
@@ -399,6 +448,7 @@ func resolveGatewayPeerTunnelMTU(globalMTU int, mySiteName string, peer gatewayP
 ) int {
 	return resolveTunnelMTU(globalMTU,
 		siteTunnelMTUs[mySiteName],
+		siteTunnelMTUs[peer.SiteName],
 		assignmentPoolTunnelMTUs[peer.PoolName],
 		poolTunnelMTUs[peer.PoolName],
 		peer.TransitTunnelMTU,

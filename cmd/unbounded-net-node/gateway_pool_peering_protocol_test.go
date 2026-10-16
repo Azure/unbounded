@@ -274,6 +274,44 @@ func (f *poolPeeringProtocolFixture) checkGateway(t *testing.T, protocol, overri
 	}
 }
 
+func TestGatewayAssignmentMTUDoesNotLeakFromWorkerAssignments(t *testing.T) {
+	f := newPoolPeeringProtocolFixture(t, true)
+	f.state.adoptedAssignment = nodeAssignment{site: "local", gatewayPool: "local-a"}
+	sites := newInformerWithObjects(
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "local"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}}),
+	)
+	assignments := newInformerWithObjects(
+		toUnstructured(t, &unboundednetv1alpha1.SiteGatewayPoolAssignment{
+			ObjectMeta: metav1.ObjectMeta{Name: "worker-only"},
+			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+				Sites: []string{"local", "site-b"}, GatewayPools: []string{"remote-pool"}, TunnelMTU: ptrInt32(1100),
+			},
+		}),
+		toUnstructured(t, &unboundednetv1alpha1.SiteGatewayPoolAssignment{
+			ObjectMeta: metav1.ObjectMeta{Name: "gateway-facing"},
+			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+				Sites: []string{"site-b"}, GatewayPools: []string{"local-a"}, TunnelMTU: ptrInt32(1400),
+			},
+		}),
+	)
+	empty := newInformerWithObjects()
+
+	cfg := &config{NodeName: "self", WireGuardPort: 51820, WireGuardInterfacePrefix: "gpp-test-wg", MTU: 576}
+	if err := updateWireGuardFromSlices(t.Context(), nil, sites, empty, f.pools, empty, empty, assignments, empty,
+		cfg, "local", "priv", "pub-self", true, f.state); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := f.state.assignmentSiteTunnelMTUs["site-b"]; got != 1400 {
+		t.Fatalf("gateway-to-Site cap=%d, want 1400, ignoring worker assignment via unrelated pool", got)
+	}
+
+	if got := f.state.assignmentPoolTunnelMTUs["remote-pool"]; got != 0 {
+		t.Fatalf("worker-side pool cap leaked into gateway path: %d", got)
+	}
+}
+
 func TestGatewayPoolPeeringProtocolUpdates(t *testing.T) {
 	f := newPoolPeeringProtocolFixture(t, true)
 	for i, step := range []struct {

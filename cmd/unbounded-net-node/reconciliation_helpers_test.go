@@ -250,6 +250,42 @@ func TestMergeLowestTunnelMTU(t *testing.T) {
 	}
 }
 
+func TestGatewayMeshTransitCaps(t *testing.T) {
+	routes := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/24": {Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{{
+			{Type: "Site", Name: "site-b"}, {Type: "GatewayPool", Name: "pool-g"},
+		}}},
+	}
+
+	peerings := []unboundednetv1alpha1.SitePeering{
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"site-b", "site-c"}, TunnelMTU: ptrInt32(1200)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"site-x", "site-c"}, TunnelMTU: ptrInt32(900)}},
+	}
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", routes, nil, nil, peerings); got != 1200 {
+		t.Fatalf("gateway-to-origin mesh edge cap=%d, want 1200", got)
+	}
+
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-b", routes, nil, nil, peerings); got != 0 {
+		t.Fatalf("same-Site edge constrained by unrelated peering: %d", got)
+	}
+
+	pools := map[string]*unboundednetv1alpha1.GatewayPool{
+		"pool-g": {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{SiteName: "site-c"}}}},
+	}
+	if got := gatewayMeshTransitTunnelMTU("pool-upstream", "site-a", routes, pools, nil, peerings); got != 1200 {
+		t.Fatalf("intermediate pool mesh edge cap=%d, want 1200", got)
+	}
+
+	if got := resolveGatewayPeerTunnelMTU(1420, "site-a", gatewayPeerInfo{SiteName: "site-c"},
+		map[string]int{"site-a": 1420, "site-c": 1200}, nil, nil); got != 1200 {
+		t.Fatalf("next-hop gateway Site cap=%d, want 1200", got)
+	}
+
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", nil, pools, nil, peerings); got != 0 {
+		t.Fatalf("absent transit routes constrained MTU: %d", got)
+	}
+}
+
 func TestLearnedGatewayTransitPathCaps(t *testing.T) {
 	path := []unboundednetv1alpha1.GatewayNodePathHop{
 		{Type: "Site", Name: "site-b"},
