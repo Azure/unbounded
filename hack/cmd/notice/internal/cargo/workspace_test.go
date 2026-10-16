@@ -373,3 +373,57 @@ func TestSharedCratesRejectsEscapingSymlink(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestSharedCratesWorkspaceInheritance(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		cratePath + "/Cargo.toml": "[package]\nname = 'racer-dataplane'\n[dependencies]\nshared = { path = '../../crates/shared' }\n",
+		cratePath + "/Cargo.lock": sharedLock,
+		sharedCratesPath + "/Cargo.toml": "[workspace]\nmembers = ['shared', 'sim']\n" +
+			"[workspace.package]\nversion = '0.1.0'\n" +
+			"[workspace.dependencies]\nfoo = '1'\nsim = { path = 'sim', version = '0.1.0' }\nbaz = '1'\n",
+		sharedCratesPath + "/shared/Cargo.toml": "[package]\nname = 'shared'\nversion.workspace = true\n" +
+			"[dependencies]\nfoo = { workspace = true, features = ['x'], optional = true }\nsim.workspace = true\n" +
+			"[dev-dependencies]\nbaz.workspace = true\n[lints]\nworkspace = true\n",
+		sharedCratesPath + "/sim/Cargo.toml": "[package]\nname = 'sim'\n[dependencies]\nbar = '0.4'\n",
+	})
+
+	versions, err := workspaceVersions(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(versions) != 2 || versions["foo"] != "1.2.3" || versions["bar"] != "0.4.0" {
+		t.Fatalf("versions = %#v", versions)
+	}
+}
+
+func TestSharedCratesWorkspaceInheritanceFailures(t *testing.T) {
+	for _, tc := range []struct{ name, workspace, dependency, want string }{
+		{"missing workspace entry", "[workspace]\n[workspace.dependencies]\n", "foo.workspace = true", "not found in [workspace.dependencies]"},
+		{"no workspace root", "", "foo.workspace = true", "workspace inheritance is not supported"},
+		{"workspace false", "[workspace]\n[workspace.dependencies]\nfoo = '1'\n", "foo = { workspace = false }", "workspace inheritance is not supported"},
+		{"conflicting local key", "[workspace]\n[workspace.dependencies]\nfoo = '1'\n", "foo = { workspace = true, version = '2' }", `key "version" cannot be combined`},
+		{"git source", "[workspace]\n[workspace.dependencies]\nfoo = { git = 'https://example.com/foo' }\n", "foo.workspace = true", "git sources are not supported"},
+		{"invalid entry", "[workspace]\n[workspace.dependencies]\nfoo = 1\n", "foo.workspace = true", "invalid workspace dependency"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+
+			tree := map[string]string{
+				cratePath + "/Cargo.toml":               "[package]\nname = 'racer-dataplane'\n[dependencies]\nshared = { path = '../../crates/shared' }\n",
+				cratePath + "/Cargo.lock":               sharedLock,
+				sharedCratesPath + "/shared/Cargo.toml": "[package]\nname = 'shared'\n[dependencies]\n" + tc.dependency + "\n",
+			}
+			if tc.workspace != "" {
+				tree[sharedCratesPath+"/Cargo.toml"] = tc.workspace
+			}
+
+			testutil.WriteTree(t, root, tree)
+
+			if _, err := workspaceVersions(root); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}

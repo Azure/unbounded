@@ -65,6 +65,7 @@ func workspaceVersions(root string) (map[string]string, error) {
 
 	shared := filepath.Join(root, sharedCratesPath)
 	seen := map[string]bool{}
+
 	queue := append([]string{"."}, workspace.Workspace.Members...)
 
 	for len(queue) > 0 {
@@ -127,7 +128,15 @@ func workspaceVersions(root string) (map[string]string, error) {
 			name = crateName
 		}
 
-		direct, err := directDependencies(string(data))
+		var inherited map[string]any
+		if external {
+			inherited, err = sharedWorkspaceDependencies(shared, filepath.Dir(path))
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+		}
+
+		direct, err := directDependenciesInheriting(string(data), inherited)
 		if err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", path, err)
 		}
@@ -175,4 +184,74 @@ func workspaceVersions(root string) (map[string]string, error) {
 	}
 
 	return versions, nil
+}
+
+// sharedWorkspaceDependencies returns the [workspace.dependencies] table of the
+// Cargo workspace that owns the package in dir, rebasing path entries onto dir.
+// The workspace root is the nearest ancestor of dir, within shared, whose
+// Cargo.toml has a [workspace] table, mirroring Cargo's search. A package with
+// no such ancestor gets a nil table, which rejects inheritance.
+func sharedWorkspaceDependencies(shared, dir string) (map[string]any, error) {
+	for current := dir; ; current = filepath.Dir(current) {
+		rel, err := filepath.Rel(shared, current)
+		if err != nil || (rel != "." && !filepath.IsLocal(rel)) {
+			return nil, nil
+		}
+
+		data, err := os.ReadFile(filepath.Join(current, "Cargo.toml"))
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+
+		if err == nil {
+			var manifest struct {
+				Workspace *struct {
+					Dependencies map[string]any
+				}
+			}
+			if err := toml.Unmarshal(data, &manifest); err != nil {
+				return nil, fmt.Errorf("parsing %s: %w", filepath.Join(current, "Cargo.toml"), err)
+			}
+
+			if manifest.Workspace != nil {
+				return rebaseWorkspacePaths(manifest.Workspace.Dependencies, current, dir)
+			}
+		}
+
+		if rel == "." {
+			return nil, nil
+		}
+	}
+}
+
+// rebaseWorkspacePaths rewrites relative `path` keys, which Cargo resolves from
+// the workspace root, so they are relative to the inheriting package instead.
+func rebaseWorkspacePaths(deps map[string]any, root, dir string) (map[string]any, error) {
+	rebased := make(map[string]any, len(deps))
+
+	for alias, value := range deps {
+		spec, ok := value.(map[string]any)
+		if !ok {
+			rebased[alias] = value
+			continue
+		}
+
+		copied := make(map[string]any, len(spec))
+		for key, item := range spec {
+			copied[key] = item
+		}
+
+		if path, ok := spec["path"].(string); ok && path != "" && !filepath.IsAbs(path) {
+			relative, err := filepath.Rel(dir, filepath.Join(root, path))
+			if err != nil {
+				return nil, fmt.Errorf("workspace dependency %s: %w", alias, err)
+			}
+
+			copied["path"] = filepath.ToSlash(relative)
+		}
+
+		rebased[alias] = copied
+	}
+
+	return rebased, nil
 }
