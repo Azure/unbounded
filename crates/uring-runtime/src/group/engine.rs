@@ -911,6 +911,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "intentionally leaks under FatalPolicy::LeakAndReport")]
     fn abandoned_owner_leaks_and_reports() {
         for release in [Release::Live, Release::Drained, Release::ShutdownFenced] {
             let dropped = Arc::new(AtomicBool::new(false));
@@ -939,6 +940,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "intentionally leaks under FatalPolicy::LeakAndReport")]
     fn released_and_leaked_owners() {
         let dropped = Arc::new(AtomicBool::new(false));
         let control = control();
@@ -964,6 +966,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "intentionally leaks under FatalPolicy::LeakAndReport")]
     fn panicking_tasks_are_forgotten_and_reported() {
         struct Tracked(Arc<AtomicBool>);
         impl Drop for Tracked {

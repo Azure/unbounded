@@ -327,6 +327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "socket syscalls are not supported by Miri")]
     fn ipv4_encoding_matches_kernel() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -357,6 +358,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "socket syscalls are not supported by Miri")]
     fn decode_edge_cases() {
         let mut empty = SockAddr::empty();
         assert_eq!(

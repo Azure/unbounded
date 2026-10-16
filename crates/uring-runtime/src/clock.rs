@@ -113,6 +113,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "wall-clock time is not available under Miri isolation")]
     fn system_clock_is_monotonic() {
         let clock = SystemClock;
         let a = clock.now();
