@@ -24,6 +24,19 @@
 //! come from the backend ([`Clock`], [`Entropy`]); the runtime never reads
 //! ambient time itself.
 //!
+//! # Reactor
+//!
+//! A [`Reactor`] owns the in-flight operations of one thread. Its typed
+//! operation methods ([`read_at`](Reactor::read_at), [`recv`](Reactor::recv),
+//! [`accept`](Reactor::accept), [`sleep_until`](Reactor::sleep_until),
+//! [`open_at2`](Reactor::open_at2), ...) return lazy futures; the application
+//! drives completions with [`Reactor::poll`] and blocks with
+//! [`Reactor::wait`]. Operations are admitted against a bounded in-flight
+//! partition or a [`Reservation`], and every operation is *fenced* (its
+//! original completion and any cancel request completion have arrived)
+//! before its memory is released. [`Uring`] is the io_uring backend. See the
+//! [`reactor`] module for the full rules.
+//!
 //! # Cancellation
 //!
 //! Operations run under a caller-defined [`Scope`]. A [`CancelToken`] is the
