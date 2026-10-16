@@ -352,6 +352,10 @@ func hostDistroFromOSRelease(path string) (string, error) {
 }
 
 func hostDistroFromOSReleaseData(data []byte) string {
+	return hostDistroFromOSReleaseValues(parseOSReleaseValues(data))
+}
+
+func parseOSReleaseValues(data []byte) map[string]string {
 	values := make(map[string]string)
 
 	for _, rawLine := range strings.Split(string(data), "\n") {
@@ -368,7 +372,27 @@ func hostDistroFromOSReleaseData(data []byte) string {
 		values[key] = normalizeOSReleaseValue(value)
 	}
 
-	return hostDistroFromOSReleaseValues(values)
+	return values
+}
+
+func hostIsAzureLinux3() bool {
+	data, err := os.ReadFile(hostOSReleasePath)
+	if err != nil {
+		return false
+	}
+
+	return hostIsAzureLinux3FromOSReleaseData(data)
+}
+
+func hostIsAzureLinux3FromOSReleaseData(data []byte) bool {
+	values := parseOSReleaseValues(data)
+	if isAzureContainerLinux(values) {
+		return false
+	}
+
+	id := normalizeOSReleaseID(values["ID"])
+
+	return (id == "azurelinux" || id == "azlinux") && strings.HasPrefix(values["VERSION_ID"], "3")
 }
 
 func hostDistroFromOSReleaseValues(values map[string]string) string {

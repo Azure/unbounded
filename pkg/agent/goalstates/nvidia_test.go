@@ -4,8 +4,12 @@
 package goalstates
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -44,6 +48,174 @@ func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	require.NotContains(t, devices, capability)
 	require.NotContains(t, devices, channel)
 	require.NotContains(t, devices, nonChannel)
+}
+
+func TestResolveNvidiaHostAzureLinuxInitializesDevicesBeforeDiscovery(t *testing.T) {
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+	deviceDir := filepath.Join(root, "dev")
+
+	addNVIDIAPCIDevice(t, pciDir)
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+	var commands []string
+
+	deps := testNvidiaHostResolverDeps(pciDir, deviceDir)
+	deps.isAzureLinux3 = func() bool { return true }
+	deps.lookPath = func(name string) (string, error) {
+		require.Equal(t, nvidiaModprobeBinary, name)
+		return "/usr/bin/nvidia-modprobe", nil
+	}
+	deps.runCommand = func(name string, args ...string) ([]byte, error) {
+		commands = append(commands, strings.Join(append([]string{name}, args...), " "))
+
+		switch strings.Join(args, " ") {
+		case "-u -c0":
+			for _, device := range []string{"nvidia0", nvidiaControlDeviceName, nvidiaUVMDeviceName} {
+				require.NoError(t, os.WriteFile(filepath.Join(deviceDir, device), nil, 0o644))
+			}
+		case "-m":
+			require.NoError(t, os.WriteFile(filepath.Join(deviceDir, nvidiaModesetDeviceName), nil, 0o644))
+		default:
+			return nil, fmt.Errorf("unexpected arguments: %v", args)
+		}
+
+		return nil, nil
+	}
+
+	host, err := resolveNvidiaHost("arm64", deps)
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"/usr/bin/nvidia-modprobe -u -c0",
+		"/usr/bin/nvidia-modprobe -m",
+	}, commands)
+	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, nvidiaModesetDeviceName))
+	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
+}
+
+func TestResolveNvidiaHostUbuntuDoesNotInitializeDevices(t *testing.T) {
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+	deviceDir := filepath.Join(root, "dev")
+
+	addNVIDIAPCIDevice(t, pciDir)
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(deviceDir, "nvidia0"), nil, 0o644))
+
+	deps := testNvidiaHostResolverDeps(pciDir, deviceDir)
+	deps.isAzureLinux3 = func() bool { return false }
+	deps.runCommand = func(string, ...string) ([]byte, error) {
+		t.Fatal("Ubuntu discovery must not invoke nvidia-modprobe")
+		return nil, nil
+	}
+
+	host, err := resolveNvidiaHost("arm64", deps)
+	require.NoError(t, err)
+	require.Equal(t, []string{filepath.Join(deviceDir, "nvidia0")}, host.GPUDevicePaths)
+}
+
+func TestResolveNvidiaHostAzureLinuxWithoutNVIDIAHardwareIsUnchanged(t *testing.T) {
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+	deviceDir := filepath.Join(root, "dev")
+
+	require.NoError(t, os.MkdirAll(pciDir, 0o755))
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+	deps := testNvidiaHostResolverDeps(pciDir, deviceDir)
+	deps.isAzureLinux3 = func() bool { return true }
+	deps.runCommand = func(string, ...string) ([]byte, error) {
+		t.Fatal("non-NVIDIA hosts must not invoke nvidia-modprobe")
+		return nil, nil
+	}
+
+	host, err := resolveNvidiaHost("arm64", deps)
+	require.NoError(t, err)
+	require.Empty(t, host.GPUDevicePaths)
+}
+
+func TestResolveNvidiaHostAzureLinuxFailsWhenNvidiaModprobeFails(t *testing.T) {
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+	deviceDir := filepath.Join(root, "dev")
+
+	addNVIDIAPCIDevice(t, pciDir)
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+	deps := testNvidiaHostResolverDeps(pciDir, deviceDir)
+	deps.isAzureLinux3 = func() bool { return true }
+	deps.lookPath = func(string) (string, error) { return "/usr/bin/nvidia-modprobe", nil }
+	deps.runCommand = func(_ string, args ...string) ([]byte, error) {
+		if slices.Equal(args, []string{"-u", "-c0"}) {
+			return []byte("module initialization failed"), errors.New("exit status 1")
+		}
+
+		t.Fatalf("unexpected command after failure: %v", args)
+
+		return nil, nil
+	}
+
+	_, err := resolveNvidiaHost("arm64", deps)
+	require.ErrorContains(t, err, "run /usr/bin/nvidia-modprobe -u -c0")
+	require.ErrorContains(t, err, "module initialization failed")
+}
+
+func TestResolveNvidiaHostAzureLinuxValidatesModesetDevice(t *testing.T) {
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+	deviceDir := filepath.Join(root, "dev")
+
+	addNVIDIAPCIDevice(t, pciDir)
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+	for _, device := range []string{"nvidia0", nvidiaControlDeviceName, nvidiaUVMDeviceName} {
+		require.NoError(t, os.WriteFile(filepath.Join(deviceDir, device), nil, 0o644))
+	}
+
+	deps := testNvidiaHostResolverDeps(pciDir, deviceDir)
+	deps.isAzureLinux3 = func() bool { return true }
+	deps.lookPath = func(string) (string, error) { return "/usr/bin/nvidia-modprobe", nil }
+	deps.runCommand = func(string, ...string) ([]byte, error) { return nil, nil }
+
+	_, err := resolveNvidiaHost("arm64", deps)
+	require.ErrorContains(t, err, "nvidia-modeset")
+}
+
+func testNvidiaHostResolverDeps(pciDir, deviceDir string) nvidiaHostResolverDeps {
+	return nvidiaHostResolverDeps{
+		isAzureLinux3: func() bool { return false },
+		pciDevicesDir: pciDir,
+		deviceDir:     deviceDir,
+		readDir:       os.ReadDir,
+		readFile:      os.ReadFile,
+		isCharDevice: func(path string) bool {
+			_, err := os.Stat(path)
+
+			return err == nil
+		},
+		lookPath: func(string) (string, error) {
+			return "", errors.New("unexpected LookPath")
+		},
+		runCommand: func(string, ...string) ([]byte, error) {
+			return nil, errors.New("unexpected command")
+		},
+		resolveLibraries: func(nvidiaArch) nvidiaLibraryResolution {
+			return nvidiaLibraryResolution{
+				libMappings:   []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
+				driverVersion: "580.1",
+			}
+		},
+		discoverBinary: func(string) string { return "" },
+	}
+}
+
+func addNVIDIAPCIDevice(t *testing.T, pciDir string) {
+	t.Helper()
+
+	device := filepath.Join(pciDir, "0001:00:00.0")
+	require.NoError(t, os.MkdirAll(device, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(device, "vendor"), []byte(nvidiaPCIVendorID+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(device, "class"), []byte("0x030200\n"), 0o644))
 }
 
 func TestParseNVIDIALibraries(t *testing.T) {
