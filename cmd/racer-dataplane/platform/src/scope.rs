@@ -19,7 +19,7 @@ pub use uring::{CancelRegistration, CancelToken, Unscoped};
 /// Shared cross-thread cancellation state (the library [`CancelToken`]).
 ///
 /// Differences from the old runtime type: `new()` and `cancel()` are
-/// infallible, `is_cancelled` is spelled [`CancelToken::is_canceled`], and
+/// infallible, the old `is_cancelled` is now [`CancelToken::is_canceled`], and
 /// there is no registration limit.
 pub type Cancellation = CancelToken;
 

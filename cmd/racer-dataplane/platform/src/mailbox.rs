@@ -960,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_completion_poll_waits_for_reply_not_cancellation() {
+    fn canceled_completion_poll_waits_for_reply_not_cancellation() {
         let (mailbox, scope) = setup();
         let receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
         let command = mailbox.pop().unwrap();
