@@ -20,13 +20,14 @@ import (
 type setupNVIDIA struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
+	run       func(context.Context, *slog.Logger, string, ...string) (string, error)
 }
 
 // SetupNVIDIA returns a task that makes NVIDIA driver libraries from the host
 // accessible inside the running nspawn machine and generates a CDI specification
 // describing the available GPUs.
 //
-// The task performs four steps in sequence:
+// The task performs five steps in sequence:
 //  1. Creates symlinks in the container's standard library path pointing into
 //     the bind-mounted /run/host-nvidia/ directories, then runs ldconfig.
 //  2. Builds a self-contained driver root under /run/nvidia/driver and creates
@@ -37,6 +38,8 @@ type setupNVIDIA struct {
 //     with the nspawn environment (e.g. mounting tmpfs over /proc paths, CUDA
 //     compat hooks on NVSwitch systems). Only create-symlinks and update-ldcache
 //     are retained.
+//  5. On Azure Linux, selects CDI runtime mode so UUID environment-variable
+//     requests from the device plugin resolve against the generated CDI spec.
 //
 // This task must run after StartNSpawnMachine (the machine must be booted and
 // the /run/host-nvidia/ bind mounts must be active) and before StartKubelet
@@ -45,7 +48,11 @@ type setupNVIDIA struct {
 // The task is a no-op when the NVIDIA runtime is not enabled or no library
 // mappings were discovered on the host.
 func SetupNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
-	return &setupNVIDIA{log: log, goalState: goalState}
+	return &setupNVIDIA{
+		log:       log,
+		goalState: goalState,
+		run:       executil.MachineRun,
+	}
 }
 
 func (s *setupNVIDIA) Name() string { return "setup-nvidia" }
@@ -71,6 +78,23 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 
 	if err := s.generateCDISpec(ctx); err != nil {
 		return err
+	}
+
+	return s.configureContainerRuntime(ctx)
+}
+
+func (s *setupNVIDIA) configureContainerRuntime(ctx context.Context) error {
+	if !s.goalState.Nvidia.UseCDIRuntime {
+		return nil
+	}
+
+	if _, err := s.run(
+		ctx, s.log, s.goalState.MachineName,
+		goalstates.NvidiaCTKPath, "config",
+		"--set", "nvidia-container-runtime.mode=cdi",
+		"--in-place",
+	); err != nil {
+		return fmt.Errorf("configure NVIDIA container runtime CDI mode: %w", err)
 	}
 
 	return nil

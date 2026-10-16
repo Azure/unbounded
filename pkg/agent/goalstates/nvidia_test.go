@@ -26,6 +26,60 @@ func TestNVIDIAStateAvailable(t *testing.T) {
 	}))
 }
 
+func TestAzureLinuxUsesNVIDIACDIRuntime(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		osRelease string
+		want      bool
+	}{
+		{
+			name: "Azure Linux 3",
+			osRelease: `ID=azurelinux
+VERSION_ID="3.0"`,
+			want: true,
+		},
+		{
+			name: "Azure Linux 3 alternate ID",
+			osRelease: `ID=azlinux
+VERSION_ID="3.0"`,
+			want: true,
+		},
+		{
+			name: "Azure Container Linux",
+			osRelease: `ID=azurelinux
+VARIANT_ID=azurecontainerlinux
+VERSION_ID="3.0.20260809"`,
+		},
+		{
+			name: "Ubuntu",
+			osRelease: `ID=ubuntu
+VERSION_ID="24.04"`,
+		},
+		{
+			name: "Fedora compatibility fallback",
+			osRelease: `ID=fedora
+VERSION_ID="44"
+ID_LIKE="rhel fedora"`,
+		},
+		{
+			name: "RHEL-like compatibility fallback",
+			osRelease: `ID=my-enterprise-linux
+VERSION_ID="9"
+ID_LIKE="rhel fedora"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, useNVIDIACDIRuntime(osReleaseValues([]byte(tt.osRelease))))
+		})
+	}
+}
+
 func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	t.Parallel()
 
