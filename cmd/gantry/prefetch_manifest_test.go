@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
+	"github.com/Azure/unbounded/internal/gantry/rangecache"
 )
 
 type manifestPrefetchResolverStub struct {
@@ -201,5 +202,46 @@ func TestLayerPrefetchAdapterDispatchesStreamingManifestChildren(t *testing.T) {
 		if resolver.children[index] != want[index] {
 			t.Fatalf("child %d = %+v, want %+v", index, resolver.children[index], want[index])
 		}
+	}
+}
+
+func TestLayerPrefetchAdapterDoesNotWarmIndexesForRegularManifest(t *testing.T) {
+	body, err := os.ReadFile("testdata/acr-streaming-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := rangecache.New(t.TempDir()+"/ranges", 0)
+	if err != nil {
+		t.Fatalf("rangecache.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = cache.Close() })
+
+	origin := &prefetchOriginStub{}
+	indexes := newIndexPrefetcher(indexPrefetchOptions{
+		Cache:     cache,
+		DHT:       prefetchProviderStub{},
+		Peer:      &prefetchPeerStub{fail: true},
+		Origin:    origin,
+		HeadBytes: 4096,
+		TailBytes: 4096,
+	})
+	resolver := &manifestPrefetchResolverStub{}
+	adapter := &layerPrefetchAdapter{
+		cache:    &delayedManifestStore{body: string(body), ready: true},
+		indexes:  indexes,
+		logger:   slog.Default(),
+		resolver: resolver,
+	}
+
+	adapter.OnManifestServed(t.Context(), "registry.example.com", "team/app", testDigest(t, "e"))
+
+	if origin.calls != 0 {
+		t.Fatalf("regular manifest index origin calls = %d, want 0", origin.calls)
+	}
+
+	if len(resolver.children) == 0 {
+		t.Fatal("regular manifest did not retain legacy chair prefetch")
 	}
 }

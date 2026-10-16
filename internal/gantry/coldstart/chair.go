@@ -398,6 +398,16 @@ func (r *ChairResolver) reportDispatch(kind ifaces.OriginRefKind, reason string)
 }
 
 func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
+	return r.prefetchManifestChildren(ctx, manifestDigest, children, registry, repository, false)
+}
+
+// PrefetchStreamingManifestChildren coordinates durable streaming convergence
+// through a bounded subset of active chair holders.
+func (r *ChairResolver) PrefetchStreamingManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
+	return r.prefetchManifestChildren(ctx, manifestDigest, children, registry, repository, true)
+}
+
+func (r *ChairResolver) prefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string, streaming bool) error {
 	if registry == "" || repository == "" {
 		return fmt.Errorf("%w: registry=%q repository=%q", ErrPrefetchInvalid, registry, repository)
 	}
@@ -415,9 +425,14 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, manifestDi
 		return err
 	}
 
-	coordinators := chairs.Rank(snapshot, manifestDigest, r.opts.ChairCount)
-	if !coordinatesChairPrefetch(r.opts.SelfPeerID, coordinators, r.opts.PrefetchCoordinatorReplicas) {
-		return nil
+	rankChairs := chairs.Rank
+	if streaming {
+		rankChairs = chairs.RankActive
+
+		coordinators := rankChairs(snapshot, manifestDigest, r.opts.ChairCount)
+		if !coordinatesChairPrefetch(r.opts.SelfPeerID, coordinators, r.opts.PrefetchCoordinatorReplicas) {
+			return nil
+		}
 	}
 
 	type groupKey struct {
@@ -439,7 +454,7 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, manifestDi
 
 		seen[child.Digest] = struct{}{}
 
-		ranked := chairs.Rank(snapshot, child.Digest, r.opts.ChairCount)
+		ranked := rankChairs(snapshot, child.Digest, r.opts.ChairCount)
 
 		seedCount := r.seedCount(len(ranked))
 		if seedCount == 0 {
@@ -472,38 +487,45 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, manifestDi
 		return keys[i].kind < keys[j].kind
 	})
 
-	dispatchOffset, dispatchDelay := prefetchDispatchPlan(r.opts.SelfPeerID, manifestDigest, len(keys), r.opts.PrefetchDispatchJitter)
-	if len(keys) > 1 {
-		rotated := append([]groupKey(nil), keys[dispatchOffset:]...)
-		keys = append(rotated, keys[:dispatchOffset]...)
-	}
+	if streaming {
+		dispatchOffset, dispatchDelay := prefetchDispatchPlan(r.opts.SelfPeerID, manifestDigest, len(keys), r.opts.PrefetchDispatchJitter)
+		if len(keys) > 1 {
+			rotated := append([]groupKey(nil), keys[dispatchOffset:]...)
+			keys = append(rotated, keys[:dispatchOffset]...)
+		}
 
-	distinctPullers := make(map[ifaces.NodeID]struct{}, len(groups))
-	totalDigests := 0
-	for key, digests := range groups {
-		distinctPullers[key.peer] = struct{}{}
-		totalDigests += len(digests)
-	}
-	if r.opts.OnPrefetchBatch != nil {
-		r.opts.OnPrefetchBatch(len(distinctPullers), totalDigests)
-	}
+		distinctPullers := make(map[ifaces.NodeID]struct{}, len(groups))
+		totalDigests := 0
 
-	if dispatchDelay > 0 {
-		timer := time.NewTimer(dispatchDelay)
-		defer timer.Stop()
+		for key, digests := range groups {
+			distinctPullers[key.peer] = struct{}{}
+			totalDigests += len(digests)
+		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+		if r.opts.OnPrefetchBatch != nil {
+			r.opts.OnPrefetchBatch(len(distinctPullers), totalDigests)
+		}
+
+		if dispatchDelay > 0 {
+			timer := time.NewTimer(dispatchDelay)
+			defer timer.Stop()
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 
 	var (
-		wg       sync.WaitGroup
-		failures atomic.Int32
+		wg          sync.WaitGroup
+		failures    atomic.Int32
+		remoteSlots chan struct{}
 	)
-	remoteSlots := make(chan struct{}, r.opts.PrefetchMaxConcurrentGroups)
+	if streaming && r.opts.PrefetchMaxConcurrentGroups > 0 {
+		remoteSlots = make(chan struct{}, r.opts.PrefetchMaxConcurrentGroups)
+	}
 
 dispatchRemote:
 	for index, key := range keys {
@@ -516,27 +538,33 @@ dispatchRemote:
 		}
 		digests := append([]digest.Digest(nil), groups[key]...)
 
-		select {
-		case remoteSlots <- struct{}{}:
-		case <-ctx.Done():
-			failures.Add(int32(len(keys) - index))
+		if remoteSlots != nil {
+			select {
+			case remoteSlots <- struct{}{}:
+			case <-ctx.Done():
+				failures.Add(int32(len(keys) - index))
 
-			break dispatchRemote
+				break dispatchRemote
+			}
 		}
 
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
-			defer func() { <-remoteSlots }()
+
+			if remoteSlots != nil {
+				defer func() { <-remoteSlots }()
+			}
 
 			outcomes, err := r.pullChair(ctx, chair, registry, repository, key.kind, digests)
 			if err != nil || !allChairOutcomesAccepted(outcomes) {
 				failures.Add(1)
-				if r.opts.OnPrefetchGroup != nil {
+
+				if streaming && r.opts.OnPrefetchGroup != nil {
 					r.opts.OnPrefetchGroup(prefetchTarget(r.opts.SelfPeerID, chair), "error")
 				}
-			} else if r.opts.OnPrefetchGroup != nil {
+			} else if streaming && r.opts.OnPrefetchGroup != nil {
 				r.opts.OnPrefetchGroup(prefetchTarget(r.opts.SelfPeerID, chair), "success")
 			}
 		}()

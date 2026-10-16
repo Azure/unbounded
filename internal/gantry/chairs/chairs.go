@@ -130,7 +130,7 @@ func (s Snapshot) AvailableCount() int {
 	count := 0
 
 	for _, chair := range s.Chairs {
-		if s.usable(chair) && chair.AssignmentEpoch == s.Epoch {
+		if chair.Selectable() && chair.AssignmentEpoch == s.Epoch {
 			count++
 		}
 	}
@@ -155,7 +155,7 @@ func (s Snapshot) SelectableCountWithin(chairCount int) int {
 			continue
 		}
 
-		if s.usable(chair) && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
+		if chair.Selectable() && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
 			count++
 		}
 	}
@@ -190,11 +190,22 @@ func (s Snapshot) HolderChair(peerID ifaces.NodeID) (Chair, bool) {
 }
 
 func Rank(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
+	return rank(snapshot, d, chairCount, false)
+}
+
+// RankActive ranks only chairs whose holder has not expired in a fresh
+// snapshot. Streaming convergence uses it to avoid dispatching durable work to
+// nodes that have left while regular pulls retain the historical ranking.
+func RankActive(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
+	return rank(snapshot, d, chairCount, true)
+}
+
+func rank(snapshot Snapshot, d digest.Digest, chairCount int, activeOnly bool) []Chair {
 	byName := make(map[string]Chair, len(snapshot.Chairs))
 	candidates := make([]ifaces.Node, 0, min(len(snapshot.Chairs), chairCount))
 
 	for _, chair := range snapshot.Chairs {
-		if chair.ID < 0 || int(chair.ID) >= chairCount || !chair.Selectable() {
+		if chair.ID < 0 || int(chair.ID) >= chairCount || !chair.Selectable() || activeOnly && !snapshot.usable(chair) {
 			continue
 		}
 
@@ -212,7 +223,7 @@ func Rank(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
 
 	for _, candidate := range scored {
 		chair, ok := byName[string(candidate.Node.ID)]
-		if !ok || !snapshot.usable(chair) {
+		if !ok {
 			continue
 		}
 

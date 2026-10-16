@@ -26,10 +26,10 @@ type providerLookup interface {
 	FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error)
 }
 
-// layerSeeder downloads every child digest of a served manifest into this
-// node's own containerd content store. Chair prefetch seeds a bounded cohort
-// from origin; the seeder is what makes every other node converge to complete
-// local content instead of reaching back over the network per read.
+// layerSeeder downloads every child digest of an Artifact Streaming manifest
+// into this node's own containerd content store. Chair prefetch seeds a bounded
+// cohort from origin; the seeder is what makes every other node converge to
+// complete local content instead of reaching back over the network per read.
 //
 // Peers are preferred and origin is used only after the peer patience budget
 // expires, so a 1000-node rollout does not turn into 1000 origin pulls.

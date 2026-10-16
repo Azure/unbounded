@@ -15,7 +15,7 @@ import (
 )
 
 type streamingLayerReconcilerOptions struct {
-	Resolver        manifestPrefetchResolver
+	Resolver        streamingManifestPrefetchResolver
 	Store           ifaces.LocalContentStore
 	Seeder          *layerSeeder
 	Logger          *slog.Logger
@@ -27,7 +27,7 @@ type streamingLayerReconcilerOptions struct {
 // identified as ACR Artifact Streaming images. Regular OCI manifests never
 // enter this component and retain the existing request-driven pull behavior.
 type streamingLayerReconciler struct {
-	resolver        manifestPrefetchResolver
+	resolver        streamingManifestPrefetchResolver
 	store           ifaces.LocalContentStore
 	seeder          *layerSeeder
 	logger          *slog.Logger
@@ -42,15 +42,19 @@ func newStreamingLayerReconciler(opts streamingLayerReconcilerOptions) *streamin
 	if opts.Resolver == nil || opts.Store == nil {
 		return nil
 	}
+
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+
 	if opts.Interval <= 0 {
 		opts.Interval = 30 * time.Second
 	}
+
 	if opts.DispatchTimeout <= 0 {
 		opts.DispatchTimeout = 30 * time.Second
 	}
+
 	return &streamingLayerReconciler{
 		resolver:        opts.Resolver,
 		store:           opts.Store,
@@ -71,6 +75,7 @@ func (r *streamingLayerReconciler) Start(baseCtx context.Context, registry, repo
 
 	go func() {
 		defer r.release(manifestDigest)
+
 		ctx := baseCtx
 
 		r.logger.Info("streaming layer reconciliation started",
@@ -87,13 +92,16 @@ func (r *streamingLayerReconciler) Start(baseCtx context.Context, registry, repo
 
 				return
 			}
+
 			if r.seeder != nil {
 				go r.seeder.Seed(ctx, registry, repository, pending)
 			}
 
 			dispatchCtx, dispatchCancel := context.WithTimeout(ctx, r.dispatchTimeout)
-			err := r.resolver.PrefetchManifestChildren(dispatchCtx, manifestDigest, pending, registry, repository)
+			err := r.resolver.PrefetchStreamingManifestChildren(dispatchCtx, manifestDigest, pending, registry, repository)
+
 			dispatchCancel()
+
 			if err != nil && ctx.Err() == nil {
 				r.logger.Debug("streaming layer reconciliation dispatch failed",
 					slog.String("manifest", manifestDigest.String()),
@@ -125,7 +133,9 @@ func (r *streamingLayerReconciler) pending(ctx context.Context, children []colds
 	for _, child := range children {
 		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		has, err := r.store.Has(checkCtx, child.Digest)
+
 		cancel()
+
 		if err != nil || !has {
 			pending = append(pending, child)
 		}
@@ -141,6 +151,7 @@ func (r *streamingLayerReconciler) claim(manifestDigest digest.Digest) bool {
 	if _, ok := r.active[manifestDigest]; ok {
 		return false
 	}
+
 	r.active[manifestDigest] = struct{}{}
 
 	return true

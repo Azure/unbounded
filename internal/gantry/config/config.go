@@ -297,21 +297,23 @@ type Config struct {
 	// except by the number of eligible nodes.
 	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
 
-	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
-	// to a deterministic HRW-ranked subset of manifest consumers. Local
-	// self-selected pulls still run on every consumer. The default is 3.
+	// PrefetchCoordinatorReplicas limits Artifact Streaming convergence
+	// dispatch to a deterministic HRW-ranked subset of manifest consumers.
+	// The default is 3.
 	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
 
-	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
-	// per manifest. Group dispatch is best effort and target-side deduplicated.
+	// PrefetchMaxConcurrentGroups caps simultaneous outbound Artifact Streaming
+	// prefetch groups per manifest. Dispatch is best effort and target-side
+	// deduplicated.
 	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
 
-	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
-	// node derives a stable delay in [0, jitter) from itself and the manifest.
+	// PrefetchDispatchJitter spreads Artifact Streaming prefetch across
+	// requesters. Each node derives a stable delay in [0, jitter) from itself
+	// and the manifest.
 	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
 
-	// LayerSeedConcurrency caps simultaneous local layer downloads started
-	// after a manifest serve.
+	// LayerSeedConcurrency caps simultaneous local layer downloads started by
+	// Artifact Streaming reconciliation.
 	LayerSeedConcurrency int `yaml:"layer_seed_concurrency"`
 
 	// LayerSeedPeerPatience is how long a seeding node waits for a peer to
@@ -409,11 +411,11 @@ type Config struct {
 	// Bootstrap is the chair prefetch path's job.
 	LayerSeedOriginFallback bool `yaml:"layer_seed_origin_fallback"`
 
-	// RangeCacheDir holds ranges fetched from peers or origin. It defaults to a
-	// subdirectory of the libp2p hostPath because that is the only node-backed
-	// writable mount the agent already has; the container root is read-only and
-	// /tmp is an emptyDir subject to ephemeral-storage eviction. Empty disables
-	// range caching.
+	// RangeCacheDir holds Artifact Streaming ranges fetched from peers or origin.
+	// It defaults to a subdirectory of the libp2p hostPath because that is the
+	// only node-backed writable mount the agent already has; the container root
+	// is read-only and /tmp is an emptyDir subject to ephemeral-storage eviction.
+	// Empty disables range caching.
 	RangeCacheDir string `yaml:"range_cache_dir"`
 
 	// RangeCacheMaxBytes caps the on-disk range cache. Once reached the cache
@@ -1463,6 +1465,7 @@ func (c *Config) Redacted() *Config {
 	cp := *c
 
 	cp.UpstreamRegistries = append([]UpstreamRegistry(nil), c.UpstreamRegistries...)
+
 	cp.ArtifactStreamingAllowedHostSuffixes = append([]string(nil), c.ArtifactStreamingAllowedHostSuffixes...)
 	for i := range cp.UpstreamRegistries {
 		endpoint := cp.UpstreamRegistries[i].Endpoint
