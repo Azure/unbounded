@@ -37,9 +37,12 @@ pub enum ResourceClass {
     IngressConnection,
     OutboundConnection,
     ControlConnection,
+    /// Outbound sockets other than origin metadata, kept below the outbound
+    /// limit so metadata lookups never queue behind page bodies.
+    OrdinaryOutboundConnection,
 }
 impl flow_control::Class for ResourceClass {
-    const COUNT: usize = 14;
+    const COUNT: usize = 15;
     fn index(self) -> usize {
         self as usize
     }
@@ -170,6 +173,10 @@ impl Policy for AdmissionPolicy {
             // Snapshot, renewal, and keyring delivery make independent progress.
             ResourceClass::ControlConnection => (self.limits.client_connections.get() / 4).min(3),
             ResourceClass::OutboundConnection => self.limits.client_connections.get() / 4,
+            ResourceClass::OrdinaryOutboundConnection => {
+                let outbound = self.limit(ResourceClass::OutboundConnection);
+                outbound - usize::from(outbound >= 2) * METADATA_OUTBOUND_RESERVE
+            }
             ResourceClass::IngressConnection => {
                 self.limits.client_connections.get().saturating_sub(
                     self.limit(ResourceClass::ControlConnection)
@@ -314,10 +321,46 @@ mod capture_tests {
         ));
     }
 }
+/// Outbound slots only origin metadata may use once a worker has at least two.
+/// A single-slot worker keeps no reserve so ordinary traffic still progresses.
+pub const METADATA_OUTBOUND_RESERVE: usize = 1;
+
 /// Compound socket role admission, retained through kernel completion.
 pub struct ConnectionReservation {
     _total: Charge<AdmissionPolicy>,
     _role: Charge<AdmissionPolicy>,
+    ordinary: Option<Charge<AdmissionPolicy>>,
+}
+impl ConnectionReservation {
+    /// Move an outbound reservation between metadata and ordinary use.
+    /// Ordinary use must fit below the metadata reserve; metadata use releases it.
+    pub fn reclassify(
+        &mut self,
+        admission: &Quotas<AdmissionPolicy>,
+        metadata: bool,
+    ) -> Result<()> {
+        if metadata {
+            self.ordinary = None;
+        } else if self.ordinary.is_none() {
+            self.ordinary =
+                Some(admission.reserve(None, ResourceClass::OrdinaryOutboundConnection, 1)?);
+        }
+        Ok(())
+    }
+}
+
+/// Reserve an outbound socket for origin metadata, which may use the reserve
+/// that ordinary outbound reservations leave free.
+pub fn reserve_metadata_connection(
+    admission: &Quotas<AdmissionPolicy>,
+) -> Result<ConnectionReservation> {
+    let role_charge = admission.reserve(None, ResourceClass::OutboundConnection, 1)?;
+    let total = admission.reserve(None, ResourceClass::Connection, 1)?;
+    Ok(ConnectionReservation {
+        _total: total,
+        _role: role_charge,
+        ordinary: None,
+    })
 }
 
 /// Reserve the socket role and total together, rolling back on either rejection.
@@ -334,11 +377,18 @@ pub fn reserve_connection(
     ) {
         return Err(Error::InvalidConfiguration);
     }
+    let ordinary = match role {
+        ResourceClass::OutboundConnection => {
+            Some(admission.reserve(None, ResourceClass::OrdinaryOutboundConnection, 1)?)
+        }
+        _ => None,
+    };
     let role_charge = admission.reserve(None, role, 1)?;
     let total = admission.reserve(None, ResourceClass::Connection, 1)?;
     Ok(ConnectionReservation {
         _total: total,
         _role: role_charge,
+        ordinary,
     })
 }
 
@@ -383,6 +433,7 @@ fn reserve_ingress_charges(
     Ok(ConnectionReservation {
         _total: total,
         _role: role,
+        ordinary: None,
     })
 }
 
@@ -650,6 +701,43 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_outbound_leaves_metadata_reserve_and_reclassification_enforces_it() {
+        for (connections, ordinary, total) in [(64, 15, 16), (8, 1, 2), (4, 1, 1)] {
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.client_connections = std::num::NonZeroUsize::new(connections).unwrap();
+            let admission = Quotas::new(AdmissionPolicy::new(limits));
+            assert_eq!(admission.limit(ResourceClass::OutboundConnection), total);
+            assert_eq!(
+                admission.limit(ResourceClass::OrdinaryOutboundConnection),
+                ordinary
+            );
+            let pages: Vec<_> = (0..ordinary)
+                .map(|_| reserve_connection(&admission, ResourceClass::OutboundConnection).unwrap())
+                .collect();
+            assert!(reserve_connection(&admission, ResourceClass::OutboundConnection).is_err());
+            let metadata: Vec<_> = (ordinary..total)
+                .map(|_| reserve_metadata_connection(&admission).unwrap())
+                .collect();
+            assert!(reserve_metadata_connection(&admission).is_err());
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), total);
+            drop(metadata);
+            // Reused metadata sockets cannot carry ordinary work past the reserve.
+            if ordinary < total {
+                let mut slot = reserve_metadata_connection(&admission).unwrap();
+                assert!(slot.reclassify(&admission, false).is_err());
+                drop(pages);
+                slot.reclassify(&admission, false).unwrap();
+                assert_eq!(admission.used(ResourceClass::OrdinaryOutboundConnection), 1);
+                slot.reclassify(&admission, true).unwrap();
+                assert_eq!(admission.used(ResourceClass::OrdinaryOutboundConnection), 0);
+            } else {
+                drop(pages);
+            }
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+    }
+
+    #[test]
     fn ingress_saturation_preserves_outbound_and_control_without_raising_total() {
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -658,10 +746,12 @@ mod tests {
             .map(|_| reserve_connection(&admission, ResourceClass::IngressConnection).unwrap())
             .collect();
         assert!(reserve_connection(&admission, ResourceClass::IngressConnection).is_err());
-        let outbound: Vec<_> = (0..admission.limit(ResourceClass::OutboundConnection))
+        let mut outbound: Vec<_> = (0..admission.limit(ResourceClass::OrdinaryOutboundConnection))
             .map(|_| reserve_connection(&admission, ResourceClass::OutboundConnection).unwrap())
             .collect();
         assert!(reserve_connection(&admission, ResourceClass::OutboundConnection).is_err());
+        outbound.push(reserve_metadata_connection(&admission).unwrap());
+        assert!(reserve_metadata_connection(&admission).is_err());
         let control: Vec<_> = (0..admission.limit(ResourceClass::ControlConnection))
             .map(|_| reserve_connection(&admission, ResourceClass::ControlConnection).unwrap())
             .collect();

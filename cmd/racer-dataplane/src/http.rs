@@ -79,6 +79,12 @@ impl http1::connection::Context for HttpContext {
     fn outbound_slot(&self) -> Result<ConnectionReservation> {
         crate::admission::reserve_connection(&self.0, ResourceClass::OutboundConnection)
     }
+    fn outbound_priority_slot(&self) -> Result<ConnectionReservation> {
+        crate::admission::reserve_metadata_connection(&self.0)
+    }
+    fn reclassify_slot(&self, slot: &mut ConnectionReservation, priority: bool) -> Result<()> {
+        slot.reclassify(&self.0, priority)
+    }
     fn stopped(&self) -> bool {
         self.0.is_stopped()
     }
@@ -2218,6 +2224,61 @@ pub(crate) mod tests {
             pool.close();
             assert_eq!(admission.used(ResourceClass::Connection), 0);
             assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        }
+        #[test]
+        fn metadata_keeps_shared_outbound_reserve_when_two_caches_saturate_pages() {
+            let (admission, reactor, mut pool) = setup();
+            let outbound = admission.limit(ResourceClass::OutboundConnection);
+            assert!(outbound >= 2, "test needs a metadata reserve");
+            pool.config_mut().secondary_cap = outbound;
+            let (listener, endpoint) = Listener::origin();
+            let Endpoint::Unix(path) = endpoint else {
+                unreachable!()
+            };
+            let origin = |cache: &str| Endpoint::Origin {
+                cache: racer_control_wire::CacheId(cache.into()),
+                path: path.clone(),
+            };
+            let (a, b) = (origin("cache-a"), origin("cache-b"));
+            // Ordinary page connections from both caches fill shared admission.
+            let mut pages = Vec::new();
+            for endpoint in [&a, &b].into_iter().cycle() {
+                match pool.prepare_connection(endpoint) {
+                    Ok((lease, _)) => pages.push(lease),
+                    Err(Error::Overloaded) => break,
+                    Err(e) => panic!("unexpected page admission error: {e:?}"),
+                }
+            }
+            assert_eq!(
+                pages.len(),
+                outbound - crate::admission::METADATA_OUTBOUND_RESERVE
+            );
+            assert!(pool.snapshot().entries[&a].0 > 0 && pool.snapshot().entries[&b].0 > 0);
+            let scope = scope();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut page = pool.checkout_wait(&a, &scope);
+            assert!(page.as_mut().poll(&mut cx).is_pending());
+            // Metadata completes a real exchange without any page releasing.
+            let (metadata, peer) = held(&pool, &reactor, &admission, &b, &listener);
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
+            assert!(page.as_mut().poll(&mut cx).is_pending());
+            // A pooled metadata socket cannot be reused to bypass the ordinary cap.
+            drop(metadata);
+            assert!(matches!(
+                pool.prepare_connection(&b),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(
+                admission.used(ResourceClass::OrdinaryOutboundConnection),
+                outbound - crate::admission::METADATA_OUTBOUND_RESERVE
+            );
+            drop((page, pages.pop()));
+            let (lease, _) = pool
+                .prepare_connection(&a)
+                .expect("page admitted once an ordinary slot frees");
+            drop((lease, pages, peer));
+            pool.close();
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
         #[test]
         fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
