@@ -467,6 +467,13 @@ status=$?
 set -e
 mv "$result_file.tmp" "$result_file"
 printf '%s\n' "$status" >"$status_file"
+grep -E '^(observed_at|image|manifest_digest|layers_per_host|bytes_per_host|desired_hosts|target_hosts|checked_hosts|unique_hosts|metric_hosts|complete_hosts|present_layers|present_bytes|expected_fleet_bytes|metrics_only|origin_started|origin_success|origin_failure|seed_failed|seed_peer|seed_origin|seed_present|prefetch_hosts|prefetch_batches|prefetch_group_success|prefetch_group_error)=' "$result_file" || true
+awk '
+  /^prefetch_coordinators:$/ {print; capture=1; next}
+  /^prefetch_coordinator_logs:$/ {exit}
+  capture {print}
+' "$result_file"
+grep -E 'streaming layer reconciliation (started|complete)' "$result_file" | tail -6 || true
 printf 'verification_status=%s\n' "$status"
 exit "$status"
 SCRIPT
@@ -515,18 +522,9 @@ SCRIPT
       Succeeded|Failed) ;;
       *) exit 0 ;;
     esac
-    script=$(cat <<'SCRIPT'
-set -Eeuo pipefail
-result_file=/var/lib/gantry-benchmark/artifacts/streaming-layer-verification.txt
-status_file=/var/lib/gantry-benchmark/artifacts/streaming-layer-verification.status
-[[ -f "$result_file" ]] || { echo "no persisted streaming layer verification result" >&2; exit 1; }
-cat "$result_file"
-status=$(cat "$status_file" 2>/dev/null || printf '1')
-[[ "$status" =~ ^[0-9]+$ ]] || status=1
-exit "$status"
-SCRIPT
-)
-    invoke_remote "$script"
+    exit_code=$(jq -r '.instanceView.exitCode // 1' <<<"$result")
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
+    exit "$exit_code"
     ;;
   verify-streaming-layers-cleanup)
     (($# == 0)) || { usage >&2; exit 2; }
