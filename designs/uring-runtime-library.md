@@ -531,6 +531,9 @@ listeners, datagrams, pipes, readiness, partitions), `fault` (`Fault`,
   which yields an always-`EBADF` handle for an id that is not unadopted.
 - Endpoint labels for partitions are per backend
   (`SimBackend::set_endpoint`), replacing the old thread-local scope.
+  Fixtures created outside a backend can be labeled explicitly with
+  `World::{labeled_socket, labeled_listen, labeled_connect}`.
+  `SimFd::socket_type()` mirrors `getsockopt(SO_TYPE)`.
 - Faults: `World::inject(FaultTarget::{Any, Op(OpKind), Sync(SyncOp)},
   Fault::{Errno, Short, Delay, HoldCompletion})`, FIFO, consumed once.
   Asynchronous operations match `Op` targets at push; synchronous `Host`
@@ -553,7 +556,9 @@ listeners, datagrams, pipes, readiness, partitions), `fault` (`Fault`,
 - `SimEntropy::new(domain, seed, stream)`: SHA-256 over
   `domain || seed_le || stream_le || counter_le`, byte-compatible with the old
   runtime (`DEFAULT_ENTROPY_DOMAIN = b"uring-runtime.entropy.v1\0"`); clones
-  share one cursor; `!Send`.
+  share one cursor (`Arc<Mutex<..>>`), so a stream is `Send + Sync` and can
+  move with its role to another thread (Racer's `Environment` is `Send` and
+  its clones share one cursor). `ptr_eq` tells whether two handles share it.
 - Trace: bounded (16384, oldest half dropped) `Event { sequence, kind:
   EventKind, resource, result }`.
 - Tests: unit tests per module, `tests/backend.rs` drives the `Backend` trait

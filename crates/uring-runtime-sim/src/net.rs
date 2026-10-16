@@ -904,7 +904,11 @@ impl World {
         self.labeled_socket(domain, ty, None)
     }
 
-    pub(crate) fn labeled_socket(
+    /// Like [`socket`](Self::socket), labeled with the endpoint `label` (see
+    /// [partitions](crate::net#partitions)); `None` creates an unlabeled
+    /// socket. [`SimBackend`](crate::SimBackend)'s `Host::socket` uses its
+    /// own [`endpoint`](crate::SimBackend::endpoint).
+    pub fn labeled_socket(
         &self,
         domain: i32,
         ty: i32,
@@ -923,7 +927,8 @@ impl World {
         self.labeled_listen(&address.into(), None)
     }
 
-    pub(crate) fn labeled_listen(
+    /// Like [`listen`](Self::listen), labeled with the endpoint `label`.
+    pub fn labeled_listen(
         &self,
         address: &SocketAddress,
         label: Option<&SocketAddress>,
@@ -944,7 +949,8 @@ impl World {
         self.labeled_connect(&address.into(), None)
     }
 
-    pub(crate) fn labeled_connect(
+    /// Like [`connect`](Self::connect), labeled with the endpoint `label`.
+    pub fn labeled_connect(
         &self,
         address: &SocketAddress,
         label: Option<&SocketAddress>,
@@ -1087,6 +1093,17 @@ impl SimFd {
         state.record(EventKind::Call(SyncOp::Accept), self.id(), id as i64);
         drop(state);
         Ok(self.world().handle(id))
+    }
+
+    /// `getsockopt(SO_TYPE)`: `SOCK_STREAM` for streams and listeners,
+    /// `SOCK_DGRAM` for datagram sockets, `ENOTSOCK` for files and pipes.
+    pub fn socket_type(&self) -> Result<i32> {
+        match self.state().resources.get(&self.id()) {
+            Some(Resource::Stream(_) | Resource::Listener(_)) => Ok(libc::SOCK_STREAM),
+            Some(Resource::Datagram(_)) => Ok(libc::SOCK_DGRAM),
+            Some(_) => Err(errno(libc::ENOTSOCK)),
+            None => Err(errno(libc::EBADF)),
+        }
     }
 
     /// The ready `POLL*` events among `events` (always including `POLLHUP`
@@ -1237,6 +1254,26 @@ mod tests {
         let kinds: Vec<_> = world.trace().iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&EventKind::Blocked(SyncOp::Connect)));
         assert!(kinds.contains(&EventKind::Blocked(SyncOp::Send)));
+    }
+
+    #[test]
+    fn socket_type_and_labeled_listen_connect() {
+        let world = World::new();
+        let (a, b) = (inet("127.0.0.1:201"), inet("127.0.0.1:202"));
+        let listener = world.labeled_listen(&b, Some(&b)).unwrap();
+        world.partition(&a, &b);
+        assert_eq!(code(world.labeled_connect(&b, Some(&a))), libc::EAGAIN);
+        world.heal(&a, &b);
+        let client = world.labeled_connect(&b, Some(&a)).unwrap();
+        let datagram = world.bind_datagram("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (read, _write) = world.pipe(16).unwrap();
+        world.write_file("/f", b"x").unwrap();
+        let file = world.open("/f", libc::O_RDONLY).unwrap();
+        assert_eq!(listener.socket_type().unwrap(), libc::SOCK_STREAM);
+        assert_eq!(client.socket_type().unwrap(), libc::SOCK_STREAM);
+        assert_eq!(datagram.socket_type().unwrap(), libc::SOCK_DGRAM);
+        assert_eq!(code(read.socket_type()), libc::ENOTSOCK);
+        assert_eq!(code(file.socket_type()), libc::ENOTSOCK);
     }
 
     #[test]
