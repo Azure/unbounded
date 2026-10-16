@@ -2087,16 +2087,17 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		siteTunnelProtocols, peeringSiteTunnelProtocols,
 		assignmentPoolTunnelProtocols, poolTunnelProtocols)
 	localPoolMTU := localGatewayPoolTunnelMTU(localGatewayPools, poolTunnelMTUs)
+	meshComponentMTU := directMeshComponentTunnelMTU(mySiteName, siteMap, sitePeerings)
+	localScopeMTU := resolveTunnelMTU(siteTunnelMTUs[mySiteName], localPoolMTU, meshComponentMTU)
 
 	if !isGatewayNode {
 		applyPublishedGatewayMTUs(gatewayPeers, gatewayPoolMap, gatewayNodeMap)
 	}
 
-	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, isGatewayNode, localPoolMTU, peeredSites, networkPeeredSites,
+	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, isGatewayNode, localScopeMTU, peeredSites, networkPeeredSites,
 		siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 		assignmentPoolTunnelMTUs, poolTunnelMTUs, state.netlinkCache)
 
-	localScopeMTU := resolveTunnelMTU(siteTunnelMTUs[mySiteName], localPoolMTU)
 	fabricMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 		unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
 	previousFabricMTU := state.cniMTU

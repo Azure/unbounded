@@ -450,6 +450,70 @@ func applyPublishedGatewayMTUs(peers []gatewayPeerInfo, pools map[string]*unboun
 	}
 }
 
+func directMeshComponentTunnelMTU(siteName string, sites map[string]*unboundedv1alpha3.Site, peerings []unboundednetv1alpha1.SitePeering) int {
+	if sites[siteName] == nil {
+		return 0
+	}
+
+	edges := make(map[string][]int)
+
+	for index, peering := range peerings {
+		if !unboundednetv1alpha1.SpecEnabled(peering.Spec.Enabled) || (peering.Spec.MeshNodes != nil && !*peering.Spec.MeshNodes) {
+			continue
+		}
+
+		members := make(map[string]bool)
+
+		for _, name := range peering.Spec.Sites {
+			if sites[name] != nil {
+				members[name] = true
+			}
+		}
+
+		if len(members) < 2 {
+			continue
+		}
+
+		for name := range members {
+			edges[name] = append(edges[name], index)
+		}
+	}
+
+	visitedSites := map[string]bool{siteName: true}
+	visitedPeerings := make(map[int]bool)
+	queue := []string{siteName}
+	result := 0
+
+	// Shared pod and tunnel interfaces couple MTU constraints across a mesh
+	// component even when routing itself is not transitive.
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		result = resolveTunnelMTU(result, tunnelMTUFromSpec(sites[current].Spec.TunnelMTU))
+
+		for _, index := range edges[current] {
+			if visitedPeerings[index] {
+				continue
+			}
+
+			visitedPeerings[index] = true
+			peering := peerings[index]
+			result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+
+			for _, name := range peering.Spec.Sites {
+				if sites[name] == nil || visitedSites[name] {
+					continue
+				}
+
+				visitedSites[name] = true
+				queue = append(queue, name)
+			}
+		}
+	}
+
+	return result
+}
+
 func gatewayMeshTransitTunnelMTU(
 	peerPool, peerSite string,
 	routes map[string]unboundednetv1alpha1.GatewayNodeRoute,
