@@ -1305,8 +1305,14 @@ mod tests {
 
     #[test]
     fn sparse_page_copies_preserve_boundaries_holes_and_snapshots() {
-        for offset in [0, 1, 4095, 4096, 4097] {
-            for length in [0, 1, 4095, 4096, 4097, 8193] {
+        // Miri is slow on page-sized buffers; keep the boundary cases only.
+        let (offsets, lengths): (&[u64], &[usize]) = if cfg!(miri) {
+            (&[0, 4095, 4097], &[0, 1, 4097])
+        } else {
+            (&[0, 1, 4095, 4096, 4097], &[0, 1, 4095, 4096, 4097, 8193])
+        };
+        for &offset in offsets {
+            for &length in lengths {
                 let world = World::new();
                 let file = world.open("/file", libc::O_CREAT | libc::O_RDWR).unwrap();
                 let offset = 8192 + offset;
