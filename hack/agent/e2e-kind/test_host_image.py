@@ -400,17 +400,29 @@ class TestGalleryVersion(unittest.TestCase):
 
     def test_latest_is_resolved_where_the_image_is_replicated(self):
         with patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", "sub"), \
-                patch.object(e2e, "capture", return_value="3.20261007.1021") as az:
+                patch.object(
+                    e2e,
+                    "capture",
+                    side_effect=["00000000-0000-0000-0000-000000000000", "3.20261007.1021"],
+                ) as az:
             self.assertEqual(e2e.acl_gallery_version(), "3.20261007.1021")
 
-        args = az.call_args.args[0]
-        self.assertEqual(args[:4], ["az", "sig", "image-version", "show-shared"])
-        for flag, value in (("--gallery-unique-name", "b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL"),
-                            ("--gallery-image-definition", "acl-1es-eval"),
-                            ("--gallery-image-version", "latest"),
-                            ("--location", e2e.ACL_IMAGE_GALLERY_LOCATION),
-                            ("--subscription", "sub")):
-            self.assertEqual(args[args.index(flag) + 1], value)
+        account_args = az.call_args_list[0].args[0]
+        self.assertEqual(account_args[:3], ["az", "account", "show"])
+        self.assertEqual(account_args[account_args.index("--subscription") + 1], "sub")
+
+        rest_args = az.call_args_list[1].args[0]
+        self.assertEqual(rest_args[:4], ["az", "rest", "--method", "get"])
+        url = rest_args[rest_args.index("--url") + 1]
+        self.assertEqual(
+            url,
+            "https://management.azure.com/subscriptions/"
+            "00000000-0000-0000-0000-000000000000/providers/Microsoft.Compute/locations/"
+            "westus2/sharedGalleries/b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL/images/"
+            "acl-1es-eval/versions/latest?api-version=2024-03-03",
+        )
+        self.assertNotIn("show-shared", rest_args)
+        self.assertEqual(rest_args[rest_args.index("--subscription") + 1], "sub")
 
     def test_a_pinned_version_is_not_looked_up(self):
         with patch.object(e2e, "ACL_IMAGE_VERSION", "3.1"), \
