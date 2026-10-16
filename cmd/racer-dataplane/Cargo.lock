@@ -893,6 +893,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-platform"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
+ "uring-runtime",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1261,6 +1270,14 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "uring-runtime"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+]
 
 [[package]]
 name = "uring-runtime-legacy"

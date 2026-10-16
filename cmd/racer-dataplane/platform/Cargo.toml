@@ -1,0 +1,19 @@
+[package]
+name = "racer-platform"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Racer policy and ergonomic surface over the uring-runtime library"
+
+[dependencies]
+uring = { package = "uring-runtime", path = "../../../crates/uring-runtime" }
+futures = "0.3"
+libc = "0.2"
+
+[features]
+default = []
+# Shared wake instrumentation for downstream tests.
+test-util = []
+# Ambient simulated clock and entropy (the seam the simulation backend plugs into).
+simulation = []
