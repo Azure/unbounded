@@ -38,6 +38,9 @@ import (
 // Gateway nodes can operate without being assigned to a site - they will still configure themselves to accept connections
 // The informers are passed in from run() and are already started and synced.
 func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, myPubKey string, nodePodCIDRs []string, manageCniPlugin bool, initialCNIConfigMTU int, healthState *nodeHealthState, netlinkCache *unboundednetnetlink.NetlinkCache, adoptedAssignment nodeAssignment, podNamespace, podName string, podUID types.UID, startupWatch *startupAssignmentWatch, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer) error {
+	ctx, stopWorkers := context.WithCancel(ctx)
+	defer stopWorkers()
+
 	klog.Info("Watching Site, SiteNodeSlice, GatewayPool, GatewayPoolNode, SitePeering, SiteGatewayPoolAssignment, and GatewayPoolPeering objects for changes")
 
 	// Read private key for WireGuard configuration
@@ -203,6 +206,16 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 
 	defer cleanupForAssignmentTransition(cfg, state, dynamicClient, gatewayNodeInformer)
 
+	// Networking writes do not observe cancellation, so reconciliation and
+	// heartbeat workers must finish before transition cleanup runs, including
+	// when a fatal error returns while the parent context is still live.
+	var workers sync.WaitGroup
+
+	defer func() {
+		stopWorkers()
+		workers.Wait()
+	}()
+
 	// Register the status server with the health state EARLY so /status endpoints work
 	// This ensures the status endpoint shows real state even during initialization
 	statusSrv := &nodeStatusServer{
@@ -220,7 +233,9 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	statusSrv.startRouteChangeWatcher(ctx)
 
 	// Start GatewayNode heartbeat updater (10s lease-style status update).
-	go startGatewayNodeHeartbeat(ctx, dynamicClient, cfg.NodeName, state, gatewayNodeHeartbeatInterval)
+	workers.Go(func() {
+		startGatewayNodeHeartbeat(ctx, dynamicClient, cfg.NodeName, state, gatewayNodeHeartbeatInterval)
+	})
 
 	fatalCh := make(chan error, 1)
 	acknowledged := false
@@ -309,13 +324,13 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 	}
 
-	go func() {
+	workers.Go(func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-updateCh:
-				for {
+				for ctx.Err() == nil {
 					updateMu.Lock()
 					if !updatePending {
 						updateMu.Unlock()
@@ -329,11 +344,11 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 				}
 			}
 		}
-	}()
+	})
 
 	// Periodic reconcile ensures stale GatewayNode route advertisements are aged out
 	// even when only heartbeat updates are observed and filtered out below.
-	go func() {
+	workers.Go(func() {
 		ticker := time.NewTicker(gatewayNodeHeartbeatInterval)
 		defer ticker.Stop()
 
@@ -345,7 +360,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 				requestUpdate()
 			}
 		}
-	}()
+	})
 
 	// Register event handlers with cleanup on partial failure.
 	// If any registration fails, already-registered handlers are removed.
@@ -515,7 +530,7 @@ func cleanupForAssignmentTransition(cfg *config, state *wireGuardState, dynamicC
 		klog.Infof("Effective assignment changed during process lifetime; cleaning managed networking before restart (site %q -> %q, GatewayPool %q -> %q)", adopted.site, current.site, adopted.gatewayPool, current.gatewayPool)
 
 		if adopted.gatewayPool != "" {
-			if err := syncGatewayNodeRoutesStatus(cleanupCtx, dynamicClient, gatewayNodeInformer, state.nodeName, nil); err != nil {
+			if err := clearGatewayNodeRoutesStatus(cleanupCtx, dynamicClient, state.nodeName); err != nil {
 				klog.Errorf("Failed to clear GatewayPoolNode route advertisements during role transition: %v", err)
 			}
 		}
@@ -525,9 +540,39 @@ func cleanupForAssignmentTransition(cfg *config, state *wireGuardState, dynamicC
 				klog.Errorf("Failed to remove gateway taint during role demotion: %v", err)
 			}
 		}
+
+		if err := disableCNIForAssignmentTransition(cleanupCtx, cfg, state, dynamicClient, current); err != nil {
+			klog.Errorf("Failed to disable managed CNI configuration during Site transition: %v", err)
+		}
 	}
 
 	cleanupNodeNetworkingOnShutdown(cfg, state, transition)
+}
+
+func disableCNIForAssignmentTransition(ctx context.Context, cfg *config, state *wireGuardState, client dynamic.Interface, current nodeAssignment) error {
+	if !state.manageCniPlugin || current.site == "" || current.site == state.adoptedAssignment.site {
+		return nil
+	}
+
+	siteObj, err := client.Resource(siteGVR).Get(ctx, current.site, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read destination Site %q: %w", current.site, err)
+	}
+
+	site, err := parseSite(siteObj)
+	if err != nil {
+		return fmt.Errorf("parse destination Site %q: %w", current.site, err)
+	}
+
+	if site.Spec.ManageCniPlugin == nil || *site.Spec.ManageCniPlugin {
+		return nil
+	}
+
+	if _, err := disableManagedCNIConfig(cfg); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func assignmentTransitionRequired(adopted, current nodeAssignment) bool {

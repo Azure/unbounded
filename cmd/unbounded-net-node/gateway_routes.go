@@ -339,6 +339,21 @@ func syncGatewayNodeRoutesStatus(ctx context.Context, dynamicClient dynamic.Inte
 	return patchGatewayNodeStatus(ctx, dynamicClient, nodeName, statusPatch)
 }
 
+// clearGatewayNodeRoutesStatus removes every advertised route, including any
+// the informer cache has not observed yet.
+func clearGatewayNodeRoutesStatus(ctx context.Context, dynamicClient dynamic.Interface, nodeName string) error {
+	if dynamicClient == nil || nodeName == "" {
+		return nil
+	}
+
+	return patchGatewayNodeStatus(ctx, dynamicClient, nodeName, map[string]interface{}{
+		"status": map[string]interface{}{
+			"lastUpdated": time.Now().UTC().Format(time.RFC3339),
+			"routes":      nil,
+		},
+	})
+}
+
 func patchGatewayNodeStatus(ctx context.Context, dynamicClient dynamic.Interface, nodeName string, statusPatch map[string]interface{}) error {
 	patchData, err := json.Marshal(statusPatch)
 	if err != nil {

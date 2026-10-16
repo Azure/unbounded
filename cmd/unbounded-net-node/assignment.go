@@ -333,6 +333,13 @@ func acknowledgeEffectiveAssignment(
 		return err
 	}
 
+	// Retry a failed demotion cleanup before publishing worker readiness.
+	if adopted.gatewayPool == "" {
+		if err := removeGatewayNodeTaint(ctx, clientset, nodeName); err != nil {
+			return fmt.Errorf("remove stale gateway taint before acknowledging worker assignment: %w", err)
+		}
+	}
+
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get own Pod %s/%s before acknowledging assignment: %w", namespace, podName, err)
