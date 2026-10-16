@@ -35,6 +35,7 @@ const (
 	markerName        = "racer-installation"
 	versionName       = "racer-version"
 	configName        = "racer-config"
+	objectImageName   = "racer-object"
 	tlsName           = "racer-controller-tls"
 	trustName         = "racer-bootstrap-trust"
 	managerAnnotation = "unbounded-cloud.io/racer-manager"
@@ -212,6 +213,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 				"RACER_REPLICATION_TRUST_FILE":      "/etc/racer/tls/ca.crt",
 				"RACER_REPLICATION_SERVER_NAME":     controllerName + "." + env.Namespace + ".svc",
 				"RACER_REPLICATION_PORT":            "8443",
+				"RACER_OBJECT_IMAGE":                env.Config.Image(objectImageName),
 			}
 			for key, value := range values {
 				if err := unstructured.SetNestedField(obj.Object, value, "data", key); err != nil {
