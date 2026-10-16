@@ -53,7 +53,7 @@ see the [racer-object reference]({{< relref "reference/racer-object" >}}).
   - **Azure Blob**: a storage account, a container of block blobs, and an Azure
     identity with **Storage Blob Data Reader** on that account or container.
 - Permission to create cluster-scoped ClusterCaches, and to run pods with
-  hostPath mounts and UID 0 containers. The adapter does not need privileged mode.
+  hostPath mounts and a UID 0 origin container. The sidecar runs as non-root. The adapter does not need privileged mode.
 
 Examples use the default operator namespace, `unbounded-system`. Substitute your
 installation namespace if different.
@@ -302,9 +302,9 @@ spec:
         - --namespace=example-store
         - --bucket=example-bucket
       securityContext:
-        runAsUser: 0
-        runAsGroup: 0
-        runAsNonRoot: false
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
         capabilities:

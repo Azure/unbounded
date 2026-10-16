@@ -147,6 +147,9 @@ Requirements:
   with hostPath type `DirectoryOrCreate`. See [Socket Mounts](#socket-mounts).
 - **Security context.** Run as UID/GID 0, with no privilege escalation, all
   capabilities dropped, `RuntimeDefault` seccomp, and a read-only root filesystem.
+  The origin must own its socket directory, which the kubelet creates as root, so
+  set `runAsUser: 0`, `runAsGroup: 0`, and `runAsNonRoot: false` explicitly. The
+  image's default user is the non-root UID 65532.
 - **Credentials.** Supply upstream credentials to the origin pods only. See
   [Upstream Providers](#upstream-providers).
 - **Arguments.** Set `--cache`, `--namespace`, and `--bucket` to match the
@@ -219,8 +222,8 @@ The sidecar runs in each application pod that reads objects. The usual way to ad
 it is automatic injection. You can also add it to the pod spec by hand.
 
 Injection needs Kubernetes 1.29 or later, because it uses native sidecars. In
-both cases the sidecar runs as root and mounts a hostPath, so the pod's namespace
-must allow it under Pod Security Admission. A namespace that enforces the `baseline` or
+both cases the sidecar runs as the non-root UID/GID 65532 but mounts a hostPath,
+so the pod's namespace must allow hostPath volumes under Pod Security Admission. A namespace that enforces the `baseline` or
 `restricted` level rejects the pod. Admission checks the pod after injection.
 
 ### Automatic Injection
@@ -338,8 +341,9 @@ Requirements:
 - **Socket mount.** Mount `/run/racer/<cache>/client` from the host, read-only,
   with hostPath type `Directory`, into the sidecar container only. See
   [Socket Mounts](#socket-mounts).
-- **Security context.** Run the sidecar container as UID/GID 0, with no privilege
-  escalation, all capabilities dropped, and a read-only root filesystem. The
+- **Security context.** Run the sidecar container as UID/GID 65532 with
+  `runAsNonRoot: true`, no privilege escalation, all capabilities dropped,
+  `RuntimeDefault` seccomp, and a read-only root filesystem. The
   application containers can run as any user.
 - **Arguments.** Set `--cache`, `--namespace`, and `--bucket` to match the
   origin. Add `--api=azure` if the application uses the Azure Blob API.
@@ -378,9 +382,9 @@ spec:
         - --listen=127.0.0.1:8080
         # Add --api=azure for Azure Blob clients.
       securityContext:
-        runAsUser: 0
-        runAsGroup: 0
-        runAsNonRoot: false
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
         capabilities:
@@ -529,9 +533,12 @@ the object read permissions it needs, including version reads if you use them.
 | Origin | `/run/racer/<cache>/origin` | `DirectoryOrCreate` | Writable |
 | Sidecar | `/run/racer/<cache>/client` | `Directory` | Read-only |
 
-Both containers run as UID/GID 0 because Racer's sockets are root-owned and mode
-`0600`. They still drop all capabilities, disable privilege escalation, use the
-`RuntimeDefault` seccomp profile, and have read-only root filesystems. The adapter
+The sidecar runs as the non-root UID/GID 65532. Racer creates client sockets with
+mode `0666`, so access is controlled by which directory the pod mounts, not by the
+process UID. The origin runs as UID/GID 0 because it must own its socket
+directory, which the kubelet creates as root. Both drop all capabilities, disable
+privilege escalation, use the `RuntimeDefault` seccomp profile, and have read-only
+root filesystems. The adapter
 does not need privileged mode.
 
 Mount only these cache-specific directories, never all of `/run/racer`. Keep
