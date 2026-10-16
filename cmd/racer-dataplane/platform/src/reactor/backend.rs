@@ -1,5 +1,5 @@
-//! Racer's [`Backend`]: an enum dispatching to the io_uring backend (and,
-//! later, to the simulator).
+//! Racer's [`Backend`]: an enum dispatching to the io_uring backend or, with
+//! the `simulation` feature, to the `uring-runtime-sim` backend.
 //!
 //! The descriptor type is `Rc<Descriptor>`, the shape Racer code already
 //! passes around. The clock reads [`crate::environment`], so simulated
@@ -52,9 +52,11 @@ impl Entropy for RacerEntropy {
 pub enum RacerBackend {
     /// The real io_uring backend.
     Uring(uring::Uring),
-    // TODO(sim): `#[cfg(feature = "simulation")] Sim(uring_runtime_sim::SimBackend)`.
-    // Every match below gets a Sim arm; descriptors map through `Descriptor`'s
-    // future Sim variant instead of `Descriptor::host`.
+    /// The deterministic simulator, over the world of a
+    /// [`Simulation`](crate::simulation::Simulation). Sockets created through
+    /// [`Host::socket`] carry the simulation's current endpoint label.
+    #[cfg(feature = "simulation")]
+    Sim(uring_runtime_sim::SimBackend, crate::simulation::Simulation),
     /// A scripted backend for adapter tests.
     #[cfg(test)]
     Scripted(super::scripted::Scripted),
@@ -64,6 +66,8 @@ impl std::fmt::Debug for RacerBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Uring(_) => f.write_str("RacerBackend::Uring"),
+            #[cfg(feature = "simulation")]
+            Self::Sim(..) => f.write_str("RacerBackend::Sim"),
             #[cfg(test)]
             Self::Scripted(_) => f.write_str("RacerBackend::Scripted"),
         }
@@ -74,9 +78,44 @@ impl RacerBackend {
     /// Select the backend for the current environment, as the old reactor did
     /// at construction.
     pub fn select() -> Self {
-        // TODO(sim): return `Self::Sim(..)` when the current environment selects
-        // a simulated world (the old `Simulation::current()` lookup).
+        #[cfg(feature = "simulation")]
+        if let Some(simulation) = crate::simulation::Simulation::current() {
+            return Self::simulated(&simulation, &crate::environment::Environment::current());
+        }
         Self::Uring(uring::Uring::new())
+    }
+
+    /// A simulated backend over `simulation`'s world. Its clock is the
+    /// environment's simulated clock when there is one (so kernel-style
+    /// timeouts follow the same time as [`RacerClock`]), else the
+    /// simulation's fallback clock. The backend's own entropy is a stream the
+    /// reactor never reads ([`RacerEntropy`] is used instead).
+    #[cfg(feature = "simulation")]
+    pub fn simulated(
+        simulation: &crate::simulation::Simulation,
+        environment: &crate::environment::Environment,
+    ) -> Self {
+        let clock = environment
+            .sim_clock()
+            .unwrap_or_else(|| simulation.clock())
+            .clone();
+        let entropy = uring_runtime_sim::SimEntropy::new(
+            uring_runtime_sim::DEFAULT_ENTROPY_DOMAIN,
+            clock.seed(),
+            u64::MAX,
+        );
+        let mut backend = uring_runtime_sim::SimBackend::new(simulation.world(), clock, entropy);
+        backend.set_endpoint(simulation.endpoint());
+        Self::Sim(backend, simulation.clone())
+    }
+
+    /// Whether this is the simulated backend.
+    pub fn is_simulated(&self) -> bool {
+        #[cfg(feature = "simulation")]
+        if let Self::Sim(..) = self {
+            return true;
+        }
+        false
     }
 }
 
@@ -91,20 +130,32 @@ fn host(fd: &Rc<Descriptor>) -> Result<&uring::Fd, PushError> {
     fd.host().ok_or_else(unsupported)
 }
 
-fn host_dir(fd: Option<&Rc<Descriptor>>) -> Result<Option<&uring::Fd>, PushError> {
-    fd.map(host).transpose()
-}
-
 fn host_err(fd: &Rc<Descriptor>) -> uring::Result<&uring::Fd> {
     host(fd).map_err(uring::Error::from)
 }
 
-fn wrap(fd: uring::Fd) -> Rc<Descriptor> {
-    Rc::new(Descriptor::from(fd))
+#[cfg(feature = "simulation")]
+fn sim(fd: &Rc<Descriptor>) -> Result<&uring_runtime_sim::SimFd, PushError> {
+    fd.as_sim().ok_or_else(unsupported)
 }
 
-/// Translate an operation on Racer descriptors into one on library descriptors.
-fn host_op<'a>(op: &Op<'a, Rc<Descriptor>>) -> Result<Op<'a, uring::Fd>, PushError> {
+#[cfg(feature = "simulation")]
+fn sim_err(fd: &Rc<Descriptor>) -> uring::Result<&uring_runtime_sim::SimFd> {
+    sim(fd).map_err(uring::Error::from)
+}
+
+fn wrap<F: Into<Descriptor>>(fd: F) -> Rc<Descriptor> {
+    Rc::new(fd.into())
+}
+
+/// Translate an operation on Racer descriptors into one on library
+/// descriptors, borrowing each through `map`.
+fn translate<'a, F>(
+    op: &Op<'a, Rc<Descriptor>>,
+    map: impl Fn(&'a Rc<Descriptor>) -> Result<&'a F, PushError>,
+) -> Result<Op<'a, F>, PushError> {
+    let host = &map;
+    let host_dir = |fd: Option<&'a Rc<Descriptor>>| fd.map(&map).transpose();
     Ok(match *op {
         Op::Nop => Op::Nop,
         Op::Read {
@@ -230,6 +281,8 @@ impl Backend for RacerBackend {
     fn init(&mut self, config: &BackendConfig) -> uring::Result<()> {
         match self {
             Self::Uring(backend) => backend.init(config),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.init(config),
             #[cfg(test)]
             Self::Scripted(backend) => backend.init(config),
         }
@@ -250,7 +303,14 @@ impl Backend for RacerBackend {
             // SAFETY: the translated op points at the same memory (and borrows
             // the library descriptors owned by the same `Rc<Descriptor>`s), so
             // our caller's guarantees carry over.
-            Self::Uring(backend) => unsafe { backend.push_with(user_data, &host_op(op)?, hints) },
+            Self::Uring(backend) => unsafe {
+                backend.push_with(user_data, &translate(op, host)?, hints)
+            },
+            // SAFETY: as above, for simulated descriptors.
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => unsafe {
+                backend.push_with(user_data, &translate(op, sim)?, hints)
+            },
             // SAFETY: forwarded from our caller.
             #[cfg(test)]
             Self::Scripted(backend) => unsafe { backend.push_with(user_data, op, hints) },
@@ -260,6 +320,8 @@ impl Backend for RacerBackend {
     fn cancel(&mut self, user_data: u64, target: u64) -> Result<(), PushError> {
         match self {
             Self::Uring(backend) => backend.cancel(user_data, target),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.cancel(user_data, target),
             #[cfg(test)]
             Self::Scripted(backend) => backend.cancel(user_data, target),
         }
@@ -269,6 +331,9 @@ impl Backend for RacerBackend {
         match self {
             // SAFETY: forwarded from our caller.
             Self::Uring(backend) => wrap(unsafe { backend.adopt_fd(raw) }),
+            #[cfg(feature = "simulation")]
+            // SAFETY: forwarded from our caller.
+            Self::Sim(backend, _) => wrap(unsafe { backend.adopt_fd(raw) }),
             // SAFETY: forwarded from our caller.
             #[cfg(test)]
             Self::Scripted(backend) => unsafe { backend.adopt_fd(raw) },
@@ -278,6 +343,8 @@ impl Backend for RacerBackend {
     fn submit(&mut self) -> uring::Result<usize> {
         match self {
             Self::Uring(backend) => backend.submit(),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.submit(),
             #[cfg(test)]
             Self::Scripted(backend) => backend.submit(),
         }
@@ -286,6 +353,8 @@ impl Backend for RacerBackend {
     fn pop(&mut self) -> Option<CompletionEntry> {
         match self {
             Self::Uring(backend) => backend.pop(),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.pop(),
             #[cfg(test)]
             Self::Scripted(backend) => backend.pop(),
         }
@@ -294,6 +363,8 @@ impl Backend for RacerBackend {
     fn wait(&mut self, timeout: Duration) -> uring::Result<()> {
         match self {
             Self::Uring(backend) => backend.wait(timeout),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.wait(timeout),
             #[cfg(test)]
             Self::Scripted(backend) => backend.wait(timeout),
         }
@@ -302,6 +373,8 @@ impl Backend for RacerBackend {
     fn remote_waker(&self) -> uring::Result<RemoteWaker> {
         match self {
             Self::Uring(backend) => backend.remote_waker(),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.remote_waker(),
             #[cfg(test)]
             Self::Scripted(backend) => backend.remote_waker(),
         }
@@ -310,6 +383,8 @@ impl Backend for RacerBackend {
     fn supports(&self, kind: OpKind) -> bool {
         match self {
             Self::Uring(backend) => backend.supports(kind),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.supports(kind),
             #[cfg(test)]
             Self::Scripted(backend) => backend.supports(kind),
         }
@@ -320,6 +395,14 @@ impl Host for RacerBackend {
     fn socket(&self, domain: i32, ty: i32, protocol: i32) -> uring::Result<Self::Fd> {
         match self {
             Self::Uring(backend) => backend.socket(domain, ty, protocol).map(wrap),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, simulation) => {
+                let endpoint = simulation.endpoint();
+                backend
+                    .world()
+                    .labeled_socket(domain, ty, endpoint.as_ref().or(backend.endpoint()))
+                    .map(wrap)
+            }
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -328,6 +411,8 @@ impl Host for RacerBackend {
     fn bind(&self, fd: &Self::Fd, address: &SocketAddress) -> uring::Result<()> {
         match self {
             Self::Uring(backend) => backend.bind(host_err(fd)?, address),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.bind(sim_err(fd)?, address),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -336,6 +421,8 @@ impl Host for RacerBackend {
     fn listen(&self, fd: &Self::Fd, backlog: i32) -> uring::Result<()> {
         match self {
             Self::Uring(backend) => backend.listen(host_err(fd)?, backlog),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.listen(sim_err(fd)?, backlog),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -344,6 +431,8 @@ impl Host for RacerBackend {
     fn local_addr(&self, fd: &Self::Fd) -> uring::Result<SocketAddress> {
         match self {
             Self::Uring(backend) => backend.local_addr(host_err(fd)?),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.local_addr(sim_err(fd)?),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -352,6 +441,8 @@ impl Host for RacerBackend {
     fn peer_addr(&self, fd: &Self::Fd) -> uring::Result<SocketAddress> {
         match self {
             Self::Uring(backend) => backend.peer_addr(host_err(fd)?),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.peer_addr(sim_err(fd)?),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -360,6 +451,8 @@ impl Host for RacerBackend {
     fn shutdown(&self, fd: &Self::Fd, how: Shutdown) -> uring::Result<()> {
         match self {
             Self::Uring(backend) => backend.shutdown(host_err(fd)?, how),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.shutdown(sim_err(fd)?, how),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -368,6 +461,8 @@ impl Host for RacerBackend {
     fn set_nodelay(&self, fd: &Self::Fd, enabled: bool) -> uring::Result<()> {
         match self {
             Self::Uring(backend) => backend.set_nodelay(host_err(fd)?, enabled),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.set_nodelay(sim_err(fd)?, enabled),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -376,6 +471,8 @@ impl Host for RacerBackend {
     fn try_send(&self, fd: &Self::Fd, buf: &[u8], flags: i32) -> uring::Result<usize> {
         match self {
             Self::Uring(backend) => backend.try_send(host_err(fd)?, buf, flags),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.try_send(sim_err(fd)?, buf, flags),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -384,6 +481,8 @@ impl Host for RacerBackend {
     fn try_recv(&self, fd: &Self::Fd, buf: &mut [u8], flags: i32) -> uring::Result<usize> {
         match self {
             Self::Uring(backend) => backend.try_recv(host_err(fd)?, buf, flags),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.try_recv(sim_err(fd)?, buf, flags),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -392,6 +491,8 @@ impl Host for RacerBackend {
     fn poll_now(&self, fd: &Self::Fd, events: i16) -> uring::Result<i16> {
         match self {
             Self::Uring(backend) => backend.poll_now(host_err(fd)?, events),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.poll_now(sim_err(fd)?, events),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }
@@ -400,6 +501,8 @@ impl Host for RacerBackend {
     fn pipe(&self) -> uring::Result<(Self::Fd, Self::Fd)> {
         match self {
             Self::Uring(backend) => backend.pipe().map(|(r, w)| (wrap(r), wrap(w))),
+            #[cfg(feature = "simulation")]
+            Self::Sim(backend, _) => backend.pipe().map(|(r, w)| (wrap(r), wrap(w))),
             #[cfg(test)]
             Self::Scripted(_) => Err(uring::ErrorKind::Unsupported.into()),
         }

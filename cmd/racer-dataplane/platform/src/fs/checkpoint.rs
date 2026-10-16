@@ -119,7 +119,10 @@ impl<const HEADER: usize> Slots<HEADER> {
             .get(slot)
             .ok_or_else(|| io::Error::other("invalid checkpoint slot"))?;
         let candidates = (0..128).map(|_| {
-            // TODO(sim): use the simulated world's deterministic sequence.
+            #[cfg(feature = "simulation")]
+            if let Some(sim) = crate::simulation::Simulation::current() {
+                return directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
+            }
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             directory.join(format!(".checkpoint.{}.{sequence}.tmp", std::process::id()))
         });
@@ -253,7 +256,8 @@ impl<T, const HEADER: usize> Iterator for Candidates<T, HEADER> {
 /// Real or simulated file with a bounded sequential cursor.
 enum CandidateFile {
     Real(std::fs::File),
-    // TODO(sim): `Sim(SimFd, offset)` for simulated worlds.
+    #[cfg(feature = "simulation")]
+    Sim(uring_runtime_sim::SimFd, u64),
 }
 
 impl CandidateFile {
@@ -261,6 +265,14 @@ impl CandidateFile {
     fn open(path: &Path, directory: bool) -> io::Result<Self> {
         let flags =
             libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
+        #[cfg(feature = "simulation")]
+        if let Some(sim) = crate::simulation::Simulation::current() {
+            let fd = sim
+                .open(None, path, libc::O_RDONLY | flags)?
+                .into_sim()
+                .map_err(|_| io::Error::other("simulated file"))?;
+            return Ok(Self::Sim(fd, 0));
+        }
         OpenOptions::new()
             .read(true)
             .custom_flags(flags)
@@ -275,6 +287,14 @@ impl CandidateFile {
                 let m = file.metadata()?;
                 (m.is_file(), m.len())
             }
+            #[cfg(feature = "simulation")]
+            Self::Sim(fd, _) => {
+                let m = fd.stat().map_err(crate::simulation::io_error)?;
+                (
+                    u32::from(m.stx_mode) & libc::S_IFMT == libc::S_IFREG,
+                    m.stx_size,
+                )
+            }
         };
         if !regular {
             return Err(io::Error::other("checkpoint is not a regular file"));
@@ -288,6 +308,14 @@ impl Read for CandidateFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Real(file) => file.read(bytes),
+            #[cfg(feature = "simulation")]
+            Self::Sim(fd, offset) => {
+                let n = fd
+                    .read_at(*offset, bytes)
+                    .map_err(crate::simulation::io_error)?;
+                *offset += n as u64;
+                Ok(n)
+            }
         }
     }
 }

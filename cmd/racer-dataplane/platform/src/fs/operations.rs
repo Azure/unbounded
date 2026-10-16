@@ -1,7 +1,8 @@
 //! Staged replacement and publication, with file policy supplied by the caller.
 //!
-//! `publish_new` is host only for now (TODO(sim): the old runtime routed it
-//! through the ambient simulated world).
+//! `publish_new` runs in the ambient simulated world when a
+//! [`Simulation`](crate::simulation::Simulation) is current, as the old
+//! runtime did.
 use super::*;
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -328,13 +329,39 @@ mod publication {
     /// Pinned directory shared by validation, creation, publication and cleanup.
     pub(super) struct Directory {
         fd: Descriptor,
-        // TODO(sim): keep the simulated world and directory path here, as the
-        // old runtime did, and route open/create/rename/unlink through it.
+
+        #[cfg(feature = "simulation")]
+        simulated: Option<(crate::simulation::Simulation, std::path::PathBuf)>,
     }
 
     impl Directory {
         /// Walk and pin private directories without traversing parent symlinks.
         pub(super) fn open(path: &Path) -> io::Result<Self> {
+            #[cfg(feature = "simulation")]
+            if let Some(sim) = crate::simulation::Simulation::current() {
+                let mut current =
+                    std::path::PathBuf::from(if path.is_absolute() { "/" } else { "." });
+                let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+                let mut fd = sim.open(None, &current, flags)?;
+                for part in path.components() {
+                    if let Component::Normal(part) = part {
+                        current.push(part);
+                        match sim.metadata(&current) {
+                            Ok(_) => (),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                sim.create_dir_all(&current)?;
+                                sim.chmod(&current, 0o700)?;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        fd = sim.open(Some(&fd), Path::new(part), flags)?;
+                    }
+                }
+                return Ok(Self {
+                    fd,
+                    simulated: Some((sim, current)),
+                });
+            }
             let mut fd = host_open(
                 libc::AT_FDCWD,
                 if path.is_absolute() { c"/" } else { c"." },
@@ -354,18 +381,35 @@ mod publication {
                     fd = host_open(fd.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
                 }
             }
-            Ok(Self { fd })
+            Ok(Self {
+                fd,
+                #[cfg(feature = "simulation")]
+                simulated: None,
+            })
         }
 
         /// Exclusively create a private stage in the pinned directory.
         pub(super) fn create(&self, name: &CString) -> io::Result<Descriptor> {
             let flags =
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            #[cfg(feature = "simulation")]
+            if let Some((sim, _)) = &self.simulated {
+                // The simulator creates files 0o666 under its umask; restrict
+                // the stage to 0o600 like the host path.
+                let fd = sim.open(Some(&self.fd), Path::new(name_os(name)), flags)?;
+                let path = self.simulated_path(name);
+                sim.chmod(&path, 0o600)?;
+                return Ok(fd);
+            }
             host_open(self.fd.as_raw_fd(), name, flags, 0o600)
         }
 
         /// Publish a stage without an implicit durability fence.
         pub(super) fn rename(&self, from: &CString, to: &CString) -> io::Result<()> {
+            #[cfg(feature = "simulation")]
+            if let Some((sim, _)) = &self.simulated {
+                return sim.rename(&self.simulated_path(from), &self.simulated_path(to), 0);
+            }
             // SAFETY: names and pinned parent stay live for this syscall.
             status(unsafe {
                 libc::renameat(
@@ -379,9 +423,29 @@ mod publication {
 
         /// Remove a failed stage without changing the destination.
         pub(super) fn unlink(&self, name: &CString) -> io::Result<()> {
+            #[cfg(feature = "simulation")]
+            if let Some((sim, _)) = &self.simulated {
+                return sim.unlink(&self.simulated_path(name));
+            }
             // SAFETY: name and pinned parent stay live for this syscall.
             status(unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) })
         }
+    }
+
+    #[cfg(feature = "simulation")]
+    impl Directory {
+        /// The simulated path of a child of the pinned directory.
+        fn simulated_path(&self, name: &CString) -> std::path::PathBuf {
+            let (_, directory) = self.simulated.as_ref().expect("simulated directory");
+            directory.join(name_os(name))
+        }
+    }
+
+    /// Borrow a component name as an OS string without copying.
+    #[cfg(feature = "simulation")]
+    fn name_os(name: &CString) -> &OsStr {
+        use std::os::unix::ffi::OsStrExt;
+        OsStr::from_bytes(name.as_bytes())
     }
 
     /// Report invalid publication input with the host syscall error convention.
@@ -441,6 +505,12 @@ mod publication {
 
     /// Perform one positioned write and return short progress or the original error.
     pub(super) fn write(fd: &Descriptor, offset: usize, bytes: &[u8]) -> io::Result<usize> {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = fd.as_sim() {
+            return fd
+                .write_at(offset as u64, bytes)
+                .map_err(crate::simulation::io_error);
+        }
         let offset = libc::off_t::try_from(offset).map_err(|_| invalid())?;
         // SAFETY: descriptor and read-only bytes remain live throughout pwrite.
         let n = unsafe { libc::pwrite(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), offset) };

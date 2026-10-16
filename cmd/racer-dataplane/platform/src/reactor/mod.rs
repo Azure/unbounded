@@ -384,6 +384,9 @@ pub(crate) struct Held<L> {
 pub struct Reactor<S: Scope, B: Budget> {
     observer: Option<Observer<S>>,
     environment: Environment,
+    /// The simulation current at construction, as the old reactor selected it.
+    #[cfg(feature = "simulation")]
+    simulation: Option<crate::simulation::Simulation>,
     budget: B,
     queue_entries: usize,
     core: OnceCell<Core>,
@@ -403,6 +406,8 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         Self {
             observer: None,
             environment: Environment::current(),
+            #[cfg(feature = "simulation")]
+            simulation: crate::simulation::Simulation::current(),
             budget,
             queue_entries,
             core: OnceCell::new(),
@@ -437,6 +442,28 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         if let Some(observer) = &self.observer {
             observer(scope, facts);
         }
+    }
+
+    /// The backend for the simulation and environment captured at
+    /// construction: simulated when a [`Simulation`](crate::simulation::Simulation)
+    /// was current, io_uring otherwise.
+    fn select_backend(&self) -> RacerBackend {
+        #[cfg(feature = "simulation")]
+        if let Some(simulation) = &self.simulation {
+            return RacerBackend::simulated(simulation, &self.environment);
+        }
+        RacerBackend::Uring(uring::Uring::new())
+    }
+
+    /// Whether this reactor runs (or will run) on the simulated backend.
+    pub fn is_simulated(&self) -> bool {
+        #[cfg(feature = "simulation")]
+        if self.simulation.is_some() {
+            return true;
+        }
+        self.core
+            .get()
+            .is_some_and(|core| core.backend().is_simulated())
     }
 
     /// The library reactor, if initialized.
@@ -478,9 +505,9 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             return Ok(core);
         }
         #[cfg(test)]
-        let backend = self.backend.take().unwrap_or_else(RacerBackend::select);
+        let backend = self.backend.take().unwrap_or_else(|| self.select_backend());
         #[cfg(not(test))]
-        let backend = RacerBackend::select();
+        let backend = self.select_backend();
         let config = ReactorConfig::default()
             .with_max_in_flight(capacity)
             .with_max_wait(MAX_WAIT)
@@ -1167,7 +1194,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             None => {
                 // Nothing can complete; behave like the old empty ppoll.
                 let duration = duration.min(MAX_WAIT);
-                if !duration.is_zero() && !self.environment.is_simulated() {
+                if !duration.is_zero() && !self.environment.is_simulated() && !self.is_simulated() {
                     std::thread::sleep(duration);
                 }
                 Ok(())

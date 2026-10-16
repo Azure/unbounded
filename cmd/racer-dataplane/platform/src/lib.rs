@@ -33,6 +33,9 @@ pub mod reactor;
 
 pub mod scope;
 
+#[cfg(feature = "simulation")]
+pub mod simulation;
+
 pub use error::{Error, Operation, Result};
 pub use scope::{Budget, Cancellation, CancellationExt, CancellationRegistration, Scope};
 

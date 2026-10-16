@@ -151,14 +151,16 @@ pub fn check_private(stat: &libc::statx, regular: bool) -> Result<(), AccessErro
     )
 }
 
-/// Check metadata in its descriptor's ownership domain, not the ambient environment.
+/// Check metadata in its descriptor's ownership domain, not the ambient
+/// environment. A [`Simulation`](crate::simulation::Simulation) reports the
+/// process's effective UID as the owner (see `World::set_owner`), so
+/// simulated descriptors share the host check; a test can make the world
+/// report another owner to exercise the rejection.
 fn check_descriptor_private(
     fd: &Descriptor,
     stat: &libc::statx,
     regular: bool,
 ) -> Result<(), AccessError> {
-    // TODO(sim): simulated descriptors use the simulator's ownership domain
-    // (owner 0, same forbidden bits) instead of the effective UID.
     let _ = fd;
     check_private(stat, regular)
 }

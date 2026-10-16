@@ -207,9 +207,7 @@ impl<V: 'static, B: 'static, S: ExecutionScope> Executor<V, B, S> {
     /// Drop accepted tasks only after the simulated operating system's crash cut.
     #[cfg(feature = "simulation")]
     pub fn simulation_crash(&mut self) {
-        // TODO(sim): assert the simulation backend's crash cut instead of
-        // only requiring a simulated environment.
-        assert!(crate::environment::Environment::current().is_simulated());
+        assert!(crate::simulation::Simulation::current().is_some());
         self.active.clear();
     }
 }

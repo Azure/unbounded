@@ -1,16 +1,16 @@
 //! Owned OS resources used with the Racer reactor.
 //!
 //! A [`Descriptor`] is the handle every reactor operation takes (usually as
-//! `Rc<Descriptor>`). Today it always owns a host file descriptor; simulated
-//! resources will be a second variant that never has a raw descriptor number,
-//! so code that needs a host descriptor should use the fallible
-//! [`Descriptor::as_host_fd`] or [`Descriptor::into_host`] rather than
-//! [`AsRawFd`]/[`AsFd`], which panic for simulated handles.
+//! `Rc<Descriptor>`). It owns a host file descriptor or, with the
+//! `simulation` feature, a simulated resource that never has a raw
+//! descriptor number. Code that needs a host descriptor should use the
+//! fallible [`Descriptor::as_host_fd`] or [`Descriptor::into_host`] rather
+//! than [`AsRawFd`]/[`AsFd`], which panic for simulated handles.
 
 use crate::{Error, Result};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-/// An owned host (or, later, simulated) resource.
+/// An owned host or simulated resource.
 ///
 /// The host variant wraps a [`uring::Fd`] so the io_uring backend can borrow
 /// it directly; this descriptor is its only handle.
@@ -21,9 +21,8 @@ pub struct Descriptor(Kind);
 #[derive(Debug)]
 enum Kind {
     Host(uring::Fd),
-    // TODO(sim): add `#[cfg(feature = "simulation")] Sim(uring_runtime_sim::SimFd)`
-    // and route every host-only method below through the simulator, as the old
-    // runtime did with `simulation::Handle`.
+    #[cfg(feature = "simulation")]
+    Sim(uring_runtime_sim::SimFd),
 }
 
 impl Descriptor {
@@ -31,6 +30,26 @@ impl Descriptor {
     pub(crate) fn host(&self) -> Option<&uring::Fd> {
         match &self.0 {
             Kind::Host(fd) => Some(fd),
+            #[cfg(feature = "simulation")]
+            Kind::Sim(_) => None,
+        }
+    }
+
+    /// Borrow a simulated resource, or `None` for a host descriptor.
+    #[cfg(feature = "simulation")]
+    pub fn as_sim(&self) -> Option<&uring_runtime_sim::SimFd> {
+        match &self.0 {
+            Kind::Sim(fd) => Some(fd),
+            Kind::Host(_) => None,
+        }
+    }
+
+    /// Extract a simulated resource, returning a host descriptor unchanged.
+    #[cfg(feature = "simulation")]
+    pub fn into_sim(self) -> std::result::Result<uring_runtime_sim::SimFd, Self> {
+        match self.0 {
+            Kind::Sim(fd) => Ok(fd),
+            other => Err(Self(other)),
         }
     }
 
@@ -46,6 +65,10 @@ impl Descriptor {
 
     /// Set TCP_NODELAY for TCP callers, including disabling it when false.
     pub fn enable_tcp_nodelay(&self, enabled: bool) -> Result<()> {
+        #[cfg(feature = "simulation")]
+        if self.as_sim().is_some() {
+            return Ok(());
+        }
         let value: libc::c_int = enabled.into();
         // SAFETY: the descriptor is owned and setsockopt reads one live integer.
         let result = unsafe {
@@ -65,6 +88,10 @@ impl Descriptor {
 
     /// Numeric socket identity only, sampled on failure while the owner is live.
     pub fn tcp_tuple(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        #[cfg(feature = "simulation")]
+        if self.as_sim().is_some() {
+            return None;
+        }
         let fd = self.as_host_fd()?;
         // SAFETY: ManuallyDrop borrows this live descriptor without closing it.
         let socket = std::mem::ManuallyDrop::new(unsafe {
@@ -77,6 +104,13 @@ impl Descriptor {
     /// accepted socket. EINTR is retried a bounded number of times; other errno
     /// values, including EAGAIN, remain available to caller retry policy.
     pub fn try_accept(&self) -> std::io::Result<Self> {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            return fd
+                .accept()
+                .map(Self::from)
+                .map_err(crate::simulation::io_error);
+        }
         // SAFETY: live listener; successful descriptor is immediately owned.
         let fd = retry_interrupted(|| {
             count(unsafe {
@@ -98,13 +132,19 @@ impl Descriptor {
     pub fn into_host(self) -> std::result::Result<OwnedFd, Self> {
         match self.0 {
             Kind::Host(fd) => fd.into_owned().map_err(|fd| Self(Kind::Host(fd))),
+            #[cfg(feature = "simulation")]
+            other => Err(Self(other)),
         }
     }
 
     /// Bind a nonblocking TCP listener in the currently selected environment.
     pub fn tcp_listener(address: std::net::SocketAddr) -> Result<Self> {
-        // TODO(sim): when the current environment is simulated, create the
-        // listener in the simulated world instead.
+        #[cfg(feature = "simulation")]
+        if let Some(sim) = crate::simulation::Simulation::current() {
+            return sim
+                .listen(uring::SocketAddress::Inet(address))
+                .map_err(|_| Error::Io);
+        }
         let listener = std::net::TcpListener::bind(address).map_err(|_| Error::Io)?;
         listener.set_nonblocking(true).map_err(|_| Error::Io)?;
         Ok(listener.into())
@@ -112,8 +152,10 @@ impl Descriptor {
 
     /// Create a nonblocking, close-on-exec stream socket for the requested family.
     pub fn socket(domain: i32) -> Result<Self> {
-        // TODO(sim): when the current environment is simulated, create the
-        // socket in the simulated world instead.
+        #[cfg(feature = "simulation")]
+        if let Some(sim) = crate::simulation::Simulation::current() {
+            return sim.socket(domain).map_err(|_| Error::Io);
+        }
         // SAFETY: no pointers; the result is checked below.
         let raw = unsafe {
             libc::socket(
@@ -133,6 +175,10 @@ impl Descriptor {
     /// O_NONBLOCK affects duplicated descriptors sharing the open file description;
     /// FD_CLOEXEC is local to this descriptor. Failure may leave partial changes.
     pub fn set_nonblocking(&self) -> Result<()> {
+        #[cfg(feature = "simulation")]
+        if self.as_sim().is_some() {
+            return Ok(());
+        }
         let fd = self.as_raw_fd();
         // SAFETY: fcntl only inspects and updates flags of this live descriptor.
         unsafe {
@@ -152,6 +198,10 @@ impl Descriptor {
     /// Send without waiting or raising SIGPIPE; preserve short progress and errno.
     /// Only zero-progress EINTR is retried, for at most four attempts.
     pub fn try_send(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            return fd.send(bytes).map_err(crate::simulation::io_error);
+        }
         retry_interrupted(|| {
             // SAFETY: `bytes` is valid for reads of its length for this call.
             count(unsafe {
@@ -168,6 +218,10 @@ impl Descriptor {
     /// Receive without waiting; preserve EOF, short progress, and errno.
     /// Only zero-progress EINTR is retried, for at most four attempts.
     pub fn try_recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            return fd.recv(bytes, false).map_err(crate::simulation::io_error);
+        }
         retry_interrupted(|| {
             // SAFETY: `bytes` is valid for writes of its length for this call.
             count(unsafe {
@@ -184,6 +238,10 @@ impl Descriptor {
     /// Check for an idle connected socket without consuming any queued byte.
     /// Unexpected data, EOF, and errors all make a pooled socket unsuitable.
     pub fn idle_healthy(&self) -> bool {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            return fd.idle_healthy();
+        }
         let mut byte = 0u8;
         // SAFETY: one writable local byte; MSG_PEEK consumes nothing.
         let result = unsafe {
@@ -200,16 +258,34 @@ impl Descriptor {
     /// Full peer close, not a write-half shutdown. Consumes no bytes and never
     /// competes with parsing, even during acquisition or response writes.
     pub fn peer_disconnected(&self) -> bool {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            return fd.peer_disconnected();
+        }
         self.host_closed(0)
     }
 
     /// Unlike POLLHUP, POLLRDHUP notices a peer FIN while our send side is open.
     pub fn peer_read_closed(&self) -> bool {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            return fd.peer_read_closed();
+        }
         self.host_closed(libc::POLLRDHUP)
     }
 
     /// Shut down one or both socket directions without releasing ownership.
     pub fn shutdown(&self, how: i32) -> Result<()> {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            let how = match how {
+                libc::SHUT_RD => std::net::Shutdown::Read,
+                libc::SHUT_WR => std::net::Shutdown::Write,
+                libc::SHUT_RDWR => std::net::Shutdown::Both,
+                _ => return Err(Error::Os(libc::EINVAL)),
+            };
+            return fd.shutdown(how).map_err(Error::from);
+        }
         // SAFETY: shutdown only changes this live owned descriptor's state.
         if unsafe { libc::shutdown(self.as_raw_fd(), how) } < 0 {
             return Err(Error::from_io(std::io::Error::last_os_error()));
@@ -219,6 +295,13 @@ impl Descriptor {
 
     /// Require a stream socket, rejecting files and other socket kinds.
     pub fn validate_socket(&self) -> Result<()> {
+        #[cfg(feature = "simulation")]
+        if let Some(fd) = self.as_sim() {
+            return match fd.socket_type() {
+                Ok(libc::SOCK_STREAM) => Ok(()),
+                _ => Err(Error::InvalidInput),
+            };
+        }
         let mut kind: libc::c_int = 0;
         let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
         // SAFETY: getsockopt writes at most `length` bytes into the local.
@@ -255,11 +338,13 @@ impl AsRawFd for Descriptor {
     ///
     /// # Panics
     ///
-    /// Panics for a simulated resource (not yet possible). Prefer
-    /// [`Descriptor::as_host_fd`] in new code.
+    /// Panics for a simulated resource. Prefer [`Descriptor::as_host_fd`]
+    /// in new code.
     fn as_raw_fd(&self) -> RawFd {
         match &self.0 {
             Kind::Host(fd) => fd.as_raw_fd(),
+            #[cfg(feature = "simulation")]
+            Kind::Sim(_) => panic!("simulated descriptor reached a host syscall"),
         }
     }
 }
@@ -269,8 +354,8 @@ impl AsFd for Descriptor {
     ///
     /// # Panics
     ///
-    /// Panics for a simulated resource (not yet possible). Prefer
-    /// [`Descriptor::as_host_fd`] in new code.
+    /// Panics for a simulated resource. Prefer [`Descriptor::as_host_fd`]
+    /// in new code.
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.as_host_fd()
             .expect("simulated descriptor reached a host syscall")
@@ -289,6 +374,14 @@ impl From<uring::Fd> for Descriptor {
     /// Wrap a library descriptor (for example one adopted by the backend).
     fn from(fd: uring::Fd) -> Self {
         Self(Kind::Host(fd))
+    }
+}
+
+#[cfg(feature = "simulation")]
+impl From<uring_runtime_sim::SimFd> for Descriptor {
+    /// Retain a simulated owner without assigning it a host descriptor number.
+    fn from(fd: uring_runtime_sim::SimFd) -> Self {
+        Self(Kind::Sim(fd))
     }
 }
 
@@ -423,6 +516,76 @@ mod tests {
         assert_eq!(left.shutdown(123), Err(Error::Os(libc::EINVAL)));
         drop(left);
         assert!(right.peer_disconnected());
+    }
+
+    /// Half-close behaves the same on simulated and host streams.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn descriptor_half_close_matches_simulated_and_host_sockets() {
+        let sim = crate::simulation::Simulation::new();
+        let simulated = sim.socket_pair();
+        let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+        for (left, right) in [simulated, (left.into(), right.into())] {
+            assert!(right.idle_healthy());
+            left.try_send(b"x").unwrap();
+            assert!(!right.idle_healthy());
+            left.shutdown(libc::SHUT_WR).unwrap();
+            assert!(right.peer_read_closed());
+            assert!(!right.peer_disconnected());
+            assert_eq!(right.try_recv(&mut [0; 1]).unwrap(), 1);
+            assert_eq!(right.try_recv(&mut [0; 1]).unwrap(), 0);
+            assert_eq!(right.try_send(b"r").unwrap(), 1);
+            assert_eq!(left.try_recv(&mut [0; 1]).unwrap(), 1);
+            assert_eq!(left.shutdown(123), Err(Error::Os(libc::EINVAL)));
+            left.validate_socket().unwrap();
+            left.set_nonblocking().unwrap();
+            drop(left);
+            assert!(right.peer_disconnected());
+        }
+    }
+
+    /// Simulated owners never cross host syscall adapter boundaries.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn raw_simulated_descriptor_access_panics_and_host_extraction_is_fallible() {
+        let sim = crate::simulation::Simulation::new();
+        let (fd, _peer) = sim.socket_pair();
+        assert!(!fd.is_host());
+        assert!(fd.as_host_fd().is_none());
+        assert!(fd.tcp_tuple().is_none());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fd.as_raw_fd())).is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fd.as_fd())).is_err());
+        let fd = fd.into_host().unwrap_err();
+        assert!(fd.into_sim().is_ok());
+        let host = Descriptor::from(std::fs::File::open("/proc/self/stat").unwrap());
+        assert!(host.into_sim().is_err());
+    }
+
+    /// Ambient constructors create simulated listeners, and files are not sockets.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn ambient_simulation_creates_listeners_and_rejects_files() {
+        let sim = crate::simulation::Simulation::new();
+        let _sim = sim.enter();
+        let listener = Descriptor::tcp_listener("127.0.0.1:9000".parse().unwrap()).unwrap();
+        assert!(listener.as_sim().is_some());
+        assert_eq!(
+            listener.try_accept().unwrap_err().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        let client = sim
+            .connect(uring::SocketAddress::Inet(
+                "127.0.0.1:9000".parse().unwrap(),
+            ))
+            .unwrap();
+        let accepted = listener.try_accept().unwrap();
+        client.try_send(b"hi").unwrap();
+        assert_eq!(accepted.try_recv(&mut [0; 2]).unwrap(), 2);
+        sim.write_file(std::path::Path::new("/f"), b"x").unwrap();
+        let file = sim
+            .open(None, std::path::Path::new("/f"), libc::O_RDONLY)
+            .unwrap();
+        assert_eq!(file.validate_socket(), Err(Error::InvalidInput));
     }
 
     /// Files are not stream sockets; listeners accept nonblocking peers.
