@@ -17,6 +17,8 @@ Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh fail-open
   operator-vm-image-pool.sh run BASELINE_RUN_ID
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
+  operator-vm-image-pool.sh verify-streaming-layers IMAGE
+  operator-vm-image-pool.sh verify-streaming-layers-status
   operator-vm-image-pool.sh status
   operator-vm-image-pool.sh prune
   operator-vm-image-pool.sh prune-status
@@ -426,6 +428,64 @@ systemctl show gantry-benchmark-operator.service --property=ActiveState --proper
 SCRIPT
 )
   invoke_remote "$script"
+    ;;
+  verify-streaming-layers)
+    (($# == 1)) || { usage >&2; exit 2; }
+    image=$1
+    node_limit=${STREAMING_VERIFY_NODE_LIMIT:-0}
+    parallelism=${STREAMING_VERIFY_PARALLELISM:-48}
+    node_name=${STREAMING_VERIFY_NODE_NAME:-}
+    metrics_only=${STREAMING_VERIFY_METRICS_ONLY:-false}
+    [[ "$node_limit" =~ ^[0-9]+$ ]] || { echo "STREAMING_VERIFY_NODE_LIMIT must be a non-negative integer" >&2; exit 2; }
+    [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || { echo "STREAMING_VERIFY_PARALLELISM must be a positive integer" >&2; exit 2; }
+    [[ "$node_name" =~ ^[a-zA-Z0-9._-]*$ ]] || { echo "STREAMING_VERIFY_NODE_NAME contains invalid characters" >&2; exit 2; }
+    [[ "$metrics_only" == true || "$metrics_only" == false ]] || { echo "STREAMING_VERIFY_METRICS_ONLY must be true or false" >&2; exit 2; }
+
+    verifier=$(base64 -w0 "$(dirname "$0")/operator-vm-verify-streaming-layers-remote.sh")
+    image_base64=$(printf '%s' "$image" | base64 -w0)
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+verifier=$(mktemp)
+trap 'rm -f "$verifier"' EXIT
+printf '%s' '__VERIFIER_BASE64__' | base64 --decode >"$verifier"
+chmod 0700 "$verifier"
+image=$(printf '%s' '__IMAGE_BASE64__' | base64 --decode)
+result_dir=/var/lib/gantry-benchmark/artifacts
+result_file=$result_dir/streaming-layer-verification.txt
+status_file=$result_dir/streaming-layer-verification.status
+mkdir -p "$result_dir"
+set +e
+"$verifier" "$image" __NODE_LIMIT__ __PARALLELISM__ "__NODE_NAME__" "__METRICS_ONLY__" >"$result_file.tmp" 2>&1
+status=$?
+set -e
+mv "$result_file.tmp" "$result_file"
+printf '%s\n' "$status" >"$status_file"
+cat "$result_file"
+exit "$status"
+SCRIPT
+)
+    script=${script/__VERIFIER_BASE64__/$verifier}
+    script=${script/__IMAGE_BASE64__/$image_base64}
+    script=${script/__NODE_LIMIT__/$node_limit}
+    script=${script/__PARALLELISM__/$parallelism}
+    script=${script/__NODE_NAME__/$node_name}
+    script=${script/__METRICS_ONLY__/$metrics_only}
+    invoke_remote "$script"
+    ;;
+  verify-streaming-layers-status)
+    (($# == 0)) || { usage >&2; exit 2; }
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+result_file=/var/lib/gantry-benchmark/artifacts/streaming-layer-verification.txt
+status_file=/var/lib/gantry-benchmark/artifacts/streaming-layer-verification.status
+[[ -f "$result_file" ]] || { echo "no persisted streaming layer verification result" >&2; exit 1; }
+cat "$result_file"
+status=$(cat "$status_file" 2>/dev/null || printf '1')
+[[ "$status" =~ ^[0-9]+$ ]] || status=1
+exit "$status"
+SCRIPT
+)
+    invoke_remote "$script"
     ;;
   status)
     (($# == 0)) || { usage >&2; exit 2; }

@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-verify-streaming-layers operator-vm-verify-streaming-layers-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
 
 help: ## Show benchmark targets
 	@echo ""
@@ -32,6 +32,8 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-deploy-runtime-watch  Follow fixed Gantry deployment progress"
 	@echo "  operator-vm-deploy-runtime-fast  Raise active Gantry rollout parallelism"
 	@echo "  operator-vm-image-pool-status  Show operator-VM pool builder and entries"
+	@echo "  operator-vm-verify-streaming-layers  Verify one streaming image in every host content store"
+	@echo "  operator-vm-verify-streaming-layers-status  Read the last persisted layer verification"
 	@echo "  operator-vm-prune-images  Asynchronously prune unused operator-VM images"
 	@echo "  operator-vm-prune-images-status  Show operator-VM image-prune progress"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
@@ -73,7 +75,7 @@ profile-gantry: operator-vm-check
 		hack/gantry-benchmark/profile-gantry.sh
 
 operator-vm-check:
-	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-watch.sh
+	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-verify-streaming-layers-remote.sh operator-vm-watch.sh
 	./deploy.sh plan deploy.env.example | grep -Fq 'Artifact Streaming:  false'
 	@stream_config=$$(mktemp); \
 	trap 'rm -f "$$stream_config"' EXIT; \
@@ -160,6 +162,13 @@ operator-vm-deploy-runtime-fast: operator-vm-check
 
 operator-vm-image-pool-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status
+
+operator-vm-verify-streaming-layers: operator-vm-check
+	@test -n "$(STREAMING_IMAGE)" || { echo "STREAMING_IMAGE is required" >&2; exit 2; }
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh verify-streaming-layers "$(STREAMING_IMAGE)"
+
+operator-vm-verify-streaming-layers-status: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh verify-streaming-layers-status
 
 operator-vm-prune-images: operator-vm-check
 	@test "$(CONFIRM_PRUNE_UNUSED_IMAGES)" = yes || { echo "set CONFIRM_PRUNE_UNUSED_IMAGES=yes to prune every unused operator-VM image" >&2; exit 2; }
