@@ -12,8 +12,17 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
+// sharedCratesPath is the repository directory holding first-party Rust
+// library crates that the dataplane may consume as path dependencies.
+const sharedCratesPath = "crates"
+
 // Workspace members use the root lock. Only explicitly declared relative members
-// are read; missing declared inputs fail closed.
+// are read; missing declared inputs fail closed. Path dependencies that leave the
+// workspace are accepted only when they resolve to a package under the
+// repository crates/ directory. Such packages are first-party: they get no
+// NOTICE entry of their own, but their registry dependencies ship in the
+// dataplane binary, so they are resolved against the dataplane Cargo.lock the
+// same way as workspace members.
 func workspaceVersions(root string) (map[string]string, error) {
 	base := filepath.Join(root, cratePath)
 
@@ -48,19 +57,26 @@ func workspaceVersions(root string) (map[string]string, error) {
 		declared[filepath.Clean(member)] = true
 	}
 
-	seen := map[string]bool{}
-
-	for _, member := range append([]string{"."}, workspace.Workspace.Members...) {
+	for _, member := range workspace.Workspace.Members {
 		if member == "" || !filepath.IsLocal(member) || strings.ContainsAny(member, "*?[\\") {
 			return nil, fmt.Errorf("workspace member %q must be an explicit local directory", member)
 		}
+	}
 
-		member = filepath.Clean(member)
+	shared := filepath.Join(root, sharedCratesPath)
+	seen := map[string]bool{}
+	queue := append([]string{"."}, workspace.Workspace.Members...)
+
+	for len(queue) > 0 {
+		member := filepath.Clean(queue[0])
+		queue = queue[1:]
+
 		if seen[member] {
 			continue
 		}
 
 		seen[member] = true
+		external := !filepath.IsLocal(member)
 		path := filepath.Join(base, member, "Cargo.toml")
 
 		resolved, err := filepath.EvalSymlinks(path)
@@ -73,9 +89,21 @@ func workspaceVersions(root string) (map[string]string, error) {
 			return nil, err
 		}
 
-		relative, err := filepath.Rel(resolvedBase, resolved)
-		if err != nil || !filepath.IsLocal(relative) {
-			return nil, fmt.Errorf("workspace member %s escapes workspace", path)
+		if external {
+			resolvedShared, err := filepath.EvalSymlinks(shared)
+			if err != nil {
+				return nil, fmt.Errorf("resolving %s: %w", shared, err)
+			}
+
+			relative, err := filepath.Rel(resolvedShared, resolved)
+			if err != nil || !filepath.IsLocal(relative) {
+				return nil, fmt.Errorf("path dependency %s escapes %s", path, sharedCratesPath)
+			}
+		} else {
+			relative, err := filepath.Rel(resolvedBase, resolved)
+			if err != nil || !filepath.IsLocal(relative) {
+				return nil, fmt.Errorf("workspace member %s escapes workspace", path)
+			}
 		}
 
 		data, err := os.ReadFile(path)
@@ -107,12 +135,29 @@ func workspaceVersions(root string) (map[string]string, error) {
 		// Includes development path edges for membership validation only;
 		// lockedPackageVersions excludes all local paths from registry notices.
 		for _, dep := range direct {
-			if dep.localPath != "" {
-				local := filepath.Clean(filepath.Join(member, dep.localPath))
-				if filepath.IsAbs(dep.localPath) || !declared[local] {
-					return nil, fmt.Errorf("%s: local dependency %q must be a declared workspace member", path, dep.localPath)
-				}
+			if dep.localPath == "" {
+				continue
 			}
+
+			if filepath.IsAbs(dep.localPath) {
+				return nil, fmt.Errorf("%s: local dependency %q must be relative", path, dep.localPath)
+			}
+
+			local := filepath.Clean(filepath.Join(member, dep.localPath))
+			if declared[local] {
+				continue
+			}
+
+			if filepath.IsLocal(local) {
+				return nil, fmt.Errorf("%s: local dependency %q must be a declared workspace member", path, dep.localPath)
+			}
+
+			target := filepath.Join(base, local)
+			if rel, err := filepath.Rel(shared, target); err != nil || rel == "." || !filepath.IsLocal(rel) {
+				return nil, fmt.Errorf("%s: local dependency %q must be a declared workspace member or a package under %s", path, dep.localPath, sharedCratesPath)
+			}
+
+			queue = append(queue, local)
 		}
 
 		locked, err := lockedPackageVersions(string(lock), name, direct)
