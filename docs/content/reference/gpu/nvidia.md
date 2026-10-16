@@ -54,7 +54,11 @@ full sequence is:
    `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid interference
    with the nspawn environment.
 5. **containerd runtime configuration.** Writes a containerd drop-in that
-   enables CDI support and registers the `nvidia` runtime class.
+   enables CDI support and registers the `nvidia` runtime class. On Azure
+   Linux hosts, the agent also selects the toolkit's CDI runtime mode so the
+   device plugin's default UUID environment variable resolves against the
+   generated driver-root CDI specification. Ubuntu retains the toolkit's
+   automatic runtime mode.
 6. **kubelet GPU advertisement.** Once kubelet starts and a user-deployed
    NVIDIA device plugin is running, GPUs are registered as `nvidia.com/gpu`
    extended resources on the node.
