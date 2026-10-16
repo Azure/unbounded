@@ -163,6 +163,7 @@ mod segments;
 
 mod slab;
 
+use racer_platform::reactor::IoBuffer;
 pub use segments::{
     FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
     SegmentSnapshot, SegmentState, Segments,
@@ -175,7 +176,6 @@ use std::{
     ptr::NonNull,
     rc::{Rc, Weak},
 };
-use uring_runtime::reactor::IoBuffer;
 
 /// Storage failures, separated from application record and admission policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
