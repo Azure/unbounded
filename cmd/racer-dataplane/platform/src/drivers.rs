@@ -2226,3 +2226,68 @@ mod hedge_tests {
         assert_eq!(fixture.won.get(), Some(Contender::Primary));
     }
 }
+
+/// Listener retries through the ambient simulated clock (`retry_listener`
+/// reads `environment::now`).
+#[cfg(all(test, feature = "simulation"))]
+mod ambient_retry_tests {
+    use super::*;
+    use crate::{Result, test_util::WakeCounter};
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::Arc,
+        task::{Context, Waker},
+    };
+
+    /// Exposes a shared caller-controlled scope failure without automatic wakeups.
+    #[derive(Clone, Default)]
+    struct TestScope(Rc<Cell<Option<Error>>>);
+
+    impl crate::scope::LibraryScope for TestScope {
+        type Error = Error;
+
+        fn check(&self) -> Result<()> {
+            self.0.get().map_or(Ok(()), Err)
+        }
+    }
+
+    /// Default retry timing requires owner polling and rechecks policy before resubmission.
+    #[test]
+    fn retries_only_after_ten_ms_without_self_wakes_and_checks_scope() {
+        let clock = crate::environment::SimulationClock::new(45);
+        let _environment = clock.environment(0).enter();
+        for cancel in [false, true] {
+            let scope = TestScope::default();
+            let attempts = Cell::new(0);
+            let wake = Arc::new(WakeCounter::default());
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut future = retry_listener(&scope, || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                Box::pin(async move {
+                    if attempt == 0 {
+                        Err(Error::Overloaded)
+                    } else {
+                        Ok(7)
+                    }
+                })
+            });
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            clock.advance(Duration::from_millis(9));
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(wake.count(), 0);
+            if cancel {
+                scope.0.set(Some(Error::Canceled));
+            }
+            clock.advance(Duration::from_millis(1));
+            assert_eq!(
+                future.as_mut().poll(&mut cx),
+                Poll::Ready(if cancel { Err(Error::Canceled) } else { Ok(7) })
+            );
+            assert_eq!(attempts.get(), if cancel { 1 } else { 2 });
+        }
+    }
+}

@@ -2131,3 +2131,38 @@ mod tests {
         assert!(matches!(worker.poll_job(&mut cx), Poll::Ready(Ok(None))));
     }
 }
+
+#[cfg(all(test, feature = "simulation"))]
+mod ambient_expiry_snapshot_tests {
+    //! The same snapshot contract through the ambient simulated clock.
+    use super::*;
+
+    /// Reading endpoint ages leaves tickets and wake ownership unchanged.
+    #[test]
+    fn expiry_snapshot_queue_endpoint_ages() {
+        let clock = crate::environment::SimulationClock::new(918);
+        let _environment = clock.environment(0).enter();
+        let queue = AdmissionQueue::new(NonZeroUsize::new(3).unwrap());
+        let cx = Context::from_waker(Waker::noop());
+        let head = queue.enter((), &cx).unwrap();
+        clock.advance(std::time::Duration::from_millis(30));
+        let tail = queue.enter((), &cx).unwrap();
+        clock.advance(std::time::Duration::from_millis(20));
+        let snapshot = queue.snapshot(crate::environment::now());
+        assert_eq!(snapshot.queued, 2);
+        assert_eq!(snapshot.head, Some(head.sequence()));
+        assert_eq!(snapshot.head_age_us, Some(50_000));
+        assert_eq!(snapshot.tail_age_us, Some(20_000));
+        assert_ne!(snapshot.head, Some(tail.sequence()));
+        drop(head);
+        assert_eq!(
+            queue.snapshot(crate::environment::now()).head,
+            Some(tail.sequence())
+        );
+        drop(tail);
+        let snapshot = queue.snapshot(crate::environment::now());
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.head_age_us, None);
+        assert_eq!(snapshot.tail_age_us, None);
+    }
+}
