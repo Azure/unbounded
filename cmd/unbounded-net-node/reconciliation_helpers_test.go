@@ -312,6 +312,63 @@ func TestIntermediateGatewaySiteMTUCaps(t *testing.T) {
 	}
 }
 
+func TestDirectMeshComponentTunnelMTU(t *testing.T) {
+	sites := map[string]*unboundedv1alpha3.Site{
+		"a": {}, "b": {}, "c": {}, "d": {}, "x": {}, "y": {},
+	}
+
+	peerings := []unboundednetv1alpha1.SitePeering{
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"a", "b"}, TunnelMTU: ptrInt32(1200)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"a", "c"}, TunnelMTU: ptrInt32(1400)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"c", "d"}, TunnelMTU: ptrInt32(1500)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"x", "y"}, TunnelMTU: ptrInt32(900)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"c", "x"}, TunnelMTU: ptrInt32(800), MeshNodes: new(false)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"c", "x"}, TunnelMTU: ptrInt32(700), Enabled: new(false)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"c", "missing"}, TunnelMTU: ptrInt32(600)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"missing", "x"}}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"c", "c"}, TunnelMTU: ptrInt32(576)}},
+	}
+	for _, name := range []string{"a", "b", "c", "d"} {
+		if got := directMeshComponentTunnelMTU(name, sites, peerings); got != 1200 {
+			t.Fatalf("Site %s cap=%d, want shared component minimum 1200", name, got)
+		}
+	}
+
+	if got := directMeshComponentTunnelMTU("x", sites, peerings); got != 900 {
+		t.Fatalf("disconnected component cap=%d, want 900", got)
+	}
+
+	if got := directMeshComponentTunnelMTU("missing", sites, peerings); got != 0 {
+		t.Fatalf("missing Site cap=%d, want no cap", got)
+	}
+
+	sites["b"].Spec.TunnelMTU = ptrInt32(1100)
+	if got := directMeshComponentTunnelMTU("d", sites, peerings); got != 1100 {
+		t.Fatalf("remote Site cap was not included: %d", got)
+	}
+
+	sites["b"].Spec.TunnelMTU = nil
+
+	peerings[0].Spec.Enabled = new(false)
+	if got := directMeshComponentTunnelMTU("c", sites, peerings); got != 1400 {
+		t.Fatalf("disabled low edge pinned the component: %d", got)
+	}
+
+	peerings[0].Spec.Enabled = nil
+
+	peerings[0].Spec.MeshNodes = new(false)
+	if got := directMeshComponentTunnelMTU("c", sites, peerings); got != 1400 {
+		t.Fatalf("network-only edge pinned the component: %d", got)
+	}
+
+	peerings[0].Spec.MeshNodes = nil
+
+	peerings[0].Spec.TunnelMTU = ptrInt32(1450)
+	if got := directMeshComponentTunnelMTU("c", sites, peerings); got != 1400 {
+		t.Fatalf("raised low edge pinned the component: %d", got)
+	}
+}
+
 func TestPublishedGatewayForwardingMTUs(t *testing.T) {
 	mesh := []meshPeerInfo{
 		{SiteName: "b", TunnelProtocol: "WireGuard", TunnelMTU: 1200},
