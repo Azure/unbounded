@@ -25,6 +25,7 @@ use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
+use racer_platform::mailbox;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
@@ -42,7 +43,6 @@ use std::task::Context;
 use std::task::Poll;
 #[cfg(test)]
 use std::task::Waker;
-use uring_runtime::mailbox;
 
 #[cfg(test)]
 type Completion = mailbox::Completion<Result<Value>, AcquisitionBudget>;
@@ -141,11 +141,6 @@ impl mailbox::executor::ExecutionScope for RequestScope {
         self.cancel()
     }
 
-    /// Expose the original acquisition ceiling to the local scheduling loop.
-    fn deadline(&self) -> std::time::Instant {
-        self.deadline.0
-    }
-
     /// Preserve the application's generation-mismatch classification.
     fn stale_completion() -> Error {
         Error::StaleFlight
@@ -210,7 +205,7 @@ impl WorkerDirectory {
         };
         // Reserve bounded worker-owned progress BEFORE retaining a mailbox
         // receipt. Dropping or delaying this optional task cannot hold delivery.
-        let Ok(permit) = uring_runtime::drivers::reserve() else {
+        let Ok(permit) = racer_platform::drivers::reserve() else {
             return;
         };
         if self.is_local(owner) {
@@ -452,7 +447,7 @@ impl WorkerDirectory {
             })?;
             *counts.entry(owner.0).or_insert(0usize) += 1;
             if number % 1024 == 1023 {
-                uring_runtime::drivers::yield_now().await;
+                racer_platform::drivers::yield_now().await;
             }
         }
         let mut accepted = until;
@@ -786,7 +781,7 @@ impl WorkerEndpoint {
     /// without polling them; the simulated reactor still fences owned buffers.
     #[cfg(test)]
     pub(crate) fn simulation_crash(&mut self) {
-        assert!(uring_runtime::reactor::simulation::Simulation::current().is_some());
+        assert!(racer_platform::simulation::Simulation::current().is_some());
         self.directory.simulation_crash();
         self.active.simulation_crash();
     }
@@ -1091,7 +1086,7 @@ mod tests {
     use std::time::Instant;
     #[test]
     fn head_admission_returns_before_body_and_survives_caller_cancel() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let directory = Arc::new(directory(4));
         let (local, _fixture) = crate::read::tests::admission_coordinator();
@@ -1178,7 +1173,7 @@ mod tests {
     }
     #[test]
     fn ordered_and_unordered_commands_wait_behind_unstarted_warm_pages() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let (local, _fixture) = crate::read::tests::admission_coordinator();
         let directory = local.streams.directory();
@@ -1686,7 +1681,7 @@ mod tests {
     /// A parked real acquisition cannot prevent an unrelated mailbox completion.
     #[test]
     fn bounded_admission_mailbox_keeps_other_work_progressing() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let directory = Arc::new(directory(4));
         let (local, _fixture) = crate::read::tests::admission_coordinator();

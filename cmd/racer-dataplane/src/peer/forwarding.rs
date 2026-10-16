@@ -431,7 +431,7 @@ impl Forwarding {
         next: &NodeId,
     ) -> Result<(SignedRequest, RequestBinding)> {
         let route = RouteState::from_budget(&request.route)?;
-        if route.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+        if route.deadline <= protocol::millis(racer_platform::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if route.visited != [self.signatures.node().clone()]
@@ -510,7 +510,7 @@ impl Forwarding {
         {
             return Err(Error::Unauthorized);
         }
-        if route.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+        if route.deadline <= protocol::millis(racer_platform::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if receiver(&previous.head)? != *self.signatures.node() {
@@ -747,7 +747,7 @@ impl Forwarding {
         }
         let old = RouteState::from_budget(&request.signed.request.route)?;
         let next = RouteState::from_budget(&budget)?;
-        if next.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+        if next.deadline <= protocol::millis(racer_platform::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         old.transition(&next, self.signatures.node())?;
@@ -881,7 +881,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
             || receivers.first() != Some(&node_field(response, "racer-grant-receiver")?)
             || number(response, "racer-grant-deadline")? > number(request, "racer-route-deadline")?
             || number(response, "racer-grant-deadline")?
-                <= protocol::millis(uring_runtime::environment::wall_now())?
+                <= protocol::millis(racer_platform::environment::wall_now())?
             || number(response, "racer-page-budget")?.checked_add(1)
                 != Some(number(request, "racer-page-budget")?)
             || number(response, "racer-byte-budget")?
@@ -948,7 +948,7 @@ fn response_authority(
     Ok(())
 }
 fn check_request_deadline(request: &RequestBinding) -> Result<()> {
-    if request.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+    if request.deadline <= protocol::millis(racer_platform::environment::wall_now())? {
         return Err(Error::DeadlineExceeded);
     }
     Ok(())
@@ -1114,7 +1114,7 @@ mod tests {
                 panic!("expected queued verification");
             };
             let caller = std::thread::current().id();
-            let environment = uring_runtime::environment::Environment::current();
+            let environment = racer_platform::environment::Environment::current();
             let completion = std::thread::spawn(move || {
                 let _guard = environment.enter();
                 assert_ne!(caller, std::thread::current().id());
@@ -1384,11 +1384,11 @@ mod tests {
                 Poll::Ready(Err(Error::Cancelled))
             ));
             assert_eq!(client.outstanding(), 0);
-            let clock = uring_runtime::environment::SimulationClock::new(929);
+            let clock = racer_platform::environment::SimulationClock::new(929);
             let _guard = clock.environment(0).enter();
             let scope = RequestScope::new(
                 RequestId([74; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(1),
+                racer_platform::environment::now() + Duration::from_secs(1),
             )
             .unwrap();
             let mut expired = Box::pin(receiver.verify_request_async(make(), &scope));
@@ -1401,7 +1401,7 @@ mod tests {
             ));
             let scope = RequestScope::new(
                 RequestId([75; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                racer_platform::environment::now() + Duration::from_secs(30),
             )
             .unwrap();
             let mut abandoned = Box::pin(receiver.verify_request_async(make(), &scope));
@@ -1421,7 +1421,7 @@ mod tests {
             assert_eq!(client.outstanding(), 0);
             let scope = RequestScope::new(
                 RequestId([77; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                racer_platform::environment::now() + Duration::from_secs(30),
             )
             .unwrap();
             client.close_submissions().unwrap();
@@ -1489,7 +1489,7 @@ mod tests {
     }
     #[test]
     fn retained_request_survives_fresh_window_but_not_deadline_or_forgery() {
-        let clock = uring_runtime::environment::SimulationClock::new_at(
+        let clock = racer_platform::environment::SimulationClock::new_at(
             931,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -1500,7 +1500,7 @@ mod tests {
         let sender = Forwarding::new(signatures[0].clone());
         let receiver = Forwarding::new(signatures[2].clone());
         let mut logical = request(44);
-        logical.route.deadline.0 = uring_runtime::environment::now() + Duration::from_secs(120);
+        logical.route.deadline.0 = racer_platform::environment::now() + Duration::from_secs(120);
         let (signed, binding) = sender.sign_request(logical).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         clock.advance(Duration::from_secs(61));
@@ -1535,7 +1535,7 @@ mod tests {
                 .verify_response(copy_response(&response), &forged_mac)
                 .is_err()
         );
-        let wall = uring_runtime::environment::wall_now();
+        let wall = racer_platform::environment::wall_now();
         clock.set_wall_time(wall - Duration::from_secs(67));
         assert!(matches!(
             signatures[2].verify_retained_request(admitted.binding()),
@@ -2464,7 +2464,7 @@ mod tests {
     #[test]
     fn deadline_roundtrip_and_verified_mailbox_ownership() {
         let deadline =
-            uring_runtime::environment::Deadline(Instant::now() + Duration::from_secs(20));
+            racer_platform::environment::Deadline(Instant::now() + Duration::from_secs(20));
         let value = protocol::encode_deadline(deadline).unwrap();
         let decoded = protocol::decode_deadline(value).unwrap();
         assert_eq!(protocol::encode_deadline(decoded).unwrap(), value);

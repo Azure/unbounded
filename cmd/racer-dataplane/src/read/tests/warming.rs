@@ -14,9 +14,9 @@ fn completed_warm_two_owner_extension_crossing_expiry_revalidates_evicted_pages(
 }
 
 fn completed_extension(refuse: bool) {
-    let clock = uring_runtime::environment::SimulationClock::new(197);
+    let clock = racer_platform::environment::SimulationClock::new(197);
     let _environment = clock.environment(0).enter();
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(1);
     let mut fixtures = [
@@ -66,7 +66,7 @@ fn completed_extension(refuse: bool) {
     let metadata = fixtures[0].origin.metadata.clone();
     let caller = RequestScope::new(
         RequestId([41; 16]),
-        uring_runtime::environment::now() + Duration::from_secs(60),
+        racer_platform::environment::now() + Duration::from_secs(60),
     )
     .unwrap();
     let context = OriginContext {
@@ -110,7 +110,7 @@ fn completed_extension(refuse: bool) {
             }
         }
         for f in &mut fixtures {
-            uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+            racer_platform::group::Service::poll(&mut f.engine, &mut cx, 64).unwrap();
             f.crypto.poll_budgeted(64).unwrap();
             f.reactor.poll_budgeted(64).unwrap();
             f.reactor.wait(Duration::from_millis(1)).unwrap();
@@ -164,13 +164,13 @@ fn completed_extension(refuse: bool) {
             .reserve_hold(
                 &pressure,
                 8,
-                uring_runtime::environment::wall_now() + Duration::from_secs(30),
+                racer_platform::environment::wall_now() + Duration::from_secs(30),
             )
             .unwrap();
     }
     let get_scope = RequestScope::new(
         RequestId([42; 16]),
-        uring_runtime::environment::now() + Duration::from_secs(20),
+        racer_platform::environment::now() + Duration::from_secs(20),
     )
     .unwrap();
     let mut get = Box::pin(directory.warm.wait(&page, &get_scope));
@@ -230,7 +230,7 @@ fn completed_extension(refuse: bool) {
                 .index()
                 .held_page_expiry(&first)
                 .unwrap()
-                > uring_runtime::environment::wall_now(),
+                > racer_platform::environment::wall_now(),
             "partial extension failure preserves already-promised pages"
         );
     } else {
@@ -317,7 +317,7 @@ impl Peer {
 
 #[test]
 fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(2);
     let mut source = fixture_with(2 * PAGE_BYTES + 7, None);
@@ -541,7 +541,7 @@ fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
 
 #[test]
 fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(1);
     let mut f = fixture_with(PAGE_BYTES + 7, None);
@@ -656,7 +656,7 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
         .reserve_hold(
             &other,
             7,
-            uring_runtime::environment::wall_now() + Duration::from_secs(30),
+            racer_platform::environment::wall_now() + Duration::from_secs(30),
         )
         .expect("failed expansion released its unused second page");
     f.fill
@@ -756,7 +756,7 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
 
 #[test]
 fn warm_drain_cancels_detached_job_and_refused_head_keeps_metadata_success() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(1);
     for length in [3, 9 * PAGE_BYTES] {
@@ -830,7 +830,7 @@ fn warm_drain_cancels_detached_job_and_refused_head_keeps_metadata_success() {
 
 #[test]
 fn warm_cancel_keeps_get_gate_until_detached_origin_driver_fences() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(1);
     let mut f = fixture();
@@ -933,7 +933,7 @@ fn warm_cancel_keeps_get_gate_until_detached_origin_driver_fences() {
 
 #[test]
 fn warm_follower_cancellation_waits_for_existing_foreground_supplier() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     f.origin.blocked_pages.borrow_mut().insert(0);
@@ -951,7 +951,7 @@ fn warm_follower_cancellation_waits_for_existing_foreground_supplier() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for _ in 0..32 {
         assert!(foreground.as_mut().poll(&mut cx).is_pending());
-        uring_runtime::drivers::poll(&mut cx, 64);
+        racer_platform::drivers::poll(&mut cx, 64);
     }
     assert_eq!(f.origin.calls.get(), 1);
     let mut warm = Box::pin(f.fill.acquire_warm(
@@ -974,7 +974,7 @@ fn warm_follower_cancellation_waits_for_existing_foreground_supplier() {
             warm.as_mut().poll(&mut cx).is_pending(),
             "follower cancellation is not the supplier fence"
         );
-        uring_runtime::drivers::poll(&mut cx, 64);
+        racer_platform::drivers::poll(&mut cx, 64);
     }
     f.origin.blocked_pages.borrow_mut().clear();
     let mut done = false;
@@ -984,8 +984,8 @@ fn warm_follower_cancellation_waits_for_existing_foreground_supplier() {
             done = true;
             break;
         }
-        uring_runtime::drivers::poll(&mut cx, 64);
-        uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+        racer_platform::drivers::poll(&mut cx, 64);
+        racer_platform::group::Service::poll(&mut f.engine, &mut cx, 64).unwrap();
         f.crypto.poll_budgeted(64).unwrap();
     }
     assert!(done);

@@ -5,7 +5,7 @@ use std::fmt;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Worker-local future: deliberately not `Send`, and never drives a hidden executor.
-pub type Operation<'a, T> = uring_runtime::Operation<'a, T, Error>;
+pub type Operation<'a, T> = racer_platform::Operation<'a, T, Error>;
 
 /// Declare root failures once, keeping publication phases out of their own causes.
 macro_rules! boundary_errors {
@@ -114,9 +114,9 @@ impl From<racer_crypto::enrollment::Error> for Error {
     }
 }
 
-impl From<uring_runtime::reactor::filesystem::secure::AccessError> for Error {
-    fn from(error: uring_runtime::reactor::filesystem::secure::AccessError) -> Self {
-        use uring_runtime::reactor::filesystem::secure::AccessError;
+impl From<racer_platform::fs::secure::AccessError> for Error {
+    fn from(error: racer_platform::fs::secure::AccessError) -> Self {
+        use racer_platform::fs::secure::AccessError;
         match error {
             AccessError::MissingMetadata => Self::Io,
             AccessError::PermissionDenied => Self::Unauthorized,
@@ -215,28 +215,33 @@ impl From<page_alloc::Error> for Error {
     }
 }
 
-impl From<uring_runtime::Error> for Error {
-    fn from(error: uring_runtime::Error) -> Self {
+impl From<racer_platform::Error> for Error {
+    fn from(error: racer_platform::Error) -> Self {
         match error {
-            uring_runtime::Error::Cancelled => Self::Cancelled,
-            uring_runtime::Error::DeadlineExceeded => Self::DeadlineExceeded,
-            uring_runtime::Error::Overloaded => Self::Overloaded,
-            uring_runtime::Error::Unavailable => Self::Unavailable,
-            uring_runtime::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            uring_runtime::Error::InvalidInput => Self::InvalidRequest,
-            uring_runtime::Error::NotFound => Self::MissingKey,
-            uring_runtime::Error::AlreadyExists => Self::Replay,
-            uring_runtime::Error::Io => Self::Io,
-            uring_runtime::Error::Os(errno) => Self::Os(errno),
+            racer_platform::Error::Canceled => Self::Cancelled,
+            racer_platform::Error::DeadlineExceeded => Self::DeadlineExceeded,
+            racer_platform::Error::Overloaded => Self::Overloaded,
+            racer_platform::Error::Unavailable => Self::Unavailable,
+            racer_platform::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            racer_platform::Error::InvalidInput => Self::InvalidRequest,
+            racer_platform::Error::NotFound => Self::MissingKey,
+            racer_platform::Error::AlreadyExists => Self::Replay,
+            racer_platform::Error::Io => Self::Io,
+            racer_platform::Error::Os(errno) => Self::Os(errno),
         }
     }
 }
 
-impl From<uring_runtime::reactor::filesystem::operations::ReplacementError<Error>> for Error {
-    fn from(
-        error: uring_runtime::reactor::filesystem::operations::ReplacementError<Error>,
-    ) -> Self {
-        use uring_runtime::reactor::filesystem::operations::ReplacementError;
+impl From<racer_platform::uring::Error> for Error {
+    /// Classify library failures through Racer's copyable runtime error.
+    fn from(error: racer_platform::uring::Error) -> Self {
+        racer_platform::Error::from(error).into()
+    }
+}
+
+impl From<racer_platform::fs::operations::ReplacementError<Error>> for Error {
+    fn from(error: racer_platform::fs::operations::ReplacementError<Error>) -> Self {
+        use racer_platform::fs::operations::ReplacementError;
         match error {
             ReplacementError::BeforeRename(cause) => cause,
             ReplacementError::RenameUncertain(cause) => Self::RenameUncertain(cause.into()),
@@ -297,7 +302,7 @@ mod tests {
     fn control_foundation_errors_preserve_boundary_meanings() {
         use racer_crypto::enrollment::Error as Enrollment;
         use racer_crypto::identity::BundleError;
-        use uring_runtime::reactor::filesystem::secure::AccessError;
+        use racer_platform::fs::secure::AccessError;
         for (source, expected) in [
             (controlplane::Error::Replay, Error::Replay),
             (controlplane::Error::Conflict, Error::IncompatibleMembership),
@@ -381,7 +386,7 @@ mod tests {
     fn operation_preserves_local_borrows_and_racer_results() {
         let value = std::rc::Rc::new(7);
         let operation: Operation<'_, _> = Box::pin(async { Ok(*value) });
-        let operation: uring_runtime::Operation<'_, _, Error> = operation;
+        let operation: racer_platform::Operation<'_, _, Error> = operation;
         assert_eq!(futures::executor::block_on(operation), Ok(7));
         let operation: Operation<'_, ()> = Box::pin(async { Err(Error::HopBudgetExhausted) });
         assert_eq!(
@@ -457,9 +462,9 @@ mod tests {
 
     #[test]
     fn runtime_errors_keep_racer_boundary_meanings() {
-        use uring_runtime::Error as RuntimeError;
+        use racer_platform::Error as RuntimeError;
         for (runtime, racer) in [
-            (RuntimeError::Cancelled, Error::Cancelled),
+            (RuntimeError::Canceled, Error::Cancelled),
             (RuntimeError::DeadlineExceeded, Error::DeadlineExceeded),
             (RuntimeError::Overloaded, Error::Overloaded),
             (RuntimeError::Unavailable, Error::Unavailable),
@@ -479,7 +484,7 @@ mod tests {
 
     #[test]
     fn replacement_outcomes_preserve_publication_phase() {
-        use uring_runtime::reactor::filesystem::operations::ReplacementError;
+        use racer_platform::fs::operations::ReplacementError;
         assert_eq!(
             Error::from(ReplacementError::BeforeRename(Error::Os(libc::ENOSPC))),
             Error::Os(libc::ENOSPC)

@@ -25,6 +25,11 @@ use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
 use racer_control_wire::RailMapping;
 use racer_crypto::identity::VerifiedPeer;
+#[cfg(test)]
+use racer_platform::drivers::poll_scoped;
+use racer_platform::environment::Deadline;
+#[cfg(test)]
+use racer_platform::group::Service;
 use rdma_verbs::DeviceHandle;
 use rdma_verbs::Endpoint;
 use rdma_verbs::IoPort;
@@ -42,11 +47,6 @@ use std::future::poll_fn;
 use std::path::Path;
 use std::rc::Rc;
 use std::task::Poll;
-#[cfg(test)]
-use uring_runtime::drivers::poll_scoped;
-use uring_runtime::environment::Deadline;
-#[cfg(test)]
-use uring_runtime::group::Service;
 
 mod retry;
 use retry::NativeRetry;
@@ -102,7 +102,7 @@ pub struct SetupParameters {
 impl SetupParameters {
     fn new(rail: RailId, endpoint: Endpoint) -> Result<Self> {
         let mut nonce = [0; 16];
-        uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
+        racer_platform::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
         let mut encoded = b"racer-rdma-setup-v1\0".to_vec();
         encoded.extend_from_slice(&rail.0.to_be_bytes());
         encoded.extend_from_slice(&nonce);
@@ -241,7 +241,7 @@ impl Sessions {
         ))?;
         // Bound a peer that opens setup but never completes the exchange. A
         // transfer subsequently replaces this with its original request deadline.
-        qp.expire_at(uring_runtime::environment::now() + std::time::Duration::from_secs(30));
+        qp.expire_at(racer_platform::environment::now() + std::time::Duration::from_secs(30));
         let setup = SetupParameters::new(rail, qp.endpoint)?;
         self.live.track(peer.node().clone(), qp.clone());
         Poll::Ready(Ok(PreparedSession {
@@ -522,7 +522,7 @@ impl Grant {
         self.transfer
     }
     pub fn descriptor(&self) -> Result<RemoteDescriptor> {
-        if uring_runtime::environment::now() >= self.deadline.0 {
+        if racer_platform::environment::now() >= self.deadline.0 {
             return Err(Error::DeadlineExceeded);
         }
         let (address, scoped_key) = self.receive.descriptor()?;
@@ -546,7 +546,7 @@ impl Grant {
                 .wait(
                     scope,
                     poll_fn(move |cx| {
-                        if uring_runtime::environment::now() >= self.deadline.0 {
+                        if racer_platform::environment::now() >= self.deadline.0 {
                             return Poll::Ready(Err(Error::DeadlineExceeded));
                         }
                         self.receive.poll_bound(cx).map_err(Into::into)
@@ -582,7 +582,7 @@ impl Grant {
                 .wait(
                     scope,
                     poll_fn(|cx| {
-                        if uring_runtime::environment::now() >= self.deadline.0 {
+                        if racer_platform::environment::now() >= self.deadline.0 {
                             return Poll::Ready(Err(Error::DeadlineExceeded));
                         }
                         self.receive.poll_finish(cx).map_err(Into::into)
@@ -846,7 +846,7 @@ impl Devices {
     pub fn with_reactor(reactor: Rc<crate::runtime::Reactor>) -> Self {
         // Simulation uses explicitly fired one-shot alarms, never ClockPoll.
         #[cfg(test)]
-        if uring_runtime::environment::simulation_seed().is_some() {
+        if racer_platform::environment::simulation_seed().is_some() {
             return Self::new();
         }
         Self {
@@ -2278,7 +2278,7 @@ pub(crate) mod tests {
                 let mut limits = crate::test_support::cluster::config(true).limits;
                 limits.queue_entries = NonZeroUsize::new(2).unwrap();
                 limits.request_context_bytes = NonZeroUsize::new(
-                    8192 + 4 * 128 + 2 * uring_runtime::reactor::SUBMISSION_BYTES,
+                    8192 + 4 * 128 + 2 * racer_platform::reactor::SUBMISSION_BYTES,
                 )
                 .unwrap();
                 let context_limit = limits.request_context_bytes.get();
@@ -2294,7 +2294,7 @@ pub(crate) mod tests {
                     .map(|_| {
                         reactor.sleep_until(
                             until,
-                            uring_runtime::reactor::timer::SleepMode::Kernel,
+                            racer_platform::reactor::timer::SleepMode::Kernel,
                             &scope,
                         )
                     })
@@ -2362,7 +2362,7 @@ pub(crate) mod tests {
                     .map(|_| {
                         reactor.sleep_until(
                             until,
-                            uring_runtime::reactor::timer::SleepMode::Kernel,
+                            racer_platform::reactor::timer::SleepMode::Kernel,
                             &scope,
                         )
                     })
@@ -2388,7 +2388,7 @@ pub(crate) mod tests {
                 drop((blocked, completed, remaining));
                 let mut recovered = reactor.sleep_until(
                     environment::now() + Duration::from_millis(1),
-                    uring_runtime::reactor::timer::SleepMode::Kernel,
+                    racer_platform::reactor::timer::SleepMode::Kernel,
                     &scope,
                 );
                 assert!(recovered.as_mut().poll(&mut cx).is_pending());
@@ -2947,7 +2947,7 @@ pub(crate) mod tests {
                     assert_eq!(admission.used(ResourceClass::Registered), 0);
                 }
             }
-            use uring_runtime::environment;
+            use racer_platform::environment;
 
             #[test]
             fn receive_completion_waits_for_invalidation_mailbox() {
@@ -3233,7 +3233,7 @@ pub(crate) mod tests {
                 ));
                 let scope = RequestScope::new(
                     RequestId([1; 16]),
-                    uring_runtime::environment::now() + std::time::Duration::from_secs(30),
+                    racer_platform::environment::now() + std::time::Duration::from_secs(30),
                 )
                 .unwrap();
                 (sim, devices, native, admission, scope)
@@ -3290,7 +3290,7 @@ pub(crate) mod tests {
                 ));
                 let scope = RequestScope::new(
                     RequestId([3; 16]),
-                    uring_runtime::environment::now() + std::time::Duration::from_secs(30),
+                    racer_platform::environment::now() + std::time::Duration::from_secs(30),
                 )
                 .unwrap();
                 assert!(matches!(
@@ -3412,7 +3412,7 @@ pub(crate) mod tests {
                         );
                         assert!(!devices.ready(RailId(0)));
                     }
-                    sibling.poll_budgeted(&mut cx, 1).unwrap();
+                    sibling.poll(&mut cx, 1).unwrap();
                     let Poll::Ready(Ok(Some(completion))) = io.poll_completion(&mut cx) else {
                         panic!("sibling must progress")
                     };
@@ -3555,8 +3555,8 @@ pub(crate) mod tests {
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 let mut activation = activate(&devices, &admission, &scope);
                 assert!(activation.as_mut().poll(&mut cx).is_pending());
-                service.poll_budgeted(&mut cx, 4).unwrap();
-                service.poll_budgeted(&mut cx, 1).unwrap();
+                service.poll(&mut cx, 4).unwrap();
+                service.poll(&mut cx, 1).unwrap();
                 assert!(matches!(
                     activation.as_mut().poll(&mut cx),
                     Poll::Ready(Ok(_))
@@ -3770,7 +3770,7 @@ pub(crate) mod tests {
                 ciphertext_length: 32,
             }
         }
-        use uring_runtime::environment;
+        use racer_platform::environment;
 
         mod lifecycle_tests {
             use super::*;
@@ -3859,7 +3859,7 @@ pub(crate) mod tests {
                 let written =
                     immediate(healthy.poll_write(source, grant.address(), grant.key())).unwrap();
                 native.poll_budgeted(2).unwrap();
-                failed.expire_at(uring_runtime::environment::now());
+                failed.expire_at(racer_platform::environment::now());
                 let sessions = Sessions::new(Rc::new(Devices::new()), 2);
                 sessions.track_test(failed.clone());
                 sessions.track_test(healthy.clone());

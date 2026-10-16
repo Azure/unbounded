@@ -34,6 +34,7 @@ use racer_dataplane::read::ReadPayload;
 use racer_dataplane::read::ReadResponse;
 use racer_dataplane::runtime::Reactor;
 use racer_dataplane::runtime::RequestScope;
+use racer_platform::reactor::IoBuffer;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -46,7 +47,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
-use uring_runtime::reactor::IoBuffer;
 
 const LIMIT: usize = 32768;
 const P: u64 = 16777216;

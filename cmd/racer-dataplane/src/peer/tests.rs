@@ -24,15 +24,15 @@ use racer_control_wire::ClusterId;
 use racer_control_wire::KeyId;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::Keyring;
+use racer_platform::environment::Deadline;
+use racer_platform::environment::SimulationClock;
+#[cfg(test)]
+use racer_platform::group::Service;
+use racer_platform::reactor::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
-use uring_runtime::environment::SimulationClock;
-#[cfg(test)]
-use uring_runtime::group::Service;
-use uring_runtime::reactor::IoBuffer;
 
 mod body_progress {
     use super::*;
@@ -1060,7 +1060,7 @@ mod encrypted_http {
             }
             assert!(Instant::now() < until, "encrypted HTTP regression watchdog");
             for engine in engines.iter_mut() {
-                engine.poll_budgeted(&mut cx, 8).unwrap();
+                engine.poll(&mut cx, 8).unwrap();
             }
             for client in clients {
                 client.poll_budgeted(8).unwrap();
@@ -1193,7 +1193,7 @@ mod encrypted_http {
         assert_ne!(pages[0].envelope().nonce, pages[1].envelope().nonce);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+        let listener = Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
             listener,
         ));
         let canceled = RequestScope::new(RequestId([9; 16]), scope.deadline.0).unwrap();
@@ -1604,7 +1604,7 @@ mod requester_safety {
         let server = async {
             let fd = reactor
                 .accept(
-                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                    Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
                         listener,
                     )),
                     &scope,
@@ -2434,7 +2434,7 @@ mod subscriptions {
         let server_work = async {
             let fd = reactor
                 .accept(
-                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                    Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
                         listener,
                     )),
                     &scope,
@@ -2543,7 +2543,7 @@ mod timing {
                 version: page.version.clone(),
                 length: 3,
                 expires_at: crate::model::ExpiresAt::test_time(
-                    uring_runtime::environment::wall_now() + Duration::from_secs(60),
+                    racer_platform::environment::wall_now() + Duration::from_secs(60),
                 ),
             },
             // Intentionally not AEAD-valid: forwarding verification does not decrypt.
@@ -2982,7 +2982,7 @@ pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> Se
 #[test]
 fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
     use crate::telemetry::{Gauge, Metrics};
-    let clock = uring_runtime::environment::SimulationClock::new(920);
+    let clock = racer_platform::environment::SimulationClock::new(920);
     let _env = clock.environment(0).enter();
     let fixtures = [SocketFixture::new(1), SocketFixture::new(1)];
     let metrics = [Metrics::default(), Metrics::default()];
@@ -3013,7 +3013,7 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
         .collect();
     let scope = RequestScope::new(
         RequestId([20; 16]),
-        uring_runtime::environment::now() + Duration::from_secs(1),
+        racer_platform::environment::now() + Duration::from_secs(1),
     )
     .unwrap();
     let mut requests: Vec<_> = fixtures.iter().map(|f| request(&f.admission, 20)).collect();
@@ -3217,8 +3217,8 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     use crate::peer::Metrics;
     use crate::peer::PageTiming;
     use crate::peer::now;
+    use racer_platform::environment::SimulationClock;
     use std::time::Duration;
-    use uring_runtime::environment::SimulationClock;
     let metrics = Metrics::default();
     let clock = SimulationClock::new(9);
     let _environment = clock.environment(1).enter();
@@ -3239,7 +3239,7 @@ mod adaptive {
     use crate::peer::*;
     #[test]
     fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
-        let clock = uring_runtime::environment::SimulationClock::new(905);
+        let clock = racer_platform::environment::SimulationClock::new(905);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -3270,7 +3270,7 @@ mod adaptive {
     }
     #[test]
     fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
-        let clock = uring_runtime::environment::SimulationClock::new(783);
+        let clock = racer_platform::environment::SimulationClock::new(783);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -3338,7 +3338,7 @@ mod adaptive {
     }
     #[test]
     fn recovery_requires_exclusive_verified_probe_and_old_success_cannot_clear_failure() {
-        let clock = uring_runtime::environment::SimulationClock::new(779);
+        let clock = racer_platform::environment::SimulationClock::new(779);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -3373,7 +3373,7 @@ mod adaptive {
     }
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
-        let clock = uring_runtime::environment::SimulationClock::new(780);
+        let clock = racer_platform::environment::SimulationClock::new(780);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -3412,7 +3412,7 @@ mod adaptive {
     }
     #[test]
     fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {
-        let clock = uring_runtime::environment::SimulationClock::new(781);
+        let clock = racer_platform::environment::SimulationClock::new(781);
         let _env = clock.environment(0).enter();
         let metrics = Metrics::default();
         let owner = AdaptivePeers::new(

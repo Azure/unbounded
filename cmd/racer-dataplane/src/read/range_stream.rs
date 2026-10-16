@@ -81,7 +81,7 @@ impl Scheduler {
         deadline: Instant,
     ) -> Result<(crate::peer::subscriptions::Subscription, Instant)> {
         let mut state = self.state.lock().unwrap();
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         state.contracts.retain(|_, (_, deadline)| *deadline > now);
         let key = (version.clone(), membership.0, provider);
         if !state.contracts.contains_key(&key) {
@@ -89,7 +89,7 @@ impl Scheduler {
                 return Err(Error::Overloaded);
             }
             let mut id = [0; 16];
-            uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+            racer_platform::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
             state.contracts.insert(
                 key.clone(),
                 (
@@ -519,12 +519,12 @@ impl RangeBudget {
     fn next_page(&mut self, _pending: bool) -> Result<Option<AcquisitionBudget>> {
         match self {
             Self::ProgressingPages { timeout } => Ok(Some(AcquisitionBudget::new(
-                uring_runtime::environment::now() + *timeout,
+                racer_platform::environment::now() + *timeout,
                 8,
                 16,
             ))),
             Self::ClientPages { deadline } => {
-                if uring_runtime::environment::now() >= *deadline {
+                if racer_platform::environment::now() >= *deadline {
                     return Err(Error::DeadlineExceeded);
                 }
                 Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))
@@ -852,7 +852,7 @@ impl RangeStream {
     fn operation_scope(&self) -> RequestScope {
         let mut scope = self.scope.clone();
         if let RangeBudget::ProgressingPages { timeout } = self.budget {
-            scope.deadline.0 = uring_runtime::environment::now() + timeout;
+            scope.deadline.0 = racer_platform::environment::now() + timeout;
         }
         scope
     }
@@ -1214,7 +1214,7 @@ pub(super) mod tests {
     #[test]
     fn optional_remote_observation_never_blocks_ready_delivery_or_duplicates_on_repoll() {
         for repoll in [false, true] {
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(8));
+            let queue = Rc::new(racer_platform::drivers::DriverQueue::new(8));
             let _queue = queue.enter();
             let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
             let directory = f.streams.directory();
@@ -1419,7 +1419,7 @@ pub(super) mod tests {
                 .is_err()
         );
         futures::executor::block_on(stream.cancel()).unwrap();
-        assert!(scope.cancellation.is_cancelled());
+        assert!(scope.cancellation.is_canceled());
         assert!(stream.subscription.is_none());
         assert!(stream.retained.is_empty());
         assert!(
@@ -1730,7 +1730,7 @@ pub(super) mod tests {
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
         for (capped, progressing) in [(true, false), (false, true), (false, false)] {
-            let clock = uring_runtime::environment::SimulationClock::new(55);
+            let clock = racer_platform::environment::SimulationClock::new(55);
             let environment = clock.environment(0);
             let _clock = environment.enter();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -1769,7 +1769,7 @@ pub(super) mod tests {
             let _queue = worker.drivers.enter();
             let scope = RequestScope::new(
                 RequestId([7; 16]),
-                uring_runtime::environment::now()
+                racer_platform::environment::now()
                     + if progressing {
                         Duration::from_millis(30)
                     } else {
@@ -1917,7 +1917,7 @@ pub(super) mod tests {
             admission.reclaim_buffers();
             if progressing {
                 assert!(
-                    uring_runtime::environment::now() > scope.deadline.0,
+                    racer_platform::environment::now() > scope.deadline.0,
                     "stream must cross the scaled old absolute deadline"
                 );
             }
@@ -1928,32 +1928,32 @@ pub(super) mod tests {
 
     #[test]
     fn progressing_page_children_keep_deadlines_and_retry_limits_across_long_streams() {
-        let clock = uring_runtime::environment::SimulationClock::new(81);
+        let clock = racer_platform::environment::SimulationClock::new(81);
         let _environment = clock.environment(0).enter();
         let timeout = Duration::from_millis(30);
-        let old_deadline = uring_runtime::environment::now() + timeout;
+        let old_deadline = racer_platform::environment::now() + timeout;
         let mut budget = RangeBudget::ProgressingPages { timeout };
         for _ in 0..12 {
             let mut page = budget.next_page(false).unwrap().unwrap();
             let deadline = page.deadline();
-            assert_eq!(deadline, uring_runtime::environment::now() + timeout);
+            assert_eq!(deadline, racer_platform::environment::now() + timeout);
             for _ in 0..8 {
-                page.begin_attempt(uring_runtime::environment::now(), deadline)
+                page.begin_attempt(racer_platform::environment::now(), deadline)
                     .unwrap();
             }
             assert_eq!(
-                page.begin_attempt(uring_runtime::environment::now(), deadline),
+                page.begin_attempt(racer_platform::environment::now(), deadline),
                 Err(Error::Unavailable)
             );
             clock.advance(Duration::from_millis(20));
             assert_eq!(page.deadline(), deadline);
             budget.complete(page).unwrap();
         }
-        assert!(uring_runtime::environment::now() > old_deadline);
+        assert!(racer_platform::environment::now() > old_deadline);
         let mut stalled = budget.next_page(false).unwrap().unwrap();
         clock.advance(timeout);
         assert_eq!(
-            stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
+            stalled.begin_attempt(racer_platform::environment::now(), stalled.deadline()),
             Err(Error::DeadlineExceeded)
         );
     }
@@ -2219,7 +2219,7 @@ pub(super) mod tests {
                 &[PageInterval { start: 0, end: 1 }]
             );
             assert!(second.poll_next(&mut cx).is_pending());
-            let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let deadline = racer_platform::environment::now() + std::time::Duration::from_secs(30);
             let (one, _) = scheduler
                 .contract(
                     version(),

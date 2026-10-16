@@ -11,6 +11,7 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailMapping;
+use racer_platform::environment::Deadline;
 use sha2::Digest;
 use sha2::Sha256;
 use std::future::Future;
@@ -20,7 +21,6 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
 
 pub use ::topology::MAX_DEGREE;
 pub use ::topology::{Maintenance, SLOT_COUNT};
@@ -59,7 +59,7 @@ pub enum LinkOutcome {
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
         self.inner
-            .acquire(node, uring_runtime::environment::now())
+            .acquire(node, racer_platform::environment::now())
             .map_err(Into::into)
     }
     /// Application misses and credential rejection do not open transport circuits.
@@ -88,7 +88,7 @@ impl LinkHealth {
         }
     }
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
-        self.observe_at(neighbor, outcome, uring_runtime::environment::now())
+        self.observe_at(neighbor, outcome, racer_platform::environment::now())
     }
     pub fn observe_at(&self, neighbor: &NodeId, outcome: LinkOutcome, now: Instant) -> Result<()> {
         if matches!(outcome, LinkOutcome::Success) {
@@ -101,13 +101,13 @@ impl LinkHealth {
     }
     /// Routing hint only; actual sends acquire an exclusive half-open probe.
     pub fn available(&self, neighbor: &NodeId) -> Result<bool> {
-        self.available_at(neighbor, uring_runtime::environment::now())
+        self.available_at(neighbor, racer_platform::environment::now())
     }
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
         Ok(self.inner.available(neighbor, now))
     }
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
-        self.try_acquire_at(neighbor, uring_runtime::environment::now())
+        self.try_acquire_at(neighbor, racer_platform::environment::now())
     }
     pub fn try_acquire_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
         Ok(self.inner.try_acquire(neighbor, now))
@@ -508,7 +508,7 @@ pub const FAILURE_LINKS: u8 = 8;
 impl RouteBudget {
     /// `visited` contains prior senders, excluding the current recipient.
     pub fn forwarded(&self, from: &NodeId, next: &NodeId) -> Result<Self> {
-        self.validate_at(from, uring_runtime::environment::now())?;
+        self.validate_at(from, racer_platform::environment::now())?;
         if self.remaining_links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
@@ -534,7 +534,7 @@ impl RouteBudget {
         {
             return Err(Error::InvalidRequest);
         }
-        forwarded.validate_at(next, uring_runtime::environment::now())
+        forwarded.validate_at(next, racer_platform::environment::now())
     }
     fn validate_at(&self, from: &NodeId, now: Instant) -> Result<()> {
         if now >= self.deadline.0 {
@@ -615,7 +615,7 @@ impl Paths {
     ) -> Operation<'a, Route> {
         Box::pin(async move {
             scope.check()?;
-            budget.validate_at(from, uring_runtime::environment::now())?;
+            budget.validate_at(from, racer_platform::environment::now())?;
             if membership.version != budget.membership {
                 return Err(Error::IncompatibleMembership);
             }
@@ -646,7 +646,7 @@ impl Paths {
                 std::future::poll_fn(|cx| {
                     if let Err(error) = scope
                         .check()
-                        .and_then(|()| budget.validate_at(from, uring_runtime::environment::now()))
+                        .and_then(|()| budget.validate_at(from, racer_platform::environment::now()))
                     {
                         return Poll::Ready(Err(error));
                     }
@@ -658,7 +658,7 @@ impl Paths {
                 .await
             };
             scope.check()?;
-            budget.validate_at(from, uring_runtime::environment::now())?;
+            budget.validate_at(from, racer_platform::environment::now())?;
             // Health/admission may change while yielded. Retry under the same budget.
             if self.blocked(&membership, source)? != blocked {
                 return Err(Error::Unavailable);
@@ -759,7 +759,7 @@ pub(crate) mod tests {
                 .observe_at(
                     &node,
                     LinkOutcome::Timeout,
-                    uring_runtime::environment::now() - Duration::from_secs(60),
+                    racer_platform::environment::now() - Duration::from_secs(60),
                 )
                 .unwrap();
             let probe = health.acquire(&node).unwrap();
@@ -767,7 +767,7 @@ pub(crate) mod tests {
                 !health
                     .try_acquire_at(
                         &node,
-                        uring_runtime::environment::now() + Duration::from_secs(60)
+                        racer_platform::environment::now() + Duration::from_secs(60)
                     )
                     .unwrap()
             );
@@ -776,7 +776,7 @@ pub(crate) mod tests {
                 health
                     .try_acquire_at(
                         &node,
-                        uring_runtime::environment::now() + Duration::from_secs(60)
+                        racer_platform::environment::now() + Duration::from_secs(60)
                     )
                     .unwrap()
             );
@@ -1374,7 +1374,7 @@ pub(crate) mod tests {
             let members = membership(100_000);
             let scope = RequestScope::new(
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + std::time::Duration::from_secs(30),
+                racer_platform::environment::now() + std::time::Duration::from_secs(30),
             )
             .unwrap();
             let mut future = placement.rank_scoped(members, &object(), PageNumber(0), Some(&scope));
@@ -1699,7 +1699,7 @@ pub(crate) mod tests {
             use crate::peer::AdaptivePeers;
             use crate::peer::Config;
             use crate::peer::Outcome;
-            let clock = uring_runtime::environment::SimulationClock::new(110);
+            let clock = racer_platform::environment::SimulationClock::new(110);
             let _env = clock.environment(0).enter();
             let members = membership(100_000);
             let source = &members.members()[0].node;
@@ -1708,7 +1708,7 @@ pub(crate) mod tests {
                 .with_peer_admission(admission.clone());
             let mut request = budget(&members, 80_003, 4);
             request.deadline =
-                Deadline(uring_runtime::environment::now() + Duration::from_secs(60));
+                Deadline(racer_platform::environment::now() + Duration::from_secs(60));
             let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
             let mut operation = paths.shortest_async(members.clone(), source, &request, &scope);
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -1733,7 +1733,7 @@ pub(crate) mod tests {
 
         #[test]
         fn yielded_and_cached_searches_enforce_scope_budget_and_membership() {
-            let clock = uring_runtime::environment::SimulationClock::new(109);
+            let clock = racer_platform::environment::SimulationClock::new(109);
             let _env = clock.environment(0).enter();
             let members = membership(100_000);
             let source = &members.members()[0].node;
@@ -1741,7 +1741,7 @@ pub(crate) mod tests {
             for case in 0..3 {
                 let paths = Paths::new(Rc::new(LinkHealth::default()), 1);
                 let mut request = budget(&members, 80_003, 4);
-                let now = uring_runtime::environment::now();
+                let now = racer_platform::environment::now();
                 request.deadline =
                     Deadline(now + Duration::from_secs(if case == 1 { 1 } else { 60 }));
                 let scope = RequestScope::new(
@@ -1768,7 +1768,7 @@ pub(crate) mod tests {
                 // Failure drops the algorithm admission before a new request starts.
                 let mut fresh = request.clone();
                 fresh.deadline =
-                    Deadline(uring_runtime::environment::now() + Duration::from_secs(60));
+                    Deadline(racer_platform::environment::now() + Duration::from_secs(60));
                 paths.shortest(members.clone(), source, &fresh).unwrap();
                 assert_eq!(
                     futures::executor::block_on(paths.shortest_async(

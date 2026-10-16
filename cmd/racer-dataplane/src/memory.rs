@@ -36,7 +36,7 @@ impl PlaintextBuffer {
     }
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
-unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
+unsafe impl racer_platform::reactor::IoBuffer for PlaintextBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(self.0.bytes())
@@ -340,7 +340,7 @@ impl CiphertextPage {
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
-unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
+unsafe impl racer_platform::reactor::SendBuffer for CiphertextPage {
     type Error = Error;
     fn send_bytes(&self) -> Result<&[u8]> {
         Ok(self.bytes())
@@ -881,7 +881,7 @@ pub(crate) mod tests {
     use crate::model::Nonce;
     use crate::model::PageNumber;
     use crate::model::VersionMetadata;
-    use uring_runtime::reactor::IoBuffer;
+    use racer_platform::reactor::IoBuffer;
     mod cache {
         use super::*;
         use crate::model::ExpiresAt;

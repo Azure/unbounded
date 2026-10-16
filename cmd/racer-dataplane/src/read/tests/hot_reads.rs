@@ -30,12 +30,12 @@ mod duplex_release {
 
     #[test]
     fn duplex_exact_release_before_final_send_cqe_is_provisional() {
-        use uring_runtime::reactor::simulation::Fault;
-        use uring_runtime::reactor::simulation::Simulation;
+        use racer_platform::simulation::Fault;
+        use racer_platform::simulation::Simulation;
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
             let sim = Simulation::new();
             let _sim = sim.enter();
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+            let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
             let signers = network(1);
             let mut f = fixture();
@@ -83,8 +83,8 @@ mod duplex_release {
             let mut bytes = Vec::new();
             let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
                 endpoint.poll(&mut cx, 64).unwrap();
-                uring_runtime::drivers::poll(&mut cx, 64);
-                uring_runtime::group::Service::poll_budgeted(
+                racer_platform::drivers::poll(&mut cx, 64);
+                racer_platform::group::Service::poll(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -216,9 +216,9 @@ mod duplex_release {
     }
 
     fn run(mode: &str) {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let clock = uring_runtime::environment::SimulationClock::new(311);
+        let clock = racer_platform::environment::SimulationClock::new(311);
         let environment = clock.environment(0);
         let _clock = environment.enter();
         let signers = network(1);
@@ -229,7 +229,7 @@ mod duplex_release {
             coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let scope = RequestScope::new(
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(60),
+            racer_platform::environment::now() + Duration::from_secs(60),
         )
         .unwrap();
         let request = ClientRequest {
@@ -529,7 +529,7 @@ mod duplex_release {
             drop((send, done));
         }
         assert_eq!(other.bytes_sent(), 0);
-        assert!(!other_scope.cancellation.is_cancelled());
+        assert!(!other_scope.cancellation.is_canceled());
         let (socket, mut independent_client) = std::os::unix::net::UnixStream::pair().unwrap();
         independent_client
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -685,7 +685,7 @@ pub(super) fn coordinator(
 
 #[test]
 fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(1);
     let mut f = fixture_with(3 * PAGE_BYTES + 7, None);
@@ -807,7 +807,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
 
 #[test]
 fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     // Full-page batch, then a one-byte boundary with byte credit just below
     // and exactly at the threshold for two additional full pages.
@@ -918,7 +918,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
 
 #[test]
 fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for mode in ["success", "cancel", "drop", "failure"] {
         let signers = network(1);
@@ -969,8 +969,8 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             endpoint.poll(&mut cx, 64).unwrap();
-            uring_runtime::drivers::poll(&mut cx, 64);
-            uring_runtime::group::Service::poll_budgeted(
+            racer_platform::drivers::poll(&mut cx, 64);
+            racer_platform::group::Service::poll(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,
@@ -1135,7 +1135,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
 
 #[test]
 fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_local_readers() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1322,12 +1322,12 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 )
                 .unwrap();
         }
-        uring_runtime::drivers::poll(
+        racer_platform::drivers::poll(
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
         );
         for f in &mut fixtures {
-            uring_runtime::group::Service::poll_budgeted(
+            racer_platform::group::Service::poll(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,
@@ -1514,7 +1514,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
 }
 #[test]
 fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);

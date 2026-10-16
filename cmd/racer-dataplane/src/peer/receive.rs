@@ -8,10 +8,10 @@ use crate::error::{Error, Result};
 use crate::runtime::RequestScope;
 use crate::telemetry::{Event, Gauge, Metrics};
 use flow_control::{Charge, Quotas};
+use racer_platform::environment::now;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use uring_runtime::environment::now;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn receive_alarm_wakes_without_completion_and_preserves_scope() {
         use std::future::Future;
-        let clock = uring_runtime::environment::SimulationClock::new(909);
+        let clock = racer_platform::environment::SimulationClock::new(909);
         let _env = clock.environment(0).enter();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,

@@ -16,12 +16,12 @@ use http1::connection::BufferRange;
 use racer_control_wire::CacheId;
 use racer_control_wire::ClusterId;
 use racer_crypto::{TAG_LEN, open, seal};
+use racer_platform::reactor::IoBuffer;
 use std::cell::Cell;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::task::Context;
 use std::task::Poll;
-use uring_runtime::reactor::IoBuffer;
 
 mod materialized_pairing {
     //! Distinct bodies make cross-exchange substitution visible across relay reuse.
@@ -168,8 +168,9 @@ mod materialized_pairing {
         let downstream_closed = Cell::new(false);
         let healthy_first = Cell::new(false);
         let overlapped = Cell::new(false);
-        let listener: Rc<uring_runtime::reactor::descriptor::Descriptor> = Rc::new(listener.into());
-        let destination = |listener: Rc<uring_runtime::reactor::descriptor::Descriptor>| async {
+        let listener: Rc<racer_platform::reactor::descriptor::Descriptor> =
+            Rc::new(listener.into());
+        let destination = |listener: Rc<racer_platform::reactor::descriptor::Descriptor>| async {
             let fd = reactors[2].accept(listener, &scope).await?;
             accepted.set(accepted.get() + 1);
             let conn = crate::http::from_accepted(fd, &admissions[2])?;
@@ -545,7 +546,7 @@ mod safety {
         )
         .unwrap();
         assert!(admitted.get() && finished.get());
-        assert_eq!(relay_scope.cancellation.is_cancelled(), cancel_parent);
+        assert_eq!(relay_scope.cancellation.is_canceled(), cancel_parent);
         assert!(
             f.scope.check().is_ok(),
             "unrelated listener scope remains usable"
@@ -629,7 +630,7 @@ mod safety {
         }
         let poll_crypto = || {
             for engine in engines.borrow_mut().iter_mut() {
-                uring_runtime::group::Service::poll_budgeted(
+                racer_platform::group::Service::poll(
                     engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     8,
@@ -913,7 +914,7 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::telemetry::Samples;
     for mode in ["success", "failure", "drop"] {
         let f = RelayFixture::new(true);
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
         let _guard = queue.enter();
         let (_, ids) = identities();
         let (io, _engine) = pair(
@@ -1579,7 +1580,7 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         if attack == "deadline" {
             // The binding retains its signed monotonic deadline; scope changes
             // cannot make a stale head eligible for reverse forwarding.
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = racer_platform::environment::SimulationClock::new_at(
                 91,
                 Instant::now() + Duration::from_secs(60),
                 std::time::SystemTime::now() + Duration::from_secs(60),

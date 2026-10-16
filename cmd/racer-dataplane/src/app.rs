@@ -107,7 +107,7 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-use uring_runtime::drivers::poll_task;
+use racer_platform::drivers::poll_task;
 
 mod devices;
 mod native;
@@ -309,7 +309,7 @@ impl Application {
 fn scope(timeout: Duration) -> Result<RequestScope> {
     RequestScope::new(
         RequestId([0; 16]),
-        uring_runtime::environment::now() + timeout,
+        racer_platform::environment::now() + timeout,
     )
 }
 
@@ -328,7 +328,7 @@ async fn start_control(
                     .sleep(
                         control
                             .next_attempt()
-                            .unwrap_or_else(uring_runtime::environment::now),
+                            .unwrap_or_else(racer_platform::environment::now),
                         startup,
                     )
                     .await?;
@@ -532,9 +532,9 @@ pub struct WorkerApplication {
 
     next_health: std::time::Instant,
 
-    environment: uring_runtime::environment::Environment,
+    environment: racer_platform::environment::Environment,
 
-    drivers: Rc<uring_runtime::drivers::DriverQueue>,
+    drivers: Rc<racer_platform::drivers::DriverQueue>,
 
     http: Rc<HttpPool>,
 
@@ -753,7 +753,7 @@ impl WorkerApplication {
         runtime: WorkerRuntime,
         discovered_nics: Vec<racer_control_wire::RailMapping>,
     ) -> Result<Self> {
-        let environment = uring_runtime::environment::Environment::current();
+        let environment = racer_platform::environment::Environment::current();
         let metrics = node
             .metrics
             .iter()
@@ -764,7 +764,7 @@ impl WorkerApplication {
         runtime
             .crypto
             .set_failure_observer(node.failures.observer(worker));
-        let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let drivers = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();
         config.page_hedge.validate()?;
@@ -983,7 +983,7 @@ impl WorkerApplication {
         #[cfg(not(test))]
         let distributed = true;
         #[cfg(test)]
-        let distributed = uring_runtime::reactor::simulation::Simulation::current().is_none();
+        let distributed = racer_platform::simulation::Simulation::current().is_none();
         let peers = PeerServer::new(
             io.clone(),
             forwarding,
@@ -1061,7 +1061,7 @@ impl WorkerApplication {
             inventory_generation: 0,
             native_numa: node.native.numa(worker)?,
             native_task: None,
-            native_retry: uring_runtime::environment::now(),
+            native_retry: racer_platform::environment::now(),
             telemetry: Rc::new(telemetry),
             directory: node.workers.clone(),
             node,
@@ -1079,9 +1079,9 @@ impl WorkerApplication {
             placement,
             candidates,
             ownership_maintenance: OwnershipMaintenance {
-                next: uring_runtime::environment::now(),
+                next: racer_platform::environment::now(),
             },
-            placement_retry: uring_runtime::environment::now(),
+            placement_retry: racer_platform::environment::now(),
             placement_warning: None,
             diagnostic_task: None,
             diagnostic_scope: None,
@@ -1101,7 +1101,7 @@ impl WorkerApplication {
             cache_prepare_task: None,
             cache_preparing_generation: 0,
             control_scope: None,
-            next_health: uring_runtime::environment::now(),
+            next_health: racer_platform::environment::now(),
         })
     }
 
@@ -1429,7 +1429,7 @@ impl WorkerApplication {
         let worker = self.worker;
         let budget = work_budget.min(64);
         stage_result(worker, "native", self.poll_native(cx))?;
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         if !self.stopping
             && now >= self.placement_retry
             && let Ok(snapshot) = self.snapshots.current()
@@ -1450,7 +1450,7 @@ impl WorkerApplication {
         }
         // Expire metadata before advancing peer/listener tasks.
         self.metadata
-            .poll_deadlines(uring_runtime::environment::now(), budget);
+            .poll_deadlines(racer_platform::environment::now(), budget);
         if !self.stopping {
             let prepared = self.poll_cache_preparation(cx);
             stage_result(worker, "cache-preparation", prepared)?;
@@ -1462,7 +1462,7 @@ impl WorkerApplication {
             let refreshed = scope(self.timeout).and_then(|turn| self.refresh_snapshot(&turn));
             stage_result(worker, "snapshot-refresh", refreshed)?;
         }
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         if now >= self.next_health {
             stage_result(worker, "health", self.observe_health())?;
             self.next_health = now + Duration::from_millis(100);
@@ -1703,7 +1703,7 @@ impl WorkerApplication {
                 // with a bounded kernel timer, not a blocking join or self-wake.
                 timer
                     .sleep(
-                        uring_runtime::environment::now() + Duration::from_millis(10),
+                        racer_platform::environment::now() + Duration::from_millis(10),
                         deadline,
                     )
                     .await?;
@@ -1735,7 +1735,7 @@ impl Application {
         &self,
         worker: WorkerId,
         runtime: WorkerRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
         let application = WorkerApplication::assemble(
             &self.config,
             self.node.clone(),
@@ -1751,18 +1751,18 @@ impl Application {
         &self,
         worker: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
         self.node
             .native
             .crypto(worker, PageCryptoEngine::new(runtime))
     }
 }
 
-impl uring_runtime::group::Factory<RequestScope> for Application {
+impl racer_platform::group::Factory<RequestScope> for Application {
     fn build_lane(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
         self.resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
@@ -1772,7 +1772,7 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     fn build_helper(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
         self.resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
@@ -1791,11 +1791,11 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     }
 }
 
-impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
+impl racer_platform::group::Service<RequestScope> for WorkerApplication {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         let _environment = self.environment.enter();
         let maximum = self.ownership_maintenance.wait_timeout(
-            uring_runtime::environment::now(),
+            racer_platform::environment::now(),
             self.stopping,
             maximum,
         );
@@ -1805,7 +1805,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             .chain(self.flights.next_deadline())
             .min()
             .map_or(maximum, |deadline| {
-                maximum.min(deadline.saturating_duration_since(uring_runtime::environment::now()))
+                maximum.min(deadline.saturating_duration_since(racer_platform::environment::now()))
             })
     }
 
@@ -1813,7 +1813,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         WorkerApplication::start(self, scope)
     }
 
-    fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
+    fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         if !self.started {
             return Err(Error::Unavailable);
         }
@@ -2136,7 +2136,7 @@ impl Observations {
     ) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
         workers.insert(worker, (resources, sequence));
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         let complete = workers.len() == count;
         let all = |test: fn(&Resources) -> bool| {
             complete
@@ -2176,7 +2176,7 @@ impl Observations {
         count: usize,
     ) -> Result<()> {
         let workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         diagnostic.expected_workers = count;
         diagnostic.matching_workers = workers
             .values()
@@ -2237,7 +2237,7 @@ impl WorkerApplication {
         self.telemetry
             .metrics
             .observe_retention(self.store.writer.retention().snapshot());
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         if self.control.is_some() {
             self.telemetry.metrics.set_gauge(
                 crate::telemetry::Gauge::KeyringGeneration,
@@ -2252,7 +2252,7 @@ impl WorkerApplication {
                     .set_gauge(crate::telemetry::Gauge::IdentityExpiresAtSeconds, expiry);
             }
             let remaining = (UNIX_EPOCH + Duration::from_secs(expiry))
-                .duration_since(uring_runtime::environment::wall_now())
+                .duration_since(racer_platform::environment::wall_now())
                 .ok()?;
             now.checked_add(remaining)
         });
@@ -2369,7 +2369,7 @@ impl WorkerApplication {
                         let io = ReactorControlIo::new(self.runtime.reactor.clone());
                         ReactorControlIo::sleep(
                             &io,
-                            uring_runtime::environment::now() + Duration::from_millis(100),
+                            racer_platform::environment::now() + Duration::from_millis(100),
                             startup,
                         )
                         .await?;
@@ -2571,7 +2571,7 @@ fn size_workers_policy(
         let partition = partition_limits_with_cause(node, count, rdma).and_then(|limits| {
             if profiling {
                 let extra = ::telemetry::server::BINARY_CONTROL_SLOTS
-                    * uring_runtime::reactor::SUBMISSION_BYTES;
+                    * racer_platform::reactor::SUBMISSION_BYTES;
                 let floor = crate::telemetry::RESERVED_BYTES
                     + crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
                     + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES);
@@ -2639,14 +2639,9 @@ mod lifecycle_policy_tests {
         config.max_threads = 40;
         let mut plan = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            racer_platform::group::affinity::EffectiveTopology {
                 cpus: (0..72)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
-                        cpu,
-                        package: 0,
-                        core: cpu,
-                        numa_node: Some(0),
-                    })
+                    .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), Some(0)))
                     .collect(),
                 quota: None,
                 nics: vec![],
@@ -2690,13 +2685,10 @@ mod lifecycle_policy_tests {
             .unwrap();
             let mut plan = AffinityPlan::from_topology(
                 &config,
-                uring_runtime::group::affinity::EffectiveTopology {
+                racer_platform::group::affinity::EffectiveTopology {
                     cpus: (0..144)
-                        .map(|cpu| uring_runtime::group::affinity::CpuLocation {
-                            cpu,
-                            package: 0,
-                            core: cpu,
-                            numa_node: Some(cpu / 72),
+                        .map(|cpu| {
+                            crate::worker::cpu_location(cpu, Some(0), Some(cpu), Some(cpu / 72))
                         })
                         .collect(),
                     quota: None,
@@ -2732,14 +2724,9 @@ mod lifecycle_policy_tests {
         .unwrap();
         let mut plan = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            racer_platform::group::affinity::EffectiveTopology {
                 cpus: (0..16)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
-                        cpu,
-                        package: 0,
-                        core: cpu,
-                        numa_node: Some(0),
-                    })
+                    .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), Some(0)))
                     .collect(),
                 quota: None,
                 nics: vec![],
@@ -2788,14 +2775,9 @@ mod lifecycle_policy_tests {
         .unwrap();
         let mut enabled = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            racer_platform::group::affinity::EffectiveTopology {
                 cpus: (0..15)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
-                        cpu,
-                        core: cpu,
-                        package: 0,
-                        numa_node: Some(0),
-                    })
+                    .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), Some(0)))
                     .collect(),
                 quota: None,
                 nics: vec![],

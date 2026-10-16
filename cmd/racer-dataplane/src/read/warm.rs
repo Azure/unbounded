@@ -221,7 +221,7 @@ impl WarmRegistry {
             let progress = job.progress.lock().unwrap();
             let expired = progress
                 .until
-                .is_some_and(|until| until <= uring_runtime::environment::wall_now());
+                .is_some_and(|until| until <= racer_platform::environment::wall_now());
             progress.running || progress.admissions != 0 || (!expired && !progress.stopped)
         });
         if let Some(job) = jobs.get(version) {
@@ -253,14 +253,14 @@ impl WarmRegistry {
             return Err(Error::Overloaded);
         }
         let mut request = [0; 16];
-        uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
+        racer_platform::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
         let job = Arc::new(Job {
             previous_until,
             metrics: self.metrics(),
             version: version.clone(),
             scope: RequestScope::new(
                 RequestId(request),
-                uring_runtime::environment::now() + config.fill_timeout,
+                racer_platform::environment::now() + config.fill_timeout,
             )?,
             admission: futures::lock::Mutex::new(()),
             progress: Mutex::new(Progress {
@@ -296,8 +296,8 @@ impl WarmRegistry {
     }
 
     pub(crate) fn poll_deadlines(&self) {
-        let now = uring_runtime::environment::now();
-        let wall = uring_runtime::environment::wall_now();
+        let now = racer_platform::environment::now();
+        let wall = racer_platform::environment::wall_now();
         let mut jobs = self.jobs.lock().unwrap();
         let mut cancel = Vec::new();
         let mut wake = Vec::new();
@@ -422,7 +422,7 @@ impl Waiter {
             || (!progress.running
                 && progress
                     .until
-                    .is_some_and(|until| until <= uring_runtime::environment::wall_now()))
+                    .is_some_and(|until| until <= racer_platform::environment::wall_now()))
         {
             return Poll::Ready(Ok(false));
         }
@@ -532,10 +532,10 @@ pub(crate) async fn admit(
     if ttl.is_zero() {
         return Err(Error::InvalidRequest);
     }
-    let until = uring_runtime::environment::wall_now()
+    let until = racer_platform::environment::wall_now()
         .checked_add(ttl.min(config.max_ttl))
         .ok_or(Error::InvalidRequest)?;
-    let permit = uring_runtime::drivers::reserve()?;
+    let permit = racer_platform::drivers::reserve()?;
     let (job, fresh) = directory
         .subscriptions
         .admit_warm(&metadata.version, &directory.warm)?;
@@ -587,7 +587,7 @@ pub(crate) async fn admit(
         } else {
             RequestScope::new(
                 job.scope.request,
-                uring_runtime::environment::now() + config.fill_timeout,
+                racer_platform::environment::now() + config.fill_timeout,
             )?
         };
         let mut fresh_workers = Vec::new();
@@ -699,7 +699,7 @@ async fn run(
                 .lock()
                 .unwrap()
                 .until
-                .is_none_or(|until| until <= uring_runtime::environment::wall_now())
+                .is_none_or(|until| until <= racer_platform::environment::wall_now())
             {
                 let _lock = job.admission.lock().await;
                 if job
@@ -707,7 +707,7 @@ async fn run(
                     .lock()
                     .unwrap()
                     .until
-                    .is_none_or(|until| until <= uring_runtime::environment::wall_now())
+                    .is_none_or(|until| until <= racer_platform::environment::wall_now())
                 {
                     failure = Some(Error::DeadlineExceeded);
                     break;
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn admission_and_job_metrics_survive_caller_drop_and_count_coalescing_once() {
-        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let queue = std::rc::Rc::new(racer_platform::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let (local, _fixture) = crate::read::tests::admission_coordinator();
         let directory = Arc::new(
@@ -1015,7 +1015,7 @@ mod tests {
     fn scope() -> RequestScope {
         RequestScope::new(
             RequestId([7; 16]),
-            uring_runtime::environment::now() + Duration::from_secs(30),
+            racer_platform::environment::now() + Duration::from_secs(30),
         )
         .unwrap()
     }
@@ -1161,7 +1161,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         registry.stop();
-        assert!(job.scope.cancellation.is_cancelled());
+        assert!(job.scope.cancellation.is_canceled());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         assert!(matches!(registry.begin(&version), Err(Error::Unavailable)));
         job.stop();
@@ -1197,7 +1197,7 @@ mod tests {
         drop(first);
         assert_eq!(registry.snapshot(), (1, 0));
         let expired =
-            RequestScope::new(RequestId([1; 16]), uring_runtime::environment::now()).unwrap();
+            RequestScope::new(RequestId([1; 16]), racer_platform::environment::now()).unwrap();
         assert_eq!(
             futures::executor::block_on(registry.wait(&page, &expired)),
             Err(Error::DeadlineExceeded)

@@ -75,8 +75,8 @@ pub struct PeerServer {
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
-        fd: uring_runtime::reactor::descriptor::Descriptor,
-    ) -> crate::error::Result<uring_runtime::reactor::descriptor::Descriptor> {
+        fd: racer_platform::reactor::descriptor::Descriptor,
+    ) -> crate::error::Result<racer_platform::reactor::descriptor::Descriptor> {
         // False preserves the accepted socket's existing application policy.
         if self.tcp_nodelay {
             fd.enable_tcp_nodelay(true)?;
@@ -115,7 +115,7 @@ impl PeerServer {
         ciphertext.provenance?;
         let receiver = connection.state().session.as_ref()?.peer();
         let (ticket, sample) = samples.begin(pair, self.signatures.node(), receiver)?;
-        let permit = match uring_runtime::drivers::reserve().map_err(Error::from) {
+        let permit = match racer_platform::drivers::reserve().map_err(Error::from) {
             Ok(p) => p,
             Err(error) => {
                 sample.finish(Some(error));
@@ -125,7 +125,7 @@ impl PeerServer {
         let deadline = scope
             .deadline
             .0
-            .min(uring_runtime::environment::now() + Duration::from_secs(2));
+            .min(racer_platform::environment::now() + Duration::from_secs(2));
         let diagnostic_scope = match RequestScope::new(scope.request, deadline) {
             Ok(s) => s,
             Err(error) => {
@@ -210,7 +210,7 @@ impl PeerServer {
             scope.check()?;
             let reactor = self.io.reactor();
             let fd =
-                Rc::new(uring_runtime::reactor::descriptor::Descriptor::tcp_listener(address)?);
+                Rc::new(racer_platform::reactor::descriptor::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
@@ -218,7 +218,7 @@ impl PeerServer {
             loop {
                 scope.check()?;
                 if let AcceptMode::Distributed(ingress) = &self.accept {
-                    uring_runtime::drivers::retry_listener(scope, || {
+                    racer_platform::drivers::retry_listener(scope, || {
                         reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
                     })
                     .await?;
@@ -260,7 +260,7 @@ impl PeerServer {
                     continue;
                 }
                 let accepted = next_accepted(
-                    uring_runtime::drivers::retry_listener(scope, || {
+                    racer_platform::drivers::retry_listener(scope, || {
                         reactor.accept(fd.clone(), scope)
                     }),
                     &mut active,
@@ -353,7 +353,7 @@ impl PeerServer {
             let header_scope = header_scope(
                 scope,
                 self.request_timeout,
-                uring_runtime::environment::now(),
+                racer_platform::environment::now(),
             )?;
             let connection = self
                 .authenticate_connection(connection, &header_scope)
@@ -774,7 +774,7 @@ impl PeerServer {
                     membership.version,
                     request.origin().node().clone(),
                     encode_deadline(scope.deadline)?,
-                    millis(uring_runtime::environment::wall_now())?,
+                    millis(racer_platform::environment::wall_now())?,
                 )?
             } else {
                 self.subscriptions
@@ -814,7 +814,7 @@ impl PeerServer {
                                     metadata,
                                     ciphertext,
                                 },
-                                millis(uring_runtime::environment::wall_now())?,
+                                millis(racer_platform::environment::wall_now())?,
                             )?;
                         }
                         Ok(other) => {
@@ -836,7 +836,7 @@ impl PeerServer {
                     if let Err(error) = scope.check() {
                         return std::task::Poll::Ready(Err(error));
                     }
-                    let now = match millis(uring_runtime::environment::wall_now()) {
+                    let now = match millis(racer_platform::environment::wall_now()) {
                         Ok(now) => now,
                         Err(error) => return std::task::Poll::Ready(Err(error)),
                     };
@@ -911,6 +911,7 @@ mod tests {
     use crate::test_support::clock::Clock;
     use futures::channel::oneshot;
     use futures::stream::FuturesUnordered;
+    use racer_platform::environment::SimulationClock;
     use std::cell::Cell;
     use std::future::Future;
     use std::io::Read;
@@ -919,7 +920,6 @@ mod tests {
     use std::pin::Pin;
     use std::task::Context;
     use std::task::Poll;
-    use uring_runtime::environment::SimulationClock;
 
     #[derive(Default)]
     struct AcceptCounts {
@@ -941,7 +941,7 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>>>
+    impl<F: Future<Output = crate::error::Result<racer_platform::reactor::descriptor::Descriptor>>>
         Future for CountedAccept<F>
     {
         type Output = F::Output;
@@ -1067,7 +1067,7 @@ mod tests {
                 );
                 assert_eq!(reactor.in_flight(), 0, "both IO and watch must be fenced");
                 assert_eq!(admission.used(ResourceClass::Relay), 0);
-                assert_eq!(parent.cancellation.is_cancelled(), cancel_parent);
+                assert_eq!(parent.cancellation.is_canceled(), cancel_parent);
                 drop(work);
                 downstream
                     .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1292,7 +1292,7 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                let fd = Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
                     listener,
                 ));
                 let weak = Rc::downgrade(&fd);
@@ -1539,7 +1539,7 @@ mod tests {
                 ));
                 let scope = RequestScope::new(
                     RequestId([5; 16]),
-                    uring_runtime::environment::now() + Duration::from_secs(365 * 24 * 3600),
+                    racer_platform::environment::now() + Duration::from_secs(365 * 24 * 3600),
                 )
                 .unwrap();
                 let (socket, mut peer) = UnixStream::pair().unwrap();

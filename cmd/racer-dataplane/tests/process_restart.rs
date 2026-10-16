@@ -699,11 +699,12 @@ fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
             &config,
             EffectiveTopology {
                 cpus: (0..8)
-                    .map(|cpu| CpuLocation {
-                        cpu,
-                        package: 0,
-                        core: cpu,
-                        numa_node: Some(0),
+                    .map(|cpu| {
+                        let mut location = CpuLocation::new(cpu);
+                        location.package = Some(0);
+                        location.core = Some(cpu);
+                        location.numa_node = Some(0);
+                        location
                     })
                     .collect(),
                 quota: None,
@@ -1455,5 +1456,5 @@ fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
-use uring_runtime::group::affinity::CpuLocation;
-use uring_runtime::group::affinity::EffectiveTopology;
+use racer_platform::group::affinity::CpuLocation;
+use racer_platform::group::affinity::EffectiveTopology;

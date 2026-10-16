@@ -34,12 +34,12 @@ use http1::MessageHead;
 #[cfg(test)]
 use http1::StartLine;
 use racer_control_wire::CacheId;
+use racer_platform::reactor::IoBuffer;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::IoBuffer;
 
 pub mod listener;
 
@@ -249,7 +249,7 @@ impl Releases {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-        socket: &Rc<uring_runtime::reactor::descriptor::Descriptor>,
+        socket: &Rc<racer_platform::reactor::descriptor::Descriptor>,
         stream: &mut RangeStream,
         outstanding: &mut BTreeMap<PageNumber, u32>,
         current: Option<(crate::model::PageSlice, &crate::http::FinalSend)>,
@@ -441,7 +441,7 @@ impl Responses {
                 stream.enable_progress(timeout);
                 while sent < expected {
                     let mut progress_scope = scope.clone();
-                    progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                    progress_scope.deadline.0 = racer_platform::environment::now() + timeout;
                     let reader = if let Some(reader) = first.take() {
                         reader
                     } else {
@@ -572,7 +572,7 @@ impl Responses {
                             let socket = socket.clone();
                             let reservation = reservation.clone();
                             let mut receive_scope = scope.clone();
-                            receive_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                            receive_scope.deadline.0 = racer_platform::environment::now() + timeout;
                             ready = Some(Box::pin(async move {
                                 reactor
                                     .readiness_with_lease(
@@ -609,7 +609,7 @@ impl Responses {
                 }
             }
             let mut final_scope = scope.clone();
-            final_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+            final_scope.deadline.0 = racer_platform::environment::now() + timeout;
             connection =
                 send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
             // Completion closes the subscription without waiting for final releases.
@@ -657,7 +657,7 @@ impl Responses {
             let scope = if scope.check().is_err() {
                 final_scope = RequestScope::new(
                     scope.request,
-                    uring_runtime::environment::now() + Duration::from_secs(1),
+                    racer_platform::environment::now() + Duration::from_secs(1),
                 )?;
                 &final_scope
             } else {
