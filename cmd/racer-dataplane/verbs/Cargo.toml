@@ -15,7 +15,7 @@ simulation = ["uring-runtime/simulation"]
 futures = "0.3"
 libc = "0.2"
 serde_json = "1"
-uring-runtime = { path = "../runtime" }
+uring-runtime = { package = "uring-runtime-legacy", path = "../runtime" }
 
 [dev-dependencies]
-uring-runtime = { path = "../runtime", features = ["simulation"] }
+uring-runtime = { package = "uring-runtime-legacy", path = "../runtime", features = ["simulation"] }

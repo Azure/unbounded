@@ -12,4 +12,4 @@ simulation = ["dep:uring-runtime", "uring-runtime/simulation"]
 
 [dependencies]
 libc = "0.2"
-uring-runtime = { path = "../runtime", optional = true }
+uring-runtime = { package = "uring-runtime-legacy", path = "../runtime", optional = true }

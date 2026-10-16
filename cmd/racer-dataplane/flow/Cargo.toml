@@ -14,4 +14,4 @@ futures = "0.3"
 libc = "0.2"
 zeroize = "1"
 page-alloc = { path = "../alloc" }
-uring-runtime = { path = "../runtime" }
+uring-runtime = { package = "uring-runtime-legacy", path = "../runtime" }

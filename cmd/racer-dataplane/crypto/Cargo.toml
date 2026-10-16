@@ -15,7 +15,7 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 racer-control-wire = { path = "../control-wire" }
-uring-runtime = { path = "../runtime" }
+uring-runtime = { package = "uring-runtime-legacy", path = "../runtime" }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 x509-parser = { version = "0.16", features = ["verify"] }
@@ -32,4 +32,4 @@ crc64fast = "1.1.0"
 
 [dev-dependencies]
 futures = "0.3"
-uring-runtime = { path = "../runtime", features = ["simulation"] }
+uring-runtime = { package = "uring-runtime-legacy", path = "../runtime", features = ["simulation"] }
