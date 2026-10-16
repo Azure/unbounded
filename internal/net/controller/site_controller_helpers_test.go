@@ -9,12 +9,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -712,6 +715,193 @@ func TestCreateOrUpdateSliceRepairsOwnerReferenceWithoutNodeChanges(t *testing.T
 	}
 }
 
+func TestUnchangedCachedSiteSliceReconcileUsesNoLiveAPIReads(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "site-a",
+			UID:        "site-a-uid",
+			Finalizers: []string{ProtectionFinalizer},
+		},
+		Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/24"}},
+		Status: unboundedv1alpha3.SiteStatus{
+			NodeCount:  1,
+			SliceCount: 1,
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "node-a",
+			Annotations: map[string]string{WireGuardPubKeyAnnotation: "key-a"},
+		},
+		Spec: corev1.NodeSpec{PodCIDRs: []string{"10.244.0.0/24"}},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type:    corev1.NodeInternalIP,
+			Address: "10.0.0.10",
+		}}},
+	}
+
+	sc := &SiteController{}
+	slice := sc.buildSliceObject(site, "site-a-0", 0, []interface{}{map[string]interface{}{
+		"name":               node.Name,
+		"wireGuardPublicKey": "key-a",
+		"internalIPs":        []interface{}{"10.0.0.10"},
+		"podCIDRs":           []interface{}{"10.244.0.0/24"},
+	}})
+	slice.SetResourceVersion("slice-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := sliceStore.Add(slice.DeepCopy()); err != nil {
+		t.Fatalf("add slice to cache: %v", err)
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(node); err != nil {
+		t.Fatalf("add node to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, site),
+		slice.DeepCopy(),
+	)
+	sc.dynamicClient = dynamicClient
+	sc.nodeLister = corev1listers.NewNodeLister(nodeIndexer)
+	sc.sliceInformer = &fakeInformer{store: sliceStore}
+	sc.sitesCache = []unboundedv1alpha3.Site{site}
+
+	sc.markSiteSlicesDirty(site.Name)
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("updateSiteSlicesIfDirty: %v", err)
+	}
+
+	if actions := dynamicClient.Actions(); len(actions) != 0 {
+		t.Fatalf("unchanged cache-synchronized reconcile made live API requests: %#v", actions)
+	}
+}
+
+func TestTargetedSiteSliceReconcileDoesNotReadOtherSite(t *testing.T) {
+	siteA := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "site-a-uid", Finalizers: []string{ProtectionFinalizer}},
+		Spec:       unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/24"}},
+		Status:     unboundedv1alpha3.SiteStatus{NodeCount: 1, SliceCount: 1},
+	}
+	siteB := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-b", UID: "site-b-uid", Finalizers: []string{ProtectionFinalizer}},
+		Spec:       unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/24"}},
+		Status:     unboundedv1alpha3.SiteStatus{NodeCount: 1, SliceCount: 1},
+	}
+
+	nodeA := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a", Annotations: map[string]string{WireGuardPubKeyAnnotation: "new-key"}},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type: corev1.NodeInternalIP, Address: "10.0.0.10",
+		}}},
+	}
+	nodeB := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-b"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type: corev1.NodeInternalIP, Address: "10.1.0.10",
+		}}},
+	}
+
+	builder := &SiteController{}
+	sliceA := builder.buildSliceObject(siteA, "site-a-0", 0, []interface{}{map[string]interface{}{
+		"name":               "node-a",
+		"wireGuardPublicKey": "old-key",
+		"internalIPs":        []interface{}{"10.0.0.10"},
+	}})
+	sliceA.SetResourceVersion("a-rv")
+
+	sliceB := builder.buildSliceObject(siteB, "site-b-0", 0, []interface{}{map[string]interface{}{
+		"name":        "node-b",
+		"internalIPs": []interface{}{"10.1.0.10"},
+	}})
+	sliceB.SetResourceVersion("b-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	for _, slice := range []*unstructured.Unstructured{sliceA, sliceB} {
+		if err := sliceStore.Add(slice.DeepCopy()); err != nil {
+			t.Fatalf("add slice %s to cache: %v", slice.GetName(), err)
+		}
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, node := range []*corev1.Node{nodeA, nodeB} {
+		if err := nodeIndexer.Add(node); err != nil {
+			t.Fatalf("add node %s to cache: %v", node.Name, err)
+		}
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, siteA),
+		siteUnstructured(t, siteB),
+		sliceA.DeepCopy(),
+		sliceB.DeepCopy(),
+	)
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		nodeLister:    corev1listers.NewNodeLister(nodeIndexer),
+		sliceInformer: &fakeInformer{store: sliceStore},
+		sitesCache:    []unboundedv1alpha3.Site{siteA, siteB},
+	}
+
+	sc.markSiteSlicesDirty(siteA.Name)
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("updateSiteSlicesIfDirty: %v", err)
+	}
+
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "list" {
+			t.Fatalf("targeted reconcile made cluster-wide list request: %#v", action)
+		}
+
+		switch typed := action.(type) {
+		case clienttesting.UpdateAction:
+			accessor, err := meta.Accessor(typed.GetObject())
+			if err != nil {
+				t.Fatalf("access updated object metadata: %v", err)
+			}
+
+			if accessor.GetName() == siteB.Name || accessor.GetName() == sliceB.GetName() {
+				t.Fatalf("targeted reconcile updated site-b: %#v", action)
+			}
+		case clienttesting.PatchAction:
+			if typed.GetName() == siteB.Name {
+				t.Fatalf("targeted reconcile patched site-b: %#v", action)
+			}
+		case clienttesting.GetAction:
+			if typed.GetName() == siteB.Name || typed.GetName() == sliceB.GetName() {
+				t.Fatalf("targeted reconcile read site-b: %#v", action)
+			}
+		}
+	}
+
+	gotB, err := dynamicClient.Tracker().Get(siteNodeSliceGVR, "", sliceB.GetName())
+	if err != nil {
+		t.Fatalf("get site-b slice from tracker: %v", err)
+	}
+
+	accessor, err := meta.Accessor(gotB)
+	if err != nil {
+		t.Fatalf("access site-b slice metadata: %v", err)
+	}
+
+	if accessor.GetResourceVersion() != "b-rv" {
+		t.Fatalf("site-b slice changed during site-a reconcile")
+	}
+}
+
 func TestCreateOrUpdateSliceGetsLiveObjectAfterConflict(t *testing.T) {
 	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "current-uid"}}
 	desired := (&SiteController{}).buildSliceObject(site, "site-a-0", 0, []interface{}{map[string]interface{}{"name": "node-a"}})
@@ -1240,6 +1430,195 @@ func TestCleanupOrphanSiteNodeSlicesRevalidatesSitesAndDeletePreconditions(t *te
 
 	if deleteActions != len(wantPreconditions) {
 		t.Fatalf("delete actions = %d, want %d", deleteActions, len(wantPreconditions))
+	}
+}
+
+func TestMalformedSliceEventsDirtyAllSites(t *testing.T) {
+	t.Parallel()
+
+	malformed := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": unboundednetv1alpha1.GroupVersion.String(),
+		"kind":       "SiteNodeSlice",
+		"metadata": map[string]interface{}{
+			"name": "site-a-0",
+		},
+		"siteName": "",
+	}}
+
+	tests := []struct {
+		name string
+		obj  interface{}
+	}{
+		{name: "update", obj: malformed},
+		{name: "delete", obj: cache.DeletedFinalStateUnknown{Key: malformed.GetName(), Obj: malformed}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sc := &SiteController{}
+			sc.markSliceObjectDirty(tt.obj)
+
+			work, ok := sc.takeSliceWork()
+			if !ok || !work.all {
+				t.Fatalf("slice work = %#v, available = %v, want all sites dirty", work, ok)
+			}
+		})
+	}
+}
+
+func TestCleanupMalformedSliceSchedulesReconstruction(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		TypeMeta: metav1.TypeMeta{APIVersion: unboundedv1alpha3.GroupVersion.String(), Kind: "Site"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "site-a",
+			UID:        "site-uid",
+			Finalizers: []string{ProtectionFinalizer},
+		},
+		Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/24"}},
+	}
+	malformed := (&SiteController{}).buildSliceObject(site, "site-a-0", 0, nil)
+	malformed.Object["siteName"] = ""
+	malformed.SetUID("slice-uid")
+	malformed.SetResourceVersion("slice-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := sliceStore.Add(malformed.DeepCopy()); err != nil {
+		t.Fatalf("add malformed slice to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, site),
+		malformed.DeepCopy(),
+	)
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type:    corev1.NodeInternalIP,
+			Address: "10.0.0.10",
+		}}},
+	}); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		nodeLister:    corev1listers.NewNodeLister(nodeIndexer),
+		sliceInformer: &fakeInformer{store: sliceStore},
+		sitesCache:    []unboundedv1alpha3.Site{site},
+	}
+
+	if err := sc.cleanupOrphanSiteNodeSlices(context.Background()); err != nil {
+		t.Fatalf("cleanup malformed slice: %v", err)
+	}
+
+	if !sc.slicesDirty.Load() {
+		t.Fatalf("cleanup did not schedule slice reconstruction")
+	}
+
+	dynamicClient.ClearActions()
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("reconstruct slices: %v", err)
+	}
+
+	reconstructed, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), malformed.GetName(), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get reconstructed slice: %v", err)
+	}
+
+	if got, found, err := unstructured.NestedString(reconstructed.Object, "siteName"); err != nil || !found || got != site.Name {
+		t.Fatalf("reconstructed siteName = %q, found = %v, err = %v", got, found, err)
+	}
+
+	nodes, found, err := unstructured.NestedSlice(reconstructed.Object, "nodes")
+	if err != nil || !found || len(nodes) != 1 {
+		t.Fatalf("reconstructed nodes = %#v, found = %v, err = %v", nodes, found, err)
+	}
+}
+
+func TestTopologyReconcileDefersOrphanRepair(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "site-uid"},
+		Status:     unboundedv1alpha3.SiteStatus{},
+	}
+	orphan := (&SiteController{}).buildSliceObject(site, "orphan-0", 0, nil)
+	orphan.Object["siteName"] = ""
+	orphan.SetUID("orphan-uid")
+	orphan.SetResourceVersion("orphan-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := sliceStore.Add(orphan.DeepCopy()); err != nil {
+		t.Fatalf("add orphan to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, site),
+		orphan.DeepCopy(),
+	)
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		nodeLister:    corev1listers.NewNodeLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+		sliceInformer: &fakeInformer{store: sliceStore},
+		sitesCache:    []unboundedv1alpha3.Site{site},
+	}
+
+	sc.markSlicesDirty()
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("topology reconcile: %v", err)
+	}
+
+	if _, err := dynamicClient.Tracker().Get(siteNodeSliceGVR, "", orphan.GetName()); err != nil {
+		t.Fatalf("topology reconcile deleted orphan before periodic repair: %v", err)
+	}
+
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "list" {
+			t.Fatalf("topology reconcile performed cluster-wide orphan list: %#v", action)
+		}
+	}
+
+	dynamicClient.ClearActions()
+
+	if err := sc.repairOrphanSiteNodeSlices(context.Background()); err != nil {
+		t.Fatalf("periodic orphan repair: %v", err)
+	}
+
+	if _, err := dynamicClient.Tracker().Get(siteNodeSliceGVR, "", orphan.GetName()); !apierrors.IsNotFound(err) {
+		t.Fatalf("periodic orphan repair left orphan present: %v", err)
+	}
+
+	sawSiteList := false
+	sawDelete := false
+
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "list" && action.GetResource() == siteGVR {
+			sawSiteList = true
+		}
+
+		if action.GetVerb() == "delete" && action.GetResource() == siteNodeSliceGVR {
+			sawDelete = true
+		}
+	}
+
+	if !sawSiteList || !sawDelete {
+		t.Fatalf("periodic orphan repair actions = %#v, want Site LIST and slice DELETE", dynamicClient.Actions())
 	}
 }
 
@@ -1999,5 +2378,116 @@ func waitForSlicesDirty(t *testing.T, ctx context.Context, sc *SiteController) {
 	})
 	if err != nil {
 		t.Fatalf("SiteNodeSlice event did not mark slices dirty: %v", err)
+	}
+}
+
+func sliceWorkSites(t *testing.T, sc *SiteController) []string {
+	t.Helper()
+
+	work, ok := sc.takeSliceWork()
+	if !ok || work.all {
+		t.Fatalf("slice work = %#v, available = %v, want targeted Sites", work, ok)
+	}
+
+	sites := make([]string, 0, len(work.sites))
+	for site := range work.sites {
+		sites = append(sites, site)
+	}
+
+	sort.Strings(sites)
+
+	return sites
+}
+
+func newIPMatchedSliceTestController() *SiteController {
+	return &SiteController{
+		workqueue: workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		sitesCache: []unboundedv1alpha3.Site{
+			{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}}},
+		},
+		pendingPodCIDRs: make(map[string]*pendingPodCIDRAssignment),
+	}
+}
+
+func sliceTestNode(ip string, labels map[string]string) *corev1.Node {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", UID: "node-uid", Labels: labels}}
+	if ip != "" {
+		node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ip}}
+	}
+
+	return node
+}
+
+func TestNodeUpdateDirtiesIPMatchedSites(t *testing.T) {
+	t.Parallel()
+
+	sc := newIPMatchedSliceTestController()
+	defer sc.workqueue.ShutDown()
+
+	sc.handleNodeUpdate(sliceTestNode("10.1.0.5", nil), sliceTestNode("10.2.0.5", nil))
+
+	if got, want := sliceWorkSites(t, sc), []string{"site-a", "site-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirty Sites = %v, want %v", got, want)
+	}
+}
+
+func TestNodeUpdateLosingAddressDirtiesPreviousSite(t *testing.T) {
+	t.Parallel()
+
+	sc := newIPMatchedSliceTestController()
+	defer sc.workqueue.ShutDown()
+
+	sc.handleNodeUpdate(sliceTestNode("10.1.0.5", nil), sliceTestNode("", nil))
+
+	if got, want := sliceWorkSites(t, sc), []string{"site-a"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirty Sites = %v, want %v", got, want)
+	}
+}
+
+func TestNodeDeleteDirtiesIPMatchedAndLabeledSites(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		obj  interface{}
+	}{
+		{name: "delete", obj: sliceTestNode("10.1.0.5", map[string]string{canonicalSiteLabelKey: "site-b"})},
+		{name: "tombstone", obj: cache.DeletedFinalStateUnknown{Key: "node-1", Obj: sliceTestNode("10.1.0.5", map[string]string{canonicalSiteLabelKey: "site-b"})}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sc := newIPMatchedSliceTestController()
+			defer sc.workqueue.ShutDown()
+
+			sc.handleNodeDelete(tt.obj)
+
+			if got, want := sliceWorkSites(t, sc), []string{"site-a", "site-b"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("dirty Sites = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestSliceSiteNameChangeDirtiesBothSites(t *testing.T) {
+	t.Parallel()
+
+	slice := func(siteName string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": unboundednetv1alpha1.GroupVersion.String(),
+			"kind":       "SiteNodeSlice",
+			"metadata":   map[string]interface{}{"name": "site-a-0"},
+			"siteName":   siteName,
+		}}
+	}
+
+	sc := &SiteController{}
+	sc.handleSliceUpdate(slice("site-a"), slice("site-b"))
+
+	if got, want := sliceWorkSites(t, sc), []string{"site-a", "site-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirty Sites = %v, want %v", got, want)
 	}
 }

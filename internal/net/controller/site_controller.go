@@ -43,6 +43,8 @@ import (
 )
 
 const (
+	orphanSliceRepairInterval = 10 * time.Minute
+
 	// canonicalSiteLabelKey is the canonical site-membership label the
 	// controller applies to Nodes (shared with the Machine site label). It
 	// supersedes deprecatedSiteLabelKey.
@@ -159,6 +161,11 @@ type SiteController struct {
 	// slicesDirty is set when node or slice state changes. The periodic loop
 	// atomically consumes it to coalesce updates and restores it after failures.
 	slicesDirty atomic.Bool
+	// sliceDirtySites limits ordinary slice reconciliation to affected Sites.
+	// allSlicesDirty is reserved for changes with cluster-wide matching effects.
+	sliceDirtyLock  sync.Mutex
+	sliceDirtySites map[string]struct{}
+	allSlicesDirty  bool
 
 	// hasSynced indicates whether the informer caches have completed initial sync
 	hasSynced atomic.Bool
@@ -258,6 +265,7 @@ func NewSiteController(
 		workqueue:            workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "Sites"}),
 		assignmentAllocators: make(map[string]*assignmentAllocator),
 		loggedNoSiteNodes:    make(map[string]struct{}),
+		sliceDirtySites:      make(map[string]struct{}),
 		ready:                make(chan struct{}),
 	}
 
@@ -266,46 +274,8 @@ func NewSiteController(
 		AddFunc: func(obj interface{}) {
 			sc.enqueueNode(obj)
 		},
-		UpdateFunc: func(old, new interface{}) {
-			oldNode := old.(*corev1.Node) //nolint:errcheck
-			newNode := new.(*corev1.Node) //nolint:errcheck
-			// Re-process if addresses changed, site label changed, WireGuard pubkey changed, or podCIDRs changed
-			if !nodeAddressesEqual(oldNode, newNode) ||
-				getNodeSiteLabel(oldNode) != getNodeSiteLabel(newNode) ||
-				getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
-				!labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels)) ||
-				oldNode.Spec.PodCIDR != newNode.Spec.PodCIDR ||
-				!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
-				sc.enqueueNode(new)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			var node *corev1.Node
-
-			switch t := obj.(type) {
-			case *corev1.Node:
-				node = t
-			case cache.DeletedFinalStateUnknown:
-				var ok bool
-
-				node, ok = t.Obj.(*corev1.Node)
-				if !ok {
-					klog.Errorf("DeletedFinalStateUnknown contained non-Node object: %#v", t.Obj)
-					sc.enqueueSiteChange()
-
-					return
-				}
-			default:
-				klog.Errorf("Delete event contained non-Node object: %#v", obj)
-				sc.enqueueSiteChange()
-
-				return
-			}
-
-			sc.releaseNodeCIDRs(node)
-			sc.markSlicesDirty()
-			sc.enqueueSiteChange()
-		},
+		UpdateFunc: sc.handleNodeUpdate,
+		DeleteFunc: sc.handleNodeDelete,
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add node event handler: %w", err)
 	}
@@ -330,13 +300,11 @@ func NewSiteController(
 	// own writes may trigger one redundant pass, which is harmless.
 	if _, err := sliceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			sc.markSlicesDirty()
+			sc.markSliceObjectDirty(obj)
 		},
-		UpdateFunc: func(old, new interface{}) {
-			sc.markSlicesDirty()
-		},
+		UpdateFunc: sc.handleSliceUpdate,
 		DeleteFunc: func(obj interface{}) {
-			sc.markSlicesDirty()
+			sc.markSliceObjectDirty(obj)
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add site node slice event handler: %w", err)
@@ -935,6 +903,14 @@ func (sc *SiteController) Run(ctx context.Context, workers int) error {
 		}
 	}, 5*time.Second)
 
+	// Orphan detection requires authoritative cluster-wide reads. Keep it off
+	// the topology event path and run it as a low-frequency repair instead.
+	go wait.UntilWithContext(ctx, func(ctx context.Context) {
+		if err := sc.repairOrphanSiteNodeSlices(ctx); err != nil {
+			klog.Errorf("Failed to repair orphan SiteNodeSlices: %v", err)
+		}
+	}, orphanSliceRepairInterval)
+
 	sc.readyOnce.Do(func() { close(sc.ready) })
 	klog.Info("Site controller started")
 	<-ctx.Done()
@@ -1020,7 +996,7 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 			return err
 		}
 
-		sc.markSlicesDirty()
+		sc.markSiteSlicesDirty(currentSite, siteName)
 
 		return nil
 	}
@@ -1051,7 +1027,7 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 			klog.Infof("Removed site label from node %s", node.Name)
 		}
 
-		sc.markSlicesDirty()
+		sc.markSiteSlicesDirty(currentSite, siteName)
 	}
 
 	if needsCIDRs {
@@ -1069,7 +1045,7 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 	// includes the node's WireGuard public key and other fields that may
 	// have changed without a label or CIDR change.
 	if siteName != "" {
-		sc.markSlicesDirty()
+		sc.markSiteSlicesDirty(currentSite, siteName)
 	}
 
 	return nil
@@ -1091,12 +1067,13 @@ func (sc *SiteController) reconcileAllNodes(_ context.Context) {
 // updateSiteSlicesIfDirty updates slices after atomically consuming the dirty
 // flag. A failed pass restores the flag so the periodic loop retries it.
 func (sc *SiteController) updateSiteSlicesIfDirty(ctx context.Context) error {
-	if !sc.slicesDirty.CompareAndSwap(true, false) {
+	work, ok := sc.takeSliceWork()
+	if !ok {
 		return nil
 	}
 
-	if err := sc.updateAllSiteSlices(ctx); err != nil {
-		sc.markSlicesDirty()
+	if err := sc.updateSiteSlicesForWork(ctx, work); err != nil {
+		sc.restoreSliceWork(work)
 
 		return err
 	}
@@ -1106,6 +1083,15 @@ func (sc *SiteController) updateSiteSlicesIfDirty(ctx context.Context) error {
 
 // updateAllSiteSlices updates the SiteNodeSlice objects for all sites
 func (sc *SiteController) updateAllSiteSlices(ctx context.Context) error {
+	return sc.updateSiteSlicesForWork(ctx, sliceWork{all: true})
+}
+
+type sliceWork struct {
+	all   bool
+	sites map[string]struct{}
+}
+
+func (sc *SiteController) updateSiteSlicesForWork(ctx context.Context, work sliceWork) error {
 	// Ensure only one slice update runs at a time to prevent conflicts
 	sc.sliceUpdateLock.Lock()
 	defer sc.sliceUpdateLock.Unlock()
@@ -1114,40 +1100,28 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) error {
 	cachedSites := append([]unboundedv1alpha3.Site(nil), sc.sitesCache...)
 	sc.sitesCacheLock.RUnlock()
 
-	// Continue converging independent resources, but return every error so the
-	// periodic loop schedules another pass.
-	var updateErrors []error
-
-	if err := sc.cleanupOrphanSiteNodeSlices(ctx); err != nil {
-		updateErrors = append(updateErrors, fmt.Errorf("clean up orphan site node slices: %w", err))
-	}
-
-	// Never use an informer-cached Site as a mutation input. Besides protecting
-	// against stale fields, the UID check prevents a delete/recreate with the
-	// same name from receiving writes intended for the deleted Site.
-	sites := make([]unboundedv1alpha3.Site, 0, len(cachedSites))
-
-	for _, cachedSite := range cachedSites {
-		liveSite, err := sc.getLiveSiteWithUID(ctx, cachedSite.Name, cachedSite.UID)
-		if err != nil {
-			updateErrors = append(updateErrors, fmt.Errorf("site %s: %w", cachedSite.Name, err))
-
-			continue
+	sites := cachedSites
+	if !work.all {
+		sites = make([]unboundedv1alpha3.Site, 0, len(work.sites))
+		for _, site := range cachedSites {
+			if _, dirty := work.sites[site.Name]; dirty {
+				sites = append(sites, site)
+			}
 		}
-
-		sites = append(sites, liveSite)
 	}
 
 	if len(sites) == 0 {
-		return errors.Join(updateErrors...)
+		return nil
 	}
 
 	nodes, err := sc.nodeLister.List(labels.Everything())
 	if err != nil {
-		updateErrors = append(updateErrors, fmt.Errorf("failed to list nodes for slice update: %w", err))
-
-		return errors.Join(updateErrors...)
+		return fmt.Errorf("failed to list nodes for slice update: %w", err)
 	}
+
+	// Site matching remains global even for targeted output because CIDR ranges
+	// from every Site participate in deciding which Site owns a Node.
+	allSites := cachedSites
 
 	// Track which nodes belong to each site
 	// Gateway nodes are excluded - they are accessed via GatewayPool.Status.Nodes instead
@@ -1159,8 +1133,8 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) error {
 			continue
 		}
 
-		siteName := sc.findSiteForNode(node, sites)
-		if siteName != "" {
+		siteName := sc.findSiteForNode(node, allSites)
+		if _, dirty := work.sites[siteName]; siteName != "" && (work.all || dirty) {
 			nodeInfo := sc.buildNodeInfo(node)
 			siteNodesInfo[siteName] = append(siteNodesInfo[siteName], nodeInfo)
 		}
@@ -1172,11 +1146,15 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) error {
 	allSiteNodeCounts := make(map[string]int)
 
 	for _, node := range nodes {
-		siteName := sc.findSiteForNode(node, sites)
-		if siteName != "" {
+		siteName := sc.findSiteForNode(node, allSites)
+		if _, dirty := work.sites[siteName]; siteName != "" && (work.all || dirty) {
 			allSiteNodeCounts[siteName]++
 		}
 	}
+
+	// Continue converging independent resources, but return every error so the
+	// periodic loop schedules another pass.
+	var updateErrors []error
 
 	for _, site := range sites {
 		nodesInfo := siteNodesInfo[site.Name]
@@ -1195,10 +1173,12 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) error {
 	for _, site := range sites {
 		nodeCount := allSiteNodeCounts[site.Name]
 		if nodeCount > 0 {
-			if err := ensureFinalizer(ctx, sc.dynamicClient, siteGVR, site.Name, site.Finalizers, site.UID); err != nil {
-				updateErrors = append(updateErrors, fmt.Errorf("site %s protection finalizer: %w", site.Name, err))
+			if !containsFinalizer(site.Finalizers, ProtectionFinalizer) {
+				if err := ensureFinalizer(ctx, sc.dynamicClient, siteGVR, site.Name, site.Finalizers, site.UID); err != nil {
+					updateErrors = append(updateErrors, fmt.Errorf("site %s protection finalizer: %w", site.Name, err))
+				}
 			}
-		} else {
+		} else if containsFinalizer(site.Finalizers, ProtectionFinalizer) {
 			if err := removeFinalizer(ctx, sc.dynamicClient, siteGVR, site.Name, site.Finalizers, site.UID); err != nil {
 				updateErrors = append(updateErrors, fmt.Errorf("site %s protection finalizer: %w", site.Name, err))
 			}
@@ -1215,13 +1195,6 @@ func (sc *SiteController) updateSiteSlices(
 	nodesInfo []unboundednetv1alpha1.NodeInfo,
 	allNodeCount int,
 ) error {
-	var err error
-
-	site, err = sc.getLiveSiteWithUID(ctx, site.Name, site.UID)
-	if err != nil {
-		return err
-	}
-
 	// Calculate how many slices we need
 	numSlices := (len(nodesInfo) + unboundednetv1alpha1.MaxNodesPerSlice - 1) / unboundednetv1alpha1.MaxNodesPerSlice
 	if numSlices == 0 {
@@ -1463,10 +1436,22 @@ func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error
 		// source is confirmed healthy and non-empty, so this is a genuine orphan.
 		if err := deleteLiveSiteNodeSlice(ctx, resource, liveSlice); err != nil && !apierrors.IsNotFound(err) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete orphan slice %s: %w", name, err))
+		} else if !found || siteName == "" {
+			// The malformed object may occupy the deterministic name of a
+			// valid slice. Rebuild all sites after deleting it because there is
+			// no trustworthy siteName with which to scope the work.
+			sc.markSlicesDirty()
 		}
 	}
 
 	return errors.Join(cleanupErrors...)
+}
+
+func (sc *SiteController) repairOrphanSiteNodeSlices(ctx context.Context) error {
+	sc.sliceUpdateLock.Lock()
+	defer sc.sliceUpdateLock.Unlock()
+
+	return sc.cleanupOrphanSiteNodeSlices(ctx)
 }
 
 // legacySiteExists reports whether a pre-migration net-group Site with the given
@@ -1525,6 +1510,12 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 	}
 
 	resource := sc.dynamicClient.Resource(siteNodeSliceGVR)
+
+	desired := sc.buildSliceObject(site, sliceName, sliceIndex, nodesData)
+	if cached, ok := sc.cachedSlice(sliceName); ok && sc.sliceMatchesDesired(cached, desired, site) {
+		return nil
+	}
+
 	backoff := wait.Backoff{
 		Duration: 100 * time.Millisecond,
 		Factor:   2,
@@ -1532,8 +1523,8 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 	}
 
 	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
-		// Always read directly from the API. The informer may remain stale after
-		// an AlreadyExists or Conflict response.
+		// Once cached state differs, use live state for every mutation attempt.
+		// The informer may remain stale after an AlreadyExists or Conflict.
 		existing, err := resource.Get(ctx, sliceName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			liveSite, siteErr := sc.getLiveSiteWithUID(ctx, site.Name, site.UID)
@@ -1542,7 +1533,7 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 			}
 
 			// Create new slice
-			desired := sc.buildSliceObject(liveSite, sliceName, sliceIndex, nodesData)
+			desired = sc.buildSliceObject(liveSite, sliceName, sliceIndex, nodesData)
 
 			_, err = resource.Create(ctx, desired, metav1.CreateOptions{})
 			if err != nil {
@@ -1564,26 +1555,16 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 			return false, fmt.Errorf("failed to get slice %s: %w", sliceName, err)
 		}
 
+		if sc.sliceMatchesDesired(existing, desired, site) {
+			return true, nil
+		}
+
 		liveSite, err := sc.getLiveSiteWithUID(ctx, site.Name, site.UID)
 		if err != nil {
 			return false, err
 		}
 
-		desired := sc.buildSliceObject(liveSite, sliceName, sliceIndex, nodesData)
-
-		// Check if update is needed
-		existingNodes, _, _ := unstructured.NestedSlice(existing.Object, "nodes")                         //nolint:errcheck
-		existingNodeCount, foundNodeCount, _ := unstructured.NestedInt64(existing.Object, "nodeCount")    //nolint:errcheck
-		existingSiteName, foundSiteName, _ := unstructured.NestedString(existing.Object, "siteName")      //nolint:errcheck
-		existingSliceIndex, foundSliceIndex, _ := unstructured.NestedInt64(existing.Object, "sliceIndex") //nolint:errcheck
-
-		if sc.sliceNodesEqual(existingNodes, nodesData) &&
-			foundNodeCount && existingNodeCount == int64(len(nodesData)) &&
-			foundSiteName && existingSiteName == liveSite.Name &&
-			foundSliceIndex && existingSliceIndex == int64(sliceIndex) &&
-			hasExactSiteOwnerReference(existing.GetOwnerReferences(), liveSite) {
-			return true, nil
-		}
+		desired = sc.buildSliceObject(liveSite, sliceName, sliceIndex, nodesData)
 
 		// Mutate a copy of the live object so labels, annotations, finalizers,
 		// and metadata owned by other actors survive this update.
@@ -1618,6 +1599,64 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 	}
 
 	return nil
+}
+
+func (sc *SiteController) cachedSlice(name string) (*unstructured.Unstructured, bool) {
+	if sc.sliceInformer == nil {
+		return nil, false
+	}
+
+	item, exists, err := sc.sliceInformer.GetStore().GetByKey(name)
+	if err != nil || !exists {
+		return nil, false
+	}
+
+	slice, ok := item.(*unstructured.Unstructured)
+
+	return slice, ok
+}
+
+func (sc *SiteController) sliceMatchesDesired(existing, desired *unstructured.Unstructured, site unboundedv1alpha3.Site) bool {
+	existingNodes, foundNodes, err := unstructured.NestedSlice(existing.Object, "nodes")
+	if err != nil || !foundNodes {
+		return false
+	}
+
+	desiredNodes, foundDesiredNodes, err := unstructured.NestedSlice(desired.Object, "nodes")
+	if err != nil || !foundDesiredNodes {
+		return false
+	}
+
+	existingNodeCount, foundNodeCount, err := unstructured.NestedInt64(existing.Object, "nodeCount")
+	if err != nil {
+		return false
+	}
+
+	desiredNodeCount, foundDesiredNodeCount, err := unstructured.NestedInt64(desired.Object, "nodeCount")
+	if err != nil || !foundDesiredNodeCount {
+		return false
+	}
+
+	existingSiteName, foundSiteName, err := unstructured.NestedString(existing.Object, "siteName")
+	if err != nil {
+		return false
+	}
+
+	existingSliceIndex, foundSliceIndex, err := unstructured.NestedInt64(existing.Object, "sliceIndex")
+	if err != nil {
+		return false
+	}
+
+	desiredSliceIndex, foundDesiredSliceIndex, err := unstructured.NestedInt64(desired.Object, "sliceIndex")
+	if err != nil || !foundDesiredSliceIndex {
+		return false
+	}
+
+	return sc.sliceNodesEqual(existingNodes, desiredNodes) &&
+		foundNodeCount && existingNodeCount == desiredNodeCount &&
+		foundSiteName && existingSiteName == site.Name &&
+		foundSliceIndex && existingSliceIndex == desiredSliceIndex &&
+		hasExactSiteOwnerReference(existing.GetOwnerReferences(), site)
 }
 
 func stringSliceToInterfaceSlice(values []string) []interface{} {
@@ -1773,6 +1812,10 @@ func (sc *SiteController) updateSiteStatusIfChanged(ctx context.Context, site un
 	// Always update gauges so they reflect the latest state.
 	SiteNodesGauge.WithLabelValues(site.Name).Set(float64(nodeCount))
 	SiteNodeSlicesGauge.WithLabelValues(site.Name).Set(float64(sliceCount))
+
+	if site.Status.NodeCount == nodeCount && site.Status.SliceCount == sliceCount {
+		return nil
+	}
 
 	backoff := wait.Backoff{
 		Duration: 50 * time.Millisecond,
@@ -2596,6 +2639,150 @@ func (sc *SiteController) validateSiteSnapshot(sites []unboundedv1alpha3.Site) e
 
 // markSlicesDirty signals that SiteNodeSlice objects need rebuilding.
 func (sc *SiteController) markSlicesDirty() {
+	sc.sliceDirtyLock.Lock()
+	sc.allSlicesDirty = true
+	clear(sc.sliceDirtySites)
+	sc.sliceDirtyLock.Unlock()
+	sc.slicesDirty.Store(true)
+}
+
+func (sc *SiteController) markSiteSlicesDirty(siteNames ...string) {
+	sc.sliceDirtyLock.Lock()
+
+	if !sc.allSlicesDirty {
+		if sc.sliceDirtySites == nil {
+			sc.sliceDirtySites = make(map[string]struct{})
+		}
+
+		for _, siteName := range siteNames {
+			if siteName != "" {
+				sc.sliceDirtySites[siteName] = struct{}{}
+			}
+		}
+	}
+
+	hasWork := sc.allSlicesDirty || len(sc.sliceDirtySites) > 0
+	sc.sliceDirtyLock.Unlock()
+
+	if hasWork {
+		sc.slicesDirty.Store(true)
+	}
+}
+
+func (sc *SiteController) handleNodeUpdate(old, new interface{}) {
+	oldNode := old.(*corev1.Node) //nolint:errcheck
+	newNode := new.(*corev1.Node) //nolint:errcheck
+	// Re-process if addresses changed, site label changed, WireGuard pubkey changed, or podCIDRs changed
+	if !nodeAddressesEqual(oldNode, newNode) ||
+		getNodeSiteLabel(oldNode) != getNodeSiteLabel(newNode) ||
+		getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
+		!labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels)) ||
+		oldNode.Spec.PodCIDR != newNode.Spec.PodCIDR ||
+		!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
+		sc.markSiteSlicesDirty(append(sc.nodeSliceSites(oldNode), sc.nodeSliceSites(newNode)...)...)
+		sc.enqueueNode(new)
+	}
+}
+
+func (sc *SiteController) handleNodeDelete(obj interface{}) {
+	var node *corev1.Node
+
+	switch t := obj.(type) {
+	case *corev1.Node:
+		node = t
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+
+		node, ok = t.Obj.(*corev1.Node)
+		if !ok {
+			klog.Errorf("DeletedFinalStateUnknown contained non-Node object: %#v", t.Obj)
+			sc.enqueueSiteChange()
+
+			return
+		}
+	default:
+		klog.Errorf("Delete event contained non-Node object: %#v", obj)
+		sc.enqueueSiteChange()
+
+		return
+	}
+
+	sc.releaseNodeCIDRs(node)
+	sc.markSiteSlicesDirty(sc.nodeSliceSites(node)...)
+}
+
+// handleSliceUpdate dirties both Sites when a slice's siteName changes, so the
+// original Site can repair a slice that the new Site deletes as extra.
+func (sc *SiteController) handleSliceUpdate(old, new interface{}) {
+	sc.markSliceObjectDirty(old)
+	sc.markSliceObjectDirty(new)
+}
+
+// nodeSliceSites returns the Sites whose slices may include node. Membership
+// is IP-derived, while the label may lag or disagree, so both are returned.
+func (sc *SiteController) nodeSliceSites(node *corev1.Node) []string {
+	return []string{getNodeSiteLabel(node), sc.GetSiteForNode(node)}
+}
+
+func (sc *SiteController) markSliceObjectDirty(obj interface{}) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+
+	slice, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		sc.markSlicesDirty()
+
+		return
+	}
+
+	siteName, found, err := unstructured.NestedString(slice.Object, "siteName")
+	if err != nil || !found || siteName == "" {
+		// A malformed object may occupy a valid slice name, and its deletion
+		// may be the only event that allows reconstruction.
+		sc.markSlicesDirty()
+
+		return
+	}
+
+	sc.markSiteSlicesDirty(siteName)
+}
+
+func (sc *SiteController) takeSliceWork() (sliceWork, bool) {
+	if !sc.slicesDirty.CompareAndSwap(true, false) {
+		return sliceWork{}, false
+	}
+
+	sc.sliceDirtyLock.Lock()
+	defer sc.sliceDirtyLock.Unlock()
+
+	work := sliceWork{
+		all:   sc.allSlicesDirty,
+		sites: sc.sliceDirtySites,
+	}
+	sc.allSlicesDirty = false
+	sc.sliceDirtySites = make(map[string]struct{})
+
+	return work, work.all || len(work.sites) > 0
+}
+
+func (sc *SiteController) restoreSliceWork(work sliceWork) {
+	sc.sliceDirtyLock.Lock()
+
+	if work.all {
+		sc.allSlicesDirty = true
+		clear(sc.sliceDirtySites)
+	} else if !sc.allSlicesDirty {
+		if sc.sliceDirtySites == nil {
+			sc.sliceDirtySites = make(map[string]struct{})
+		}
+
+		for siteName := range work.sites {
+			sc.sliceDirtySites[siteName] = struct{}{}
+		}
+	}
+
+	sc.sliceDirtyLock.Unlock()
 	sc.slicesDirty.Store(true)
 }
 
