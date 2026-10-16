@@ -1,9 +1,9 @@
 //! A manually advanced, seeded clock.
 //!
 //! [`SimClock`] never reads host time after construction. Time moves only when
-//! a test calls [`advance`](SimClock::advance) (or a `SimBackend` configured
-//! with `set_auto_advance` jumps to the
-//! next timer deadline), so a program driven by the same seed observes the
+//! a test calls [`advance`](SimClock::advance) (or a [`SimBackend`](crate::SimBackend) configured
+//! with [`set_auto_advance`](crate::SimBackend::set_auto_advance) jumps to
+//! the next timer deadline), so a program driven by the same seed observes the
 //! same instants on every run.
 //!
 //! The clock is `Send + Sync` so one world clock can be shared by simulated
