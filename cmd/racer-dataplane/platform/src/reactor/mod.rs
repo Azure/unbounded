@@ -43,10 +43,10 @@ pub mod descriptor;
 pub mod ready_set;
 #[cfg(test)]
 mod scripted;
-#[cfg(test)]
-pub(crate) mod tests;
 #[cfg(all(test, feature = "simulation"))]
 mod sim_tests;
+#[cfg(test)]
+pub(crate) mod tests;
 pub mod timer;
 
 pub use backend::{RacerBackend, RacerClock, RacerEntropy};
