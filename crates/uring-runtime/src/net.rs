@@ -24,8 +24,11 @@ use crate::{Error, ErrorKind, Result};
 ///
 /// Abstract Unix addresses are not supported. An unnamed Unix socket (for
 /// example the peer of a `socketpair`) is represented by an empty path.
+///
+/// Addresses are totally ordered (Internet before Unix, then by address) so
+/// they can key ordered maps such as connection pools.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum SocketAddress {
     /// An IPv4 or IPv6 address.
     Inet(SocketAddr),
@@ -299,6 +302,16 @@ impl fmt::Debug for SockAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addresses_are_totally_ordered() {
+        let v4: SocketAddress = "127.0.0.1:80".parse::<SocketAddr>().unwrap().into();
+        let v4_high: SocketAddress = "127.0.0.1:81".parse::<SocketAddr>().unwrap().into();
+        let unix = SocketAddress::Unix(PathBuf::from("/a"));
+        let mut addresses = vec![unix.clone(), v4_high.clone(), v4.clone()];
+        addresses.sort();
+        assert_eq!(addresses, [v4, v4_high, unix]);
+    }
 
     fn round_trip(address: SocketAddress) {
         let encoded = SockAddr::encode(&address).unwrap();
