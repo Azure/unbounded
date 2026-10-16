@@ -228,9 +228,9 @@ pub mod rest {
     };
 
     /// Owner-local future carrying the caller's transport error type.
-    pub use uring_runtime::Operation;
+    pub use racer_platform::Operation;
 
-    use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
+    use racer_platform::{reactor::descriptor::Descriptor, scope::LibraryScope as _};
 
     /// Transport failures contain no credentials, headers, or body bytes.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,7 +261,11 @@ pub mod rest {
     pub type Result<T, E = Error> = std::result::Result<T, E>;
 
     /// Narrowing must preserve cancellation and all caller policy, never extend time.
-    pub trait Scope: uring_runtime::Scope {
+    ///
+    /// Implementations should also report the same instant from the library
+    /// [`LibraryScope::deadline`](racer_platform::scope::LibraryScope::deadline)
+    /// so runtime operations observe it.
+    pub trait Scope: racer_platform::Scope {
         /// Return the caller's absolute monotonic deadline.
         fn deadline(&self) -> Instant;
 
@@ -273,7 +277,7 @@ pub mod rest {
     /// including cancellation cleanup. Futures run on the caller's sole I/O owner.
     pub trait Io: 'static {
         /// Caller errors preserve cancellation and transport failure classification.
-        type Error: Copy + Send + PartialEq + From<Error> + From<uring_runtime::Error> + 'static;
+        type Error: Copy + Send + PartialEq + From<Error> + From<racer_platform::Error> + 'static;
 
         /// Caller policy governing each I/O operation.
         type Scope: Scope<Error = Self::Error>;
@@ -609,7 +613,7 @@ pub mod rest {
         ) -> Operation<'a, Connection<I>, I::Error> {
             Box::pin(async move {
                 scope.check()?;
-                if identity.is_some_and(|i| uring_runtime::environment::wall_now() >= i.expires) {
+                if identity.is_some_and(|i| racer_platform::environment::wall_now() >= i.expires) {
                     return Err(Error::Unauthorized.into());
                 }
                 let endpoint = endpoint(&self.config.url)?;
@@ -673,7 +677,7 @@ pub mod rest {
                 && auth.epoch == epoch
                 && auth.owner.upgrade().is_some()
                 && connection.within_max_age()
-                && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
+                && racer_platform::environment::now().saturating_duration_since(auth.idle_since)
                     < Duration::from_secs(20)
                 && connection.check(scope).is_ok()
             {
@@ -694,15 +698,15 @@ pub mod rest {
                 return Ok(Authentication::Bootstrap);
             };
             let mut random = [0; 8];
-            uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+            racer_platform::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
             let retire_at =
-                uring_runtime::environment::now() + authenticated_age(u64::from_ne_bytes(random));
+                racer_platform::environment::now() + authenticated_age(u64::from_ne_bytes(random));
             Ok(Authentication::Authenticated(Authenticated {
                 expires: identity.expires,
                 epoch,
                 idle: Rc::downgrade(&self.idle),
                 owner,
-                idle_since: uring_runtime::environment::now(),
+                idle_since: racer_platform::environment::now(),
                 retire_at,
             }))
         }
@@ -730,14 +734,15 @@ pub mod rest {
             scope.check()?;
             // Reserve a share for every remaining address and one for TLS. A local
             // blackhole must not consume the parent's entire connection deadline.
-            let now = uring_runtime::environment::now();
-            let share = scope.deadline().saturating_duration_since(now)
+            let now = racer_platform::environment::now();
+            let share = Scope::deadline(scope).saturating_duration_since(now)
                 / (addresses.len() - index + 1) as u32;
             let attempt = scope.narrowed(now + share.min(Duration::from_secs(5)));
             let charge = io.lease()?;
             #[cfg(feature = "simulation")]
-            if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-                if let Ok(fd) = sim.connect(uring_runtime::reactor::SocketAddress::Inet(*address)) {
+            if let Some(sim) = racer_platform::simulation::Simulation::current() {
+                if let Ok(fd) = sim.connect(racer_platform::reactor::SocketAddress::Inet(*address))
+                {
                     let fd = Rc::new(fd);
                     return Ok(Connected {
                         charge,
@@ -757,7 +762,7 @@ pub mod rest {
                 match ready {
                     Ok(()) => {}
                     Err(error)
-                        if error == uring_runtime::Error::DeadlineExceeded.into()
+                        if error == racer_platform::Error::DeadlineExceeded.into()
                             || error == Error::Io.into()
                             || error == Error::Unavailable.into() =>
                     {
@@ -872,7 +877,7 @@ pub mod rest {
             match &self.authentication {
                 Authentication::Bootstrap => true,
                 Authentication::Authenticated(auth) => {
-                    uring_runtime::environment::now() < auth.retire_at
+                    racer_platform::environment::now() < auth.retire_at
                 }
             }
         }
@@ -881,7 +886,7 @@ pub mod rest {
         fn check(&self, scope: &I::Scope) -> Result<(), I::Error> {
             scope.check()?;
             if let Authentication::Authenticated(auth) = &self.authentication
-                && uring_runtime::environment::wall_now() >= auth.expires
+                && racer_platform::environment::wall_now() >= auth.expires
             {
                 return Err(Error::Unauthorized.into());
             }
@@ -892,7 +897,7 @@ pub mod rest {
         async fn step(&mut self, scope: &I::Scope) -> Result<(), I::Error> {
             self.check(scope)?;
             // Even a continuously readable peer must yield to other owner work.
-            uring_runtime::drivers::yield_now().await;
+            racer_platform::drivers::yield_now().await;
             let mut progress = false;
             if self.tls.wants_write() {
                 match self.tls.write_tls(&mut self.socket.stream) {
@@ -918,9 +923,9 @@ pub mod rest {
                 if let Authentication::Authenticated(auth) = &self.authentication {
                     let remaining = auth
                         .expires
-                        .duration_since(uring_runtime::environment::wall_now())
+                        .duration_since(racer_platform::environment::wall_now())
                         .map_err(|_| Error::Unauthorized)?;
-                    bounded = scope.narrowed(uring_runtime::environment::now() + remaining);
+                    bounded = scope.narrowed(racer_platform::environment::now() + remaining);
                 }
                 self.io
                     .ready(
@@ -1028,7 +1033,7 @@ pub mod rest {
                 && auth.owner.upgrade().is_some()
                 && let Some(idle) = auth.idle.upgrade()
             {
-                auth.idle_since = uring_runtime::environment::now();
+                auth.idle_since = racer_platform::environment::now();
                 *idle.borrow_mut() = Some(self);
             }
         }
@@ -1468,7 +1473,7 @@ pub mod rest {
         let target = std::time::UNIX_EPOCH
             + Duration::from_secs(seconds.try_into().map_err(|_| Error::InvalidRequest)?);
         Ok(target
-            .duration_since(uring_runtime::environment::wall_now())
+            .duration_since(racer_platform::environment::wall_now())
             .unwrap_or_default())
     }
 
@@ -1502,12 +1507,12 @@ pub mod rest {
     /// Bounded UDP DNS on caller-owned readiness. TLS, never DNS, authenticates the host.
     pub mod dns {
         use super::{Error, Io, Result, Scope};
+        use racer_platform::{reactor::descriptor::Descriptor, scope::LibraryScope as _};
         use std::{
             net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
             rc::Rc,
             time::Duration,
         };
-        use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
         /// Resolve through bounded owner-local UDP queries and resolv.conf search rules.
         pub async fn resolve<I: Io + ?Sized>(
@@ -1577,11 +1582,11 @@ pub mod rest {
                     let mut addresses = Vec::new();
                     for kind in [1u16, 28] {
                         let attempt = scope
-                            .narrowed(uring_runtime::environment::now() + Duration::from_secs(2));
+                            .narrowed(racer_platform::environment::now() + Duration::from_secs(2));
                         match query(io, *server, &name, kind, &attempt).await {
                             Ok(ips) => addresses
                                 .extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port))),
-                            Err(error) if error == uring_runtime::Error::Cancelled.into() => {
+                            Err(error) if error == racer_platform::Error::Canceled.into() => {
                                 return Err(error);
                             }
                             Err(_) => {
@@ -1612,7 +1617,7 @@ pub mod rest {
             /// Bind an ephemeral socket and restrict its peer to the chosen resolver.
             fn connect(server: SocketAddr) -> Result<(Self, Rc<Descriptor>)> {
                 #[cfg(feature = "simulation")]
-                if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+                if let Some(sim) = racer_platform::simulation::Simulation::current() {
                     let fd = sim
                         .bind_datagram(
                             if server.is_ipv4() {
@@ -1627,7 +1632,7 @@ pub mod rest {
                     let Some(handle) = fd.as_sim() else {
                         unreachable!()
                     };
-                    handle.connect_datagram(server).map_err(|_| Error::Io)?;
+                    handle.connect(&server.into()).map_err(|_| Error::Io)?;
                     let fd = Rc::new(fd);
                     return Ok((Self::Sim(fd.clone()), fd));
                 }
@@ -1650,7 +1655,7 @@ pub mod rest {
                     #[cfg(feature = "simulation")]
                     Self::Sim(fd) => {
                         let Some(h) = fd.as_sim() else { unreachable!() };
-                        h.send_datagram(bytes)
+                        h.send(bytes).map_err(std::io::Error::from)
                     }
                 }
             }
@@ -1662,7 +1667,9 @@ pub mod rest {
                     #[cfg(feature = "simulation")]
                     Self::Sim(fd) => {
                         let Some(h) = fd.as_sim() else { unreachable!() };
-                        h.recv_from(bytes).map(|(n, _)| n)
+                        h.recv_from(bytes)
+                            .map(|(n, _)| n)
+                            .map_err(std::io::Error::from)
                     }
                 }
             }
@@ -1677,7 +1684,7 @@ pub mod rest {
             scope: &I::Scope,
         ) -> Result<Vec<IpAddr>, I::Error> {
             let mut id = [0; 2];
-            uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+            racer_platform::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
             let mut request = vec![id[0], id[1], 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
             if name.len() > 253 {
                 return Err(Error::InvalidConfiguration.into());

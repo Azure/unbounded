@@ -1394,11 +1394,11 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
+ "racer-platform",
  "rcgen",
  "rustls",
  "rustls-pemfile",
  "sha2",
- "uring-runtime-legacy",
  "zeroize",
 ]
 
