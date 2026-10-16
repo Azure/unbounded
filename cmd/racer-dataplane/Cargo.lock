@@ -556,7 +556,7 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
- "uring-runtime-legacy",
+ "racer-platform",
  "zeroize",
 ]
 

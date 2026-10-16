@@ -4,6 +4,10 @@ use http1::{
     Codec, Error, Header, MessageHead, StartLine,
     connection::{ConnectionLease, Context, Endpoint, HttpIo, OwnedBuffer},
 };
+use racer_platform::{
+    reactor::{IoBuffer, Reactor, SocketAddress},
+    scope::LibraryScope,
+};
 use std::{
     future::Future,
     os::unix::net::UnixStream,
@@ -11,17 +15,13 @@ use std::{
     task::{Poll, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::{
-    Scope,
-    reactor::{IoBuffer, Reactor, SocketAddress},
-};
 
 /// Keeps HTTP syntax failures distinct from transport failures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Failure {
     Http(Error),
 
-    Runtime(uring_runtime::Error),
+    Runtime(racer_platform::Error),
 }
 
 impl From<Error> for Failure {
@@ -31,9 +31,16 @@ impl From<Error> for Failure {
     }
 }
 
-impl From<uring_runtime::Error> for Failure {
+impl From<racer_platform::uring::Error> for Failure {
+    /// Library errors take the Racer runtime mapping.
+    fn from(error: racer_platform::uring::Error) -> Self {
+        racer_platform::Error::from(error).into()
+    }
+}
+
+impl From<racer_platform::Error> for Failure {
     /// Preserve the runtime failure without mapping it to HTTP syntax.
-    fn from(error: uring_runtime::Error) -> Self {
+    fn from(error: racer_platform::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -42,7 +49,7 @@ impl From<uring_runtime::Error> for Failure {
 #[derive(Clone)]
 struct RequestScope;
 
-impl Scope for RequestScope {
+impl LibraryScope for RequestScope {
     type Error = Failure;
 
     /// Allow progress until the surrounding test driver stops polling.
@@ -160,7 +167,7 @@ fn accept_retains_one_future_across_completions_and_preserves_errors() {
     }
     let mut active = FuturesUnordered::new();
     active.push(std::future::ready(()));
-    let failure = Failure::Runtime(uring_runtime::Error::Io);
+    let failure = Failure::Runtime(racer_platform::Error::Io);
     assert_eq!(
         futures::executor::block_on(http1::connection::next_accepted(
             std::future::ready(Err::<(), _>(failure)),
@@ -209,7 +216,7 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
     );
     assert_eq!(
         result,
-        Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+        Err(Failure::Runtime(racer_platform::Error::Canceled))
     );
     assert!(canceled.get() && cleaned.get() && watch_canceled.get());
     assert_eq!(io.reactor().in_flight(), 0);
@@ -218,19 +225,19 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
 /// Independent caller scopes exercise cancellation and watch fencing without Racer.
 mod disconnect_scopes {
     use super::*;
+    use racer_platform::Cancellation;
     use std::cell::Cell;
-    use uring_runtime::environment::Cancellation;
 
     /// A cancellable caller scope, independent of wall time.
     #[derive(Clone)]
     struct CancelScope(Cancellation);
 
-    impl Scope for CancelScope {
+    impl LibraryScope for CancelScope {
         type Error = Failure;
 
         fn check(&self) -> Result<(), Failure> {
-            if self.0.is_cancelled() {
-                Err(uring_runtime::Error::Cancelled.into())
+            if self.0.is_canceled() {
+                Err(racer_platform::Error::Canceled.into())
             } else {
                 Ok(())
             }
@@ -290,12 +297,12 @@ mod disconnect_scopes {
             io.reactor().init().unwrap();
             let (socket, _peer) = UnixStream::pair().unwrap();
             let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
-            let parent = CancelScope(Cancellation::new().unwrap());
-            let exchange = CancelScope(Cancellation::new().unwrap());
-            let watch = CancelScope(Cancellation::new().unwrap());
+            let parent = CancelScope(Cancellation::new());
+            let exchange = CancelScope(Cancellation::new());
+            let watch = CancelScope(Cancellation::new());
             let cleanup_turns = Cell::new(0);
             let work = std::future::poll_fn(|cx| {
-                if cancel && !exchange.0.is_cancelled() {
+                if cancel && !exchange.0.is_canceled() {
                     return Poll::Pending;
                 }
                 cleanup_turns.set(cleanup_turns.get() + 1);
@@ -311,14 +318,14 @@ mod disconnect_scopes {
                 &connection,
                 &parent,
                 || Ok(watch.clone()),
-                || exchange.0.cancel().unwrap(),
-                |scope| scope.0.cancel().unwrap(),
+                || exchange.0.cancel(),
+                |scope| scope.0.cancel(),
                 work,
             ));
             let mut cx = std::task::Context::from_waker(Waker::noop());
             assert!(operation.as_mut().poll(&mut cx).is_pending());
             if cancel {
-                parent.0.cancel().unwrap();
+                parent.0.cancel();
             }
             let until = Instant::now() + Duration::from_secs(2);
             let result = loop {
@@ -331,14 +338,14 @@ mod disconnect_scopes {
             assert_eq!(
                 result,
                 if cancel {
-                    Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+                    Err(Failure::Runtime(racer_platform::Error::Canceled))
                 } else {
                     Ok(7)
                 }
             );
-            assert!(watch.0.is_cancelled());
-            assert_eq!(parent.0.is_cancelled(), cancel);
-            assert_eq!(exchange.0.is_cancelled(), cancel);
+            assert!(watch.0.is_canceled());
+            assert_eq!(parent.0.is_canceled(), cancel);
+            assert_eq!(exchange.0.is_canceled(), cancel);
             assert_eq!(cleanup_turns.get(), 2);
             assert_eq!(io.reactor().in_flight(), 0);
         }
@@ -356,8 +363,8 @@ mod disconnect_scopes {
         );
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
-        let parent = CancelScope(Cancellation::new().unwrap());
-        let error = Failure::Runtime(uring_runtime::Error::Overloaded);
+        let parent = CancelScope(Cancellation::new());
+        let error = Failure::Runtime(racer_platform::Error::Overloaded);
         let result = futures::executor::block_on(http1::connection::disconnect_fenced(
             &io,
             &connection,
@@ -369,7 +376,7 @@ mod disconnect_scopes {
         ));
         assert_eq!(result, Err(error));
         assert_eq!(io.reactor().in_flight(), 0);
-        assert!(!parent.0.is_cancelled());
+        assert!(!parent.0.is_canceled());
     }
 }
 /// Poll one operation and its reactor under a fixed progress deadline.

@@ -33,8 +33,8 @@ pub mod delivery {
 
     use crate::connection::{ConnectionLease, Context, OwnedBuffer, Result};
     use flow_control::{PipeLease, Policy, splice_unsupported};
+    use racer_platform::reactor::{IoBuffer, SendBuffer, descriptor::Descriptor};
     use std::{io, task::Poll, time::Instant};
-    use uring_runtime::reactor::{IoBuffer, SendBuffer, descriptor::Descriptor};
 
     /// Nonblocking staging pipe. Writes/drains expose EINTR and EAGAIN; successful
     /// counts must be bounded by the supplied slice or requested count.
@@ -124,7 +124,7 @@ pub mod delivery {
         O: DirectOwner<C>,
         H: Observer<C>,
     {
-        let mut stalled_at = uring_runtime::environment::now();
+        let mut stalled_at = racer_platform::environment::now();
         let mut budget = 0;
         let mut calls = 0;
         while !owner.bytes().is_empty() {
@@ -142,7 +142,7 @@ pub mod delivery {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     let view = owner.view(count)?;
                     if view.send_bytes()?.len() != count {
-                        return Err(uring_runtime::Error::Io.into());
+                        return Err(racer_platform::Error::Io.into());
                     }
                     observer.before_send(count, owner.bytes().len());
                     let completion = reactor
@@ -152,14 +152,14 @@ pub mod delivery {
                     observer.after_send(count, completion.bytes)?;
                     completion.bytes
                 }
-                Err(_) => return Err(uring_runtime::Error::Io.into()),
+                Err(_) => return Err(racer_platform::Error::Io.into()),
             };
             if sent == 0 || sent > count {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_platform::Error::Io.into());
             }
             observer.direct_bytes(sent);
             owner.advance(sent);
-            stalled_at = uring_runtime::environment::now();
+            stalled_at = racer_platform::environment::now();
             budget += sent;
             calls += 1;
             if (budget >= TURN_BYTES || calls >= TURN_CALLS) && !owner.bytes().is_empty() {
@@ -188,7 +188,7 @@ pub mod delivery {
         O: Owner<C>,
         H: Observer<C>,
     {
-        let mut stalled_at = uring_runtime::environment::now();
+        let mut stalled_at = racer_platform::environment::now();
         let mut copying = false;
         let mut budget = 0;
         let mut calls = 0;
@@ -236,7 +236,7 @@ pub mod delivery {
                                 yield_once().await;
                                 continue;
                             }
-                            _ => return Err(uring_runtime::Error::Io.into()),
+                            _ => return Err(racer_platform::Error::Io.into()),
                         }
                         observer.pipe_drained();
                         Buffer::Pipe(buffer)
@@ -254,7 +254,7 @@ pub mod delivery {
                     (owner, connection) = completion.lease;
                     observer.after_send(count, completion.bytes)?;
                     if completion.bytes > count {
-                        return Err(uring_runtime::Error::Io.into());
+                        return Err(racer_platform::Error::Io.into());
                     }
                     // Reconstruct any unsent suffix from immutable backing, not the
                     // now-empty pipe. Subsequent backpressure owns immutable views.
@@ -262,13 +262,13 @@ pub mod delivery {
                     observer.direct_bytes(completion.bytes);
                     completion.bytes
                 }
-                Err(_) => return Err(uring_runtime::Error::Io.into()),
+                Err(_) => return Err(racer_platform::Error::Io.into()),
             };
             if sent == 0 || sent > owner.remaining() {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_platform::Error::Io.into());
             }
             owner.advance(sent);
-            stalled_at = uring_runtime::environment::now();
+            stalled_at = racer_platform::environment::now();
             budget += sent;
             calls += 1;
             if (budget >= TURN_BYTES || calls >= TURN_CALLS) && owner.remaining() != 0 {
@@ -356,6 +356,7 @@ pub mod delivery {
         use super::super::fixtures::{Failure, Key, TestScope};
         use super::*;
         use crate::Error;
+        use racer_platform::reactor::Reactor;
         use std::{
             cell::{Cell, RefCell},
             future::Future,
@@ -365,7 +366,6 @@ pub mod delivery {
             task::Waker,
             time::Duration,
         };
-        use uring_runtime::reactor::Reactor;
 
         /// Permissive context with reference-counted connection admission.
         struct Caller;
@@ -638,7 +638,7 @@ pub mod delivery {
             fn scope(&self, stalled_at: Instant) -> Result<Caller, TestScope> {
                 self.times.borrow_mut().push(stalled_at);
                 if self.scope_error.get() {
-                    return Err(uring_runtime::Error::DeadlineExceeded.into());
+                    return Err(racer_platform::Error::DeadlineExceeded.into());
                 }
                 Ok(TestScope)
             }
@@ -795,8 +795,8 @@ pub mod delivery {
                     send(&Caller, &reactor, owner, connection, &observer),
                 );
                 let expected = match failure {
-                    "drain" => Failure::Runtime(uring_runtime::Error::Io),
-                    "scope" => Failure::Runtime(uring_runtime::Error::DeadlineExceeded),
+                    "drain" => Failure::Runtime(racer_platform::Error::Io),
+                    "scope" => Failure::Runtime(racer_platform::Error::DeadlineExceeded),
                     _ => Failure::Http(Error::Malformed),
                 };
                 assert!(matches!(result, Err(e) if e == expected));
@@ -959,8 +959,8 @@ pub mod relay {
 
     use crate::connection::{ConnectionLease, Context, HttpIo, OwnedBuffer, Result};
     use flow_control::{MAX_PIPE_BYTES, PipeLease, Policy, splice_unsupported};
+    use racer_platform::reactor::{IoBuffer, descriptor::Descriptor};
     use std::{io, ops::Range, rc::Rc};
-    use uring_runtime::reactor::{IoBuffer, descriptor::Descriptor};
 
     /// Exact opaque HTTP body transit. Does not finish exchanges or select deadlines.
     pub struct Relay<C: Context, P: RelayPipe> {
@@ -1033,8 +1033,8 @@ pub mod relay {
             tick: impl Fn() -> C::Scope,
             retry: impl Fn(C::Error) -> bool,
         ) -> Result<C, Self> {
+            use racer_platform::scope::LibraryScope as _;
             use std::{cell::RefCell, task::Poll};
-            use uring_runtime::Scope;
             let state = Rc::new(RefCell::new(self));
             loop {
                 scope.check()?;
@@ -1069,7 +1069,7 @@ pub mod relay {
             }
             scope.check()?;
             Ok(Rc::try_unwrap(state)
-                .map_err(|_| uring_runtime::Error::InvalidInput)?
+                .map_err(|_| racer_platform::Error::InvalidInput)?
                 .into_inner())
         }
 
@@ -1110,7 +1110,7 @@ pub mod relay {
             // A requester may finish writing while still reading its response.
             // Reject only full disconnect here; sends report other write failures.
             if self.destination.socket().peer_disconnected() {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_platform::Error::Io.into());
             }
             let mut wait = Step::Yield;
             for _ in 0..32 {
@@ -1140,7 +1140,7 @@ pub mod relay {
                         let n = self
                             .pipe
                             .drain(buffer.bytes_mut()?)
-                            .map_err(|_| uring_runtime::Error::Io)?;
+                            .map_err(|_| racer_platform::Error::Io)?;
                         self.pending = 0..n;
                         continue;
                     }
@@ -1165,7 +1165,7 @@ pub mod relay {
                     self.pipe.receive(&self.source.socket(), remaining)
                 };
                 match result {
-                    Ok(0) => return Err(uring_runtime::Error::Io.into()),
+                    Ok(0) => return Err(racer_platform::Error::Io.into()),
                     Ok(n) => {
                         if writing {
                             if !self.pending.is_empty() {
@@ -1192,7 +1192,7 @@ pub mod relay {
                         };
                         break;
                     }
-                    Err(_) => return Err(uring_runtime::Error::Io.into()),
+                    Err(_) => return Err(racer_platform::Error::Io.into()),
                 }
             }
             if self.source.receive_remaining() == Some(0)
@@ -1271,6 +1271,7 @@ pub mod relay {
         use super::super::fixtures::{Failure, Key, TestScope};
         use super::*;
         use crate::{Codec, Error};
+        use racer_platform::reactor::Reactor;
         use std::{
             cell::{Cell, RefCell},
             io::{Read, Write},
@@ -1278,7 +1279,6 @@ pub mod relay {
             task::{Poll, Waker},
             time::{Duration, Instant},
         };
-        use uring_runtime::reactor::Reactor;
 
         /// Counted admission returned to its ledger on drop.
         struct Charge(Rc<Cell<usize>>, usize);
@@ -1322,7 +1322,7 @@ pub mod relay {
             /// Reserve counted bytes unless overload has been injected.
             fn charge(&self, n: usize) -> Result<Self, Charge> {
                 if self.reject.get() {
-                    return Err(uring_runtime::Error::Overloaded.into());
+                    return Err(racer_platform::Error::Overloaded.into());
                 }
                 self.bytes.set(self.bytes.get() + n);
                 Ok(Charge(self.bytes.clone(), n))
@@ -1514,7 +1514,7 @@ pub mod relay {
                 drop(reader);
                 assert!(matches!(
                     relay.step(&f.io),
-                    Err(Failure::Runtime(uring_runtime::Error::Io))
+                    Err(Failure::Runtime(racer_platform::Error::Io))
                 ));
                 assert_eq!(relay.destination.send_remaining(), Some(3));
             }
@@ -1638,9 +1638,9 @@ pub mod relay {
                     f.hooks.reject.set(failure == "allocation");
                 }
                 let expected = if failure == "allocation" {
-                    uring_runtime::Error::Overloaded
+                    racer_platform::Error::Overloaded
                 } else {
-                    uring_runtime::Error::Io
+                    racer_platform::Error::Io
                 };
                 assert!(matches!(relay.step(&f.io), Err(Failure::Runtime(e)) if e == expected));
                 assert!(!relay.source.is_reusable() && !relay.destination.is_reusable());
@@ -1713,7 +1713,7 @@ pub mod relay {
             f.hooks.reject.set(true);
             assert!(matches!(
                 relay.step(&f.io),
-                Err(Failure::Runtime(uring_runtime::Error::Overloaded))
+                Err(Failure::Runtime(racer_platform::Error::Overloaded))
             ));
             assert!(relay.fallback.is_none());
             assert_eq!(relay.source.receive_remaining(), Some(3));
@@ -1771,7 +1771,7 @@ pub mod relay {
 #[cfg(test)]
 mod fixtures {
     use crate::{Error, connection::Endpoint};
-    use uring_runtime::{Scope, reactor::SocketAddress};
+    use racer_platform::{reactor::SocketAddress, scope::LibraryScope};
 
     /// Keep HTTP and runtime failures distinct in assertions.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1780,7 +1780,7 @@ mod fixtures {
         Http(Error),
 
         /// A runtime transport or admission failure.
-        Runtime(uring_runtime::Error),
+        Runtime(racer_platform::Error),
     }
 
     impl From<Error> for Failure {
@@ -1790,9 +1790,16 @@ mod fixtures {
         }
     }
 
-    impl From<uring_runtime::Error> for Failure {
+    impl From<racer_platform::uring::Error> for Failure {
+        /// Library errors take the Racer runtime mapping.
+        fn from(error: racer_platform::uring::Error) -> Self {
+            racer_platform::Error::from(error).into()
+        }
+    }
+
+    impl From<racer_platform::Error> for Failure {
         /// Preserve a runtime failure without reclassification.
-        fn from(e: uring_runtime::Error) -> Self {
+        fn from(e: racer_platform::Error) -> Self {
             Self::Runtime(e)
         }
     }
@@ -1801,7 +1808,7 @@ mod fixtures {
     #[derive(Clone)]
     pub(super) struct TestScope;
 
-    impl Scope for TestScope {
+    impl LibraryScope for TestScope {
         type Error = Failure;
 
         /// Keep fixture operations live while the driver runs.
