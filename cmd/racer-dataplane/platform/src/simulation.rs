@@ -138,6 +138,83 @@ pub fn fault_target(name: &str) -> io::Result<FaultTarget> {
     })
 }
 
+/// The legacy name of a reactor operation, as accepted by [`fault_target`].
+/// Kinds without a legacy name (added after the migration) are `"other"`.
+pub fn op_name(op: OpKind) -> &'static str {
+    match op {
+        OpKind::Nop => "nop",
+        OpKind::Read => "read",
+        OpKind::Write => "write",
+        OpKind::Recv => "recv",
+        OpKind::Send => "send",
+        OpKind::PollAdd => "poll",
+        OpKind::Accept => "accept",
+        OpKind::Connect => "connect",
+        OpKind::Timeout => "timeout",
+        OpKind::OpenAt2 => "open",
+        OpKind::Statx => "stat",
+        OpKind::Fsync => "fsync",
+        OpKind::RenameAt => "rename",
+        OpKind::UnlinkAt => "unlink",
+        OpKind::MkDirAt => "mkdir",
+        OpKind::Cancel => "cancel",
+        _ => "other",
+    }
+}
+
+/// The legacy name of a synchronous call, as accepted by [`fault_target`]
+/// where one exists. Kinds without a legacy name are `"other"`.
+pub fn sync_name(op: SyncOp) -> &'static str {
+    match op {
+        SyncOp::Open => "open",
+        SyncOp::Read => "read",
+        SyncOp::Write => "write",
+        SyncOp::Fsync => "fsync",
+        SyncOp::Send => "send",
+        SyncOp::Recv => "recv",
+        SyncOp::PipeRead => "pipe_read",
+        SyncOp::PipeWrite => "pipe_write",
+        SyncOp::Splice => "splice",
+        SyncOp::SendTo => "send_datagram",
+        SyncOp::RecvFrom => "recv_datagram",
+        SyncOp::Chmod => "chmod",
+        SyncOp::Rename => "rename",
+        SyncOp::Unlink => "unlink",
+        SyncOp::Mkdir => "mkdir",
+        SyncOp::Socket => "socket",
+        SyncOp::Bind => "bind",
+        SyncOp::Listen => "listen",
+        SyncOp::Connect => "connect",
+        SyncOp::Accept => "accept",
+        _ => "other",
+    }
+}
+
+/// The legacy name of a fault site; the inverse of [`fault_target`].
+pub fn target_name(target: FaultTarget) -> &'static str {
+    match target {
+        FaultTarget::Any => "*",
+        FaultTarget::Op(op) | FaultTarget::Either(op, _) => op_name(op),
+        FaultTarget::Sync(op) => sync_name(op),
+    }
+}
+
+/// The legacy string label of a trace event, for callers that key coverage
+/// by name: `submit:<op>`, `reject:<op>`, `complete:<op>`, `fault:<op>`,
+/// `call:<op>`, `blocked:<op>`, `disk:crash`. Other kinds return `None`.
+pub fn event_label(kind: EventKind) -> Option<String> {
+    Some(match kind {
+        EventKind::Submit(op) => format!("submit:{}", op_name(op)),
+        EventKind::Reject(op) => format!("reject:{}", op_name(op)),
+        EventKind::Complete(op) => format!("complete:{}", op_name(op)),
+        EventKind::Fault(target) => format!("fault:{}", target_name(target)),
+        EventKind::Call(op) => format!("call:{}", sync_name(op)),
+        EventKind::Blocked(op) => format!("blocked:{}", sync_name(op)),
+        EventKind::Crash => "disk:crash".to_owned(),
+        _ => return None,
+    })
+}
+
 /// Convert like the legacy simulator: an errno always survives, even when
 /// the library attached context.
 fn io<T>(result: uring::Result<T>) -> io::Result<T> {
@@ -458,6 +535,51 @@ mod tests {
 
     fn code<T: std::fmt::Debug>(result: io::Result<T>) -> i32 {
         result.unwrap_err().raw_os_error().unwrap()
+    }
+
+    /// Legacy labels round-trip through the fault names they came from.
+    #[test]
+    fn event_labels_match_fault_names() {
+        for name in [
+            "read",
+            "write",
+            "recv",
+            "send",
+            "accept",
+            "connect",
+            "open",
+            "fsync",
+            "mkdir",
+            "rename",
+            "unlink",
+            "poll",
+            "stat",
+            "timeout",
+            "nop",
+            "chmod",
+            "pipe_read",
+            "pipe_write",
+            "splice",
+            "send_datagram",
+            "recv_datagram",
+            "*",
+        ] {
+            assert_eq!(target_name(fault_target(name).unwrap()), name);
+        }
+        assert_eq!(
+            event_label(EventKind::Complete(OpKind::RenameAt)).as_deref(),
+            Some("complete:rename")
+        );
+        assert_eq!(
+            event_label(EventKind::Fault(FaultTarget::Sync(SyncOp::SendTo))).as_deref(),
+            Some("fault:send_datagram")
+        );
+        assert_eq!(
+            event_label(EventKind::Blocked(SyncOp::Send)).as_deref(),
+            Some("blocked:send")
+        );
+        assert_eq!(event_label(EventKind::Crash).as_deref(), Some("disk:crash"));
+        assert_eq!(event_label(EventKind::Partition), None);
     }
 
     #[test]
