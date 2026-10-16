@@ -598,6 +598,49 @@ whose error keeps kernel errno apart from scope failures. File operations use
 simulation builds and tests, `SimBackend`). The simulation choice is Racer
 policy and stays behind Racer's own `simulation` feature.
 
+### Simulation in Racer (where things landed)
+
+`racer-platform`'s `simulation` feature depends on `uring-runtime-sim`
+(the production image builds without it but copies the crate so the lockfile
+resolves).
+
+- `environment`: `Environment` holds an optional world `SimClock` and role
+  `SimEntropy` (both `Send`; clones share the entropy cursor), built by
+  `SimulationClock::{new, new_at, environment, environment_with_entropy_domain}`
+  (legacy domain by default, so replay bytes are unchanged) or
+  `Environment::simulated(clock, entropy)`. `SimulationClock` keeps
+  `advance`, `checked_advance` (`Error::InvalidInput` on overflow), `elapsed`,
+  `set_wall_time`, plus `sim_clock()` and `seed()`. Without the feature `now()`
+  is `Instant::now()` with no thread-local access.
+- `simulation`: `Simulation` wraps a `World`, a fallback `SimClock`, the
+  current endpoint label and a deterministic name sequence. It keeps the legacy
+  method names and `io::Result` signatures (fixture helpers return
+  `Descriptor`s); the module docs carry the legacy-to-new mapping table.
+  Legacy fault names map to typed targets through `fault_target` (names shared
+  by reactor and synchronous calls use `FaultTarget::Either`; unknown names are
+  `EINVAL`). `reject_submissions(n)` rejects `n` operations by doubling into
+  backend push rejections, because the library retries a full push once.
+  New worlds report the effective UID and GID as owner, so private-access
+  checks are the same code path as on the host (the legacy simulator checked
+  against owner 0).
+- Endpoint labels: `Simulation::enter_endpoint` sets a label read whenever a
+  socket is created (fixtures, `Descriptor::socket`/`tcp_listener` and
+  `RacerBackend::Sim`'s `Host::socket`), matching the legacy world-global
+  label; `SimBackend::set_endpoint` is set at construction as a fallback.
+- Reactor: `Reactor::new` captures `Simulation::current()` (as the legacy
+  reactor did) and initializes `RacerBackend::Sim(SimBackend, Simulation)`
+  with the captured environment's `SimClock` (else the simulation's fallback
+  clock); `RacerClock`/`RacerEntropy` still read the ambient environment.
+  `SleepMode::Kernel` is rejected on a simulated backend or clock.
+- `Descriptor::Sim(SimFd)`: `as_sim`, `into_sim`, `From<SimFd>`; the helper
+  methods route to `SimFd`; `AsRawFd`/`AsFd` panic for simulated handles;
+  `validate_socket` uses `SimFd::socket_type` (listeners now pass, as on the
+  host). `publish_new`, checkpoint candidates and `Executor::simulation_crash`
+  use the ambient simulation.
+- Tests: `reactor/sim_tests.rs`, `fs/sim_tests.rs`, and simulation modules in
+  `environment`, `simulation`, `descriptor`, `checkpoint`, `drivers` and
+  `offload`.
+
 ## Validation
 
 - Reactor state-machine tests use a scripted backend (`reactor/tests.rs`)
