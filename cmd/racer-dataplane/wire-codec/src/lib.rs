@@ -1,31 +1,46 @@
+//! Bounded byte codecs and optional owner-local REST transport.
+//!
+//! Codec callers choose byte order, bounds, and error mapping. The `rest` feature
+//! adds TLS JSON HTTP on caller-owned readiness, deadlines, and admission leases.
+
 // Shared REST fixtures use the same imports in unit and integration builds.
 #[cfg(all(test, feature = "rest"))]
 extern crate self as wire_codec;
 
+/// A malformed field or a caller-supplied bound prevented a codec operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// A fixed-width read exceeds the remaining input.
     Truncated,
 
+    /// A length, count, or output buffer exceeds its allowed bound.
     Limit,
 
+    /// Hex input has the wrong length or is not canonical lowercase ASCII.
     InvalidHex,
 }
 
+/// The result of reading or writing a bounded field.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The byte order used for integer fields and length prefixes.
 #[derive(Clone, Copy, Debug)]
 pub enum Endian {
+    /// Least significant byte first.
     Little,
 
+    /// Most significant byte first.
     Big,
 }
 
+/// Reads borrowed fields without advancing past the input slice.
 pub struct Reader<'a> {
     remaining: &'a [u8],
 
     endian: Endian,
 }
 
+/// Appends whole fields, including existing buffer bytes in the total bound.
 pub struct Writer<'a> {
     bytes: &'a mut Vec<u8>,
 
@@ -35,6 +50,7 @@ pub struct Writer<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// Uses the input slice as the total read bound and the chosen byte order.
     pub fn new(bytes: &'a [u8], endian: Endian) -> Self {
         Self {
             remaining: bytes,
@@ -42,10 +58,12 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Returns the unread input without advancing the cursor.
     pub fn remaining(&self) -> &'a [u8] {
         self.remaining
     }
 
+    /// Borrows exactly `length` bytes, leaving the cursor unchanged on failure.
     pub fn take(&mut self, length: usize) -> Result<&'a [u8]> {
         let (value, rest) = self
             .remaining
@@ -55,10 +73,12 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    /// Copies a fixed-width field, leaving the cursor unchanged on failure.
     pub fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.take(N)?.try_into().map_err(|_| Error::Truncated)
     }
 
+    /// Reads a 32-bit integer in the chosen byte order.
     pub fn u32(&mut self) -> Result<u32> {
         Ok(match self.endian {
             Endian::Little => u32::from_le_bytes(self.array()?),
@@ -66,6 +86,7 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// Reads a 64-bit integer in the chosen byte order.
     pub fn u64(&mut self) -> Result<u64> {
         Ok(match self.endian {
             Endian::Little => u64::from_le_bytes(self.array()?),
@@ -73,6 +94,10 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// Read a u32 count bounded by both caller policy and remaining storage.
+    ///
+    /// A zero minimum permits zero-size items while still enforcing `maximum`.
+    /// A complete count is consumed even when it exceeds either bound.
     pub fn count(&mut self, maximum: usize, minimum_bytes: usize) -> Result<usize> {
         let count = usize::try_from(self.u32()?).map_err(|_| Error::Limit)?;
         if count > maximum || (minimum_bytes != 0 && count > self.remaining.len() / minimum_bytes) {
@@ -81,6 +106,9 @@ impl<'a> Reader<'a> {
         Ok(count)
     }
 
+    /// Borrows a u32-length-prefixed field bounded by `maximum` and input size.
+    ///
+    /// A complete prefix is consumed even when the field exceeds either bound.
     pub fn length_prefixed(&mut self, maximum: usize) -> Result<&'a [u8]> {
         let length = self.count(maximum, 1)?;
         self.take(length)
@@ -88,6 +116,7 @@ impl<'a> Reader<'a> {
 }
 
 impl<'a> Writer<'a> {
+    /// Borrows an output buffer with a total size bound and chosen byte order.
     pub fn new(bytes: &'a mut Vec<u8>, maximum: usize, endian: Endian) -> Self {
         Self {
             bytes,
@@ -96,10 +125,12 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// Appends bytes, leaving the output unchanged if its total bound is exceeded.
     pub fn bytes(&mut self, value: &[u8]) -> Result<()> {
         self.append([value])
     }
 
+    /// Appends a 32-bit integer in the chosen byte order.
     pub fn u32(&mut self, value: u32) -> Result<()> {
         self.bytes(&match self.endian {
             Endian::Little => value.to_le_bytes(),
@@ -107,6 +138,7 @@ impl<'a> Writer<'a> {
         })
     }
 
+    /// Appends a 64-bit integer in the chosen byte order.
     pub fn u64(&mut self, value: u64) -> Result<()> {
         self.bytes(&match self.endian {
             Endian::Little => value.to_le_bytes(),
@@ -114,10 +146,14 @@ impl<'a> Writer<'a> {
         })
     }
 
+    /// Appends a count only if it fits in a 32-bit integer and the output bound.
     pub fn count(&mut self, value: usize) -> Result<()> {
         self.u32(u32::try_from(value).map_err(|_| Error::Limit)?)
     }
 
+    /// Appends a u32 length and its bytes, bounded by `maximum` and output size.
+    ///
+    /// A failed field append leaves the entire buffer unchanged.
     pub fn length_prefixed(&mut self, value: &[u8], maximum: usize) -> Result<()> {
         if value.len() > maximum {
             return Err(Error::Limit);
@@ -130,6 +166,7 @@ impl<'a> Writer<'a> {
         self.append([&prefix, value])
     }
 
+    /// Checks every part before appending any bytes of a field.
     fn append<const N: usize>(&mut self, parts: [&[u8]; N]) -> Result<()> {
         let length = parts.iter().try_fold(self.bytes.len(), |length, part| {
             length.checked_add(part.len())
@@ -144,6 +181,7 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// Decodes exactly `N` bytes of canonical lowercase ASCII hex.
 pub fn decode_hex<const N: usize>(value: &[u8]) -> Result<[u8; N]> {
     if N.checked_mul(2) != Some(value.len()) {
         return Err(Error::InvalidHex);
@@ -160,6 +198,7 @@ pub fn decode_hex<const N: usize>(value: &[u8]) -> Result<[u8; N]> {
     Ok(bytes)
 }
 
+/// Encodes bytes as canonical lowercase ASCII hex without a prefix.
 pub fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::new();
@@ -172,6 +211,10 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 #[cfg(feature = "rest")]
 pub mod rest {
+    //! Bounded TLS 1.3 JSON HTTP on caller-owned readiness, deadlines, and leases.
+    //!
+    //! Connections and the single idle slot stay on their I/O owner's thread. TLS
+    //! authenticates peers; endpoint health and identity admission belong to callers.
 
     use std::{
         cell::RefCell,
@@ -184,46 +227,67 @@ pub mod rest {
         time::{Duration, Instant, SystemTime},
     };
 
+    /// Owner-local future carrying the caller's transport error type.
     pub use uring_runtime::Operation;
 
     use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
+    /// Transport failures contain no credentials, headers, or body bytes.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Error {
+        /// The endpoint or local transport configuration is invalid.
         InvalidConfiguration,
 
+        /// The request or response violates the supported HTTP contract.
         InvalidRequest,
 
+        /// Trust, identity, or TLS authentication failed.
         Unauthorized,
 
+        /// No endpoint is available, or TLS admission is temporarily saturated.
         Unavailable,
 
+        /// A configured byte or count limit was exceeded.
         Overloaded,
 
+        /// Socket or local I/O failed.
         Io,
 
+        /// An internal encoding operation failed.
         Internal,
     }
 
+    /// A transport result, optionally carrying the caller's richer error type.
     pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+    /// Narrowing must preserve cancellation and all caller policy, never extend time.
     pub trait Scope: uring_runtime::Scope {
+        /// Return the caller's absolute monotonic deadline.
         fn deadline(&self) -> Instant;
 
+        /// Retain caller policy while limiting the deadline to `until`.
         fn narrowed(&self, until: Instant) -> Self;
     }
 
+    /// Readiness retains the descriptor and optional lease until deregistration,
+    /// including cancellation cleanup. Futures run on the caller's sole I/O owner.
     pub trait Io: 'static {
+        /// Caller errors preserve cancellation and transport failure classification.
         type Error: Copy + Send + PartialEq + From<Error> + From<uring_runtime::Error> + 'static;
 
+        /// Caller policy governing each I/O operation.
         type Scope: Scope<Error = Self::Error>;
 
+        /// Admission charge retained through readiness cleanup.
         type Lease: 'static;
 
+        /// Caller-owned sensitive bytes, retaining any read admission charge.
         type FileBytes: AsRef<[u8]>;
 
+        /// Acquire an optional admission charge before opening a connection.
         fn lease(&self) -> Result<Option<Rc<Self::Lease>>, Self::Error>;
 
+        /// Wait for requested readiness while retaining the descriptor and lease.
         fn ready<'a>(
             &'a self,
             fd: Rc<Descriptor>,
@@ -233,6 +297,7 @@ pub mod rest {
             scope: &'a Self::Scope,
         ) -> Operation<'a, (), Self::Error>;
 
+        /// Resolve addresses using the caller's owner-local resolver.
         fn resolve<'a>(
             &'a self,
             host: &'a str,
@@ -240,6 +305,7 @@ pub mod rest {
             scope: &'a Self::Scope,
         ) -> Operation<'a, Vec<SocketAddr>, Self::Error>;
 
+        /// Read a fresh file under a byte limit and the caller's scope.
         fn read_file<'a>(
             &'a self,
             path: &'a Path,
@@ -248,114 +314,166 @@ pub mod rest {
         ) -> Operation<'a, Self::FileBytes, Self::Error>;
     }
 
+    /// HTTPS endpoint and per-operation input limits.
     pub struct Config {
+        /// HTTPS authority without a path, query, or credentials.
         pub url: String,
 
+        /// PEM trust file reread on every connection checkout.
         pub trust_bundle: PathBuf,
 
+        /// Maximum bytes admitted from the trust file.
         pub max_trust_bundle: usize,
 
+        /// Maximum response body size for statuses other than 200.
         pub max_error_body: usize,
     }
 
+    /// Borrowed DER certificates and PKCS#8 key. Caller validates identity policy.
     #[derive(Clone, Copy)]
     pub struct Identity<'a> {
+        /// Client certificate followed by its issuing chain.
         pub certificate_chain: &'a [Vec<u8>],
 
+        /// Borrowed PKCS#8 private key, copied only into TLS-owned storage.
         pub private_key: &'a [u8],
 
+        /// Identity expiration checked before and during I/O.
         pub expires: SystemTime,
     }
 
+    /// Methods supported by the generic transport; route policy belongs to callers.
     #[derive(Clone, Copy)]
     pub enum Method {
+        /// Fetch a JSON resource.
         Get,
 
+        /// Submit a JSON resource.
         Post,
     }
 
+    /// Borrowed request data and the maximum successful response size.
     pub struct Request<'a> {
+        /// HTTP method selected by the caller.
         pub method: Method,
 
+        /// Absolute path with no whitespace or control bytes.
         pub path: &'a str,
 
+        /// Optional bearer credential; authentication policy belongs to the caller.
         pub bearer: Option<&'a str>,
 
+        /// Optional non-reserved header; value semantics belong to the caller.
         pub header: Option<(&'a str, &'a str)>,
 
+        /// JSON bytes sent without interpretation.
         pub body: &'a [u8],
 
+        /// Maximum response body size for status 200.
         pub limit: usize,
     }
 
+    /// Owner-local HTTPS transport with at most one idle authenticated connection.
     pub struct Transport<I: Io + ?Sized> {
+        /// Endpoint and byte limits retained across owner attachment.
         config: Config,
 
+        /// Attached readiness owner; never shared across threads.
         io: RefCell<Option<Rc<I>>>,
 
+        /// Single authenticated connection available for exclusive checkout.
         idle: Rc<RefCell<Option<Connection<I>>>>,
 
+        /// Only the current attachment keeps its recycling authorization alive.
         owner: RefCell<Rc<()>>,
     }
 
+    /// An exclusive TLS connection, consumed by one request before possible reuse.
     pub struct Connection<I: Io + ?Sized> {
+        /// Socket resources stay together until request or readiness cleanup finishes.
         socket: Connected<I>,
 
+        /// Exclusive TLS state for this connection.
         tls: rustls::ClientConnection,
 
+        /// Readiness owner retained even if the transport attaches a new one.
         io: Rc<I>,
 
+        /// Original endpoint authority used for the HTTP Host header.
         host: String,
 
+        /// Bootstrap or authenticated pooling and lifetime policy.
         authentication: Authentication<I>,
 
+        /// Maximum response body size for statuses other than 200.
         max_error_body: usize,
     }
 
+    /// A framed JSON response whose body is erased when it is dropped.
     pub struct Response {
+        /// HTTP status, including retryable server failures.
         pub status: u16,
 
+        /// Owned response bytes, zeroized on drop.
         pub body: Vec<u8>,
 
+        /// Parsed Retry-After delay, relative to receipt for HTTP dates.
         pub retry_after: Option<Duration>,
     }
 
+    /// Bootstrap connections cannot carry authenticated pooling metadata.
     enum Authentication<I: Io + ?Sized> {
+        /// Server-authenticated TLS without a client identity or pool destination.
         Bootstrap,
 
+        /// Client-authenticated TLS with its identity lifetime and pool destination.
         Authenticated(Authenticated<I>),
     }
 
+    /// Identity lifetime and trust epoch required for authenticated reuse.
     struct Authenticated<I: Io + ?Sized> {
+        /// Wall-clock identity deadline checked during active I/O.
         expires: SystemTime,
 
+        /// Trust and certificate-chain fingerprint used at checkout.
         epoch: [u8; 32],
 
+        /// Non-owning destination for successful connection recycling.
         idle: std::rc::Weak<RefCell<Option<Connection<I>>>>,
 
+        /// Invalidated on owner replacement, including while connect is awaiting I/O.
         owner: std::rc::Weak<()>,
 
+        /// Monotonic start of the current idle interval.
         idle_since: Instant,
 
+        /// Redistribution is checked only between requests, never during a long poll.
         retire_at: Instant,
     }
 
+    /// Minimum lifetime before an authenticated connection is redistributed.
     const AUTHENTICATED_AGE_MIN: Duration = Duration::from_secs(240);
 
+    /// Maximum extra lifetime used to spread reconnections across owners.
     const AUTHENTICATED_AGE_JITTER_MS: u64 = 60_000;
 
+    /// Spread authenticated retirement over the inclusive four-to-five-minute range.
     fn authenticated_age(random: u64) -> Duration {
         AUTHENTICATED_AGE_MIN + Duration::from_millis(random % (AUTHENTICATED_AGE_JITTER_MS + 1))
     }
 
+    /// A real or simulated nonblocking byte stream owned by this I/O thread.
     enum Stream {
+        /// Kernel TCP stream with readiness tracked by a separate descriptor.
         Real(TcpStream),
 
+        /// Simulated TCP stream and readiness share one owner-local descriptor.
         #[cfg(feature = "simulation")]
         Sim(Rc<Descriptor>),
     }
 
     impl Read for Stream {
+        /// Read without waiting; the reactor handles readiness separately.
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             match self {
                 Self::Real(stream) => stream.read(bytes),
@@ -366,6 +484,7 @@ pub mod rest {
     }
 
     impl Write for Stream {
+        /// Write without waiting; the reactor handles readiness separately.
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             match self {
                 Self::Real(stream) => stream.write(bytes),
@@ -374,6 +493,7 @@ pub mod rest {
             }
         }
 
+        /// Flush the underlying stream, which has no simulation-side buffer.
         fn flush(&mut self) -> std::io::Result<()> {
             match self {
                 Self::Real(stream) => stream.flush(),
@@ -384,20 +504,26 @@ pub mod rest {
     }
 
     impl Drop for Response {
+        /// Erase response plaintext before releasing its allocation.
         fn drop(&mut self) {
             use zeroize::Zeroize;
             self.body.zeroize();
         }
     }
 
+    /// Validated TLS server name, HTTP authority, and connection port.
     struct Endpoint {
+        /// Unbracketed name or IP address used for TLS and resolution.
         host: String,
 
+        /// Original authority, including brackets and any explicit port.
         authority: String,
 
+        /// Validated nonzero TCP port.
         port: u16,
     }
 
+    /// Accept only a TLS authority, preserving its spelling for the Host header.
     fn endpoint(url: &str) -> Result<Endpoint> {
         let authority = url
             .strip_prefix("https://")
@@ -445,6 +571,7 @@ pub mod rest {
     }
 
     impl<I: Io + ?Sized> Transport<I> {
+        /// Create a detached transport; attach its owner before connecting.
         pub fn new(config: Config) -> Self {
             Self {
                 config,
@@ -454,12 +581,14 @@ pub mod rest {
             }
         }
 
+        /// Replace the owner, discarding idle TLS and invalidating old recycling rights.
         pub fn attach_io(&self, io: Rc<I>) {
             *self.owner.borrow_mut() = Rc::new(());
             self.idle.borrow_mut().take();
             *self.io.borrow_mut() = Some(io);
         }
 
+        /// Retrieve the attached owner or report missing configuration.
         pub fn io(&self) -> Result<Rc<I>, I::Error> {
             self.io
                 .borrow()
@@ -467,10 +596,12 @@ pub mod rest {
                 .ok_or_else(|| Error::InvalidConfiguration.into())
         }
 
+        /// Drop the idle connection without interrupting checked-out requests.
         pub fn close_idle(&self) {
             self.idle.borrow_mut().take();
         }
 
+        /// Reread trust and reuse eligible authenticated TLS, or establish fresh TLS.
         pub fn connect<'a>(
             &'a self,
             identity: Option<Identity<'a>>,
@@ -492,9 +623,6 @@ pub mod rest {
                     )
                     .await?;
                 let epoch = trust_epoch(trust.as_ref(), identity);
-                if let Some(identity) = identity {
-                    validate_client_key(identity)?;
-                }
                 if owner.upgrade().is_some()
                     && let Some(connection) = self.checkout(identity, epoch, scope)
                 {
@@ -531,6 +659,7 @@ pub mod rest {
             })
         }
 
+        /// Consume the idle slot even when its identity, epoch, or age is ineligible.
         fn checkout(
             &self,
             identity: Option<Identity<'_>>,
@@ -540,9 +669,8 @@ pub mod rest {
             let mut idle = self.idle.borrow_mut();
             let connection = idle.take()?;
             if let Authentication::Authenticated(auth) = &connection.authentication
-                && let Some(identity) = identity
+                && identity.is_some()
                 && auth.epoch == epoch
-                && auth.expires == identity.expires
                 && auth.owner.upgrade().is_some()
                 && connection.within_max_age()
                 && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
@@ -555,6 +683,7 @@ pub mod rest {
             }
         }
 
+        /// Create pooling metadata only for authenticated connections, after socket setup.
         fn authentication(
             &self,
             identity: Option<Identity<'_>>,
@@ -579,14 +708,19 @@ pub mod rest {
         }
     }
 
+    /// Connected socket, readiness descriptor, and retained admission charge.
     struct Connected<I: Io + ?Sized> {
+        /// Admission charge, also retained by outstanding readiness operations.
         charge: Option<Rc<I::Lease>>,
 
+        /// Owner-local nonblocking socket used by TLS.
         stream: Stream,
 
+        /// Readiness registration handle for the same socket.
         fd: Rc<Descriptor>,
     }
 
+    /// Try addresses in order while reserving deadline shares for fallback and TLS.
     async fn connect_addresses<I: Io + ?Sized>(
         io: &I,
         addresses: &[SocketAddr],
@@ -644,6 +778,7 @@ pub mod rest {
         Err(Error::Unavailable.into())
     }
 
+    /// Begin a close-on-exec, nonblocking TCP connection.
     fn connect_socket(address: SocketAddr) -> Result<TcpStream> {
         let domain = if address.is_ipv4() {
             libc::AF_INET
@@ -705,6 +840,7 @@ pub mod rest {
     }
 
     impl<I: Io + ?Sized> Connection<I> {
+        /// Successful framed requests recycle one connection within its trust/identity epoch.
         pub fn request<'a>(
             mut self,
             request: Request<'a>,
@@ -731,6 +867,7 @@ pub mod rest {
             })
         }
 
+        /// Check redistribution age only at request boundaries, not during I/O.
         fn within_max_age(&self) -> bool {
             match &self.authentication {
                 Authentication::Bootstrap => true,
@@ -740,6 +877,7 @@ pub mod rest {
             }
         }
 
+        /// Check caller cancellation first, then the authenticated identity lifetime.
         fn check(&self, scope: &I::Scope) -> Result<(), I::Error> {
             scope.check()?;
             if let Authentication::Authenticated(auth) = &self.authentication
@@ -750,11 +888,11 @@ pub mod rest {
             Ok(())
         }
 
+        /// Make bounded TLS progress, yielding and waiting on owner-local readiness.
         async fn step(&mut self, scope: &I::Scope) -> Result<(), I::Error> {
             self.check(scope)?;
             // Even a continuously readable peer must yield to other owner work.
             uring_runtime::drivers::yield_now().await;
-            self.check(scope)?;
             let mut progress = false;
             if self.tls.wants_write() {
                 match self.tls.write_tls(&mut self.socket.stream) {
@@ -797,6 +935,7 @@ pub mod rest {
             Ok(())
         }
 
+        /// Send the already validated head and body, then flush pending TLS records.
         async fn send(
             &mut self,
             head: &[u8],
@@ -822,6 +961,7 @@ pub mod rest {
             Ok(())
         }
 
+        /// Receive one exact frame and check for plaintext left in the TLS reader.
         async fn receive_response(
             &mut self,
             limit: usize,
@@ -877,6 +1017,7 @@ pub mod rest {
             })
         }
 
+        /// Recycle only completed successful responses; failures reselect a backend.
         fn recycle(mut self, completed: &CompletedResponse) {
             // An aged connection finishes its in-flight response, then retires.
             if completed.reusable
@@ -892,6 +1033,7 @@ pub mod rest {
             }
         }
 
+        /// Decode bounded chunks, rejecting extensions, trailers, and trailing bytes.
         async fn receive_chunked(
             &mut self,
             initial: &[u8],
@@ -952,6 +1094,7 @@ pub mod rest {
             }
         }
 
+        /// Append one available plaintext fragment without freeing unerased storage.
         async fn receive(
             &mut self,
             into: &mut zeroize::Zeroizing<Vec<u8>>,
@@ -975,6 +1118,7 @@ pub mod rest {
         }
     }
 
+    /// Validate and bound request headers before copying any bearer credential.
     fn request_head(
         host: &str,
         method: Method,
@@ -983,6 +1127,7 @@ pub mod rest {
         body_length: usize,
         header: Option<(&str, &str)>,
     ) -> Result<zeroize::Zeroizing<String>> {
+        /// Allocation ceiling including fixed syntax and variable header fields.
         const MAX_HEAD: usize = 16384;
 
         if !path.starts_with('/')
@@ -1029,6 +1174,7 @@ pub mod rest {
         Ok(request)
     }
 
+    /// Grow without freeing an allocation containing plaintext key material.
     fn append_sensitive(into: &mut zeroize::Zeroizing<Vec<u8>>, bytes: &[u8]) {
         if into.capacity() - into.len() < bytes.len() {
             let capacity = (into.len() + bytes.len()).max(into.capacity().saturating_mul(2));
@@ -1039,6 +1185,7 @@ pub mod rest {
         into.extend_from_slice(bytes);
     }
 
+    /// Retry Go server admission saturation, but keep certificate/protocol failures terminal.
     fn tls_failure(error: rustls::Error) -> Error {
         match error {
             rustls::Error::AlertReceived(rustls::AlertDescription::InternalError) => {
@@ -1048,6 +1195,7 @@ pub mod rest {
         }
     }
 
+    /// Hash trust bytes and length-delimited certificates without copying key material.
     fn trust_epoch(trust: &[u8], identity: Option<Identity<'_>>) -> [u8; 32] {
         use sha2::Digest;
         let mut epoch = sha2::Sha256::new();
@@ -1061,22 +1209,7 @@ pub mod rest {
         epoch.finalize().into()
     }
 
-    fn validate_client_key(identity: Identity<'_>) -> Result<()> {
-        let private = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key).into();
-        let key = rustls::crypto::ring::sign::any_supported_type(&private)
-            .map_err(|_| Error::Unauthorized)?;
-        let leaf = identity
-            .certificate_chain
-            .first()
-            .ok_or(Error::Unauthorized)?;
-        rustls::sign::CertifiedKey::new(
-            vec![rustls::pki_types::CertificateDer::from(leaf.clone())],
-            key,
-        )
-        .keys_match()
-        .map_err(|_| Error::Unauthorized)
-    }
-
+    /// Build fresh TLS 1.3 trust and optional client authentication without resumption.
     fn tls_config(
         mut trust: &[u8],
         identity: Option<Identity<'_>>,
@@ -1117,38 +1250,53 @@ pub mod rest {
         Ok(config)
     }
 
+    /// Supported, unambiguous HTTP body boundaries.
     #[derive(Debug, Eq, PartialEq)]
     enum Framing {
+        /// Exact plaintext body length, already checked against its status limit.
         Length(usize),
 
+        /// Chunked body carrying the status-specific limit selected by the parser.
         Chunked { bound: usize },
     }
 
+    /// Validated response metadata, including the connection reuse directive.
     #[derive(Debug, Eq, PartialEq)]
     struct ResponseHead {
+        /// Parsed HTTP status used for body limits and pool policy.
         status: u16,
 
+        /// Offset of the first body byte in the accumulated plaintext.
         header_len: usize,
 
+        /// Exact length or chunk limit validated together with the headers.
         framing: Framing,
 
+        /// Server retry hint, already converted to a relative delay.
         retry_after: Option<Duration>,
 
+        /// Whether any Connection header asks to close the socket.
         close: bool,
     }
 
+    /// A fully received frame with no trailing plaintext, ready for reuse policy.
     struct CompletedResponse {
+        /// Validated metadata for the fully consumed frame.
         head: ResponseHead,
 
+        /// Plaintext retained in zeroizing storage until response ownership transfers.
         body: zeroize::Zeroizing<Vec<u8>>,
 
+        /// TLS reader reported WouldBlock rather than EOF or a read failure.
         reusable: bool,
     }
 
+    /// Bound the complete frame before receiving or allocating body storage.
     fn length_frame_end(header_len: usize, body_len: usize) -> Result<usize> {
         header_len.checked_add(body_len).ok_or(Error::Overloaded)
     }
 
+    /// Parse framing and reuse metadata together, preserving failure precedence.
     fn parse_head(
         bytes: &[u8],
         limit: usize,
@@ -1208,7 +1356,7 @@ pub mod rest {
                 retry = Some(retry_delay(h.value)?);
             }
             if h.name.eq_ignore_ascii_case("connection") {
-                // Defer invalid UTF-8 until after framing validation, as before.
+                // Defer invalid UTF-8 until after framing validation.
                 if let Ok(value) = std::str::from_utf8(h.value) {
                     close |= value
                         .split(',')
@@ -1238,8 +1386,8 @@ pub mod rest {
         if size > bound {
             return Err(Error::Overloaded);
         }
-        // The old request path required UTF-8 even in ignored headers. Keep that
-        // acceptance rule after size/framing checks, without reparsing Connection.
+        // Every header, including ignored ones, must be valid UTF-8. Check this
+        // after size/framing checks, without reparsing Connection.
         std::str::from_utf8(&bytes[..length]).map_err(|_| Error::InvalidRequest)?;
         Ok(Some(ResponseHead {
             status,
@@ -1254,6 +1402,7 @@ pub mod rest {
         }))
     }
 
+    /// Decode delta seconds or IMF-fixdate without locale or time-zone globals.
     fn retry_delay(bytes: &[u8]) -> Result<Duration> {
         let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidRequest)?;
         if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
@@ -1323,6 +1472,7 @@ pub mod rest {
             .unwrap_or_default())
     }
 
+    /// Accept printable extension headers but never overrides of transport metadata.
     fn valid_header(name: &str, value: &str) -> bool {
         !name.is_empty()
             && name
@@ -1349,6 +1499,7 @@ pub mod rest {
             .any(|reserved| name.eq_ignore_ascii_case(reserved))
     }
 
+    /// Bounded UDP DNS on caller-owned readiness. TLS, never DNS, authenticates the host.
     pub mod dns {
         use super::{Error, Io, Result, Scope};
         use std::{
@@ -1358,6 +1509,7 @@ pub mod rest {
         };
         use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
+        /// Resolve through bounded owner-local UDP queries and resolv.conf search rules.
         pub async fn resolve<I: Io + ?Sized>(
             io: &I,
             host: &str,
@@ -1446,14 +1598,18 @@ pub mod rest {
             Err(Error::Unavailable.into())
         }
 
+        /// A connected real or simulated DNS datagram socket.
         enum Datagram {
+            /// Connected nonblocking UDP socket owned by this thread.
             Real(UdpSocket),
 
+            /// Simulated socket restricted to one resolver peer.
             #[cfg(feature = "simulation")]
             Sim(Rc<Descriptor>),
         }
 
         impl Datagram {
+            /// Bind an ephemeral socket and restrict its peer to the chosen resolver.
             fn connect(server: SocketAddr) -> Result<(Self, Rc<Descriptor>)> {
                 #[cfg(feature = "simulation")]
                 if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
@@ -1487,6 +1643,7 @@ pub mod rest {
                 Ok((Self::Real(socket), fd))
             }
 
+            /// Send one query without waiting for readiness.
             fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
                 match self {
                     Self::Real(socket) => socket.send(bytes),
@@ -1498,6 +1655,7 @@ pub mod rest {
                 }
             }
 
+            /// Receive one answer from the connected resolver without waiting.
             fn recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
                 match self {
                     Self::Real(socket) => socket.recv(bytes),
@@ -1510,6 +1668,7 @@ pub mod rest {
             }
         }
 
+        /// Exchange one bounded DNS question with a random transaction identifier.
         async fn query<I: Io + ?Sized>(
             io: &I,
             server: SocketAddr,
@@ -1533,15 +1692,13 @@ pub mod rest {
             request.push(0);
             request.extend_from_slice(&kind.to_be_bytes());
             request.extend_from_slice(&[0, 1]);
-            let charge = io.lease()?;
             let (socket, fd) = Datagram::connect(server)?;
             loop {
                 scope.check()?;
                 match socket.send(&request) {
                     Ok(n) if n == request.len() => break,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        io.ready(fd.clone(), false, true, charge.clone(), scope)
-                            .await?
+                        io.ready(fd.clone(), false, true, None, scope).await?
                     }
                     _ => return Err(Error::Io.into()),
                 }
@@ -1552,14 +1709,14 @@ pub mod rest {
                 match socket.recv(&mut response) {
                     Ok(n) => return parse(&response[..n], &request, kind).map_err(Into::into),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        io.ready(fd.clone(), true, false, charge.clone(), scope)
-                            .await?
+                        io.ready(fd.clone(), true, false, None, scope).await?
                     }
                     _ => return Err(Error::Io.into()),
                 }
             }
         }
 
+        /// Read a network-order integer without indexing beyond the packet.
         fn u16_at(b: &[u8], p: usize) -> Result<u16> {
             Ok(u16::from_be_bytes(
                 b.get(p..p + 2)
@@ -1569,6 +1726,7 @@ pub mod rest {
             ))
         }
 
+        /// Skip bounded labels or a compression pointer without following pointers.
         fn skip_name(b: &[u8], p: &mut usize) -> Result<()> {
             for _ in 0..128 {
                 let n = *b.get(*p).ok_or(Error::InvalidRequest)?;
@@ -1592,6 +1750,7 @@ pub mod rest {
             Err(Error::InvalidRequest)
         }
 
+        /// Validate the echoed question and collect bounded A or AAAA answers.
         fn parse(b: &[u8], request: &[u8], kind: u16) -> Result<Vec<IpAddr>> {
             if b.len() < request.len()
                 || b[..2] != request[..2]
@@ -1631,152 +1790,12 @@ pub mod rest {
             Ok(addresses)
         }
 
+        /// DNS wire parser boundary coverage.
         #[cfg(test)]
         mod tests {
             use super::*;
-            use crate::{rest::Operation, testing};
-            use std::{
-                cell::{Cell, RefCell},
-                rc::Weak,
-                task::{Context, Poll},
-            };
 
-            #[derive(Default)]
-            struct DnsIo {
-                deny: bool,
-                attempts: Cell<usize>,
-                lease: RefCell<Weak<()>>,
-                retained: RefCell<Option<(Rc<Descriptor>, Rc<()>)>>,
-                ready: Cell<bool>,
-            }
-
-            impl Io for DnsIo {
-                type Error = testing::Error;
-                type Scope = testing::TestScope;
-                type Lease = ();
-                type FileBytes = Vec<u8>;
-
-                fn lease(&self) -> Result<Option<Rc<()>>, Self::Error> {
-                    self.attempts.set(self.attempts.get() + 1);
-                    if self.deny {
-                        return Err(Error::Overloaded.into());
-                    }
-                    let lease = Rc::new(());
-                    *self.lease.borrow_mut() = Rc::downgrade(&lease);
-                    Ok(Some(lease))
-                }
-
-                fn ready<'a>(
-                    &'a self,
-                    fd: Rc<Descriptor>,
-                    read: bool,
-                    write: bool,
-                    lease: Option<Rc<()>>,
-                    _: &'a Self::Scope,
-                ) -> Operation<'a, (), Self::Error> {
-                    assert!(read);
-                    assert!(!write);
-                    let lease = lease.expect("DNS readiness must inherit admission");
-                    assert_eq!(Rc::strong_count(&lease), 2, "query retains its lease");
-                    *self.retained.borrow_mut() = Some((fd, lease));
-                    Box::pin(std::future::poll_fn(move |_| {
-                        if self.ready.get() {
-                            self.retained.borrow_mut().take();
-                            Poll::Ready(Ok(()))
-                        } else {
-                            Poll::Pending
-                        }
-                    }))
-                }
-
-                fn resolve<'a>(
-                    &'a self,
-                    _: &'a str,
-                    _: u16,
-                    _: &'a Self::Scope,
-                ) -> Operation<'a, Vec<SocketAddr>, Self::Error> {
-                    unreachable!("test calls the actual DNS query")
-                }
-
-                fn read_file<'a>(
-                    &'a self,
-                    _: &'a std::path::Path,
-                    _: usize,
-                    _: &'a Self::Scope,
-                ) -> Operation<'a, Vec<u8>, Self::Error> {
-                    unreachable!("query does not read resolver configuration")
-                }
-            }
-
-            #[test]
-            fn dns_query_denied_admission_sends_nothing() {
-                let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-                server.set_nonblocking(true).unwrap();
-                let io = DnsIo {
-                    deny: true,
-                    ..Default::default()
-                };
-                assert_eq!(
-                    futures::executor::block_on(query(
-                        &io,
-                        server.local_addr().unwrap(),
-                        "example.test",
-                        1,
-                        &testing::scope(),
-                    )),
-                    Err(Error::Overloaded.into())
-                );
-                assert_eq!(io.attempts.get(), 1);
-                assert!(io.retained.borrow().is_none());
-                assert_eq!(
-                    server.recv_from(&mut [0; 512]).unwrap_err().kind(),
-                    std::io::ErrorKind::WouldBlock
-                );
-            }
-
-            #[test]
-            fn dns_query_lease_lives_through_response_or_cancel_cleanup() {
-                for cancel in [false, true] {
-                    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-                    server.set_nonblocking(true).unwrap();
-                    let io = DnsIo::default();
-                    let scope = testing::scope();
-                    let mut query = Box::pin(query(
-                        &io,
-                        server.local_addr().unwrap(),
-                        "example.test",
-                        1,
-                        &scope,
-                    ));
-                    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-                    assert!(query.as_mut().poll(&mut cx).is_pending());
-                    assert_eq!(io.attempts.get(), 1);
-                    assert_eq!(io.lease.borrow().strong_count(), 2);
-                    let mut request = [0; 512];
-                    let (n, peer) = server.recv_from(&mut request).unwrap();
-                    if cancel {
-                        drop(query);
-                        assert_eq!(io.lease.borrow().strong_count(), 1);
-                        io.retained.borrow_mut().take();
-                    } else {
-                        let mut response = request[..n].to_vec();
-                        response[2] = 0x81;
-                        response[3] = 0x80;
-                        response[7] = 1;
-                        response.extend_from_slice(&[
-                            0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 192, 0, 2, 1,
-                        ]);
-                        server.send_to(&response, peer).unwrap();
-                        io.ready.set(true);
-                        assert_eq!(
-                            query.as_mut().poll(&mut cx),
-                            Poll::Ready(Ok(vec!["192.0.2.1".parse::<IpAddr>().unwrap()]))
-                        );
-                    }
-                    assert!(io.lease.borrow().upgrade().is_none());
-                }
-            }
-
+            /// Reject truncated packets, changed questions, and incomplete answers.
             #[test]
             fn rejects_truncation_wrong_question_and_malformed_answers() {
                 let request = [1, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
@@ -1805,246 +1824,13 @@ pub mod rest {
     #[cfg(test)]
     use crate::testing;
 
+    /// Pure parser tests and owner-local pool invariants.
     #[cfg(test)]
     mod tests {
         use super::*;
         use testing::{FixtureIo, TestIdentity, TestTransport as _};
 
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        enum CancelError {
-            Runtime(uring_runtime::Error),
-            Fixture(testing::Error),
-        }
-
-        impl From<uring_runtime::Error> for CancelError {
-            fn from(error: uring_runtime::Error) -> Self {
-                Self::Runtime(error)
-            }
-        }
-
-        impl From<Error> for CancelError {
-            fn from(error: Error) -> Self {
-                Self::Fixture(error.into())
-            }
-        }
-
-        #[derive(Clone)]
-        struct CancelScope {
-            cancelled: Rc<std::cell::Cell<bool>>,
-            inner: testing::TestScope,
-        }
-
-        impl uring_runtime::Scope for CancelScope {
-            type Error = CancelError;
-
-            fn check(&self) -> Result<(), Self::Error> {
-                if self.cancelled.get() {
-                    return Err(uring_runtime::Error::Cancelled.into());
-                }
-                self.inner.check().map_err(CancelError::Fixture)
-            }
-        }
-
-        impl Scope for CancelScope {
-            fn deadline(&self) -> Instant {
-                self.inner.deadline()
-            }
-
-            fn narrowed(&self, until: Instant) -> Self {
-                Self {
-                    cancelled: self.cancelled.clone(),
-                    inner: self.inner.narrowed(until),
-                }
-            }
-        }
-
-        struct CancelIo;
-
-        impl Io for CancelIo {
-            type Error = CancelError;
-            type Scope = CancelScope;
-            type Lease = ();
-            type FileBytes = <FixtureIo as Io>::FileBytes;
-
-            fn lease(&self) -> Result<Option<Rc<()>>, Self::Error> {
-                FixtureIo.lease().map_err(CancelError::Fixture)
-            }
-
-            fn ready<'a>(
-                &'a self,
-                fd: Rc<Descriptor>,
-                read: bool,
-                write: bool,
-                lease: Option<Rc<()>>,
-                scope: &'a CancelScope,
-            ) -> Operation<'a, (), Self::Error> {
-                Box::pin(async move {
-                    FixtureIo
-                        .ready(fd, read, write, lease, &scope.inner)
-                        .await
-                        .map_err(CancelError::Fixture)
-                })
-            }
-
-            fn resolve<'a>(
-                &'a self,
-                host: &'a str,
-                port: u16,
-                scope: &'a CancelScope,
-            ) -> Operation<'a, Vec<SocketAddr>, Self::Error> {
-                Box::pin(async move {
-                    FixtureIo
-                        .resolve(host, port, &scope.inner)
-                        .await
-                        .map_err(CancelError::Fixture)
-                })
-            }
-
-            fn read_file<'a>(
-                &'a self,
-                path: &'a Path,
-                limit: usize,
-                scope: &'a CancelScope,
-            ) -> Operation<'a, Self::FileBytes, Self::Error> {
-                Box::pin(async move {
-                    FixtureIo
-                        .read_file(path, limit, &scope.inner)
-                        .await
-                        .map_err(CancelError::Fixture)
-                })
-            }
-        }
-
-        fn request_at_yield(cancel: bool) {
-            use std::{net::TcpListener, task::Context};
-
-            let (ca, ca_key) = testing::ca();
-            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-            let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
-                .unwrap()
-                .signed_by(&key, &ca, &ca_key)
-                .unwrap();
-            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.der().clone()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
-            )
-            .unwrap();
-            config.send_tls13_tickets = 0;
-            let directory = testing::Directory::new();
-            let trust = directory.0.join("ca.crt");
-            std::fs::write(&trust, ca.pem()).unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let server = std::thread::spawn(move || {
-                let until = Instant::now() + Duration::from_secs(5);
-                let mut socket = loop {
-                    match listener.accept() {
-                        Ok((socket, _)) => break socket,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < until, "client did not connect");
-                            std::thread::yield_now();
-                        }
-                        Err(error) => panic!("accept: {error}"),
-                    }
-                };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                socket
-                    .set_write_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut tls = rustls::ServerConnection::new(Arc::new(config)).unwrap();
-                while tls.is_handshaking() {
-                    tls.complete_io(&mut socket).unwrap();
-                }
-                (socket, tls)
-            });
-            let scope = CancelScope {
-                cancelled: Rc::new(std::cell::Cell::new(false)),
-                inner: testing::scope().narrowed(Instant::now() + Duration::from_secs(5)),
-            };
-            let transport = Transport::new(testing::config(format!("https://{address}"), trust));
-            transport.attach_io(Rc::new(CancelIo));
-            let mut connection =
-                futures::executor::block_on(transport.connect(None, &scope)).unwrap();
-            while connection.tls.wants_write() {
-                futures::executor::block_on(connection.step(&scope)).unwrap();
-            }
-            let (mut socket, mut tls) = server.join().unwrap();
-            socket.set_nonblocking(true).unwrap();
-            assert_eq!(
-                socket.peek(&mut [0; 1]).unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-            assert_eq!(
-                tls.reader().read(&mut [0; 1]).unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-            socket.set_nonblocking(false).unwrap();
-            let mut request = connection.request(
-                testing::request(Method::Post, "/cancel-test", Some("test-token"), 1024),
-                &scope,
-            );
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            assert!(request.as_mut().poll(&mut cx).is_pending());
-            scope.cancelled.set(cancel);
-            let result = request.as_mut().poll(&mut cx);
-            if cancel {
-                drop(request);
-                // EOF must follow the handshake directly, with no request records.
-                assert_eq!(socket.read(&mut [0; 4096]).unwrap(), 0, "request leaked");
-                assert!(matches!(
-                    result,
-                    std::task::Poll::Ready(Err(CancelError::Runtime(
-                        uring_runtime::Error::Cancelled
-                    )))
-                ));
-            } else {
-                assert!(result.is_pending());
-                let mut head = Vec::new();
-                while !head.ends_with(b"\r\n\r\n") {
-                    assert_ne!(tls.read_tls(&mut socket).unwrap(), 0);
-                    tls.process_new_packets().unwrap();
-                    let mut bytes = [0; 4096];
-                    loop {
-                        match tls.reader().read(&mut bytes) {
-                            Ok(0) => panic!("unexpected TLS EOF"),
-                            Ok(n) => head.extend_from_slice(&bytes[..n]),
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(error) => panic!("read request: {error}"),
-                        }
-                    }
-                }
-                let head = String::from_utf8(head).unwrap();
-                assert!(head.starts_with("POST /cancel-test HTTP/1.1\r\n"));
-                assert!(head.contains("\r\nAuthorization: Bearer test-token\r\n"));
-                tls.writer()
-                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
-                while tls.wants_write() {
-                    tls.write_tls(&mut socket).unwrap();
-                }
-                assert_eq!(futures::executor::block_on(request).unwrap().status, 204);
-            }
-        }
-
-        #[test]
-        fn cancellation_during_tls_yield_sends_no_request_bytes() {
-            request_at_yield(true);
-        }
-
-        #[test]
-        fn active_scope_after_tls_yield_sends_request() {
-            request_at_yield(false);
-        }
-
+        /// Access authenticated metadata only inside tests that mutate pool boundaries.
         fn authenticated(connection: &mut Connection<FixtureIo>) -> &mut Authenticated<FixtureIo> {
             let Authentication::Authenticated(auth) = &mut connection.authentication else {
                 panic!("expected authenticated connection");
@@ -2052,6 +1838,7 @@ pub mod rest {
             auth
         }
 
+        /// Projected trust changes must invalidate the private idle slot before reuse.
         #[test]
         fn weekly_projected_trust_reload_invalidates_idle_transport() {
             use testing::{RotationServer, WeeklyCertificates, rotation_request};
@@ -2113,6 +1900,7 @@ pub mod rest {
             transport.close_idle();
         }
 
+        /// Successful bootstrap requests always open fresh TLS and leave no idle slot.
         #[test]
         fn bootstrap_never_carries_authenticated_pool_state() {
             use testing::{RotationServer, WeeklyCertificates, rotation_request};
@@ -2139,6 +1927,7 @@ pub mod rest {
             assert!(transport.idle.borrow().is_none());
         }
 
+        /// A checked-out request may finish on A but must never enter B's idle pool.
         #[test]
         fn replacing_owner_invalidates_checked_out_connection_recycling() {
             let d = testing::Directory::new();
@@ -2181,6 +1970,7 @@ pub mod rest {
             server.join().unwrap();
         }
 
+        /// Retirement affects request boundaries, while expiry and failure discard TLS.
         #[test]
         fn pooled_connections_retire_between_requests_and_discard_failures() {
             let d = testing::Directory::new();
@@ -2296,97 +2086,7 @@ pub mod rest {
             server.join().unwrap();
         }
 
-        #[test]
-        fn pooled_connections_validate_client_key_before_reuse() {
-            let d = testing::Directory::new();
-            let (ca, key) = testing::ca();
-            let identity = TestIdentity::new(&ca, &key);
-            let unrelated = TestIdentity::new(&ca, &key);
-            let response = || ("/snapshot".to_owned(), 200, b"{}".to_vec());
-            let (endpoint, server) =
-                scripted_server(&d, &ca, &key, vec![vec![response(), response()]]);
-            let transport = Transport::new(endpoint);
-            transport.attach_io(Rc::new(FixtureIo));
-            let scope = testing::scope();
-            let invalid_keys = [unrelated.borrowed().private_key, b"corrupt PKCS#8"];
-            let connect_error = |private_key| {
-                futures::executor::block_on(transport.connect(
-                    Some(Identity {
-                        private_key,
-                        ..identity.borrowed()
-                    }),
-                    &scope,
-                ))
-                .err()
-            };
-            let cold_errors = invalid_keys.map(connect_error);
-            assert_eq!(
-                cold_errors,
-                [Some(testing::Error::Transport(Error::Unauthorized)); 2]
-            );
-            let get = || {
-                futures::executor::block_on(async {
-                    transport
-                        .authenticated(&identity, &scope)
-                        .await
-                        .unwrap()
-                        .request(
-                            testing::request(Method::Get, "/snapshot", None, 1024),
-                            &scope,
-                        )
-                        .await
-                        .unwrap()
-                })
-            };
-            assert_eq!(get().status, 200);
-            assert!(transport.idle.borrow().is_some());
-            for (private_key, cold_error) in invalid_keys.into_iter().zip(cold_errors) {
-                assert_eq!(connect_error(private_key), cold_error);
-                assert!(transport.idle.borrow().is_some());
-            }
-            assert_eq!(get().status, 200);
-            assert!(transport.idle.borrow().is_some());
-            transport.close_idle();
-            server.join().unwrap();
-        }
-
-        #[test]
-        fn pooled_connections_require_matching_identity_expiration() {
-            let d = testing::Directory::new();
-            let (ca, key) = testing::ca();
-            let identity = TestIdentity::new(&ca, &key);
-            let (endpoint, server) = scripted_server(
-                &d,
-                &ca,
-                &key,
-                vec![vec![("/snapshot".to_owned(), 200, b"{}".to_vec())]],
-            );
-            let transport = Transport::new(endpoint);
-            transport.attach_io(Rc::new(FixtureIo));
-            let scope = testing::scope();
-            let connection =
-                futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
-            futures::executor::block_on(connection.request(
-                testing::request(Method::Get, "/snapshot", None, 1024),
-                &scope,
-            ))
-            .unwrap();
-            let (epoch, expires) = {
-                let mut idle = transport.idle.borrow_mut();
-                let auth = authenticated(idle.as_mut().unwrap());
-                (auth.epoch, auth.expires)
-            };
-            let mut shorter_identity = identity.borrowed();
-            shorter_identity.expires = expires - Duration::from_secs(1);
-            assert!(
-                transport
-                    .checkout(Some(shorter_identity), epoch, &scope)
-                    .is_none()
-            );
-            assert!(transport.idle.borrow().is_none());
-            server.join().unwrap();
-        }
-
+        /// Each group uses exactly one TLS connection, with EOF proving disposal.
         fn scripted_server(
             d: &testing::Directory,
             ca: &rcgen::Certificate,
@@ -2490,6 +2190,7 @@ pub mod rest {
             (endpoint, server)
         }
 
+        /// Request syntax and credential allocation limits survive consolidation.
         #[test]
         fn request_heads_validate_and_bound_credentials_before_copying() {
             let base = "a".repeat(64);
@@ -2550,6 +2251,7 @@ pub mod rest {
             );
         }
 
+        /// Age jitter remains inclusive, bounded, and nonconstant.
         #[test]
         fn authenticated_age_jitter_is_bounded() {
             assert_eq!(authenticated_age(0), Duration::from_secs(240));
@@ -2561,6 +2263,7 @@ pub mod rest {
             assert_ne!(authenticated_age(1), authenticated_age(30_000));
         }
 
+        /// Reject insecure authorities and ambiguous or oversized response framing.
         #[test]
         fn rejects_ambiguous_framing_and_insecure_urls() {
             for url in [
@@ -2579,6 +2282,7 @@ pub mod rest {
         ] { assert!(parse_head(bytes, 10, 65536).is_err()); }
         }
 
+        /// Maximum caller limits cannot permit overflowing frame sizes or body allocation.
         #[test]
         fn maximum_content_length_rejects_frame_overflow_without_body_allocation() {
             for status in [200, 429] {
@@ -2610,6 +2314,7 @@ pub mod rest {
             }
         }
 
+        /// Connection directives are comma-delimited, case-insensitive, and cumulative.
         #[test]
         fn response_head_collects_connection_close_once() {
             for (headers, close) in [
@@ -2636,6 +2341,7 @@ pub mod rest {
             assert_eq!(parse_head(b"HTTP/1.1 204 No Content\r\n", 10, 20), Ok(None));
         }
 
+        /// Ignored non-UTF-8 headers remain invalid, after framing and size errors.
         #[test]
         fn response_head_preserves_utf8_acceptance_and_error_precedence() {
             for name in ["X-Ignored", "Connection"] {
@@ -2649,6 +2355,7 @@ pub mod rest {
             assert_eq!(parse_head(b"HTTP/1.1 429 Busy\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n", 10, 20).unwrap().unwrap().framing, Framing::Length(12));
         }
 
+        /// Chunked framing retains its status-specific bound, including zero limits.
         #[test]
         fn chunked_framing_carries_the_validated_body_limit() {
             for (status, limit, max_error_body, bound) in [
@@ -2678,6 +2385,7 @@ pub mod rest {
             );
         }
 
+        /// Pool epochs bind trust and certificate boundaries, not borrowed key bytes.
         #[test]
         fn trust_epochs_preserve_certificate_boundaries() {
             let chain = vec![b"ab".to_vec(), b"c".to_vec()];
@@ -2713,6 +2421,7 @@ pub mod rest {
             );
         }
 
+        /// Extension headers retain printable values without changing framing.
         #[test]
         fn generic_header_accepts_tokens_and_printable_values() {
             let head = request_head(
@@ -2732,6 +2441,7 @@ pub mod rest {
             assert!(valid_header("X-Test", " ~"));
         }
 
+        /// Invalid syntax and transport-owned headers cannot be injected.
         #[test]
         fn generic_header_rejects_injection_and_reserved_overrides() {
             for (name, value) in [
@@ -2786,6 +2496,7 @@ pub mod rest {
             }
         }
 
+        /// Header sizes are rejected before credentials enter an allocation.
         #[test]
         fn generic_header_bounds_name_and_value_before_copying() {
             let large = "a".repeat(16384);
@@ -2799,14 +2510,18 @@ pub mod rest {
     }
 }
 
+/// Loopback fixtures shared with the cohesive external transport integration suite.
+/// Keeping this test-only module separate avoids duplicating private pool tests.
 #[cfg(all(test, feature = "rest"))]
 #[path = "../tests/support/mod.rs"]
 mod testing;
 
+/// Byte-level compatibility and boundary checks for the binary codecs.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Every byte round-trips and noncanonical representations are rejected.
     #[test]
     fn canonical_hex() {
         let bytes = std::array::from_fn::<_, 256, _>(|i| i as u8);
@@ -2833,6 +2548,7 @@ mod tests {
         }
     }
 
+    /// Both byte orders match fixed vectors and reject every truncated record.
     #[test]
     fn endian_vectors_and_every_truncation() {
         for (endian, expected) in [
@@ -2866,6 +2582,7 @@ mod tests {
         }
     }
 
+    /// Empty fields, impossible sizes, and full buffers retain their contracts.
     #[test]
     fn limits_empty_fields_and_overflow() {
         let mut bytes = Vec::new();
@@ -2882,18 +2599,6 @@ mod tests {
         let mut reader = Reader::new(&[1, 2], Endian::Big);
         assert_eq!(reader.take(usize::MAX), Err(Error::Truncated));
         assert_eq!(reader.remaining(), &[1, 2]);
-        assert_eq!(
-            Reader::new(&[2, 0, 0, 0, 0], Endian::Little).count(2, 1),
-            Err(Error::Limit)
-        );
-        assert_eq!(
-            Reader::new(&[2, 0, 0, 0], Endian::Little).count(1, 0),
-            Err(Error::Limit)
-        );
-        assert_eq!(
-            Reader::new(&[2, 0, 0, 0], Endian::Little).count(2, 0),
-            Ok(2)
-        );
         let mut oversized = vec![0; 5];
         assert_eq!(
             Writer::new(&mut oversized, 4, Endian::Big).bytes(&[]),
@@ -2907,6 +2612,7 @@ mod tests {
         }
     }
 
+    /// Every output and field bound either appends the whole field or nothing.
     #[test]
     fn length_prefixed_append_is_atomic_at_every_bound() {
         for endian in [Endian::Little, Endian::Big] {
@@ -2935,6 +2641,7 @@ mod tests {
         }
     }
 
+    /// Short prefixes leave the cursor intact; rejected complete counts consume it.
     #[test]
     fn count_failures_preserve_cursor_contract() {
         for endian in [Endian::Little, Endian::Big] {

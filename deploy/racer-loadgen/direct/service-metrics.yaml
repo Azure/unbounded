@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: racer-loadgen-metrics
+  namespace: unbounded-system
+  labels:
+    app.kubernetes.io/name: racer-loadgen
+spec:
+  selector:
+    app.kubernetes.io/name: racer-loadgen
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP

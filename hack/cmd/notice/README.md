@@ -48,16 +48,15 @@ hack/cmd/notice/
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
-### Retained Racer scaffolding
+### Cargo and native collectors
 
-Cargo and native collectors remain registered for the replacement Racer
-implementation. Cargo collection is inactive when neither `Cargo.toml` nor
-`Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is
-required for a workspace without direct registry dependencies. The collector reads
-the root package and its explicitly declared workspace members using the root
-lockfile; no future members or load generator are required.
-Native collection is inactive when neither native version pin is declared in
-`Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
+The Cargo collector reads the Racer dataplane workspace under
+`cmd/racer-dataplane`. It reads the root package and its declared workspace
+members using the root lockfile. Collection is skipped when neither
+`Cargo.toml` nor `Cargo.lock` exists. A workspace without direct registry
+dependencies needs no Cargo registry cache.
+The native collector is skipped when neither native version pin is declared in
+`Makefile`. Incomplete inputs are errors rather than silently omitting notices.
 
 ## Adding a new ecosystem
 

@@ -48,6 +48,10 @@ type NvidiaHost struct {
 	// was provisioned. Discovery refreshes must preserve this value.
 	Required bool
 
+	// UseCDIRuntime selects CDI injection for Azure Linux NVIDIA workloads.
+	// Ubuntu retains the toolkit's existing automatic runtime mode.
+	UseCDIRuntime bool
+
 	// GPUDevicePaths lists NVIDIA GPU device paths discovered on the host
 	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps,
 	// /dev/nvidia-caps-imex-channels, /dev/dri/*).
@@ -134,7 +138,11 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	if err := initializeAzureLinuxNVIDIADevices(defaultNvidiaDeviceInitDeps()); err != nil {
+	hostDistro, useCDIRuntime := detectNVIDIAHostOS()
+	initDeps := defaultNvidiaDeviceInitDeps()
+	initDeps.hostDistro = func() string { return hostDistro }
+
+	if err := initializeAzureLinuxNVIDIADevices(initDeps); err != nil {
 		return NvidiaHost{}, err
 	}
 
@@ -142,6 +150,7 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
+		UseCDIRuntime:     useCDIRuntime,
 		GPUDevicePaths:    devices,
 		ContainerLibDir:   archInfo.libDir,
 		LibMappings:       libraries.libMappings,
@@ -153,6 +162,28 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
 		DriverVersion:     libraries.driverVersion,
 	}, nil
+}
+
+func detectNVIDIAHostOS() (string, bool) {
+	data, err := os.ReadFile(hostOSReleasePath)
+	if err != nil {
+		return "", false
+	}
+
+	values := osReleaseValues(data)
+
+	return hostDistroFromOSReleaseValues(values), useNVIDIACDIRuntime(values)
+}
+
+func useNVIDIACDIRuntime(osRelease map[string]string) bool {
+	if isAzureContainerLinux(osRelease) {
+		return false
+	}
+
+	id := normalizeOSReleaseID(osRelease["ID"])
+
+	return (id == "azurelinux" || id == "azlinux") &&
+		strings.HasPrefix(osRelease["VERSION_ID"], "3")
 }
 
 const (

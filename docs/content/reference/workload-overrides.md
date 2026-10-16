@@ -110,7 +110,7 @@ data:
 
 At least one of `patch` and `extraArgs` must be present.
 
-Each component emits one kind, except `net`:
+Each component emits one kind, except `net` and `racer`:
 
 | Component | Kinds | Per-Site |
 |---|---|---|
@@ -118,6 +118,7 @@ Each component emits one kind, except `net`:
 | `machina` | `Deployment` | no |
 | `gantry` | `DaemonSet` | no |
 | `token-refresher` | `Deployment` | no |
+| `racer` | `Deployment` and `DaemonSet` | no |
 | `metalman` | `Deployment` | yes |
 
 ### Always use `extraArgs` to add arguments

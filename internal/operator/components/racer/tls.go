@@ -35,8 +35,6 @@ const (
 	leafRenewBefore    = 30 * day
 	caLifetime         = 10 * 365 * day
 	trustOverlap       = 360 * day
-	legacyCALifetime   = 28 * day
-	legacyTrustOverlap = 14 * day
 	tlsStateKey        = "rotation.json"
 	previousCAKey      = "previous-ca.crt"
 	caBundleKey        = "ca-bundle.crt"
@@ -276,12 +274,7 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 		}
 	}
 
-	interval := caRotationInterval
-	if ca.NotAfter.Equal(state.CreatedAt.Add(legacyCALifetime)) {
-		interval = 7 * day
-	}
-
-	rotate := !now.Before(state.CreatedAt.Add(interval))
+	rotate := !now.Before(state.CreatedAt.Add(caRotationInterval))
 	if rotate {
 		newKey, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if keyErr != nil {
@@ -532,7 +525,7 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 		return state, fmt.Errorf("trailing Racer serving rotation state")
 	}
 
-	validLifetime := ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || ca.NotAfter.Equal(state.CreatedAt.Add(legacyCALifetime))
+	validLifetime := ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime))
 	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" || !state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || !validLifetime || len(state.Previous) > maxPreviousCAs {
 		return state, fmt.Errorf("invalid Racer serving rotation policy state")
 	}
@@ -559,12 +552,7 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 			expires = root.NotAfter
 		}
 
-		overlap := trustOverlap
-		if child.NotAfter.Equal(child.NotBefore.Add(time.Hour + legacyCALifetime)) {
-			overlap = legacyTrustOverlap
-		}
-
-		retireAt := child.NotBefore.Add(time.Hour + overlap)
+		retireAt := child.NotBefore.Add(time.Hour + trustOverlap)
 		if expires.Before(retireAt) {
 			retireAt = expires
 		}

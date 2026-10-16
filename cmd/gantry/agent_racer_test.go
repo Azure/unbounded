@@ -36,7 +36,7 @@ func (c *startupRacerClient) Close() error { c.closed.Store(true); return nil }
 
 func TestRacerStartupSelection(t *testing.T) {
 	// Both modes read the same config. The Racer path reaches mirror listener setup
-	// despite missing legacy requirements; legacy mode rejects those requirements.
+	// despite missing p2p requirements; p2p mode rejects those requirements.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +244,7 @@ func TestRacerReadinessAndCancellation(t *testing.T) {
 	}
 
 	if !strings.Contains(string(body), "go_goroutines") || strings.Contains(string(body), "p2p_") || strings.Contains(string(body), "gantry_containerd_") {
-		t.Fatalf("expected runtime metrics without legacy instruments, got %s", body)
+		t.Fatalf("expected runtime metrics without p2p instruments, got %s", body)
 	}
 
 	socketsAvailable.Store(false)
@@ -383,6 +383,6 @@ func TestRacerIgnoresSharedCredentialFile(t *testing.T) {
 		probe:       func(context.Context, string) error { return nil },
 	})
 	if !errors.Is(err, want) || !client.closed.Load() {
-		t.Fatalf("Racer loaded legacy credentials or leaked client: %v", err)
+		t.Fatalf("Racer loaded p2p credentials or leaked client: %v", err)
 	}
 }
