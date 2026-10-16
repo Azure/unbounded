@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -141,6 +142,39 @@ func TestWaitForNodeAssignmentWatchRestartAndCancel(t *testing.T) {
 			t.Fatalf("error = %v, want context canceled", err)
 		}
 	})
+}
+
+func TestWaitForNodeAssignmentThrottlesWatchReconnect(t *testing.T) {
+	for _, errorEvent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("errorEvent=%v", errorEvent), func(t *testing.T) {
+			client := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}})
+			calls := 0
+
+			client.PrependWatchReactor("nodes", func(k8stesting.Action) (bool, watch.Interface, error) {
+				calls++
+
+				watcher := watch.NewRaceFreeFake()
+				if errorEvent {
+					watcher.Error(&metav1.Status{Status: metav1.StatusFailure, Reason: metav1.StatusReasonExpired})
+				} else {
+					watcher.Stop()
+				}
+
+				return true, watcher, nil
+			})
+
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+
+			if _, err := waitForNodeAssignment(ctx, client, "node-a"); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error=%v, want cancellation while retrying", err)
+			}
+
+			if calls != 1 {
+				t.Fatalf("watch reconnected %d times before retry interval", calls)
+			}
+		})
+	}
 }
 
 func TestAcknowledgeEffectiveAssignment(t *testing.T) {
