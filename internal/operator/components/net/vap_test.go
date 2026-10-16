@@ -285,6 +285,25 @@ func TestNodeFieldPolicyRestrictsGatewayTaint(t *testing.T) {
 	if evalCEL(t, taintExpression, map[string]any{"oldObject": oldObject, "object": exact, "request": request("node-b")}) {
 		t.Fatal("cross-Node gateway taint was allowed")
 	}
+
+	for _, taint := range []map[string]any{
+		{"key": "net.unbounded-cloud.io/gateway-node", "value": "true", "effect": "NoExecute"},
+		{"key": "net.unbounded-cloud.io/gateway-node", "value": "false", "effect": "NoSchedule"},
+		{"key": "net.unbounded-cloud.io/gateway-node", "effect": "NoSchedule"},
+	} {
+		protected := nodeSpecAdmissionObject([]map[string]any{taint})
+		if !evalCEL(t, taintExpression, map[string]any{"oldObject": protected, "object": protected, "request": request("node-a")}) {
+			t.Fatalf("unchanged non-owned taint denied: %v", taint)
+		}
+
+		if evalCEL(t, taintExpression, map[string]any{"oldObject": protected, "object": oldObject, "request": request("node-a")}) {
+			t.Fatalf("non-owned taint removal allowed: %v", taint)
+		}
+
+		if evalCEL(t, taintExpression, map[string]any{"oldObject": protected, "object": exact, "request": request("node-a")}) {
+			t.Fatalf("non-owned taint replacement allowed: %v", taint)
+		}
+	}
 }
 
 func TestPublicIPAnnotationOwnershipPolicyScope(t *testing.T) {
