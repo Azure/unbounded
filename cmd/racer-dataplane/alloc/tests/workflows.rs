@@ -4,6 +4,9 @@ use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segme
 #[cfg(feature = "simulation")]
 use page_alloc::{Charge, SegmentState};
 #[cfg(feature = "simulation")]
+use racer_platform::simulation::{Fault, Simulation};
+use racer_platform::{Operation, reactor::Reactor, scope::LibraryScope};
+#[cfg(feature = "simulation")]
 use std::{cell::Cell, path::Path, rc::Rc};
 use std::{
     fs::File,
@@ -14,16 +17,13 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
-#[cfg(feature = "simulation")]
-use uring_runtime::reactor::simulation::{Fault, Simulation};
-use uring_runtime::{Operation, Scope, reactor::Reactor};
 
 /// Distinguishes allocator validation errors from runtime completion failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestError {
     Alloc(Error),
 
-    Runtime(uring_runtime::Error),
+    Runtime(racer_platform::Error),
 }
 
 impl From<Error> for TestError {
@@ -33,9 +33,9 @@ impl From<Error> for TestError {
     }
 }
 
-impl From<uring_runtime::Error> for TestError {
+impl From<racer_platform::Error> for TestError {
     /// Preserve runtime errors without enriching them as synchronous allocator errors.
-    fn from(error: uring_runtime::Error) -> Self {
+    fn from(error: racer_platform::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -44,7 +44,14 @@ impl From<uring_runtime::Error> for TestError {
 #[derive(Clone)]
 struct TestScope;
 
-impl Scope for TestScope {
+impl From<racer_platform::uring::Error> for TestError {
+    /// Library errors take the runtime category.
+    fn from(error: racer_platform::uring::Error) -> Self {
+        Self::Runtime(error.into())
+    }
+}
+
+impl LibraryScope for TestScope {
     type Error = TestError;
 
     /// Keep the scope live; cancellation is injected by dropping waiting futures.
@@ -519,7 +526,7 @@ fn roundtrip_short_io_and_runtime_errors() {
     sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
     assert!(matches!(
         drive(&reactor, read()),
-        Err(TestError::Runtime(uring_runtime::Error::Os(libc::EIO)))
+        Err(TestError::Runtime(racer_platform::Error::Os(libc::EIO)))
     ));
     assert_eq!(reactor.in_flight(), 0);
     segments.begin_evict(SegmentId(0)).unwrap();
