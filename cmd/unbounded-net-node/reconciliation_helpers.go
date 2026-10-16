@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -276,6 +277,10 @@ func gatewayPoolPeeringTunnelMTU(
 	remotePool = strings.TrimSpace(remotePool)
 
 	for _, peering := range poolPeerings {
+		if !unboundednetv1alpha1.SpecEnabled(peering.Spec.Enabled) {
+			continue
+		}
+
 		hasLocal := false
 		hasRemote := false
 
@@ -294,36 +299,51 @@ func gatewayPoolPeeringTunnelMTU(
 }
 
 func learnedGatewayTransitTunnelMTU(
-	peerPool string,
 	learnedRoutes map[string]unboundednetv1alpha1.GatewayNodeRoute,
+	siteMTUs, poolMTUs map[string]int,
+	assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment,
 	poolPeerings []unboundednetv1alpha1.GatewayPoolPeering,
 ) int {
 	result := 0
-	peerPool = strings.TrimSpace(peerPool)
 
 	for _, route := range learnedRoutes {
 		for _, path := range route.Paths {
-			pathPools := map[string]bool{peerPool: true}
-
-			for _, hop := range path {
-				if hop.Type == "GatewayPool" {
-					if poolName := strings.TrimSpace(hop.Name); poolName != "" {
-						pathPools[poolName] = true
-					}
-				}
-			}
-
-			for _, peering := range poolPeerings {
-				matchedPools := 0
-
-				for _, poolName := range peering.Spec.GatewayPools {
-					if pathPools[strings.TrimSpace(poolName)] {
-						matchedPools++
-					}
+			for index, hop := range path {
+				switch hop.Type {
+				case "Site":
+					result = resolveTunnelMTU(result, siteMTUs[hop.Name])
+				case "GatewayPool":
+					result = resolveTunnelMTU(result, poolMTUs[hop.Name])
 				}
 
-				if matchedPools >= 2 {
-					result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+				if index == 0 {
+					continue
+				}
+
+				// Paths run from origin to advertiser. Only adjacent hops
+				// identify a forwarding edge; co-occurrence is not enough.
+				previous := path[index-1]
+				if previous.Type == "GatewayPool" && hop.Type == "GatewayPool" {
+					result = resolveTunnelMTU(result, gatewayPoolPeeringTunnelMTU([]string{previous.Name}, hop.Name, poolPeerings))
+
+					continue
+				}
+
+				site, pool := previous, hop
+				if site.Type == "GatewayPool" && pool.Type == "Site" {
+					site, pool = pool, site
+				}
+
+				if site.Type != "Site" || pool.Type != "GatewayPool" {
+					continue
+				}
+
+				for _, assignment := range assignments {
+					if unboundednetv1alpha1.SpecEnabled(assignment.Spec.Enabled) &&
+						slices.Contains(assignment.Spec.Sites, site.Name) &&
+						slices.Contains(assignment.Spec.GatewayPools, pool.Name) {
+						result = resolveTunnelMTU(result, tunnelMTUFromSpec(assignment.Spec.TunnelMTU))
+					}
 				}
 			}
 		}

@@ -33,23 +33,26 @@ type gatewayInformerGeneration struct {
 }
 
 type gatewayInformerLifecycle struct {
-	client dynamic.Interface
-	resync time.Duration
+	client      dynamic.Interface
+	resync      time.Duration
+	syncTimeout time.Duration
 
-	mu         sync.RWMutex
-	required   bool
-	starting   bool
-	retiring   bool
-	generation uint64
-	active     *gatewayInformerGeneration
-	onEvent    func()
-	lastErr    error
+	mu          sync.RWMutex
+	required    bool
+	starting    bool
+	retiring    bool
+	generation  uint64
+	active      *gatewayInformerGeneration
+	onEvent     func()
+	lastErr     error
+	startCancel context.CancelFunc
 }
 
 func newGatewayInformerLifecycle(client dynamic.Interface, resync time.Duration) *gatewayInformerLifecycle {
 	return &gatewayInformerLifecycle{
-		client: client,
-		resync: resync,
+		client:      client,
+		resync:      resync,
+		syncTimeout: 30 * time.Second,
 	}
 }
 
@@ -75,7 +78,11 @@ func (l *gatewayInformerLifecycle) setRequired(required bool) {
 	defer l.mu.Unlock()
 
 	l.required = required
+
 	l.retiring = !required && l.active != nil
+	if !required && l.startCancel != nil {
+		l.startCancel()
+	}
 }
 
 func (l *gatewayInformerLifecycle) readiness() (bool, string) {
@@ -155,6 +162,20 @@ func (l *gatewayInformerLifecycle) start(ctx context.Context) (gatewayInformerSn
 		return snapshot, false, nil
 	}
 
+	if !l.required {
+		l.mu.Unlock()
+
+		return gatewayInformerSnapshot{}, false, nil
+	}
+
+	if l.starting {
+		l.mu.Unlock()
+
+		return gatewayInformerSnapshot{}, false, fmt.Errorf("gateway informer caches are already starting")
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	l.startCancel = cancel
 	l.starting = true
 	l.lastErr = nil
 	l.generation++
@@ -168,12 +189,12 @@ func (l *gatewayInformerLifecycle) start(ctx context.Context) (gatewayInformerSn
 
 	cleanups, err := addGatewayInformerEventHandlers(pools, nodes, poolPeerings, l.requestUpdate)
 	if err != nil {
+		cancel()
 		l.recordStartFailure(err)
 
 		return gatewayInformerSnapshot{}, false, err
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
 	factory.Start(runCtx.Done())
 
 	snapshot := gatewayInformerSnapshot{
@@ -183,7 +204,11 @@ func (l *gatewayInformerLifecycle) start(ctx context.Context) (gatewayInformerSn
 		nodes:        nodes,
 		poolPeerings: poolPeerings,
 	}
-	if !cache.WaitForCacheSync(runCtx.Done(), pools.HasSynced, nodes.HasSynced, poolPeerings.HasSynced) {
+
+	syncCtx, stopSync := context.WithTimeout(runCtx, l.syncTimeout)
+	defer stopSync()
+
+	if !cache.WaitForCacheSync(syncCtx.Done(), pools.HasSynced, nodes.HasSynced, poolPeerings.HasSynced) {
 		cancel()
 		runGatewayInformerCleanups(cleanups)
 
@@ -204,7 +229,18 @@ func (l *gatewayInformerLifecycle) start(ctx context.Context) (gatewayInformerSn
 	}
 
 	l.mu.Lock()
+	if !l.required || runCtx.Err() != nil {
+		l.starting = false
+		l.startCancel = nil
+		l.mu.Unlock()
+		cancel()
+		runGatewayInformerCleanups(cleanups)
+
+		return gatewayInformerSnapshot{}, false, fmt.Errorf("gateway informer generation %d start canceled", generation)
+	}
+
 	l.starting = false
+	l.startCancel = nil
 	l.lastErr = nil
 	l.active = activeGeneration
 	l.retiring = !l.required
@@ -218,6 +254,7 @@ func (l *gatewayInformerLifecycle) recordStartFailure(err error) {
 	defer l.mu.Unlock()
 
 	l.starting = false
+	l.startCancel = nil
 	l.lastErr = err
 }
 
@@ -244,7 +281,11 @@ func (l *gatewayInformerLifecycle) close() {
 	active := l.active
 	l.active = nil
 	l.required = false
+
 	l.retiring = false
+	if l.startCancel != nil {
+		l.startCancel()
+	}
 	l.mu.Unlock()
 
 	if active != nil {

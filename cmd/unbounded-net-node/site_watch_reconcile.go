@@ -284,6 +284,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 			gatewaySnapshot        gatewayInformerSnapshot
 			retireGatewayInformers bool
 			gatewayStateStable     bool
+			err                    error
 		)
 
 		for range 3 {
@@ -1886,9 +1887,9 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				excludedNodeCIDRSites := networkPeeredSites
 				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
 
-				transitTunnelMTU := learnedGatewayTransitTunnelMTU(pool.Name, learnedRoutes, poolPeerings)
+				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignments, poolPeerings)
 				if isGatewayNode {
-					transitTunnelMTU = gatewayPoolPeeringTunnelMTU(localGatewayPools, pool.Name, poolPeerings)
+					transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU, gatewayPoolPeeringTunnelMTU(localGatewayPools, pool.Name, poolPeerings))
 				}
 
 				peeringTunnelProtocol := poolPeeringTunnelProtocols[pool.Name]
