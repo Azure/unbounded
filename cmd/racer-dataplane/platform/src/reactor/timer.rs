@@ -33,8 +33,9 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             scope.check()?;
             #[cfg(feature = "simulation")]
             match mode {
-                // TODO(sim): also reject Kernel mode when the backend is simulated.
-                SleepMode::Kernel if crate::environment::simulation_seed().is_some() => {
+                SleepMode::Kernel
+                    if crate::environment::simulation_seed().is_some() || self.is_simulated() =>
+                {
                     return Err(Error::InvalidConfiguration.into());
                 }
                 SleepMode::ClockPoll if crate::environment::simulation_seed().is_none() => {
