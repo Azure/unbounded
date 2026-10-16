@@ -212,7 +212,7 @@ name = "controlplane"
 version = "0.1.0"
 dependencies = [
  "futures",
- "uring-runtime",
+ "uring-runtime-legacy",
  "wire-codec",
 ]
 
@@ -425,7 +425,7 @@ dependencies = [
  "futures",
  "libc",
  "page-alloc",
- "uring-runtime",
+ "uring-runtime-legacy",
  "zeroize",
 ]
 
@@ -556,7 +556,7 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
- "uring-runtime",
+ "uring-runtime-legacy",
  "zeroize",
 ]
 
@@ -699,7 +699,7 @@ name = "page-alloc"
 version = "0.1.0"
 dependencies = [
  "libc",
- "uring-runtime",
+ "uring-runtime-legacy",
  "zeroize",
 ]
 
@@ -713,7 +713,7 @@ dependencies = [
  "racer-crypto",
  "racer-object-wire",
  "sha2",
- "uring-runtime",
+ "uring-runtime-legacy",
 ]
 
 [[package]]
@@ -842,7 +842,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "uring-runtime",
+ "uring-runtime-legacy",
  "x509-parser",
  "xaes-256-gcm",
  "zeroize",
@@ -877,7 +877,7 @@ dependencies = [
  "telemetry",
  "topology",
  "uds-endpoint",
- "uring-runtime",
+ "uring-runtime-legacy",
  "wire-codec",
  "x509-parser",
  "zeroize",
@@ -922,7 +922,7 @@ dependencies = [
  "futures",
  "libc",
  "serde_json",
- "uring-runtime",
+ "uring-runtime-legacy",
 ]
 
 [[package]]
@@ -1164,7 +1164,7 @@ name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "httparse",
- "uring-runtime",
+ "uring-runtime-legacy",
  "zeroize",
 ]
 
@@ -1237,7 +1237,7 @@ name = "uds-endpoint"
 version = "0.1.0"
 dependencies = [
  "libc",
- "uring-runtime",
+ "uring-runtime-legacy",
 ]
 
 [[package]]
@@ -1263,7 +1263,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
-name = "uring-runtime"
+name = "uring-runtime-legacy"
 version = "0.1.0"
 dependencies = [
  "futures",
@@ -1370,7 +1370,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "sha2",
- "uring-runtime",
+ "uring-runtime-legacy",
  "zeroize",
 ]
 

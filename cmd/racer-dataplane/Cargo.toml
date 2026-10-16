@@ -37,7 +37,7 @@ http1 = { path = "http" }
 racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }
 page-alloc = { path = "alloc" }
-uring-runtime = { path = "runtime" }
+uring-runtime = { package = "uring-runtime-legacy", path = "runtime" }
 base64 = "0.22"
 futures = "0.3"
 getrandom = "0.2"
@@ -63,7 +63,7 @@ wire-codec = { path = "wire-codec", features = ["simulation"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }
 page-alloc = { path = "alloc", features = ["simulation"] }
-uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
+uring-runtime = { package = "uring-runtime-legacy", path = "runtime", features = ["simulation", "test-util"] }
 
 # Keep source locations and inline frames for Parca.
 #

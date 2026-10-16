@@ -1,10 +1,16 @@
 [package]
-name = "uring-runtime"
+name = "uring-runtime-legacy"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
 description = "Explicitly driven worker-local io_uring runtime"
+
+# Legacy runtime kept while consumers migrate to racer-platform. The package is
+# renamed so it can share one lockfile with crates/uring-runtime; the library
+# name stays `uring_runtime` so consumer sources are unchanged.
+[lib]
+name = "uring_runtime"
 
 [features]
 default = []

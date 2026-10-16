@@ -167,8 +167,8 @@ jobs:
 
       - name: Strict runtime Clippy
         run: |
-          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --all-features -- -D warnings
-          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --no-default-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime-legacy --all-targets --all-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime-legacy --all-targets --no-default-features -- -D warnings
 
       # Keep allocator invocations separate from runtime/workspace builds:
       # runtime test features must not enable simulation in the production
@@ -261,7 +261,7 @@ jobs:
       - name: Runtime production real I/O (no simulation)
         env:
           RUNTIME_REQUIRE_IO_URING: "1"
-        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --no-default-features
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime-legacy --no-default-features
 
       # Keep allocator invocations separate from runtime/workspace tests: runtime
       # test features must not enable simulation in the production allocator gate.
