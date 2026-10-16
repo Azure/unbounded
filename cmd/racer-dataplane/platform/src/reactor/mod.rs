@@ -168,6 +168,17 @@ pub struct ReactorWake {
 }
 
 impl ReactorWake {
+    /// The backend wake endpoint, if the backend has one.
+    pub(crate) fn into_remote(self) -> Option<uring::backend::RemoteWaker> {
+        self.waker
+    }
+
+    /// Wrap a backend wake endpoint (tests).
+    #[cfg(test)]
+    pub(crate) fn from_remote(waker: uring::backend::RemoteWaker) -> Self {
+        Self { waker: Some(waker) }
+    }
+
     /// Notify the worker without blocking. Wakes from the reactor's own thread
     /// only mark the next wait as non-blocking.
     pub fn wake(&self) -> Result<()> {
