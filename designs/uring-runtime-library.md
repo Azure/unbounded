@@ -165,6 +165,7 @@ pub trait Backend: 'static {
     fn init(&mut self, config: &BackendConfig) -> Result<()>;
     unsafe fn push(&mut self, user_data: u64, op: &Op<'_, Self::Fd>) -> Result<(), PushError>;
     fn cancel(&mut self, user_data: u64, target: u64) -> Result<(), PushError>;
+    unsafe fn adopt_fd(&mut self, raw: i32) -> Self::Fd;   // own an Accept/OpenAt2 result
     fn submit(&mut self) -> Result<usize>;
     fn pop(&mut self) -> Option<CompletionEntry>;   // { user_data, result: i32, flags }
     fn wait(&mut self, timeout: Duration) -> Result<()>;
@@ -220,63 +221,149 @@ Vec-backed allocation, stable across moves.
 
 ### Reactor
 
+Module `reactor` (`reactor/{mod,ops,table,admission,fence}.rs`).
+
 ```rust
-pub struct Reactor<B: Backend> { /* RefCell<State<B>> */ }
+pub struct Reactor<B: Backend> { /* RefCell<State<B>>, !Send */ }
+
+#[non_exhaustive] #[derive(Clone, Debug, Eq, PartialEq)]   // impl Default
 pub struct ReactorConfig {
-    pub max_in_flight: usize,          // ordinary partition; ring = 2x for cancels
-    pub max_wait: Duration,            // cap on a single wait (default 10 ms)
-    pub drop_wait: Duration,           // bounded drain on Drop (default 0: never block)
-    pub cancel_scan_budget: usize,     // entries scanned per poll
-    pub cancel_wins: bool,             // default false: kernel result is returned
-}
+    pub max_in_flight: usize,       // ordinary partition, default 256, must be > 0
+    pub max_reserved: usize,        // pool for reserve(), default 0
+    pub max_wait: Duration,         // cap per wait, default 10 ms
+    pub drop_wait: Duration,        // bounded fence on Drop, default 0 (never block)
+    pub cancel_scan_budget: usize,  // slots scanned per poll, default 64
+    pub cancel_wins: bool,          // default false: kernel result wins
+}   // + with_* builders; backend capacity = 2 * (max_in_flight + max_reserved)
+
 impl<B: Backend> Reactor<B> {
-    pub fn new(backend: B, config: ReactorConfig) -> Result<Self>;
-    pub fn backend(&self) -> Ref<'_, B>; pub fn clock(&self) -> B::Clock;
-    pub fn read_at<Buf: IoBufMut, S: Scope>(&self, fd: &B::Fd, offset: u64, buf: Buf, scope: &S) -> Read<'_, B, Buf, S>;
-    // write_at, recv, send, poll (readiness), accept, connect, sleep_until,
-    // open_at2, statx, fsync, rename_at, unlink_at, mkdir_at
-    pub fn reserve(&self, slots: usize) -> Result<Reservation>;   // dedicated capacity
-    pub fn poll(&self, max_completions: usize) -> Result<usize>;  // reap + scan + submit
+    pub fn new(backend: B, config: ReactorConfig) -> Result<Self>;  // calls backend.init
+    pub fn config(&self) -> &ReactorConfig;
+    pub fn backend(&self) -> Ref<'_, B>; pub fn backend_mut(&self) -> RefMut<'_, B>;
+    pub fn clock(&self) -> &B::Clock; pub fn entropy(&self) -> Ref<'_, B::Entropy>;
+    pub fn remote_waker(&self) -> RemoteWaker;
+    pub fn in_flight(&self) -> usize; pub fn is_closed(&self) -> bool;
+    pub fn failure(&self) -> Option<Error>;
+
+    // Operations: lazy futures, submitted on first poll.
+    pub fn read_at<Buf: IoBufMut, S: Scope>(&self, fd: &B::Fd, offset: u64, buf: Buf, scope: &S)
+        -> Operation<'_, B, ReadAt<B, Buf>, S>;          // BufResult<usize, Buf, S::Error>
+    pub fn write_at<Buf: IoBuf, S>(..) ;                 // BufResult<usize, Buf, S::Error>
+    pub fn recv<Buf: IoBufMut, S>(&self, fd, buf, scope);  // BufResult<usize, Buf, S::Error>
+    pub fn send<Buf: IoBuf, S>(&self, fd, buf, scope);     // MSG_NOSIGNAL; BufResult<usize, ..>
+    pub fn readiness<S>(&self, fd, events: u32, scope);    // Result<u32 revents, S::Error>
+    pub fn accept<S>(&self, fd, scope);                    // Result<(B::Fd, SockAddr), S::Error>
+    pub fn connect<S>(&self, fd, address: &SocketAddress, scope); // Result<(), S::Error>
+    pub fn sleep_until<S>(&self, deadline: Instant, scope);       // Result<(), S::Error>, -ETIME = Ok
+    pub fn open_at2<S>(&self, dir: Option<&B::Fd>, path: &CStr, how: OpenHow, scope); // Result<B::Fd, _>
+    pub fn statx<S>(&self, dir, path, flags: i32, mask: u32, scope); // Result<libc::statx, _>
+    pub fn fsync<S>(&self, fd, datasync: bool, scope);
+    pub fn rename_at<S>(&self, old_dir, old_path, new_dir, new_path, flags: u32, scope);
+    pub fn unlink_at<S>(&self, dir, path, flags: i32, scope);
+    pub fn mkdir_at<S>(&self, dir, path, mode: u32, scope);
+    pub fn nop<S>(&self, scope);
+
+    pub fn reserve(&self, slots: usize) -> Result<Reservation>;
+    pub fn reserved_available(&self) -> usize;
+    pub fn set_rejection_observer(&self, f: impl Fn(&Rejection<'_>) + 'static);
+    pub fn clear_rejection_observer(&self);
+    pub fn poll(&self, max_completions: usize) -> Result<usize>;
     pub fn wait(&self, timeout: Duration) -> Result<()>;
-    pub fn remote_waker(&self) -> Result<RemoteWaker>;
-    pub fn in_flight(&self) -> usize;
-    pub async fn drain(&self) -> Result<()>;           // stop admission, fence everything
-    pub async fn fence_matching(&self, f: impl Fn(&dyn Any) -> bool);  // or typed by scope
+    pub fn drain(&self) -> Fence<'_, B>;                                  // close + cancel all
+    pub fn fence_matching<S: Scope>(&self, f: impl FnMut(&S) -> bool) -> Fence<'_, B>;
     pub fn shutdown(&self, timeout: Duration) -> Result<()>;
 }
+pub fn leaked_operations() -> usize;   // process-wide count of leaked operations
+
+// Operation<'r, B, O: OpSpec<B>, S: Scope, L = ()>: Future + Unpin
+impl Operation<..> {
+    pub fn reserved(self, r: &Reservation) -> Self;               // before first poll
+    pub fn lease<L>(self, lease: L) -> Operation<.., Leased<L>>;  // output becomes (output, L)
+    pub fn is_submitted(&self) -> bool;
+}
 ```
 
-Every I/O result returns ownership of everything the caller passed in, on
-success and on failure:
+Op spec types (`ReadAt`, `WriteAt`, `SocketRecv`, `SocketSend`, `Readiness`,
+`Accept`, `Connect`, `SleepUntil`, `OpenAt2`, `Statx`, `Fsync`, `RenameAt`,
+`UnlinkAt`, `MkDirAt`, `Nop`) implement the sealed `OpSpec<B>` trait; the
+single generic future `Operation` avoids boxing.
 
-```rust
-pub struct BufResult<T, B, E = Error> { pub result: Result<T, E>, pub buf: B }
-// new, into_parts, map, and From<BufResult> for (Result<T, E>, B)
-```
+Ownership: on first poll the spec (owning the buffer, a descriptor clone, the
+encoded `SockAddr`, `CString` paths, `OpenHow`, a one-element `Vec<statx>`,
+the timeout's `KernelTimespec`), the scope and the lease are moved into one
+heap node (`Box::into_raw`, addressed only through raw pointers), and the
+`Op` is derived from the node in place. The node is freed after the fence by
+the future (inputs returned to the caller) or by the reactor (future
+dropped). Otherwise it is leaked and counted. Accepted/opened descriptors are
+adopted (`Backend::adopt_fd`) when the original completion arrives.
 
-Option-style combinators replace the `_with_lease`, `_reserved` and
-`_with_observation` method families: a `Submit` options struct (or builder) on
-each operation carries an optional `Reservation` and an optional
-caller-owned "lease" value that is held until both fences and returned.
+In-flight table: a generation-tagged slab; `user_data` = generation (31 bits)
+<< 32 | slot, bit 63 marks the cancel request. Fence state per entry:
+`InFlight(None | Queued | Pushed | Completed) -> AwaitingCancel(result) ->
+Done(result)`; unknown, stale or duplicate completions fail the reactor
+(admission closed, everything canceled, `poll` returns the error, `failure()`
+reports it, later polls keep reaping).
 
-Cancellation precedence: by default the kernel result wins. If an operation
-completed successfully after its scope was canceled, the caller still gets the
-bytes or the accepted descriptor plus a `canceled` flag, so stream state is
-never silently lost. `cancel_wins = true` restores the old behavior.
+Cancellation is requested by: the scope's `CancelToken` (registered per
+operation; canceling wakes the reactor through the backend's `RemoteWaker`),
+an expired `Scope::deadline` hint followed by a failing `check` (`wait`
+never sleeps past the earliest hint), the bounded round-robin `check` scan, a
+dropped future, `drain`, `fence_matching`, `shutdown`, or a reactor failure.
+Precedence: a successful completion is returned as `Ok` (kernel wins; the
+caller can consult its scope); a failed completion of a canceled operation
+is the scope's error, or `Canceled` if the scope still passes. With
+`cancel_wins`, every canceled operation reports the cancellation error and
+drops the result (closing accepted descriptors). Kernel errors convert with
+`S::Error: From<Error>`; keep `Error` in the application error type to
+observe errno (for example `ECONNREFUSED` from `connect`). No retries.
 
-Retries are not done by the reactor. Short reads/writes and `EAGAIN` are
-returned to the caller.
+Admission: ordinary slots (`max_in_flight`) or a `Reservation` (`Rc`-shared,
+`slots()/in_use()/available()`, pool returned when the last clone drops and
+its operations are fenced). Slots are held until the fence, not until the
+result is collected. Rejections (`RejectionReason::{Capacity,
+ReservationExhausted, ForeignReservation, Closed, Failed, QueueFull,
+Unsupported, Backend}`) return all inputs and the lease, and are reported
+to the observer as `Rejection { reason, kind: OpKind, reserved, scope: &dyn
+Any, error: &Error }` after the state borrow is released. Scope failures
+before submission are not rejections.
 
-Drop: never blocks unless `drop_wait > 0`. Anything the kernel may still touch
-is leaked (`mem::forget`) and counted (`Reactor::leaked()`), never freed.
+Re-entrancy: no user code runs under the state borrow (waker clones are made
+outside it). `poll` and `fence_matching` fail with `Unavailable` when called
+from a scope check or fence predicate (the busy guard protects in-flight node
+pointers). Wakers, scope-check panics and destructors of released inputs are
+isolated with `catch_unwind`; the first panic is resumed after the batch.
+
+Drop: if work is in flight, `shutdown(drop_wait)` when `drop_wait > 0`
+and not panicking; anything still in flight is leaked together with the
+backend (`ManuallyDrop`), and counted by `leaked_operations()`.
 
 Kernel requirements: Linux 5.6 for the core opcodes, 5.15 for `MkDirAt`.
-`Uring::init` probes opcodes with `io_uring::Probe`, requires
-`IORING_FEAT_NODROP`, and falls back from `SINGLE_ISSUER`/`SUBMIT_ALL` on
-`EINVAL`. `sleep_until` uses absolute `CLOCK_MONOTONIC` timeouts.
 
-Fixes carried over: IPv6 `sin6_flowinfo` is passed through without byte
-swapping, matching std.
+### Uring backend
+
+`uring::Uring` (`!Send`; `Fd = crate::Fd`, `SystemClock`, `SystemEntropy`;
+`Uring::new()`, `Uring::is_available()`, `single_issuer()`, `submit_all()`).
+
+- `init`: SQ = capacity, CQ = 2 * capacity; setup flags tried in order
+  `SUBMIT_ALL | SINGLE_ISSUER`, `SUBMIT_ALL`, none, falling back only on
+  `EINVAL`; requires `IORING_FEAT_NODROP` (else `Unsupported`); probes
+  opcodes with `register_probe` (`supports`, and `push` refuses unsupported
+  opcodes with `PushError::Unsupported`); creates the wake eventfd. Setup
+  flags are recorded from what was requested, not read from the
+  `Parameters` layout.
+- `submit`: skips `io_uring_enter` when the SQ is empty and neither
+  `CQ_OVERFLOW` nor `TASKRUN` is flagged; `EINTR`/`EAGAIN`/`EBUSY` count as
+  zero submitted.
+- `wait`: does not submit (the reactor does); returns at once on a zero
+  timeout, a pending same-thread wake, or ready completions; otherwise
+  `ppoll` on the ring fd and the eventfd, draining the eventfd afterwards.
+- `RemoteWaker`: same-thread wakes set a flag; remote wakes are coalesced
+  with an atomic and write the eventfd once.
+- `Timeout`: absolute `CLOCK_MONOTONIC` (`TimeoutFlags::ABS`), converted
+  from `Instant` via `Instant::now()` and `clock_gettime` read back to back.
+- `Accept` uses `SOCK_CLOEXEC | SOCK_NONBLOCK`; the reactor's `send` sets
+  `MSG_NOSIGNAL`.
+- `Host`: libc calls; sockets and pipes are nonblocking and close-on-exec.
 
 ### Task, time, cancel
 
@@ -442,6 +529,9 @@ policy and stays behind Racer's own `simulation` feature.
 
 ## Validation
 
+- Reactor state-machine tests use a scripted backend (`reactor/tests.rs`)
+  and run under Miri (Stacked and Tree Borrows); real-kernel tests live in
+  `uring-runtime/tests/uring.rs`.
 - `crates/`: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
   `cargo test` (io_uring tests fail, not skip, when `URING_RUNTIME_REQUIRE_KERNEL=1`),
   `cargo doc -D warnings`, Miri on the pure state-machine, buffer and executor

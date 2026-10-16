@@ -717,9 +717,10 @@ impl<B: Backend> Reactor<B> {
     /// after all the others ran.
     ///
     /// A completion that does not match an in-flight operation, or a
-    /// backend submit failure, stops the reactor: it is reported once as an
-    /// error here, admission is closed, everything in flight is canceled,
-    /// and later polls keep reaping so that fences can still complete.
+    /// backend submit failure, stops the reactor: the poll that observes it
+    /// returns the error, admission is closed (see [`failure`](Reactor::failure)),
+    /// everything in flight is canceled, and later polls keep reaping so
+    /// that fences can still complete.
     pub fn poll(&self, max_completions: usize) -> Result<usize> {
         let guard = self.enter()?;
         let mut released = Released::default();
