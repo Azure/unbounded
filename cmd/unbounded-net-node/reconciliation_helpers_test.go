@@ -286,6 +286,32 @@ func TestGatewayMeshTransitCaps(t *testing.T) {
 	}
 }
 
+func TestIntermediateGatewaySiteMTUCaps(t *testing.T) {
+	routes := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/24": {Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{{
+			{Type: "Site", Name: "site-b"},
+			{Type: "GatewayPool", Name: "pool-h"},
+			{Type: "GatewayPool", Name: "pool-j"},
+			{Type: "GatewayPool", Name: "pool-g"},
+		}}},
+	}
+	pools := map[string]*unboundednetv1alpha1.GatewayPool{
+		"pool-h":    {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{SiteName: "site-b"}}}},
+		"pool-j":    {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{SiteName: "site-d"}, {SiteName: "site-e"}}}},
+		"pool-g":    {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{SiteName: "unused-advertiser"}}}},
+		"unrelated": {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{SiteName: "unrelated"}}}},
+	}
+
+	caps := map[string]int{"site-b": 1420, "site-d": 1200, "site-e": 1300, "site-c": 1420, "unrelated": 900, "unused-advertiser": 800}
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", routes, pools, caps, nil); got != 1200 {
+		t.Fatalf("three-pool candidate Site cap=%d, want 1200", got)
+	}
+
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", nil, pools, caps, nil); got != 0 {
+		t.Fatalf("unused pools constrained MTU without routes: %d", got)
+	}
+}
+
 func TestLearnedGatewayTransitPathCaps(t *testing.T) {
 	path := []unboundednetv1alpha1.GatewayNodePathHop{
 		{Type: "Site", Name: "site-b"},
