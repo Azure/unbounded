@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-status-snapshot-start operator-vm-status-snapshot-result operator-vm-status-snapshot-cleanup operator-vm-verify-streaming-layers operator-vm-verify-streaming-layers-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-status-snapshot-start operator-vm-status-snapshot-result operator-vm-status-snapshot-cleanup operator-vm-verify-streaming-layers operator-vm-verify-streaming-layers-status operator-vm-verify-streaming-layers-cleanup operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
 
 help: ## Show benchmark targets
 	@echo ""
@@ -35,8 +35,9 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-status-snapshot-start  Submit a nonblocking persisted operator status snapshot"
 	@echo "  operator-vm-status-snapshot-result  Read the persisted operator status snapshot"
 	@echo "  operator-vm-status-snapshot-cleanup  Delete the persisted operator status snapshot"
-	@echo "  operator-vm-verify-streaming-layers  Verify one streaming image in every host content store"
-	@echo "  operator-vm-verify-streaming-layers-status  Read the last persisted layer verification"
+	@echo "  operator-vm-verify-streaming-layers  Submit nonblocking host content verification"
+	@echo "  operator-vm-verify-streaming-layers-status  Read managed execution and persisted results"
+	@echo "  operator-vm-verify-streaming-layers-cleanup  Delete the managed verification resource"
 	@echo "  operator-vm-prune-images  Asynchronously prune unused operator-VM images"
 	@echo "  operator-vm-prune-images-status  Show operator-VM image-prune progress"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
@@ -181,6 +182,9 @@ operator-vm-verify-streaming-layers: operator-vm-check
 
 operator-vm-verify-streaming-layers-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh verify-streaming-layers-status
+
+operator-vm-verify-streaming-layers-cleanup: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh verify-streaming-layers-cleanup
 
 operator-vm-prune-images: operator-vm-check
 	@test "$(CONFIRM_PRUNE_UNUSED_IMAGES)" = yes || { echo "set CONFIRM_PRUNE_UNUSED_IMAGES=yes to prune every unused operator-VM image" >&2; exit 2; }
