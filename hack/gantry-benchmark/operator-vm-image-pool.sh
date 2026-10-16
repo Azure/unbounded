@@ -19,6 +19,9 @@ Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
   operator-vm-image-pool.sh verify-streaming-layers IMAGE
   operator-vm-image-pool.sh verify-streaming-layers-status
+  operator-vm-image-pool.sh status-snapshot-start
+  operator-vm-image-pool.sh status-snapshot-result
+  operator-vm-image-pool.sh status-snapshot-cleanup
   operator-vm-image-pool.sh status
   operator-vm-image-pool.sh prune
   operator-vm-image-pool.sh prune-status
@@ -38,6 +41,7 @@ USAGE
 }
 
 remote_status_marker="GANTRY_BENCHMARK_REMOTE_STATUS="
+managed_status_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-status"
 
 invoke_remote() {
   local body=$1
@@ -486,6 +490,75 @@ exit "$status"
 SCRIPT
 )
     invoke_remote "$script"
+    ;;
+  status-snapshot-start)
+    (($# == 0)) || { usage >&2; exit 2; }
+    command_name="gantry-benchmark-status-$(date -u +%Y%m%d%H%M%S)-$$"
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+source /etc/gantry-benchmark/env
+export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/kubeconfig}"
+namespace=${BENCHMARK_NAMESPACE:-gantry-benchmark}
+service=$(systemctl is-active gantry-benchmark-operator.service 2>/dev/null || true)
+printf 'observed_at=%s\nservice=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${service:-unknown}"
+progress_file=${BENCHMARK_ARTIFACT_ROOT:-$HOME/artifacts}/progress.json
+if [[ -s "$progress_file" ]]; then
+  jq -r '"run_id=\(.run_id // "")\nstage=\(.stage // "")\nstage_started_at=\(.stage_started_at // "")\nmessage=\(.message // "")"' "$progress_file"
+fi
+state=$(kubectl --request-timeout=20s -n "$namespace" get configmap gantry-benchmark-state \
+  -o jsonpath='{.data.state\.json}' 2>/dev/null || true)
+if [[ -n "$state" ]]; then
+  jq -r '"benchmark_status=\(.status // "")\nactive_phase=\(.active_phase // "")\nimage=\(.gantry_streaming_image // .gantry_image // "")\nnode_count=\(.node_count // 0)"' <<<"$state"
+fi
+SCRIPT
+)
+    az vm run-command create \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --script "$script" \
+      --timeout-in-seconds 60 \
+      --async-execution false \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    printf '%s\n' "$command_name" >"$managed_status_file"
+    printf 'status_snapshot=%s\n' "$command_name"
+    ;;
+  status-snapshot-result)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_status_file" ]] || { echo "no submitted status snapshot" >&2; exit 1; }
+    command_name=$(cat "$managed_status_file")
+    result=$(az vm run-command show \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --instance-view \
+      --only-show-errors \
+      -o json)
+    jq -r '
+      "status_snapshot=" + .name,
+      "provisioning_state=" + (.provisioningState // "unknown"),
+      "execution_state=" + (.instanceView.executionState // "pending"),
+      "exit_code=" + ((.instanceView.exitCode // "") | tostring),
+      (.instanceView.output // empty),
+      (.instanceView.error // empty)
+    ' <<<"$result"
+    ;;
+  status-snapshot-cleanup)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_status_file" ]] || { echo "no submitted status snapshot" >&2; exit 1; }
+    command_name=$(cat "$managed_status_file")
+    az vm run-command delete \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --yes \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    rm -f "$managed_status_file"
     ;;
   status)
     (($# == 0)) || { usage >&2; exit 2; }
