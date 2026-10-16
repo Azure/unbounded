@@ -396,3 +396,6 @@ fn open_flags(flags: i32) -> Result<(i32, u64)> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "simulation"))]
+mod sim_tests;
