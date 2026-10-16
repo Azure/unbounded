@@ -1510,10 +1510,16 @@ fn offload_hint_reaches_the_backend() {
 }
 
 #[test]
-#[should_panic(expected = "offload called after the first poll")]
 fn offload_after_poll_panics() {
-    let (reactor, _mock) = reactor();
+    let (reactor, mock) = reactor();
     let mut op = reactor.nop(&Unscoped);
     assert!(poll_noop(&mut op).is_pending());
-    drop(op.offload());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(op.offload())));
+    let message = panic.unwrap_err();
+    let message = message.downcast_ref::<&str>().copied().unwrap_or_default();
+    assert!(
+        message.contains("offload called after the first poll"),
+        "{message}"
+    );
+    settle(&reactor, &mock);
 }
