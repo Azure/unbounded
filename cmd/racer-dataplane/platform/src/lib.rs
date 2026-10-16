@@ -27,6 +27,8 @@ pub mod mailbox;
 
 pub mod offload;
 
+pub mod reactor;
+
 pub mod scope;
 
 pub use error::{Error, Operation, Result};
