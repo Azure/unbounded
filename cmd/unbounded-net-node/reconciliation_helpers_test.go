@@ -387,6 +387,25 @@ func TestSitePeeringEdgeTunnelMTUs(t *testing.T) {
 	}
 }
 
+func TestGatewayPoolPeeringEdgeTunnelMTUs(t *testing.T) {
+	peerings := []unboundednetv1alpha1.GatewayPoolPeering{
+		{Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{GatewayPools: []string{"c", " b ", "a"}, TunnelMTU: ptrInt32(1400)}},
+		{Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{GatewayPools: []string{"b", "a"}, TunnelMTU: ptrInt32(1200)}},
+		{Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{GatewayPools: []string{"b", "a"}, TunnelMTU: ptrInt32(900), Enabled: new(false)}},
+		{Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{GatewayPools: []string{"unused", "a"}}},
+	}
+
+	got := gatewayPoolPeeringEdgeTunnelMTUs(peerings)
+	if len(got) != 3 || got[canonicalPoolPair("b", "a")] != 1200 ||
+		got[canonicalPoolPair("b", "c")] != 1400 || got[canonicalPoolPair("a", "c")] != 1400 {
+		t.Fatalf("unexpected enabled peering minima: %v", got)
+	}
+
+	if mtu := gatewayPoolPeeringTunnelMTU([]string{" a ", "unrelated"}, "b", got); mtu != 1200 {
+		t.Fatalf("local-pool indexed minimum=%d, want 1200", mtu)
+	}
+}
+
 func TestAssignmentEdgeTunnelMTUs(t *testing.T) {
 	assignments := []unboundednetv1alpha1.SiteGatewayPoolAssignment{
 		{Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
@@ -445,7 +464,7 @@ func TestLearnedGatewayTransitPathCaps(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := learnedGatewayTransitTunnelMTU(routes, tc.sites, tc.pools, assignmentEdgeTunnelMTUs(tc.assignments), tc.peerings)
+			got := learnedGatewayTransitTunnelMTU(routes, tc.sites, tc.pools, assignmentEdgeTunnelMTUs(tc.assignments), gatewayPoolPeeringEdgeTunnelMTUs(tc.peerings))
 			if got != tc.want {
 				t.Fatalf("transit MTU=%d want=%d", got, tc.want)
 			}
@@ -486,7 +505,9 @@ func TestForwardingAwareTunnelMTU(t *testing.T) {
 		},
 	}
 
-	transitMTU := gatewayPoolPeeringTunnelMTU([]string{"pool-g"}, "pool-h", []unboundednetv1alpha1.GatewayPoolPeering{peering})
+	poolPeeringMTUs := gatewayPoolPeeringEdgeTunnelMTUs([]unboundednetv1alpha1.GatewayPoolPeering{peering})
+
+	transitMTU := gatewayPoolPeeringTunnelMTU([]string{"pool-g"}, "pool-h", poolPeeringMTUs)
 	if got := resolveGatewayPeerTunnelMTU(0, "site-a", gatewayPeerInfo{PoolName: "pool-h", TransitTunnelMTU: transitMTU}, siteMTUs, nil, poolMTUs); got != 1200 {
 		t.Fatalf("gateway multi-pool routed path MTU = %d, want peering minimum 1200", got)
 	}
@@ -499,11 +520,11 @@ func TestForwardingAwareTunnelMTU(t *testing.T) {
 			}},
 		},
 	}
-	if got := learnedGatewayTransitTunnelMTU(learnedRoutes, nil, nil, nil, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 1200 {
+	if got := learnedGatewayTransitTunnelMTU(learnedRoutes, nil, nil, nil, poolPeeringMTUs); got != 1200 {
 		t.Fatalf("worker learned gateway transit MTU = %d, want 1200", got)
 	}
 
-	if got := learnedGatewayTransitTunnelMTU(nil, nil, nil, nil, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 0 {
+	if got := learnedGatewayTransitTunnelMTU(nil, nil, nil, nil, poolPeeringMTUs); got != 0 {
 		t.Fatalf("gateway peering without a learned forwarding path constrained worker MTU: %d", got)
 	}
 

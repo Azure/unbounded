@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -366,6 +367,51 @@ func runGatewayInformerCleanups(cleanups []func()) {
 	for i := len(cleanups) - 1; i >= 0; i-- {
 		cleanups[i]()
 	}
+}
+
+func gatewayAssignmentEventHandler(siteName string, refreshRequired, requestUpdate func()) cache.ResourceEventHandlerFuncs {
+	changed := func(oldObj, newObj interface{}) {
+		if reflect.DeepEqual(oldObj, newObj) {
+			return
+		}
+
+		if gatewayAssignmentTargetsSite(oldObj, siteName) || gatewayAssignmentTargetsSite(newObj, siteName) {
+			refreshRequired()
+		}
+
+		requestUpdate()
+	}
+
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { changed(nil, obj) },
+		UpdateFunc: changed,
+		DeleteFunc: func(obj interface{}) { changed(obj, nil) },
+	}
+}
+
+func gatewayAssignmentTargetsSite(obj interface{}, siteName string) bool {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+
+	assignment, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return false
+	}
+
+	sites, _, err := unstructured.NestedStringSlice(assignment.Object, "spec", "sites")
+	if err != nil {
+		klog.Warningf("Cannot read SiteGatewayPoolAssignment %s Sites: %v", assignment.GetName(), err)
+		return false
+	}
+
+	for _, site := range sites {
+		if strings.TrimSpace(site) == strings.TrimSpace(siteName) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func gatewayCachesRequired(adopted nodeAssignment, siteName string, assignmentInformer cache.SharedIndexInformer) bool {
