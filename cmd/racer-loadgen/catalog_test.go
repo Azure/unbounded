@@ -186,9 +186,14 @@ func TestCatalogWorkerTraversalAndVerifiedBytes(t *testing.T) {
 			cancel()
 			<-done
 
+			mu.Lock()
+
+			gotRefs := append([]string(nil), refs...)
+			mu.Unlock()
+
 			for pass := range 2 {
 				seen := make(map[string]bool)
-				for _, ref := range refs[pass*5 : (pass+1)*5] {
+				for _, ref := range gotRefs[pass*5 : (pass+1)*5] {
 					seen[ref] = true
 				}
 
