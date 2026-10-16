@@ -50,6 +50,7 @@ func TestCachedRangeIsReusedWithoutTouchingOrigin(t *testing.T) {
 
 		req := httptest.NewRequest(http.MethodGet, streaming.HandlerPrefix+rawOrigin, nil)
 		req.Header.Set("Range", "bytes=0-3")
+
 		rec := httptest.NewRecorder()
 		server.ServeHTTP(rec, req)
 

@@ -94,6 +94,7 @@ func TestMissingFinalLayerResponseTimestampPods(t *testing.T) {
 	timestamps["gantry-b"] = map[string]float64{
 		"gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=origin}": 1235,
 	}
+
 	timestamps["gantry-c"] = map[string]float64{
 		"gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=local}": 1236,
 	}

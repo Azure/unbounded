@@ -78,6 +78,7 @@ func TestCanonicalOriginResolverPreservesConfiguredEndpoint(t *testing.T) {
 	if !ok {
 		t.Fatal("canonical origin was not resolved")
 	}
+
 	want := "http://127.0.0.1:8578/proxy/v2/team/app/blobs/" + d.String() + "?ns=app.azurecr.io"
 	if resolved.Raw != want || resolved.Digest != d || resolved.Canonical {
 		t.Fatalf("resolved origin = %+v, want raw %q and signed-origin mode", resolved, want)

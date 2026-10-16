@@ -120,6 +120,7 @@ func TestPrepareArtifactStreamingPollsOperation(t *testing.T) {
 	if len(runner.commands) != 3 {
 		t.Fatalf("commands = %d, want 3", len(runner.commands))
 	}
+
 	status := runner.commands[2]
 	if status.name != "az" || !slices.Contains(status.args, "operation-1") {
 		t.Fatalf("status command = %s %v", status.name, status.args)
@@ -155,6 +156,7 @@ func TestPrepareArtifactStreamingPollsByImageWhenCreateOutputIsEmpty(t *testing.
 	if !slices.Contains(status.args, "--image") || !slices.Contains(status.args, "gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
 		t.Fatalf("status command = %s %v", status.name, status.args)
 	}
+
 	if slices.Contains(status.args, "--repository") || slices.Contains(status.args, "--id") {
 		t.Fatalf("status command mixes image and operation ID lookup: %v", status.args)
 	}
@@ -165,6 +167,7 @@ func TestArtifactStreamingConfigIsOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load classic config: %v", err)
 	}
+
 	if classic.ArtifactStreaming || classic.NodePool != "" {
 		t.Fatalf("classic config ArtifactStreaming=%t NodePool=%q", classic.ArtifactStreaming, classic.NodePool)
 	}
@@ -177,6 +180,7 @@ func TestArtifactStreamingConfigIsOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load streaming config: %v", err)
 	}
+
 	if !streaming.ArtifactStreaming || streaming.NodePool != "stream" {
 		t.Fatalf("streaming config ArtifactStreaming=%t NodePool=%q", streaming.ArtifactStreaming, streaming.NodePool)
 	}
@@ -203,6 +207,7 @@ func TestPreparedStandaloneRequiresArtifactStreamingConversion(t *testing.T) {
 	}
 
 	state.ArtifactStreamingPrepared = true
+
 	state.ArtifactStreamingImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	if _, _, err := state.preparedImages(); err != nil {
 		t.Fatalf("preparedImages rejected converted image: %v", err)
@@ -210,8 +215,10 @@ func TestPreparedStandaloneRequiresArtifactStreamingConversion(t *testing.T) {
 }
 
 func TestGantryRuntimeImage(t *testing.T) {
-	const digestImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	const streamingImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	const (
+		digestImage    = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		streamingImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	)
 
 	classic := benchmarkState{GantryColdImage: digestImage}
 	if got, err := classic.gantryRuntimeImage(); err != nil || got != digestImage {
@@ -231,6 +238,7 @@ func TestGantryRuntimeImage(t *testing.T) {
 
 func TestArtifactStreamingRuntimeImageRejectsTagAndOriginalDigest(t *testing.T) {
 	const originalImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 	state := benchmarkState{
 		ArtifactStreaming:      true,
 		GantryColdImage:        originalImage,
@@ -273,10 +281,12 @@ func TestResolveArtifactStreamingImageReturnsConvertedDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveArtifactStreamingImage: %v", err)
 	}
+
 	want := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	if resolved != want {
 		t.Fatalf("resolved image = %q, want %q", resolved, want)
 	}
+
 	if len(runner.commands) != 2 || runner.commands[0].name != "kubectl" ||
 		!reflect.DeepEqual(runner.commands[0].args, []string{
 			"-n", "gantry-system", "get", "pod",
@@ -286,6 +296,7 @@ func TestResolveArtifactStreamingImageReturnsConvertedDigest(t *testing.T) {
 		}) {
 		t.Fatalf("resolver pod command = %+v", runner.commands)
 	}
+
 	request := runner.commands[1]
 	if request.name != "kubectl" || !slices.Contains(request.args, "gantry-overlaybd-config-abc") ||
 		!slices.Contains(request.args, "http://127.0.0.1:8578/v2/gantry-benchmark-pull/manifests/converted?ns=benchstreamacr.azurecr.io") {
@@ -320,10 +331,12 @@ func TestResolveArtifactStreamingImageWaitsForConvertedDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveArtifactStreamingImage: %v", err)
 	}
+
 	want := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	if resolved != want {
 		t.Fatalf("resolved image = %q, want %q", resolved, want)
 	}
+
 	if len(runner.commands) != 3 {
 		t.Fatalf("resolver commands = %d, want 3", len(runner.commands))
 	}
@@ -336,6 +349,7 @@ func TestArtifactStreamingDigestFromHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("artifactStreamingDigestFromHeaders: %v", err)
 	}
+
 	if parsed.String() != want {
 		t.Fatalf("digest = %q, want %q", parsed, want)
 	}
@@ -354,6 +368,7 @@ func TestArtifactStreamingDigestFromHeaders(t *testing.T) {
 
 func TestValidateArtifactStreamingGantryConfig(t *testing.T) {
 	const registry = "benchstreamacr.azurecr.io"
+
 	raw := `artifact_streaming_enabled: true
 upstream_registries:
   - name: benchstreamacr.azurecr.io
@@ -394,7 +409,9 @@ func TestValidateStreamingDaemonSetUsesGantryNamespace(t *testing.T) {
 	if len(runner.commands) != 1 {
 		t.Fatalf("commands = %d, want 1", len(runner.commands))
 	}
+
 	command := runner.commands[0]
+
 	want := []string{"-n", "gantry-system", "get", "daemonset", "gantry-overlaybd-config", "-o", "json"}
 	if command.name != "kubectl" || !reflect.DeepEqual(command.args, want) {
 		t.Fatalf("command = %s %v, want kubectl %v", command.name, command.args, want)

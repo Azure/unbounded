@@ -242,6 +242,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.opts.ResolveCanonicalOrigin != nil {
 			resolved, ok = s.opts.ResolveCanonicalOrigin(origin)
 		}
+
 		if !ok {
 			http.Error(w, "canonical origin unavailable", http.StatusServiceUnavailable)
 

@@ -171,6 +171,7 @@ func TestServerCanonicalRequestFallsBackThroughConfiguredOrigin(t *testing.T) {
 	t.Parallel()
 
 	origin := &originStub{body: []byte("help"), total: 10}
+
 	server, err := streaming.NewServer(
 		&rangeStoreStub{err: &ifaces.ErrNotFound{}},
 		&discoveryStub{},
@@ -190,12 +191,14 @@ func TestServerCanonicalRequestFallsBackThroughConfiguredOrigin(t *testing.T) {
 	raw := "https://app.azurecr.io/v2/team/app/blobs/sha256:" + testDigest
 	req := httptest.NewRequest(http.MethodGet, streaming.HandlerPrefix+raw, nil)
 	req.Header.Set("Range", "bytes=2-5")
+
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, req)
 
 	if response.Code != http.StatusPartialContent || response.Body.String() != "help" {
 		t.Fatalf("response = %d %q", response.Code, response.Body.String())
 	}
+
 	if origin.calls != 1 || origin.originRaw != "http://127.0.0.1:8578/v2/team/app/blobs/sha256:"+testDigest+"?ns=app.azurecr.io" {
 		t.Fatalf("origin calls = %d raw=%q", origin.calls, origin.originRaw)
 	}
@@ -205,6 +208,7 @@ func TestServerCanonicalRequestWithoutConfiguredOriginReturnsUnavailable(t *test
 	t.Parallel()
 
 	origin := &originStub{}
+
 	server, err := streaming.NewServer(
 		&rangeStoreStub{err: &ifaces.ErrNotFound{}},
 		&discoveryStub{},
@@ -219,12 +223,14 @@ func TestServerCanonicalRequestWithoutConfiguredOriginReturnsUnavailable(t *test
 	raw := "https://app.azurecr.io/v2/team/app/blobs/sha256:" + testDigest
 	req := httptest.NewRequest(http.MethodGet, streaming.HandlerPrefix+raw, nil)
 	req.Header.Set("Range", "bytes=2-5")
+
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, req)
 
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("response = %d, want 503", response.Code)
 	}
+
 	if origin.calls != 0 {
 		t.Fatalf("origin calls = %d, want zero", origin.calls)
 	}

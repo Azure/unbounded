@@ -247,6 +247,7 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 		if err := b.prepareArtifactStreaming(ctx, state, gantryImage); err != nil {
 			return err
 		}
+
 		streamingImage, err := b.resolveArtifactStreamingImage(ctx, state, gantryImage, standaloneGantryTaggedImage(state))
 		if err != nil {
 			return err
@@ -285,12 +286,15 @@ func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, s
 	if state.Status != "enabled" {
 		return fmt.Errorf("benchmark state is %q, run enable before prepare-gantry-standalone-adopt", state.Status)
 	}
+
 	if state.usesProxy() {
 		return fmt.Errorf("prepare-gantry-standalone-adopt requires direct dual-ACR mode")
 	}
+
 	if err := b.requireLock(ctx, state.RunID); err != nil {
 		return err
 	}
+
 	if err := b.validateContext(ctx); err != nil {
 		return err
 	}
@@ -299,9 +303,11 @@ func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, s
 	if err != nil {
 		return fmt.Errorf("adopt standalone image: %w", err)
 	}
+
 	if repository != state.WorkloadRepository || !strings.HasPrefix(digestValue, "sha256:") {
 		return fmt.Errorf("adopted image must be a digest-pinned %s image", state.WorkloadRepository)
 	}
+
 	if parsed, err := digest.Parse(payloadSHA); err != nil || parsed.Algorithm() != digest.SHA256 {
 		return fmt.Errorf("payload fingerprint %q must be a sha256 digest", payloadSHA)
 	}
@@ -311,9 +317,11 @@ func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, s
 		if err := state.validateArtifactStreamingImage(); err != nil {
 			return err
 		}
+
 		if err := b.verifyArtifactStreamingImage(ctx, state, image); err != nil {
 			return err
 		}
+
 		state.ArtifactStreamingPrepared = true
 	}
 
@@ -327,6 +335,7 @@ func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, s
 	if _, _, err := state.preparedImages(); err != nil {
 		return err
 	}
+
 	if err := b.saveState(ctx, state); err != nil {
 		return err
 	}
@@ -352,16 +361,20 @@ func (b *benchmark) resolveArtifactStreamingImage(
 	if err != nil {
 		return "", fmt.Errorf("resolve original image: %w", err)
 	}
+
 	taggedRepository, tag, err := splitImageReference(taggedImage, state.GantryACRLoginServer)
 	if err != nil {
 		return "", fmt.Errorf("resolve converted image tag: %w", err)
 	}
+
 	if originalRepository != state.WorkloadRepository || taggedRepository != state.WorkloadRepository {
-		return "", fmt.Errorf("Artifact Streaming image repositories must both be %q", state.WorkloadRepository)
+		return "", fmt.Errorf("artifact streaming image repositories must both be %q", state.WorkloadRepository)
 	}
+
 	if strings.HasPrefix(tag, "sha256:") {
 		return "", fmt.Errorf("converted image lookup must use a tag: %s", taggedImage)
 	}
+
 	podContext, cancel := context.WithTimeout(ctx, 30*time.Second)
 	podOutput, err := b.commands.Run(podContext, nil,
 		"kubectl", "-n", state.GantryNamespace,
@@ -370,10 +383,13 @@ func (b *benchmark) resolveArtifactStreamingImage(
 		"--field-selector=status.phase=Running",
 		"-o", "jsonpath={.items[0].metadata.name}",
 	)
+
 	cancel()
+
 	if err != nil {
 		return "", fmt.Errorf("select OverlayBD configurator for Artifact Streaming resolution: %w", err)
 	}
+
 	pod := strings.TrimSpace(string(podOutput))
 	if pod == "" {
 		return "", fmt.Errorf("no running OverlayBD configurator pod is available for Artifact Streaming resolution")
@@ -388,6 +404,7 @@ func (b *benchmark) resolveArtifactStreamingImage(
 
 	deadline := time.NewTimer(b.config.ArtifactStreamingTimeout)
 	defer deadline.Stop()
+
 	ticker := time.NewTicker(b.config.ArtifactStreamingPoll)
 	defer ticker.Stop()
 
@@ -400,7 +417,9 @@ func (b *benchmark) resolveArtifactStreamingImage(
 			"-H", "Accept: "+registryManifestAccept,
 			helperURL,
 		)
+
 		cancel()
+
 		if err != nil {
 			return "", fmt.Errorf("resolve converted Artifact Streaming manifest %s through AKS helper: %w", taggedImage, err)
 		}
@@ -409,11 +428,13 @@ func (b *benchmark) resolveArtifactStreamingImage(
 		if err != nil {
 			return "", fmt.Errorf("resolve converted Artifact Streaming manifest %s through AKS helper: %w", taggedImage, err)
 		}
+
 		if convertedDigest.String() != originalDigest {
 			return fmt.Sprintf("%s/%s@%s", state.GantryACRLoginServer, taggedRepository, convertedDigest), nil
 		}
 
 		writeAll(b.stdout, fmt.Sprintf("Artifact Streaming manifest %s still resolves to source digest %s; waiting for converted digest\n", taggedImage, originalDigest))
+
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -426,12 +447,14 @@ func (b *benchmark) resolveArtifactStreamingImage(
 
 func artifactStreamingDigestFromHeaders(headers []byte) (digest.Digest, error) {
 	var value string
+
 	for _, line := range strings.Split(string(headers), "\n") {
 		name, candidate, found := strings.Cut(line, ":")
 		if found && strings.EqualFold(strings.TrimSpace(name), "Docker-Content-Digest") {
 			value = strings.TrimSpace(candidate)
 		}
 	}
+
 	parsed, err := digest.Parse(value)
 	if err != nil || parsed.Algorithm() != digest.SHA256 {
 		return "", fmt.Errorf("AKS helper returned invalid Docker-Content-Digest %q", value)
@@ -445,6 +468,7 @@ func (b *benchmark) verifyArtifactStreamingImage(ctx context.Context, state benc
 	if err != nil {
 		return fmt.Errorf("verify Artifact Streaming image: %w", err)
 	}
+
 	image := repository + "@" + digestValue
 
 	output, err := b.runArtifactStreamingCommand(ctx,
@@ -457,6 +481,7 @@ func (b *benchmark) verifyArtifactStreamingImage(ctx context.Context, state benc
 	if err != nil {
 		return fmt.Errorf("verify Artifact Streaming image %s: %w", image, err)
 	}
+
 	if err := requireArtifactStreamingSucceeded(output); err != nil {
 		return fmt.Errorf("verify Artifact Streaming image %s: %w", image, err)
 	}
@@ -473,9 +498,11 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 	if err != nil {
 		return fmt.Errorf("resolve Artifact Streaming image: %w", err)
 	}
+
 	if !strings.HasPrefix(digest, "sha256:") {
-		return fmt.Errorf("Artifact Streaming image must be digest-pinned: %s", imageReference)
+		return fmt.Errorf("artifact streaming image must be digest-pinned: %s", imageReference)
 	}
+
 	image := repository + "@" + digest
 
 	updateOutput, err := b.runArtifactStreamingCommand(ctx,
@@ -489,6 +516,7 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 	if err != nil {
 		return fmt.Errorf("enable Artifact Streaming on repository %s: %w", state.WorkloadRepository, err)
 	}
+
 	if err := requireArtifactStreamingSucceeded(updateOutput); err != nil {
 		return fmt.Errorf("enable Artifact Streaming on repository %s: %w", state.WorkloadRepository, err)
 	}
@@ -504,17 +532,21 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 	if err != nil {
 		return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
 	}
+
 	operation := artifactStreamingOperation{Status: "Submitted"}
 	lookupArgs := []string{"--image", image}
 	operationLabel := image
+
 	if len(bytes.TrimSpace(createOutput)) != 0 {
 		operation, err = parseArtifactStreamingOperation(createOutput)
 		if err != nil {
 			return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
 		}
+
 		if operation.Status == "Succeeded" {
 			return nil
 		}
+
 		if operation.ID != "" {
 			lookupArgs = []string{"--repository", repository, "--id", operation.ID}
 			operationLabel = operation.ID
@@ -525,6 +557,7 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 
 	deadline := time.NewTimer(b.config.ArtifactStreamingTimeout)
 	defer deadline.Stop()
+
 	ticker := time.NewTicker(b.config.ArtifactStreamingPoll)
 	defer ticker.Stop()
 
@@ -533,7 +566,7 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("Artifact Streaming conversion %s did not complete within %s", operationLabel, b.config.ArtifactStreamingTimeout)
+			return fmt.Errorf("artifact streaming conversion %s did not complete within %s", operationLabel, b.config.ArtifactStreamingTimeout)
 		case <-ticker.C:
 			statusArgs := []string{
 				"operation", "show",
@@ -544,6 +577,7 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 				"--only-show-errors",
 				"--output", "json",
 			)
+
 			statusOutput, err := b.runArtifactStreamingCommand(ctx, statusArgs...)
 			if err != nil {
 				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationLabel, err)
@@ -553,13 +587,14 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 			if err != nil {
 				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationLabel, err)
 			}
+
 			writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationLabel, operation.Status))
 
 			switch operation.Status {
 			case "Succeeded":
 				return nil
-			case "Failed", "Canceled", "Cancelled":
-				return fmt.Errorf("Artifact Streaming conversion %s ended with status %s", operationLabel, operation.Status)
+			case "Failed", "Canceled", "Cancelled": //nolint:misspell // Azure has returned both cancellation spellings.
+				return fmt.Errorf("artifact streaming conversion %s ended with status %s", operationLabel, operation.Status)
 			}
 		}
 	}
@@ -593,6 +628,7 @@ func requireArtifactStreamingSucceeded(output []byte) error {
 	if err != nil {
 		return err
 	}
+
 	if operation.Status != "Succeeded" {
 		return fmt.Errorf("operation status is %q, want Succeeded", operation.Status)
 	}
@@ -947,6 +983,7 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 	if state.ArtifactStreaming != b.config.ArtifactStreaming {
 		return fmt.Errorf("benchmark Artifact Streaming state=%t does not match BENCHMARK_ARTIFACT_STREAMING=%t", state.ArtifactStreaming, b.config.ArtifactStreaming)
 	}
+
 	if state.NodePool != b.config.NodePool {
 		return fmt.Errorf("benchmark node pool state=%q does not match BENCHMARK_NODE_POOL=%q", state.NodePool, b.config.NodePool)
 	}
@@ -971,6 +1008,7 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	runtimeImage, err := state.gantryRuntimeImage()
 	if err != nil {
 		return err
@@ -1105,6 +1143,7 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	b.warnIncompleteFinalLayerResponseTimestamps(diagnostics)
 
 	bytes, bytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, proxyPhaseTotals{}, metrics, job)

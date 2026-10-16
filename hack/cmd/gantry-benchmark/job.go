@@ -74,10 +74,12 @@ func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase 
 	if len(platformParts) != 2 || platformParts[0] == "" || platformParts[1] == "" {
 		return jobObservation{}, fmt.Errorf("image platform BENCHMARK_IMAGE_PLATFORM=%q must have os/architecture form", b.config.ImagePlatform)
 	}
+
 	nodes, err := b.targetNodes(ctx)
 	if err != nil {
 		return jobObservation{}, err
 	}
+
 	sort.Strings(nodes)
 
 	podLabels := map[string]string{

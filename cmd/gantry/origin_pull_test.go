@@ -626,6 +626,7 @@ func TestPullerPumpReportsCommittedContent(t *testing.T) {
 		digest     digest.Digest
 		kind       ifaces.OriginRefKind
 	}
+
 	committed := make(chan committedContent, 1)
 	pump := newPullerPump(
 		inflight.New(inflight.DefaultStalls(), nil),
@@ -649,6 +650,7 @@ func TestPullerPumpReportsCommittedContent(t *testing.T) {
 	if result.Status != coord.PumpStarted {
 		t.Fatalf("status = %v, want PumpStarted", result.Status)
 	}
+
 	gate.Wait()
 
 	select {

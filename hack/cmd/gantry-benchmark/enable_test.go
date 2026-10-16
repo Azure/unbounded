@@ -66,6 +66,7 @@ func TestRenderMonitoringManifestSelectsBenchmarkPool(t *testing.T) {
 	}
 
 	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
+
 	rendered, err := benchmark.renderManifest(monitoringManifestPath, proxyManifestData{
 		Namespace:       "gantry-benchmark",
 		GantryNamespace: "gantry-system",
@@ -109,6 +110,7 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	if strings.Contains(string(rendered), "{{") {
 		t.Fatalf("rendered manifest contains an unresolved template expression")
 	}
+
 	if strings.Contains(string(rendered), "agentpool:") {
 		t.Fatalf("classic monitoring manifest unexpectedly selects a node pool")
 	}
@@ -395,6 +397,7 @@ func TestContainerdPullTuningManifest(t *testing.T) {
 
 	migrateIndex := bytes.Index(deployScript, []byte("migrate_legacy_gantry_install"))
 	helmArgsIndex := bytes.Index(deployScript, []byte("local helm_args=("))
+
 	helmRunIndex := bytes.Index(deployScript, []byte("\"$repo_root/bin/helm\" \"${helm_args[@]}\""))
 	if migrateIndex < 0 || helmArgsIndex <= migrateIndex || helmRunIndex <= helmArgsIndex {
 		t.Fatal("deploy script does not migrate legacy Gantry resources before Helm install")

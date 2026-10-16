@@ -75,6 +75,7 @@ func (b *benchmark) targetNodes(ctx context.Context) ([]string, error) {
 	result := make([]string, 0, len(list.Items))
 	for _, node := range list.Items {
 		matches := true
+
 		for key, value := range selector {
 			if node.Metadata.Labels[key] != value {
 				matches = false
@@ -82,6 +83,7 @@ func (b *benchmark) targetNodes(ctx context.Context) ([]string, error) {
 				break
 			}
 		}
+
 		if !matches || node.Spec.Unschedulable {
 			continue
 		}
