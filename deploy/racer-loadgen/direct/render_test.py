@@ -73,9 +73,9 @@ class DirectRenderTest(unittest.TestCase):
         self.assertNotIn("initContainers", self.pod)
         self.assertFalse(self.pod["automountServiceAccountToken"])
         self.assertEqual(self.pod["securityContext"], {
-            "runAsUser": 0,
-            "runAsGroup": 0,
-            "runAsNonRoot": False,
+            "runAsUser": 65532,
+            "runAsGroup": 65532,
+            "runAsNonRoot": True,
             "seccompProfile": {"type": "RuntimeDefault"},
         })
         self.assertEqual(self.container["securityContext"], {
@@ -83,13 +83,20 @@ class DirectRenderTest(unittest.TestCase):
             "readOnlyRootFilesystem": True,
             "capabilities": {"drop": ["ALL"]},
         })
-        self.assertEqual(self.pod["volumes"], [{
-            "name": "racer-sockets",
-            "hostPath": {"path": "/run/racer/racer-loadgen", "type": "DirectoryOrCreate"},
-        }])
-        self.assertEqual(self.container["volumeMounts"], [{
-            "name": "racer-sockets", "mountPath": "/run/racer/racer-loadgen",
-        }])
+        self.assertEqual(self.pod["volumes"], [
+            {
+                "name": "racer-client",
+                "hostPath": {"path": "/run/racer/racer-loadgen/client", "type": "Directory"},
+            },
+            {
+                "name": "racer-origin",
+                "hostPath": {"path": "/run/racer/racer-loadgen/origin", "type": "Directory"},
+            },
+        ])
+        self.assertEqual(self.container["volumeMounts"], [
+            {"name": "racer-client", "mountPath": "/run/racer/racer-loadgen/client"},
+            {"name": "racer-origin", "mountPath": "/run/racer/racer-loadgen/origin"},
+        ])
 
     def test_inherited_probes_metrics_and_unchanged_base(self):
         base_ds = next(r for r in self.base if r["kind"] == "DaemonSet")

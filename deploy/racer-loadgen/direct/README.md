@@ -24,8 +24,8 @@ Service, or a Gantry Service. The parent deployment files are unchanged.
   Racer's placement if it does not run on every schedulable Linux node.
 - The `unbounded-system` namespace must exist. The deploying identity must be
   allowed by RBAC and admission to create ClusterCaches and this workload. Pod
-  admission must permit UID 0 and the narrowly scoped writable hostPath below;
-  this is not compatible with the Restricted Pod Security Standard. Do not
+  admission must permit the narrowly scoped writable hostPaths below; hostPath
+  volumes are not compatible with the Restricted Pod Security Standard. Do not
   disable cluster-wide admission protections to run the example.
 - Build/publish a `racer-loadgen` image that includes the UDS backend and generic
   blob flags, and make it accessible from all selected nodes.
@@ -87,21 +87,26 @@ the memory budget and account for Racer's separate resources when tuning load.
 
 ## Security and socket ownership
 
-Only `/run/racer/racer-loadgen` is mounted read-write using hostPath
-`DirectoryOrCreate`, not all of `/run/racer`. This grants access to that cache's
-client and origin sockets and assumes trusted node administrators, Racer, and
-load-generator images. Treat permission to mount this path as cache access.
+Only `/run/racer/racer-loadgen/client` and `/run/racer/racer-loadgen/origin`
+are mounted read-write, using hostPath type `Directory`, not all of
+`/run/racer`. This grants access to that cache's client and origin sockets and
+assumes trusted node administrators, Racer, and load-generator images. Treat
+permission to mount these paths as cache access.
 
-The pod runs as UID/GID 0 with `runAsNonRoot: false`, matching Gantry's Racer UDS
-ownership model. It still drops **all capabilities**, disallows privilege
-escalation, uses `RuntimeDefault` seccomp, disables service account token mounts,
-and keeps its root filesystem read-only. The writable socket volume is the only
-exception; there is no privileged container or permission-fixing init container.
+The racer-dataplane creates both directories when it publishes the cache. It
+creates the origin directory owned by UID/GID 65532 with mode `0700` and repairs
+the owner and mode if they drift. Until the directories exist, the pod stays in
+`ContainerCreating`; the load generator never creates them.
 
-Existing socket-path directories must be real directories owned by root (the
-process UID here), without group/other write permission. The origin creates
-missing directories with mode `0755` and refuses unsafe paths. It does not
-recursively chown/chmod the mount or alter Racer's client directory. The SDK owns
+The pod runs as UID/GID 65532 with `runAsNonRoot: true`, inherited from the base
+DaemonSet. It drops **all capabilities**, disallows privilege escalation, uses
+`RuntimeDefault` seccomp, disables service account token mounts, and keeps its
+root filesystem read-only. The writable socket volumes are the only exception;
+there is no privileged container or permission-fixing init container.
+
+At startup the origin refuses a missing origin directory, symlinks,
+group/other-writable or foreign-owned ancestors, and an origin directory not
+owned by its effective UID. It does not chown/chmod anything. The SDK owns
 origin locking, stale-socket recovery, and cleanup; do not manually delete a live
 origin socket to bypass a competing owner. The dedicated cache prevents collision
 with Gantry's origin, but still permits only one origin owner per cache per node.
