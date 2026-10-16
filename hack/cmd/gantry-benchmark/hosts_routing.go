@@ -63,6 +63,9 @@ server = "http://%s:5002"
 	case hostsModeGantry:
 		if state.GantryRoutingStrategy == gantryRoutingFailOpen {
 			fallbackServer := "https://" + registry
+			if state.ArtifactStreaming {
+				fallbackServer = "http://127.0.0.1:8578"
+			}
 
 			if state.usesProxy() {
 				if state.ProxyClusterIP == "" {
@@ -126,6 +129,10 @@ func (s benchmarkState) registryForHosts(mode hostsMode) (string, error) {
 }
 
 func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode hostsMode) error {
+	if state.ArtifactStreaming {
+		return nil
+	}
+
 	content, err := renderHosts(state, mode)
 	if err != nil {
 		return err
@@ -279,6 +286,10 @@ exec sleep 2147483647
 }
 
 func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) error {
+	if state.ArtifactStreaming {
+		return nil
+	}
+
 	if _, err := b.commands.Run(
 		ctx,
 		nil,
@@ -561,10 +572,14 @@ func nodeDaemonSet(
 }
 
 func (b *benchmark) validateBenchmarkDaemonSet(ctx context.Context, name string) error {
+	return b.validateDaemonSet(ctx, b.config.Namespace, name)
+}
+
+func (b *benchmark) validateDaemonSet(ctx context.Context, namespace, name string) error {
 	output, err := b.commands.Run(
 		ctx,
 		nil,
-		"kubectl", "-n", b.config.Namespace,
+		"kubectl", "-n", namespace,
 		"get", "daemonset", name, "-o", "json",
 	)
 	if err != nil {

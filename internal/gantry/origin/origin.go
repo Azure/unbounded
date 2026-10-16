@@ -783,6 +783,8 @@ func (r *registry) urlFor(ref ifaces.OriginRef) string {
 	}
 
 	u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
+	u.RawQuery = r.base.RawQuery
+	u.ForceQuery = r.base.ForceQuery
 
 	return u.String()
 }

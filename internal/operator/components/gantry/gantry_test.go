@@ -188,7 +188,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash")(ds); err != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{})(ds); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -200,7 +200,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash")(config); err != nil || config.Object != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{})(config); err != nil || config.Object != nil {
 		t.Fatalf("gantry ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 }
@@ -209,6 +209,7 @@ func TestOperatorManifestAllowlist(t *testing.T) {
 	want := map[string]bool{
 		"configmap.yaml":         true,
 		"daemonset.yaml":         true,
+		"overlaybd-config.yaml":  true,
 		"rendezvous-leases.yaml": true,
 		"serviceaccount.yaml":    true,
 	}
@@ -253,7 +254,7 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "h")(agent); err != nil {
+	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{})(agent); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -280,12 +281,91 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "h")(nodeDS); err != nil {
+	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{})(nodeDS); err != nil {
 		t.Fatalf("applyMutator node-config: %v", err)
 	}
 
 	if img := containerImage(t, nodeDS, "containers", "configure"); img != "mcr.microsoft.com/cbl-mariner/busybox:2.0" {
 		t.Fatalf("node-config busybox image was rewritten to %q; must stay pinned", img)
+	}
+}
+
+func TestApplyMutatorEnablesArtifactStreaming(t *testing.T) {
+	artifact := artifactStreamingConfig{
+		Enabled:      true,
+		NodeSelector: map[string]string{"kubernetes.azure.com/agentpool": "streaming"},
+	}
+
+	agent := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": daemonSetName},
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{},
+			"spec": map[string]any{"containers": []any{
+				map[string]any{"name": agentContainerName, "image": "placeholder"},
+			}},
+		}},
+	}}
+	overlay := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": overlayBDConfigDaemonSetName},
+		"spec": map[string]any{"template": map[string]any{
+			"spec": map[string]any{
+				"nodeSelector": map[string]any{},
+				"containers": []any{
+					map[string]any{"name": overlayBDConfigContainerName, "image": "placeholder"},
+				},
+			},
+		}},
+	}}
+
+	mutate := applyMutator("gantry:test", "gantry-node-config:test", "hash", artifact)
+	if err := mutate(agent); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mutate(overlay); err != nil {
+		t.Fatal(err)
+	}
+
+	containers, _, err := unstructured.NestedSlice(agent.Object, "spec", "template", "spec", "containers")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	variableFound := false
+
+	for _, entry := range containers[0].(map[string]any)["env"].([]any) {
+		variable := entry.(map[string]any)
+		if variable["name"] == artifactStreamingEnabledEnv && variable["value"] == "true" {
+			variableFound = true
+		}
+	}
+
+	if !variableFound {
+		t.Fatal("artifact streaming environment override missing")
+	}
+
+	if image := containerImage(t, overlay, "containers", overlayBDConfigContainerName); image != "gantry-node-config:test" {
+		t.Fatalf("configurator image = %q", image)
+	}
+
+	selector, _, err := unstructured.NestedStringMap(overlay.Object, "spec", "template", "spec", "nodeSelector")
+	if err != nil || selector["kubernetes.azure.com/agentpool"] != "streaming" {
+		t.Fatalf("selector = %#v, err=%v", selector, err)
+	}
+}
+
+func TestResolveArtifactStreamingRejectsConflictingSites(t *testing.T) {
+	sites := []unboundedv1alpha3.Site{
+		{ObjectMeta: metav1.ObjectMeta{Name: "a"}, Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{Gantry: &unboundedv1alpha3.GantryComponentSpec{ArtifactStreaming: &unboundedv1alpha3.GantryArtifactStreamingSpec{Enabled: true, NodeSelector: map[string]string{"pool": "a"}}}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "b"}, Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{Gantry: &unboundedv1alpha3.GantryComponentSpec{ArtifactStreaming: &unboundedv1alpha3.GantryArtifactStreamingSpec{Enabled: true, NodeSelector: map[string]string{"pool": "b"}}}}}},
+	}
+
+	if _, err := resolveArtifactStreaming(sites); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("error = %v, want selector conflict", err)
 	}
 }
 
@@ -353,6 +433,52 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	// The gantry ConfigMap is reconciled separately, not via the manifest apply.
 	if applied["ConfigMap/gantry-config"] {
 		t.Fatal("gantry-config ConfigMap should be reconciled separately, not applied")
+	}
+}
+
+func TestReconcileDeletesOverlayBDConfiguratorWhenArtifactStreamingDisabled(t *testing.T) {
+	configurator := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: component.DefaultNamespace,
+		Name:      overlayBDConfigDaemonSetName,
+	}}
+	env, applied := reconcilerEnv(t, configurator)
+
+	res := reconcile(t, env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if !res.Ready || res.Err != nil {
+		t.Fatalf("Reconcile = %+v, want ready", res)
+	}
+
+	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(configurator), configurator); !apierrors.IsNotFound(err) {
+		t.Fatalf("disabled artifact streaming retained configurator: %v", err)
+	}
+
+	if applied["DaemonSet/"+overlayBDConfigDaemonSetName] {
+		t.Fatal("disabled artifact streaming reapplied configurator")
+	}
+}
+
+func TestPlanAppliesOverlayBDConfiguratorWhenArtifactStreamingEnabled(t *testing.T) {
+	gantryEnabled := true
+	site := siteWithGantry("edge", &gantryEnabled)
+	site.Spec.Components.Gantry.ArtifactStreaming = &unboundedv1alpha3.GantryArtifactStreamingSpec{
+		Enabled:      true,
+		NodeSelector: map[string]string{"pool": "streaming"},
+	}
+
+	plan, res, err := (Component{}).Plan(t.Context(), testEnv(t), []unboundedv1alpha3.Site{*site})
+	if err != nil || !res.Ready {
+		t.Fatalf("Plan = (%+v, %v), want ready", res, err)
+	}
+
+	summary := plan.Summary()
+
+	want := "Apply DaemonSet/unbounded-system/" + overlayBDConfigDaemonSetName
+	if !strings.Contains(summary, want) {
+		t.Fatalf("plan does not apply enabled configurator:\n%s", summary)
+	}
+
+	if strings.Contains(summary, "Delete DaemonSet/unbounded-system/"+overlayBDConfigDaemonSetName) {
+		t.Fatalf("plan deletes enabled configurator:\n%s", summary)
 	}
 }
 
@@ -572,6 +698,7 @@ func TestPlanGolden(t *testing.T) {
 		"ConfigMap/unbounded-system/gantry-containerd-hosts " +
 		"ClusterRoleBinding/gantry-agent " +
 		"ClusterRole/gantry-agent " +
+		"DaemonSet/unbounded-system/gantry-overlaybd-config " +
 		"ConfigMap/unbounded-system/gantry-config]"
 
 	var chairPlan strings.Builder
@@ -583,6 +710,7 @@ func TestPlanGolden(t *testing.T) {
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 Delete ClusterRoleBinding/gantry-agent
 Delete ClusterRole/gantry-agent
+Delete DaemonSet/unbounded-system/gantry-overlaybd-config
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
 ` + chairPlan.String() + `Apply PriorityClass/gantry-low` + after + `
@@ -621,6 +749,7 @@ func TestExecutionOrderGolden(t *testing.T) {
 	}
 
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
+Delete DaemonSet/unbounded-system/gantry-overlaybd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 Delete ClusterRoleBinding/gantry-agent
 Delete ClusterRole/gantry-agent

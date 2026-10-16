@@ -39,6 +39,8 @@ BENCHMARK_SOURCE_REVISION="${BENCHMARK_SOURCE_REVISION:-}"
 BENCHMARK_NODE_COUNT="${BENCHMARK_NODE_COUNT:-5}"
 BENCHMARK_IMAGE_SIZE_MIB="${BENCHMARK_IMAGE_SIZE_MIB:-128}"
 BENCHMARK_IMAGE_LAYERS="${BENCHMARK_IMAGE_LAYERS:-4}"
+BENCHMARK_ARTIFACT_STREAMING="${BENCHMARK_ARTIFACT_STREAMING:-false}"
+BENCHMARK_NODE_POOL="${BENCHMARK_NODE_POOL:-}"
 BENCHMARK_AZURE_TELEMETRY="${BENCHMARK_AZURE_TELEMETRY:-true}"
 BENCHMARK_MINIMUM_BYTE_REDUCTION="${BENCHMARK_MINIMUM_BYTE_REDUCTION:-0.70}"
 BENCHMARK_MAXIMUM_LATENCY_RATIO="${BENCHMARK_MAXIMUM_LATENCY_RATIO:-3.0}"
@@ -46,6 +48,15 @@ ADOPT_BASELINE_IMAGE="${ADOPT_BASELINE_IMAGE:-}"
 ADOPT_GANTRY_IMAGE="${ADOPT_GANTRY_IMAGE:-}"
 ADOPT_PAYLOAD_SHA256="${ADOPT_PAYLOAD_SHA256:-}"
 START_BENCHMARK="${START_BENCHMARK:-false}"
+
+[[ "$BENCHMARK_ARTIFACT_STREAMING" == true || "$BENCHMARK_ARTIFACT_STREAMING" == false ]] || {
+  echo "BENCHMARK_ARTIFACT_STREAMING must be true or false" >&2
+  exit 2
+}
+if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true && -z "$BENCHMARK_NODE_POOL" ]]; then
+  echo "BENCHMARK_NODE_POOL is required when Artifact Streaming is enabled" >&2
+  exit 2
+fi
 
 repo_root=$(git rev-parse --show-toplevel)
 bootstrap_script="$repo_root/hack/gantry-benchmark/operator-vm-bootstrap.sh"
@@ -143,6 +154,24 @@ if ! az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" --ou
     --disk-mbps-read-write "$OPERATOR_BUILD_DISK_MBPS" \
     --only-show-errors \
     -o none
+else
+  current_build_disk_gb=$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" \
+    --query diskSizeGB -o tsv)
+  if ((current_build_disk_gb > OPERATOR_BUILD_DISK_GB)); then
+    echo "operator build disk is ${current_build_disk_gb} GiB; shrinking to ${OPERATOR_BUILD_DISK_GB} GiB is not supported" >&2
+    exit 1
+  fi
+  if ((current_build_disk_gb < OPERATOR_BUILD_DISK_GB)); then
+    echo "expanding operator build disk: ${current_build_disk_gb} GiB -> ${OPERATOR_BUILD_DISK_GB} GiB"
+    az disk update \
+      -g "$AZURE_RESOURCE_GROUP" \
+      -n "$OPERATOR_BUILD_DISK_NAME" \
+      --size-gb "$OPERATOR_BUILD_DISK_GB" \
+      --disk-iops-read-write "$OPERATOR_BUILD_DISK_IOPS" \
+      --disk-mbps-read-write "$OPERATOR_BUILD_DISK_MBPS" \
+      --only-show-errors \
+      -o none
+  fi
 fi
 
 build_disk_id=$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" --query id -o tsv)
@@ -219,6 +248,8 @@ az vm run-command invoke \
     "${ADOPT_BASELINE_IMAGE:--}" \
     "${ADOPT_GANTRY_IMAGE:--}" \
     "${ADOPT_PAYLOAD_SHA256:--}" \
+    "$BENCHMARK_ARTIFACT_STREAMING" \
+    "${BENCHMARK_NODE_POOL:--}" \
   --only-show-errors \
   -o json
 

@@ -44,6 +44,11 @@ func TestOriginEndpointURL(t *testing.T) {
 				fallback := strings.Contains(operation, "fallback")
 				bounded := strings.HasPrefix(operation, "range")
 
+				parsedSuffix, err := url.Parse(endpoint.suffix)
+				if err != nil {
+					t.Fatal(err)
+				}
+
 				srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 					hit := hits.Add(1)
 
@@ -55,6 +60,10 @@ func TestOriginEndpointURL(t *testing.T) {
 					wantURI := endpoint.prefix + "/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String()
 					if operation == "root challenge" {
 						wantURI = endpoint.prefix + "/v2/"
+					}
+
+					if !challenge && (parsedSuffix.RawQuery != "" || parsedSuffix.ForceQuery) {
+						wantURI += "?" + parsedSuffix.RawQuery
 					}
 
 					wantMethod := http.MethodGet

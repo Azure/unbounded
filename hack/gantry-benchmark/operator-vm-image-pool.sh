@@ -13,9 +13,19 @@ usage() {
 Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh full
   operator-vm-image-pool.sh standalone
+  operator-vm-image-pool.sh stop
   operator-vm-image-pool.sh fail-open
   operator-vm-image-pool.sh run BASELINE_RUN_ID
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
+  operator-vm-image-pool.sh sync-benchmark-source
+  operator-vm-image-pool.sh sync-benchmark-source-status
+  operator-vm-image-pool.sh sync-benchmark-source-cleanup
+  operator-vm-image-pool.sh verify-streaming-layers IMAGE
+  operator-vm-image-pool.sh verify-streaming-layers-status
+  operator-vm-image-pool.sh verify-streaming-layers-cleanup
+  operator-vm-image-pool.sh status-snapshot-start
+  operator-vm-image-pool.sh status-snapshot-result
+  operator-vm-image-pool.sh status-snapshot-cleanup
   operator-vm-image-pool.sh status
   operator-vm-image-pool.sh prune
   operator-vm-image-pool.sh prune-status
@@ -27,10 +37,17 @@ during a measured phase invalidate Azure telemetry.
 
 Set ADOPT_BASELINE_IMAGE, ADOPT_GANTRY_IMAGE, and ADOPT_PAYLOAD_SHA256 together
 with "full" to reuse an existing digest-pinned image pair.
+
+Set GANTRY_ONLY_STANDALONE_IMAGE, GANTRY_ONLY_STANDALONE_STREAMING_IMAGE, and
+GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 together with "standalone" to reuse an
+existing converted image.
 USAGE
 }
 
 remote_status_marker="GANTRY_BENCHMARK_REMOTE_STATUS="
+managed_status_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-status"
+managed_verification_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-verification"
+managed_source_sync_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-source-sync"
 
 invoke_remote() {
   local body=$1
@@ -269,11 +286,25 @@ SCRIPT
       standalone)
         (($# == 0)) || { usage >&2; exit 2; }
         mode_config='GANTRY_ONLY_STANDALONE="true"'
+        if [[ -n "${GANTRY_ONLY_STANDALONE_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_STREAMING_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:-}" ]]; then
+          : "${GANTRY_ONLY_STANDALONE_IMAGE:?Set GANTRY_ONLY_STANDALONE_IMAGE with the complete standalone adoption set}"
+          : "${GANTRY_ONLY_STANDALONE_STREAMING_IMAGE:?Set GANTRY_ONLY_STANDALONE_STREAMING_IMAGE with the complete standalone adoption set}"
+          : "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:?Set GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 with the complete standalone adoption set}"
+          printf -v mode_config '%s\nGANTRY_ONLY_STANDALONE_IMAGE=%q\nGANTRY_ONLY_STANDALONE_STREAMING_IMAGE=%q\nGANTRY_ONLY_STANDALONE_PAYLOAD_SHA256=%q' \
+            "$mode_config" "$GANTRY_ONLY_STANDALONE_IMAGE" "$GANTRY_ONLY_STANDALONE_STREAMING_IMAGE" "$GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256"
+        fi
         local_repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
         standalone_paths=(
+          hack/cmd/gantry-benchmark/config.go
+          hack/cmd/gantry-benchmark/enable.go
           hack/cmd/gantry-benchmark/gantry_only.go
+          hack/cmd/gantry-benchmark/hosts_routing.go
           hack/cmd/gantry-benchmark/main.go
+          hack/cmd/gantry-benchmark/peer_telemetry.go
+          hack/cmd/gantry-benchmark/preflight.go
+          hack/cmd/gantry-benchmark/results.go
           hack/cmd/gantry-benchmark/state.go
+          hack/gantry-benchmark/manifests/monitoring.yaml.tmpl
           hack/gantry-benchmark/operator-vm-run.sh
         )
         standalone_base_hashes_base64=$(
@@ -408,6 +439,318 @@ SCRIPT
 )
   invoke_remote "$script"
     ;;
+  sync-benchmark-source)
+    (($# == 0)) || { usage >&2; exit 2; }
+    repo_root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+    job_go=$repo_root/hack/cmd/gantry-benchmark/job.go
+    job_test_go=$repo_root/hack/cmd/gantry-benchmark/job_test.go
+    job_go_base64=$(base64 -w0 "$job_go")
+    job_test_go_base64=$(base64 -w0 "$job_test_go")
+    job_go_sha=$(sha256sum "$job_go" | cut -d' ' -f1)
+    job_test_go_sha=$(sha256sum "$job_test_go" | cut -d' ' -f1)
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+source /etc/gantry-benchmark/env
+export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
+for service in gantry-benchmark-operator.service gantry-benchmark-image-builder.service gantry-benchmark-image-prune.service; do
+  state=$(systemctl is-active "$service" 2>/dev/null || true)
+  case "$state" in
+    active|activating)
+      echo "$service is $state; refusing benchmark source sync" >&2
+      exit 1
+      ;;
+  esac
+done
+
+cd "$BENCHMARK_REPO_ROOT"
+paths=(hack/cmd/gantry-benchmark/job.go hack/cmd/gantry-benchmark/job_test.go)
+backup=$(mktemp -d)
+restore_on_exit() {
+  status=$?
+  trap - EXIT
+  if ((status != 0)); then
+    install -m 0644 "$backup/job.go" "${paths[0]}"
+    install -m 0644 "$backup/job_test.go" "${paths[1]}"
+  fi
+  rm -rf "$backup"
+  exit "$status"
+}
+trap restore_on_exit EXIT
+
+install -m 0644 "${paths[0]}" "$backup/job.go"
+install -m 0644 "${paths[1]}" "$backup/job_test.go"
+printf '%s' '__JOB_GO_BASE64__' | base64 --decode >"${paths[0]}.tmp"
+printf '%s' '__JOB_TEST_GO_BASE64__' | base64 --decode >"${paths[1]}.tmp"
+install -m 0644 "${paths[0]}.tmp" "${paths[0]}"
+install -m 0644 "${paths[1]}.tmp" "${paths[1]}"
+rm -f "${paths[0]}.tmp" "${paths[1]}.tmp"
+
+printf '%s  %s\n' '__JOB_GO_SHA__' "${paths[0]}" '__JOB_TEST_GO_SHA__' "${paths[1]}" | sha256sum --check --strict
+GOTOOLCHAIN=auto go test ./hack/cmd/gantry-benchmark
+printf 'benchmark_source_job_go_sha=%s\nbenchmark_source_job_test_go_sha=%s\n' '__JOB_GO_SHA__' '__JOB_TEST_GO_SHA__'
+SCRIPT
+)
+    script=${script/__JOB_GO_BASE64__/$job_go_base64}
+    script=${script/__JOB_TEST_GO_BASE64__/$job_test_go_base64}
+    script=${script//__JOB_GO_SHA__/$job_go_sha}
+    script=${script//__JOB_TEST_GO_SHA__/$job_test_go_sha}
+    command_name="gantry-benchmark-source-sync-$(date -u +%Y%m%d%H%M%S)-$$"
+    az vm run-command create \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --script "$script" \
+      --timeout-in-seconds 900 \
+      --async-execution false \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    printf '%s\n' "$command_name" >"$managed_source_sync_file"
+    printf 'benchmark_source_sync=%s\n' "$command_name"
+    ;;
+  sync-benchmark-source-status)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_source_sync_file" ]] || { echo "no submitted benchmark source sync" >&2; exit 1; }
+    command_name=$(cat "$managed_source_sync_file")
+    result=$(az vm run-command show \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --instance-view \
+      --only-show-errors \
+      -o json)
+    jq -r '
+      "benchmark_source_sync=" + .name,
+      "provisioning_state=" + (.provisioningState // "unknown"),
+      "execution_state=" + (.instanceView.executionState // "pending"),
+      "exit_code=" + ((.instanceView.exitCode // "") | tostring),
+      (.instanceView.output // empty),
+      (.instanceView.error // empty)
+    ' <<<"$result"
+    execution_state=$(jq -r '.instanceView.executionState // "pending"' <<<"$result")
+    case "$execution_state" in
+      Succeeded|Failed) ;;
+      *) exit 0 ;;
+    esac
+    exit_code=$(jq -r '.instanceView.exitCode // 1' <<<"$result")
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
+    exit "$exit_code"
+    ;;
+  sync-benchmark-source-cleanup)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_source_sync_file" ]] || { echo "no submitted benchmark source sync" >&2; exit 1; }
+    command_name=$(cat "$managed_source_sync_file")
+    az vm run-command delete \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --yes \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    rm -f "$managed_source_sync_file"
+    ;;
+  verify-streaming-layers)
+    (($# == 1)) || { usage >&2; exit 2; }
+    image=$1
+    node_limit=${STREAMING_VERIFY_NODE_LIMIT:-0}
+    parallelism=${STREAMING_VERIFY_PARALLELISM:-48}
+    node_name=${STREAMING_VERIFY_NODE_NAME:-}
+    metrics_only=${STREAMING_VERIFY_METRICS_ONLY:-false}
+    [[ "$node_limit" =~ ^[0-9]+$ ]] || { echo "STREAMING_VERIFY_NODE_LIMIT must be a non-negative integer" >&2; exit 2; }
+    [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || { echo "STREAMING_VERIFY_PARALLELISM must be a positive integer" >&2; exit 2; }
+    [[ "$node_name" =~ ^[a-zA-Z0-9._-]*$ ]] || { echo "STREAMING_VERIFY_NODE_NAME contains invalid characters" >&2; exit 2; }
+    [[ "$metrics_only" == true || "$metrics_only" == false ]] || { echo "STREAMING_VERIFY_METRICS_ONLY must be true or false" >&2; exit 2; }
+
+    verifier=$(base64 -w0 "$(dirname "$0")/operator-vm-verify-streaming-layers-remote.sh")
+    image_base64=$(printf '%s' "$image" | base64 -w0)
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+verifier=$(mktemp)
+trap 'rm -f "$verifier"' EXIT
+printf '%s' '__VERIFIER_BASE64__' | base64 --decode >"$verifier"
+chmod 0700 "$verifier"
+image=$(printf '%s' '__IMAGE_BASE64__' | base64 --decode)
+result_dir=/var/lib/gantry-benchmark/artifacts
+result_file=$result_dir/streaming-layer-verification.txt
+status_file=$result_dir/streaming-layer-verification.status
+mkdir -p "$result_dir"
+rm -f "$result_file" "$status_file" "$result_file.tmp"
+set +e
+"$verifier" "$image" __NODE_LIMIT__ __PARALLELISM__ "__NODE_NAME__" "__METRICS_ONLY__" >"$result_file.tmp" 2>&1
+status=$?
+set -e
+mv "$result_file.tmp" "$result_file"
+printf '%s\n' "$status" >"$status_file"
+grep -E '^(observed_at|image|manifest_digest|layers_per_host|bytes_per_host|desired_hosts|target_hosts|checked_hosts|unique_hosts|metric_hosts|complete_hosts|present_layers|present_bytes|expected_fleet_bytes|metrics_only|origin_started|origin_success|origin_failure|seed_failed|seed_peer|seed_origin|seed_present|prefetch_hosts|prefetch_batches|prefetch_group_success|prefetch_group_error)=' "$result_file" || true
+awk '
+  /^prefetch_coordinators:$/ {print; capture=1; next}
+  /^prefetch_coordinator_logs:$/ {exit}
+  capture {print}
+' "$result_file"
+grep -E 'streaming layer reconciliation (started|complete)' "$result_file" | tail -6 || true
+printf 'verification_status=%s\n' "$status"
+exit "$status"
+SCRIPT
+)
+    script=${script/__VERIFIER_BASE64__/$verifier}
+    script=${script/__IMAGE_BASE64__/$image_base64}
+    script=${script/__NODE_LIMIT__/$node_limit}
+    script=${script/__PARALLELISM__/$parallelism}
+    script=${script/__NODE_NAME__/$node_name}
+    script=${script/__METRICS_ONLY__/$metrics_only}
+    command_name="gantry-streaming-verify-$(date -u +%Y%m%d%H%M%S)-$$"
+    az vm run-command create \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --script "$script" \
+      --timeout-in-seconds 3600 \
+      --async-execution false \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    printf '%s\n' "$command_name" >"$managed_verification_file"
+    printf 'streaming_verification=%s\n' "$command_name"
+    ;;
+  verify-streaming-layers-status)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_verification_file" ]] || { echo "no submitted streaming layer verification" >&2; exit 1; }
+    command_name=$(cat "$managed_verification_file")
+    result=$(az vm run-command show \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --instance-view \
+      --only-show-errors \
+      -o json)
+    jq -r '
+      "streaming_verification=" + .name,
+      "provisioning_state=" + (.provisioningState // "unknown"),
+      "execution_state=" + (.instanceView.executionState // "pending"),
+      "exit_code=" + ((.instanceView.exitCode // "") | tostring),
+      (.instanceView.output // empty),
+      (.instanceView.error // empty)
+    ' <<<"$result"
+    execution_state=$(jq -r '.instanceView.executionState // "pending"' <<<"$result")
+    case "$execution_state" in
+      Succeeded|Failed) ;;
+      *) exit 0 ;;
+    esac
+    exit_code=$(jq -r '.instanceView.exitCode // 1' <<<"$result")
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
+    exit "$exit_code"
+    ;;
+  verify-streaming-layers-cleanup)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_verification_file" ]] || { echo "no submitted streaming layer verification" >&2; exit 1; }
+    command_name=$(cat "$managed_verification_file")
+    az vm run-command delete \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --yes \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    rm -f "$managed_verification_file"
+    ;;
+  status-snapshot-start)
+    (($# == 0)) || { usage >&2; exit 2; }
+    command_name="gantry-benchmark-status-$(date -u +%Y%m%d%H%M%S)-$$"
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+source /etc/gantry-benchmark/env
+export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/kubeconfig}"
+namespace=${BENCHMARK_NAMESPACE:-gantry-benchmark}
+service=$(systemctl is-active gantry-benchmark-operator.service 2>/dev/null || true)
+printf 'observed_at=%s\nservice=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${service:-unknown}"
+progress_file=${BENCHMARK_ARTIFACT_ROOT:-$HOME/artifacts}/progress.json
+if [[ -s "$progress_file" ]]; then
+  jq -r '"run_id=\(.run_id // "")\nstage=\(.stage // "")\nstage_started_at=\(.stage_started_at // "")\nmessage=\(.message // "")"' "$progress_file"
+  run_id=$(jq -r '.run_id // empty' "$progress_file")
+  if [[ -n "$run_id" ]]; then
+    build_root=${BENCHMARK_REPO_ROOT:-/opt/gantry-benchmark/unbounded}/tmp/gantry-benchmark/$run_id/build
+    build_dir=$build_root/gantry-only-fresh
+    [[ -d "$build_dir" ]] || build_dir=$build_root/shared-payload
+    payload_files=0
+    payload_bytes=0
+    if [[ -d "$build_dir" ]]; then
+      payload_files=$(find "$build_dir" -maxdepth 1 -type f -name 'payload*.bin' | wc -l)
+      payload_bytes=$(find "$build_dir" -maxdepth 1 -type f -name 'payload*.bin' -printf '%s\n' | awk '{sum += $1} END {printf "%.0f\n", sum}')
+    fi
+    image_operation=$(ps -C podman -o args= 2>/dev/null | awk '
+      $2 == "build" || $2 == "push" {print $2; exit}
+    ') || true
+    printf 'payload_files=%s\npayload_bytes=%s\nimage_operation=%s\n' \
+      "$payload_files" "$payload_bytes" "${image_operation:-none}"
+  fi
+fi
+conversion_event=$(grep -E 'Artifact Streaming conversion .* status=(Submitted|Running|Succeeded|Failed|Canceled|Cancelled)$' \
+  "${BENCHMARK_ARTIFACT_ROOT:-$HOME/artifacts}/operator.log" 2>/dev/null | \
+  tail -1 || true)
+printf 'conversion_event=%s\n' "$conversion_event"
+operator_log=${BENCHMARK_ARTIFACT_ROOT:-$HOME/artifacts}/operator.log
+if [[ -s "$operator_log" ]]; then
+  printf '%s\n' 'operator_log_tail_begin'
+  tail -40 "$operator_log"
+  printf '%s\n' 'operator_log_tail_end'
+fi
+state=$(kubectl --request-timeout=20s -n "$namespace" get configmap gantry-benchmark-state \
+  -o jsonpath='{.data.state\.json}' 2>/dev/null || true)
+if [[ -n "$state" ]]; then
+  jq -r '"benchmark_status=\(.status // "")\nactive_phase=\(.active_phase // "")\nimage=\(.artifact_streaming_image // .gantry_cold_image // "")\nnode_count=\(.node_count // 0)"' <<<"$state"
+fi
+SCRIPT
+)
+    az vm run-command create \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --script "$script" \
+      --timeout-in-seconds 60 \
+      --async-execution false \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    printf '%s\n' "$command_name" >"$managed_status_file"
+    printf 'status_snapshot=%s\n' "$command_name"
+    ;;
+  status-snapshot-result)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_status_file" ]] || { echo "no submitted status snapshot" >&2; exit 1; }
+    command_name=$(cat "$managed_status_file")
+    result=$(az vm run-command show \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --instance-view \
+      --only-show-errors \
+      -o json)
+    jq -r '
+      "status_snapshot=" + .name,
+      "provisioning_state=" + (.provisioningState // "unknown"),
+      "execution_state=" + (.instanceView.executionState // "pending"),
+      "exit_code=" + ((.instanceView.exitCode // "") | tostring),
+      (.instanceView.output // empty),
+      (.instanceView.error // empty)
+    ' <<<"$result"
+    ;;
+  status-snapshot-cleanup)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_status_file" ]] || { echo "no submitted status snapshot" >&2; exit 1; }
+    command_name=$(cat "$managed_status_file")
+    az vm run-command delete \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --yes \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    rm -f "$managed_status_file"
+    ;;
   status)
     (($# == 0)) || { usage >&2; exit 2; }
 
@@ -498,6 +841,26 @@ systemctl show "$prune_service" --property=ActiveState --property=SubState --no-
 SCRIPT
 )
     script=${script/__PRUNE_WORKER_BASE64__/$prune_worker}
+    invoke_remote "$script"
+    ;;
+  stop)
+    (($# == 0)) || { usage >&2; exit 2; }
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+systemctl stop gantry-benchmark-operator.service || true
+source /etc/gantry-benchmark/env
+export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/kubeconfig}"
+export BENCHMARK_CONFIRM_CONTEXT="$(kubectl config current-context)"
+if kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state >/dev/null 2>&1 ||
+  kubectl -n "${GANTRY_NAMESPACE:-gantry-system}" get configmap gantry-benchmark-lock >/dev/null 2>&1; then
+  cd "$BENCHMARK_REPO_ROOT"
+  make -C hack/gantry-benchmark disable
+fi
+systemctl show gantry-benchmark-operator.service \
+  --property=ActiveState --property=SubState --property=Result --property=ExecMainStatus --no-pager
+SCRIPT
+)
     invoke_remote "$script"
     ;;
   prune-status)
