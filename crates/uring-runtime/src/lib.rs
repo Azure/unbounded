@@ -38,6 +38,17 @@
 //! time. Both are driven explicitly from the application's loop; see the
 //! [`task`] module for how they fit together with a reactor.
 //!
+//! # Thread groups and CPU affinity
+//!
+//! [`group`] runs a fixed set of pinned threads ("lanes" and optional
+//! "helpers"), each building its services on its own thread and taking them
+//! through start, steady-state polling, drain, two ownership fences and
+//! shutdown. Panics are caught and reported with their message; a service
+//! whose fence cannot be confirmed is leaked rather than freed. [`affinity`]
+//! discovers the CPUs, cgroup limits and device NUMA locality visible to the
+//! calling thread and pins threads; choosing a placement is left to the
+//! application.
+//!
 //! # Kernel requirements
 //!
 //! Linux 5.6 or newer for the core operations, and 5.15 for
@@ -71,6 +82,7 @@ pub mod cancel;
 pub mod clock;
 pub mod error;
 pub mod fd;
+pub mod group;
 pub mod net;
 pub mod scope;
 pub mod task;
