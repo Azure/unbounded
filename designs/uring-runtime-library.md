@@ -569,15 +569,24 @@ policy that multiple Racer crates share; root-only pieces go to the root crate.
 | Old location | New home |
 |---|---|
 | `reactor::filesystem::{secure, operations}` | `racer-platform::fs` (built on core `open_at2`/`statx`/... ops) |
-| `reactor::filesystem::checkpoint` | root `src/store/` |
+| `reactor::filesystem::checkpoint` | `racer-platform::fs::checkpoint` for now (root-only consumer; may move to root `src/store/`) |
 | `channel`, `mailbox`, `mailbox::executor`, `offload` | `racer-platform` |
 | `drivers::{retry_listener, race, Hedge*}` | `racer-platform::retry` |
 | `environment::{now, wall_now, fill_random, Environment, require_simulated}` (ambient TLS) | `racer-platform::env` (Racer's choice of ambient context, built on core `Clock`/`Entropy` and the sim crate's `SimClock`) |
 | `environment::{Deadline, unix_millis, Observer, Registry}` | `racer-platform::time` |
 | `group::affinity::{place, place_exact}` | root `src/worker.rs` area |
-| `reactor::ready_set::ReadySet` | root `src/client/` |
-| `Descriptor::{idle_healthy, peer_*, tcp_tuple, ...}` | `racer-platform::socket` |
+| `reactor::ready_set::ReadySet` | `racer-platform::reactor::ready_set` |
+| `reactor::descriptor::Descriptor` (incl. `idle_healthy`, `peer_*`, `tcp_tuple`, ...) | `racer-platform::reactor::descriptor` |
 | `Reactor<S, B: Budget>` admission accounting, `SUBMISSION_BYTES` | `racer-platform::reactor` adapter over `uring_runtime::Reactor<RacerBackend>` |
+
+The adapter keeps the old method names and `Operation` (boxed future) return
+types, initializes lazily, admits operations against Racer's ordinary and
+reserved partitions, charges bookkeeping bytes to its `Budget` and holds the
+charge as a library lease until the fence, and owns the data retry policy
+(zero-progress `EINTR`/`EAGAIN` up to 8 times, waiting for readiness after
+`EAGAIN`). Library operations run under a `repr(transparent)` scope wrapper
+whose error keeps kernel errno apart from scope failures. File operations use
+`Operation::offload` where the old reactor set `IOSQE_ASYNC`.
 
 `RacerBackend` is Racer's own `Backend` (an enum dispatching to `Uring` or, in
 simulation builds and tests, `SimBackend`). The simulation choice is Racer
