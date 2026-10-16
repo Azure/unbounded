@@ -59,9 +59,11 @@ func TestArtifactStreamingDoesNotMutateHostsRouting(t *testing.T) {
 	if err := benchmark.installHosts(context.Background(), state, hostsModeGantry); err != nil {
 		t.Fatalf("installHosts: %v", err)
 	}
+
 	if err := benchmark.restoreHosts(context.Background(), state); err != nil {
 		t.Fatalf("restoreHosts: %v", err)
 	}
+
 	if len(runner.commands) != 0 {
 		t.Fatalf("streaming routing executed %d commands", len(runner.commands))
 	}

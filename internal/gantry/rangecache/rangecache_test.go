@@ -159,6 +159,7 @@ func TestCacheStopsAdmittingNewBlobsAtCapacity(t *testing.T) {
 
 func TestSpansInsertOverlapping(t *testing.T) {
 	var s spans
+
 	s = s.insert(10, 20)
 	s = s.insert(5, 12)
 	s = s.insert(30, 40)

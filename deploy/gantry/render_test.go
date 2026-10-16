@@ -603,6 +603,7 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	hostRoot := t.TempDir()
 	sourceRoot := t.TempDir()
 	targetDir := filepath.Join(hostRoot, "_default")
+
 	sourceDir := filepath.Join(sourceRoot, "_default")
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
 		t.Fatalf("create source directory: %v", err)

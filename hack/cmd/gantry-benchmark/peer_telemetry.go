@@ -236,6 +236,7 @@ func (b *benchmark) fetchGantryDiagnosticTimestamps(
 	)
 
 	queryWindow := diagnosticTimestampQueryWindow(window, time.Now().UTC())
+
 	raw, err := b.queryPrometheusRange(ctx, query, queryWindow, performanceTelemetryStep)
 	if err != nil {
 		return nil, err

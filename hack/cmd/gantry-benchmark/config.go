@@ -269,8 +269,9 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 	if config.ArtifactStreaming && config.Mode != benchmarkModeDirect {
 		return benchmarkConfig{}, errors.New("BENCHMARK_ARTIFACT_STREAMING requires BENCHMARK_MODE=direct")
 	}
+
 	if config.ArtifactStreamingTimeout <= 0 || config.ArtifactStreamingPoll <= 0 {
-		return benchmarkConfig{}, errors.New("Artifact Streaming timeout and poll interval must be greater than zero")
+		return benchmarkConfig{}, errors.New("artifact streaming timeout and poll interval must be greater than zero")
 	}
 
 	if config.TelemetryTimeout <= 0 {
@@ -346,6 +347,7 @@ func (c benchmarkConfig) validateEnable() error {
 		required["BENCHMARK_PROXY_IMAGE"] = c.ProxyImage
 	} else {
 		required["BASELINE_ACR_LOGIN_SERVER"] = c.BaselineACRLoginServer
+
 		required["GANTRY_ACR_LOGIN_SERVER"] = c.GantryACRLoginServer
 		if c.ArtifactStreaming {
 			required["GANTRY_ACR_NAME"] = c.GantryACRName
@@ -396,6 +398,7 @@ func (c benchmarkConfig) nodeSelector() map[string]string {
 		selector["kubernetes.io/os"] = parts[0]
 		selector["kubernetes.io/arch"] = parts[1]
 	}
+
 	if c.NodePool != "" {
 		selector["agentpool"] = c.NodePool
 	}

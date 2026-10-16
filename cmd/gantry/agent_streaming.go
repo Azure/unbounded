@@ -19,6 +19,7 @@ func newCanonicalOriginResolver(registries []config.UpstreamRegistry) func(strea
 		if err != nil || !endpoint.IsAbs() || endpoint.Host == "" {
 			continue
 		}
+
 		endpoints[strings.ToLower(registry.Name)] = endpoint
 		if registry.NSAlias != "" {
 			endpoints[strings.ToLower(registry.NSAlias)] = endpoint
@@ -30,6 +31,7 @@ func newCanonicalOriginResolver(registries []config.UpstreamRegistry) func(strea
 		if err != nil {
 			return streamingapi.OriginURL{}, false
 		}
+
 		endpoint, ok := endpoints[strings.ToLower(canonical.Hostname())]
 		if !ok {
 			return streamingapi.OriginURL{}, false

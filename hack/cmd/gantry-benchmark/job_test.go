@@ -82,6 +82,7 @@ func TestPullPodListBindsExactlyOnePodPerNode(t *testing.T) {
 	}
 
 	seen := map[string]bool{}
+
 	for index, item := range items {
 		pod := item.(map[string]any)
 		metadata := pod["metadata"].(map[string]any)
@@ -91,6 +92,7 @@ func TestPullPodListBindsExactlyOnePodPerNode(t *testing.T) {
 		if seen[node] {
 			t.Fatalf("node %q received multiple pods", node)
 		}
+
 		seen[node] = true
 
 		wantName := fmt.Sprintf("gantry-pull-test-run-%05d", index)

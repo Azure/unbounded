@@ -141,6 +141,7 @@ func TestIsOverlayBDStreamingManifest(t *testing.T) {
 	if !manifest.IsOverlayBDStreamingManifest([]byte(streaming)) {
 		t.Fatal("fully annotated OverlayBD manifest was not detected")
 	}
+
 	if manifest.IsOverlayBDStreamingManifest([]byte(ociImageManifest)) {
 		t.Fatal("regular OCI manifest was detected as OverlayBD streaming")
 	}

@@ -47,11 +47,13 @@ func (b *benchmark) preflight(ctx context.Context) error {
 	if state.ArtifactStreaming != b.config.ArtifactStreaming {
 		return fmt.Errorf("benchmark Artifact Streaming state=%t does not match BENCHMARK_ARTIFACT_STREAMING=%t", state.ArtifactStreaming, b.config.ArtifactStreaming)
 	}
+
 	if state.NodePool != b.config.NodePool {
 		return fmt.Errorf("benchmark node pool state=%q does not match BENCHMARK_NODE_POOL=%q", state.NodePool, b.config.NodePool)
 	}
+
 	if state.ArtifactStreaming && !state.StandaloneGantry {
-		return fmt.Errorf("Artifact Streaming requires prepare-gantry-standalone")
+		return fmt.Errorf("artifact streaming requires prepare-gantry-standalone")
 	}
 
 	if _, _, err := state.preparedImages(); err != nil {
@@ -150,7 +152,7 @@ func validateArtifactStreamingGantryConfig(raw, registry string) error {
 	}
 
 	if !config.ArtifactStreamingEnabled {
-		return fmt.Errorf("Gantry Artifact Streaming is disabled")
+		return fmt.Errorf("gantry artifact streaming is disabled")
 	}
 
 	wantEndpoint := "http://127.0.0.1:8578?ns=" + registry
@@ -160,7 +162,7 @@ func validateArtifactStreamingGantryConfig(raw, registry string) error {
 		}
 	}
 
-	return fmt.Errorf("Gantry upstream %q is not chained through %q", registry, wantEndpoint)
+	return fmt.Errorf("gantry upstream %q is not chained through %q", registry, wantEndpoint)
 }
 
 func (b *benchmark) smokeProxy(ctx context.Context, state benchmarkState) error {

@@ -19,9 +19,11 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if state.Status != "preflight-passed" {
 		return fmt.Errorf("benchmark state is %q, run preflight before run", state.Status)
 	}
+
 	if state.ArtifactStreaming {
-		return fmt.Errorf("Artifact Streaming requires run-gantry")
+		return fmt.Errorf("artifact streaming requires run-gantry")
 	}
+
 	if state.NodePool != b.config.NodePool {
 		return fmt.Errorf("benchmark node pool state=%q does not match BENCHMARK_NODE_POOL=%q", state.NodePool, b.config.NodePool)
 	}
@@ -328,6 +330,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	b.warnIncompleteFinalLayerResponseTimestamps(gantryDiagnostics)
 
 	var gantryProxy proxyPhaseTotals

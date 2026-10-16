@@ -69,10 +69,12 @@ func ParseOriginURL(raw string, policy URLPolicy) (OriginURL, error) {
 
 	d, err := digestFromURL(u)
 	canonical := false
+
 	if err != nil {
 		d, err = canonicalDigestFromURL(u)
 		canonical = err == nil
 	}
+
 	if err != nil {
 		return OriginURL{}, err
 	}
@@ -223,6 +225,7 @@ func canonicalDigestFromURL(u *url.URL) (digest.Digest, error) {
 	first, firstErr := url.PathUnescape(segments[0])
 	family, familyErr := url.PathUnescape(segments[len(segments)-2])
 	value, valueErr := url.PathUnescape(segments[len(segments)-1])
+
 	hex, ok := strings.CutPrefix(value, "sha256:")
 	if firstErr != nil || familyErr != nil || valueErr != nil || first != "v2" || family != "blobs" || !ok || !digestHexPattern.MatchString(hex) {
 		return zero, fmt.Errorf("streaming origin: canonical blob path required")

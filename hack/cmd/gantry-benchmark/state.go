@@ -91,6 +91,7 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 		if s.ArtifactStreaming && !s.ArtifactStreamingPrepared {
 			return "", "", fmt.Errorf("standalone Gantry image has not completed Artifact Streaming conversion")
 		}
+
 		if s.ArtifactStreaming {
 			if err := s.validateArtifactStreamingImage(); err != nil {
 				return "", "", err
@@ -159,23 +160,27 @@ func (s benchmarkState) validateArtifactStreamingImage() error {
 	if s.ArtifactStreamingImage == "" {
 		return fmt.Errorf("standalone Gantry run has no Artifact Streaming digest reference")
 	}
+
 	if !strings.Contains(s.ArtifactStreamingImage, "@") {
-		return fmt.Errorf("Artifact Streaming runtime image must use a digest: %s", s.ArtifactStreamingImage)
+		return fmt.Errorf("artifact streaming runtime image must use a digest: %s", s.ArtifactStreamingImage)
 	}
 
 	repository, digestValue, err := splitImageReference(s.ArtifactStreamingImage, s.GantryACRLoginServer)
 	if err != nil {
 		return fmt.Errorf("invalid Artifact Streaming runtime image: %w", err)
 	}
+
 	if repository != s.WorkloadRepository {
-		return fmt.Errorf("Artifact Streaming runtime repository %q, want %q", repository, s.WorkloadRepository)
+		return fmt.Errorf("artifact streaming runtime repository %q, want %q", repository, s.WorkloadRepository)
 	}
+
 	parsedDigest, err := digest.Parse(digestValue)
 	if err != nil || parsedDigest.Algorithm() != digest.SHA256 {
-		return fmt.Errorf("Artifact Streaming runtime image must use a sha256 digest: %s", s.ArtifactStreamingImage)
+		return fmt.Errorf("artifact streaming runtime image must use a sha256 digest: %s", s.ArtifactStreamingImage)
 	}
+
 	if s.ArtifactStreamingImage == s.GantryColdImage {
-		return fmt.Errorf("Artifact Streaming runtime digest must differ from the original image digest: %s", s.ArtifactStreamingImage)
+		return fmt.Errorf("artifact streaming runtime digest must differ from the original image digest: %s", s.ArtifactStreamingImage)
 	}
 
 	return nil
@@ -185,6 +190,7 @@ func (s benchmarkState) gantryRuntimeImage() (string, error) {
 	if !s.ArtifactStreaming {
 		return s.GantryColdImage, nil
 	}
+
 	if err := s.validateArtifactStreamingImage(); err != nil {
 		return "", err
 	}
