@@ -212,7 +212,7 @@ name = "controlplane"
 version = "0.1.0"
 dependencies = [
  "futures",
- "uring-runtime-legacy",
+ "racer-platform",
  "wire-codec",
 ]
 

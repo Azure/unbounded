@@ -4,6 +4,7 @@ use controlplane::{
     Codec, Error, Feed, Generation, Host, Published, Retention, Rollout, Sync, Target,
     feed::{FailureClass, FetchError, Preparation, Schedule, Source},
 };
+use racer_platform::{Operation, reactor::descriptor::Descriptor, scope::LibraryScope as _};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -15,14 +16,13 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use uring_runtime::{Operation, Scope as _, reactor::descriptor::Descriptor};
 use wire_codec::rest;
 
 /// Test adapter error keeps cancellation distinct from retry and replay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Failure {
     Core(Error),
-    Runtime(uring_runtime::Error),
+    Runtime(racer_platform::Error),
     Rest(rest::Error),
     Invalid,
 }
@@ -33,8 +33,15 @@ impl From<Error> for Failure {
     }
 }
 
-impl From<uring_runtime::Error> for Failure {
-    fn from(error: uring_runtime::Error) -> Self {
+impl From<racer_platform::uring::Error> for Failure {
+    /// Library errors take the Racer runtime mapping.
+    fn from(error: racer_platform::uring::Error) -> Self {
+        racer_platform::Error::from(error).into()
+    }
+}
+
+impl From<racer_platform::Error> for Failure {
+    fn from(error: racer_platform::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -365,19 +372,19 @@ impl Scope {
     fn new() -> Self {
         Self {
             canceled: Rc::new(Cell::new(false)),
-            deadline: uring_runtime::environment::now() + Duration::from_secs(5),
+            deadline: racer_platform::environment::now() + Duration::from_secs(5),
         }
     }
 }
 
-impl uring_runtime::Scope for Scope {
+impl racer_platform::scope::LibraryScope for Scope {
     type Error = Failure;
 
     fn check(&self) -> Result<(), Failure> {
         if self.canceled.get() {
-            Err(uring_runtime::Error::Cancelled.into())
-        } else if uring_runtime::environment::now() >= self.deadline {
-            Err(uring_runtime::Error::DeadlineExceeded.into())
+            Err(racer_platform::Error::Canceled.into())
+        } else if racer_platform::environment::now() >= self.deadline {
+            Err(racer_platform::Error::DeadlineExceeded.into())
         } else {
             Ok(())
         }
@@ -464,8 +471,10 @@ impl Host for TestHost {
 
     fn classify(&self, error: Failure) -> FailureClass {
         match error {
-            Failure::Runtime(uring_runtime::Error::Cancelled) => FailureClass::Cancelled,
-            Failure::Runtime(uring_runtime::Error::DeadlineExceeded | uring_runtime::Error::Io)
+            Failure::Runtime(racer_platform::Error::Canceled) => FailureClass::Cancelled,
+            Failure::Runtime(
+                racer_platform::Error::DeadlineExceeded | racer_platform::Error::Io,
+            )
             | Failure::Core(Error::Capacity | Error::Pending)
             | Failure::Rest(rest::Error::Unavailable) => FailureClass::Retry,
             Failure::Rest(rest::Error::Unauthorized) => FailureClass::Rejected,
@@ -663,7 +672,7 @@ fn feed_rejects_unbased_unchanged_oversized_and_canceled_responses() {
                 .await
                 .unwrap_err()
                 .error,
-            Failure::Runtime(uring_runtime::Error::Cancelled)
+            Failure::Runtime(racer_platform::Error::Canceled)
         );
         assert_eq!(script.requests.borrow().len(), 2);
         assert!(feed.last().is_none());
@@ -789,7 +798,7 @@ fn latest_pending_wins_one_job_survives_cancellation_and_owner_stays_local() {
         scope.canceled.set(true);
         assert_eq!(
             sync.turn(&scope).await.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::Cancelled)
+            Failure::Runtime(racer_platform::Error::Canceled)
         );
         assert_eq!(sync.status().error, None);
         assert!(target.started.load(Ordering::Acquire) <= 1);
@@ -797,7 +806,7 @@ fn latest_pending_wins_one_job_survives_cancellation_and_owner_stays_local() {
         let result = sync.turn(&Scope::new()).await;
         assert_eq!(
             result.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::DeadlineExceeded)
+            Failure::Runtime(racer_platform::Error::DeadlineExceeded)
         );
         assert_eq!(*target.installed.borrow(), vec![3]);
         assert_eq!(sync.status().accepted, Some(3));
@@ -834,7 +843,7 @@ fn install_retries_during_network_wait_and_retry_after_does_not_advance_acceptan
         target.blocked.set(false);
         assert_eq!(
             sync.turn(&Scope::new()).await.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::DeadlineExceeded)
+            Failure::Runtime(racer_platform::Error::DeadlineExceeded)
         );
         assert_eq!(
             script.requests.borrow().len(),
@@ -865,7 +874,7 @@ fn settle_installs_slow_preparation_without_network() {
         assert_eq!(sync.status().pending, Some(1));
         assert_eq!(
             sync.settle(&Scope::new()).await.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::DeadlineExceeded),
+            Failure::Runtime(racer_platform::Error::DeadlineExceeded),
             "settle is bounded by the turn schedule"
         );
         target.release.store(true, Ordering::Release);
@@ -876,7 +885,7 @@ fn settle_installs_slow_preparation_without_network() {
         sync.shutdown(&Scope::new()).await.unwrap();
         assert_eq!(
             sync.settle(&Scope::new()).await.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::Cancelled)
+            Failure::Runtime(racer_platform::Error::Canceled)
         );
     });
 }
@@ -891,12 +900,12 @@ fn bounded_shutdown_retains_unfinished_job_for_later_fence() {
         sync.turn(&Scope::new()).await.unwrap();
         assert_eq!(
             sync.shutdown(&Scope::new()).await.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::DeadlineExceeded)
+            Failure::Runtime(racer_platform::Error::DeadlineExceeded)
         );
         assert!(sync.status().stopped);
         assert_eq!(
             sync.turn(&Scope::new()).await.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::Cancelled)
+            Failure::Runtime(racer_platform::Error::Canceled)
         );
         target.release.store(true, Ordering::Release);
         sync.shutdown(&Scope::new()).await.unwrap();
@@ -1070,7 +1079,7 @@ fn driver_drop_joins_unfinished_preparation_even_after_canceled_shutdown() {
         scope.canceled.set(true);
         assert_eq!(
             sync.shutdown(&scope).await.unwrap_err(),
-            Failure::Runtime(uring_runtime::Error::Cancelled)
+            Failure::Runtime(racer_platform::Error::Canceled)
         );
         let release = target.release.clone();
         // Release from an independent finite helper, never from the joined owner.
@@ -1128,14 +1137,14 @@ fn canceled_install_preserves_prepared_state_and_later_supersession_wins() {
         let target = Installer::new();
         target
             .install_error
-            .set(Some(uring_runtime::Error::Cancelled.into()));
+            .set(Some(racer_platform::Error::Canceled.into()));
         let script = Script::new([full(2)]);
         let mut sync = driver(script.clone(), target.clone());
         sync.seed(Arc::new(1)).unwrap();
         sync.turn(&Scope::new()).await.unwrap();
         assert_eq!(
             sync.turn(&Scope::new()).await,
-            Err(uring_runtime::Error::Cancelled.into())
+            Err(racer_platform::Error::Canceled.into())
         );
         assert_eq!(sync.status().accepted, Some(1));
         assert_eq!(sync.status().pending, Some(2));
@@ -1270,7 +1279,7 @@ fn cancellation_after_no_change_response_is_not_reported_as_success() {
                 .await
                 .unwrap_err()
                 .error,
-            Failure::Runtime(uring_runtime::Error::Cancelled)
+            Failure::Runtime(racer_platform::Error::Canceled)
         );
         assert_eq!(*feed.last().unwrap(), 1);
     });
@@ -1366,7 +1375,7 @@ impl Host for ClockHost {
             if let Err(error) = scope.check() {
                 return std::task::Poll::Ready(Err(error));
             }
-            if uring_runtime::environment::now() >= until {
+            if racer_platform::environment::now() >= until {
                 std::task::Poll::Ready(Ok(()))
             } else {
                 std::task::Poll::Pending
@@ -1402,11 +1411,11 @@ impl Source<ClockHost> for Script {
 /// Explicit clock steps prove no request can start before the rejection deadline.
 #[test]
 fn candidate_rejection_backoff_survives_successful_receipts_and_newer_recovers() {
+    use racer_platform::environment::{SimulationClock, now};
     use std::{
         future::Future as _,
         task::{Context, Poll},
     };
-    use uring_runtime::environment::{SimulationClock, now};
     for phase in 0..3 {
         let clock = SimulationClock::new(42);
         let _environment = clock.environment(0).enter();
