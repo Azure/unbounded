@@ -115,7 +115,7 @@ func TestMutateSuccess(t *testing.T) {
 			}
 
 			sc := c.SecurityContext
-			if *sc.RunAsUser != 0 || *sc.RunAsGroup != 0 || *sc.RunAsNonRoot || *sc.AllowPrivilegeEscalation || !*sc.ReadOnlyRootFilesystem ||
+			if *sc.RunAsUser != SidecarUID || *sc.RunAsGroup != SidecarUID || !*sc.RunAsNonRoot || *sc.AllowPrivilegeEscalation || !*sc.ReadOnlyRootFilesystem ||
 				!reflect.DeepEqual(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 				t.Fatalf("security context: %+v", sc)
 			}

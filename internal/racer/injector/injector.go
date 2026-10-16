@@ -26,6 +26,11 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
+// SidecarUID is the UID and GID the injected sidecar runs as. The sidecar
+// needs no root: Racer client sockets are mode 0666 and access is controlled
+// by which hostPath directory the pod mounts.
+const SidecarUID int64 = 65532
+
 const (
 	Path                    = "/mutate-racer-object-sidecar"
 	ContainerName           = "racer-object"
@@ -110,9 +115,9 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
 		Resources:     spec.resources,
 		SecurityContext: &corev1.SecurityContext{
-			RunAsUser:                ptr.To[int64](0),
-			RunAsGroup:               ptr.To[int64](0),
-			RunAsNonRoot:             ptr.To(false),
+			RunAsUser:                ptr.To[int64](SidecarUID),
+			RunAsGroup:               ptr.To[int64](SidecarUID),
+			RunAsNonRoot:             ptr.To(true),
 			AllowPrivilegeEscalation: ptr.To(false),
 			ReadOnlyRootFilesystem:   ptr.To(true),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
