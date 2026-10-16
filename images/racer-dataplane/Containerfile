@@ -8,7 +8,7 @@ ARG RUNTIME_IMAGE=ubuntu:noble
 FROM ${RUST_IMAGE} AS builder
 ARG RACER_NATIVE_RDMA=true
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
-WORKDIR /src
+WORKDIR /src/cmd/racer-dataplane
 
 RUN case "$RACER_NATIVE_RDMA" in \
         true) apt-get update && apt-get install -y --no-install-recommends \
@@ -30,6 +30,12 @@ COPY cmd/racer-dataplane/object-wire/Cargo.toml ./object-wire/Cargo.toml
 COPY cmd/racer-dataplane/object-wire/src ./object-wire/src
 COPY cmd/racer-dataplane/runtime/Cargo.toml ./runtime/Cargo.toml
 COPY cmd/racer-dataplane/runtime/src ./runtime/src
+COPY cmd/racer-dataplane/platform/Cargo.toml ./platform/Cargo.toml
+COPY cmd/racer-dataplane/platform/src ./platform/src
+# Shared runtime library, referenced by path from ../../crates.
+COPY crates/Cargo.toml crates/Cargo.lock /src/crates/
+COPY crates/uring-runtime/Cargo.toml /src/crates/uring-runtime/Cargo.toml
+COPY crates/uring-runtime/src /src/crates/uring-runtime/src
 COPY cmd/racer-dataplane/alloc/Cargo.toml ./alloc/Cargo.toml
 COPY cmd/racer-dataplane/alloc/src ./alloc/src
 COPY cmd/racer-dataplane/flow/Cargo.toml ./flow/Cargo.toml

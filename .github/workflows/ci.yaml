@@ -169,6 +169,7 @@ jobs:
         run: |
           timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime-legacy --all-targets --all-features -- -D warnings
           timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime-legacy --all-targets --no-default-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-platform --all-targets --all-features -- -D warnings
 
       # Keep allocator invocations separate from runtime/workspace builds:
       # runtime test features must not enable simulation in the production
