@@ -1,4 +1,5 @@
 //! Startup futures must drive native activation without steady-state polling.
+use racer_platform::{Cancellation, Operation, group::Service};
 use rdma_verbs::{Configuration, Error, IoPort, WithNative, pair};
 use std::{
     rc::Rc,
@@ -8,19 +9,25 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
 };
-use uring_runtime::{Operation, Scope, environment::Cancellation, group::Service};
 
 /// Keep runtime cancellation distinct from activation errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Failure {
-    Runtime(uring_runtime::Error),
+    Runtime(racer_platform::Error),
 
     Verbs(Error),
 }
 
-impl From<uring_runtime::Error> for Failure {
+impl From<racer_platform::uring::Error> for Failure {
+    /// Library errors take the Racer runtime mapping.
+    fn from(error: racer_platform::uring::Error) -> Self {
+        racer_platform::Error::from(error).into()
+    }
+}
+
+impl From<racer_platform::Error> for Failure {
     /// Preserve the runtime failure.
-    fn from(error: uring_runtime::Error) -> Self {
+    fn from(error: racer_platform::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -36,13 +43,13 @@ impl From<Error> for Failure {
 #[derive(Clone)]
 struct StartupScope(Cancellation);
 
-impl Scope for StartupScope {
+impl racer_platform::scope::LibraryScope for StartupScope {
     type Error = Failure;
 
     /// Reject canceled startup.
     fn check(&self) -> Result<(), Failure> {
-        if self.0.is_cancelled() {
-            Err(uring_runtime::Error::Cancelled.into())
+        if self.0.is_canceled() {
+            Err(racer_platform::Error::Canceled.into())
         } else {
             Ok(())
         }
@@ -91,7 +98,7 @@ impl Service<StartupScope> for Activating {
     }
 
     /// Steady-state polling must not be needed during startup.
-    fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
+    fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
         panic!("startup must drive native work through its own future")
     }
 
@@ -129,7 +136,7 @@ fn startup_awaits_empty_plan_activation_and_preserves_selector_errors() {
             },
             native,
         );
-        let scope = StartupScope(Cancellation::new().unwrap());
+        let scope = StartupScope(Cancellation::new());
         let notifications = Arc::new(Notifications(AtomicUsize::new(0)));
         let waker = Waker::from(notifications.clone());
         let mut cx = Context::from_waker(&waker);
@@ -161,14 +168,14 @@ fn startup_activation_preserves_scope_cancellation() {
         },
         native,
     );
-    let scope = StartupScope(Cancellation::new().unwrap());
+    let scope = StartupScope(Cancellation::new());
     let mut cx = Context::from_waker(Waker::noop());
     let mut startup = service.start(&scope);
     assert!(startup.as_mut().poll(&mut cx).is_pending());
-    scope.0.cancel().unwrap();
+    scope.0.cancel();
     assert_eq!(
         startup.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Cancelled)))
+        Poll::Ready(Err(Failure::Runtime(racer_platform::Error::Canceled)))
     );
     drop(startup);
     assert!(io.closed());
