@@ -1,6 +1,8 @@
 # uring-runtime: a standalone io_uring runtime library
 
-Status: in progress. This document is the working specification for extracting
+Status: migration complete. The legacy crate `cmd/racer-dataplane/runtime`
+has been removed; Racer now uses `cmd/racer-dataplane/platform` over the
+library. This document is the working specification for extracting
 `cmd/racer-dataplane/runtime` (package `uring-runtime`) into a reusable,
 publishable library under `crates/`, and for migrating the Racer dataplane onto
 it. Code is authoritative once written; update this document when a decision
