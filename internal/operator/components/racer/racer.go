@@ -6,6 +6,7 @@ package racer
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -38,6 +39,7 @@ const (
 	objectImageName   = "racer-object"
 	tlsName           = "racer-controller-tls"
 	trustName         = "racer-bootstrap-trust"
+	webhookName       = "racer-object-sidecar-injector"
 	managerAnnotation = "unbounded-cloud.io/racer-manager"
 	claimAnnotation   = "unbounded-cloud.io/racer-operator-claim-uid"
 	// Authority protocol key, not operator ownership metadata.
@@ -183,7 +185,7 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 }
 
 func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, error) {
-	return env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml"}, nil)
+	return env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml", "mutating-webhook.yaml"}, nil)
 }
 
 func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) error {
@@ -252,6 +254,12 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			prerequisites = append(prerequisites, component.RefOf(component.ToUnstructured(cm)))
 
 			continue
+		case "MutatingWebhookConfiguration":
+			// Publish the same roots as the bootstrap trust so CA rotation and
+			// cross-signing also reach the API server's webhook client.
+			if err := setWebhookCABundle(obj, servingRoots(secret)); err != nil {
+				return err
+			}
 		case "Deployment":
 			if err := component.SetNamedContainerImage(obj, "controller", env.Config.Image(controllerName)); err != nil {
 				return err
@@ -305,9 +313,38 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 	return planDataplane(ctx, env, plan, marker, runtimeConfig)
 }
 
+func setWebhookCABundle(obj *unstructured.Unstructured, roots []byte) error {
+	webhooks, found, err := unstructured.NestedSlice(obj.Object, "webhooks")
+	if err != nil {
+		return err
+	}
+
+	if !found || len(webhooks) == 0 {
+		return fmt.Errorf("racer webhook configuration %s has no webhooks", obj.GetName())
+	}
+
+	bundle := base64.StdEncoding.EncodeToString(roots)
+
+	for i, webhook := range webhooks {
+		entry, ok := webhook.(map[string]any)
+		if !ok {
+			return fmt.Errorf("racer webhook configuration %s has malformed webhook %d", obj.GetName(), i)
+		}
+
+		if err := unstructured.SetNestedField(entry, bundle, "clientConfig", "caBundle"); err != nil {
+			return err
+		}
+
+		webhooks[i] = entry
+	}
+
+	return unstructured.SetNestedSlice(obj.Object, webhooks, "webhooks")
+}
+
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&admissionv1.ValidatingAdmissionPolicy{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&admissionv1.ValidatingAdmissionPolicyBinding{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
+	b.Watches(&admissionv1.MutatingWebhookConfiguration{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == webhookName })))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName))))
