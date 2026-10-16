@@ -10,11 +10,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-func TestInstallIgnoresObsoleteRacerGate(t *testing.T) {
-	// Keep the original regression name; ENABLE_RACER is just an unknown key.
+func TestInstallDropsUnknownSettings(t *testing.T) {
 	for _, value := range []string{"FALSE", "true", "", "invalid"} {
 		t.Run(value, func(t *testing.T) {
-			for _, key := range []string{"ENABLE_RACER", "UNKNOWN_SETTING", "UNBOUNDED_UNKNOWN_SETTING"} {
+			for _, key := range []string{"UNKNOWN_SETTING", "UNBOUNDED_UNKNOWN_SETTING"} {
 				t.Run(key, func(t *testing.T) {
 					cm := &unstructured.Unstructured{Object: map[string]any{
 						"apiVersion": "v1", "kind": "ConfigMap",

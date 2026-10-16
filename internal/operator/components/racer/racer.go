@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer provisions the Racer controller on demand from ClusterCaches.
+// Package racer provisions the Racer controller and dataplane on demand from ClusterCaches.
 package racer
 
 import (
@@ -43,7 +43,7 @@ const (
 	installationAnnotation = "racer.unbounded-cloud.io/installation-uid"
 )
 
-// Component owns controller deployment inputs, not external dataplane workloads.
+// Component owns the Racer controller and dataplane workloads and their inputs.
 type Component struct{}
 
 func New() component.ClusterComponent   { return Component{} }
@@ -193,6 +193,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	var (
 		configHash    string
+		runtimeConfig *corev1.ConfigMap
 		prerequisites []component.ObjectRef
 	)
 
@@ -231,6 +232,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			}
 
 			configHash = component.ConfigMapPayloadHash(cm)
+			runtimeConfig = cm
 
 			_, err = racercore.ConfigFromLookup(func(key string) (string, bool) {
 				if key == "POD_NAMESPACE" {
@@ -294,7 +296,11 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	plan.Add(op)
 
-	return nil
+	if runtimeConfig == nil {
+		return fmt.Errorf("racer runtime manifests contain no %s", configName)
+	}
+
+	return planDataplane(ctx, env, plan, marker, runtimeConfig)
 }
 
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
@@ -302,6 +308,8 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&admissionv1.ValidatingAdmissionPolicyBinding{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName))))
+	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(dataplaneName))))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))
 }
@@ -311,7 +319,7 @@ func startupConfigPredicate(env *component.Env) predicate.Predicate {
 	version := env.InNamespaceNamed(versionName)
 
 	return predicate.Or(
-		env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, trustName)),
+		env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, trustName, dataplaneConfigName)),
 		predicate.Funcs{
 			CreateFunc:  func(e event.CreateEvent) bool { return version(e.Object) },
 			DeleteFunc:  func(e event.DeleteEvent) bool { return version(e.Object) },

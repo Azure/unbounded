@@ -105,7 +105,6 @@ func initialize(t *testing.T, env *component.Env) racercore.Config {
 
 	for range 9 {
 		plan := planPass(t, env)
-		require.NotContains(t, plan.Summary(), "DaemonSet/")
 		persist(t, env, plan)
 	}
 
@@ -157,18 +156,26 @@ func TestClusterCacheActivationUsesLiveReader(t *testing.T) {
 	require.Nil(t, plan)
 }
 
-func TestControllerOnlyLifecycleWithoutSites(t *testing.T) {
+func TestLifecycleWithoutSites(t *testing.T) {
 	env := testEnv(t, cacheObject("first"))
 	cfg := initialize(t, env)
 	plan := planPass(t, env)
 	persist(t, env, plan)
 
+	daemonSets := 0
+
 	for _, op := range plan.Operations {
-		require.NotEqual(t, "DaemonSet", op.Object.GetKind())
 		require.NotEqual(t, "NetworkPolicy", op.Object.GetKind())
-		require.NotContains(t, op.Object.GetName(), "dataplane")
 		require.Empty(t, op.Object.GetOwnerReferences())
+
+		if op.Object.GetKind() == "DaemonSet" {
+			daemonSets++
+
+			require.Equal(t, dataplaneName, op.Object.GetName())
+		}
 	}
+
+	require.Equal(t, 1, daemonSets)
 
 	deployment := &appsv1.Deployment{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
@@ -209,8 +216,8 @@ func TestControllerOnlyLifecycleWithoutSites(t *testing.T) {
 
 	accounts := &corev1.ServiceAccountList{}
 	require.NoError(t, env.Client.List(t.Context(), accounts))
-	require.Len(t, accounts.Items, 1)
-	require.Equal(t, controllerName, accounts.Items[0].Name)
+	require.Len(t, accounts.Items, 2)
+	require.ElementsMatch(t, []string{controllerName, dataplaneName}, []string{accounts.Items[0].Name, accounts.Items[1].Name})
 
 	before := &corev1.ConfigMap{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, versionName), before))
@@ -307,12 +314,14 @@ func TestDamagedStateFailsClosed(t *testing.T) {
 	}
 }
 
-func TestExternalWorkloadsAreNotAdoptedOrChanged(t *testing.T) {
+func TestStandaloneDataplaneBlocksNewInstallation(t *testing.T) {
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Namespace: "custom-system", UID: "external"}}
 	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Namespace: "custom-system", UID: "external"}}
 	env := testEnv(t, cacheObject("cache"), ds, sa)
-	initialize(t, env)
-	persist(t, env, planPass(t, env))
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorContains(t, err, "standalone installations are not adopted")
+	require.Nil(t, plan)
 
 	actual := &appsv1.DaemonSet{}
 	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(ds), actual))

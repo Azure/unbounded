@@ -27,8 +27,8 @@ func TestStatMethodNotAllowed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := rawServer(t, func(conn net.Conn, _ *bufio.Reader, head []byte) {
-				if !strings.HasPrefix(string(head), "HEAD /v2/objects/") {
-					t.Error("Stat did not use the client-v2 HEAD endpoint")
+				if !strings.HasPrefix(string(head), "HEAD /v1/objects/") {
+					t.Error("Stat did not use the client HEAD endpoint")
 				}
 
 				_, _ = io.WriteString(conn, fmt.Sprintf("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n%s\r\n", tc.fields))

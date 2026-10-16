@@ -147,6 +147,8 @@ impl Budget for () {
 
 /// Bounded owned handoffs. Cancellation is notification, never a completion fence.
 pub mod mailbox {
+    /// Explicit local execution of accepted mailbox commands.
+    pub mod executor;
     use crate::{Error, Result, Scope, environment::CancellationRegistration};
     use futures::task::AtomicWaker;
     use std::{

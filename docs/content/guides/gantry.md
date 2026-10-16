@@ -371,3 +371,31 @@ metrics:
 | `p2p_origin_fallback_total` | Remains near zero during healthy operation. |
 | `gantry_advertise_reconcile_total` | Continues increasing as Gantry reconciles containerd content with the DHT. |
 | `gantry_containerd_lease_created_total` | Increases when coordinated background pulls ingest new content. |
+
+## Use Racer as the Backend
+
+{{< callout type="warning" >}}
+Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
+migration path. Cached data is disposable; Racer is not durable storage. Start
+with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+{{< /callout >}}
+
+The installation and distribution flow above describe Gantry's default containerd
+backend. Racer mode instead uses Racer for object caching and peer reads, with
+Gantry supplying the registry origin adapter. Racer needs the
+Unbounded operator and the [node requirements]({{< relref "reference/racer" >}}#node-requirements).
+Create this cluster-scoped cache:
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: gantry
+```
+
+Creating any ClusterCache triggers operator-managed Racer installation.
+
+Racer must run on the same nodes as Gantry. Run one Gantry origin owner on every
+eligible node that can supply origin reads for this cache, with consistent
+upstream registry configuration. Match placement and tolerations; installing
+Gantry on only the requesting nodes is not sufficient.
