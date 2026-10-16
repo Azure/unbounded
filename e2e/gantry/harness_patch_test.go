@@ -279,6 +279,10 @@ func TestPatchConfigMapForArtifactStreamingE2E(t *testing.T) {
 		t.Fatal("artifact streaming was not enabled")
 	}
 
+	if !strings.Contains(patched, `    range_cache_dir: ""`) {
+		t.Fatal("artifact streaming source-transition E2E did not disable the local range cache")
+	}
+
 	if !strings.Contains(patched, "      - "+streamingOriginHost) {
 		t.Fatalf("artifact streaming allowed hosts do not include %s", streamingOriginHost)
 	}
