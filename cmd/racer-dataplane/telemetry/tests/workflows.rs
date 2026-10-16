@@ -1,5 +1,6 @@
 //! End-to-end diagnostic ownership, formatting failure, and request-boundary workflows.
 
+use racer_platform::{Cancellation, Error, Operation, reactor::Reactor, scope::LibraryScope};
 use std::{
     cell::RefCell,
     fmt,
@@ -12,7 +13,6 @@ use telemetry::{
     Lease, Metrics, Ring,
     server::{self, Event, Handler, Response, Server},
 };
-use uring_runtime::{Error, Operation, Scope, environment::Cancellation, reactor::Reactor};
 
 telemetry::metrics! { Counter, COUNTERS, COUNTER_COUNT;
     Self::Completed => "completed_total",
@@ -136,13 +136,13 @@ struct RequestScope {
     cancellation: Cancellation,
 }
 
-impl Scope for RequestScope {
+impl LibraryScope for RequestScope {
     type Error = Error;
 
     /// Report cancellation before checking the deadline.
     fn check(&self) -> Result<(), Error> {
-        if self.cancellation.is_cancelled() {
-            Err(Error::Cancelled)
+        if self.cancellation.is_canceled() {
+            Err(Error::Canceled)
         } else if Instant::now() >= self.deadline {
             Err(Error::DeadlineExceeded)
         } else {
@@ -266,7 +266,7 @@ fn failed_and_oversized_handler_output_closes_only_that_connection() {
     };
     let scope = RequestScope {
         deadline: Instant::now() + Duration::from_secs(15),
-        cancellation: Cancellation::new().unwrap(),
+        cancellation: Cancellation::new(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -299,11 +299,11 @@ fn failed_and_oversized_handler_output_closes_only_that_connection() {
         ]
     );
 
-    scope.cancellation.cancel().unwrap();
+    scope.cancellation.cancel();
     let mut cx = Context::from_waker(Waker::noop());
     assert_eq!(
         service.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     );
     drop(service);
     drop(owner);
@@ -325,7 +325,7 @@ fn exact_request_limit_distinguishes_complete_and_unterminated_headers() {
     };
     let scope = RequestScope {
         deadline: Instant::now() + Duration::from_secs(15),
-        cancellation: Cancellation::new().unwrap(),
+        cancellation: Cancellation::new(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -368,11 +368,11 @@ fn exact_request_limit_distinguishes_complete_and_unterminated_headers() {
             Event::Accepted
         ]
     );
-    scope.cancellation.cancel().unwrap();
+    scope.cancellation.cancel();
     let mut cx = Context::from_waker(Waker::noop());
     assert_eq!(
         service.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     );
     drop(service);
     drop(owner);

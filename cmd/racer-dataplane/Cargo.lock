@@ -1175,7 +1175,7 @@ name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "httparse",
- "uring-runtime-legacy",
+ "racer-platform",
  "zeroize",
 ]
 

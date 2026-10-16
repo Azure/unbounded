@@ -17,6 +17,10 @@
 //! The handler receives only the path and a bounded formatter, selects the response
 //! kind, and observes fixed transport events. Application routes, trusted response
 //! bodies, health, metric names, and connection admission remain with the caller.
+use racer_platform::{
+    Budget, CancellationExt, Error, Operation, Result, environment,
+    reactor::{IoBuffer, Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
+};
 use std::{
     cell::Cell,
     fmt::{self, Write},
@@ -24,10 +28,6 @@ use std::{
     rc::Rc,
     task::Poll,
     time::{Duration, Instant},
-};
-use uring_runtime::{
-    Budget, Error, Operation, Result, environment,
-    reactor::{IoBuffer, Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -77,7 +77,7 @@ pub struct BinaryResponse {
 }
 
 /// A runtime scope that can narrow the deadline for a single exchange.
-pub trait Scope: uring_runtime::Scope {
+pub trait Scope: racer_platform::Scope {
     /// Narrow the deadline, preserving cancellation and caller metadata.
     fn with_deadline(&self, deadline: Instant) -> Self;
 }
@@ -248,7 +248,7 @@ impl Server {
             let mut accepting = None;
             let mut connections: Vec<Operation<'_, (), S::Error>> =
                 Vec::with_capacity(MAX_CONNECTIONS);
-            let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+            let cancellation = scope.cancellation().map(CancellationExt::subscribe);
             std::future::poll_fn(|cx| {
                 if let Some(cancellation) = &cancellation {
                     cancellation.register(cx.waker());
@@ -271,7 +271,7 @@ impl Server {
                     }
                 }
                 if accepting.is_none() && self.resources.active.get() < MAX_CONNECTIONS {
-                    accepting = Some(uring_runtime::drivers::retry_listener(scope, || {
+                    accepting = Some(racer_platform::drivers::retry_listener(scope, || {
                         reactor.accept_reserved(
                             listener.clone(),
                             Some(self.resources.submissions.clone()),
@@ -779,8 +779,8 @@ mod tests {
 
     #[test]
     fn binary_small_window_abandonment_retains_output_and_session_until_fence() {
+        use racer_platform::simulation::Simulation;
         use std::task::{Context, Waker};
-        use uring_runtime::reactor::simulation::Simulation;
         let sim = Simulation::new();
         sim.set_stream_capacity(32).unwrap();
         let _sim = sim.enter();
@@ -791,7 +791,7 @@ mod tests {
         let owner = Server::new(submissions.clone(), ()).with_binary(submissions, ());
         let scope = TestScope {
             deadline: environment::now() + Duration::from_secs(100),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_platform::Cancellation::new(),
         };
         let (fd, peer) = sim.socket_pair();
         let (completion, signal) = sim.socket_pair();
@@ -882,13 +882,13 @@ mod tests {
 
     #[test]
     fn binary_wait_preserves_text_progress_half_close_and_fenced_ownership() {
+        use racer_platform::environment::SimulationClock;
         use std::{
             io::{Read, Write as _},
             net::{Shutdown, TcpListener, TcpStream},
             os::unix::net::UnixStream,
             task::{Context, Waker},
         };
-        use uring_runtime::environment::SimulationClock;
         for outcome in [
             "success",
             "timeout",
@@ -910,7 +910,7 @@ mod tests {
             let owner = Server::new(submissions, ()).with_binary(binary, ());
             let scope = TestScope {
                 deadline: now + Duration::from_secs(if outcome == "parent" { 4 } else { 100 }),
-                cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+                cancellation: racer_platform::Cancellation::new(),
             };
             let (completion, mut signal) = UnixStream::pair().unwrap();
             completion.set_nonblocking(true).unwrap();
@@ -1125,7 +1125,7 @@ mod tests {
         let buffer_bytes = (MAX_CONNECTIONS + 1) * MAX_RESPONSE_BYTES;
         assert_eq!(
             RESERVED_BYTES - buffer_bytes,
-            CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+            CONTROL_SLOTS * racer_platform::reactor::SUBMISSION_BYTES
         );
     }
 
@@ -1329,16 +1329,16 @@ mod tests {
     struct TestScope {
         deadline: Instant,
 
-        cancellation: uring_runtime::environment::Cancellation,
+        cancellation: racer_platform::Cancellation,
     }
 
-    impl uring_runtime::Scope for TestScope {
+    impl racer_platform::scope::LibraryScope for TestScope {
         type Error = Error;
 
         /// Prioritize cancellation over deadline expiry.
         fn check(&self) -> Result<()> {
-            if self.cancellation.is_cancelled() {
-                Err(Error::Cancelled)
+            if self.cancellation.is_canceled() {
+                Err(Error::Canceled)
             } else if environment::now() >= self.deadline {
                 Err(Error::DeadlineExceeded)
             } else {
@@ -1347,7 +1347,7 @@ mod tests {
         }
 
         /// Share the caller's cancellation source with reactor operations.
-        fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
+        fn cancellation(&self) -> Option<&racer_platform::Cancellation> {
             Some(&self.cancellation)
         }
     }
@@ -1426,8 +1426,8 @@ mod tests {
     /// Reject deadline overflow before submitting I/O and release connection ownership.
     #[test]
     fn exchange_deadline_overflow_returns_invalid_input_without_io() {
+        use racer_platform::{environment::SimulationClock, simulation::Simulation};
         use std::task::{Context, Waker};
-        use uring_runtime::{environment::SimulationClock, reactor::simulation::Simulation};
 
         let limit = near_instant_limit();
         let now = limit - Duration::from_secs(1);
@@ -1447,9 +1447,9 @@ mod tests {
         };
         let scope = TestScope {
             deadline: limit,
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_platform::Cancellation::new(),
         };
-        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert_eq!(racer_platform::scope::LibraryScope::check(&scope), Ok(()));
         let (fd, peer) = simulation.socket_pair();
         let buffer = owner.buffer(&handler).unwrap();
         assert_eq!(connections.get(), 1);
@@ -1466,15 +1466,18 @@ mod tests {
         let after = simulation.trace();
         assert_eq!(&after[..trace.len()], trace);
         assert_eq!(after.len(), trace.len() + 1);
-        assert_eq!(after.last().unwrap().operation, "close");
+        assert_eq!(
+            after.last().unwrap().kind,
+            racer_platform::simulation::EventKind::Close
+        );
         assert_eq!(peer.try_recv(&mut [0; 1]).unwrap(), 0);
     }
 
     /// Keep the two-second limit and earlier parent deadline, even near Instant's limit.
     #[test]
     fn exchange_deadline_preserves_timeout_and_parent_limit() {
+        use racer_platform::{environment::SimulationClock, simulation::Simulation};
         use std::task::{Context, Waker};
-        use uring_runtime::{environment::SimulationClock, reactor::simulation::Simulation};
 
         for (now, parent_timeout, timeout) in [
             (Instant::now(), Duration::from_secs(10), CONNECTION_TIMEOUT),
@@ -1499,7 +1502,7 @@ mod tests {
             let handler = Routes::default();
             let scope = TestScope {
                 deadline: now.checked_add(parent_timeout).unwrap(),
-                cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+                cancellation: racer_platform::Cancellation::new(),
             };
             let (fd, _peer) = simulation.socket_pair();
             let buffer = owner.buffer(&handler).unwrap();
@@ -1530,11 +1533,10 @@ mod tests {
     /// Report exchange expiry once, keep serving, and release all resources on drain.
     #[test]
     fn serve_classifies_exchange_deadline_without_stopping_listener() {
-        use std::task::{Context, Waker};
-        use uring_runtime::{
-            environment::SimulationClock,
-            reactor::{SocketAddress, simulation::Simulation},
+        use racer_platform::{
+            environment::SimulationClock, reactor::SocketAddress, simulation::Simulation,
         };
+        use std::task::{Context, Waker};
 
         let now = Instant::now();
         let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
@@ -1556,7 +1558,7 @@ mod tests {
         };
         let scope = TestScope {
             deadline: now + Duration::from_secs(10),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_platform::Cancellation::new(),
         };
         let address = SocketAddress::Inet("127.0.0.1:18080".parse().unwrap());
         let listener = simulation.listen(address.clone()).unwrap();
@@ -1583,7 +1585,7 @@ mod tests {
             reactor.poll_budgeted(32).unwrap();
             assert!(server.as_mut().poll(&mut cx).is_pending());
         }
-        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert_eq!(racer_platform::scope::LibraryScope::check(&scope), Ok(()));
         assert!(owner.serving.get());
         assert_eq!(
             *handler.routes.0.borrow(),
@@ -1607,7 +1609,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\nConnection: close\r\nCache-Control: no-store\r\n\r\nok\n"
         );
         assert_eq!(healthy.try_recv(&mut response).unwrap(), 0);
-        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert_eq!(racer_platform::scope::LibraryScope::check(&scope), Ok(()));
         assert_eq!(connections.get(), 0);
         assert_eq!(
             *handler.routes.0.borrow(),
@@ -1659,7 +1661,7 @@ mod tests {
         };
         let scope = TestScope {
             deadline: environment::now() + Duration::from_secs(10),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_platform::Cancellation::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1754,7 +1756,7 @@ mod tests {
         };
         let scope = TestScope {
             deadline: environment::now() + Duration::from_secs(10),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_platform::Cancellation::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
