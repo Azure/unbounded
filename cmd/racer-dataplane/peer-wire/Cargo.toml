@@ -13,11 +13,11 @@ test-util = []
 http1 = { path = "../http" }
 racer-crypto = { path = "../crypto" }
 racer-control-wire = { path = "../control-wire" }
-uring-runtime = { package = "uring-runtime-legacy", path = "../runtime" }
+racer-platform = { path = "../platform" }
 base64 = "0.22"
 sha2 = "0.10"
 
 [dev-dependencies]
 racer-object-wire = { path = "../object-wire" }
 racer-crypto = { path = "../crypto", features = ["test-util"] }
-uring-runtime = { package = "uring-runtime-legacy", path = "../runtime", features = ["simulation", "test-util"] }
+racer-platform = { path = "../platform", features = ["simulation", "test-util"] }
