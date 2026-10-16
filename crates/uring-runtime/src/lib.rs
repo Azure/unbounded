@@ -64,6 +64,7 @@ pub mod error;
 pub mod fd;
 pub mod net;
 pub mod scope;
+pub mod task;
 
 pub use backend::{Backend, Host};
 pub use buf::{BufResult, IoBuf, IoBufMut};
@@ -73,3 +74,4 @@ pub use error::{Error, ErrorKind, Result};
 pub use fd::Fd;
 pub use net::{SockAddr, SocketAddress};
 pub use scope::{Scope, Unscoped};
+pub use task::{JoinHandle, LocalExecutor, Spawner};
