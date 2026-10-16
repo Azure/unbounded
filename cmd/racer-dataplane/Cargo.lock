@@ -899,6 +899,7 @@ dependencies = [
  "futures",
  "libc",
  "uring-runtime",
+ "zeroize",
 ]
 
 [[package]]

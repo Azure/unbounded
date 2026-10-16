@@ -21,6 +21,8 @@ pub mod environment;
 
 pub mod error;
 
+pub mod fs;
+
 pub mod group;
 
 pub mod mailbox;
