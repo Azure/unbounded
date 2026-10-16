@@ -293,6 +293,16 @@ fn positioned_file_io() {
     );
     assert_eq!(eof.result.unwrap(), 0);
     block_on(&reactor, reactor.fsync(&file, true, &Unscoped)).unwrap();
+    // IOSQE_ASYNC changes only where the kernel executes the operation.
+    let read = block_on(
+        &reactor,
+        reactor
+            .read_at(&file, 5, Vec::with_capacity(6), &Unscoped)
+            .offload(),
+    );
+    assert_eq!(read.result.unwrap(), 6);
+    assert_eq!(read.buf, b"abcdef");
+    block_on(&reactor, reactor.fsync(&file, false, &Unscoped).offload()).unwrap();
 }
 
 #[test]

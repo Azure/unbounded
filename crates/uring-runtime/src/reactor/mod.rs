@@ -163,7 +163,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
-use crate::backend::{BackendConfig, CompletionEntry, PushError, RemoteWaker};
+use crate::backend::{BackendConfig, CompletionEntry, PushError, PushHints, RemoteWaker};
 use crate::{Backend, Clock, Error, ErrorKind, Result, Scope};
 
 pub use admission::{Rejection, RejectionReason, Reservation};
@@ -522,6 +522,7 @@ impl<B: Backend> Reactor<B> {
         &self,
         mut node: NodeImpl<O, S, L>,
         reservation: Option<&Reservation>,
+        hints: PushHints,
         waker: &Waker,
     ) -> std::result::Result<(u64, NonNull<NodeImpl<O, S, L>>), (NodeImpl<O, S, L>, S::Error)> {
         if let Err(error) = node.scope.check() {
@@ -553,7 +554,7 @@ impl<B: Backend> Reactor<B> {
         // owned by the table entry inserted below, and is freed only after
         // the entry is fenced (every completion for `key` popped), which
         // satisfies `Backend::push`'s contract. It is never moved.
-        let pushed = unsafe { push_node(&mut *state.backend, key, ptr) };
+        let pushed = unsafe { push_node(&mut *state.backend, key, ptr, hints) };
         if let Err(error) = pushed {
             drop(state);
             // SAFETY: the push failed, so the backend holds no reference into
@@ -951,18 +952,19 @@ unsafe fn push_node<B: Backend, O: OpSpec<B>, S: Scope, L>(
     backend: &mut B,
     key: u64,
     node: NonNull<NodeImpl<O, S, L>>,
+    hints: PushHints,
 ) -> std::result::Result<(), PushError> {
     // SAFETY: the caller guarantees exclusive access to the node; this
     // borrow ends before we return.
     let data = unsafe { &mut (*node.as_ptr()).data };
     let op = data.op();
     // SAFETY: forwarded from our caller.
-    match unsafe { backend.push(key, &op) } {
+    match unsafe { backend.push_with(key, &op, hints) } {
         Err(PushError::Full) => {
             // Make room by submitting what is queued, then retry once.
             backend.submit().map_err(PushError::Failed)?;
             // SAFETY: as above.
-            unsafe { backend.push(key, &op) }
+            unsafe { backend.push_with(key, &op, hints) }
         }
         result => result,
     }
