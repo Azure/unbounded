@@ -532,7 +532,7 @@ func routedCIDRsForGatewayPeer(
 	staleAfter time.Duration,
 ) ([]string, map[string]int, map[string]unboundednetv1alpha1.GatewayNodeRoute) {
 	if gatewayNode == nil {
-		return fallback, map[string]int{}, map[string]unboundednetv1alpha1.GatewayNodeRoute{}
+		return nil, map[string]int{}, map[string]unboundednetv1alpha1.GatewayNodeRoute{}
 	}
 
 	planRoutes := make(map[string]routeplan.LearnedRoute, len(gatewayNode.Status.Routes))

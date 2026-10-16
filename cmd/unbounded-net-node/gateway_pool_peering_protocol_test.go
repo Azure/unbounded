@@ -223,10 +223,13 @@ func newPoolPeeringProtocolFixture(t *testing.T, gateway bool) *poolPeeringProto
 		},
 	}))
 	empty := newInformerWithObjects()
+	gatewayNodes := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+	}))
 	cfg := &config{NodeName: "self", WireGuardPort: 51820, WireGuardInterfacePrefix: "gpp-test-wg", MTU: 576, PreferredPrivateEncap: "WireGuard"}
 	f.update = func() error {
 		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, f.pools,
-			empty, empty, assignmentInformer, f.peerings, cfg, siteName, "priv", "pub-self", true, f.state)
+			gatewayNodes, empty, assignmentInformer, f.peerings, cfg, siteName, "priv", "pub-self", true, f.state)
 	}
 
 	original := configureWireGuardFunc

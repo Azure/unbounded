@@ -590,7 +590,9 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseSkipsPodCIDRRoutesForSame
 				},
 			}),
 		)
-		gatewayNodeInformer := newInformerWithObjects()
+		gatewayNodeInformer := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "gw-site1"},
+		}))
 		sitePeeringInformer := newInformerWithObjects()
 		assignmentInformer := newInformerWithObjects(
 			toUnstructured(t, &unboundednetv1alpha1.SiteGatewayPoolAssignment{

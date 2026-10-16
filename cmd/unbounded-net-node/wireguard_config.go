@@ -106,7 +106,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 		// Tear down any tracked or kernel-resident gateway wg* interfaces.
 		cleanupErr = errors.Join(cleanupErr, removeUnmanagedWireGuardInterfaces(cfg, state, nil, iface))
-		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
+		if cleanupErr == nil && cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
 			cleanupErr = errors.Join(cleanupErr, state.gatewayPolicyManager.ReconcileExpectedInterfaces(nil))
 		}
 		// Sync routes (clear WG routes, keep any GENEVE/IPIP additional routes)

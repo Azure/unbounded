@@ -1812,6 +1812,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	var gatewayPeers []gatewayPeerInfo
 
 	assignmentEdgeMTUs := assignmentEdgeTunnelMTUs(assignments)
+	peeringEdgeMTUs := sitePeeringEdgeTunnelMTUs(sitePeerings)
 	{
 		var poolsToIterate map[string]*unboundednetv1alpha1.GatewayPool
 		if isGatewayNode {
@@ -1866,6 +1867,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				}
 
 				peerGatewayNode := gatewayNodeMap[gwNode.Name]
+				if peerGatewayNode == nil {
+					klog.V(3).Infof("Skipping gateway peer %s: GatewayPoolNode is not present", gwNode.Name)
+					continue
+				}
+
 				// Never install NodeCidr routes from network-peered sites via gateways.
 				excludedNodeCIDRSites := networkPeeredSites
 				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
@@ -1877,7 +1883,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignmentEdgeMTUs, poolPeerings)
 
 				transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU,
-					gatewayMeshTransitTunnelMTU(pool.Name, gwNode.SiteName, learnedRoutes, gatewayPoolMap, siteTunnelMTUs, sitePeerings))
+					gatewayMeshTransitTunnelMTU(pool.Name, gwNode.SiteName, learnedRoutes, gatewayPoolMap, siteTunnelMTUs, peeringEdgeMTUs))
 				if isGatewayNode {
 					transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU, gatewayPoolPeeringTunnelMTU(localGatewayPools, pool.Name, poolPeerings))
 				}

@@ -136,6 +136,35 @@ func TestUpdateWireGuardFromSlices_LocalGatewayExclusions(t *testing.T) {
 			}
 		})
 	}
+
+	gatewayObject, exists, err := gatewayNodes.GetStore().GetByKey("gateway")
+	if err != nil || !exists {
+		t.Fatalf("get gateway: exists=%v err=%v", exists, err)
+	}
+
+	if err := gatewayNodes.GetStore().Delete(gatewayObject); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gotGatewayPeers) != 0 || len(state.gatewayPeers) != 0 {
+		t.Fatal("missing GatewayPoolNode retained a route destination")
+	}
+
+	if err := gatewayNodes.GetStore().Add(gatewayObject); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gotGatewayPeers) != 1 {
+		t.Fatal("restored GatewayPoolNode did not restore route destination")
+	}
 }
 
 func TestUpdateWireGuardFromSlices_GatewayRoutingChanges(t *testing.T) {

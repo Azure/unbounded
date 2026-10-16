@@ -532,6 +532,8 @@ func (m *GatewayPolicyManager) ensureIPRule(tableNum int) error {
 }
 
 // RemoveInterface removes policy routing configuration for an interface
+var discoverGatewayInterfaceTable = (*GatewayPolicyManager).findInterfaceTableNumLocked
+
 func (m *GatewayPolicyManager) RemoveInterface(ifaceName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -548,10 +550,16 @@ func (m *GatewayPolicyManager) RemoveInterface(ifaceName string) error {
 	if !exists {
 		var discovered bool
 
-		tableNum, discovered = m.findInterfaceTableNumLocked(ifaceName)
+		tableNum, discovered = discoverGatewayInterfaceTable(m, ifaceName)
 		if !discovered {
 			return nil
 		}
+
+		if m.configuredIfaces == nil {
+			m.configuredIfaces = make(map[string]int)
+		}
+
+		m.configuredIfaces[ifaceName] = tableNum
 	}
 
 	if err := m.removeInterfaceRulesLocked(ifaceName, tableNum); err != nil {
@@ -570,6 +578,18 @@ func (m *GatewayPolicyManager) ReconcileExpectedInterfaces(expected map[string]i
 	defer m.mu.Unlock()
 
 	klog.V(4).Infof("Reconciling gateway policy expected interfaces: %s", formatExpectedGatewayPolicyTables(expected))
+
+	for iface, tableNum := range m.configuredIfaces {
+		if _, keep := expected[iface]; keep {
+			continue
+		}
+
+		if err := m.removeInterfaceRulesLocked(iface, tableNum); err != nil {
+			return err
+		}
+
+		delete(m.configuredIfaces, iface)
+	}
 
 	if err := m.cleanupLegacyOutputSourceRulesLocked(); err != nil {
 		return err

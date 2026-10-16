@@ -15,14 +15,16 @@ import (
 
 func TestRemoveGatewayPolicyInterfaceRetriesFailedCleanup(t *testing.T) {
 	oldList, oldDelete, oldFlush, oldTables := netlinkRuleList, netlinkRuleDel, flushGatewayRouteTable, rtTablesPath
+	oldDiscovery := discoverGatewayInterfaceTable
 
 	t.Cleanup(func() {
 		netlinkRuleList, netlinkRuleDel, flushGatewayRouteTable, rtTablesPath = oldList, oldDelete, oldFlush, oldTables
+		discoverGatewayInterfaceTable = oldDiscovery
 	})
 	rtTablesPath = filepath.Join(t.TempDir(), "rt_tables")
 	injected := errors.New("cleanup failed")
 
-	for _, mode := range []string{"list", "delete", "flush"} {
+	for _, mode := range []string{"list", "delete", "flush", "discovered flush"} {
 		t.Run(mode, func(t *testing.T) {
 			if err := os.WriteFile(rtTablesPath, []byte("1001 wg51821\n"), 0o600); err != nil {
 				t.Fatal(err)
@@ -32,6 +34,15 @@ func TestRemoveGatewayPolicyInterfaceRetriesFailedCleanup(t *testing.T) {
 				wireguardBasePort: 51820, gatewayTableBase: 1000,
 				configuredIfaces: map[string]int{"wg51821": 1001},
 			}
+			if mode == "discovered flush" {
+				m.configuredIfaces = nil
+				discoveryCalls := 0
+				discoverGatewayInterfaceTable = func(*GatewayPolicyManager, string) (int, bool) {
+					discoveryCalls++
+					return 1001, discoveryCalls == 1
+				}
+			}
+
 			fail := true
 			netlinkRuleList = func(int) ([]vishnetlink.Rule, error) {
 				if fail && mode == "list" {
@@ -48,7 +59,7 @@ func TestRemoveGatewayPolicyInterfaceRetriesFailedCleanup(t *testing.T) {
 				return nil
 			}
 			flushGatewayRouteTable = func(int) error {
-				if fail && mode == "flush" {
+				if fail && (mode == "flush" || mode == "discovered flush") {
 					return injected
 				}
 
@@ -61,6 +72,14 @@ func TestRemoveGatewayPolicyInterfaceRetriesFailedCleanup(t *testing.T) {
 
 			if _, tracked := m.configuredIfaces["wg51821"]; !tracked {
 				t.Fatal("failed cleanup forgot interface")
+			}
+
+			if err := m.ReconcileExpectedInterfaces(nil); !errors.Is(err, injected) {
+				t.Fatalf("reconciliation hid pending cleanup failure: %v", err)
+			}
+
+			if _, tracked := m.configuredIfaces["wg51821"]; !tracked {
+				t.Fatal("reconciliation forgot failed cleanup")
 			}
 
 			fail = false

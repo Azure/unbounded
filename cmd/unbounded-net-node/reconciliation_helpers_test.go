@@ -261,18 +261,18 @@ func TestGatewayMeshTransitCaps(t *testing.T) {
 		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"site-b", "site-c"}, TunnelMTU: ptrInt32(1200)}},
 		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"site-x", "site-c"}, TunnelMTU: ptrInt32(900)}},
 	}
-	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", routes, nil, nil, peerings); got != 1200 {
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", routes, nil, nil, sitePeeringEdgeTunnelMTUs(peerings)); got != 1200 {
 		t.Fatalf("gateway-to-origin mesh edge cap=%d, want 1200", got)
 	}
 
-	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-b", routes, nil, nil, peerings); got != 0 {
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-b", routes, nil, nil, sitePeeringEdgeTunnelMTUs(peerings)); got != 0 {
 		t.Fatalf("same-Site edge constrained by unrelated peering: %d", got)
 	}
 
 	pools := map[string]*unboundednetv1alpha1.GatewayPool{
 		"pool-g": {Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{SiteName: "site-c"}}}},
 	}
-	if got := gatewayMeshTransitTunnelMTU("pool-upstream", "site-a", routes, pools, nil, peerings); got != 1200 {
+	if got := gatewayMeshTransitTunnelMTU("pool-upstream", "site-a", routes, pools, nil, sitePeeringEdgeTunnelMTUs(peerings)); got != 1200 {
 		t.Fatalf("intermediate pool mesh edge cap=%d, want 1200", got)
 	}
 
@@ -281,7 +281,7 @@ func TestGatewayMeshTransitCaps(t *testing.T) {
 		t.Fatalf("next-hop gateway Site cap=%d, want 1200", got)
 	}
 
-	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", nil, pools, nil, peerings); got != 0 {
+	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", nil, pools, nil, sitePeeringEdgeTunnelMTUs(peerings)); got != 0 {
 		t.Fatalf("absent transit routes constrained MTU: %d", got)
 	}
 }
@@ -309,6 +309,21 @@ func TestIntermediateGatewaySiteMTUCaps(t *testing.T) {
 
 	if got := gatewayMeshTransitTunnelMTU("pool-g", "site-c", nil, pools, caps, nil); got != 0 {
 		t.Fatalf("unused pools constrained MTU without routes: %d", got)
+	}
+}
+
+func TestSitePeeringEdgeTunnelMTUs(t *testing.T) {
+	peerings := []unboundednetv1alpha1.SitePeering{
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"c", "b", "a"}, TunnelMTU: ptrInt32(1400)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"b", "a"}, TunnelMTU: ptrInt32(1200)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"b", "a"}, TunnelMTU: ptrInt32(900), Enabled: new(false)}},
+		{Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"unused", "a"}}},
+	}
+
+	got := sitePeeringEdgeTunnelMTUs(peerings)
+	if len(got) != 3 || got[sitePairMTUKey{"a", "b"}] != 1200 ||
+		got[sitePairMTUKey{"b", "c"}] != 1400 || got[sitePairMTUKey{"a", "c"}] != 1400 {
+		t.Fatalf("unexpected enabled peering minima: %v", got)
 	}
 }
 
