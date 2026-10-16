@@ -1173,7 +1173,8 @@ fn worker_sizing_funds_derived_connection_pools() {
         let control = (0..3)
             .map(|_| reserve_connection(&admission, ResourceClass::ControlConnection).unwrap())
             .collect::<Vec<_>>();
-        let outbound_count = neighbor.min(admission.limit(ResourceClass::OutboundConnection));
+        let outbound_count =
+            neighbor.min(admission.limit(ResourceClass::OrdinaryOutboundConnection));
         let outbound = (0..outbound_count)
             .map(|_| reserve_connection(&admission, ResourceClass::OutboundConnection).unwrap())
             .collect::<Vec<_>>();
