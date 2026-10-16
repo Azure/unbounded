@@ -7,7 +7,8 @@
 //! same instants on every run.
 //!
 //! The clock is `Send + Sync` so one world clock can be shared by simulated
-//! workers running on several threads. Reads are a single atomic load; only
+//! workers running on several threads. Reads never block: monotonic time is
+//! a single atomic load and wall time a short sequence-checked read; only
 //! writers take a lock.
 //!
 //! ```
@@ -24,7 +25,7 @@
 //! ```
 
 use std::fmt;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -49,11 +50,22 @@ struct Inner {
     wall_origin: SystemTime,
     /// Monotonic nanoseconds since `origin`.
     elapsed: AtomicU64,
-    /// Wall nanoseconds relative to `wall_origin`.
-    wall_offset: AtomicI64,
-    /// Serializes writers so `elapsed` and `wall_offset` move together.
+    /// Whole wall seconds relative to `wall_origin` (rounded toward negative
+    /// infinity), so any representable wall time can be set.
+    wall_secs: AtomicI64,
+    /// Nanoseconds added to `wall_secs`, below one second.
+    wall_nanos: AtomicU32,
+    /// Odd while a writer updates `wall_secs` and `wall_nanos`.
+    wall_sequence: AtomicU64,
+    /// Serializes writers so `elapsed` and the wall offset move together.
     writer: Mutex<()>,
 }
+
+/// A wall offset from `wall_origin`: whole seconds plus nanoseconds below one
+/// second.
+type WallOffset = (i64, u32);
+
+const NANOS_PER_SEC: u32 = 1_000_000_000;
 
 impl SimClock {
     /// Create a clock for `seed`, starting at a process-global monotonic origin
@@ -79,7 +91,9 @@ impl SimClock {
             origin: monotonic,
             wall_origin: wall,
             elapsed: AtomicU64::new(0),
-            wall_offset: AtomicI64::new(0),
+            wall_secs: AtomicI64::new(0),
+            wall_nanos: AtomicU32::new(0),
+            wall_sequence: AtomicU64::new(0),
             writer: Mutex::new(()),
         }))
     }
@@ -135,13 +149,17 @@ impl SimClock {
             .origin
             .checked_add(Duration::from_nanos(elapsed))
             .ok_or_else(overflow)?;
-        let wall = i64::try_from(step)
+        let (secs, nanos) = self.wall_offset();
+        let nanos = nanos + duration.subsec_nanos();
+        let wall = i64::try_from(duration.as_secs())
             .ok()
-            .and_then(|step| self.0.wall_offset.load(Ordering::Relaxed).checked_add(step))
+            .and_then(|step| secs.checked_add(step))
+            .and_then(|secs| secs.checked_add(i64::from(nanos / NANOS_PER_SEC)))
+            .map(|secs| (secs, nanos % NANOS_PER_SEC))
             .ok_or_else(overflow)?;
         self.wall_at(wall).ok_or_else(overflow)?;
         self.0.elapsed.store(elapsed, Ordering::Release);
-        self.0.wall_offset.store(wall, Ordering::Release);
+        self.store_wall(wall);
         Ok(())
     }
 
@@ -149,25 +167,64 @@ impl SimClock {
     ///
     /// # Panics
     ///
-    /// Panics if `wall` is more than about 292 years away from
-    /// [`wall_origin`](Self::wall_origin).
+    /// Panics if `wall` is more than `i64::MAX` seconds away from
+    /// [`wall_origin`](Self::wall_origin), which no `SystemTime` near the
+    /// origin can be.
     pub fn set_wall_time(&self, wall: SystemTime) {
         let offset = match wall.duration_since(self.0.wall_origin) {
-            Ok(after) => i64::try_from(after.as_nanos()).ok(),
-            Err(before) => i64::try_from(before.duration().as_nanos()).ok().map(|n| -n),
+            Ok(after) => i64::try_from(after.as_secs())
+                .ok()
+                .map(|secs| (secs, after.subsec_nanos())),
+            Err(before) => {
+                let before = before.duration();
+                i64::try_from(before.as_secs())
+                    .ok()
+                    .map(|secs| match before.subsec_nanos() {
+                        0 => (-secs, 0),
+                        nanos => (-secs - 1, NANOS_PER_SEC - nanos),
+                    })
+            }
         }
         .expect("SimClock::set_wall_time: too far from the wall origin");
         let _writer = self.0.writer.lock().unwrap_or_else(|e| e.into_inner());
-        self.0.wall_offset.store(offset, Ordering::Release);
+        self.store_wall(offset);
     }
 
-    fn wall_at(&self, offset: i64) -> Option<SystemTime> {
-        let magnitude = Duration::from_nanos(offset.unsigned_abs());
-        if offset >= 0 {
-            self.0.wall_origin.checked_add(magnitude)
-        } else {
-            self.0.wall_origin.checked_sub(magnitude)
+    /// Read a consistent wall offset without blocking writers.
+    fn wall_offset(&self) -> WallOffset {
+        loop {
+            let before = self.0.wall_sequence.load(Ordering::Acquire);
+            if before % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let secs = self.0.wall_secs.load(Ordering::Relaxed);
+            let nanos = self.0.wall_nanos.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            if self.0.wall_sequence.load(Ordering::Relaxed) == before {
+                return (secs, nanos);
+            }
         }
+    }
+
+    /// Publish a wall offset. Callers hold the writer lock.
+    fn store_wall(&self, (secs, nanos): WallOffset) {
+        let sequence = self.0.wall_sequence.load(Ordering::Relaxed);
+        self.0.wall_sequence.store(sequence + 1, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.0.wall_secs.store(secs, Ordering::Relaxed);
+        self.0.wall_nanos.store(nanos, Ordering::Relaxed);
+        self.0.wall_sequence.store(sequence + 2, Ordering::Release);
+    }
+
+    fn wall_at(&self, (secs, nanos): WallOffset) -> Option<SystemTime> {
+        let whole = Duration::from_secs(secs.unsigned_abs());
+        let base = if secs >= 0 {
+            self.0.wall_origin.checked_add(whole)
+        } else {
+            self.0.wall_origin.checked_sub(whole)
+        };
+        base?.checked_add(Duration::from_nanos(u64::from(nanos)))
     }
 }
 
@@ -178,7 +235,7 @@ impl Clock for SimClock {
     }
 
     fn wall_now(&self) -> SystemTime {
-        self.wall_at(self.0.wall_offset.load(Ordering::Acquire))
+        self.wall_at(self.wall_offset())
             .expect("wall offset validated on store")
     }
 }
@@ -250,12 +307,28 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_secs(42)
         );
         assert_eq!(clock.wall_origin(), wall);
-        assert!(
-            std::panic::catch_unwind(
-                || clock.set_wall_time(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX / 2))
-            )
-            .is_err()
+    }
+
+    #[test]
+    fn wall_time_is_not_limited_to_a_nanosecond_range() {
+        let clock = SimClock::new(1);
+        // Far beyond the roughly 292 years an i64 of nanoseconds can span,
+        // like the year-4096 expiry rcgen certificates default to.
+        let far = SystemTime::UNIX_EPOCH + Duration::from_secs(66_000_000_000);
+        clock.set_wall_time(far);
+        assert_eq!(clock.wall_now(), far);
+        clock.advance(Duration::from_millis(1500));
+        assert_eq!(clock.wall_now(), far + Duration::from_millis(1500));
+        let before = SystemTime::UNIX_EPOCH - Duration::new(20_000_000_000, 250);
+        clock.set_wall_time(before);
+        assert_eq!(clock.wall_now(), before);
+        clock.advance(Duration::from_nanos(250));
+        assert_eq!(
+            clock.wall_now(),
+            SystemTime::UNIX_EPOCH - Duration::from_secs(20_000_000_000)
         );
+        clock.set_wall_time(clock.wall_origin());
+        assert_eq!(clock.wall_now(), clock.wall_origin());
     }
 
     #[test]
