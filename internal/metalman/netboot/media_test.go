@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -269,7 +270,7 @@ func TestMediaFirstBootIgnoresForwardedLease(t *testing.T) {
 
 	w = httptest.NewRecorder()
 	h.handleCloudInitLog(w, r)
-	require.Equal(t, http.StatusNotFound, w.Code)
+	require.Equal(t, http.StatusOK, w.Code)
 	o, claimed, err := h.Media.firstBootOwner(t.Context(), "192.0.2.20")
 	require.NoError(t, err)
 	require.True(t, claimed)
@@ -322,6 +323,10 @@ func TestMediaPathAliasesAuthorization(t *testing.T) {
 
 				want := http.StatusNotFound
 				if firstBoot && !forged {
+					want = http.StatusOK
+				}
+
+				if forged && (endpoint.path == "/cloudinit/log" || endpoint.path == "/unbounded-agent/install-log") {
 					want = http.StatusOK
 				}
 
@@ -383,6 +388,7 @@ func TestFirstBootForwardedAuthorization(t *testing.T) {
 			} {
 				t.Run(endpoint.path, func(t *testing.T) {
 					h, m, op := firstBootFixture(t)
+					h.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.30/32")}
 					fc := h.Media.Client
 					b := op.Status.Targets[0].BootMedia
 					m.Spec.Netboot().NetbootImage = b.Netboot.NetbootImage
@@ -437,6 +443,10 @@ func TestFirstBootForwardedAuthorization(t *testing.T) {
 						}
 
 						want, legacyReport = http.StatusOK, true
+					}
+
+					if !strings.HasPrefix(scenario, "forged") {
+						h.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.30/32")}
 					}
 
 					require.NoError(t, fc.Update(t.Context(), m))
@@ -525,7 +535,14 @@ func TestMediaArtifactForwardedAuthorization(t *testing.T) {
 				require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("b", 64), files))
 				p.Resolver.Cache.SetDigest(m.Spec.Netboot().NetbootImage, "sha256:"+strings.Repeat("d", 64))
 				p.Resolver.Cache.SetDigest(m.Spec.Netboot().Image, "sha256:"+strings.Repeat("b", 64))
-				h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
+				h := &HTTPServer{
+					Media:        p,
+					FileResolver: *p.Resolver,
+					TrustedProxies: []netip.Prefix{
+						netip.MustParsePrefix("192.0.2.30/32"),
+						netip.MustParsePrefix("192.0.2.31/32"),
+					},
+				}
 
 				for path, content := range files {
 					t.Run(path, func(t *testing.T) {

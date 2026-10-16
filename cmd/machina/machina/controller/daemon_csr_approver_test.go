@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	certificatesv1 "k8s.io/api/certificates/v1"
@@ -36,19 +37,19 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeBeforeMachineExists(t *testing.T) {
 
 	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
 	require.NoError(t, err)
-	require.True(t, allowed)
+	require.False(t, allowed)
 }
 
-func TestDaemonCSRBootstrapTokenMayClaimNodeWithDefaultToken(t *testing.T) {
-	checker := testDaemonCSRClaimChecker(defaultBootstrapToken("abc123"))
+func TestDaemonCSRBootstrapTokenMayClaimNodeRejectsUnboundToken(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(bootstrapToken("abc123", ""))
 	csr := csrForBinding("system:bootstrap:abc123")
 
 	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
 	require.NoError(t, err)
-	require.True(t, allowed)
+	require.False(t, allowed)
 }
 
-func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresSiteBinding(t *testing.T) {
+func TestDaemonCSRBootstrapTokenMayClaimNodeUsesExactMachineBindingWithoutSiteLabel(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(
 		bootstrapToken("abc123", ""),
 		machineForToken("machine-a", "node-a", "abc123", "site-a"),
@@ -57,7 +58,7 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresSiteBinding(t *testing.T) {
 
 	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
 	require.NoError(t, err)
-	require.False(t, allowed)
+	require.True(t, allowed)
 }
 
 func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresBootstrapTokenSecret(t *testing.T) {
@@ -71,7 +72,23 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresBootstrapTokenSecret(t *test
 	require.False(t, allowed)
 }
 
-func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsSiteTokenReuseWithExistingMachine(t *testing.T) {
+func TestDaemonCSRBootstrapTokenMayClaimNodeRejectsExpiredToken(t *testing.T) {
+	token := bootstrapToken("abc123", "site-a")
+	token.Data = map[string][]byte{
+		"expiration": []byte(time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)),
+	}
+	checker := testDaemonCSRClaimChecker(
+		token,
+		machineForToken("machine-a", "node-a", "abc123", "site-a"),
+	)
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
+func TestDaemonCSRBootstrapTokenMayClaimNodeRejectsDifferentMachine(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(
 		bootstrapToken("abc123", "site-a"),
 		machineForToken("machine-a", "node-a", "abc123", "site-a"),
@@ -80,12 +97,12 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsSiteTokenReuseWithExistingMach
 
 	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-b")
 	require.NoError(t, err)
-	require.True(t, allowed)
+	require.False(t, allowed)
 }
 
-func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsDefaultTokenMachineSite(t *testing.T) {
+func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsBoundMachineWithUnlabeledToken(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(
-		defaultBootstrapToken("abc123"),
+		bootstrapToken("abc123", ""),
 		machineForToken("machine-a", "node-a", "abc123", "site-a"),
 	)
 	csr := csrForBinding("system:bootstrap:abc123")
@@ -93,6 +110,87 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsDefaultTokenMachineSite(t *tes
 	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
 	require.NoError(t, err)
 	require.True(t, allowed)
+}
+
+func TestDaemonCSRBootstrapTokenMayClaimMetalmanMachine(t *testing.T) {
+	token := bootstrapToken("abc123", "")
+	token.Annotations = map[string]string{
+		unboundedv1alpha3.MachineBootstrapTokenAnnotationKey: "machine-a",
+	}
+	checker := testDaemonCSRClaimChecker(
+		token,
+		machineForToken("machine-a", "node-a", "abc123", ""),
+	)
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
+	require.NoError(t, err)
+	require.True(t, allowed)
+
+	allowed, err = checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-b")
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
+func TestDaemonCSRLegacyBootstrapTokenMayClaimBeforeMachineExists(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(bootstrapToken("abc123", "site-a"))
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.legacyBootstrapTokenMayClaimNode(context.Background(), csr, "new-node")
+	require.NoError(t, err)
+	require.True(t, allowed)
+}
+
+func TestDaemonCSRLegacyBootstrapTokenRequiresSiteOrDefaultBinding(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(bootstrapToken("abc123", ""))
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.legacyBootstrapTokenMayClaimNode(context.Background(), csr, "new-node")
+	require.NoError(t, err)
+	require.False(t, allowed)
+
+	token := bootstrapToken("def456", "")
+	token.Labels[defaultBootstrapTokenLabel] = "true"
+	checker = testDaemonCSRClaimChecker(token)
+	csr = csrForBinding("system:bootstrap:def456")
+
+	allowed, err = checker.legacyBootstrapTokenMayClaimNode(context.Background(), csr, "new-node")
+	require.NoError(t, err)
+	require.True(t, allowed)
+}
+
+func TestBootstrapGroupApproverRoutesOnlyMatchingBootstrapGroup(t *testing.T) {
+	delegate := &recordingCSRApprover{}
+	approver := bootstrapGroupApprover{
+		group:    "system:bootstrappers:metalman",
+		approver: delegate,
+	}
+	csr := csrForBinding("system:bootstrap:abc123")
+	csr.Spec.Groups = []string{"system:bootstrappers:unbounded-agent-daemons"}
+
+	decision, err := approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.True(t, decision.Ignore)
+	require.False(t, delegate.called)
+
+	csr.Spec.Groups = []string{"system:bootstrappers:metalman"}
+	decision, err = approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.False(t, decision.Ignore)
+	require.True(t, delegate.called)
+}
+
+type recordingCSRApprover struct {
+	called bool
+}
+
+func (a *recordingCSRApprover) Evaluate(
+	context.Context,
+	*certificatesv1.CertificateSigningRequest,
+) (daemoncred.CSRDecision, error) {
+	a.called = true
+
+	return daemoncred.CSRDecision{Approve: true}, nil
 }
 
 func TestDaemonCSRNodeHasMachineBinding(t *testing.T) {
@@ -163,13 +261,6 @@ func bootstrapToken(tokenID, site string) *corev1.Secret {
 		},
 		Type: corev1.SecretType("bootstrap.kubernetes.io/token"),
 	}
-}
-
-func defaultBootstrapToken(tokenID string) *corev1.Secret {
-	token := bootstrapToken(tokenID, "")
-	token.Labels[defaultBootstrapTokenLabel] = "true"
-
-	return token
 }
 
 func machineForToken(machineName, nodeName, tokenID, site string) *unboundedv1alpha3.Machine {

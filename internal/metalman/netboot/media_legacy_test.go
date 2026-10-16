@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -77,7 +78,11 @@ func TestMediaLegacyServingAfterLiveLeaseChange(t *testing.T) {
 					"grub.cfg.tmpl":      []byte("install={{ .InstallRequested }}"),
 					"grub/grub.cfg.tmpl": []byte("install={{ .InstallRequested }}"),
 				}))
-				h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
+				h := &HTTPServer{
+					Media:          p,
+					FileResolver:   *p.Resolver,
+					TrustedProxies: []netip.Prefix{netip.MustParsePrefix("192.0.2.30/32")},
+				}
 				tftp := &TFTPServer{Media: p, FileResolver: *p.Resolver}
 				ip := m.Spec.Netboot().DHCPLeases[0].IPv4
 

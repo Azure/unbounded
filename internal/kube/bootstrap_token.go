@@ -28,10 +28,12 @@ const (
 var ErrBootstrapTokenNotFound = errors.New("bootstrap token not found")
 
 type BootstrapToken struct {
-	ID        string
-	Secret    string
-	Labels    map[string]string
-	ExpiresAt time.Time
+	ID              string
+	Secret          string
+	Labels          map[string]string
+	Annotations     map[string]string
+	AuthExtraGroups []string
+	ExpiresAt       time.Time
 }
 
 func (t *BootstrapToken) WithLabel(key, value string) *BootstrapToken {
@@ -40,6 +42,22 @@ func (t *BootstrapToken) WithLabel(key, value string) *BootstrapToken {
 	}
 
 	t.Labels[key] = value
+
+	return t
+}
+
+func (t *BootstrapToken) WithAnnotation(key, value string) *BootstrapToken {
+	if t.Annotations == nil {
+		t.Annotations = make(map[string]string)
+	}
+
+	t.Annotations[key] = value
+
+	return t
+}
+
+func (t *BootstrapToken) WithAuthExtraGroups(groups ...string) *BootstrapToken {
+	t.AuthExtraGroups = append([]string(nil), groups...)
 
 	return t
 }
@@ -74,11 +92,14 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 		expiresAt = time.Now().UTC().Add(DefaultBootstrapTokenTTL)
 	}
 
+	authExtraGroups := tokenAuthExtraGroups(token)
+
 	s := v1.Secret(bootstrapTokenName(token), metav1.NamespaceSystem).
 		WithType(corev1.SecretTypeBootstrapToken).
 		WithLabels(token.Labels).
+		WithAnnotations(token.Annotations).
 		WithData(map[string][]byte{
-			"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
+			"auth-extra-groups":              []byte(authExtraGroups),
 			"expiration":                     []byte(expiresAt.UTC().Format(time.RFC3339)),
 			"token-id":                       []byte(token.ID),
 			"token-secret":                   []byte(token.Secret),
@@ -87,6 +108,42 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 		})
 
 	return ApplySecret(ctx, kubeCli, s, ao)
+}
+
+// BootstrapTokenSecret returns the Kubernetes Secret representation of token.
+func BootstrapTokenSecret(token *BootstrapToken) *corev1.Secret {
+	expiresAt := token.ExpiresAt
+	if expiresAt.IsZero() {
+		expiresAt = time.Now().UTC().Add(DefaultBootstrapTokenTTL)
+	}
+
+	authExtraGroups := tokenAuthExtraGroups(token)
+
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        bootstrapTokenName(token),
+			Namespace:   metav1.NamespaceSystem,
+			Labels:      token.Labels,
+			Annotations: token.Annotations,
+		},
+		Type: corev1.SecretTypeBootstrapToken,
+		Data: map[string][]byte{
+			"auth-extra-groups":              []byte(authExtraGroups),
+			"expiration":                     []byte(expiresAt.UTC().Format(time.RFC3339)),
+			"token-id":                       []byte(token.ID),
+			"token-secret":                   []byte(token.Secret),
+			"usage-bootstrap-authentication": []byte("true"),
+			"usage-bootstrap-signing":        []byte("true"),
+		},
+	}
+}
+
+func tokenAuthExtraGroups(token *BootstrapToken) string {
+	if len(token.AuthExtraGroups) == 0 {
+		return "system:bootstrappers:unbounded-agent-daemons"
+	}
+
+	return strings.Join(token.AuthExtraGroups, ",")
 }
 
 func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface, siteName string) (*BootstrapToken, error) {

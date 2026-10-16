@@ -18,27 +18,28 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"os"
-	"strings"
+	"time"
 
 	"github.com/google/go-tpm/tpm2"
-	authenticationv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/utils/ptr"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/kube"
+	metalmanbootstrap "github.com/Azure/unbounded/internal/metalman/bootstrap"
+	"github.com/Azure/unbounded/internal/metalman/clientip"
 )
 
 const (
-	BootstrapSAName = "metalman-bootstrap"
-
 	// maxRequestBodySize limits attestation request bodies to 1 MiB.
 	maxRequestBodySize = 1 << 20
+
+	bootstrapTokenTTL = time.Hour
 )
 
 type Handler struct {
@@ -46,8 +47,9 @@ type Handler struct {
 	ClusterCA      []byte // PEM-encoded cluster CA certificate
 	LookupNodeByIP func(ctx context.Context, ip string) (*v1alpha3.Machine, error)
 	// LookupMachine takes precedence over LookupNodeByIP when set.
-	LookupMachine func(r *http.Request) (*v1alpha3.Machine, error)
-	StatusUpdater StatusUpdater
+	LookupMachine  func(r *http.Request, ip string) (*v1alpha3.Machine, error)
+	StatusUpdater  StatusUpdater
+	TrustedProxies []netip.Prefix
 }
 
 // StatusUpdater updates the status subresource of a Machine.
@@ -68,22 +70,6 @@ type AttestResponse struct {
 	ClusterCA       string `json:"clusterCA,omitempty"` // PEM-encoded CA certificate
 }
 
-// clientIP extracts the client IP from an HTTP request, checking
-// X-Forwarded-For first, then falling back to RemoteAddr.
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.SplitN(fwd, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-
-	return host
-}
-
 // Attest handles the single-round-trip TPM attestation flow.
 // The node sends its EK and SRK public keys. The server wraps a random
 // AES-256 key via CreateCredential (bound to the EK and SRK), encrypts a
@@ -100,11 +86,18 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip, err := (clientip.Resolver{TrustedProxies: h.TrustedProxies}).FromRequest(r)
+	if err != nil {
+		slog.Warn("attest: invalid remote address", "remote", r.RemoteAddr, "err", err)
+		http.Error(w, "invalid remote address", http.StatusBadRequest)
+
+		return
+	}
 
 	log := slog.With("remote", r.RemoteAddr, "ip", ip)
 	if len(req.EKPub) == 0 || len(req.SRKPub) == 0 {
-		log.Warn("attest: missing fields",
+		log.Warn(
+			"attest: missing fields",
 			"hasEKPub", len(req.EKPub) > 0,
 			"hasSRKPub", len(req.SRKPub) > 0,
 		)
@@ -115,13 +108,10 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	var (
-		node *v1alpha3.Machine
-		err  error
-	)
+	var node *v1alpha3.Machine
 
 	if h.LookupMachine != nil {
-		node, err = h.LookupMachine(r)
+		node, err = h.LookupMachine(r, ip)
 	} else {
 		node, err = h.LookupNodeByIP(ctx, ip)
 	}
@@ -274,22 +264,32 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	binary.BigEndian.PutUint16(encryptedSecret[:2], uint16(len(encSecret)))
 	copy(encryptedSecret[2:], encSecret)
 
-	// Create a short-lived bootstrap token.
-	tokenRequest := &authenticationv1.TokenRequest{
-		Spec: authenticationv1.TokenRequestSpec{
-			ExpirationSeconds: ptr.To(int64(3600)),
-		},
-	}
-
-	tokenResp, err := h.Clientset.CoreV1().ServiceAccounts(unbounded.SystemNamespace()).CreateToken(
-		ctx, BootstrapSAName, tokenRequest, metav1.CreateOptions{},
-	)
+	bootstrapToken, err := kube.NewBootstrapToken()
 	if err != nil {
-		log.Error("attest: creating SA token", "err", err)
+		log.Error("attest: generating bootstrap token", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
 	}
+
+	bootstrapToken.ExpiresAt = time.Now().UTC().Add(bootstrapTokenTTL)
+	bootstrapToken.WithAnnotation(v1alpha3.MachineBootstrapTokenAnnotationKey, node.Name)
+	bootstrapToken.WithAuthExtraGroups(metalmanbootstrap.Group)
+
+	tokenSecret := kube.BootstrapTokenSecret(bootstrapToken)
+	if _, err := h.Clientset.CoreV1().Secrets(metav1.NamespaceSystem).Create(ctx, tokenSecret, metav1.CreateOptions{}); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			log.Error("attest: bootstrap token collision", "err", err)
+		} else {
+			log.Error("attest: creating bootstrap token", "err", err)
+		}
+
+		http.Error(w, "internal error", http.StatusInternalServerError)
+
+		return
+	}
+
+	token := bootstrapToken.ID + "." + bootstrapToken.Secret
 
 	// Encrypt the bootstrap token with the credential-wrapped AES key.
 	block, err := aes.NewCipher(aesKey)
@@ -316,9 +316,9 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encryptedToken := gcm.Seal(nil, gcmNonce, []byte(tokenResp.Status.Token), nil)
+	encryptedToken := gcm.Seal(nil, gcmNonce, []byte(token), nil)
 
-	tokenHash := sha256.Sum256([]byte(tokenResp.Status.Token))
+	tokenHash := sha256.Sum256([]byte(token))
 	log.Info("attest: issued encrypted bootstrap token", "tokenID", fmt.Sprintf("%x", tokenHash[:8]))
 
 	resp := AttestResponse{

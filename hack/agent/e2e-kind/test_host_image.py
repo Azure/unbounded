@@ -417,8 +417,8 @@ class TestGalleryVersion(unittest.TestCase):
         with patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", ""), \
                 patch.object(e2e, "capture", return_value="3.1") as az:
             self.assertEqual(e2e.acl_gallery_version(), "3.1")
-
         url = az.call_args.args[0][az.call_args.args[0].index("--url") + 1]
+        self.assertIn("/subscriptions/{subscriptionId}/providers/", url)
         self.assertIn("/subscriptions/{subscriptionId}/providers/", url)
 
     def test_a_pinned_version_is_not_looked_up(self):

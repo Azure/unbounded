@@ -209,11 +209,17 @@ def create_vm() -> tuple[Path, Path]:
 def setup_kubernetes_and_images() -> None:
     log("Building binaries and applying Metalman RBAC/CRDs")
     run(["make", "machina-manifests"], cwd=ROOT)
-    for output, package in (("metalman", "./cmd/metalman"), ("unbounded-agent", "./cmd/agent")):
+    for output, package in (
+        ("machina", "./cmd/machina"),
+        ("metalman", "./cmd/metalman"),
+        ("unbounded-agent", "./cmd/agent"),
+    ):
         run(["go", "build", "-o", str(ROOT / "bin" / output), package], cwd=ROOT)
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/01-namespace.yaml")])
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/crd")])
+    run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/02-rbac.yaml")])
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/06-metalman-rbac.yaml")])
+    smoke.start_machina_controller(TMP)
     for resource in (
         f"machineoperation/http-smoke-host-replace",
         f"machine/{NODE}",

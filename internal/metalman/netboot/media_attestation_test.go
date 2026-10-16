@@ -24,14 +24,14 @@ func TestMediaAttestationFrozenLease(t *testing.T) {
 
 			_, err := h.LookupNodeByIP(t.Context(), "192.0.2.20")
 			require.Error(t, err)
-			node, err := h.Media.LookupAttestationMachine(r)
+			node, err := h.Media.LookupAttestationMachine(r, "192.0.2.20")
 			require.NoError(t, err)
 			require.Equal(t, m.UID, node.UID)
 			require.Equal(t, m.Spec, node.Spec)
 
 			body := `{"name":"modules-final","event_type":"finish","result":"` + result + `"}`
 			require.Equal(t, http.StatusOK, firstBootRequest(h, "/cloudinit/log", "192.0.2.20", body).Code)
-			node, err = h.Media.LookupAttestationMachine(r)
+			node, err = h.Media.LookupAttestationMachine(r, "192.0.2.20")
 			require.Error(t, err)
 			require.Nil(t, node)
 		})
@@ -94,7 +94,7 @@ func TestMediaAttestationAuthorization(t *testing.T) {
 
 			require.NoError(t, h.Media.Client.Update(t.Context(), m))
 			require.NoError(t, h.Media.Client.Status().Update(t.Context(), op))
-			node, err := h.Media.LookupAttestationMachine(r)
+			node, err := h.Media.LookupAttestationMachine(r, "192.0.2.30")
 			require.Error(t, err)
 			require.Nil(t, node)
 		})
@@ -119,7 +119,7 @@ func TestMediaAttestationLegacyLookup(t *testing.T) {
 					r.Header.Set("X-Forwarded-For", "192.0.2.99, 192.0.2.31")
 				}
 
-				node, err := h.Media.LookupAttestationMachine(r)
+				node, err := h.Media.LookupAttestationMachine(r, "192.0.2.99")
 				require.NoError(t, err)
 				require.Equal(t, client.ObjectKeyFromObject(m), client.ObjectKeyFromObject(node))
 				require.Equal(t, m.Spec, node.Spec)

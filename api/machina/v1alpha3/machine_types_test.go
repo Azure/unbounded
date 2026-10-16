@@ -28,6 +28,23 @@ func TestKubernetesSpecOmitsUnsetBootstrapTokenRef(t *testing.T) {
 	}
 }
 
+func TestMachineNodeName(t *testing.T) {
+	machine := &Machine{}
+	machine.Name = "machine-a"
+
+	if got := machine.NodeName(); got != "machine-a" {
+		t.Fatalf("NodeName() = %q, want machine-a", got)
+	}
+
+	machine.Spec.Kubernetes = &KubernetesSpec{
+		NodeRef: &LocalObjectReference{Name: "node-a"},
+	}
+
+	if got := machine.NodeName(); got != "node-a" {
+		t.Fatalf("NodeName() = %q, want node-a", got)
+	}
+}
+
 func TestBootProtocolDefaultsAndVirtualMedia(t *testing.T) {
 	for _, tc := range []struct {
 		name string

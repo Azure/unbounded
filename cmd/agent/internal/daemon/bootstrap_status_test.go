@@ -6,16 +6,19 @@ package daemon
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 func fakeBootstrapStatusClient(objs ...client.Object) client.Client {
@@ -94,6 +97,60 @@ func TestBootstrapStatusReporter_SucceededSetsCondition(t *testing.T) {
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
 	assert.Equal(t, "Succeeded", cond.Reason)
 	assert.Equal(t, "unbounded-agent bootstrap completed successfully", cond.Message)
+}
+
+func TestNewBootstrapStatusReporterUsesDaemonCredentials(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cfg := baseConfig()
+	machine := buildMachineCR(cfg)
+	statusClient := fake.NewClientBuilder().
+		WithScheme(fakeScheme()).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithObjects(&machine).
+		Build()
+
+	var (
+		credentialsCalled bool
+		clientCalled      bool
+		stopped           bool
+	)
+
+	reporter := newBootstrapStatusReporter(
+		ctx,
+		discardLogger(),
+		cfg,
+		&runOptions{
+			DaemonCredentialDir: t.TempDir(),
+			NewClient: func(cfg *rest.Config, _ client.Options) (client.WithWatch, error) {
+				clientCalled = true
+
+				require.Equal(t, "https://daemon-credentials.example", cfg.Host)
+
+				return statusClient, nil
+			},
+		},
+		func(
+			context.Context,
+			*slog.Logger,
+			*provision.AgentConfig,
+			*runOptions,
+		) (*rest.Config, context.CancelFunc, error) {
+			credentialsCalled = true
+
+			return &rest.Config{Host: "https://daemon-credentials.example"}, func() {
+				stopped = true
+			}, nil
+		},
+	)
+
+	require.True(t, reporter.ready)
+	require.True(t, credentialsCalled)
+	require.True(t, clientCalled)
+
+	reporter.Succeeded(ctx)
+	require.True(t, stopped)
 }
 
 func findMachineCondition(t *testing.T, conditions []metav1.Condition, conditionType string) metav1.Condition {

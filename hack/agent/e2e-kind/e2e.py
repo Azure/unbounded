@@ -1685,6 +1685,7 @@ ACL_IMAGE_VERSION = os.environ.get("ACL_IMAGE_VERSION", "")
 ACL_IMAGE_RESOURCE_GROUP = os.environ.get("ACL_IMAGE_RESOURCE_GROUP", "")
 ACL_IMAGE_SUBSCRIPTION = os.environ.get("ACL_IMAGE_SUBSCRIPTION", "")
 ACL_GALLERY_IMAGE_PATTERN = re.compile(r"/SharedGalleries/([^/]+)/Images/([^/]+)")
+ACL_SHARED_GALLERY_API_VERSION = "2024-03-03"
 
 # The manifest source.
 ACL_IMAGE_MANIFEST_URL = os.environ.get(

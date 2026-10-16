@@ -6,13 +6,6 @@ metadata:
   namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: metalman-bootstrap
-  namespace: {{ default "unbounded-system" .Namespace }}
-
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -26,12 +19,6 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Bootstrap token creation (scoped to metalman-bootstrap SA)
-  - apiGroups: [""]
-    resources: ["serviceaccounts/token"]
-    resourceNames: ["metalman-bootstrap"]
-    verbs: ["create"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -76,7 +63,8 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Allow metalman-controller to read the kube-dns Service from kube-system.
+# Allow metalman-controller to read kube-dns and create short-lived,
+# Machine-bound bootstrap tokens in kube-system.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -87,6 +75,9 @@ rules:
     resources: ["services"]
     resourceNames: ["kube-dns"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -154,62 +145,38 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Allow bootstrap tokens issued for the metalman-bootstrap SA to create
-# certificate signing requests (kubelet TLS bootstrap).
+# Replace the legacy shared bootstrap ServiceAccount subject with Metalman's
+# dedicated bootstrap-token group.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: metalman:node-bootstrapper
 subjects:
-  - kind: ServiceAccount
-    name: metalman-bootstrap
-    namespace: {{ default "unbounded-system" .Namespace }}
+  - kind: Group
+    name: system:bootstrappers:metalman
+    apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: ClusterRole
   name: system:node-bootstrapper
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Auto-approve kubelet client certificate requests from the bootstrap SA.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: metalman:node-autoapprove-bootstrap
-subjects:
-  - kind: ServiceAccount
-    name: metalman-bootstrap
-    namespace: {{ default "unbounded-system" .Namespace }}
+subjects: []
 roleRef:
   kind: ClusterRole
   name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Allow the metalman-bootstrap SA to get and create Machine CRs and publish
-# initial agent bootstrap status.
-# The agent's register-machine phase uses this SA token to check whether a
-# Machine CR already exists and, if not, to create one during bootstrap.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: metalman-bootstrap
-rules:
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machines"]
-    verbs: ["get", "create"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machines/status"]
-    verbs: ["get", "update", "patch"]
-
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: metalman:bootstrap-machine
-subjects:
-  - kind: ServiceAccount
-    name: metalman-bootstrap
-    namespace: {{ default "unbounded-system" .Namespace }}
+subjects: []
 roleRef:
   kind: ClusterRole
   name: metalman-bootstrap

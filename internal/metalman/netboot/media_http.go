@@ -89,7 +89,7 @@ func (p *MediaProvider) liveFirstBootOwner(ctx context.Context, ip string) (*med
 
 // LookupAttestationMachine uses direct-peer media ownership before legacy IP lookup.
 // Unlike datasource lookup, it returns the live Machine spec for status updates.
-func (p *MediaProvider) LookupAttestationMachine(r *http.Request) (*v1alpha3.Machine, error) {
+func (p *MediaProvider) LookupAttestationMachine(r *http.Request, fallbackIP string) (*v1alpha3.Machine, error) {
 	remote, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, err)
@@ -104,12 +104,12 @@ func (p *MediaProvider) LookupAttestationMachine(r *http.Request) (*v1alpha3.Mac
 		return o.machine, nil
 	}
 
-	node, err := p.Resolver.LookupNodeByIP(r.Context(), clientIP(r))
+	node, err := p.Resolver.LookupNodeByIP(r.Context(), fallbackIP)
 	if node != nil && node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
 		return nil, errMediaFirstBootUnauthorized
 	}
 
-	if mediaErr := p.rejectFirstBootFallback(r.Context(), node, clientIP(r)); mediaErr != nil {
+	if mediaErr := p.rejectFirstBootFallback(r.Context(), node, fallbackIP); mediaErr != nil {
 		return nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, mediaErr)
 	}
 

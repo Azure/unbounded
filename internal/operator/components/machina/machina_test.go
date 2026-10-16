@@ -499,11 +499,111 @@ Apply ClusterRole/unbounded-daemon-controller-machine
 Apply ClusterRoleBinding/unbounded-daemon-controller-machine
 Apply ClusterRoleBinding/unbounded-bootstrapper-node
 Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
+Apply ValidatingAdmissionPolicy/unbounded-daemon-machine-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-daemon-machine-create-restriction
 `
 
 	if got := plan.Summary(); got != want {
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
 	}
+
+	assertBootstrapAutoApprovalGroup(t, plan)
+	assertDaemonMachineCreateRestriction(t, plan)
+}
+
+func assertBootstrapAutoApprovalGroup(t *testing.T, plan *component.Plan) {
+	t.Helper()
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() != "ClusterRoleBinding" || op.Object.GetName() != "unbounded-bootstrapper-node-autoapprove" {
+			continue
+		}
+
+		subjects, found, err := unstructured.NestedSlice(op.Object.Object, "subjects")
+		if err != nil {
+			t.Fatalf("read auto-approval binding subjects: %v", err)
+		}
+
+		if !found || len(subjects) != 1 {
+			t.Fatalf("auto-approval binding subjects = %#v, want existing bootstrap group", subjects)
+		}
+
+		subject := subjects[0].(map[string]any)
+		if got := subject["name"]; got != "system:bootstrappers:unbounded-agent-daemons" {
+			t.Fatalf("auto-approval group = %v", got)
+		}
+
+		return
+	}
+
+	t.Fatal("unbounded-bootstrapper-node-autoapprove binding not found")
+}
+
+func assertDaemonMachineCreateRestriction(t *testing.T, plan *component.Plan) {
+	t.Helper()
+
+	var policy, binding *unstructured.Unstructured
+
+	for _, op := range plan.Operations {
+		if op.Object.GetName() != "unbounded-daemon-machine-create-restriction" {
+			continue
+		}
+
+		switch op.Object.GetKind() {
+		case "ValidatingAdmissionPolicy":
+			policy = op.Object
+		case "ValidatingAdmissionPolicyBinding":
+			binding = op.Object
+		}
+	}
+
+	if policy == nil || binding == nil {
+		t.Fatalf("daemon Machine create restriction policy=%v binding=%v, want both", policy != nil, binding != nil)
+	}
+
+	if got, _, _ := unstructured.NestedString(policy.Object, "spec", "failurePolicy"); got != "Fail" {
+		t.Fatalf("policy failurePolicy = %q, want Fail", got)
+	}
+
+	rules, _, _ := unstructured.NestedSlice(policy.Object, "spec", "matchConstraints", "resourceRules")
+	if len(rules) != 1 {
+		t.Fatalf("policy resourceRules = %#v, want one rule", rules)
+	}
+
+	rule := rules[0].(map[string]any)
+	if got := rule["operations"]; !equalStringSlice(got, "CREATE") {
+		t.Fatalf("policy operations = %#v, want CREATE", got)
+	}
+
+	if got := rule["resources"]; !equalStringSlice(got, "machines") {
+		t.Fatalf("policy resources = %#v, want machines", got)
+	}
+
+	conditions, _, _ := unstructured.NestedSlice(policy.Object, "spec", "matchConditions")
+	if len(conditions) != 1 || !strings.Contains(conditions[0].(map[string]any)["expression"].(string), "unbounded-agent-daemons") {
+		t.Fatalf("policy matchConditions = %#v, want daemon bootstrap group", conditions)
+	}
+
+	validations, _, _ := unstructured.NestedSlice(policy.Object, "spec", "validations")
+	if len(validations) != 1 {
+		t.Fatalf("policy validations = %#v, want one validation", validations)
+	}
+
+	expression := validations[0].(map[string]any)["expression"].(string)
+	if !strings.Contains(expression, "object.spec.pxe") || !strings.Contains(expression, "object.spec.host.netboot") {
+		t.Fatalf("policy validation = %q, want PXE and host.netboot restrictions", expression)
+	}
+
+	actions, _, _ := unstructured.NestedStringSlice(binding.Object, "spec", "validationActions")
+	if len(actions) != 1 || actions[0] != "Deny" {
+		t.Fatalf("binding validationActions = %#v, want Deny", actions)
+	}
+}
+
+func equalStringSlice(value any, want string) bool {
+	values, ok := value.([]any)
+
+	return ok && len(values) == 1 && values[0] == want
 }
 
 // TestExecutionOrderGolden pins what the executor runs, as distinct from what
@@ -540,6 +640,8 @@ Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
 CreateIfAbsent ConfigMap/unbounded-system/machina-config
 Apply Service/unbounded-system/machina-controller
 Apply Deployment/unbounded-system/machina-controller
+Apply ValidatingAdmissionPolicy/unbounded-daemon-machine-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-daemon-machine-create-restriction
 `
 
 	if got != want {

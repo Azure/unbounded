@@ -60,6 +60,7 @@ AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # bridge IP so the VM can reach the registry over the virtual network.
 AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 BINARY = REPO_ROOT / "bin" / "metalman"
+MACHINA_BINARY = REPO_ROOT / "bin" / "machina"
 AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
@@ -450,6 +451,32 @@ def write_service_account_kubeconfig(namespace: str, service_account: str, path:
 
     path.write_text(json.dumps(kubeconfig), encoding="utf-8")
     os.chmod(path, 0o600)
+
+
+def start_machina_controller(work_dir: Path) -> None:
+    kubeconfig = work_dir / "machina-controller.kubeconfig"
+    config = work_dir / "machina-config.yaml"
+    api_endpoint = apiserver_url()
+    write_service_account_kubeconfig(METALMAN_NAMESPACE, "machina-controller", kubeconfig)
+    config.write_text(
+        f"apiServerEndpoint: {json.dumps(api_endpoint)}\n"
+        "metricsAddr: \"127.0.0.1:0\"\n"
+        "probeAddr: \"127.0.0.1:0\"\n"
+        "enableLeaderElection: false\n"
+        "maxConcurrentReconciles: 10\n",
+        encoding="utf-8",
+    )
+    proc = spawn([
+        "env",
+        f"KUBECONFIG={kubeconfig}",
+        f"POD_NAMESPACE={METALMAN_NAMESPACE}",
+        str(MACHINA_BINARY),
+        "controller",
+        f"--config={config}",
+    ], work_dir / "machina.log")
+    log(f"  Machina controller PID={proc.pid}")
+    time.sleep(2)
+    check_procs()
 
 
 def apiserver_url() -> str:
@@ -1107,8 +1134,12 @@ def main() -> None:
     log("Rendering machina and net manifests")
     run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
-    log("Building metalman, kubectl-unbounded, and unbounded-agent (parallel)")
+    log("Building Machina, Metalman, kubectl-unbounded, and unbounded-agent (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
+        ("machina", subprocess.Popen(
+            ["go", "build", "-o", str(MACHINA_BINARY), "./cmd/machina"],
+            cwd=str(REPO_ROOT),
+        )),
         ("metalman", subprocess.Popen(
             ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
             cwd=str(REPO_ROOT),
@@ -1136,6 +1167,7 @@ def main() -> None:
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "02-rbac.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
 
     log("Creating Kubernetes resources")
@@ -1180,6 +1212,7 @@ def main() -> None:
         if rc != 0:
             die(f"go build {name} failed (exit code {rc})")
     log("  Go builds finished")
+    start_machina_controller(TMPDIR)
 
     log("Packaging branch-built unbounded-agent")
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)

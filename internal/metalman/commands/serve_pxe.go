@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,6 +60,7 @@ func ServePXECmd() *cobra.Command {
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
+		trustedProxyCIDRs              []string
 	)
 
 	cmd := &cobra.Command{
@@ -71,6 +73,11 @@ func ServePXECmd() *cobra.Command {
 			selector, err := SiteSelector(site)
 			if err != nil {
 				return fmt.Errorf("building site selector: %w", err)
+			}
+
+			trustedProxies, err := parseTrustedProxyCIDRs(trustedProxyCIDRs)
+			if err != nil {
+				return err
 			}
 
 			leID := LeaderElectionID(site)
@@ -315,10 +322,11 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			attestHandler := &attestation.Handler{
-				Clientset:     clientset,
-				ClusterCA:     clusterCA,
-				LookupMachine: media.LookupAttestationMachine,
-				StatusUpdater: &StatusUpdater{Client: mgr.GetClient()},
+				Clientset:      clientset,
+				ClusterCA:      clusterCA,
+				LookupMachine:  media.LookupAttestationMachine,
+				StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+				TrustedProxies: trustedProxies,
 			}
 
 			httpMux := http.NewServeMux()
@@ -332,6 +340,7 @@ func ServePXECmd() *cobra.Command {
 				Mux:            httpMux,
 				FileResolver:   resolver,
 				StatusRecorder: statusQueue,
+				TrustedProxies: trustedProxies,
 			}
 			if err := mgr.Add(httpServer); err != nil {
 				return fmt.Errorf("adding HTTP server: %w", err)
@@ -384,8 +393,24 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
+	cmd.Flags().StringSliceVar(&trustedProxyCIDRs, "trusted-proxy-cidr", nil, "Proxy CIDR allowed to supply X-Forwarded-For; repeat for multiple CIDRs")
 
 	return cmd
+}
+
+func parseTrustedProxyCIDRs(values []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(values))
+
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("parse --trusted-proxy-cidr %q: %w", value, err)
+		}
+
+		prefixes = append(prefixes, prefix.Masked())
+	}
+
+	return prefixes, nil
 }
 
 func resolveMediaTFTPServer(raw string, serverIP net.IP) (string, error) {

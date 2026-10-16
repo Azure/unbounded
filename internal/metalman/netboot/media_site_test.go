@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -53,6 +54,7 @@ func TestMediaSiteFirstBootFallback(t *testing.T) {
 						remote, forwarded := ip, ""
 						if source == "forwarded" {
 							remote, forwarded = "192.0.2.30", ip
+							h.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.30/32")}
 						}
 
 						want := http.StatusOK

@@ -358,7 +358,6 @@ func TestPlanGolden(t *testing.T) {
 	}
 
 	want := `Apply ServiceAccount/unbounded-system/metalman-controller [shared]
-Apply ServiceAccount/unbounded-system/metalman-bootstrap [shared]
 Apply Role/unbounded-system/metalman-controller [shared]
 Apply RoleBinding/unbounded-system/metalman-controller [shared]
 Apply Role/kube-public/metalman-controller [shared]
@@ -369,7 +368,6 @@ Apply ClusterRole/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
 Apply ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
-Apply ClusterRole/metalman-bootstrap [shared]
 Apply ClusterRoleBinding/metalman:bootstrap-machine [shared]
 Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable]
 `
@@ -377,6 +375,66 @@ Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable]
 	if got := plan.Summary(); got != want {
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
 	}
+
+	for _, name := range []string{
+		"metalman:node-autoapprove-bootstrap",
+		"metalman:bootstrap-machine",
+	} {
+		assertEmptyBindingSubjects(t, plan, name)
+	}
+
+	foundMetalmanBootstrapper := false
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() != "ClusterRoleBinding" || op.Object.GetName() != "metalman:node-bootstrapper" {
+			continue
+		}
+
+		foundMetalmanBootstrapper = true
+
+		subjects, found, err := unstructured.NestedSlice(op.Object.Object, "subjects")
+		if err != nil {
+			t.Fatalf("read Metalman bootstrapper subjects: %v", err)
+		}
+
+		if !found || len(subjects) != 1 {
+			t.Fatalf("Metalman bootstrapper subjects = %#v, want dedicated group", subjects)
+		}
+
+		subject := subjects[0].(map[string]any)
+		if got := subject["name"]; got != "system:bootstrappers:metalman" {
+			t.Fatalf("Metalman bootstrapper group = %v", got)
+		}
+
+		break
+	}
+
+	if !foundMetalmanBootstrapper {
+		t.Fatal("metalman:node-bootstrapper binding not found")
+	}
+}
+
+func assertEmptyBindingSubjects(t *testing.T, plan *component.Plan, name string) {
+	t.Helper()
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() != "ClusterRoleBinding" || op.Object.GetName() != name {
+			continue
+		}
+
+		subjects, found, err := unstructured.NestedSlice(op.Object.Object, "subjects")
+		if err != nil {
+			t.Fatalf("read subjects for %s: %v", name, err)
+		}
+
+		if !found || len(subjects) != 0 {
+			t.Fatalf("subjects for %s = %#v, want explicit empty list", name, subjects)
+		}
+
+		return
+	}
+
+	t.Fatalf("ClusterRoleBinding %s not found", name)
 }
 
 // TestCleanupPlanGolden pins what disabling metalman for a Site removes. The

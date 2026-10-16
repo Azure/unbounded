@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"path"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/clientip"
 )
 
 // cloudInitEvent represents a cloud-init webhook reporting event.
@@ -38,6 +40,7 @@ type HTTPServer struct {
 	Mux      *http.ServeMux
 	FileResolver
 	StatusRecorder StatusRecorder
+	TrustedProxies []netip.Prefix
 	Media          *MediaProvider
 }
 
@@ -137,7 +140,11 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
+
 	log := slog.With("proto", "http", "path", path, "ip", ip)
 	// The running installer keeps its original lease even if the Machine is
 	// edited. Resolve its artifacts from the operation snapshot, never live input.
@@ -207,7 +214,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	case "cloud-init/meta-data", "cloud-init/user-data", "cloud-init/vendor-data", "cloud-init/network-config":
 		var owner *mediaOwner
 
-		node, owner, err = h.firstBootMachine(r)
+		node, owner, err = h.firstBootMachine(r, ip)
 		if owner != nil {
 			ip = owner.status().Netboot.DHCPLeases[0].IPv4
 		}
@@ -337,7 +344,10 @@ func serveMissingShimRevocationsFile(w http.ResponseWriter, log *slog.Logger, no
 }
 
 func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -371,7 +381,7 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 	if h.Media != nil || h.Reader != nil {
 		var owner *mediaOwner
 
-		node, owner, err = h.firstBootMachine(r)
+		node, owner, err = h.firstBootMachine(r, ip)
 		if err != nil {
 			log.Warn("cloud-init report has no authorized Machine", "err", err)
 
@@ -406,7 +416,10 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -419,7 +432,7 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 	log := slog.With("ip", ip)
 
 	if h.Media != nil || h.Reader != nil {
-		node, owner, err := h.firstBootMachine(r)
+		node, owner, err := h.firstBootMachine(r, ip)
 		if err != nil {
 			log.Warn("install log has no authorized Machine", "err", err)
 
@@ -444,9 +457,9 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 
 var errMediaFirstBootUnauthorized = errors.New("no authorized media first-boot owner")
 
-// Only the direct peer can claim a frozen lease. Live-IP fallback, including
-// forwarding headers, is allowed only for Machines and leases without media owners.
-func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *mediaOwner, error) {
+// Only the direct peer can claim a frozen lease. The resolved client-IP fallback
+// is allowed only for Machines and leases without media owners.
+func (h *HTTPServer) firstBootMachine(r *http.Request, ip string) (*v1alpha3.Machine, *mediaOwner, error) {
 	if h.Media != nil {
 		remote, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
@@ -463,13 +476,13 @@ func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *medi
 		}
 	}
 
-	node, err := h.LookupNodeByIP(r.Context(), clientIP(r))
+	node, err := h.LookupNodeByIP(r.Context(), ip)
 	if node != nil && node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
 		return nil, nil, errMediaFirstBootUnauthorized
 	}
 
 	if h.Media != nil {
-		if mediaErr := h.Media.rejectFirstBootFallback(r.Context(), node, clientIP(r)); mediaErr != nil {
+		if mediaErr := h.Media.rejectFirstBootFallback(r.Context(), node, ip); mediaErr != nil {
 			return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, mediaErr)
 		}
 	}
@@ -554,7 +567,11 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 }
 
 func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip, ok := h.requestClientIP(w, r)
+	if !ok {
+		return
+	}
+
 	log := slog.With("handler", "pxe-disable", "ip", ip)
 
 	node, err := h.LookupNodeByIP(r.Context(), ip)
@@ -642,16 +659,14 @@ func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger
 	}
 }
 
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.SplitN(fwd, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+func (h *HTTPServer) requestClientIP(w http.ResponseWriter, r *http.Request) (string, bool) {
+	ip, err := (clientip.Resolver{TrustedProxies: h.TrustedProxies}).FromRequest(r)
 	if err != nil {
-		return r.RemoteAddr
+		slog.Warn("invalid remote address", "remote", r.RemoteAddr, "err", err)
+		http.Error(w, "invalid remote address", http.StatusBadRequest)
+
+		return "", false
 	}
 
-	return host
+	return ip, true
 }

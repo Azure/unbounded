@@ -22,6 +22,10 @@ const (
 	// Machine to a site and is also the canonical label the net controller
 	// applies to Nodes, superseding the deprecated net.unbounded-cloud.io/site.
 	MachineSiteLabelKey = "unbounded-cloud.io/site"
+
+	// MachineBootstrapTokenAnnotationKey binds a short-lived bootstrap token to one
+	// Machine. CSR approvers reject node names that do not match this annotation.
+	MachineBootstrapTokenAnnotationKey = "unbounded-cloud.io/bootstrap-machine"
 )
 
 // +kubebuilder:object:root=true
@@ -160,6 +164,22 @@ type MachineSpec struct {
 	// controller.
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+}
+
+// NodeName returns the Kubernetes Node identity bound to this Machine.
+func (m *Machine) NodeName() string {
+	if m != nil &&
+		m.Spec.Kubernetes != nil &&
+		m.Spec.Kubernetes.NodeRef != nil &&
+		m.Spec.Kubernetes.NodeRef.Name != "" {
+		return m.Spec.Kubernetes.NodeRef.Name
+	}
+
+	if m == nil {
+		return ""
+	}
+
+	return m.Name
 }
 
 // ProviderMachineReference identifies a cluster-scoped provider-owned Machine
