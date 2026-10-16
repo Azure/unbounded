@@ -87,6 +87,11 @@ impl Cancellation {
     pub fn is_canceled(&self) -> bool {
         self.inner.is_canceled()
     }
+    /// Live wake registrations on the shared token (tests).
+    #[cfg(test)]
+    pub(crate) fn registrations(&self) -> usize {
+        self.inner.registrations()
+    }
     /// Subscribe for one operation's lifetime, even when several operations share
     /// an executor waker. Dropping the subscription reclaims its capacity and wake.
     pub fn subscribe(&self) -> Result<CancellationRegistration> {
@@ -970,10 +975,17 @@ mod tests {
                 assert!(poll(&mut pending).is_pending());
                 drive(&reactor, reactor.drain()).unwrap();
                 assert_eq!(reactor.in_flight(), 0);
-                assert!(matches!(
-                    poll(&mut pending),
-                    Poll::Ready(Err(Error::Cancelled))
-                ));
+                // Drain cancels the pending readiness wait, but a kernel result
+                // that arrives first wins over the cancellation (here the
+                // socket is already writable), so either outcome is final.
+                let drained = poll(&mut pending);
+                assert!(
+                    matches!(
+                        drained,
+                        Poll::Ready(Err(Error::Cancelled)) | Poll::Ready(Ok(_))
+                    ),
+                    "{drained:?}"
+                );
                 assert_eq!(reactor.init(), Err(Error::Unavailable));
                 assert_eq!(reactor.admission.used(ResourceClass::ControlProgress), 2);
                 drop(control);

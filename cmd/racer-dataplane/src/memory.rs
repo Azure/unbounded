@@ -2294,28 +2294,22 @@ pub(crate) mod tests {
             let scope =
                 RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
-            let mut registrations = Vec::new();
-            loop {
-                match scope.cancellation.subscribe() {
-                    Ok(registration) => registrations.push(registration),
-                    Err(Error::Overloaded) => break,
-                    Err(error) => panic!("unexpected registration failure: {error:?}"),
-                }
-                assert!(registrations.len() <= 1024);
-            }
+            // Registrations are unbounded now; observe them by count instead of
+            // exhausting a registration limit.
             let mut cx = Context::from_waker(Waker::noop());
             let Poll::Ready(Ok(held)) = acquire_wait(&pool, &scope).as_mut().poll(&mut cx) else {
-                panic!("immediate acquisition unnecessarily subscribed")
+                panic!("immediate acquisition failed")
             };
-            assert!(matches!(
-                acquire_wait(&pool, &scope).as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Overloaded))
-            ));
+            assert_eq!(
+                scope.cancellation.registrations(),
+                0,
+                "immediate acquisition unnecessarily subscribed"
+            );
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(admission.used(ResourceClass::Pipe), 1);
-            drop(registrations);
             let mut wait = acquire_wait(&pool, &scope);
             assert!(wait.as_mut().poll(&mut cx).is_pending());
+            assert!(scope.cancellation.registrations() > 0);
             drop(held);
             assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);

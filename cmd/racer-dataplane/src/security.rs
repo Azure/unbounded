@@ -2887,8 +2887,14 @@ mod tests {
                 let _env = env.enter();
                 let _strict = environment::require_simulated();
                 let start = environment::now();
-                clock.advance(std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
-                assert_eq!(elapsed_ns(start), u64::MAX);
+                // The library clock refuses to pass u64::MAX nanoseconds, so the
+                // saturating branch is unreachable in DST; measure the largest
+                // representable span exactly, from simulated time only.
+                let beyond = std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1);
+                assert!(clock.checked_advance(beyond).is_err());
+                let span = std::time::Duration::from_secs(500 * 365 * 86_400);
+                clock.advance(span);
+                assert_eq!(u128::from(elapsed_ns(start)), span.as_nanos());
             }
 
             fn measurement_events(decrypt: bool) -> [Event; 8] {

@@ -2005,7 +2005,9 @@ pub(crate) mod tests {
             #[test]
             fn borrowed_ready_and_bound_errors_request_stop_without_releasing_owners() {
                 for bound in [false, true] {
-                    for failure in 0..3 {
+                    // Cancellation registration can no longer be exhausted, so only
+                    // the retry-failure and cancellation cases remain.
+                    for failure in 0..2 {
                         let signers = network(2);
                         let (_, io, mut native, charges) = fixture(2);
                         let qp = claim(&io);
@@ -2032,13 +2034,6 @@ pub(crate) mod tests {
                             grant.wait_bound(&scope)
                         } else {
                             session.wait_ready(&scope)
-                        };
-                        let _registrations = if failure == 2 {
-                            (0..1024)
-                                .map(|_| scope.cancellation.subscribe().unwrap())
-                                .collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
                         };
                         if failure == 1 {
                             scope.cancel().unwrap();

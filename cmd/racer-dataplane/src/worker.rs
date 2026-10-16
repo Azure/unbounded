@@ -2617,32 +2617,9 @@ mod tests {
             assert!(position("crypto-drain") < position("crypto-shutdown"));
             assert!(events.contains(&"io-shutdown"));
             assert_eq!(group.stats().done, 2);
-            // Completed workers cannot retain cancellation slots in the caller's scope.
-            let registrations = (0..1024)
-                .map(|_| scope.cancellation.subscribe().unwrap())
-                .collect::<Vec<_>>();
-            assert!(matches!(
-                scope.cancellation.subscribe(),
-                Err(Error::Overloaded)
-            ));
-            drop(registrations);
-        }
-
-        #[test]
-        fn cancellation_subscription_failure_tears_down_built_services() {
-            let (mut group, factory) = fixture(3);
-            let events = factory.events.clone();
-            let scope = lifecycle_scope().unwrap();
-            let _registrations = (0..1024)
-                .map(|_| scope.cancellation.subscribe().unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                group.start_recipe(Arc::new(factory), &scope),
-                Err(Error::Overloaded)
-            );
-            assert!(!group.stats().joinable);
-            assert_eq!(group.stats().done, 2);
-            assert!(events.lock().unwrap().contains(&"crypto-shutdown"));
+            // Completed workers cannot retain cancellation registrations in
+            // the caller's scope.
+            assert_eq!(scope.cancellation.registrations(), 0);
         }
 
         #[test]
