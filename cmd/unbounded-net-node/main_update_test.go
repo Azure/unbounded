@@ -629,6 +629,15 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseSkipsPodCIDRRoutesForSame
 		if !gotGatewayPeers[0].SkipPodCIDRRoutes {
 			t.Fatalf("expected same-site gateway peer to skip podCIDR routes when manageCniPlugin is false, got %#v", gotGatewayPeers[0])
 		}
+
+		cfg.ManageSameSitePodRoutes = true
+		if err := updateWireGuardFromSlices(t.Context(), nil, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer, cfg, mySiteName, "priv", myPubKey, false, state); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(gotGatewayPeers) != 1 || gotGatewayPeers[0].SkipPodCIDRRoutes {
+			t.Fatalf("explicit same-site routing override was ignored: %#v", gotGatewayPeers)
+		}
 	})
 
 	t.Run("gateway node marks same-site mesh peer podCIDR routes to skip", func(t *testing.T) {
