@@ -765,6 +765,31 @@ func run(cfg *config) (resultErr error) {
 
 	klog.Info("Node annotated with WireGuard public key")
 
+	informerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, cfg.InformerResyncPeriod)
+	sliceInformer := informerFactory.ForResource(siteNodeSliceGVR).Informer()
+	siteInformer := informerFactory.ForResource(siteGVR).Informer()
+	gatewayPoolInformer := informerFactory.ForResource(gatewayPoolGVR).Informer()
+	gatewayNodeInformer := informerFactory.ForResource(gatewayNodeGVR).Informer()
+	sitePeeringInformer := informerFactory.ForResource(sitePeeringGVR).Informer()
+	assignmentInformer := informerFactory.ForResource(siteGatewayPoolAssignmentGVR).Informer()
+	poolPeeringInformer := informerFactory.ForResource(gatewayPoolPeeringGVR).Informer()
+
+	healthState := &nodeHealthState{
+		nodeName: cfg.NodeName,
+		informersSynced: []cache.InformerSynced{
+			sliceInformer.HasSynced,
+			siteInformer.HasSynced,
+			gatewayPoolInformer.HasSynced,
+			gatewayNodeInformer.HasSynced,
+			sitePeeringInformer.HasSynced,
+			assignmentInformer.HasSynced,
+			poolPeeringInformer.HasSynced,
+		},
+	}
+	if cfg.HealthPort > 0 {
+		go startHealthServer(cfg.HealthPort, healthState)
+	}
+
 	adoptedAssignment, err := waitForNodeAssignment(ctx, clientset, cfg.NodeName)
 	if err != nil {
 		if err == context.Canceled {
@@ -805,17 +830,6 @@ func run(cfg *config) (resultErr error) {
 		klog.Warningf("WARNING: preferredPublicNetworkEncapsulation is set to %q -- traffic over public networks will be sent UNENCRYPTED", cfg.PreferredPublicEncap)
 	}
 
-	// Create informers early - before any CRD-based lookups
-	// This allows us to use the informer cache for all CRD operations
-	informerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, cfg.InformerResyncPeriod)
-	sliceInformer := informerFactory.ForResource(siteNodeSliceGVR).Informer()
-	siteInformer := informerFactory.ForResource(siteGVR).Informer()
-	gatewayPoolInformer := informerFactory.ForResource(gatewayPoolGVR).Informer()
-	gatewayNodeInformer := informerFactory.ForResource(gatewayNodeGVR).Informer()
-	sitePeeringInformer := informerFactory.ForResource(sitePeeringGVR).Informer()
-	assignmentInformer := informerFactory.ForResource(siteGatewayPoolAssignmentGVR).Informer()
-	poolPeeringInformer := informerFactory.ForResource(gatewayPoolPeeringGVR).Informer()
-
 	// Start the informers
 	informerFactory.Start(ctx.Done())
 
@@ -832,25 +846,6 @@ func run(cfg *config) (resultErr error) {
 	netlinkCache := unboundednetnetlink.NewNetlinkCache(cfg.NetlinkResyncPeriod)
 	if err := netlinkCache.Start(ctx); err != nil {
 		klog.Fatalf("Failed to start netlink cache: %v", err)
-	}
-
-	// Create shared health state for health server
-	healthState := &nodeHealthState{
-		nodeName: cfg.NodeName,
-		informersSynced: []cache.InformerSynced{
-			sliceInformer.HasSynced,
-			siteInformer.HasSynced,
-			gatewayPoolInformer.HasSynced,
-			gatewayNodeInformer.HasSynced,
-			sitePeeringInformer.HasSynced,
-			assignmentInformer.HasSynced,
-			poolPeeringInformer.HasSynced,
-		},
-	}
-
-	// Start health server if enabled (readiness should not wait on site membership)
-	if cfg.HealthPort > 0 {
-		go startHealthServer(cfg.HealthPort, healthState)
 	}
 
 	isGatewayNode := adoptedAssignment.gatewayPool != ""

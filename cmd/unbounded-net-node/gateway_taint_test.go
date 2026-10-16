@@ -22,6 +22,44 @@ import (
 
 const gatewayTaintTestNode = "gateway-a"
 
+func TestRemoveGatewayNodeTaintPreservesOtherTuples(t *testing.T) {
+	protected := []corev1.Taint{
+		{Key: GatewayNodeTaintKey, Value: "true", Effect: corev1.TaintEffectNoExecute},
+		{Key: GatewayNodeTaintKey, Value: "false", Effect: corev1.TaintEffectNoSchedule},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: gatewayTaintTestNode},
+		Spec: corev1.NodeSpec{Taints: append(append([]corev1.Taint{}, protected...),
+			corev1.Taint{Key: GatewayNodeTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule})},
+	}
+
+	client := fake.NewClientset(node)
+	for range 2 {
+		if err := removeGatewayNodeTaint(t.Context(), client, node.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := client.CoreV1().Nodes().Get(t.Context(), node.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.Spec.Taints) != len(protected) {
+		t.Fatalf("taints=%v, want %v", got.Spec.Taints, protected)
+	}
+
+	for i, taint := range protected {
+		if got.Spec.Taints[i] != taint {
+			t.Fatalf("taints=%v, want %v", got.Spec.Taints, protected)
+		}
+	}
+
+	if countPatches(client) != 1 {
+		t.Fatalf("patches=%d, want only exact owned tuple removal", countPatches(client))
+	}
+}
+
 func setGatewayTaintRemovalBackoff(t *testing.T, attempts int, initial, maxDelay time.Duration) {
 	t.Helper()
 
