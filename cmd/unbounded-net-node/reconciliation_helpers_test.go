@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -438,9 +439,50 @@ func TestSitePeeringEdgeTunnelMTUs(t *testing.T) {
 	}
 
 	got := sitePeeringEdgeTunnelMTUs(peerings)
-	if len(got) != 3 || got[sitePairMTUKey{"a", "b"}] != 1200 ||
-		got[sitePairMTUKey{"b", "c"}] != 1400 || got[sitePairMTUKey{"a", "c"}] != 1400 {
+	if len(got.byMember) != 3 || got.between("a", "b") != 1200 ||
+		got.between("b", "c") != 1400 || got.between("a", "c") != 1400 {
 		t.Fatalf("unexpected enabled peering minima: %v", got)
+	}
+
+	if got.between("a", "unused") != 0 || got.between("a", "a") != 0 {
+		t.Fatal("uncapped or same-Site pair acquired a cap")
+	}
+}
+
+func TestSitePeeringMTUIndexUsesLinearMemberships(t *testing.T) {
+	sites := make([]string, 1000)
+	for i := range sites {
+		sites[i] = fmt.Sprintf("site-%d", i)
+	}
+
+	for kind, index := range map[string]*peeringMTUIndex{
+		"Site": sitePeeringEdgeTunnelMTUs([]unboundednetv1alpha1.SitePeering{{
+			Spec: unboundednetv1alpha1.SitePeeringSpec{Sites: sites, TunnelMTU: ptrInt32(1200)},
+		}}),
+		"GatewayPool": gatewayPoolPeeringEdgeTunnelMTUs([]unboundednetv1alpha1.GatewayPoolPeering{{
+			Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{GatewayPools: sites, TunnelMTU: ptrInt32(1200)},
+		}}),
+	} {
+		t.Run(kind, func(t *testing.T) {
+			memberships := 0
+			for _, scopes := range index.byMember {
+				memberships += len(scopes)
+			}
+
+			if len(index.byMember) != 1000 || memberships != 1000 || len(index.pairs) != 0 {
+				t.Fatalf("index eagerly expanded pairs: members=%d memberships=%d cachedPairs=%d", len(index.byMember), memberships, len(index.pairs))
+			}
+
+			for range 1000 {
+				if index.between(sites[0], sites[999]) != 1200 || index.between(sites[999], sites[0]) != 1200 {
+					t.Fatal("requested pair lost its MTU cap")
+				}
+			}
+
+			if len(index.pairs) != 1 {
+				t.Fatalf("repeated pair did not reuse cache: %d entries", len(index.pairs))
+			}
+		})
 	}
 }
 
@@ -453,8 +495,8 @@ func TestGatewayPoolPeeringEdgeTunnelMTUs(t *testing.T) {
 	}
 
 	got := gatewayPoolPeeringEdgeTunnelMTUs(peerings)
-	if len(got) != 3 || got[canonicalPoolPair("b", "a")] != 1200 ||
-		got[canonicalPoolPair("b", "c")] != 1400 || got[canonicalPoolPair("a", "c")] != 1400 {
+	if len(got.byMember) != 3 || got.between("b", "a") != 1200 ||
+		got.between("b", "c") != 1400 || got.between("a", "c") != 1400 {
 		t.Fatalf("unexpected enabled peering minima: %v", got)
 	}
 
