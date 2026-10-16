@@ -226,7 +226,7 @@ func TestWorkerAcknowledgmentRetriesTaintCleanup(t *testing.T) {
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: adopted.nodeUID, Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: adopted.site}},
 		Spec: corev1.NodeSpec{Taints: []corev1.Taint{
-			{Key: GatewayNodeTaintKey, Effect: corev1.TaintEffectNoSchedule},
+			{Key: GatewayNodeTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule},
 			{Key: "other", Effect: corev1.TaintEffectNoSchedule},
 		}},
 	}

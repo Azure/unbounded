@@ -6,6 +6,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -17,10 +19,58 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
+
+func TestHealthWhileWaitingForNodeAssignment(t *testing.T) {
+	client := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "unassigned"}})
+	started := make(chan struct{})
+	watcher := watch.NewFake()
+
+	client.PrependWatchReactor("nodes", func(k8stesting.Action) (bool, watch.Interface, error) {
+		close(started)
+
+		return true, watcher, nil
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := waitForNodeAssignment(ctx, client, "unassigned")
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("assignment watch did not start")
+	}
+
+	informer := newTestInformer()
+	health := &nodeHealthState{informersSynced: []cache.InformerSynced{informer.HasSynced}}
+	mux := newHealthMux(health)
+
+	for path, want := range map[string]int{"/healthz": http.StatusOK, "/readyz": http.StatusServiceUnavailable} {
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+
+		if response.Code != want {
+			t.Fatalf("%s status=%d, want %d", path, response.Code, want)
+		}
+	}
+
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("assignment wait error=%v", err)
+	}
+}
 
 func TestWaitForAdoptedNodePodCIDRsAndConfigureRejectsChangedAssignment(t *testing.T) {
 	const nodeName = "node-a"

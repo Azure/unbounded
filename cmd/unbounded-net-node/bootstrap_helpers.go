@@ -562,7 +562,7 @@ func removeGatewayNodeTaint(ctx context.Context, clientset kubernetes.Interface,
 		index := -1
 
 		for i := range node.Spec.Taints {
-			if node.Spec.Taints[i].Key == GatewayNodeTaintKey {
+			if taint := node.Spec.Taints[i]; taint.Key == GatewayNodeTaintKey && taint.Value == "true" && taint.Effect == corev1.TaintEffectNoSchedule {
 				index = i
 
 				break
