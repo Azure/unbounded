@@ -85,7 +85,7 @@ virtual-host addressing.
 
 Credentials come from the AWS default credential chain: environment variables,
 shared config, web identity, or instance and container credentials. Prefer
-workload identity or another short-lived provider. The example `origin.yaml` reads
+workload identity or another short-lived provider. The S3 example below reads
 static keys from an optional Secret named `racer-object-aws` for quick tests only.
 
 Grant the origin read access to the objects it serves, such as `s3:GetObject`, and
@@ -99,8 +99,8 @@ environment variables. Only block blobs are served.
 `--azure-credential=default` uses `DefaultAzureCredential`, covering environment,
 workload identity, and managed identity. With it, `--account-url` must use HTTPS.
 Select a user-assigned identity with the `AZURE_CLIENT_ID` environment variable;
-there is no flag for it. The example `origin-azure.yaml` reads that variable from
-an optional Secret named `racer-object-azure`.
+there is no flag for it. One option is to read that variable from an optional
+Secret, for example `racer-object-azure`, with `envFrom`.
 
 Setting a client ID does not attach an identity or grant access. The identity must
 be attached to the origin pods and hold **Storage Blob Data Reader** at the account
@@ -110,7 +110,7 @@ For workload identity you also need the pod label
 `azure.workload.identity/use: "true"`, a service account with the
 `azure.workload.identity/client-id` annotation, federated credential trust matching
 the cluster issuer and service account subject, and `AZURE_TENANT_ID` plus
-`AZURE_FEDERATED_TOKEN_FILE`. The example configures none of this, and sets
+`AZURE_FEDERATED_TOKEN_FILE`. The example below configures none of this, and sets
 `automountServiceAccountToken: false`.
 
 SAS tokens and shared keys are not supported. Use `--azure-credential=anonymous`
@@ -133,12 +133,8 @@ when you need an exact one and the upstream supports versioning.
 ## Deploying the Origin
 
 Run the origin as a DaemonSet in the Racer installation namespace, one per
-ClusterCache. Start from
-[`deploy/racer-object/origin.yaml`](https://github.com/Azure/unbounded/tree/main/deploy/racer-object/origin.yaml)
-for S3 or
-[`deploy/racer-object/origin-azure.yaml`](https://github.com/Azure/unbounded/tree/main/deploy/racer-object/origin-azure.yaml)
-for Azure Blob. Both define the DaemonSet `racer-object-origin`, so apply only one
-per cache.
+ClusterCache. Start from the S3 example below and change the provider flags for
+Azure Blob. Run only one origin DaemonSet per cache.
 
 Requirements:
 
@@ -219,9 +215,121 @@ Changing a credentials Secret requires restarting the origin pods.
 
 ## Deploying the Sidecar
 
+The sidecar runs in each application pod that reads objects. The usual way to add
+it is automatic injection. You can also add it to the pod spec by hand.
+
+Injection needs Kubernetes 1.29 or later, because it uses native sidecars. In
+both cases the sidecar runs as root and mounts a hostPath, so the pod's namespace
+must allow it under Pod Security Admission. A namespace that enforces the `baseline` or
+`restricted` level rejects the pod. Admission checks the pod after injection.
+
+### Automatic Injection
+
+`racer-controller` runs a mutating admission webhook that adds the sidecar to
+opted-in pods. The unbounded operator installs the
+`MutatingWebhookConfiguration` named `racer-object-sidecar-injector` and manages
+its CA bundle. The webhook:
+
+- Handles only pod `CREATE`. Existing pods are not changed.
+- Matches only pods with the label
+  `racer.unbounded-cloud.io/object-sidecar: enabled`.
+- Skips the racer-controller namespace.
+- Skips pods that already have a container named `racer-object`.
+- Uses `failurePolicy: Fail`. If the webhook is down or an annotation is invalid,
+  the pod is not created.
+
+Put the label and annotations on the pod. For a Deployment, StatefulSet, or Job,
+put them on the pod template, not the workload object:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: racer-object-example
+spec:
+  selector:
+    matchLabels:
+      app: racer-object-example
+  template:
+    metadata:
+      labels:
+        app: racer-object-example
+        racer.unbounded-cloud.io/object-sidecar: enabled
+      annotations:
+        racer.unbounded-cloud.io/object-namespace: example-store
+        racer.unbounded-cloud.io/object-buckets: example-bucket,other-bucket
+        # Optional:
+        # racer.unbounded-cloud.io/object-api: azure
+        # racer.unbounded-cloud.io/object-memory-limit: 256Mi
+    spec:
+      containers:
+        - name: app
+          image: curlimages/curl:8.20.0
+          command: ["sleep", "infinity"]
+```
+
+Annotations, all with the prefix `racer.unbounded-cloud.io/`:
+
+| Annotation | Default | Meaning |
+|------------|---------|---------|
+| `object-namespace` | none, required | Sets `--namespace`. Must match the origin. |
+| `object-buckets` | none, required | Comma-separated list. Each entry sets one `--bucket`. Must match the origin. |
+| `object-cache` | `racer-object` | Sets `--cache` and the socket mount path. |
+| `object-api` | flag default (`s3`) | Sets `--api`. `s3` or `azure`. |
+| `object-listen` | flag default (`127.0.0.1:8080`) | Sets `--listen`. Loopback IP literal and port. |
+| `object-cpu-request` | not set | Sidecar CPU request. |
+| `object-cpu-limit` | not set | Sidecar CPU limit. |
+| `object-memory-request` | not set | Sidecar memory request. |
+| `object-memory-limit` | not set | Sidecar memory limit. |
+
+An annotation that is present with an empty value is rejected. Values are checked
+with the same rules as the flags; see [Cache Identity](#cache-identity) for
+namespace and bucket limits.
+
+Resource annotations take Kubernetes quantities, such as `100m` or `128Mi`. Each
+must be greater than zero, and a request must not exceed its limit. With none set,
+the sidecar has no requests or limits. If you set only a limit, Kubernetes sets the
+request to the same value. Native sidecar resources count toward pod scheduling and
+the pod's QoS class.
+
+The webhook makes these changes to the pod:
+
+- Adds an init container named `racer-object` with `restartPolicy: Always`, placed
+  first. It uses the `racer-object` image of the same release as
+  `racer-controller`, and the args
+  `sidecar --cache=... --namespace=... --bucket=...` plus `--api` and `--listen`
+  when set.
+- Sets the security context described below, with `RuntimeDefault` seccomp.
+- Adds the volume `racer-object-client`: hostPath `/run/racer/<cache>/client`,
+  type `Directory`, mounted read-only in the sidecar only.
+- Sets the node selector `kubernetes.io/os: linux`, and adds a required node
+  affinity term `racer.unbounded-cloud.io/exclude DoesNotExist` to every node
+  selector term.
+- Adds the annotation `racer.unbounded-cloud.io/object-sidecar-injected` with the
+  sidecar image.
+
+The webhook does not add tolerations. Add them yourself if Racer runs on tainted
+nodes.
+
+#### Troubleshooting Injection
+
+When the webhook denies a pod, the reason appears in the error from
+`kubectl apply`, or for workloads in the ReplicaSet, StatefulSet, or Job events
+(`kubectl describe`). The message names the bad annotation, for example
+`annotation racer.unbounded-cloud.io/object-buckets is required`.
+
+Other denial causes:
+
+- The pod already has a volume named `racer-object-client`.
+- The pod has a `kubernetes.io/os` node selector other than `linux`.
+
+If the pod is created without a sidecar, check that the label is on the pod (not
+only on the Deployment), that the pod is not in the racer-controller namespace,
+and that no container is already named `racer-object`.
+
+### Manual Pod Spec
+
 Add the sidecar as an extra container in each application pod that reads objects.
-Start from
-[`deploy/racer-object/sidecar-pod.yaml`](https://github.com/Azure/unbounded/tree/main/deploy/racer-object/sidecar-pod.yaml).
 
 Requirements:
 
@@ -447,7 +555,6 @@ that only reports that the diagnostic listener is up.
 make racer-object-test
 ```
 
-These cover adapter behavior through the Go SDK test bridge and check the example
-manifests. The bridge does not cache data. They do not establish live multi-node
+These cover adapter behavior through the Go SDK test bridge. The bridge does not cache data. They do not establish live multi-node
 behavior, admission compatibility, or compatibility with every S3 provider or Azure
 identity setup. Validate those in your own environment.
