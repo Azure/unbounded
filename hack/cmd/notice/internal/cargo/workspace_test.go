@@ -281,3 +281,95 @@ func TestLockedPackageFailures(t *testing.T) {
 		}
 	}
 }
+
+const sharedLock = `version = 4
+[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "shared",
+]
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "foo 1.2.3",
+ "sim",
+]
+[[package]]
+name = "sim"
+version = "0.1.0"
+dependencies = [
+ "bar",
+]
+[[package]]
+name = "foo"
+version = "1.2.3"
+[[package]]
+name = "bar"
+version = "0.4.0"
+`
+
+func TestSharedCratesPathDependencies(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		cratePath + "/Cargo.toml":                  "[package]\nname = 'racer-dataplane'\n[dependencies]\nshared = { path = '../../crates/shared' }\n",
+		cratePath + "/Cargo.lock":                  sharedLock,
+		sharedCratesPath + "/shared/Cargo.toml":    "[package]\nname = 'shared'\n[dependencies]\nfoo = '1'\nsim = { path = '../sim' }\n[dev-dependencies]\nbaz = '1'\n",
+		sharedCratesPath + "/sim/Cargo.toml":       "[package]\nname = 'sim'\n[dependencies]\nbar = '0.4'\n",
+		sharedCratesPath + "/Cargo.lock":           "invalid separate lock",
+		sharedCratesPath + "/Cargo.toml":           "[workspace]\nmembers = ['shared', 'sim']\n",
+		sharedCratesPath + "/shared/src/lib.rs":    "",
+		sharedCratesPath + "/unrelated/Cargo.toml": "invalid",
+	})
+
+	versions, err := workspaceVersions(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(versions) != 2 || versions["foo"] != "1.2.3" || versions["bar"] != "0.4.0" {
+		t.Fatalf("versions = %#v", versions)
+	}
+}
+
+func TestSharedCratesPathDependencyFailures(t *testing.T) {
+	for _, tc := range []struct{ name, dep, want string }{
+		{"outside crates", "../../elsewhere/x", "package under crates"},
+		{"escapes repository", "../../../outside", "package under crates"},
+		{"crates root itself", "../../crates", "package under crates"},
+		{"missing package", "../../crates/absent", "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			testutil.WriteTree(t, root, map[string]string{
+				cratePath + "/Cargo.toml":       "[package]\nname = 'racer-dataplane'\n[dependencies]\nshared = { path = '" + tc.dep + "' }\n",
+				cratePath + "/Cargo.lock":       sharedLock,
+				"elsewhere/x/Cargo.toml":        "[package]\nname = 'shared'\n",
+				sharedCratesPath + "/README.md": "",
+			})
+
+			if _, err := workspaceVersions(root); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSharedCratesRejectsEscapingSymlink(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		cratePath + "/Cargo.toml":   "[package]\nname = 'racer-dataplane'\n[dependencies]\nshared = { path = '../../crates/shared' }\n",
+		cratePath + "/Cargo.lock":   sharedLock,
+		"outside/Cargo.toml":        "[package]\nname = 'shared'\n",
+		sharedCratesPath + "/.keep": "",
+	})
+
+	if err := os.Symlink(filepath.Join(root, "outside"), filepath.Join(root, sharedCratesPath, "shared")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := workspaceVersions(root); err == nil || !strings.Contains(err.Error(), "escapes crates") {
+		t.Fatalf("error = %v", err)
+	}
+}
