@@ -155,7 +155,7 @@ mod directory {
         assert_eq!(after.mode() & 0o7777, mode);
     }
     #[test]
-    fn startup_hardens_existing_client_directory_without_changing_ancestors() {
+    fn startup_hardens_existing_client_directory_and_origin_without_changing_ancestors() {
         for mode in [0o777, 0o775, 0o757, 0o770, 0o722, 0o2775, 0o1777] {
             let fixture = Fixture::new();
             let path = fixture.socket().parent().unwrap().to_owned();
@@ -170,9 +170,11 @@ mod directory {
             let before = fs::metadata(&path).unwrap();
             fixture.reconcile(&[definition()]).unwrap();
             assert_identity(&before, &fs::metadata(&path).unwrap(), mode & !0o022);
-            for ancestor in [&fixture.root.0, cache, &origin] {
+            for ancestor in [&fixture.root.0, cache] {
                 assert_eq!(fs::metadata(ancestor).unwrap().mode() & 0o7777, 0o777);
             }
+            // The dataplane owns the origin directory layout and makes it private.
+            assert_eq!(fs::metadata(&origin).unwrap().mode() & 0o7777, 0o700);
             assert_eq!(
                 fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
                 0o666
@@ -2947,8 +2949,9 @@ fn prepared_rename_failure_restores_already_exchanged_paths() {
 fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
     let fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();
+    // The dataplane created the origin directory; the adapter owns its socket.
     let origin = fixture.root.0.join("example/origin");
-    fs::create_dir(&origin).unwrap();
+    assert!(fs::symlink_metadata(&origin).unwrap().is_dir());
     fs::write(origin.join("socket"), b"origin").unwrap();
     let mut replacement = definition();
     replacement.id = CacheId("00000000-0000-4000-8000-000000000002".into());
