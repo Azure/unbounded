@@ -280,15 +280,47 @@ swapping, matching std.
 
 ### Task, time, cancel
 
-- `LocalExecutor`: bounded set of `!Send` tasks with a wake-driven ready queue
-  (a woken task is pushed once; `poll(budget)` polls at most `budget` ready
-  tasks; idle tasks cost nothing). `spawn` returns a `JoinHandle<T>`;
-  `try_spawn` fails with `Overloaded` at capacity. `clear()` drops all tasks.
-  Preserve the old drop-ordering guarantees: capacity is released only after
-  the task future is dropped; waking from inside a waker callback is safe.
-- `Timers`: deadline queue keyed by `(Instant, id)`; `register(deadline)`
-  returns a `Sleep` future; `poll(now, budget)` fires expired entries; it never
-  reads a clock itself.
+- `LocalExecutor` (`task` module): bounded set of `!Send` tasks with a
+  wake-driven ready queue.
+  - API: `new(capacity)`, `spawn(fut) -> Result<JoinHandle<T>>` and
+    `spawn_detached(fut) -> Result<()>` (both `Overloaded` at capacity;
+    there is no separate `try_spawn`), `reserve() -> Result<Permit>` then
+    `Permit::{spawn, spawn_detached}` (infallible), `spawner() -> Spawner`
+    (`Weak`, `!Send`; `Unavailable` once the executor is dropped),
+    `run_ready(budget) -> usize`, `poll(&mut Context, budget) -> usize`,
+    `abort_all()`, `len()` (tasks), `reserved()` (unused permits),
+    `capacity()`, `is_empty()`, `has_ready()`. `yield_now() -> YieldNow`.
+  - Scheduling: task wakers are `Send + Sync` and carry only a
+    `(slot, generation)` key; a wake pushes the key into an
+    `Arc<Mutex<VecDeque>>` once (atomic `queued` flag) and wakes the owner
+    waker (the one last passed to `poll`; taken on wake like `AtomicWaker`).
+    A turn polls at most `budget` tasks and only those queued before it
+    started, so yielding or newly spawned tasks run next turn. Idle tasks
+    cost nothing. `poll` self-wakes the owner if ready work remains and
+    `budget > 0`. Nested `poll`/`run_ready` from a task returns `0` and does
+    not replace the owner.
+  - `JoinHandle<T>: Future<Output = Result<T>>`: `Ok` after the future was
+    dropped; `Canceled` ("task aborted") on `abort()`, `abort_all()` or
+    executor drop; `Unavailable` ("task panicked") on panic. Dropping it
+    detaches. `is_finished()`.
+  - Panics: the task is removed, capacity released, the task dropped, then
+    the panic is resumed in the caller of `run_ready`/`poll`.
+  - Drop ordering (from the old `Detached`): capacity is released before a
+    finished, aborted or panicked task's future is dropped. Async blocks drop
+    their own locals inside their final poll, so only state still owned by
+    the future (for example fields of a hand-written future) observes it.
+  - No internal borrow or lock is held while user code (polls, waker clone,
+    wake and drop, destructors) runs.
+  - Not ported (Racer keeps them): `Busy`, `poll_scoped`, `thread_waker`,
+    `drive_local_with`, `poll_task`, the thread-local "current queue"
+    (`enter`, `scope`, free functions `reserve`/`poll`/`pending`).
+- `Timers` (`time` module): `Rc` handle over a `BTreeMap<(Instant, id),
+  Option<Waker>>`. `sleep_until(deadline) -> Sleep` (infallible, registers
+  immediately; drop removes), `timeout(deadline, fut) -> Timeout<F>`
+  (`Result<T>`, `DeadlineExceeded`, the output wins ties),
+  `poll(now, budget) -> usize` (wakes outside the borrow),
+  `next_deadline()`, `len()`, `is_empty()`. `Sleep::{deadline, is_elapsed}`.
+  It never reads a clock.
 - `CancelToken`: `Clone + Send + Sync`, infallible `new`/`cancel`,
   `is_canceled`, `child()`, `canceled()` future (`Canceled`, owned),
   `register(&Waker) -> CancelRegistration` (`update(&Waker)` to re-arm,
