@@ -1347,17 +1347,9 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			assignmentSiteHealthCheckSourceAssignment,
 		)
 
-		// Collect assignment-level tunnelMTU overrides per site and per pool.
-		if v := tunnelMTUFromSpec(assignment.Spec.TunnelMTU); v > 0 {
-			for _, siteName := range assignment.Spec.Sites {
-				siteName = strings.TrimSpace(siteName)
-				if siteName == "" || siteName == mySiteName {
-					continue
-				}
-
-				mergeLowestTunnelMTU(assignmentSiteTunnelMTUs, siteName, v)
-			}
-
+		// Worker-to-pool caps follow this Site's assignments. Gateway-to-Site
+		// caps are collected separately below using only local pool matches.
+		if v := tunnelMTUFromSpec(assignment.Spec.TunnelMTU); v > 0 && state.adoptedAssignment.gatewayPool == "" {
 			for _, poolName := range assignment.Spec.GatewayPools {
 				poolName = strings.TrimSpace(poolName)
 				if poolName == "" {
@@ -1877,6 +1869,9 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
 
 				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignments, poolPeerings)
+
+				transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU,
+					gatewayMeshTransitTunnelMTU(pool.Name, gwNode.SiteName, learnedRoutes, gatewayPoolMap, siteTunnelMTUs, sitePeerings))
 				if isGatewayNode {
 					transitTunnelMTU = resolveTunnelMTU(transitTunnelMTU, gatewayPoolPeeringTunnelMTU(localGatewayPools, pool.Name, poolPeerings))
 				}
