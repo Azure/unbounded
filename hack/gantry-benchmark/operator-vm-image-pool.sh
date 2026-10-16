@@ -19,6 +19,7 @@ Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
   operator-vm-image-pool.sh verify-streaming-layers IMAGE
   operator-vm-image-pool.sh verify-streaming-layers-status
+  operator-vm-image-pool.sh verify-streaming-layers-cleanup
   operator-vm-image-pool.sh status-snapshot-start
   operator-vm-image-pool.sh status-snapshot-result
   operator-vm-image-pool.sh status-snapshot-cleanup
@@ -42,6 +43,7 @@ USAGE
 
 remote_status_marker="GANTRY_BENCHMARK_REMOTE_STATUS="
 managed_status_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-status"
+managed_verification_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-verification"
 
 invoke_remote() {
   local body=$1
@@ -458,13 +460,14 @@ result_dir=/var/lib/gantry-benchmark/artifacts
 result_file=$result_dir/streaming-layer-verification.txt
 status_file=$result_dir/streaming-layer-verification.status
 mkdir -p "$result_dir"
+rm -f "$result_file" "$status_file" "$result_file.tmp"
 set +e
 "$verifier" "$image" __NODE_LIMIT__ __PARALLELISM__ "__NODE_NAME__" "__METRICS_ONLY__" >"$result_file.tmp" 2>&1
 status=$?
 set -e
 mv "$result_file.tmp" "$result_file"
 printf '%s\n' "$status" >"$status_file"
-cat "$result_file"
+printf 'verification_status=%s\n' "$status"
 exit "$status"
 SCRIPT
 )
@@ -474,10 +477,44 @@ SCRIPT
     script=${script/__PARALLELISM__/$parallelism}
     script=${script/__NODE_NAME__/$node_name}
     script=${script/__METRICS_ONLY__/$metrics_only}
-    invoke_remote "$script"
+    command_name="gantry-streaming-verify-$(date -u +%Y%m%d%H%M%S)-$$"
+    az vm run-command create \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --script "$script" \
+      --timeout-in-seconds 3600 \
+      --async-execution false \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    printf '%s\n' "$command_name" >"$managed_verification_file"
+    printf 'streaming_verification=%s\n' "$command_name"
     ;;
   verify-streaming-layers-status)
     (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_verification_file" ]] || { echo "no submitted streaming layer verification" >&2; exit 1; }
+    command_name=$(cat "$managed_verification_file")
+    result=$(az vm run-command show \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --instance-view \
+      --only-show-errors \
+      -o json)
+    jq -r '
+      "streaming_verification=" + .name,
+      "provisioning_state=" + (.provisioningState // "unknown"),
+      "execution_state=" + (.instanceView.executionState // "pending"),
+      "exit_code=" + ((.instanceView.exitCode // "") | tostring),
+      (.instanceView.output // empty),
+      (.instanceView.error // empty)
+    ' <<<"$result"
+    execution_state=$(jq -r '.instanceView.executionState // "pending"' <<<"$result")
+    case "$execution_state" in
+      Succeeded|Failed) ;;
+      *) exit 0 ;;
+    esac
     script=$(cat <<'SCRIPT'
 set -Eeuo pipefail
 result_file=/var/lib/gantry-benchmark/artifacts/streaming-layer-verification.txt
@@ -490,6 +527,20 @@ exit "$status"
 SCRIPT
 )
     invoke_remote "$script"
+    ;;
+  verify-streaming-layers-cleanup)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_verification_file" ]] || { echo "no submitted streaming layer verification" >&2; exit 1; }
+    command_name=$(cat "$managed_verification_file")
+    az vm run-command delete \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --yes \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    rm -f "$managed_verification_file"
     ;;
   status-snapshot-start)
     (($# == 0)) || { usage >&2; exit 2; }
