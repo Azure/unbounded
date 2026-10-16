@@ -43,8 +43,7 @@ no knowledge of Racer. Racer depends on it with
 Workspace settings (`crates/Cargo.toml`):
 
 - `edition = "2024"`, `rust-version = "1.88"`, `license = "Apache-2.0"`,
-  `repository = "https://github.com/project-unbounded/unbounded"` (copy the URL
-  used by other manifests if one exists), shared through `[workspace.package]`.
+  `repository = "https://github.com/Azure/unbounded"`, shared through `[workspace.package]`.
 - `[workspace.lints.rust]`: `missing_docs`, `unsafe_op_in_unsafe_fn`,
   `unreachable_pub`, `rust_2018_idioms` (`deny`/`warn` as appropriate).
 - `[workspace.lints.clippy]`: `undocumented_unsafe_blocks = "deny"`,
@@ -103,6 +102,10 @@ impl From<std::io::Error> for Error; impl From<Error> for std::io::Error;
 breaking change. Kernel `ECANCELED` is reported as `Os(ECANCELED)`; only
 cancellation requested through a `Scope` or the reactor is `Canceled`.
 Every syscall failure keeps its errno (ring setup, eventfd, bind, epoll, ...).
+`from_errno` accepts negated values (CQE results) and maps `ENOENT`, `EEXIST`,
+`EINVAL`, `ENOSYS`/`EOPNOTSUPP` and `ETIMEDOUT` to dedicated kinds. Helpers:
+`context()`, `is_canceled()`, `is_deadline_exceeded()`, `is_would_block()`,
+`is_interrupted()`, `last_os_error()`; `ErrorKind::as_str()`.
 
 ### Scope
 
@@ -115,7 +118,10 @@ pub trait Scope: Clone + 'static {
 }
 ```
 
-`Unscoped` (a unit struct, `Error = Error`) never cancels. The reactor uses
+`Unscoped` (a unit struct, `Error = Error`) never cancels. `CancelToken`
+itself implements `Scope` (`Error = Error`, fails with `Canceled`). The runtime
+never reads a clock for a scope: `check()` must enforce the deadline itself;
+`deadline()` is only a hint for arming a timer. The reactor uses
 `check()` during its bounded cancellation scan, and also registers with
 `cancellation()` so that canceling a token wakes the reactor instead of waiting
 for the next scan.
@@ -137,8 +143,10 @@ pub unsafe trait IoBufMut: IoBuf {
 Safety contract stated in terms of moves: the pointer must remain valid and
 point to the same allocation while the value is moved and while it is owned by
 the reactor; `IoBufMut` must not be aliased. Impls: `Vec<u8>`, `&'static [u8]`,
-`&'static str`, `Box<[u8]>` only if Miri passes for it. `Read`/`Recv` write into
-`[0, bytes_total)` and call `set_init(n)`.
+`&'static str`. `Box<[u8]>` is not implemented: moving a `Box` retags its
+allocation and invalidates previously derived pointers. `Read`/`Recv` write
+into `[0, bytes_total)` and call `set_init(n)` (which never shrinks a `Vec`).
+No `Slice<B>` view yet.
 
 ### Backend seam
 
@@ -150,28 +158,39 @@ into a public trait.
 ```rust
 pub trait Backend: 'static {
     type Fd: Clone + Debug + 'static;        // Uring: `Fd`, simulator: `SimFd`
-    type Clock: Clock;
+    type Clock: Clock + Clone;
     type Entropy: Entropy;
     fn clock(&self) -> &Self::Clock;
     fn entropy(&self) -> &Self::Entropy;
     fn init(&mut self, config: &BackendConfig) -> Result<()>;
-    fn push(&mut self, user_data: u64, op: &Op<'_, Self::Fd>) -> Result<(), PushError>;
+    unsafe fn push(&mut self, user_data: u64, op: &Op<'_, Self::Fd>) -> Result<(), PushError>;
     fn cancel(&mut self, user_data: u64, target: u64) -> Result<(), PushError>;
     fn submit(&mut self) -> Result<usize>;
     fn pop(&mut self) -> Option<CompletionEntry>;   // { user_data, result: i32, flags }
     fn wait(&mut self, timeout: Duration) -> Result<()>;
-    fn waker(&self) -> Result<RemoteWaker>;          // cross-thread wake (eventfd for Uring)
+    fn remote_waker(&self) -> Result<RemoteWaker>;   // cross-thread wake (eventfd for Uring)
     fn supports(&self, kind: OpKind) -> bool;
 }
 ```
 
 `Op<'a, Fd>` is a `#[non_exhaustive]` enum of raw descriptions whose pointers
 point into memory owned by the reactor's in-flight entry (stable for the whole
-lifetime of the operation): `Read`, `Write`, `Recv`, `Send`, `PollAdd`,
+lifetime of the operation): `Nop`, `Read`, `Write`, `Recv`, `Send`, `PollAdd`,
 `Accept`, `Connect`, `Timeout`, `OpenAt2`, `Statx`, `Fsync`, `RenameAt`,
-`UnlinkAt`, `MkDirAt`. Building an `Op` is safe; `push` is the only place that
-may hand pointers to the kernel, and the reactor guarantees the backing memory
-outlives both completions.
+`UnlinkAt`, `MkDirAt` (see `backend.rs` for fields). Read-only inputs are
+references (`&'a Fd`, `&'a CStr`, `&'a SockAddr`, `&'a OpenHow`); buffers and
+outputs are raw pointers (`*mut u8`, `*mut SockAddr`, `*mut libc::statx`).
+Directory `None` means `AT_FDCWD`. `Timeout { deadline: Instant, timespec:
+*mut KernelTimespec }`: the backend compares `deadline` with its clock (sim) or
+writes the absolute `CLOCK_MONOTONIC` time into the reactor-owned `timespec`
+(uring). Building an `Op` is safe; `push` is `unsafe`: every pointer and
+referent must stay valid and unaliased until the completion for `user_data`
+has been popped, so a backend may hand them to the kernel or keep them and
+complete later. `OpKind` mirrors the variants plus `Cancel`.
+`PushError { Full, Unsupported, Failed(Error) }` converts into `Error`
+(`Full` -> `Overloaded`). `BackendConfig::new(capacity: u32)` is
+`#[non_exhaustive]`. `CompletionEntry::into_result() -> Result<u32>`.
+`RemoteWaker::new(impl Fn() + Send + Sync)` / `wake()`.
 
 Synchronous resource creation is backend-neutral too, so applications never
 need to branch on "am I simulated":
@@ -187,8 +206,17 @@ pub trait Host: Backend {
 }
 ```
 
-(The exact `Host` method set is whatever the migrated Racer code needs, kept
-POSIX-shaped and documented.)
+Implemented set: `socket`, `bind`, `listen`, `local_addr`, `peer_addr`,
+`shutdown(fd, std::net::Shutdown)`, `set_nodelay(fd, bool)`,
+`try_send(fd, &[u8], flags)`, `try_recv(fd, &mut [u8], flags)`,
+`poll_now(fd, i16) -> i16`, `pipe() -> (read, write)`. Sockets and pipes are
+nonblocking and close-on-exec. Extend as the Racer migration needs.
+
+`SocketAddress` (`#[non_exhaustive]`: `Inet(SocketAddr)`, `Unix(PathBuf)`;
+unnamed Unix = empty path, abstract Unix unsupported) is encoded by the public
+`SockAddr` (`encode`, `empty`, `decode`, `as_ptr`, `as_mut_ptr`, `len`,
+`len_mut_ptr`, `set_len`); both the address and its length live in one
+Vec-backed allocation, stable across moves.
 
 ### Reactor
 
@@ -222,7 +250,8 @@ Every I/O result returns ownership of everything the caller passed in, on
 success and on failure:
 
 ```rust
-pub struct BufResult<T, Buf> { pub result: Result<T, E>, pub buf: Buf }
+pub struct BufResult<T, B, E = Error> { pub result: Result<T, E>, pub buf: B }
+// new, into_parts, map, and From<BufResult> for (Result<T, E>, B)
 ```
 
 Option-style combinators replace the `_with_lease`, `_reserved` and
@@ -261,8 +290,17 @@ swapping, matching std.
   returns a `Sleep` future; `poll(now, budget)` fires expired entries; it never
   reads a clock itself.
 - `CancelToken`: `Clone + Send + Sync`, infallible `new`/`cancel`,
-  `is_canceled`, `child()`, `canceled()` future, `register(&Waker)`.
-  Registration limit is a constructor argument (default unbounded slab).
+  `is_canceled`, `child()`, `canceled()` future (`Canceled`, owned),
+  `register(&Waker) -> CancelRegistration` (`update(&Waker)` to re-arm,
+  deregisters on drop), `registrations()` for diagnostics. Unbounded slab with
+  O(1) removal and no registration limit (registrations are bounded by the
+  reactor's in-flight capacity), so `register` is infallible. Wakers run
+  outside the lock.
+- `Clock`/`Entropy` are implemented for `&C`/`&E`; handles must be cheap (ZST,
+  `Rc` or borrow), never an `Arc` clone per read. `SystemEntropy` uses
+  `libc::getrandom` with EINTR retry and short-read handling.
+- `Fd`: `Rc<OwnedFd>`, `!Send`, `into_owned() -> Result<OwnedFd, Fd>`,
+  `ptr_eq`, `handle_count`, `From<OwnedFd>` and std socket/file types.
 
 ### Group and affinity
 
