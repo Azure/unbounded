@@ -218,7 +218,7 @@ func TestIdentityRejectsManifestCollisions(t *testing.T) {
 	require.NotEmpty(t, objects)
 
 	for _, obj := range objects {
-		for _, phase := range []string{"absent", "reserved", "staged", "legacy"} {
+		for _, phase := range []string{"absent", "reserved", "staged"} {
 			t.Run(obj.GetKind()+"/"+obj.GetName()+"/"+phase, func(t *testing.T) {
 				env := testEnv(t, cacheObject("cache"))
 				if phase != "absent" {
@@ -231,24 +231,13 @@ func TestIdentityRejectsManifestCollisions(t *testing.T) {
 					persist(t, env, plan)
 				}
 
-				if phase == "legacy" {
-					claim := &corev1.ConfigMap{}
-					require.NoError(t, env.Client.Get(t.Context(), objectKey(env, claimName), claim))
-					delete(claim.Data, operatorInitialization)
-					require.NoError(t, env.Client.Update(t.Context(), claim))
-				}
-
 				existing := obj.DeepCopy()
 				require.NoError(t, env.Client.Create(t.Context(), existing))
 				before := existing.DeepCopy()
 				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(existing), before))
 
 				plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-				if phase == "legacy" {
-					require.ErrorContains(t, err, "unsupported Racer operator initialization protocol")
-				} else {
-					require.ErrorContains(t, err, "standalone installations are not adopted")
-				}
+				require.ErrorContains(t, err, "standalone installations are not adopted")
 
 				require.Nil(t, plan)
 				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(existing), existing))

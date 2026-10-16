@@ -98,12 +98,12 @@ func TestCredentialsClaimValidation(t *testing.T) {
 	}
 }
 
-func TestCredentialsMissingOrLegacyEntriesNeverRegenerate(t *testing.T) {
-	for _, corruption := range []string{"issuer.json", "bundle.json", "rotation.json", "pending", "trailing metadata", "symmetric retirement", "duplicate material"} {
+func TestCredentialsMissingOrCorruptEntriesNeverRegenerate(t *testing.T) {
+	for _, corruption := range []string{"issuer.json", "bundle.json", "rotation.json", "trailing metadata", "symmetric retirement", "duplicate material"} {
 		t.Run(corruption, func(t *testing.T) {
 			r, _ := testKeyring(t)
 			runKeys(t, r)
-			secret, bundle, state, material := keyState(t, r)
+			secret, bundle, state, _ := keyState(t, r)
 
 			switch corruption {
 			case "duplicate material":
@@ -116,8 +116,6 @@ func TestCredentialsMissingOrLegacyEntriesNeverRegenerate(t *testing.T) {
 				keys[1].(map[string]any)["material"] = keys[0].(map[string]any)["material"]
 				document["generation"] = fmt.Sprint(uint64(bundle.Generation + 1))
 				secret.Data["bundle.json"], _ = json.Marshal(document)
-			case "pending":
-				secret.Data["issuer.json"], _ = json.Marshal(map[string]any{"keys": material.Keys, "pending": state.ActiveIssuer})
 			case "trailing metadata":
 				secret.Data["rotation.json"] = append(secret.Data["rotation.json"], []byte(" {}")...)
 			case "symmetric retirement":
@@ -896,7 +894,7 @@ func TestPlanRotationOwnsOutput(t *testing.T) {
 	runKeys(t, r)
 	_, original, state, _ := keyState(t, r)
 	catalog := []wire.CacheDefinition{{ID: wire.CacheID(testNodeUID)}}
-	// The old codec round trip preserves order, even when it is not sorted.
+	// A codec round trip preserves order, even when it is not sorted.
 	original.PeerTrustRoots[0], original.PeerTrustRoots[1] = original.PeerTrustRoots[1], original.PeerTrustRoots[0]
 	original.CacheKeys[0], original.CacheKeys[1] = original.CacheKeys[1], original.CacheKeys[0]
 

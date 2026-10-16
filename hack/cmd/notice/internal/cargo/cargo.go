@@ -104,7 +104,7 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	return entries, nil
 }
 
-// cargoFilesPresent permits an inactive scaffold, but rejects incomplete inputs.
+// cargoFilesPresent reports whether Cargo inputs exist, and rejects incomplete inputs.
 func cargoFilesPresent(root string) (bool, error) {
 	missing := make([]string, 0, 2)
 

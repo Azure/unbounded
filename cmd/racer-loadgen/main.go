@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // racer-loadgen serves deterministic synthetic blobs and repeatedly reads them
-// through Gantry, the Racer SDK, or S3, without a local content cache.
+// through Gantry or the Racer SDK, without a local content cache.
 package main
 
 import (
@@ -28,18 +28,18 @@ import (
 )
 
 type options struct {
-	s3                   s3Options
-	image                imageOptions
-	pull                 pullOptions
-	listen               string
-	metricsListen        string
-	metricsShutdownGrace time.Duration
-	startDelay           time.Duration
-	duration             time.Duration
-	catalogImages        int
-	catalogBlobs         int
-	blobBytes            int64
-	startupTimeout       time.Duration
+	s3             s3Options
+	image          imageOptions
+	pull           pullOptions
+	listen         string
+	metricsListen  string
+	startDelay     time.Duration
+	duration       time.Duration
+	catalogImages  int
+	catalogBlobs   int
+	catalogWorkers int
+	blobBytes      int64
+	startupTimeout time.Duration
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -47,23 +47,23 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
-	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP), uds (direct Racer SDK), or s3 (S3 GetObject)")
-	f.StringVar(&opts.pull.Volume, "volume", "", "Racer cache name; required for uds, using /run/racer/<cache>/{client,origin}/socket")
-	f.StringVar(&opts.s3.Endpoint, "endpoint", "", "S3 endpoint for the standard S3 client: racer-object sidecar or synthetic origin (default http://127.0.0.1:8080)")
+	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP), uds (direct Racer SDK), or s3 (HTTP object GET)")
+	f.StringVar(&opts.pull.Cache, "cache", "", "Racer cache name (ClusterCache); required for uds, using /run/racer/<cache>/{client,origin}/socket")
+	f.StringVar(&opts.s3.Endpoint, "endpoint", "", "S3 HTTP endpoint: racer-object sidecar or direct synthetic origin (default http://127.0.0.1:8080)")
 	f.StringVar(&opts.s3.Bucket, "bucket", "", "Synthetic S3 bucket (default benchmark; requires backend=s3)")
 	f.IntVar(&opts.s3.Count, "object-count", 0, "Synthetic S3 object count, 1-512 (default 128)")
 	f.Int64Var(&opts.s3.Bytes, "object-bytes", 0, "Exact bytes per S3 object (default 67108864)")
 	f.BoolVar(&opts.s3.Origin, "s3-origin", false, "Serve synthetic S3 on listen; requires backend=s3, use concurrency=0 for origin only")
 	f.StringVar(&opts.listen, "listen", ":8080", "Synthetic registry listen address")
 	f.StringVar(&opts.metricsListen, "metrics-listen", ":9090", "Metrics and health listen address")
-	f.DurationVar(&opts.metricsShutdownGrace, "metrics-shutdown-grace", 30*time.Second, "Keep metrics and origins available after timed load completion; zero disables, signals interrupt")
 	f.StringVar(&opts.image.Repository, "repository", "benchmark/image", "Synthetic image repository (tag: latest)")
 	f.IntVar(&opts.image.Layers, "layers", 8, "Number of synthetic layers")
 	f.Int64Var(&opts.image.LayerBytes, "layer-bytes", 64<<20, "Payload bytes per layer, before jitter and tar overhead")
 	f.Float64Var(&opts.image.Jitter, "jitter", 0.2, "Deterministic per-layer size jitter fraction in [0,1)")
 	f.StringVar(&opts.image.Seed, "seed", "benchmark-v1", "Content seed; keep identical on all nodes")
 	f.IntVar(&opts.catalogImages, "catalog-images", 1, "Number of deterministic images, 1-512; keep identical on all origins")
-	f.IntVar(&opts.catalogBlobs, "catalog-blobs", 0, "Select generic workload: 1-512 independent raw blobs, one blob per operation; excludes image sizing flags")
+	f.IntVar(&opts.catalogBlobs, "catalog-blobs", 0, fmt.Sprintf("Select generic workload: 1-%d independent raw blobs, one blob per operation; excludes image sizing flags", maxCatalogBlobs))
+	f.IntVar(&opts.catalogWorkers, "catalog-workers", 1, "Parallel catalog hashing workers, 1-64; requires catalog-blobs")
 	f.Int64Var(&opts.blobBytes, "blob-bytes", 64<<20, "Exact bytes per generic blob (no jitter or tar framing); requires catalog-blobs")
 	f.StringVar(&opts.pull.Profile, "profile", profileShuffle, "Catalog selection profile: shuffle or zipf")
 	f.Float64Var(&opts.pull.ZipfExponent, "zipf-exponent", defaultZipfExponent, "Finite positive Zipf exponent; larger values increase skew (zipf profile only)")
@@ -104,9 +104,13 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	if opts.pull.Backend == "uds" {
-		client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: opts.pull.Volume})
+		if opts.pull.Cache == "" {
+			return opts, fmt.Errorf("uds requires a valid cache: empty cache name: %w", racersdk.ErrInvalidRequest)
+		}
+
+		client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: opts.pull.Cache})
 		if err != nil {
-			return opts, fmt.Errorf("uds requires a valid cache name via --volume: %w", err)
+			return opts, fmt.Errorf("uds requires a valid cache: %w", err)
 		}
 
 		if err := client.Close(); err != nil {
@@ -115,8 +119,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	if seen["catalog-blobs"] {
-		if opts.catalogBlobs < 1 || opts.catalogBlobs > maxCatalogImages || opts.blobBytes < 1 {
-			return opts, errors.New("catalog-blobs must be in [1, 512] and blob-bytes must be positive")
+		if opts.catalogBlobs < 1 || opts.catalogBlobs > maxCatalogBlobs || opts.blobBytes < 1 {
+			return opts, fmt.Errorf("catalog-blobs must be in [1, %d] and blob-bytes must be positive", maxCatalogBlobs)
 		}
 
 		for _, name := range []string{"catalog-images", "layers", "layer-bytes", "jitter"} {
@@ -128,12 +132,16 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return opts, errors.New("blob-bytes requires catalog-blobs")
 	}
 
-	if opts.startDelay < 0 || opts.duration < 0 {
-		return opts, errors.New("start-delay and duration must be nonnegative")
+	if seen["catalog-workers"] && !seen["catalog-blobs"] {
+		return opts, errors.New("catalog-workers requires catalog-blobs")
 	}
 
-	if opts.metricsShutdownGrace < 0 {
-		return opts, errors.New("metrics-shutdown-grace must be nonnegative")
+	if opts.catalogWorkers < 1 || opts.catalogWorkers > maxCatalogWorkers {
+		return opts, fmt.Errorf("catalog-workers must be in [1, %d]", maxCatalogWorkers)
+	}
+
+	if opts.startDelay < 0 || opts.duration < 0 {
+		return opts, errors.New("start-delay and duration must be nonnegative")
 	}
 
 	if opts.catalogImages < 1 || opts.catalogImages > maxCatalogImages {
@@ -183,7 +191,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	reg := prometheus.NewRegistry()
 	metrics := newMetrics(reg)
 
-	p, err := newPuller(opts.image.Repository, opts.pull, metrics)
+	p, err := newPuller(&syntheticImage{}, opts.pull, metrics)
 	if err != nil {
 		return err
 	}
@@ -265,7 +273,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 		})
 	}
 
-	slog.Info("generating synthetic catalog", "catalog_images", opts.catalogImages, "catalog_blobs", opts.catalogBlobs, "blob_bytes", opts.blobBytes, "seed", opts.image.Seed)
+	slog.Info("generating synthetic catalog", "catalog_images", opts.catalogImages, "catalog_blobs", opts.catalogBlobs, "catalog_workers", opts.catalogWorkers, "blob_bytes", opts.blobBytes, "seed", opts.image.Seed)
 
 	startupCtx := ctx
 
@@ -280,17 +288,22 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	if opts.pull.Backend == "s3" {
 		catalog, err = newBlobCatalog(startupCtx, "benchmark/s3", opts.image.Seed, opts.s3.Count, opts.s3.Bytes)
 	} else if opts.catalogBlobs > 0 {
-		catalog, err = newBlobCatalog(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes)
+		catalog, err = newBlobCatalogWithWorkers(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes, opts.catalogWorkers)
 	} else {
 		catalog, err = newCatalog(startupCtx, opts.image, opts.catalogImages)
 	}
 
 	if err == nil {
-		p.repository = catalog.repository
+		p.img = &syntheticImage{repository: catalog.repository}
+		if len(catalog.images) != 0 {
+			p.img = catalog.images[0]
+		}
 
 		if err := p.configureDiagnostics(catalog); err != nil {
 			return err
 		}
+
+		p.images = catalog.images
 
 		p.batches = catalog.batches
 		if p.opts.Backend == "s3" {
@@ -315,7 +328,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 				var stopOrigin func()
 
 				stopOrigin, err = startOrigin(ctx, startupCtx, racersdk.OriginConfig{
-					Cache: p.opts.Volume, RecoverStaleSocket: true,
+					Cache: p.opts.Cache, RecoverStaleSocket: true,
 					MaxConcurrentRequests: max(64, limit),
 				}, adapter, probe, func(originErr error) { serveErrors <- originErr; cancel() })
 				if err == nil {
@@ -341,7 +354,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 
 		stopStartup()
 		ready.Store(catalog)
-		slog.Info("origin ready", "backend", p.opts.Backend, "batches", len(p.batches), "repository", opts.image.Repository, "target", opts.pull.Target, "volume", p.opts.Volume, "concurrency", opts.pull.Concurrency)
+		slog.Info("origin ready", "backend", p.opts.Backend, "batches", len(p.batches), "repository", opts.image.Repository, "target", opts.pull.Target, "cache", p.opts.Cache, "concurrency", opts.pull.Concurrency)
 
 		if waitPullDelay(ctx, opts.startDelay) {
 			loadCtx := ctx
@@ -354,11 +367,6 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 			}
 
 			p.run(loadCtx)
-
-			if opts.duration > 0 && opts.metricsShutdownGrace > 0 && ctx.Err() == nil {
-				slog.Info("load complete; waiting for final metrics scrapes", "metrics_shutdown_grace", opts.metricsShutdownGrace)
-				waitPullDelay(ctx, opts.metricsShutdownGrace)
-			}
 		}
 	}
 

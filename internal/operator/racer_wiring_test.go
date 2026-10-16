@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,8 +63,10 @@ func TestRacerBootstrapUsesClusterScopedClusterCache(t *testing.T) {
 		}
 	}
 
-	if desired["clustervolumes.racer.unbounded-cloud.io"] != nil {
-		t.Fatal("obsolete ClusterVolume CRD is bootstrapped")
+	for name := range desired {
+		if strings.HasSuffix(name, ".racer.unbounded-cloud.io") && name != "clustercaches.racer.unbounded-cloud.io" {
+			t.Fatalf("unexpected Racer CRD %q is bootstrapped", name)
+		}
 	}
 }
 

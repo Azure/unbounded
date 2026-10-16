@@ -163,6 +163,68 @@ func TestGetRanges(t *testing.T) {
 	}
 }
 
+func TestGetPageCredits(t *testing.T) {
+	const (
+		first = PageSize - 1
+		end   = PageSize + 2
+	)
+
+	c := rawServer(t, func(conn net.Conn, r *bufio.Reader, head []byte) {
+		if !strings.Contains(string(head), "Racer-Page-Credits: 2\r\n") ||
+			!strings.Contains(string(head), fmt.Sprintf("Racer-Byte-Credits: %d\r\n", 2*PageSize)) {
+			t.Errorf("subscription must grant two pages and 2*PageSize bytes: %q", head)
+			return
+		}
+
+		if _, err := io.WriteString(conn, subscriptionHead(end, first, end)); err != nil {
+			return
+		}
+
+		for number, payload := range []string{"a", "bc"} {
+			offset := uint64(first + number)
+			length := uint32(len(payload))
+
+			if err := writeFrame(conn, wire.PageFrame, uint64(number), offset, length); err != nil {
+				return
+			}
+
+			if _, err := io.WriteString(conn, payload); err != nil {
+				return
+			}
+		}
+
+		for number, length := range []uint32{1, 2} {
+			if err := readCredit(r, uint64(number), length); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+
+		_ = writeFrame(conn, wire.CompleteFrame, 2, end-first, 0)
+	})
+
+	for _, mode := range []string{"read", "write"} {
+		t.Run(mode, func(t *testing.T) {
+			o, err := c.Get(t.Context(), Request{}, ReadOptions{Offset: first, Length: end - first})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeQuietly(o)
+
+			var b strings.Builder
+			if mode == "read" {
+				_, err = io.Copy(writerOnly{&b}, readerOnly{o})
+			} else {
+				_, err = o.WriteTo(&b)
+			}
+
+			if err != nil || b.String() != "abc" {
+				t.Fatalf("received %q, %v; want abc", b.String(), err)
+			}
+		})
+	}
+}
+
 func TestGetEmptyObject(t *testing.T) {
 	c := fakeClient(t, offsetOrigin(0))
 

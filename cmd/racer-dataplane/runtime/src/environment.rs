@@ -681,7 +681,7 @@ mod tests {
 
     /// Overflow leaves both clocks unchanged and does not poison later advances.
     #[test]
-    fn checked_clock_overflow_is_atomic_and_legacy_panic_does_not_poison() {
+    fn checked_clock_overflow_is_atomic_and_unchecked_panic_does_not_poison() {
         let clock = SimulationClock::new(9);
         let _role = clock.environment(0).enter();
         let before = (now(), wall_now(), clock.elapsed());
