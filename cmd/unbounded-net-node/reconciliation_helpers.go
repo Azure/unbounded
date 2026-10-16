@@ -363,6 +363,20 @@ func gatewayMeshTransitTunnelMTU(
 
 	for _, route := range routes {
 		for _, path := range route.Paths {
+			for _, hop := range path {
+				if hop.Type != "GatewayPool" {
+					continue
+				}
+
+				if hop.Name == peerPool {
+					result = resolveTunnelMTU(result, siteMTUs[peerSite])
+				} else if pool := pools[hop.Name]; pool != nil {
+					for _, node := range pool.Status.Nodes {
+						result = resolveTunnelMTU(result, siteMTUs[node.SiteName])
+					}
+				}
+			}
+
 			for i := 1; i < len(path); i++ {
 				site, pool := path[i-1], path[i]
 				if site.Type != "Site" || pool.Type != "GatewayPool" {
