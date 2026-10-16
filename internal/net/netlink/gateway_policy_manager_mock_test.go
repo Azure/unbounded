@@ -4,11 +4,77 @@
 package netlink
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	vishnetlink "github.com/vishvananda/netlink"
 )
+
+func TestRemoveGatewayPolicyInterfaceRetriesFailedCleanup(t *testing.T) {
+	oldList, oldDelete, oldFlush, oldTables := netlinkRuleList, netlinkRuleDel, flushGatewayRouteTable, rtTablesPath
+
+	t.Cleanup(func() {
+		netlinkRuleList, netlinkRuleDel, flushGatewayRouteTable, rtTablesPath = oldList, oldDelete, oldFlush, oldTables
+	})
+	rtTablesPath = filepath.Join(t.TempDir(), "rt_tables")
+	injected := errors.New("cleanup failed")
+
+	for _, mode := range []string{"list", "delete", "flush"} {
+		t.Run(mode, func(t *testing.T) {
+			if err := os.WriteFile(rtTablesPath, []byte("1001 wg51821\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			m := &GatewayPolicyManager{
+				wireguardBasePort: 51820, gatewayTableBase: 1000,
+				configuredIfaces: map[string]int{"wg51821": 1001},
+			}
+			fail := true
+			netlinkRuleList = func(int) ([]vishnetlink.Rule, error) {
+				if fail && mode == "list" {
+					return nil, injected
+				}
+
+				return []vishnetlink.Rule{{Table: 1001, Mark: 1}}, nil
+			}
+			netlinkRuleDel = func(*vishnetlink.Rule) error {
+				if fail && mode == "delete" {
+					return injected
+				}
+
+				return nil
+			}
+			flushGatewayRouteTable = func(int) error {
+				if fail && mode == "flush" {
+					return injected
+				}
+
+				return nil
+			}
+
+			if err := m.RemoveInterface("wg51821"); !errors.Is(err, injected) {
+				t.Fatalf("cleanup hid error: %v", err)
+			}
+
+			if _, tracked := m.configuredIfaces["wg51821"]; !tracked {
+				t.Fatal("failed cleanup forgot interface")
+			}
+
+			fail = false
+
+			if err := m.RemoveInterface("wg51821"); err != nil {
+				t.Fatal(err)
+			}
+
+			if len(m.configuredIfaces) != 0 {
+				t.Fatal("successful cleanup retained interface")
+			}
+		})
+	}
+}
 
 // TestDeleteIPRulesByMarkSetDeletesOnlyMatchingEntries tests delete iprules by mark set deletes only matching entries.
 func TestDeleteIPRulesByMarkSetDeletesOnlyMatchingEntries(t *testing.T) {
