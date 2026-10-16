@@ -72,7 +72,7 @@ types in the public API.
 | `net` | `SocketAddress` and sockaddr encoding |
 | `task` | `LocalExecutor` (bounded, `!Send` tasks, real ready queue), `Spawner`, `JoinHandle`, `yield_now` |
 | `time` | `Timers` (deadline queue driven explicitly), `Sleep` |
-| `group` | pinned thread groups: `Group`, `Plan`, `Service`, `Factory`, `FailureReporter`, `FatalPolicy` |
+| `group` | pinned thread groups: `Group`, `Plan`, `Service`, `Factory`, `FailureReporter`, `GroupConfig`, `GroupError`, `FatalPolicy` |
 | `affinity` | CPU topology discovery and thread pinning (no placement policy) |
 
 ### Errors
@@ -336,13 +336,73 @@ swapping, matching std.
 
 ### Group and affinity
 
-- `group` keeps the lifecycle engine (Running -> Drain -> Shutdown, two fences
-  per service, panic capture with payload kept in the error) with configurable
-  `GroupConfig { idle_wait, work_budget, helper_budget, fatal: FatalPolicy }`.
-  `FatalPolicy::LeakAndReport` is the default; `Abort` is opt-in.
-- `affinity` keeps topology discovery (`Topology::discover()`, injectable sysfs
-  root for tests), `CpuSet`, `current_cpus`, `set_cpus`, `pin_cpu`. Placement
-  (`place`, `place_exact`) moves to Racer.
+`group` is the lifecycle engine. It does not depend on the reactor or task
+modules.
+
+```rust
+let plan = Plan::builder()                     // validates; InvalidConfiguration + context
+    .lane("lane-0", 0).lane("lane-1", None)    // cpu: usize or None (unpinned)
+    .helper("helper-0", 2, [0, 1])             // one shard per served lane
+    .max_threads(4)                            // default unlimited
+    .build()?;
+pub trait Factory<S: Scope>: Sync {
+    fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<S>>, S::Error>;
+    fn build_helper(&self, lane: usize) -> ...;          // default InvalidConfiguration
+    fn abandon_lane(&self, lane: usize) -> Result<(), S::Error>;  // default Ok
+    fn teardown_scope(&self, startup: &S) -> S;          // default clone
+}
+pub type LifecycleFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + 'a>>;
+pub trait Service<S: Scope> {          // only `poll` is required
+    fn poll(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<(), S::Error>;
+    // defaults: set_failure_reporter, waker (thread_waker(None)), register_driver,
+    // start, wait_timeout, stop_admission, drain, close, fence, shutdown
+}
+impl<S: Scope + Send> Group<S> where S::Error: Clone + Send {
+    pub fn new(plan: Plan, config: GroupConfig) -> Result<Self>;
+    pub fn start<F: Factory<S> + Send + ?Sized + 'static>(&mut self, Arc<F>, &S) -> Result<(), GroupError<S::Error>>;
+    pub fn run / run_scoped(&mut self, &F, &S) -> Result<(), GroupError<S::Error>>;
+    pub fn drain(&self, &S); pub fn shutdown(&self, &S); pub fn join(&mut self); pub fn stats(&self) -> Stats;
+}
+```
+
+- Lane 0 is the coordinator: under `start` it is a new thread that spawns and
+  joins the others; under `run`/`run_scoped` it is the caller (whose affinity
+  is restored afterwards). `start` counts the caller against `max_threads`.
+- Per lane: build, `start`, steady state (`poll(work_budget)`, then park for
+  at most `wait_timeout(idle_wait)`), `stop_admission`, `drain`, `close`,
+  first `fence` (drained), wait for shutdown, `shutdown`, second `fence`,
+  drop on the owner thread. A helper shard starts before its lane is built,
+  is polled until its lane closes and its lane's first fence is confirmed,
+  then drains and fences; shards are polled round-robin.
+- `GroupConfig` (`#[non_exhaustive]`, `Default`, `with_*`): `idle_wait` 1 ms,
+  `work_budget` 64, `helper_budget` 1, `helper_passes_per_park` 64,
+  `wait_interval` 1 ms, `fatal`.
+- Every error and panic is caught and attributed:
+  `GroupError<E> { Failed { role, stage, error }, Panicked { role, stage, message }, Fatal { event, error } }`
+  with `Role { Group, Lane(i), Helper { helper, lane } }` and `Stage`.
+  `into_error()` maps to `E` (panics and error-less fatals become
+  `Unavailable` with context). A fatal error replaces an earlier ordinary one.
+- `FatalPolicy { LeakAndReport (default), Abort, Custom(Arc<dyn Fn(&FatalEvent)>) }`
+  applies when a fence or `abandon_lane` fails or panics, or a service would be
+  dropped before both fences. The service (and a panicking fence future) is
+  `mem::forget`-ed; a helper shard whose lane failed its fence is leaked too.
+- `FailureReporter<E>` (`Clone`, no `Copy` bound) records
+  `Failed { stage: Report }` and moves the group to drain.
+- `thread_waker(Option<RemoteWaker>)` unparks the creating thread and wakes the
+  optional reactor waker.
+
+`affinity` has no placement policy:
+
+- `CpuSet` (ascending, `Display`/`FromStr` in Linux list format,
+  `MAX_CPU = 2^20 - 1`), `current_cpus()`, `set_cpus(&CpuSet)`, `pin_cpu(cpu)`.
+- `Topology { cpus: Vec<CpuLocation>, quota: Option<CpuQuota>, devices: Vec<DeviceLocality> }`
+  from `Topology::discover()` or `discover_at(root, &allowed)` (fake trees in
+  tests). `CpuLocation { cpu, package, die, core, numa_node }` uses `None` for
+  absent ids and `-1`. Cgroup v1 and v2 limits are read from every visible
+  ancestor; an applicable hierarchy that is not visible fails closed.
+  `DeviceLocality { class: "net" | "infiniband", name, numa_node }`; devices
+  that vanish mid-scan are skipped.
+- `place`/`place_exact` move to Racer.
 
 ## Crate: `uring-runtime-sim`
 
