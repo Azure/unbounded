@@ -84,6 +84,7 @@ type config struct {
 	WireGuardDir                  string
 	WireGuardPort                 int
 	EnablePolicyRouting           bool
+	ManageSameSitePodRoutes       bool
 	MTU                           int
 	HealthPort                    int
 	InformerResyncPeriod          time.Duration
@@ -307,6 +308,7 @@ then annotates the node with the public key.`,
 	flags.StringVar(&cfg.WireGuardDir, "wireguard-dir", "/etc/wireguard", "Directory to store WireGuard keys")
 	flags.IntVar(&cfg.WireGuardPort, "wireguard-port", 51820, "WireGuard listen port")
 	flags.BoolVar(&cfg.EnablePolicyRouting, "enable-policy-routing", false, "Enable policy-based routing on gateway interfaces (deprecated, UNBOUNDED-FORWARD chain rules replace PBR)")
+	flags.BoolVar(&cfg.ManageSameSitePodRoutes, "manage-same-site-pod-routes", false, "Manage same-site PodCIDR routes even when the Site does not manage CNI")
 
 	// Tunnel-interface configuration flags. All three shared tunnel device
 	// names must be non-empty, distinct, and must not collide with
@@ -447,6 +449,10 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 
 	if !flags.Changed("enable-policy-routing") && nodeCfg.EnablePolicyRouting != nil { //nolint:staticcheck // intentional use of deprecated field for backward compat
 		cfg.EnablePolicyRouting = *nodeCfg.EnablePolicyRouting //nolint:staticcheck // intentional use of deprecated field
+	}
+
+	if !flags.Changed("manage-same-site-pod-routes") && nodeCfg.ManageSameSitePodRoutes != nil {
+		cfg.ManageSameSitePodRoutes = *nodeCfg.ManageSameSitePodRoutes
 	}
 
 	if !flags.Changed("mtu") && nodeCfg.MTU != nil {

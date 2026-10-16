@@ -913,7 +913,7 @@ var configureWireGuardFunc = configureWireGuard
 // It uses per-node podCIDRs from slices and gateway pools for routing
 // It also looks up gateway pools referenced by the site and adds gateway peers with all remote sites' CIDRs
 // For gateway nodes, it adds all nodes from all sites as peers (pubkey only, no endpoint)
-// When manageCniPlugin is false on non-gateway nodes, same-site peers are skipped but
+// Unless same-site routing is explicitly enabled, unmanaged non-gateway nodes skip same-site peers but
 // directly peered remote-site peers are still included for podCIDR routing.
 // Sites that are directly peered via SitePeering objects are treated as if they were the same site
 func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interface, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer, cfg *config, mySiteName, privKey, myPubKey string, manageCniPlugin bool, state *wireGuardState) error {
@@ -1742,7 +1742,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					RouteDistances:         routeDistances,
 					LearnedRoutes:          learnedRoutes,
 					PodCIDRs:               gwNode.PodCIDRs,
-					SkipPodCIDRRoutes:      !manageCniPlugin && !isGatewayNode && gwNode.SiteName == mySiteName,
+					SkipPodCIDRRoutes:      !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode && gwNode.SiteName == mySiteName,
 				}, siteRouting.localCIDRs))
 			}
 		}
@@ -1802,9 +1802,9 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				continue
 			}
 		}
-		// When manageCniPlugin is false, skip same-site peers for non-gateway nodes.
+		// An unmanaged CNI owns same-site routes unless explicitly overridden.
 		// Keep directly peered remote sites so unmanaged sites can still route to managed remote pods.
-		if !manageCniPlugin && !isGatewayNode && slice.SiteName == mySiteName {
+		if !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode && slice.SiteName == mySiteName {
 			continue
 		}
 
@@ -1835,7 +1835,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				WireGuardPublicKey: node.WireGuardPublicKey,
 				InternalIPs:        node.InternalIPs,
 				PodCIDRs:           node.PodCIDRs,
-				SkipPodCIDRRoutes:  !manageCniPlugin && isGatewayNode && slice.SiteName == mySiteName,
+				SkipPodCIDRRoutes:  !manageCniPlugin && !cfg.ManageSameSitePodRoutes && isGatewayNode && slice.SiteName == mySiteName,
 			})
 		}
 	}
@@ -1874,7 +1874,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 	}
 
-	if !manageCniPlugin && !isGatewayNode {
+	if !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode {
 		klog.V(2).Info("manageCniPlugin is false - skipping same-site tunnel peers for non-gateway nodes")
 	}
 

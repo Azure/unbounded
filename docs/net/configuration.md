@@ -715,6 +715,12 @@ allocation without blocking their
 otherwise-unmanaged routing bootstrap. To retain direct host-local instead,
 provide your own conflist and set `manageCniPlugin: false`.
 
+Delegated IPAM does not provide inter-node routing. If the third-party CNI
+does not install those routes, set `node.manageSameSitePodRoutes: true` to
+have Unbounded manage same-site PodCIDR routes without managing the CNI
+configuration. The default remains false for unmanaged CNI sites. A Site
+with `tunnelProtocol: None` uses direct routes to peers on the same underlay.
+
 **Migration:** The allocation gate only applies after the runtime loads a
 conflist that invokes `unbounded-ipam`. Install the binary, replace the active
 configuration, and verify your runtime has reloaded it; follow your runtime's

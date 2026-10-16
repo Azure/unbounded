@@ -62,20 +62,21 @@ type ControllerLeaderElectionYAML struct {
 
 // NodeRuntimeConfig contains node-agent runtime settings.
 type NodeRuntimeConfig struct {
-	InformerResyncPeriod string `yaml:"informerResyncPeriod"`
-	NodeName             string `yaml:"nodeName"`
-	STUNEnabled          *bool  `yaml:"stunEnabled"`
-	STUNHost             string `yaml:"stunHost"`
-	STUNPort             *int   `yaml:"stunPort"`
-	STUNRecheckInterval  string `yaml:"stunRecheckInterval"`
-	CNIConfDir           string `yaml:"cniConfDir"`
-	CNIConfFile          string `yaml:"cniConfFile"`
-	IPAMSocketPath       string `yaml:"ipamSocketPath"`
-	InstallIPAMPlugin    *bool  `yaml:"installIPAMPlugin"`
-	IPAMBinDir           string `yaml:"ipamBinDir"`
-	BridgeName           string `yaml:"bridgeName"`
-	WireGuardDir         string `yaml:"wireGuardDir"`
-	WireGuardPort        *int   `yaml:"wireGuardPort"`
+	InformerResyncPeriod    string `yaml:"informerResyncPeriod"`
+	NodeName                string `yaml:"nodeName"`
+	STUNEnabled             *bool  `yaml:"stunEnabled"`
+	STUNHost                string `yaml:"stunHost"`
+	STUNPort                *int   `yaml:"stunPort"`
+	STUNRecheckInterval     string `yaml:"stunRecheckInterval"`
+	CNIConfDir              string `yaml:"cniConfDir"`
+	CNIConfFile             string `yaml:"cniConfFile"`
+	IPAMSocketPath          string `yaml:"ipamSocketPath"`
+	InstallIPAMPlugin       *bool  `yaml:"installIPAMPlugin"`
+	IPAMBinDir              string `yaml:"ipamBinDir"`
+	ManageSameSitePodRoutes *bool  `yaml:"manageSameSitePodRoutes"`
+	BridgeName              string `yaml:"bridgeName"`
+	WireGuardDir            string `yaml:"wireGuardDir"`
+	WireGuardPort           *int   `yaml:"wireGuardPort"`
 	// Deprecated: EnablePolicyRouting enables connmark/fwmark/ip-rule policy
 	// routing on gateway interfaces. Replaced by the UNBOUNDED-FORWARD chain.
 	// Defaults to false; retained for backward compatibility.
