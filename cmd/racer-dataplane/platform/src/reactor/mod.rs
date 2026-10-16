@@ -378,6 +378,15 @@ pub(crate) struct Held<L> {
     _accounting: Accounting,
 }
 
+impl<L> Held<L> {
+    /// Release the slot and accounting now (the operation is fenced) and
+    /// return the caller's value. A partial move out of `user` would keep
+    /// the slot until the end of the enclosing scope.
+    pub(crate) fn into_user(self) -> L {
+        self.user
+    }
+}
+
 /// Worker-local I/O owner, explicitly driven by [`Self::poll_budgeted`].
 /// Dropping a waiting operation abandons delivery, never its kernel-owned
 /// resources.
@@ -778,7 +787,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
                     (result, held)
                 }
             };
-            lease = held.user;
+            lease = held.into_user();
             let failure = match result {
                 Ok(bytes) => {
                     return Ok(Completion {
@@ -809,7 +818,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
                     .readiness(&fd, operation.interest(), op_scope)
                     .lease(held)
                     .await;
-                (buffer, lease) = held.user;
+                (buffer, lease) = held.into_user();
                 result.map_err(Failure::into_scope)?;
             }
         }
