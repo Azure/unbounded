@@ -523,6 +523,10 @@ if [[ -s "$progress_file" ]]; then
       "$payload_files" "$payload_bytes" "${image_operation:-none}"
   fi
 fi
+conversion_event=$(grep -E 'Artifact Streaming conversion .* status=(Submitted|Running|Succeeded|Failed|Canceled|Cancelled)$' \
+  "${BENCHMARK_ARTIFACT_ROOT:-$HOME/artifacts}/operator.log" 2>/dev/null | \
+  tail -1 || true)
+printf 'conversion_event=%s\n' "$conversion_event"
 state=$(kubectl --request-timeout=20s -n "$namespace" get configmap gantry-benchmark-state \
   -o jsonpath='{.data.state\.json}' 2>/dev/null || true)
 if [[ -n "$state" ]]; then
