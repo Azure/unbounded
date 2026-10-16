@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -498,7 +499,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	}
 }
 
-// cleanupNodeNetworkingOnShutdown conditionally removes managed networking state during node-agent shutdown.
+var cleanupNodeNetworkingOnShutdownFunc = cleanupNodeNetworkingOnShutdown
+
 func cleanupForAssignmentTransition(cfg *config, state *wireGuardState, dynamicClient dynamic.Interface, gatewayNodeInformer cache.SharedIndexInformer) {
 	if cfg == nil || state == nil {
 		return
@@ -508,9 +510,23 @@ func cleanupForAssignmentTransition(cfg *config, state *wireGuardState, dynamicC
 	defer cancel()
 
 	currentNode, err := state.clientset.CoreV1().Nodes().Get(cleanupCtx, state.nodeName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		klog.Infof("Node %s was deleted; forcing managed networking cleanup", state.nodeName)
+
+		if state.adoptedAssignment.gatewayPool != "" {
+			if err := clearGatewayNodeRoutesStatus(cleanupCtx, dynamicClient, state.nodeName); err != nil {
+				klog.Errorf("Failed to clear gateway advertisements after Node deletion: %v", err)
+			}
+		}
+
+		cleanupNodeNetworkingOnShutdownFunc(cfg, state, true)
+
+		return
+	}
+
 	if err != nil {
 		klog.Errorf("Failed to read current Node assignment during shutdown; transition cleanup cannot be confirmed: %v", err)
-		cleanupNodeNetworkingOnShutdown(cfg, state, false)
+		cleanupNodeNetworkingOnShutdownFunc(cfg, state, false)
 
 		return
 	}
@@ -518,7 +534,7 @@ func cleanupForAssignmentTransition(cfg *config, state *wireGuardState, dynamicC
 	current, err := assignmentFromNode(currentNode)
 	if err != nil {
 		klog.Errorf("Failed to parse current Node assignment during shutdown; transition cleanup cannot be confirmed: %v", err)
-		cleanupNodeNetworkingOnShutdown(cfg, state, false)
+		cleanupNodeNetworkingOnShutdownFunc(cfg, state, false)
 
 		return
 	}
@@ -546,7 +562,7 @@ func cleanupForAssignmentTransition(cfg *config, state *wireGuardState, dynamicC
 		}
 	}
 
-	cleanupNodeNetworkingOnShutdown(cfg, state, transition)
+	cleanupNodeNetworkingOnShutdownFunc(cfg, state, transition)
 }
 
 func disableCNIForAssignmentTransition(ctx context.Context, cfg *config, state *wireGuardState, client dynamic.Interface, current nodeAssignment) error {
