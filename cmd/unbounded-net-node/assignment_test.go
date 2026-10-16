@@ -11,8 +11,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
@@ -216,6 +218,65 @@ func TestWaitForAssignmentRetryHonorsCancellation(t *testing.T) {
 
 	if err := waitForAssignmentRetry(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestWorkerAcknowledgmentRetriesTaintCleanup(t *testing.T) {
+	adopted := nodeAssignment{site: "site-a", nodeUID: "node-uid"}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: adopted.nodeUID, Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: adopted.site}},
+		Spec: corev1.NodeSpec{Taints: []corev1.Taint{
+			{Key: GatewayNodeTaintKey, Effect: corev1.TaintEffectNoSchedule},
+			{Key: "other", Effect: corev1.TaintEffectNoSchedule},
+		}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "system", UID: "pod-uid"},
+		Spec:       corev1.PodSpec{NodeName: node.Name},
+	}
+	client := fake.NewClientset(node, pod)
+	fail := true
+
+	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if fail {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, node.Name, errors.New("denied"))
+		}
+
+		return false, nil, nil
+	})
+
+	if err := acknowledgeEffectiveAssignment(t.Context(), client, pod.Namespace, pod.Name, pod.UID, node.Name, adopted); err == nil || !strings.Contains(err.Error(), "remove stale gateway taint") {
+		t.Fatalf("expected taint cleanup failure, got %v", err)
+	}
+
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "patch" && action.GetResource().Resource == "pods" {
+			t.Fatal("acknowledged worker after failed taint cleanup")
+		}
+	}
+
+	fail = false
+
+	if err := acknowledgeEffectiveAssignment(t.Context(), client, pod.Namespace, pod.Name, pod.UID, node.Name, adopted); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := client.CoreV1().Nodes().Get(t.Context(), node.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(current.Spec.Taints) != 1 || current.Spec.Taints[0].Key != "other" {
+		t.Fatalf("taints after recovery = %v", current.Spec.Taints)
+	}
+
+	got, err := client.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if site, ok := got.Annotations[unboundednetv1alpha1.EffectiveSiteAnnotation]; !ok || site != adopted.site {
+		t.Fatalf("worker not acknowledged after recovery: %v", got.Annotations)
 	}
 }
 

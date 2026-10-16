@@ -6,15 +6,89 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
+
+func TestDisableCNIForAssignmentTransition(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		managed      bool
+		destination  string
+		unmanaged    bool
+		missing      bool
+		renameFails  bool
+		wantDisabled bool
+		wantErr      bool
+	}{
+		{name: "managed to unmanaged", managed: true, destination: "new", unmanaged: true, wantDisabled: true},
+		{name: "managed to managed", managed: true, destination: "new"},
+		{name: "unmanaged source", destination: "new", unmanaged: true},
+		{name: "same site", managed: true, destination: "old", unmanaged: true},
+		{name: "no destination", managed: true},
+		{name: "unknown destination", managed: true, destination: "new", missing: true, wantErr: true},
+		{name: "rename failure", managed: true, destination: "new", unmanaged: true, renameFails: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config{CNIConfDir: t.TempDir(), CNIConfFile: "10-unbounded.conflist"}
+
+			active := filepath.Join(cfg.CNIConfDir, cfg.CNIConfFile)
+			if err := os.WriteFile(active, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.renameFails {
+				// A directory at the snapshot path is not a replaceable managed file.
+				if err := os.Mkdir(cniDisabledPath(cfg), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			objects := []runtime.Object{}
+
+			if !tc.missing && tc.destination != "" {
+				managed := !tc.unmanaged
+				objects = append(objects, toUnstructuredSiteWatch(t, &unboundedv1alpha3.Site{
+					TypeMeta:   metav1.TypeMeta{APIVersion: siteGVR.GroupVersion().String(), Kind: "Site"},
+					ObjectMeta: metav1.ObjectMeta{Name: tc.destination},
+					Spec:       unboundedv1alpha3.SiteSpec{ManageCniPlugin: &managed},
+				}))
+			}
+
+			client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), objects...)
+			state := &wireGuardState{manageCniPlugin: tc.managed, adoptedAssignment: nodeAssignment{site: "old"}}
+
+			err := disableCNIForAssignmentTransition(t.Context(), cfg, state, client, nodeAssignment{site: tc.destination})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr=%v", err, tc.wantErr)
+			}
+
+			data, err := os.ReadFile(active)
+			if tc.wantDisabled {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("active conflist remains: %v", err)
+				}
+
+				data, err = os.ReadFile(cniDisabledPath(cfg))
+			}
+
+			if err != nil || string(data) != "original" {
+				t.Fatalf("conflist contents = %q, err=%v", data, err)
+			}
+		})
+	}
+}
 
 func toUnstructuredSiteWatch(t *testing.T, v interface{}) *unstructured.Unstructured {
 	t.Helper()
