@@ -1481,23 +1481,52 @@ impl<C: Context> HttpPool<C> {
             generation,
         };
         let mut slot = ConnectingSlot(Some(target));
-        if let Some(mut idle) = idle
-            && idle.fd.idle_healthy()
-        {
-            if let Err(e) = self
-                .context
-                .reclassify_slot(&mut idle.reservation, priority)
-            {
-                // Keep the healthy socket pooled; the slot guard releases `active`.
-                if let Some(entry) = self.state.borrow_mut().entries.get_mut(endpoint) {
-                    entry.idle.push(idle);
+        // Search the idle stack top-down for a healthy socket this class may reuse.
+        // Sockets that cannot be reclassified (metadata sockets while ordinary admission
+        // is full) stay pooled in their original order so reusable ordinary sockets
+        // below them are not shadowed.
+        let mut next = idle;
+        let mut skipped = Vec::new();
+        let mut rejected = None;
+        let reused = loop {
+            let Some(mut idle) = next.take() else {
+                break None;
+            };
+            if idle.fd.idle_healthy() {
+                match self
+                    .context
+                    .reclassify_slot(&mut idle.reservation, priority)
+                {
+                    Ok(()) => break Some(idle),
+                    Err(e) => {
+                        skipped.push(idle);
+                        rejected = Some(e);
+                    }
                 }
-                return Err(e);
             }
+            // Unhealthy sockets are dropped outside the pool borrow.
+            next = self
+                .state
+                .borrow_mut()
+                .entries
+                .get_mut(endpoint)
+                .and_then(|entry| entry.idle.pop());
+        };
+        if !skipped.is_empty()
+            && let Some(entry) = self.state.borrow_mut().entries.get_mut(endpoint)
+        {
+            entry.idle.extend(skipped.drain(..).rev());
+        }
+        drop(skipped);
+        if let Some(idle) = reused {
             return Ok((
                 ConnectionLease::new(idle.fd, idle.reservation, idle.state, slot.0.take()),
                 None,
             ));
+        }
+        if let Some(e) = rejected {
+            // No pooled socket holds a reusable charge; the slot guard releases `active`.
+            return Err(e);
         }
         let reserve = || {
             if priority {
