@@ -49,6 +49,7 @@
 //!         self.0.push_back(CompletionEntry { user_data, result: -libc::ENOENT, flags: 0 });
 //!         Ok(())
 //!     }
+//!     unsafe fn adopt_fd(&mut self, raw: i32) -> i32 { raw }
 //!     fn submit(&mut self) -> Result<usize> { Ok(0) }
 //!     fn pop(&mut self) -> Option<CompletionEntry> { self.0.pop_front() }
 //!     fn wait(&mut self, _: Duration) -> Result<()> { Ok(()) }
@@ -475,6 +476,20 @@ pub trait Backend: 'static {
     /// completion.
     fn cancel(&mut self, user_data: u64, target: u64) -> Result<(), PushError>;
 
+    /// Take ownership of the descriptor reported by a successful
+    /// [`Op::Accept`] or [`Op::OpenAt2`] completion (`result >= 0`).
+    ///
+    /// The reactor calls this as soon as the completion is popped, so the
+    /// descriptor is closed (by dropping the returned value) if nobody
+    /// collects it.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be the `result` of a completion, popped from this backend,
+    /// of an `Accept` or `OpenAt2` operation, and must be adopted at most
+    /// once.
+    unsafe fn adopt_fd(&mut self, raw: i32) -> Self::Fd;
+
     /// Start every queued operation, returning how many were submitted.
     fn submit(&mut self) -> Result<usize>;
 
@@ -586,6 +601,10 @@ mod tests {
 
         fn cancel(&mut self, _: u64, _: u64) -> Result<(), PushError> {
             Err(PushError::Full)
+        }
+
+        unsafe fn adopt_fd(&mut self, raw: i32) -> u32 {
+            raw as u32
         }
 
         fn submit(&mut self) -> Result<usize> {
