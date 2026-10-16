@@ -250,9 +250,7 @@ func validateCache(cache string) error {
 		return err
 	}
 
-	_ = client.Close()
-
-	return nil
+	return client.Close()
 }
 
 func validListen(value string) bool {

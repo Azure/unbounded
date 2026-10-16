@@ -28,6 +28,7 @@ var testCfg = Config{Image: testImage}
 
 func newPod(annotations map[string]string) *corev1.Pod {
 	a := map[string]string{NamespaceAnnotation: "store", BucketsAnnotation: "one"}
+
 	for k, v := range annotations {
 		if v == "<delete>" {
 			delete(a, k)
@@ -193,6 +194,7 @@ func TestMutateErrors(t *testing.T) {
 
 func TestMutateResources(t *testing.T) {
 	q := resource.MustParse
+
 	tests := []struct {
 		name     string
 		anno     map[string]string
