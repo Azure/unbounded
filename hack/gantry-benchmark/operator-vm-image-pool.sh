@@ -581,7 +581,7 @@ printf 'conversion_event=%s\n' "$conversion_event"
 state=$(kubectl --request-timeout=20s -n "$namespace" get configmap gantry-benchmark-state \
   -o jsonpath='{.data.state\.json}' 2>/dev/null || true)
 if [[ -n "$state" ]]; then
-  jq -r '"benchmark_status=\(.status // "")\nactive_phase=\(.active_phase // "")\nimage=\(.gantry_streaming_image // .gantry_image // "")\nnode_count=\(.node_count // 0)"' <<<"$state"
+  jq -r '"benchmark_status=\(.status // "")\nactive_phase=\(.active_phase // "")\nimage=\(.artifact_streaming_image // .gantry_cold_image // "")\nnode_count=\(.node_count // 0)"' <<<"$state"
 fi
 SCRIPT
 )
