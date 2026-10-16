@@ -315,7 +315,11 @@ func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
 // the origin's request limit so steady page fetches reuse warm TLS
 // connections instead of reconnecting once more than two are in flight.
 func originHTTPClient(o options) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	}
+
 	transport.MaxIdleConns = o.maxRequests
 	transport.MaxIdleConnsPerHost = o.maxRequests
 
