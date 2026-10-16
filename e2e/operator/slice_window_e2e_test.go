@@ -45,8 +45,8 @@ const sliceWindowClusterName = "operator-slice-window-e2e"
 //     re-owned and still present.
 //   - Phase 3 (partial migration): with the machina set non-empty, a slice whose
 //     Site is still only in the legacy group must survive (legacySiteExists).
-//   - Phase 4 (genuine orphan): a slice whose Site is absent from both groups is
-//     still cleaned up, proving the guard did not neuter cleanup.
+//   - Phase 4 (genuine orphan): after controller restart, a slice whose Site is
+//     absent from both groups is cleaned up by the production startup repair.
 func TestSiteControllerPreservesSlicesDuringMigrationWindow(t *testing.T) {
 	requireBins(t, "kind", "kubectl", "docker")
 
@@ -100,6 +100,19 @@ func TestSiteControllerPreservesSlicesDuringMigrationWindow(t *testing.T) {
 	defer cancelController()
 
 	controllerResult := startRestrictedSiteController(controllerCtx, t, restrictedConfig)
+	stopController := func() {
+		t.Helper()
+		cancelController()
+
+		select {
+		case err := <-controllerResult:
+			if err != nil {
+				t.Fatalf("restricted SiteController stopped with error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("restricted SiteController did not stop")
+		}
+	}
 
 	// Phase 1: empty machina window. The slice must never disappear while the
 	// controller reconciles with zero machina Sites.
@@ -118,21 +131,19 @@ func TestSiteControllerPreservesSlicesDuringMigrationWindow(t *testing.T) {
 	stageLegacyOwnedSlice(ctx, t, cli, "edge-site-0", "edge-site", edgeSite.GetUID(), nodeData)
 	assertSliceContinuouslyPresent(controllerCtx, t, cli, "edge-site-0", 8*time.Second, controllerResult)
 
-	// Phase 4: genuine orphan. A slice whose Site exists in neither group must be
-	// deleted, proving the guard did not disable cleanup.
+	// Phase 4: restart with a genuine orphan so the startup repair removes it
+	// without waiting for the low-frequency periodic repair.
+	stopController()
 	stageLegacyOwnedSlice(ctx, t, cli, "ghost-0", "ghost", "", nodeData)
+
+	controllerCtx, cancelController = context.WithCancel(ctx)
+	defer cancelController()
+
+	controllerResult = startRestrictedSiteController(controllerCtx, t, restrictedConfig)
 	waitForSliceDeleted(controllerCtx, t, cli, "ghost-0", controllerResult)
-
-	cancelController()
-
-	select {
-	case err := <-controllerResult:
-		if err != nil {
-			t.Fatalf("restricted SiteController stopped with error: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("restricted SiteController did not stop")
-	}
+	assertSliceOwnerGroup(ctx, t, cli, "win-site-0", machinaSiteGVK.Group)
+	assertSliceOwnerGroup(ctx, t, cli, "edge-site-0", legacySiteGVK.Group)
+	stopController()
 }
 
 // firstKindNode returns the single kind node and its InternalIPs.
