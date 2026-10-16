@@ -25,6 +25,9 @@ unbounded-kube is organized into several directories:
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
   - `unping` - health check probe utility.
   - `unroute` - eBPF route inspection utility.
+- `crates/` - standalone, reusable Rust library workspace (`crates/Cargo.toml`, own `Cargo.lock`, MSRV 1.88).
+  - `uring-runtime/` - explicitly driven io_uring runtime.
+  - `uring-runtime-sim/` - deterministic simulation backend for `uring-runtime`.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
   - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
   - `gantry/` - gantry DaemonSet, ConfigMap, and ServiceAccount manifests.
@@ -61,6 +64,13 @@ unbounded-kube is organized into several directories:
 - `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
 - `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
 - Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
+- The `crates/` Rust workspace is built with cargo directly, always passing `--manifest-path crates/Cargo.toml`:
+  `cargo fmt --manifest-path crates/Cargo.toml --all`,
+  `cargo clippy --locked --manifest-path crates/Cargo.toml --workspace --all-targets -- -D warnings`,
+  `cargo test --locked --manifest-path crates/Cargo.toml --workspace`, and
+  `RUSTDOCFLAGS="-D warnings" cargo doc --locked --manifest-path crates/Cargo.toml --workspace --no-deps`.
+  io_uring tests skip when the kernel rejects io_uring; set `URING_RUNTIME_REQUIRE_KERNEL=1` (as CI does) to make
+  them fail instead. CI also checks the MSRV with `cargo +1.88.0 check` and runs `cargo miri test --lib`.
 
 ## Coding Standards
 
