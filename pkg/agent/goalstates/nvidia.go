@@ -134,6 +134,10 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
+	if err := initializeAzureLinuxNVIDIADevices(defaultNvidiaDeviceInitDeps()); err != nil {
+		return NvidiaHost{}, err
+	}
+
 	devices := discoverNVIDIADevices()
 	libraries := resolveNVIDIALibraries(archInfo)
 
@@ -144,11 +148,160 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		LibDirMounts:      libraries.libDirMounts,
 		I386LibMappings:   libraries.i386LibMappings,
 		I386LibDirMounts:  libraries.i386LibDirMounts,
-		NvidiaSMIPath:     discoverNVIDIASMI(),
+		NvidiaSMIPath:     discoverNVIDIABinary("nvidia-smi"),
 		NvidiaIMEXPath:    discoverNVIDIABinary("nvidia-imex"),
 		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
 		DriverVersion:     libraries.driverVersion,
 	}, nil
+}
+
+const (
+	nvidiaPCIVendorID       = "0x10de"
+	pciDisplayClassPrefix   = "0x03"
+	nvidiaModprobeBinary    = "nvidia-modprobe"
+	nvidiaControlDeviceName = "nvidiactl"
+	nvidiaUVMDeviceName     = "nvidia-uvm"
+	nvidiaModesetDeviceName = "nvidia-modeset"
+)
+
+type nvidiaDeviceInitDeps struct {
+	hostDistro    func() string
+	pciDevicesDir string
+	deviceDir     string
+	readDir       func(string) ([]os.DirEntry, error)
+	readFile      func(string) ([]byte, error)
+	isCharDevice  func(string) bool
+	lookPath      func(string) (string, error)
+	runCommand    func(string, ...string) ([]byte, error)
+}
+
+func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
+	return nvidiaDeviceInitDeps{
+		hostDistro:    detectHostDistro,
+		pciDevicesDir: "/sys/bus/pci/devices",
+		deviceDir:     devDir,
+		readDir:       os.ReadDir,
+		readFile:      os.ReadFile,
+		isCharDevice: func(path string) bool {
+			info, err := os.Stat(path)
+
+			return err == nil && info.Mode()&os.ModeDevice != 0 && info.Mode()&os.ModeCharDevice != 0
+		},
+		lookPath: exec.LookPath,
+		runCommand: func(name string, args ...string) ([]byte, error) {
+			return exec.Command(name, args...).CombinedOutput()
+		},
+	}
+}
+
+func initializeAzureLinuxNVIDIADevices(deps nvidiaDeviceInitDeps) error {
+	if deps.hostDistro() != hostDistroAzureLinux3 || !hasNVIDIADisplayHardware(deps) {
+		return nil
+	}
+
+	modprobe, err := deps.lookPath(nvidiaModprobeBinary)
+	if err != nil {
+		return fmt.Errorf("locate %s on Azure Linux NVIDIA host: %w", nvidiaModprobeBinary, err)
+	}
+
+	for _, args := range [][]string{{"-u", "-c0"}, {"-m"}} {
+		output, runErr := deps.runCommand(modprobe, args...)
+		if runErr != nil {
+			return fmt.Errorf(
+				"run %s %s on Azure Linux NVIDIA host: %w: %s",
+				modprobe,
+				strings.Join(args, " "),
+				runErr,
+				strings.TrimSpace(string(output)),
+			)
+		}
+	}
+
+	if err := validateNVIDIADeviceNodes(deps); err != nil {
+		return fmt.Errorf("validate Azure Linux NVIDIA device initialization: %w", err)
+	}
+
+	return nil
+}
+
+func hasNVIDIADisplayHardware(deps nvidiaDeviceInitDeps) bool {
+	entries, err := deps.readDir(deps.pciDevicesDir)
+	if err != nil {
+		return false
+	}
+
+	for _, entry := range entries {
+		devicePath := filepath.Join(deps.pciDevicesDir, entry.Name())
+		vendor, vendorErr := deps.readFile(filepath.Join(devicePath, "vendor"))
+
+		class, classErr := deps.readFile(filepath.Join(devicePath, "class"))
+		if vendorErr != nil || classErr != nil {
+			continue
+		}
+
+		if strings.EqualFold(strings.TrimSpace(string(vendor)), nvidiaPCIVendorID) &&
+			strings.HasPrefix(strings.ToLower(strings.TrimSpace(string(class))), pciDisplayClassPrefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func validateNVIDIADeviceNodes(deps nvidiaDeviceInitDeps) error {
+	entries, err := deps.readDir(deps.deviceDir)
+	if err != nil {
+		return fmt.Errorf("read NVIDIA device directory %s: %w", deps.deviceDir, err)
+	}
+
+	present := make(map[string]bool, len(entries))
+	hasGPU := false
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !deps.isCharDevice(filepath.Join(deps.deviceDir, name)) {
+			continue
+		}
+
+		present[name] = true
+		hasGPU = hasGPU || isNVIDIAGPUDeviceName(name)
+	}
+
+	var missing []string
+	if !hasGPU {
+		missing = append(missing, "nvidia[0-9]+")
+	}
+
+	for _, name := range []string{
+		nvidiaControlDeviceName,
+		nvidiaUVMDeviceName,
+		nvidiaModesetDeviceName,
+	} {
+		if !present[name] {
+			missing = append(missing, name)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("required device nodes are missing from %s: %s", deps.deviceDir, strings.Join(missing, ", "))
+	}
+
+	return nil
+}
+
+func isNVIDIAGPUDeviceName(name string) bool {
+	suffix := strings.TrimPrefix(name, nvidiaDevPrefix)
+	if suffix == name || suffix == "" {
+		return false
+	}
+
+	for _, character := range suffix {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+
+	return true
 }
 
 // NVIDIAStateAvailable reports whether discovery produced all host state needed
@@ -365,10 +518,6 @@ func resolveNVIDIALibraries(arch nvidiaArch) nvidiaLibraryResolution {
 		i386LibDirMounts: i386Mounts,
 		driverVersion:    driverVersion,
 	}
-}
-
-func discoverNVIDIASMI() string {
-	return discoverNVIDIABinary("nvidia-smi")
 }
 
 func discoverNVIDIABinary(name string) string {

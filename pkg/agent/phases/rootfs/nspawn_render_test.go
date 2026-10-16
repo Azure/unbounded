@@ -170,6 +170,23 @@ func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	}
 }
 
+func TestNSpawnConfig_NVIDIAModesetDevice(t *testing.T) {
+	t.Parallel()
+
+	const modeset = "/dev/nvidia-modeset"
+
+	data := defaultNSpawnTemplateData("kube1")
+	data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{modeset})
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.Contains(t, nspawnBuf.String(), "Bind="+modeset)
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.Contains(t, overrideBuf.String(), "DeviceAllow="+modeset+" rwm")
+}
+
 func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	t.Parallel()
 
