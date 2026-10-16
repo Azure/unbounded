@@ -1872,6 +1872,34 @@ mod tests {
     }
 
     #[test]
+    fn origin_pool_keeps_metadata_headroom_under_outbound_saturation() {
+        use crate::admission::AdmissionPolicy;
+        use crate::admission::ResourceClass;
+        use flow_control::Policy;
+        let effective = |config: &Config| {
+            let outbound = AdmissionPolicy::new(config.limits.clone())
+                .limit(ResourceClass::OutboundConnection);
+            let cap = crate::app::origin_pool_capacity(
+                config.origin_connections_per_cache.get(),
+                outbound,
+            );
+            (cap, outbound)
+        };
+        // Stock budget: page GETs stop at cap - 1 active, before outbound
+        // admission is exhausted, so a HEAD can still open a connection.
+        let (cap, outbound) = effective(&parse(&[]).unwrap());
+        assert!(cap <= outbound, "{cap} > {outbound}");
+        assert!(cap - 1 < outbound);
+        // An explicit cap above outbound admission is bounded the same way.
+        let explicit = parse(&[("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "64")]).unwrap();
+        assert_eq!(effective(&explicit), (outbound, outbound));
+        // Large budgets keep the full default.
+        let large = parse(&[("RACER_CLIENT_CONNECTIONS", "16384")]).unwrap();
+        assert_eq!(effective(&large).0, DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE);
+        assert_eq!(crate::app::origin_pool_capacity(8, 0), 1);
+    }
+
+    #[test]
     fn diagnostics_accepts_expanded_pod_ip_of_either_family() {
         for (address, expected) in [
             ("192.0.2.1:9090", "192.0.2.1:9090"),

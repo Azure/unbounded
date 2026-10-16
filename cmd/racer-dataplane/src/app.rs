@@ -821,10 +821,10 @@ impl WorkerApplication {
             limits.connections_per_neighbor.get(),
         );
         http.config_mut().tcp_nodelay = config.peer_tcp_nodelay;
-        http.config_mut().secondary_cap = config
-            .origin_connections_per_cache
-            .get()
-            .min(limits.client_connections.get());
+        http.config_mut().secondary_cap = origin_pool_capacity(
+            config.origin_connections_per_cache.get(),
+            admission.limit(crate::admission::ResourceClass::OutboundConnection),
+        );
         let http = Rc::new(http);
         let io = Rc::new(crate::http::new_io(
             reactor.clone(),
@@ -2855,4 +2855,10 @@ mod lifecycle_policy_tests {
         assert!(poll_task(&mut task, &mut cx).is_none());
         assert!(task.is_some());
     }
+}
+
+/// Bound the per-cache origin pool by outbound admission so the pool's
+/// metadata reservation engages before page fetches hold every outbound slot.
+pub(crate) fn origin_pool_capacity(configured: usize, outbound: usize) -> usize {
+    configured.min(outbound).max(1)
 }
