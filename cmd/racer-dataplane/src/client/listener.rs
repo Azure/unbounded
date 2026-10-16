@@ -17,6 +17,7 @@ use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::CacheId;
+use racer_platform::reactor::ready_set::ReadySet;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -36,7 +37,6 @@ pub(super) use uds_endpoint::file_path;
 use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
 #[cfg(test)]
 pub(super) use uds_endpoint::same_inode;
-use uring_runtime::reactor::ready_set::ReadySet;
 
 enum Listener {
     Real(uds_endpoint::BoundSocket),
@@ -44,7 +44,7 @@ enum Listener {
     Sim(uds_endpoint::simulation::BoundSocket),
 }
 impl Listener {
-    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::descriptor::Descriptor, ())> {
+    fn accept(&self) -> std::io::Result<(racer_platform::reactor::descriptor::Descriptor, ())> {
         #[cfg(test)]
         if let Some(errno) = FAIL_ACCEPT.with(|fail| fail.take()) {
             return Err(std::io::Error::from_raw_os_error(errno));
@@ -156,7 +156,7 @@ impl BoundListener {
 }
 
 pub(super) struct Active {
-    pub(super) runnable: Arc<uring_runtime::drivers::Runnable>,
+    pub(super) runnable: Arc<racer_platform::drivers::Runnable>,
     pub(super) deadline: Rc<Cell<std::time::Instant>>,
     pub(super) expired: Option<std::time::Instant>,
     pub(super) cache: CacheId,
@@ -270,7 +270,7 @@ impl ClientListeners {
         let idle = Rc::new(Cell::new(!retirement_request));
         let task_idle = idle.clone();
         let timeout = self.request_timeout;
-        let deadline = Rc::new(Cell::new(uring_runtime::environment::now() + timeout));
+        let deadline = Rc::new(Cell::new(racer_platform::environment::now() + timeout));
         let task_deadline = deadline.clone();
         let parser = self.parser.clone();
         let reads = self.reads.clone();
@@ -303,7 +303,7 @@ impl ClientListeners {
             .await
         });
         self.active.borrow_mut().push_back(Active {
-            runnable: uring_runtime::drivers::Runnable::new(),
+            runnable: racer_platform::drivers::Runnable::new(),
             deadline,
             expired: None,
             cache,
@@ -327,7 +327,7 @@ impl ClientListeners {
             || !authorization
                 .allowed
                 .load(std::sync::atomic::Ordering::Acquire)
-            || uring_runtime::environment::now() >= authorization.deadline
+            || racer_platform::environment::now() >= authorization.deadline
         {
             return Ok(());
         }
@@ -400,7 +400,7 @@ impl ClientListeners {
             self.cleanup.borrow_mut().clear();
             self.retirement_records
                 .borrow_mut()
-                .retain(|record| record.live(uring_runtime::environment::now()));
+                .retain(|record| record.live(racer_platform::environment::now()));
             let old = self.listeners.borrow().clone();
             let old_by_name: BTreeMap<_, _> = old
                 .values()
@@ -439,7 +439,7 @@ impl ClientListeners {
                     name: listener.definition.name.clone(),
                     listener: Rc::downgrade(listener),
                     allowed: Arc::downgrade(&listener.backlog_allowed),
-                    deadline: uring_runtime::environment::now(),
+                    deadline: racer_platform::environment::now(),
                 });
             }
             // Commit must not allocate while adding deferred owners to the queue.
@@ -476,7 +476,7 @@ impl ClientListeners {
                     continue;
                 }
                 let mut random = [0; 16];
-                uring_runtime::environment::fill_random(&mut random)
+                racer_platform::environment::fill_random(&mut random)
                     .map_err(|_| Error::Unavailable)?;
                 let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
                 let previous = old_by_name.get(definition.name.as_str()).cloned();
@@ -566,8 +566,8 @@ impl ClientListeners {
             }
             let deadline = active.deadline.get();
             let force = active.expired != Some(deadline)
-                && (uring_runtime::environment::now() >= deadline
-                    || active.cancellation.is_cancelled());
+                && (racer_platform::environment::now() >= deadline
+                    || active.cancellation.is_canceled());
             if force {
                 active.expired = Some(deadline);
             }
@@ -613,7 +613,7 @@ impl ClientListeners {
             #[cfg(not(test))]
             let simulated = false;
             #[cfg(test)]
-            let simulated = uring_runtime::reactor::simulation::Simulation::current().is_some();
+            let simulated = racer_platform::simulation::Simulation::current().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
                 let key = self.sim_cursor.borrow().clone();
@@ -700,7 +700,7 @@ impl ClientListeners {
         };
         if !self.accepting.get()
             || entry.remaining == 0
-            || uring_runtime::environment::now() >= entry.deadline
+            || racer_platform::environment::now() >= entry.deadline
         {
             return;
         }
@@ -1042,11 +1042,13 @@ async fn serve_connection(
 
 pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestScope> {
     let mut id = [0; 16];
-    uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+    racer_platform::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId(id),
-        deadline: uring_runtime::environment::Deadline(uring_runtime::environment::now() + timeout),
+        deadline: racer_platform::environment::Deadline(
+            racer_platform::environment::now() + timeout,
+        ),
         cancellation,
     })
 }
@@ -1113,7 +1115,7 @@ impl ReadyListeners {
             let scope = self.scope.clone();
             Box::pin(async move {
                 let scope = scope.ok_or(Error::Internal)?;
-                uring_runtime::drivers::retry_listener(&scope, || {
+                racer_platform::drivers::retry_listener(&scope, || {
                     reactor.readiness_with_lease(
                         fd.clone(),
                         libc::POLLIN as u32,
@@ -1194,7 +1196,7 @@ impl PreparedListeners {
             retain
         });
         if self.accepting.get() {
-            let retirement_deadline = uring_runtime::environment::now() + self.retirement_timeout;
+            let retirement_deadline = racer_platform::environment::now() + self.retirement_timeout;
             for mut record in self.new_records.drain(..) {
                 record.deadline = retirement_deadline;
                 self.retirement_records.borrow_mut().push(record);
@@ -1345,7 +1347,7 @@ fn bind(
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
     #[cfg(test)]
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+    if let Some(sim) = racer_platform::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
         let listener =
             uds_endpoint::simulation::BoundSocket::bind(sim, directory.clone(), basename)

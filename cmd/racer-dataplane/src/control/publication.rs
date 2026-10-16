@@ -78,7 +78,7 @@ impl PublicationTarget {
     ) -> Result<Arc<Snapshot>> {
         self.published.publish(
             snapshot,
-            uring_runtime::environment::now(),
+            racer_platform::environment::now(),
             |_, next| {
                 if next.cluster != self.cluster {
                     return Err(Error::Unauthorized);

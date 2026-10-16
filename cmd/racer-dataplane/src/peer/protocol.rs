@@ -39,6 +39,7 @@ use racer_control_wire::NodeId;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::Keyring;
 use racer_crypto::identity::VerifiedPeer;
+use racer_platform::environment::Deadline;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
@@ -47,7 +48,6 @@ use std::time::Duration;
 use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
-use uring_runtime::environment::Deadline;
 
 pub enum FetchMode {
     CopyOnly,
@@ -1666,7 +1666,7 @@ pub(crate) mod tests {
             drop(response);
             let scope = RequestScope::new(
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                racer_platform::environment::now() + Duration::from_secs(30),
             )
             .unwrap();
             for case in 0..5 {
@@ -1999,7 +1999,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn parallel_connections_isolate_counters_and_wall_rollback_cannot_resurrect_frames() {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = racer_platform::environment::SimulationClock::new_at(
                 92,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2018,7 +2018,7 @@ pub(crate) mod tests {
             assert_eq!(other_b.rx, 0);
             other_b.admit(other_a.sign(frame()).unwrap()).unwrap();
             clock.advance(Duration::from_secs(61));
-            clock.set_wall_time(uring_runtime::environment::wall_now() - Duration::from_secs(61));
+            clock.set_wall_time(racer_platform::environment::wall_now() - Duration::from_secs(61));
             assert!(b.admit(old).is_err());
             assert_eq!(b.rx, 1);
             b.admit(a.sign(frame()).unwrap()).unwrap();
@@ -2026,7 +2026,7 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn more_than_4096_frames_at_fixed_time_have_constant_session_storage() {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = racer_platform::environment::SimulationClock::new_at(
                 71,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2034,7 +2034,7 @@ pub(crate) mod tests {
             let environment = clock.environment(0);
             let _guard = environment.enter();
             let (mut a, mut b) = pair();
-            let now = uring_runtime::environment::wall_now();
+            let now = racer_platform::environment::wall_now();
             let bytes = std::mem::size_of_val(&a) + std::mem::size_of_val(&b);
             for sequence in 1..=5000 {
                 let h = a.sign(frame()).unwrap();
@@ -2075,7 +2075,7 @@ pub(crate) mod tests {
             let pool = crate::http::new_pool(reactor.clone(), admission.clone(), 2);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-            let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+            let listener = Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
                 listener,
             ));
             let scope =
@@ -2212,7 +2212,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
-            use uring_runtime::reactor::IoBuffer;
+            use racer_platform::reactor::IoBuffer;
             let n = crate::test_support::security::network(2);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,

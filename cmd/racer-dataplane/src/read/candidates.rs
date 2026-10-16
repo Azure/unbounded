@@ -32,6 +32,7 @@ use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
 use racer_control_wire::NodeId;
+use racer_platform::environment::Deadline;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -40,7 +41,6 @@ use std::task::Poll;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
 
 fn reserve_hedge_pages(
     admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
@@ -1269,7 +1269,7 @@ impl CandidatePolicy {
             if links == 0 {
                 return Err(Error::HopBudgetExhausted);
             }
-            let now = uring_runtime::environment::now();
+            let now = racer_platform::environment::now();
             let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
             // Share bounds idle fallback. A separate nonrenewable local cap bounds
             // every exchange, even when no alternative is affordable.
@@ -1330,7 +1330,7 @@ impl CandidatePolicy {
                 .max(std::time::Duration::from_nanos(1));
             attempt_scope.set_candidate_body_budget(observation, complete_by)?;
             let mut bytes = [0; 16];
-            uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+            racer_platform::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
             let attempt = AttemptId(bytes);
             facts.attempt = Some(attempt);
             let credentials = &self.credentials;
@@ -1587,7 +1587,7 @@ fn candidate_final_validation_tail_preserves_identity_and_omissions() {
 
 fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> {
     scope.check()?;
-    if uring_runtime::environment::now() >= budget.deadline() {
+    if racer_platform::environment::now() >= budget.deadline() {
         Err(Error::DeadlineExceeded)
     } else {
         Ok(())
@@ -1879,7 +1879,7 @@ impl Hedges {
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
         let capacity = self.capacity.acquire(
             DUPLICATE_BYTES,
-            uring_runtime::environment::now() + self.config.delay,
+            racer_platform::environment::now() + self.config.delay,
         )?;
         Ok(Permit {
             owner: self.clone(),
@@ -1887,12 +1887,12 @@ impl Hedges {
         })
     }
     pub(crate) fn poll(&self) {
-        self.capacity.poll(uring_runtime::environment::now());
+        self.capacity.poll(racer_platform::environment::now());
     }
 }
 impl Permit {
     pub(crate) fn delay(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.capacity.delay(uring_runtime::environment::now(), cx)
+        self.capacity.delay(racer_platform::environment::now(), cx)
     }
     pub(crate) fn started(&self) {
         self.owner.metrics.record(Event::PageHedgeStarted, 1);
@@ -1904,12 +1904,12 @@ impl Permit {
         self.owner.metrics.record(Event::PageHedgeWon, 1);
     }
 }
-impl uring_runtime::drivers::HedgeScope for RequestScope {
+impl racer_platform::drivers::HedgeScope for RequestScope {
     fn cancel(&self) {
         let _ = RequestScope::cancel(self);
     }
 }
-impl uring_runtime::drivers::HedgePolicy<Error> for &Permit {
+impl racer_platform::drivers::HedgePolicy<Error> for &Permit {
     fn delay(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         Permit::delay(self, cx)
     }
@@ -1919,8 +1919,8 @@ impl uring_runtime::drivers::HedgePolicy<Error> for &Permit {
     fn failure(&mut self) -> Error {
         Error::Unavailable
     }
-    fn won(&mut self, contender: uring_runtime::drivers::Contender) {
-        if contender == uring_runtime::drivers::Contender::Secondary {
+    fn won(&mut self, contender: racer_platform::drivers::Contender) {
+        if contender == racer_platform::drivers::Contender::Secondary {
             Permit::won(self);
         }
     }
@@ -1936,7 +1936,7 @@ pub(crate) async fn race(
     parent: &crate::runtime::RequestScope,
     permit: &Permit,
 ) -> Result<crate::memory::PageResult> {
-    uring_runtime::drivers::race(
+    racer_platform::drivers::race(
         primary,
         secondary,
         primary_scope,
@@ -3168,11 +3168,11 @@ pub(super) mod tests {
         use crate::model::RequestId;
         use crate::read::tests::page;
         use crate::runtime::RequestScope;
+        use racer_platform::environment::SimulationClock;
+        use racer_platform::environment::now;
         use std::cell::Cell;
         use std::future::Future;
         use std::rc::Rc;
-        use uring_runtime::environment::SimulationClock;
-        use uring_runtime::environment::now;
         fn scope() -> RequestScope {
             RequestScope::new(RequestId([1; 16]), now() + Duration::from_secs(10)).unwrap()
         }
@@ -3255,7 +3255,7 @@ pub(super) mod tests {
                         );
                     } else {
                         assert!(result.is_pending());
-                        assert!(!a.cancellation.is_cancelled());
+                        assert!(!a.cancellation.is_canceled());
                         ready.set(true);
                         assert!(
                             matches!(work.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
@@ -3311,14 +3311,14 @@ pub(super) mod tests {
             let _env = clock.environment(0).enter();
             let owner = controller(1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+            let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
             let _guard = queue.enter();
             let (send, receive) = futures::channel::oneshot::channel();
             let fence = Rc::new(Cell::new(false));
             let primary_fence = fence.clone();
             let completion = Rc::new(Cell::new(false));
             let done = completion.clone();
-            uring_runtime::drivers::reserve()
+            racer_platform::drivers::reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
                     let a = scope();
@@ -3406,8 +3406,8 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(10));
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(a.cancellation.is_cancelled());
-            assert!(!parent.cancellation.is_cancelled());
+            assert!(a.cancellation.is_canceled());
+            assert!(!parent.cancellation.is_canceled());
             assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
             fence.set(true);
             assert!(
@@ -3446,7 +3446,7 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(10));
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(!a.cancellation.is_cancelled());
+            assert!(!a.cancellation.is_canceled());
             ready.set(true);
             assert!(
                 matches!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [7])
@@ -3479,7 +3479,7 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             parent.cancel().unwrap();
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(a.cancellation.is_cancelled() && b.cancellation.is_cancelled());
+            assert!(a.cancellation.is_canceled() && b.cancellation.is_canceled());
             assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
             fence.set(true);
             assert!(matches!(

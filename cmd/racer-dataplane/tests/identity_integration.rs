@@ -32,11 +32,11 @@ use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
 use racer_dataplane::security::PageCryptoEngine;
+use racer_platform::reactor::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::reactor::IoBuffer;
 
 const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";
@@ -276,7 +276,7 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     bundle.cache_keys = vec![record(2, 10)];
     install_decoded(&installer, &bundle).unwrap();
     assert!(keys.lease(Some(&cache), old_id, KeyPurpose::Page).is_err());
-    uring_runtime::group::Service::poll_budgeted(
+    racer_platform::group::Service::poll(
         &mut engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,

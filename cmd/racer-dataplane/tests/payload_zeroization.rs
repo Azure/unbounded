@@ -359,4 +359,4 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
-use uring_runtime::reactor::IoBuffer;
+use racer_platform::reactor::IoBuffer;

@@ -31,6 +31,7 @@ use page_alloc::SegmentState;
 use page_alloc::Segments;
 use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
+use racer_platform::drivers::yield_now;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -38,11 +39,10 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use uring_runtime::drivers::yield_now;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
-const SLOTS: uring_runtime::reactor::filesystem::checkpoint::Slots<HEADER_BYTES> =
-    uring_runtime::reactor::filesystem::checkpoint::Slots {
+const SLOTS: racer_platform::fs::checkpoint::Slots<HEADER_BYTES> =
+    racer_platform::fs::checkpoint::Slots {
         names: CHECKPOINT_NAMES,
         minimum_bytes: HEADER_BYTES + 4 + DIGEST_BYTES,
         maximum_bytes: MAX_CHECKPOINT_BYTES,
@@ -452,7 +452,7 @@ pub(crate) fn candidates(directory: &Path, budget: usize) -> Result<Candidates> 
 }
 
 pub(crate) type Candidates =
-    uring_runtime::reactor::filesystem::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
+    racer_platform::fs::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
 
 #[cfg(test)]
 pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {

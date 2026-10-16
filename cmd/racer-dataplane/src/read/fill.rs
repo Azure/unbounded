@@ -46,9 +46,9 @@ use crate::telemetry::Gauge;
 use crate::telemetry::LookupTier;
 use crate::telemetry::Metrics;
 use crate::telemetry::{Detail, FillAdmissionSite};
+use racer_platform::reactor::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
-use uring_runtime::reactor::IoBuffer;
 
 #[derive(Clone)]
 pub struct FillDependencies {
@@ -462,7 +462,7 @@ impl Fill {
             );
             // Always yield between scan quanta and the next reservation, including
             // the final retry. Cancellation never extends the original allowance.
-            uring_runtime::drivers::yield_now().await;
+            racer_platform::drivers::yield_now().await;
         }
     }
 
@@ -883,7 +883,7 @@ impl Fill {
             LookupTier::Ciphertext,
             self.dependencies.memory.unverified(page),
         )?);
-        let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+        let driver_permit = racer_platform::drivers::reserve().map_err(Error::from)?;
         let acquisition = waiter.acquisition(&leader)?;
         // The driver stays on this owner. Admit an independent zeroizing context
         // without crossing an AEAD domain.
@@ -973,10 +973,10 @@ impl Fill {
                 }
             });
             let result = std::future::poll_fn(|cx| {
-                if !caller_scope.cancellation.is_cancelled() {
+                if !caller_scope.cancellation.is_canceled() {
                     caller_cancellation.register(cx.waker());
                 }
-                if !owned_scope.cancellation.is_cancelled()
+                if !owned_scope.cancellation.is_canceled()
                     && (caller_scope.check().is_err() || operation.cancellation_requested())
                 {
                     if let Some(diagnostic) = &fill.diagnostic {
@@ -1020,8 +1020,8 @@ impl Fill {
             Ok(())
         }));
         let remaining = std::future::poll_fn(|cx| {
-            uring_runtime::drivers::poll(cx, 64);
-            if !self.fence_acquisition || !acquisition.scope.cancellation.is_cancelled() {
+            racer_platform::drivers::poll(cx, 64);
+            if !self.fence_acquisition || !acquisition.scope.cancellation.is_canceled() {
                 acquisition.cancellation.register(cx.waker());
             }
             if !self.fence_acquisition {
@@ -1179,7 +1179,7 @@ impl Fill {
         let mut receive = if let Some(existing) = existing {
             existing
         } else {
-            let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+            let permit = racer_platform::drivers::reserve().map_err(Error::from)?;
             let flight = self.dependencies.flights.reserve_copy_flight(page, scope)?;
             let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
             let (receive, completion) = self
@@ -1221,7 +1221,7 @@ impl Fill {
         std::future::poll_fn(|cx| {
             cancellation.register(cx.waker());
             scope.check()?;
-            uring_runtime::drivers::poll(cx, 64);
+            racer_platform::drivers::poll(cx, 64);
             std::pin::Pin::new(&mut receive).poll(cx)
         })
         .await
@@ -1492,7 +1492,7 @@ impl Fill {
             CandidateResolution::Copy(result) => result,
             CandidateResolution::Origin(authority) => {
                 authority.validate(&context.object, page.number)?;
-                budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+                budget.begin_attempt(racer_platform::environment::now(), scope.deadline.0)?;
                 scope.check()?;
                 // Peer reception owns its ciphertext allocation. Reserve encryption
                 // output only when this candidate actually needs an origin fill.
@@ -1594,7 +1594,7 @@ impl Fill {
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
-        use uring_runtime::reactor::IoBuffer;
+        use racer_platform::reactor::IoBuffer;
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
@@ -1718,7 +1718,7 @@ impl Fill {
         {
             return;
         }
-        let Ok(permit) = uring_runtime::drivers::reserve() else {
+        let Ok(permit) = racer_platform::drivers::reserve() else {
             return;
         };
         let mut fill = self.clone();

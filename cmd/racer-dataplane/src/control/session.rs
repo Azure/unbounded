@@ -169,7 +169,7 @@ impl controlplane::feed::Source<ReactorControlIo> for PublicationSource {
         digest: Option<&'a str>,
         limit: usize,
         scope: &'a RequestScope,
-    ) -> uring_runtime::Operation<'a, rest::Response, controlplane::feed::FetchError<Error>> {
+    ) -> racer_platform::Operation<'a, rest::Response, controlplane::feed::FetchError<Error>> {
         self.started.set(true);
         self.client.get(path, digest, limit, scope)
     }
@@ -511,11 +511,11 @@ impl Session {
         let failures = self.issuance_failures.get().saturating_add(1);
         self.issuance_failures.set(failures);
         let mut random = [0; 8];
-        uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+        racer_platform::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
         let ceiling = (1u64 << failures.saturating_sub(1).min(5)).min(30) * 1000;
         let delay = Duration::from_millis(1000 + u64::from_ne_bytes(random) % (ceiling - 999))
             .max(self.issuance_retry_after.take().unwrap_or_default());
-        uring_runtime::environment::now()
+        racer_platform::environment::now()
             .checked_add(delay)
             .ok_or(Error::InvalidRequest)
     }
@@ -570,7 +570,7 @@ impl Session {
             if self
                 .renewal_next
                 .get()
-                .is_some_and(|n| n > uring_runtime::environment::now())
+                .is_some_and(|n| n > racer_platform::environment::now())
             {
                 return Err(Error::Unavailable);
             }
@@ -681,7 +681,7 @@ impl Session {
                     self.enrollment_transport
                         .io()?
                         .sleep(
-                            uring_runtime::environment::now() + Duration::from_secs(1),
+                            racer_platform::environment::now() + Duration::from_secs(1),
                             scope,
                         )
                         .await?;
@@ -791,7 +791,7 @@ impl Session {
             && self
                 .renewal_next
                 .get()
-                .is_none_or(|n| n <= uring_runtime::environment::now())
+                .is_none_or(|n| n <= racer_platform::environment::now())
         {
             let result = async {
                 let nics = self.rails.persist(scope).await?;
@@ -982,7 +982,7 @@ pub(super) mod tests {
             digest: Option<&'a str>,
             _: usize,
             _: &'a RequestScope,
-        ) -> uring_runtime::Operation<'a, rest::Response, FetchError<Error>> {
+        ) -> racer_platform::Operation<'a, rest::Response, FetchError<Error>> {
             Box::pin(async move {
                 self.requests
                     .borrow_mut()
@@ -1005,7 +1005,7 @@ pub(super) mod tests {
 
     /// Explicit simulated clock progression with a host watchdog and CPU yield.
     fn drive<T>(
-        clock: &uring_runtime::environment::SimulationClock,
+        clock: &racer_platform::environment::SimulationClock,
         operation: impl Future<Output = T>,
     ) -> T {
         let mut operation = std::pin::pin!(operation);
@@ -1038,7 +1038,7 @@ pub(super) mod tests {
     fn scope() -> RequestScope {
         RequestScope::new(
             crate::model::RequestId([8; 16]),
-            uring_runtime::environment::now() + Duration::from_secs(300),
+            racer_platform::environment::now() + Duration::from_secs(300),
         )
         .unwrap()
     }
@@ -1092,7 +1092,7 @@ pub(super) mod tests {
 
     /// Preserve the former lagging-replica scenario through real generic scheduling.
     pub(crate) fn lagging_replica() {
-        let clock = uring_runtime::environment::SimulationClock::new(731);
+        let clock = racer_platform::environment::SimulationClock::new(731);
         let _time = clock.environment(0).enter();
         for pending in [false, true] {
             let session = session();
@@ -1152,7 +1152,7 @@ pub(super) mod tests {
                 assert_eq!(drive(&clock, sync.turn(&scope)), Err(error));
                 assert!(
                     sync.status().next_fetch
-                        >= uring_runtime::environment::now() + Duration::from_secs(7)
+                        >= racer_platform::environment::now() + Duration::from_secs(7)
                 );
                 assert_eq!(sync.status().accepted, Some(10));
                 assert_eq!(sync.status().pending, pending.then_some(11));
@@ -1201,7 +1201,7 @@ pub(super) mod tests {
                 Err(expected)
             );
         }
-        let clock = uring_runtime::environment::SimulationClock::new(732);
+        let clock = racer_platform::environment::SimulationClock::new(732);
         let _time = clock.environment(0).enter();
         let session = session();
         session.attach_io(host()).unwrap();
@@ -1229,7 +1229,7 @@ pub(super) mod tests {
 
     /// Key feed validates 204 and tracks its cursor independently of publication/issuance.
     pub(crate) fn independent_keyring() {
-        let clock = uring_runtime::environment::SimulationClock::new(733);
+        let clock = racer_platform::environment::SimulationClock::new(733);
         let _time = clock.environment(0).enter();
         let session = session();
         session.attach_io(host()).unwrap();
@@ -1290,7 +1290,7 @@ pub(super) mod tests {
 
     /// No string method or externally supplied delta digest exists in the feed API.
     pub(crate) fn canonical_delta_and_get_only() {
-        let clock = uring_runtime::environment::SimulationClock::new(734);
+        let clock = racer_platform::environment::SimulationClock::new(734);
         let _time = clock.environment(0).enter();
         let feed = Feed::new(
             PublicationCodec,
@@ -1334,7 +1334,7 @@ pub(super) mod tests {
     /// Pending documents, not lossy reconstructed snapshots, form the next delta base.
     #[test]
     fn pending_publication_delta_uses_exact_received_document() {
-        let clock = uring_runtime::environment::SimulationClock::new(735);
+        let clock = racer_platform::environment::SimulationClock::new(735);
         let _time = clock.environment(0).enter();
         let session = session();
         let first = document(10);
