@@ -21,9 +21,8 @@
 //! assert_eq!(x, y);
 //! ```
 
-use std::cell::RefCell;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use sha2::{Digest, Sha256};
 use uring_runtime::{Entropy, Error, ErrorKind, Result};
@@ -39,13 +38,17 @@ const BLOCK: usize = 32;
 ///
 /// Clones share one cursor: bytes read through a clone are not returned
 /// again by the original. Create one stream per simulated worker or role
-/// with a distinct `stream` number. `SimEntropy` is single-threaded
-/// (`!Send`); create a separate instance on each thread.
+/// with a distinct `stream` number.
+///
+/// `SimEntropy` is `Send + Sync` so a role's stream can move with the role
+/// to another thread (and clones on several threads share the cursor).
+/// Reads take an uncontended lock; which clone reads first decides which
+/// bytes it gets, so keep a stream on one thread at a time for replay.
 #[derive(Clone)]
-pub struct SimEntropy(Rc<RefCell<Cursor>>);
+pub struct SimEntropy(Arc<Mutex<Cursor>>);
 
 struct Cursor {
-    domain: Rc<[u8]>,
+    domain: Arc<[u8]>,
     seed: u64,
     stream: u64,
     counter: u64,
@@ -57,7 +60,7 @@ impl SimEntropy {
     /// Create the stream identified by `(domain, seed, stream)`, positioned at
     /// its first byte.
     pub fn new(domain: impl AsRef<[u8]>, seed: u64, stream: u64) -> Self {
-        Self(Rc::new(RefCell::new(Cursor {
+        Self(Arc::new(Mutex::new(Cursor {
             domain: domain.as_ref().into(),
             seed,
             stream,
@@ -69,17 +72,30 @@ impl SimEntropy {
 
     /// The seed this stream was created with.
     pub fn seed(&self) -> u64 {
-        self.0.borrow().seed
+        self.cursor_lock().seed
     }
 
     /// The stream number this stream was created with.
     pub fn stream(&self) -> u64 {
-        self.0.borrow().stream
+        self.cursor_lock().stream
+    }
+
+    /// Whether `self` and `other` are clones sharing one cursor.
+    pub fn ptr_eq(&self, other: &SimEntropy) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Lock the cursor. A panic cannot leave it inconsistent (every update is
+    /// a plain store after the fallible step), so poisoning is ignored.
+    fn cursor_lock(&self) -> MutexGuard<'_, Cursor> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(test)]
     fn set_cursor(&self, counter: u64, offset: usize, block: [u8; BLOCK]) {
-        let mut cursor = self.0.borrow_mut();
+        let mut cursor = self.cursor_lock();
         cursor.counter = counter;
         cursor.offset = offset;
         cursor.block = block;
@@ -87,7 +103,7 @@ impl SimEntropy {
 
     #[cfg(test)]
     fn cursor(&self) -> (u64, usize) {
-        let cursor = self.0.borrow();
+        let cursor = self.cursor_lock();
         (cursor.counter, cursor.offset)
     }
 }
@@ -124,13 +140,13 @@ impl Entropy for SimEntropy {
     /// Fails with [`ErrorKind::Unavailable`] only after 2^64 blocks; bytes
     /// copied before the failure stay in `buf`.
     fn fill(&self, buf: &mut [u8]) -> Result<()> {
-        self.0.borrow_mut().fill(buf)
+        self.cursor_lock().fill(buf)
     }
 }
 
 impl fmt::Debug for SimEntropy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let cursor = self.0.borrow();
+        let cursor = self.cursor_lock();
         f.debug_struct("SimEntropy")
             .field("seed", &cursor.seed)
             .field("stream", &cursor.stream)
@@ -196,6 +212,22 @@ mod tests {
         );
         assert_eq!((entropy.seed(), entropy.stream()), (7, 11));
         assert!(format!("{entropy:?}").contains("stream: 11"));
+    }
+
+    #[test]
+    fn streams_are_send_and_clones_share_the_cursor_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SimEntropy>();
+        let whole = read(&SimEntropy::new(DEFAULT_ENTROPY_DOMAIN, 3, 4), 64);
+        let entropy = SimEntropy::new(DEFAULT_ENTROPY_DOMAIN, 3, 4);
+        let remote = entropy.clone();
+        assert!(remote.ptr_eq(&entropy));
+        assert!(!entropy.ptr_eq(&SimEntropy::new(DEFAULT_ENTROPY_DOMAIN, 3, 4)));
+        let first = std::thread::spawn(move || read(&remote, 40))
+            .join()
+            .unwrap();
+        assert_eq!(first, whole[..40]);
+        assert_eq!(read(&entropy, 24), whole[40..]);
     }
 
     #[test]
