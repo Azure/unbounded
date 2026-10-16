@@ -368,45 +368,6 @@ VERSION_ID=24.04`,
 	}
 }
 
-func TestHostIsAzureLinux3FromOSReleaseData(t *testing.T) {
-	tests := []struct {
-		name      string
-		osRelease string
-		want      bool
-	}{
-		{
-			name: "azure linux 3",
-			osRelease: `ID=azurelinux
-VERSION_ID=3.0`,
-			want: true,
-		},
-		{
-			name: "ubuntu",
-			osRelease: `ID=ubuntu
-VERSION_ID=24.04`,
-		},
-		{
-			name: "generic rpm host",
-			osRelease: `ID=fedora
-VERSION_ID=44
-ID_LIKE="rhel fedora"`,
-		},
-		{
-			name: "azure container linux",
-			osRelease: `ID=azurelinux
-ID_LIKE=flatcar
-VARIANT_ID=azurecontainerlinux
-VERSION_ID=3.0.20260809`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hostIsAzureLinux3FromOSReleaseData([]byte(tt.osRelease)))
-		})
-	}
-}
-
 // TestResolveKubelet_EmptyAuthAllowed verifies that resolveKubelet does
 // not reject a config with an empty Kubelet.Auth. In the metalman
 // PXE/attestation flow the bootstrap token is fetched from the metalman

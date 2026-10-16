@@ -129,55 +129,17 @@ type NvidiaRuntime struct {
 // architectures. On a non-GPU host the returned struct has all nil/empty
 // fields (except ContainerLibDir).
 func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
-	return resolveNvidiaHost(arch, defaultNvidiaHostResolverDeps())
-}
-
-type nvidiaHostResolverDeps struct {
-	isAzureLinux3    func() bool
-	pciDevicesDir    string
-	deviceDir        string
-	readDir          func(string) ([]os.DirEntry, error)
-	readFile         func(string) ([]byte, error)
-	isCharDevice     func(string) bool
-	lookPath         func(string) (string, error)
-	runCommand       func(string, ...string) ([]byte, error)
-	resolveLibraries func(nvidiaArch) nvidiaLibraryResolution
-	discoverBinary   func(string) string
-}
-
-func defaultNvidiaHostResolverDeps() nvidiaHostResolverDeps {
-	return nvidiaHostResolverDeps{
-		isAzureLinux3: hostIsAzureLinux3,
-		pciDevicesDir: "/sys/bus/pci/devices",
-		deviceDir:     devDir,
-		readDir:       os.ReadDir,
-		readFile:      os.ReadFile,
-		isCharDevice: func(path string) bool {
-			info, err := os.Stat(path)
-
-			return err == nil && info.Mode()&os.ModeDevice != 0 && info.Mode()&os.ModeCharDevice != 0
-		},
-		lookPath: exec.LookPath,
-		runCommand: func(name string, args ...string) ([]byte, error) {
-			return exec.Command(name, args...).CombinedOutput()
-		},
-		resolveLibraries: resolveNVIDIALibraries,
-		discoverBinary:   discoverNVIDIABinary,
-	}
-}
-
-func resolveNvidiaHost(arch string, deps nvidiaHostResolverDeps) (NvidiaHost, error) {
 	archInfo, ok := nvidiaArchMap[arch]
 	if !ok {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	if err := initializeAzureLinuxNVIDIADevices(deps); err != nil {
+	if err := initializeAzureLinuxNVIDIADevices(defaultNvidiaDeviceInitDeps()); err != nil {
 		return NvidiaHost{}, err
 	}
 
-	devices := discoverNVIDIADevicesIn(deps.deviceDir)
-	libraries := deps.resolveLibraries(archInfo)
+	devices := discoverNVIDIADevices()
+	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
 		GPUDevicePaths:    devices,
@@ -186,9 +148,9 @@ func resolveNvidiaHost(arch string, deps nvidiaHostResolverDeps) (NvidiaHost, er
 		LibDirMounts:      libraries.libDirMounts,
 		I386LibMappings:   libraries.i386LibMappings,
 		I386LibDirMounts:  libraries.i386LibDirMounts,
-		NvidiaSMIPath:     deps.discoverBinary("nvidia-smi"),
-		NvidiaIMEXPath:    deps.discoverBinary("nvidia-imex"),
-		NvidiaIMEXCtlPath: deps.discoverBinary("nvidia-imex-ctl"),
+		NvidiaSMIPath:     discoverNVIDIABinary("nvidia-smi"),
+		NvidiaIMEXPath:    discoverNVIDIABinary("nvidia-imex"),
+		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
 		DriverVersion:     libraries.driverVersion,
 	}, nil
 }
@@ -202,8 +164,38 @@ const (
 	nvidiaModesetDeviceName = "nvidia-modeset"
 )
 
-func initializeAzureLinuxNVIDIADevices(deps nvidiaHostResolverDeps) error {
-	if !deps.isAzureLinux3() || !hasNVIDIADisplayHardware(deps) {
+type nvidiaDeviceInitDeps struct {
+	hostDistro    func() string
+	pciDevicesDir string
+	deviceDir     string
+	readDir       func(string) ([]os.DirEntry, error)
+	readFile      func(string) ([]byte, error)
+	isCharDevice  func(string) bool
+	lookPath      func(string) (string, error)
+	runCommand    func(string, ...string) ([]byte, error)
+}
+
+func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
+	return nvidiaDeviceInitDeps{
+		hostDistro:    detectHostDistro,
+		pciDevicesDir: "/sys/bus/pci/devices",
+		deviceDir:     devDir,
+		readDir:       os.ReadDir,
+		readFile:      os.ReadFile,
+		isCharDevice: func(path string) bool {
+			info, err := os.Stat(path)
+
+			return err == nil && info.Mode()&os.ModeDevice != 0 && info.Mode()&os.ModeCharDevice != 0
+		},
+		lookPath: exec.LookPath,
+		runCommand: func(name string, args ...string) ([]byte, error) {
+			return exec.Command(name, args...).CombinedOutput()
+		},
+	}
+}
+
+func initializeAzureLinuxNVIDIADevices(deps nvidiaDeviceInitDeps) error {
+	if deps.hostDistro() != hostDistroAzureLinux3 || !hasNVIDIADisplayHardware(deps) {
 		return nil
 	}
 
@@ -232,7 +224,7 @@ func initializeAzureLinuxNVIDIADevices(deps nvidiaHostResolverDeps) error {
 	return nil
 }
 
-func hasNVIDIADisplayHardware(deps nvidiaHostResolverDeps) bool {
+func hasNVIDIADisplayHardware(deps nvidiaDeviceInitDeps) bool {
 	entries, err := deps.readDir(deps.pciDevicesDir)
 	if err != nil {
 		return false
@@ -256,7 +248,7 @@ func hasNVIDIADisplayHardware(deps nvidiaHostResolverDeps) bool {
 	return false
 }
 
-func validateNVIDIADeviceNodes(deps nvidiaHostResolverDeps) error {
+func validateNVIDIADeviceNodes(deps nvidiaDeviceInitDeps) error {
 	entries, err := deps.readDir(deps.deviceDir)
 	if err != nil {
 		return fmt.Errorf("read NVIDIA device directory %s: %w", deps.deviceDir, err)
@@ -377,6 +369,10 @@ var nvidiaArchMap = map[string]nvidiaArch{
 //
 // Returns nil (not an error) when no NVIDIA devices are found; the host
 // simply does not have NVIDIA GPUs or the driver is not loaded.
+func discoverNVIDIADevices() []string {
+	return discoverNVIDIADevicesIn(devDir)
+}
+
 func discoverNVIDIADevicesIn(deviceDir string) []string {
 	var devices []string
 
