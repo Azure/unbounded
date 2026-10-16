@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,7 +20,27 @@ import (
 
 	"github.com/Azure/unbounded/internal/net/ipam"
 	ipamproto "github.com/Azure/unbounded/internal/net/ipam/proto"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
+
+func setPodCIDRPreferredSources(manager *unboundednetnetlink.UnifiedRouteManager, cidrs []string) {
+	var ipv4, ipv6 net.IP
+
+	for _, cidr := range cidrs {
+		gateway := getGatewayIPFromCIDR(cidr)
+		if gateway == nil {
+			continue
+		}
+
+		if gateway.To4() != nil {
+			ipv4 = gateway
+		} else {
+			ipv6 = gateway
+		}
+	}
+
+	manager.SetPreferredSourceIPs(ipv4, ipv6)
+}
 
 func registerIPAMFlags(flags *pflag.FlagSet, cfg *config) {
 	flags.StringVar(&cfg.IPAMSocketPath, "ipam-socket-path", ipam.DefaultSocketPath, "Unix socket shared with unbounded-ipam on the host")
@@ -48,6 +69,14 @@ func (h *nodeHealthState) setVerifiedIPAMAssignment(cidrs []string) {
 	defer h.mu.Unlock()
 
 	h.verifiedIPAMCIDRs = slices.Clone(cidrs)
+	h.podCIDRs = slices.Clone(cidrs)
+}
+
+func (h *nodeHealthState) verifiedIPAMAssignment() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return slices.Clone(h.verifiedIPAMCIDRs)
 }
 
 func (h *nodeHealthState) getIPAMConfig() (*ipamproto.Config, error) {
