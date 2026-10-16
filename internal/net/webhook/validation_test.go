@@ -365,15 +365,16 @@ func TestDecodeSiteFromRequest(t *testing.T) {
 
 // TestAssignmentEnabledAndIPFamily tests assignment enabled and ipfamily.
 func TestAssignmentEnabledAndIPFamily(t *testing.T) {
-	if !assignmentEnabled(nil) {
+	spec := unboundedv1alpha3.SiteSpec{}
+	if !spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{}) {
 		t.Fatalf("expected nil assignmentEnabled to default true")
 	}
 
-	if assignmentEnabled(boolPtr(false)) {
+	if spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{AssignmentEnabled: new(false)}) {
 		t.Fatalf("expected explicit false assignmentEnabled")
 	}
 
-	if !assignmentEnabled(boolPtr(true)) {
+	if !spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{AssignmentEnabled: new(true)}) {
 		t.Fatalf("expected explicit true assignmentEnabled")
 	}
 
@@ -382,6 +383,43 @@ func TestAssignmentEnabledAndIPFamily(t *testing.T) {
 	_, v6, _ := net.ParseCIDR("fd00::/64")
 	if ipFamily(v4) != "ipv4" || ipFamily(v6) != "ipv6" {
 		t.Fatalf("unexpected ip families: %s %s", ipFamily(v4), ipFamily(v6))
+	}
+}
+
+func TestUnmanagedAssignmentValidation(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			ManageCniPlugin: new(false),
+			NodeCidrs:       []string{"10.0.0.0/16"},
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+				CidrBlocks: []string{"10.244.0.0/16"},
+				NodeRegex:  []string{"("},
+			}},
+		},
+	}
+	if err := validateSiteSpec(site); err != nil {
+		t.Fatalf("inherited disabled assignment validated allocation settings: %v", err)
+	}
+
+	entries, err := collectPodCIDRs([]unboundedv1alpha3.Site{site})
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("inherited disabled assignment included in allocation overlap checks: %v, %v", entries, err)
+	}
+
+	site.Spec.PodCidrAssignments[0].AssignmentEnabled = new(true)
+	if err := validateSiteSpec(site); err == nil || !strings.Contains(err.Error(), "nodeRegex") {
+		t.Fatalf("explicit enabled assignment skipped regex validation: %v", err)
+	}
+
+	entries, err = collectPodCIDRs([]unboundedv1alpha3.Site{site})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("explicit enabled assignment missing from overlap checks: %v, %v", entries, err)
+	}
+
+	site.Spec.PodCidrAssignments[0].AssignmentEnabled = new(false)
+	if err := validateSiteSpec(site); err != nil {
+		t.Fatalf("explicit disabled assignment validated allocation settings: %v", err)
 	}
 }
 

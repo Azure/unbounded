@@ -709,9 +709,13 @@ existing installation directory rather than creating a container-local binary
 directory. Ensure that directory is actually backed by the host mount.
 
 For a third-party CNI, set `manageCniPlugin: false` on the Site and delegate
-IPAM to `unbounded-ipam`. The agent obtains the startup assignment and serves
-IPAM without inspecting or changing that CNI's bridge or conflist. Nodes with
-no assignment remain unavailable for allocation without blocking their
+IPAM to `unbounded-ipam`. Set `assignmentEnabled: true` on each desired
+`spec.podCidrAssignments` rule to have Unbounded allocate Node PodCIDRs, or use
+another controller that populates `Node.spec.podCIDRs`. With CNI management
+disabled, omitted assignment settings default to disabled. The agent obtains
+the startup assignment and serves IPAM without inspecting or changing that
+CNI's bridge or conflist. Nodes with no assignment remain unavailable for
+allocation without blocking their
 otherwise-unmanaged routing bootstrap. To retain direct host-local instead,
 provide your own conflist and set `manageCniPlugin: false`.
 
