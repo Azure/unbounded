@@ -977,6 +977,29 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 	}
 }
 
+func adoptedSiteCNISettings(siteInformer cache.SharedIndexInformer, siteName string) (bool, int, error) {
+	obj, exists, err := siteInformer.GetStore().GetByKey(siteName)
+	if err != nil {
+		return false, 0, fmt.Errorf("look up adopted Site %q: %w", siteName, err)
+	}
+
+	if !exists {
+		return false, 0, fmt.Errorf("adopted Site %q is not available; refusing to select CNI mode", siteName)
+	}
+
+	unstr, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return false, 0, fmt.Errorf("adopted Site %q has unexpected cache type %T", siteName, obj)
+	}
+
+	site, err := parseSite(unstr)
+	if err != nil {
+		return false, 0, fmt.Errorf("parse adopted Site %q: %w", siteName, err)
+	}
+
+	return site.Spec.ManageCniPlugin == nil || *site.Spec.ManageCniPlugin, tunnelMTUFromSpec(site.Spec.TunnelMTU), nil
+}
+
 // getManageCniPluginFromCRDs checks if the site has manageCniPlugin enabled by looking up the site CRD.
 // Returns true (the default) if the site doesn't exist or doesn't have the field set.
 func getManageCniPluginFromCRDs(siteInformer cache.SharedIndexInformer, siteName string) bool {
@@ -1010,30 +1033,6 @@ func getManageCniPluginFromCRDs(siteInformer cache.SharedIndexInformer, siteName
 // siteHasUnmanagedCNI reports whether the site explicitly sets manageCniPlugin=false.
 func siteHasUnmanagedCNI(site *unboundedv1alpha3.Site) bool {
 	return site != nil && site.Spec.ManageCniPlugin != nil && !*site.Spec.ManageCniPlugin
-}
-
-func getSiteTunnelMTUFromCRDs(siteInformer cache.SharedIndexInformer, siteName string) int {
-	if siteName == "" {
-		return 0
-	}
-
-	for _, item := range siteInformer.GetStore().List() {
-		unstr, ok := item.(*unstructured.Unstructured)
-		if !ok {
-			continue
-		}
-
-		site, err := parseSite(unstr)
-		if err != nil {
-			continue
-		}
-
-		if site.Name == siteName {
-			return tunnelMTUFromSpec(site.Spec.TunnelMTU)
-		}
-	}
-
-	return 0
 }
 
 var configureWireGuardFunc = configureWireGuard

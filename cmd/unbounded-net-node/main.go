@@ -901,9 +901,11 @@ func run(cfg *config) (resultErr error) {
 
 	mySiteName := adoptedAssignment.site
 
-	// Check if this node's site has manageCniPlugin enabled using the informer cache
-	manageCniPlugin := getManageCniPluginFromCRDs(siteInformer, mySiteName)
-	siteTunnelMTU := getSiteTunnelMTUFromCRDs(siteInformer, mySiteName)
+	manageCniPlugin, siteTunnelMTU, err := adoptedSiteCNISettings(siteInformer, mySiteName)
+	if err != nil {
+		return err
+	}
+
 	healthState.setBootstrapSnapshot(cfg.NodeName, mySiteName, pubKey, nil, isGatewayNode)
 
 	initialCNIConfigMTU := resolveInitialCNIConfigMTU(cfg.MTU, siteTunnelMTU, unboundednetnetlink.DetectDefaultRouteMTU())

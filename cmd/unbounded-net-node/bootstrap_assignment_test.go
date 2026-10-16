@@ -258,6 +258,36 @@ func TestWaitForAdoptedNodePodCIDRsAndConfigureCancellationPreservesCNI(t *testi
 	}
 }
 
+func TestAdoptedSiteCNISettingsRequireSite(t *testing.T) {
+	informer := newTestInformer()
+	if managed, _, err := adoptedSiteCNISettings(informer, "site-a"); err == nil || managed {
+		t.Fatalf("missing Site selected CNI mode: managed=%v err=%v", managed, err)
+	}
+
+	unmanaged := false
+
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
+		Spec:       unboundedv1alpha3.SiteSpec{ManageCniPlugin: &unmanaged, TunnelMTU: new(int32(1200))},
+	}
+	if err := informer.GetStore().Add(toUnstructuredSiteWatch(t, site)); err != nil {
+		t.Fatal(err)
+	}
+
+	if managed, mtu, err := adoptedSiteCNISettings(informer, "site-a"); err != nil || managed || mtu != 1200 {
+		t.Fatalf("late unmanaged Site: managed=%v mtu=%d err=%v", managed, mtu, err)
+	}
+
+	site.Spec.ManageCniPlugin = nil
+	if err := informer.GetStore().Update(toUnstructuredSiteWatch(t, site)); err != nil {
+		t.Fatal(err)
+	}
+
+	if managed, _, err := adoptedSiteCNISettings(informer, "site-a"); err != nil || !managed {
+		t.Fatalf("existing default Site: managed=%v err=%v", managed, err)
+	}
+}
+
 func TestGatewayAssignmentSkipsManagedCNI(t *testing.T) {
 	assignment := nodeAssignment{site: "site-a", gatewayPool: "pool-a", nodeUID: types.UID("uid-a")}
 	siteInformer := newTestInformer()
