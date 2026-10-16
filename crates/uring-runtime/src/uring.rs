@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 
 use crate::backend::{
-    BackendConfig, CompletionEntry, KernelTimespec, Op, OpKind, PushError, RemoteWaker,
+    BackendConfig, CompletionEntry, KernelTimespec, Op, OpKind, PushError, PushHints, RemoteWaker,
 };
 use crate::{
     Backend, Error, ErrorKind, Fd, Host, Result, SockAddr, SocketAddress, SystemClock,
@@ -327,6 +327,16 @@ impl Backend for Uring {
     }
 
     unsafe fn push(&mut self, user_data: u64, op: &Op<'_, Fd>) -> Result<(), PushError> {
+        // SAFETY: forwarded from our caller.
+        unsafe { self.push_with(user_data, op, PushHints::new()) }
+    }
+
+    unsafe fn push_with(
+        &mut self,
+        user_data: u64,
+        op: &Op<'_, Fd>,
+        hints: PushHints,
+    ) -> Result<(), PushError> {
         let ring = self.ring()?;
         let entry: squeue::Entry = match *op {
             Op::Nop => opcode::Nop::new().build(),
@@ -437,7 +447,10 @@ impl Backend for Uring {
         if !ring.probe.is_supported(entry.get_opcode() as u8) {
             return Err(PushError::Unsupported);
         }
-        let entry = entry.user_data(user_data);
+        let mut entry = entry.user_data(user_data);
+        if hints.offload {
+            entry = entry.flags(squeue::Flags::ASYNC);
+        }
         // SAFETY: the caller guarantees every pointer in `op` stays valid
         // until the completion for `user_data` is popped.
         unsafe { ring.ring.submission().push(&entry) }.map_err(|_| PushError::Full)

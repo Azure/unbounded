@@ -89,6 +89,42 @@ impl BackendConfig {
     }
 }
 
+/// Optional submission hints, passed to [`Backend::push_with`].
+///
+/// Hints never change an operation's meaning or result, only how a backend
+/// executes it. Backends ignore hints they have no use for.
+///
+/// ```
+/// use uring_runtime::backend::PushHints;
+///
+/// let hints = PushHints::new().with_offload(true);
+/// assert!(hints.offload);
+/// assert_eq!(PushHints::default(), PushHints::new());
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct PushHints {
+    /// Execute the operation in a kernel worker instead of first attempting
+    /// it inline during submission (io_uring `IOSQE_ASYNC`). Useful for
+    /// operations that are known to block, such as cold buffered file reads,
+    /// so that submission does not stall the reactor thread.
+    pub offload: bool,
+}
+
+impl PushHints {
+    /// No hints.
+    pub const fn new() -> Self {
+        Self { offload: false }
+    }
+
+    /// Set [`offload`](PushHints::offload).
+    #[must_use]
+    pub const fn with_offload(mut self, offload: bool) -> Self {
+        self.offload = offload;
+        self
+    }
+}
+
 /// A completed operation, as reported by [`Backend::pop`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct CompletionEntry {
@@ -469,6 +505,25 @@ pub trait Backend: 'static {
     /// [`pop`](Backend::pop). If `push` returns an error, the operation was
     /// not queued and no completion will be produced.
     unsafe fn push(&mut self, user_data: u64, op: &Op<'_, Self::Fd>) -> Result<(), PushError>;
+
+    /// Queue `op` like [`push`](Backend::push), applying `hints`.
+    ///
+    /// The reactor always calls this method. The default implementation
+    /// ignores the hints and calls [`push`](Backend::push).
+    ///
+    /// # Safety
+    ///
+    /// The same as for [`push`](Backend::push).
+    unsafe fn push_with(
+        &mut self,
+        user_data: u64,
+        op: &Op<'_, Self::Fd>,
+        hints: PushHints,
+    ) -> Result<(), PushError> {
+        let _ = hints;
+        // SAFETY: forwarded from our caller.
+        unsafe { self.push(user_data, op) }
+    }
 
     /// Queue a request to cancel the operation tagged `target`. The request
     /// itself completes with `user_data` (`0`, `-ENOENT` or `-EALREADY`, as

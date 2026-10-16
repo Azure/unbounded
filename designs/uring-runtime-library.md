@@ -164,6 +164,8 @@ pub trait Backend: 'static {
     fn entropy(&self) -> &Self::Entropy;
     fn init(&mut self, config: &BackendConfig) -> Result<()>;
     unsafe fn push(&mut self, user_data: u64, op: &Op<'_, Self::Fd>) -> Result<(), PushError>;
+    unsafe fn push_with(&mut self, user_data: u64, op: &Op<'_, Self::Fd>, hints: PushHints)
+        -> Result<(), PushError>;                       // default: ignore hints, call push
     fn cancel(&mut self, user_data: u64, target: u64) -> Result<(), PushError>;
     unsafe fn adopt_fd(&mut self, raw: i32) -> Self::Fd;   // own an Accept/OpenAt2 result
     fn submit(&mut self) -> Result<usize>;
@@ -188,6 +190,11 @@ writes the absolute `CLOCK_MONOTONIC` time into the reactor-owned `timespec`
 referent must stay valid and unaliased until the completion for `user_data`
 has been popped, so a backend may hand them to the kernel or keep them and
 complete later. `OpKind` mirrors the variants plus `Cancel`.
+The reactor always calls `push_with`. `PushHints` (`#[non_exhaustive]`,
+`Default`, `with_offload`) carries execution hints that never change an
+operation's result: `offload` asks for execution in a kernel worker instead
+of an inline attempt during submission (`IOSQE_ASYNC` on `Uring`); backends
+without that distinction ignore it.
 `PushError { Full, Unsupported, Failed(Error) }` converts into `Error`
 (`Full` -> `Overloaded`). `BackendConfig::new(capacity: u32)` is
 `#[non_exhaustive]`. `CompletionEntry::into_result() -> Result<u32>`.
@@ -279,6 +286,7 @@ pub fn leaked_operations() -> usize;   // process-wide count of leaked operation
 impl Operation<..> {
     pub fn reserved(self, r: &Reservation) -> Self;               // before first poll
     pub fn lease<L>(self, lease: L) -> Operation<.., Leased<L>>;  // output becomes (output, L)
+    pub fn offload(self) -> Self;                                 // PushHints::offload, before first poll
     pub fn is_submitted(&self) -> bool;
 }
 ```

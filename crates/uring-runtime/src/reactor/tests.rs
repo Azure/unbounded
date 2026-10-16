@@ -12,7 +12,9 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::backend::{BackendConfig, CompletionEntry, Op, OpKind, PushError, RemoteWaker};
+use crate::backend::{
+    BackendConfig, CompletionEntry, Op, OpKind, PushError, PushHints, RemoteWaker,
+};
 use crate::{
     BufResult, CancelToken, Entropy, ErrorKind, IoBuf, IoBufMut, SocketAddress, SystemClock,
     SystemEntropy, Unscoped,
@@ -47,6 +49,8 @@ struct MockState {
     /// Complete canceled targets with -ECANCELED automatically on submit.
     auto_cancel: bool,
     adopted: Vec<Weak<i32>>,
+    /// Hints of every `push_with` call, in order.
+    hints: Vec<(OpKind, PushHints)>,
 }
 
 /// A scripted backend. Tests keep a [`Handle`] to drive it.
@@ -166,6 +170,17 @@ impl Backend for Mock {
             buf,
         });
         Ok(())
+    }
+
+    unsafe fn push_with(
+        &mut self,
+        user_data: u64,
+        op: &Op<'_, MockFd>,
+        hints: PushHints,
+    ) -> Result<(), PushError> {
+        self.state.borrow_mut().hints.push((op.kind(), hints));
+        // SAFETY: forwarded from our caller.
+        unsafe { self.push(user_data, op) }
     }
 
     fn cancel(&mut self, user_data: u64, target: u64) -> Result<(), PushError> {
@@ -1468,4 +1483,37 @@ fn wait_does_not_block_with_pending_cancellation_work() {
     mock.complete_cancel(op.user_data, 0);
     reactor.poll(8).unwrap();
     assert_eq!(reactor.in_flight(), 0);
+}
+
+#[test]
+fn offload_hint_reaches_the_backend() {
+    let (reactor, mock) = reactor();
+    let fd: MockFd = Rc::new(3);
+    let mut plain = reactor.read_at(&fd, 0, Vec::with_capacity(4), &Unscoped);
+    let mut offloaded = reactor.write_at(&fd, 0, vec![1u8; 4], &Unscoped).offload();
+    assert!(poll_noop(&mut plain).is_pending());
+    assert!(poll_noop(&mut offloaded).is_pending());
+    assert_eq!(
+        mock.state.borrow().hints,
+        [
+            (OpKind::Read, PushHints::new()),
+            (OpKind::Write, PushHints::new().with_offload(true)),
+        ]
+    );
+    reactor.poll(usize::MAX).unwrap();
+    for op in mock.pending() {
+        mock.complete(op.user_data, 0);
+    }
+    reactor.poll(usize::MAX).unwrap();
+    assert_eq!(ready(poll_noop(&mut plain)).result.unwrap(), 0);
+    assert_eq!(ready(poll_noop(&mut offloaded)).result.unwrap(), 0);
+}
+
+#[test]
+#[should_panic(expected = "offload called after the first poll")]
+fn offload_after_poll_panics() {
+    let (reactor, _mock) = reactor();
+    let mut op = reactor.nop(&Unscoped);
+    assert!(poll_noop(&mut op).is_pending());
+    drop(op.offload());
 }

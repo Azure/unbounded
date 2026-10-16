@@ -13,7 +13,7 @@ use std::ptr::NonNull;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use crate::backend::{KernelTimespec, Op, OpKind, OpenHow};
+use crate::backend::{KernelTimespec, Op, OpKind, OpenHow, PushHints};
 use crate::{
     Backend, BufResult, Error, ErrorKind, IoBuf, IoBufMut, Result, Scope, SockAddr, SocketAddress,
 };
@@ -116,6 +116,7 @@ enum Stage<O, S, L> {
         scope: S,
         lease: L,
         reservation: Option<Reservation>,
+        hints: PushHints,
     },
     Submitted {
         key: u64,
@@ -137,6 +138,7 @@ impl<'r, B: Backend, O: OpSpec<B>, S: Scope, L: 'static> Operation<'r, B, O, S, 
                 scope: scope.clone(),
                 lease,
                 reservation: None,
+                hints: PushHints::new(),
             },
         }
     }
@@ -155,6 +157,22 @@ impl<'r, B: Backend, O: OpSpec<B>, S: Scope, L: 'static> Operation<'r, B, O, S, 
         self
     }
 
+    /// Ask the backend to execute this operation in a kernel worker rather
+    /// than inline during submission (see [`PushHints::offload`]). Use it for
+    /// operations expected to block, such as cold buffered file I/O. It does
+    /// not change the operation's result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation was already polled.
+    pub fn offload(mut self) -> Self {
+        match &mut self.stage {
+            Stage::Unsubmitted { hints, .. } => *hints = hints.with_offload(true),
+            _ => panic!("Operation::offload called after the first poll"),
+        }
+        self
+    }
+
     /// Whether the operation was submitted and has not resolved yet.
     pub fn is_submitted(&self) -> bool {
         matches!(self.stage, Stage::Submitted { .. })
@@ -167,11 +185,12 @@ impl<'r, B: Backend, O: OpSpec<B>, S: Scope, L: 'static> Operation<'r, B, O, S, 
                 scope,
                 lease,
                 reservation,
+                hints,
             } => {
                 let node = NodeImpl { scope, lease, data };
                 match self
                     .reactor
-                    .submit_node(node, reservation.as_ref(), cx.waker())
+                    .submit_node(node, reservation.as_ref(), hints, cx.waker())
                 {
                     Ok((key, node)) => {
                         self.stage = Stage::Submitted { key, node };
@@ -222,6 +241,7 @@ impl<'r, B: Backend, O: OpSpec<B>, S: Scope> Operation<'r, B, O, S, ()> {
             data,
             scope,
             reservation,
+            hints,
             ..
         } = std::mem::replace(&mut self.stage, Stage::Finished)
         else {
@@ -234,6 +254,7 @@ impl<'r, B: Backend, O: OpSpec<B>, S: Scope> Operation<'r, B, O, S, ()> {
                 scope,
                 lease: Leased(lease),
                 reservation,
+                hints,
             },
         }
     }
