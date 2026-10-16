@@ -27,8 +27,9 @@
 //!
 //! `Accept` and `OpenAt2` complete with the new resource's id as a
 //! nonnegative result, exactly like a kernel file descriptor number. Turn it
-//! into a [`SimFd`] with [`SimBackend::adopt_fd`] (or
-//! [`World::adopt`]); until then it stays open and counted by
+//! into a [`SimFd`] with [`SimBackend::try_adopt`] (or
+//! [`World::adopt`]); the reactor does this itself through
+//! [`Backend::adopt_fd`]. Until then it stays open and counted by
 //! [`World::live_handles`].
 
 use std::collections::{BTreeMap, VecDeque};
@@ -650,8 +651,10 @@ impl SimBackend {
     }
 
     /// Take ownership of a resource returned by an `Accept` or `OpenAt2`
-    /// completion; see [`World::adopt`].
-    pub fn adopt_fd(&self, result: i32) -> Result<SimFd> {
+    /// completion, failing with `EBADF` if `result` is not an unadopted
+    /// resource; see [`World::adopt`]. [`Backend::adopt_fd`] is the
+    /// infallible form the reactor uses.
+    pub fn try_adopt(&self, result: i32) -> Result<SimFd> {
         self.world.adopt(result)
     }
 
@@ -821,6 +824,17 @@ impl Backend for SimBackend {
         self.pending.insert(self.next_sequence, pending);
         self.next_sequence += 1;
         Ok(())
+    }
+
+    /// Adopt `raw` as [`try_adopt`](SimBackend::try_adopt) does. A `raw`
+    /// that does not name an unadopted resource (for example a fabricated
+    /// [`inject_completion`](SimBackend::inject_completion) result) yields a
+    /// handle to an id that is never allocated: every operation on it fails
+    /// with `EBADF` and dropping it closes nothing.
+    unsafe fn adopt_fd(&mut self, raw: i32) -> SimFd {
+        self.world
+            .adopt(raw)
+            .unwrap_or_else(|_| self.world.handle(u64::MAX))
     }
 
     /// Cancel an operation that has not executed yet. A removed target
