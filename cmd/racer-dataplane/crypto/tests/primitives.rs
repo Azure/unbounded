@@ -642,7 +642,7 @@ mod identity_workflows {
     /// TLS time follows the current scope and clamps/truncates epoch offsets.
     #[test]
     fn tls_time_uses_current_scoped_wall_clock_clamps_and_truncates() {
-        let clock = uring_runtime::environment::SimulationClock::new(71);
+        let clock = racer_platform::environment::SimulationClock::new(71);
         let _environment = clock.environment(0).enter();
         for (wall, seconds) in [
             (UNIX_EPOCH - Duration::from_nanos(1), 0),
@@ -1091,7 +1091,7 @@ mod identity_workflows {
     /// Accepted identities and cached peer keys share conservative validity boundaries.
     #[test]
     fn accepted_chain_validity_is_enforced_at_expiry_and_after_clock_rollback() {
-        let clock = uring_runtime::environment::SimulationClock::new(97);
+        let clock = racer_platform::environment::SimulationClock::new(97);
         let _environment = clock.environment(0).enter();
         clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let (pending, chain, roots) = issued_with(|params| {
