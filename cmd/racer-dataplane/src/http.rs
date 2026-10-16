@@ -2349,6 +2349,49 @@ pub(crate) mod tests {
             assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
         #[test]
+        fn ordinary_checkout_reclaims_other_cache_idle_pages_before_metadata_overload() {
+            let (admission, reactor, mut pool) = setup();
+            let outbound = admission.limit(ResourceClass::OutboundConnection);
+            assert!(outbound >= 2, "test needs a metadata reserve");
+            pool.config_mut().secondary_cap = outbound;
+            let (listener, endpoint) = Listener::origin();
+            let Endpoint::Unix(path) = endpoint else {
+                unreachable!()
+            };
+            let origin = |cache: &str| Endpoint::Origin {
+                cache: racer_control_wire::CacheId(cache.into()),
+                path: path.clone(),
+            };
+            let (a, b) = (origin("cache-a"), origin("cache-b"));
+            let ordinary = outbound - crate::admission::METADATA_OUTBOUND_RESERVE;
+            // Cache B's pages hold every ordinary charge; cache A holds only metadata.
+            let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
+                .map(|_| exchanged(&pool, &reactor, &admission, &b, &listener, false))
+                .unzip();
+            let (metadata, peer) = exchanged(&pool, &reactor, &admission, &a, &listener, true);
+            peers.push(peer);
+            drop(metadata);
+            assert_eq!(pool.snapshot().entries[&a].1, 1);
+            // While B's pages are active, A's metadata socket stays pooled.
+            assert!(matches!(
+                pool.prepare_connection(&a),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(pool.snapshot().entries[&a], (0, 1));
+            // Once B's pages idle, A reclaims them instead of waiting for idle expiry.
+            drop(pages);
+            assert_eq!(pool.snapshot().entries[&b].1, ordinary);
+            let (lease, address) = pool
+                .prepare_connection(&a)
+                .expect("idle pages in another cache are reclaimed");
+            assert!(address.is_none(), "metadata socket reclassified and reused");
+            assert_eq!(pool.snapshot().entries[&b].1, 0);
+            assert_eq!(admission.used(ResourceClass::OrdinaryOutboundConnection), 1);
+            drop((lease, peers));
+            pool.close();
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+        #[test]
         fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,

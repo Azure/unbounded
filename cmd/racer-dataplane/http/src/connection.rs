@@ -1512,6 +1512,31 @@ impl<C: Context> HttpPool<C> {
                 .get_mut(endpoint)
                 .and_then(|entry| entry.idle.pop());
         };
+        let mut reused = reused;
+        if reused.is_none()
+            && rejected
+                .as_ref()
+                .is_some_and(|e| *e == C::Error::from(uring_runtime::Error::Overloaded))
+        {
+            // Idle sockets elsewhere in the pool (for example another cache's pages)
+            // may hold the ordinary charges. Reclaim them like the fresh path does,
+            // then retry once. Skipped sockets are held here, so they survive.
+            self.clear_idle();
+            let mut idle = skipped.remove(0);
+            match self
+                .context
+                .reclassify_slot(&mut idle.reservation, priority)
+            {
+                Ok(()) => {
+                    reused = Some(idle);
+                    rejected = None;
+                }
+                Err(e) => {
+                    skipped.insert(0, idle);
+                    rejected = Some(e);
+                }
+            }
+        }
         if !skipped.is_empty()
             && let Some(entry) = self.state.borrow_mut().entries.get_mut(endpoint)
         {
@@ -1525,7 +1550,7 @@ impl<C: Context> HttpPool<C> {
             ));
         }
         if let Some(e) = rejected {
-            // No pooled socket holds a reusable charge; the slot guard releases `active`.
+            // Ordinary admission is held by active connections; the slot guard releases `active`.
             return Err(e);
         }
         let reserve = || {
