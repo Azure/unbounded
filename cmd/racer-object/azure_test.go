@@ -254,11 +254,16 @@ func TestAzureDefaultCredentialConstruction(t *testing.T) {
 
 	t.Setenv("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001")
 
-	o := options{provider: "azure", namespace: "store", accountURL: "https://account.blob.core.windows.net", azureCredential: "default", requestTimeout: 2 * time.Second}
+	o := options{provider: "azure", namespace: "store", accountURL: "https://account.blob.core.windows.net", azureCredential: "default", requestTimeout: 2 * time.Second, maxRequests: 7}
 
 	clientOptions := originAzureClientOptions(o)
 	if clientOptions.Transport.(*http.Client).Timeout != 2*time.Second || clientOptions.Telemetry.ApplicationID != "racer-object" {
 		t.Fatal("Azure transport timeout or telemetry missing")
+	}
+
+	transport, ok := clientOptions.Transport.(*http.Client).Transport.(*http.Transport)
+	if !ok || transport.MaxIdleConnsPerHost != 7 || transport.MaxIdleConns != 7 || transport == http.DefaultTransport {
+		t.Fatal("Azure transport idle pool not sized to the origin request limit")
 	}
 	// Construction must not request a token or contact Azure.
 	if origin, err := createOrigin(t.Context(), o); err != nil || origin == nil {
