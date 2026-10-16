@@ -128,6 +128,29 @@ func TestChildDigests_OCIManifest(t *testing.T) {
 	}
 }
 
+func TestIsOverlayBDStreamingManifest(t *testing.T) {
+	streaming := strings.ReplaceAll(ociImageManifest,
+		`"size": 10485760`,
+		`"size": 10485760, "annotations": {"containerd.io/snapshot/overlaybd/blob-digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "containerd.io/snapshot/overlaybd/blob-size": "10485760"}`,
+	)
+	streaming = strings.ReplaceAll(streaming,
+		`"size": 20971520`,
+		`"size": 20971520, "annotations": {"containerd.io/snapshot/overlaybd/blob-digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "containerd.io/snapshot/overlaybd/blob-size": "20971520"}`,
+	)
+
+	if !manifest.IsOverlayBDStreamingManifest([]byte(streaming)) {
+		t.Fatal("fully annotated OverlayBD manifest was not detected")
+	}
+	if manifest.IsOverlayBDStreamingManifest([]byte(ociImageManifest)) {
+		t.Fatal("regular OCI manifest was detected as OverlayBD streaming")
+	}
+
+	partial := strings.Replace(streaming, `"containerd.io/snapshot/overlaybd/blob-size": "20971520"`, `"containerd.io/snapshot/overlaybd/blob-size": "1"`, 1)
+	if manifest.IsOverlayBDStreamingManifest([]byte(partial)) {
+		t.Fatal("partially invalid OverlayBD manifest was detected as streaming")
+	}
+}
+
 func TestDetectContentType(t *testing.T) {
 	t.Parallel()
 
