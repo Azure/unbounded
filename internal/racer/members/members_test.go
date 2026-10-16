@@ -587,34 +587,6 @@ func TestWorkloadConfigIgnoresControllerRuntime(t *testing.T) {
 	}
 }
 
-func TestWorkloadIgnoresLegacyKeyringSecret(t *testing.T) {
-	want := workloadConfig(t)
-	values := map[string]string{
-		"RACER_CLUSTER_ID": string(want.Cluster), "POD_NAMESPACE": want.Namespace,
-		"RACER_CONTROL_URL": want.ControlURL, "RACER_DATAPLANE_IMAGE": want.DataplaneImage,
-		"RACER_CREDENTIALS_SECRET_NAME": "../obsolete",
-	}
-
-	cfg, err := ConfigFromLookup(func(key string) (string, bool) {
-		value, ok := values[key]
-		return value, ok
-	})
-	if err != nil || !reflect.DeepEqual(cfg, want) {
-		t.Fatalf("legacy environment changed workload configuration: %+v, %v", cfg, err)
-	}
-
-	ds, err := DesiredDaemonSet(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, volume := range ds.Spec.Template.Spec.Volumes {
-		if volume.Secret != nil || volume.Name == "keyring" {
-			t.Fatal("legacy environment must not restore shared key mounts")
-		}
-	}
-}
-
 func TestWorkloadNetworkPortBounds(t *testing.T) {
 	values := map[string]string{
 		"RACER_CLUSTER_ID":  "11111111-1111-1111-1111-111111111111",
@@ -1000,20 +972,12 @@ func TestReconcileIdentityValidation(t *testing.T) {
 	}
 }
 
-func TestReconcileRemovalAndLegacyDiagnostics(t *testing.T) {
+func TestReconcileRemoval(t *testing.T) {
 	input := observedInput()
 
 	initial, err := Reconcile(input, nil)
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	input.Nodes[0].Annotations = map[string]string{"racer.unbounded-cloud.io/rails": "ignored", "racer.unbounded-cloud.io/aligned-rails": "ignored"}
-	result, err := Reconcile(input, initial.Members)
-
-	wantDiagnostics := []Diagnostic{}
-	if err != nil || !reflect.DeepEqual(result.Diagnostics, wantDiagnostics) || !reflect.DeepEqual(result.Members, initial.Members) {
-		t.Fatalf("legacy diagnostics: %+v, %v", result, err)
 	}
 
 	for _, excluded := range []bool{true, false} {

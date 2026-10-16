@@ -24,11 +24,6 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
-type corruptBody struct {
-	io.Reader
-	io.Closer
-}
-
 func TestSDKFullReadUnpinnedMetadataValidation(t *testing.T) {
 	for _, mode := range []string{"valid", "wrong-etag", "wrong-size", "incomplete"} {
 		for _, verify := range []bool{true, false} {
@@ -91,7 +86,7 @@ func TestSDKFullReadUnpinnedMetadataValidation(t *testing.T) {
 	}
 
 	opts := pullTestOptions("http://unused")
-	opts.Volume = "test"
+	opts.Cache = "test"
 	config := sdkClientConfig(opts, 64)
 	require.Equal(t, 128, config.MaxConnections, "SDK configuration must preserve configured admission")
 }

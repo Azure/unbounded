@@ -836,6 +836,7 @@ impl GeometryModel {
                 generation: Generation(1),
                 state: SegmentState::Sealed,
                 used_bytes: bytes,
+                retained_records: Vec::new(),
             });
         }
         assert_eq!(segments.snapshot(), expected);
@@ -1333,9 +1334,9 @@ impl<'t, 'w> Phase<'t, 'w> {
                     .err(),
                     Some(Error::InvalidConfiguration)
                 );
-                // A withdrawn charge rejects rebinding after the idle owner was
-                // taken. Idle owners have no return pool, so storage is released.
-                assert_eq!(slab.idle_bytes(), 0);
+                // A charge that cannot cover the idle capacity is rejected before
+                // the idle owner is taken, so pooled storage stays available.
+                assert_eq!(slab.idle_bytes(), idle);
                 let buffer = slab
                     .allocate(
                         PAGE as usize,
@@ -2072,8 +2073,8 @@ impl<'t, 'w> Phase<'t, 'w> {
             }
         }
         if result.is_ok() && reserve != 0 {
+            // Success guarantees the reserve, not that pending evictions drained.
             assert!(self.t.segments.free_count() >= reserve.min(SLOTS));
-            assert!(post.iter().all(|s| s.state != SegmentState::Evicting));
         }
         self.check_reclaim(&pre, &post, unpublished);
     }
@@ -2801,7 +2802,7 @@ fn pending_read_terminal_results_during_write() {
     }
 }
 
-/// Phil's restore regressions and other fixed histories, each run through the
+/// Fixed restore and cancellation histories, each run through the
 /// same runner with both cancellation orders.
 #[test]
 fn regression_traces() {

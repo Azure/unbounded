@@ -175,7 +175,7 @@ impl Api {
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]
-    /// Load `librdma_verbs.so.1` and check it speaks ABI version 4.
+    /// Load `librdma_verbs.so.1` and check it speaks ABI version 1.
     fn load() -> Result<Rc<Self>> {
         // Fixed library name, found via the normal loader path.
         unsafe {
@@ -212,7 +212,7 @@ impl Api {
             }
 
             let version = sym!("rdma_verbs_abi", unsafe extern "C" fn() -> u32);
-            if version() != 4 {
+            if version() != 1 {
                 return Err(Error::Unavailable);
             }
             let api = Self::symbols(library)?;
@@ -939,7 +939,7 @@ mod tests {
     #[test]
     #[ignore = "requires built C adapter on loader path; no RDMA hardware required"]
     fn required_native_adapter_loads_abi_and_symbols() {
-        let api = Api::load().expect("built native adapter must load with ABI 4 and all symbols");
+        let api = Api::load().expect("built native adapter must load with ABI 1 and all symbols");
         assert!(api.library.is_some(), "must load C adapter, not simulation");
     }
 

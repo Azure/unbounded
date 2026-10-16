@@ -63,7 +63,7 @@ fn route_to_a_replica_forward_without_loops_and_recover_from_blocked_links() {
             Some(replica)
         );
     }
-    assert_eq!(placement.rank(&members, key).unwrap(), replicas);
+    assert_eq!(placement.rank(&members, key), replicas);
 
     let to = replicas[0];
     let from = (0..members.members().len())
@@ -91,7 +91,7 @@ fn route_to_a_replica_forward_without_loops_and_recover_from_blocked_links() {
     let alternate = block_on(paths.route(&members, retry)).unwrap();
     assert_route(&members, retry, &alternate);
     assert_ne!(alternate[1], original[1]);
-    assert_eq!(placement.rank(&members, key).unwrap(), replicas);
+    assert_eq!(placement.rank(&members, key), replicas);
 
     // Each relay recomputes using its own source and the remaining hop budget.
     let mut visited = vec![from];
@@ -161,7 +161,7 @@ fn replace_membership_during_pending_placement_then_fall_back_for_large_changes(
     let old = members(0..600);
     let key = b"objects/snapshot";
     let oracle = Placement::new(0);
-    let expected_old = oracle.rank(&old, key).unwrap();
+    let expected_old = oracle.rank(&old, key);
     let removed_id = old.members()[expected_old[0]].0;
     let mut replacement = old.members().to_vec();
     replacement.remove(expected_old[0]);
@@ -178,39 +178,39 @@ fn replace_membership_during_pending_placement_then_fall_back_for_large_changes(
         block_on(placement.rank_async(&next, key)),
         Err(Error::Overloaded)
     );
-    assert_eq!(placement.maintain(&next), Ok(Maintenance::Blocked));
-    assert_eq!(placement.maintain(&next), Ok(Maintenance::Blocked));
+    assert_eq!(placement.maintain(&next), Maintenance::Blocked);
+    assert_eq!(placement.maintain(&next), Maintenance::Blocked);
 
     // Dropping the old request frees admission. Retry the interrupted maintenance
     // before requesting a rank; an incomplete predecessor must never be reused.
     drop(pending);
-    assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
+    assert_eq!(placement.maintain(&next), Maintenance::Progress);
     let ranked = block_on(placement.rank_async(&next, key)).unwrap();
-    assert_eq!(ranked, oracle.rank(&next, key).unwrap());
+    assert_eq!(ranked, oracle.rank(&next, key));
     assert_eq!(ranked.len(), 3);
     assert!(
         ranked
             .iter()
             .all(|&index| next.members()[index].0 != removed_id)
     );
-    assert_eq!(placement.rank(&old, key).unwrap(), expected_old);
-    assert_eq!(placement.rank(&next, key).unwrap(), ranked);
+    assert_eq!(placement.rank(&old, key), expected_old);
+    assert_eq!(placement.rank(&next, key), ranked);
 
     // Replacing every member exceeds the bounded predecessor hint. The public
     // workflow must still yield cooperatively and produce an exact cold ranking.
     let fresh = members(1000..1600).with_predecessor(&next);
-    placement.maintain(&fresh).unwrap();
+    placement.maintain(&fresh);
     let mut pending = Box::pin(placement.rank_async(&fresh, key));
     assert!(pending.as_mut().poll(&mut cx).is_pending());
     let fresh_ranked = block_on(pending).unwrap();
-    assert_eq!(fresh_ranked, oracle.rank(&fresh, key).unwrap());
+    assert_eq!(fresh_ranked, oracle.rank(&fresh, key));
     assert!(
         fresh_ranked
             .iter()
             .all(|&index| { next.position(fresh.members()[index].id()).is_none() })
     );
     // Returning to a retained snapshot after eviction is still safe.
-    assert_eq!(placement.rank(&old, key).unwrap(), expected_old);
+    assert_eq!(placement.rank(&old, key), expected_old);
 }
 
 /// Test member whose weight can differ between memberships.

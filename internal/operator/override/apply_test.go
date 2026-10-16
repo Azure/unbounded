@@ -4,7 +4,7 @@
 package override
 
 import (
-	"os"
+	"io/fs"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/yaml"
 
+	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/components/racer"
 )
@@ -133,7 +134,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 }
 
 func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
-	manifest, err := os.ReadFile("../../../deploy/racer/controller.yaml")
+	manifest, err := fs.ReadFile(manifests.Manifests, "controller.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

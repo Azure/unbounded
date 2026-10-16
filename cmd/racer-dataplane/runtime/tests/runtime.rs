@@ -140,7 +140,7 @@ mod filesystem {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("target")
                 .join(format!(
-                    "filesystem-review-{}-{}",
+                    "filesystem-test-{}-{}",
                     std::process::id(),
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ));

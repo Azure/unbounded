@@ -45,7 +45,7 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 	}
 
 	if cfg.Iterations < 1 || cfg.BlobConcurrency < 1 || len(cfg.ImageIndices) == 0 || len(cfg.ImageIndices) > maxCatalogImages {
-		return errors.New("positive iterations, blob concurrency, and selected images required")
+		return errors.New("positive iterations, layer concurrency, and selected images required")
 	}
 
 	for _, index := range cfg.ImageIndices {
@@ -63,11 +63,11 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 		Verify: true, DiagnoseIntegrity: true, ZipfExponent: defaultZipfExponent,
 	}
 
-	p, err := newPuller(cfg.Image.Repository, opts, pullTestMetrics())
+	p, err := newPuller(&syntheticImage{}, opts, pullTestMetrics())
 	if err != nil {
 		return err
 	}
-	defer p.close()
+	defer p.transport.CloseIdleConnections()
 
 	startupCtx, stop := context.WithTimeout(ctx, startup)
 	defer stop()
@@ -84,6 +84,7 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 
 	stop()
 
+	p.img = images[0]
 	if err := p.configureDiagnostics(catalogFromImages(images)); err != nil {
 		return err
 	}

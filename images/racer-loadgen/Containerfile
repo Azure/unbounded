@@ -1,22 +1,54 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.9-trixie AS builder
+# Build stage
+# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
+# host even when targeting a foreign TARGETPLATFORM.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.2-trixie AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
 WORKDIR /src
+
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+
+COPY ../../ .
+
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/racer-loadgen ./cmd/racer-loadgen
 
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} make racer-loadgen-build
+
+# Runtime stage
+# racer-loadgen is a static benchmark client, so it ships on scratch rather
+# than ubuntu:noble. cmd/racer-loadgen/container_test.go enforces the base.
 FROM scratch
+
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /out/racer-loadgen /racer-loadgen
-COPY LICENSE NOTICE /usr/share/licenses/racer-loadgen/
-# UDS needs write access to /run/racer and a 0600 origin socket the dataplane can use.
-# Default to the root dataplane UID; non-root deployments must align ownership and UID.
+COPY --from=builder /src/bin/racer-loadgen /unbounded/bin/racer-loadgen
+COPY LICENSE NOTICE /unbounded/licenses/
+
+ENV PATH="/unbounded/bin"
+
+WORKDIR /unbounded
+
+# UDS startup needs the default root-owned /run/racer layout and an origin
+# socket accessible to the root dataplane.
 USER 0:0
+
+# 8080 = synthetic registry, 9090 = metrics and health
 EXPOSE 8080 9090
-ENTRYPOINT ["/racer-loadgen"]
+
+ENTRYPOINT ["/unbounded/bin/racer-loadgen"]

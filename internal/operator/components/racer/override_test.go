@@ -34,11 +34,15 @@ func TestPlannedDeploymentOverrideValidation(t *testing.T) {
 			var deployment *unstructured.Unstructured
 
 			for _, op := range plan.Operations {
-				if op.Object.GetKind() == "Deployment" {
+				switch op.Object.GetKind() {
+				case "Deployment":
 					require.True(t, op.Overridable)
 					require.NotNil(t, op.ValidateOverride)
 					deployment = op.Object
-				} else {
+				case "DaemonSet":
+					require.True(t, op.Overridable)
+					require.NotNil(t, op.ValidateOverride)
+				default:
 					require.Nil(t, op.ValidateOverride)
 				}
 			}

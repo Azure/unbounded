@@ -315,11 +315,11 @@ func (w racerHTTPFallback) Unwrap() http.ResponseWriter { return w.ResponseWrite
 func handlerStreamHandler(t *testing.T, client Client, timeout time.Duration, observe func(HTTPObservation)) http.Handler {
 	t.Helper()
 
-	trap := &racerLegacyTrap{}
+	trap := &racerDirectTrap{}
 
 	t.Cleanup(func() {
 		if trap.storeCalls.Load() != 0 || trap.originCalls.Load() != 0 {
-			t.Error("stream reached legacy content backend")
+			t.Error("stream reached direct content backend")
 		}
 	})
 
