@@ -6,9 +6,9 @@ publish = false
 description = "Generic bounded control feeds, rollout barriers, and immutable publication"
 
 [dependencies]
-uring-runtime = { package = "uring-runtime-legacy", path = "../runtime" }
+racer-platform = { path = "../platform" }
 wire-codec = { path = "../wire-codec", features = ["rest"] }
 futures = "0.3"
 
 [dev-dependencies]
-uring-runtime = { package = "uring-runtime-legacy", path = "../runtime", features = ["simulation"] }
+racer-platform = { path = "../platform", features = ["simulation"] }

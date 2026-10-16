@@ -1,6 +1,7 @@
 //! Scoped long polls, credential policy, and a single-owner synchronization loop.
 
 use crate::Error;
+use racer_platform::{Operation, scope::LibraryScope as _};
 use std::{
     cell::{Cell, RefCell},
     fmt::Display,
@@ -9,7 +10,6 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use uring_runtime::{Operation, Scope as _};
 use wire_codec::rest::{self, Scope as _};
 
 /// Caller-local codec implementation; documents may belong to another crate.
@@ -21,7 +21,12 @@ pub trait Codec {
     type Version: Copy + Ord + Display;
 
     /// Domain errors preserve structured wire validation failures.
-    type Error: Copy + Send + From<Error> + From<rest::Error> + From<uring_runtime::Error> + 'static;
+    type Error: Copy
+        + Send
+        + From<Error>
+        + From<rest::Error>
+        + From<racer_platform::Error>
+        + 'static;
 
     /// Read the document's cursor.
     fn version(&self, document: &Self::Document) -> Self::Version;
@@ -497,7 +502,7 @@ where
         {
             return Err(rest::Error::InvalidConfiguration.into());
         }
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         if [schedule.turn, schedule.tick, schedule.retry_max]
             .into_iter()
             .any(|delay| now.checked_add(delay).is_none())
@@ -567,9 +572,9 @@ where
     /// later fetch may supersede them without retaining a rejected delta base.
     pub async fn turn(&mut self, scope: &H::Scope) -> Result<(), H::Error> {
         if self.stopped.get() {
-            return Err(uring_runtime::Error::Cancelled.into());
+            return Err(racer_platform::Error::Canceled.into());
         }
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
         scope.check()?;
         let next_fetch = self.state.fetch_at();
@@ -582,7 +587,7 @@ where
             scope.check()?;
             self.state
                 .advance(&self.feed, &self.target, self.host.as_ref(), self.schedule)?;
-            let now = uring_runtime::environment::now();
+            let now = racer_platform::environment::now();
             let tick = self
                 .host
                 .sleep(now.checked_add(self.schedule.tick).unwrap_or(now), &scope);
@@ -591,7 +596,7 @@ where
                     Ok(document) => {
                         self.state.failures = 0;
                         self.state.next_fetch =
-                            uring_runtime::environment::now() + self.schedule.tick;
+                            racer_platform::environment::now() + self.schedule.tick;
                         if let Some(document) = document
                             && self.state.accepted.as_ref().is_none_or(|old| {
                                 self.feed.codec.version(&document) > self.feed.codec.version(old)
@@ -625,9 +630,10 @@ where
                             } else {
                                 delay
                             };
-                            let now = uring_runtime::environment::now();
-                            self.state.next_fetch =
-                                now.checked_add(delay).unwrap_or(scope.deadline());
+                            let now = racer_platform::environment::now();
+                            self.state.next_fetch = now
+                                .checked_add(delay)
+                                .unwrap_or(rest::Scope::deadline(&scope));
                         }
                         return Err(failure.error);
                     }
@@ -644,9 +650,9 @@ where
     /// preparation outlasts one tick.
     pub async fn settle(&mut self, scope: &H::Scope) -> Result<(), H::Error> {
         if self.stopped.get() {
-            return Err(uring_runtime::Error::Cancelled.into());
+            return Err(racer_platform::Error::Canceled.into());
         }
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
         loop {
             scope.check()?;
@@ -658,7 +664,7 @@ where
             {
                 return Ok(());
             }
-            let now = uring_runtime::environment::now();
+            let now = racer_platform::environment::now();
             self.host
                 .sleep(now.checked_add(self.schedule.tick).unwrap_or(now), &scope)
                 .await?;
@@ -673,7 +679,7 @@ where
         self.state.queued.take();
         self.state.prepared.take();
         self.feed.restore(self.state.accepted.clone());
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
         while self
             .state
@@ -684,7 +690,7 @@ where
             scope.check()?;
             self.host
                 .sleep(
-                    uring_runtime::environment::now() + self.schedule.tick,
+                    racer_platform::environment::now() + self.schedule.tick,
                     &scope,
                 )
                 .await?;
@@ -733,7 +739,7 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
         host: &H,
         schedule: Schedule,
     ) -> Result<(), C::Error> {
-        let now = uring_runtime::environment::now();
+        let now = racer_platform::environment::now();
         if self
             .job
             .as_ref()
@@ -837,7 +843,7 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
                 Err(_) => {
                     self.queued = Some(document);
                     self.next_prepare = now.checked_add(jitter(schedule.retry_min)).unwrap_or(now);
-                    return Err(uring_runtime::Error::Io.into());
+                    return Err(racer_platform::Error::Io.into());
                 }
             }
         }
@@ -860,7 +866,7 @@ fn retry_delay(schedule: Schedule, failures: u32) -> Duration {
 /// fails, retain the full delay rather than spinning or discarding the real error.
 fn jitter(delay: Duration) -> Duration {
     let mut bytes = [0; 4];
-    if uring_runtime::environment::fill_random(&mut bytes).is_err() {
+    if racer_platform::environment::fill_random(&mut bytes).is_err() {
         return delay;
     }
     jitter_sample(delay, u32::from_le_bytes(bytes))
