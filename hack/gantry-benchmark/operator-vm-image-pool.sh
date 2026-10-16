@@ -17,6 +17,9 @@ Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh fail-open
   operator-vm-image-pool.sh run BASELINE_RUN_ID
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
+  operator-vm-image-pool.sh sync-benchmark-source
+  operator-vm-image-pool.sh sync-benchmark-source-status
+  operator-vm-image-pool.sh sync-benchmark-source-cleanup
   operator-vm-image-pool.sh verify-streaming-layers IMAGE
   operator-vm-image-pool.sh verify-streaming-layers-status
   operator-vm-image-pool.sh verify-streaming-layers-cleanup
@@ -44,6 +47,7 @@ USAGE
 remote_status_marker="GANTRY_BENCHMARK_REMOTE_STATUS="
 managed_status_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-status"
 managed_verification_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-verification"
+managed_source_sync_file="${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.managed-source-sync"
 
 invoke_remote() {
   local body=$1
@@ -435,6 +439,117 @@ SCRIPT
 )
   invoke_remote "$script"
     ;;
+  sync-benchmark-source)
+    (($# == 0)) || { usage >&2; exit 2; }
+    repo_root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+    job_go=$repo_root/hack/cmd/gantry-benchmark/job.go
+    job_test_go=$repo_root/hack/cmd/gantry-benchmark/job_test.go
+    job_go_base64=$(base64 -w0 "$job_go")
+    job_test_go_base64=$(base64 -w0 "$job_test_go")
+    job_go_sha=$(sha256sum "$job_go" | cut -d' ' -f1)
+    job_test_go_sha=$(sha256sum "$job_test_go" | cut -d' ' -f1)
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+source /etc/gantry-benchmark/env
+export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
+for service in gantry-benchmark-operator.service gantry-benchmark-image-builder.service gantry-benchmark-image-prune.service; do
+  state=$(systemctl is-active "$service" 2>/dev/null || true)
+  case "$state" in
+    active|activating)
+      echo "$service is $state; refusing benchmark source sync" >&2
+      exit 1
+      ;;
+  esac
+done
+
+cd "$BENCHMARK_REPO_ROOT"
+paths=(hack/cmd/gantry-benchmark/job.go hack/cmd/gantry-benchmark/job_test.go)
+backup=$(mktemp -d)
+restore_on_exit() {
+  status=$?
+  trap - EXIT
+  if ((status != 0)); then
+    install -m 0644 "$backup/job.go" "${paths[0]}"
+    install -m 0644 "$backup/job_test.go" "${paths[1]}"
+  fi
+  rm -rf "$backup"
+  exit "$status"
+}
+trap restore_on_exit EXIT
+
+install -m 0644 "${paths[0]}" "$backup/job.go"
+install -m 0644 "${paths[1]}" "$backup/job_test.go"
+printf '%s' '__JOB_GO_BASE64__' | base64 --decode >"${paths[0]}.tmp"
+printf '%s' '__JOB_TEST_GO_BASE64__' | base64 --decode >"${paths[1]}.tmp"
+install -m 0644 "${paths[0]}.tmp" "${paths[0]}"
+install -m 0644 "${paths[1]}.tmp" "${paths[1]}"
+rm -f "${paths[0]}.tmp" "${paths[1]}.tmp"
+
+printf '%s  %s\n' '__JOB_GO_SHA__' "${paths[0]}" '__JOB_TEST_GO_SHA__' "${paths[1]}" | sha256sum --check --strict
+GOTOOLCHAIN=auto go test ./hack/cmd/gantry-benchmark
+printf 'benchmark_source_job_go_sha=%s\nbenchmark_source_job_test_go_sha=%s\n' '__JOB_GO_SHA__' '__JOB_TEST_GO_SHA__'
+SCRIPT
+)
+    script=${script/__JOB_GO_BASE64__/$job_go_base64}
+    script=${script/__JOB_TEST_GO_BASE64__/$job_test_go_base64}
+    script=${script//__JOB_GO_SHA__/$job_go_sha}
+    script=${script//__JOB_TEST_GO_SHA__/$job_test_go_sha}
+    command_name="gantry-benchmark-source-sync-$(date -u +%Y%m%d%H%M%S)-$$"
+    az vm run-command create \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --script "$script" \
+      --timeout-in-seconds 900 \
+      --async-execution false \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    printf '%s\n' "$command_name" >"$managed_source_sync_file"
+    printf 'benchmark_source_sync=%s\n' "$command_name"
+    ;;
+  sync-benchmark-source-status)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_source_sync_file" ]] || { echo "no submitted benchmark source sync" >&2; exit 1; }
+    command_name=$(cat "$managed_source_sync_file")
+    result=$(az vm run-command show \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --instance-view \
+      --only-show-errors \
+      -o json)
+    jq -r '
+      "benchmark_source_sync=" + .name,
+      "provisioning_state=" + (.provisioningState // "unknown"),
+      "execution_state=" + (.instanceView.executionState // "pending"),
+      "exit_code=" + ((.instanceView.exitCode // "") | tostring),
+      (.instanceView.output // empty),
+      (.instanceView.error // empty)
+    ' <<<"$result"
+    execution_state=$(jq -r '.instanceView.executionState // "pending"' <<<"$result")
+    case "$execution_state" in
+      Succeeded|Failed) ;;
+      *) exit 0 ;;
+    esac
+    exit_code=$(jq -r '.instanceView.exitCode // 1' <<<"$result")
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
+    exit "$exit_code"
+    ;;
+  sync-benchmark-source-cleanup)
+    (($# == 0)) || { usage >&2; exit 2; }
+    [[ -s "$managed_source_sync_file" ]] || { echo "no submitted benchmark source sync" >&2; exit 1; }
+    command_name=$(cat "$managed_source_sync_file")
+    az vm run-command delete \
+      -g "$AZURE_RESOURCE_GROUP" \
+      --vm-name "$OPERATOR_VM_NAME" \
+      --run-command-name "$command_name" \
+      --yes \
+      --no-wait \
+      --only-show-errors \
+      -o none
+    rm -f "$managed_source_sync_file"
+    ;;
   verify-streaming-layers)
     (($# == 1)) || { usage >&2; exit 2; }
     image=$1
@@ -576,6 +691,12 @@ conversion_event=$(grep -E 'Artifact Streaming conversion .* status=(Submitted|R
   "${BENCHMARK_ARTIFACT_ROOT:-$HOME/artifacts}/operator.log" 2>/dev/null | \
   tail -1 || true)
 printf 'conversion_event=%s\n' "$conversion_event"
+operator_log=${BENCHMARK_ARTIFACT_ROOT:-$HOME/artifacts}/operator.log
+if [[ -s "$operator_log" ]]; then
+  printf '%s\n' 'operator_log_tail_begin'
+  tail -40 "$operator_log"
+  printf '%s\n' 'operator_log_tail_end'
+fi
 state=$(kubectl --request-timeout=20s -n "$namespace" get configmap gantry-benchmark-state \
   -o jsonpath='{.data.state\.json}' 2>/dev/null || true)
 if [[ -n "$state" ]]; then
