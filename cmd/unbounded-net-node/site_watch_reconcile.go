@@ -1805,9 +1805,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// Gateway nodes: connect only to peered pools (other pools in the same Peering)
 	var gatewayPeers []gatewayPeerInfo
 
-	assignmentEdgeMTUs := assignmentEdgeTunnelMTUs(assignments)
-	peeringEdgeMTUs := sitePeeringEdgeTunnelMTUs(sitePeerings)
-	poolPeeringEdgeMTUs := gatewayPoolPeeringEdgeTunnelMTUs(poolPeerings)
+	var (
+		assignmentEdgeMTUs  map[sitePoolMTUKey]int
+		peeringEdgeMTUs     *peeringMTUIndex
+		poolPeeringEdgeMTUs *peeringMTUIndex
+	)
 	{
 		var poolsToIterate map[string]*unboundednetv1alpha1.GatewayPool
 		if isGatewayNode {
@@ -1874,6 +1876,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					RoutedCidrs: routedCidrs, RouteDistances: routeDistances, LearnedRoutes: learnedRoutes,
 				}, siteRouting.localCIDRs)
 				routedCidrs, routeDistances, learnedRoutes = filteredRoutes.RoutedCidrs, filteredRoutes.RouteDistances, filteredRoutes.LearnedRoutes
+
+				if len(learnedRoutes) > 0 && peeringEdgeMTUs == nil {
+					assignmentEdgeMTUs = assignmentEdgeTunnelMTUs(assignments)
+					peeringEdgeMTUs = sitePeeringEdgeTunnelMTUs(sitePeerings)
+				}
+
+				if poolPeeringEdgeMTUs == nil && (isGatewayNode || len(learnedRoutes) > 0) {
+					poolPeeringEdgeMTUs = gatewayPoolPeeringEdgeTunnelMTUs(poolPeerings)
+				}
 
 				transitTunnelMTU := learnedGatewayTransitTunnelMTU(learnedRoutes, siteTunnelMTUs, poolTunnelMTUs, assignmentEdgeMTUs, poolPeeringEdgeMTUs)
 
