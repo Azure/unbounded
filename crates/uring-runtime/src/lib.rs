@@ -64,6 +64,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod affinity;
 pub mod backend;
 pub mod buf;
 pub mod cancel;
