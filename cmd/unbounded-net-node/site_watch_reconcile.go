@@ -1673,7 +1673,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			if v := tunnelMTUFromSpec(assignment.Spec.TunnelMTU); v > 0 {
 				for _, siteName := range assignment.Spec.Sites {
 					siteName = strings.TrimSpace(siteName)
-					if siteName == "" || siteName == mySiteName {
+					if siteName == "" {
 						continue
 					}
 
@@ -2074,11 +2074,13 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		cfg.PreferredPrivateEncap, cfg.PreferredPublicEncap,
 		siteTunnelProtocols, peeringSiteTunnelProtocols,
 		assignmentPoolTunnelProtocols, poolTunnelProtocols)
-	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, isGatewayNode, peeredSites, networkPeeredSites,
+	localPoolMTU := localGatewayPoolTunnelMTU(localGatewayPools, poolTunnelMTUs)
+	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, isGatewayNode, localPoolMTU, peeredSites, networkPeeredSites,
 		siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 		assignmentPoolTunnelMTUs, poolTunnelMTUs, state.netlinkCache)
 
-	fabricMTU := resolveCNIConfigMTU(cfg.MTU, siteTunnelMTUs[mySiteName], peers, gatewayPeers,
+	localScopeMTU := resolveTunnelMTU(siteTunnelMTUs[mySiteName], localPoolMTU)
+	fabricMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 		unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
 	previousFabricMTU := state.cniMTU
 	fabricMTUChanged := fabricMTU > 0 && fabricMTU != previousFabricMTU
@@ -2264,7 +2266,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			klog.Warningf("Tunnel configuration failed (WireGuard will still be configured): %v", sharedTunnelErr)
 		}
 
-		unboundedMTU := resolveCNIConfigMTU(cfg.MTU, siteTunnelMTUs[mySiteName], peers, gatewayPeers,
+		unboundedMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 			unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
 		if unboundedMTU > 0 {
 			unboundedLinkManager := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)

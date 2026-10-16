@@ -153,12 +153,22 @@ func resolveCNIConfigMTU(configuredMTU, siteMTU int, meshPeers []meshPeerInfo, g
 	return resolveInitialCNIConfigMTU(configuredMTU, siteMTU, underlayMTU)
 }
 
+func localGatewayPoolTunnelMTU(localPools []string, poolMTUs map[string]int) int {
+	result := 0
+	for _, pool := range localPools {
+		result = resolveTunnelMTU(result, poolMTUs[pool])
+	}
+
+	return result
+}
+
 func resolvePeerTunnelMTUs(
 	cfg *config,
 	meshPeers []meshPeerInfo,
 	gatewayPeers []gatewayPeerInfo,
 	mySiteName string,
 	isGatewayNode bool,
+	localPoolMTU int,
 	peeredSites, networkPeeredSites map[string]bool,
 	siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 	assignmentPoolTunnelMTUs, poolTunnelMTUs map[string]int,
@@ -167,7 +177,7 @@ func resolvePeerTunnelMTUs(
 	for i := range meshPeers {
 		underlayIP := selectUnderlayIP(meshPeers[i].InternalIPs, cfg.TunnelIPFamily)
 		autoMTU := detectEncapsulatedRouteMTU(cfg, underlayIP, meshPeers[i].TunnelProtocol, cache)
-		meshPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU,
+		meshPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU, localPoolMTU,
 			resolveMeshPeerTunnelMTU(0, meshPeers[i], mySiteName,
 				siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, isGatewayNode))
 	}
@@ -179,7 +189,7 @@ func resolvePeerTunnelMTUs(
 		}
 
 		autoMTU := detectEncapsulatedRouteMTU(cfg, underlayIP, gatewayPeers[i].TunnelProtocol, cache)
-		gatewayPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU,
+		gatewayPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU, localPoolMTU,
 			resolveGatewayPeerTunnelMTU(0, mySiteName, gatewayPeers[i],
 				siteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs))
 	}

@@ -381,9 +381,10 @@ func resolveMeshPeerTunnelMTU(globalMTU int, peer meshPeerInfo, mySiteName strin
 	values := []int{siteTunnelMTUs[mySiteName], siteTunnelMTUs[peer.SiteName]}
 	if peer.SiteName != mySiteName {
 		values = append(values, peeringSiteTunnelMTUs[peer.SiteName])
-		if includeAssignmentMTU {
-			values = append(values, assignmentSiteTunnelMTUs[peer.SiteName])
-		}
+	}
+
+	if includeAssignmentMTU {
+		values = append(values, assignmentSiteTunnelMTUs[peer.SiteName])
 	}
 
 	return resolveTunnelMTU(globalMTU, values...)
