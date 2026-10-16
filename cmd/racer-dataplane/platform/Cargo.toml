@@ -9,6 +9,7 @@ description = "Racer policy and ergonomic surface over the uring-runtime library
 [dependencies]
 uring = { package = "uring-runtime", path = "../../../crates/uring-runtime" }
 futures = "0.3"
+zeroize = "1"
 libc = "0.2"
 
 [features]

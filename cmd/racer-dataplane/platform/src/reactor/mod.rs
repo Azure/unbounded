@@ -44,7 +44,7 @@ pub mod ready_set;
 #[cfg(test)]
 mod scripted;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub mod timer;
 
 pub use backend::{RacerBackend, RacerClock, RacerEntropy};
@@ -300,7 +300,7 @@ unsafe impl<T: 'static> IoBuf for Shared<T> {
 pub(crate) struct OpScope<S>(pub(crate) S);
 
 impl<S> OpScope<S> {
-    fn wrap(scope: &S) -> &Self {
+    pub(crate) fn wrap(scope: &S) -> &Self {
         // SAFETY: `OpScope<S>` is `repr(transparent)` over `S`.
         unsafe { &*(scope as *const S).cast::<Self>() }
     }
@@ -321,7 +321,7 @@ impl<E> From<uring::Error> for Failure<E> {
 }
 
 impl<E: From<Error>> Failure<E> {
-    fn into_scope(self) -> E {
+    pub(crate) fn into_scope(self) -> E {
         match self {
             Self::Scope(error) => error,
             Self::Runtime(error) => Error::from(error).into(),
@@ -834,7 +834,6 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
 
     /// Positioned read executed in a kernel worker (`IOSQE_ASYNC`), for cold
     /// buffered file I/O.
-    #[allow(dead_code)] // Used by the filesystem module.
     pub(crate) fn read_at_offloaded<'a, T: IoBuffer, L: 'static>(
         &'a self,
         file: Rc<Descriptor>,
@@ -883,7 +882,6 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     }
 
     /// Positioned write executed in a kernel worker (`IOSQE_ASYNC`).
-    #[allow(dead_code)] // Used by the filesystem module.
     pub(crate) fn write_at_offloaded<'a, T: IoBuffer, L: 'static>(
         &'a self,
         file: Rc<Descriptor>,
