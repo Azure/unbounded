@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,9 +16,75 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
+
+func TestGatewayInformerFailedListCanBeAbandoned(t *testing.T) {
+	for _, mode := range []string{"assignment removed", "sync timeout", "close"} {
+		t.Run(mode, func(t *testing.T) {
+			client := newGatewayLifecycleClient()
+			listed := make(chan struct{}, 1)
+
+			client.PrependReactor("list", "*", func(k8stesting.Action) (bool, runtime.Object, error) {
+				select {
+				case listed <- struct{}{}:
+				default:
+				}
+
+				return true, nil, errors.New("list unavailable")
+			})
+			lifecycle := newGatewayInformerLifecycle(client, 0)
+			t.Cleanup(lifecycle.close)
+
+			if mode == "sync timeout" {
+				lifecycle.syncTimeout = 50 * time.Millisecond
+			}
+
+			done := make(chan error, 1)
+
+			go func() {
+				_, _, err := lifecycle.prepare(t.Context(), true)
+				done <- err
+			}()
+
+			select {
+			case <-listed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("informers did not attempt LIST")
+			}
+
+			switch mode {
+			case "assignment removed":
+				lifecycle.setRequired(false)
+			case "close":
+				lifecycle.close()
+			}
+
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("failed LIST unexpectedly produced synced caches")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("cache sync blocked reconciliation")
+			}
+
+			if lifecycle.snapshot().available {
+				t.Fatal("unsynced generation was published")
+			}
+
+			if mode != "sync timeout" {
+				if _, retire, err := lifecycle.prepare(t.Context(), false); err != nil || retire {
+					t.Fatalf("failed to abandon caches: retire=%v err=%v", retire, err)
+				}
+			} else if ready, _ := lifecycle.readiness(); ready {
+				t.Fatal("timed-out required caches reported ready")
+			}
+		})
+	}
+}
 
 func TestGatewayInformerLifecycleLateEventHandler(t *testing.T) {
 	client := newGatewayLifecycleClient()

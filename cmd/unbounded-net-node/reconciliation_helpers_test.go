@@ -250,6 +250,49 @@ func TestMergeLowestTunnelMTU(t *testing.T) {
 	}
 }
 
+func TestLearnedGatewayTransitPathCaps(t *testing.T) {
+	path := []unboundednetv1alpha1.GatewayNodePathHop{
+		{Type: "Site", Name: "site-b"},
+		{Type: "GatewayPool", Name: "pool-h"},
+		{Type: "GatewayPool", Name: "pool-j"},
+		{Type: "GatewayPool", Name: "pool-g"},
+	}
+	routes := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/24": {Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{path}},
+	}
+
+	for _, tc := range []struct {
+		name        string
+		sites       map[string]int
+		pools       map[string]int
+		assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment
+		peerings    []unboundednetv1alpha1.GatewayPoolPeering
+		want        int
+	}{
+		{name: "origin Site", sites: map[string]int{"site-b": 1200, "unrelated": 900}, want: 1200},
+		{name: "downstream pool", pools: map[string]int{"pool-h": 1250, "unrelated": 900}, want: 1250},
+		{name: "assignment edge", assignments: []unboundednetv1alpha1.SiteGatewayPoolAssignment{
+			{Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{Sites: []string{"site-b"}, GatewayPools: []string{"pool-h"}, TunnelMTU: ptrInt32(1100)}},
+		}, want: 1100},
+		{name: "assignment nonadjacent", assignments: []unboundednetv1alpha1.SiteGatewayPoolAssignment{
+			{Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{Sites: []string{"site-b"}, GatewayPools: []string{"pool-g"}, TunnelMTU: ptrInt32(1100)}},
+		}},
+		{name: "adjacent peering", peerings: []unboundednetv1alpha1.GatewayPoolPeering{
+			{Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{GatewayPools: []string{"pool-h", "pool-j"}, TunnelMTU: ptrInt32(1300)}},
+		}, want: 1300},
+		{name: "nonadjacent peering", peerings: []unboundednetv1alpha1.GatewayPoolPeering{
+			{Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{GatewayPools: []string{"pool-h", "pool-g"}, TunnelMTU: ptrInt32(1000)}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := learnedGatewayTransitTunnelMTU(routes, tc.sites, tc.pools, tc.assignments, tc.peerings)
+			if got != tc.want {
+				t.Fatalf("transit MTU=%d want=%d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestForwardingAwareTunnelMTU(t *testing.T) {
 	siteMTUs := map[string]int{
 		"site-a": 1450,
@@ -296,11 +339,11 @@ func TestForwardingAwareTunnelMTU(t *testing.T) {
 			}},
 		},
 	}
-	if got := learnedGatewayTransitTunnelMTU("pool-g", learnedRoutes, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 1200 {
+	if got := learnedGatewayTransitTunnelMTU(learnedRoutes, nil, nil, nil, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 1200 {
 		t.Fatalf("worker learned gateway transit MTU = %d, want 1200", got)
 	}
 
-	if got := learnedGatewayTransitTunnelMTU("pool-g", nil, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 0 {
+	if got := learnedGatewayTransitTunnelMTU(nil, nil, nil, nil, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 0 {
 		t.Fatalf("gateway peering without a learned forwarding path constrained worker MTU: %d", got)
 	}
 
