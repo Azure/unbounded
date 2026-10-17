@@ -1,0 +1,51 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Azure Linux NVIDIA host image
+
+on:
+  pull_request:
+    paths:
+      - images/host-azurelinux3/**
+      - images/host-azurelinux3-nvidia/**
+      - hack/hostimage/**
+      - .github/workflows/host-azurelinux3-nvidia.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install offline inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs fdisk mtools
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Run contract tests
+        run: go test ./hack/hostimage
+
+      - name: Build ARM64 disk image
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --file images/host-azurelinux3-nvidia/Containerfile \
+            --output type=local,dest=tmp/host-azurelinux3-nvidia \
+            .
+
+      - name: Inspect ARM64 disk image
+        run: |
+          images/host-azurelinux3/assets/verify-disk.sh \
+            tmp/host-azurelinux3-nvidia/disk/disk.img.gz
+          sha256sum tmp/host-azurelinux3-nvidia/disk/disk.img.gz
