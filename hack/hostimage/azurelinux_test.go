@@ -50,7 +50,8 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 
 	rootfs := readRepoFile(t, "images/host-azurelinux3/assets/rootfs.sh")
 	require.Contains(t, rootfs, `[ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]`)
-	require.Contains(t, rootfs, "retry tdnf install -y kernel-hwe")
+	require.Contains(t, rootfs, `KERNEL_PACKAGE="${KERNEL_PACKAGE:-kernel}"`)
+	require.Contains(t, rootfs, `retry tdnf install -y "$KERNEL_PACKAGE"`)
 	require.Contains(t, rootfs, "retry tdnf install -y grub2-efi-binary cuda-open-hwe")
 }
 

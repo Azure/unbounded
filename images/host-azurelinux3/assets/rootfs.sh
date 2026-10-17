@@ -11,10 +11,12 @@
 # and writes the archive. Separate steps let the build cache the slow step.
 #
 # Environment:
+#   KERNEL_PACKAGE  single kernel package to install (default: kernel)
 #   NVIDIA          set to 1 to install the NVIDIA open GPU driver
 #   TARGETARCH      target architecture
 set -eu
 
+KERNEL_PACKAGE="${KERNEL_PACKAGE:-kernel}"
 NVIDIA="${NVIDIA:-0}"
 TARGETARCH="${TARGETARCH:-}"
 
@@ -55,9 +57,9 @@ if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
     "kernel-${AZURELINUX_KERNEL_VERSION}" \
     "kernel-hwe-${AZURELINUX_KERNEL_HWE_VERSION}"
 elif [ "$NVIDIA" = 1 ]; then
-  retry tdnf install -y kernel-hwe
+  retry tdnf install -y "$KERNEL_PACKAGE"
 else
-  retry tdnf install -y kernel
+  retry tdnf install -y "$KERNEL_PACKAGE"
 fi
 
 retry tdnf install -y \
