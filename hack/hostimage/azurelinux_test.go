@@ -45,9 +45,13 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 	require.NotContains(t, versions, "latest")
 
 	containerfile := readRepoFile(t, "images/host-azurelinux3-nvidia/Containerfile")
-	require.Contains(t, containerfile, `test "${TARGETARCH}" = arm64`)
 	require.Contains(t, containerfile, "versions.env")
 	require.NotContains(t, containerfile, "host-ubuntu")
+
+	rootfs := readRepoFile(t, "images/host-azurelinux3/assets/rootfs.sh")
+	require.Contains(t, rootfs, `[ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]`)
+	require.Contains(t, rootfs, "retry tdnf install -y kernel-hwe")
+	require.Contains(t, rootfs, "retry tdnf install -y grub2-efi-binary cuda-open-hwe")
 }
 
 func TestAzureLinuxGraceGRUBConfig(t *testing.T) {

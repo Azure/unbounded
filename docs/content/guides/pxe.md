@@ -87,8 +87,9 @@ docker push ghcr.io/azure/host-ubuntu2404:v1
 docker push ghcr.io/azure/netboot:v1
 ```
 
-The `host-azurelinux3-nvidia` machine image is ARM64-only. It contains both
-Azure Linux kernel tracks and selects `kernel-hwe` with
+The `host-azurelinux3-nvidia` machine image remains available for AMD64 and
+ARM64. AMD64 keeps its single-HWE-kernel layout. ARM64 contains both Azure
+Linux kernel tracks and selects `kernel-hwe` with
 `iommu.passthrough=1 irqchip.gicv3_nolpi=y
 arm_smmu_v3.disable_msipolling=1` only when GRUB detects an NVIDIA Grace CPU.
 Use `make verify-host-azurelinux3-nvidia` to build and offline-inspect its

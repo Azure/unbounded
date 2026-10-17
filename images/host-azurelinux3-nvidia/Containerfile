@@ -1,9 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# Metalman ARM64 machine image for Azure Linux 3.0 with the NVIDIA open GPU
-# driver. It contains both kernel tracks and selects kernel-hwe plus the Grace
-# boot arguments only when SMBIOS reports an NVIDIA CPU.
+# Metalman machine image for Azure Linux 3.0 with the NVIDIA open GPU driver.
+# ARM64 contains both kernel tracks and selects kernel-hwe plus the Grace boot
+# arguments only when SMBIOS reports an NVIDIA CPU. AMD64 keeps the existing
+# single-HWE-kernel behavior.
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS rootfs
 ARG TARGETARCH
@@ -12,8 +13,7 @@ COPY images/host-azurelinux3/assets/rootfs.sh /usr/local/bin/build-rootfs
 COPY images/host-azurelinux3/assets/10_azure_nvidia /usr/local/share/unbounded/10_azure_nvidia
 COPY images/host-azurelinux3/assets/51-azure-nvidia.cfg /usr/local/share/unbounded/51-azure-nvidia.cfg
 COPY images/host-azurelinux3-nvidia/versions.env /usr/local/share/unbounded/versions.env
-RUN test "${TARGETARCH}" = arm64 && \
-    set -a && . /usr/local/share/unbounded/versions.env && set +a && \
+RUN set -a && . /usr/local/share/unbounded/versions.env && set +a && \
     TARGETARCH="${TARGETARCH}" NVIDIA="${NVIDIA}" sh /usr/local/bin/build-rootfs install
 RUN set -a && . /usr/local/share/unbounded/versions.env && set +a && \
     TARGETARCH="${TARGETARCH}" NVIDIA="${NVIDIA}" sh /usr/local/bin/build-rootfs finish

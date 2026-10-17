@@ -30,8 +30,9 @@ machine disk image.
 
 ### Azure Linux NVIDIA Grace Host Image
 
-`host-azurelinux3-nvidia` is an ARM64-only Metalman machine image. It installs
-both the standard Azure Linux kernel and `kernel-hwe`, then uses the SMBIOS CPU
+`host-azurelinux3-nvidia` is a multi-architecture Metalman machine image.
+AMD64 retains the existing single-HWE-kernel layout. ARM64 installs both the
+standard Azure Linux kernel and `kernel-hwe`, then uses the SMBIOS CPU
 manufacturer at boot to select `kernel-hwe` with the required NVIDIA Grace
 arguments. Non-NVIDIA ARM64 hardware boots the standard kernel without those
 arguments.

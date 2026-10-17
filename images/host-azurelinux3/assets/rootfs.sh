@@ -31,11 +31,7 @@ retry() {
 }
 
 install_packages() {
-if [ "$NVIDIA" = 1 ]; then
-  [ "$TARGETARCH" = arm64 ] || {
-    echo "the Azure Linux NVIDIA host image supports only arm64" >&2
-    exit 1
-  }
+if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
   : "${AZURELINUX_KERNEL_VERSION:?AZURELINUX_KERNEL_VERSION is required}"
   : "${AZURELINUX_KERNEL_HWE_VERSION:?AZURELINUX_KERNEL_HWE_VERSION is required}"
   : "${AZURELINUX_GRUB_VERSION:?AZURELINUX_GRUB_VERSION is required}"
@@ -54,10 +50,12 @@ sslverify=1
 EOF
 fi
 
-if [ "$NVIDIA" = 1 ]; then
+if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
   retry tdnf install -y \
     "kernel-${AZURELINUX_KERNEL_VERSION}" \
     "kernel-hwe-${AZURELINUX_KERNEL_HWE_VERSION}"
+elif [ "$NVIDIA" = 1 ]; then
+  retry tdnf install -y kernel-hwe
 else
   retry tdnf install -y kernel
 fi
@@ -71,12 +69,14 @@ retry tdnf install -y \
   iproute iputils nftables util-linux kmod procps-ng \
   efibootmgr chrony less
 
-if [ "$NVIDIA" = 1 ]; then
+if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
   retry tdnf install -y \
     "grub2-${AZURELINUX_GRUB_VERSION}" \
     "grub2-efi-binary-${AZURELINUX_GRUB_VERSION}" \
     "grub2-efi-${AZURELINUX_GRUB_VERSION}"
   retry tdnf install -y "cuda-open-hwe-${AZURELINUX_CUDA_OPEN_HWE_VERSION}"
+elif [ "$NVIDIA" = 1 ]; then
+  retry tdnf install -y grub2-efi-binary cuda-open-hwe
 else
   retry tdnf install -y grub2-efi-binary
 fi
@@ -85,7 +85,7 @@ tdnf clean all
 }
 
 finish() {
-if [ "$NVIDIA" = 1 ]; then
+if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
   for package_and_version in \
     "kernel:$AZURELINUX_KERNEL_VERSION" \
     "kernel-hwe:$AZURELINUX_KERNEL_HWE_VERSION"; do
@@ -191,8 +191,9 @@ WantedBy=multi-user.target
 EOF
   systemctl enable nvidia-persistence-mode.service
 
-  mkdir -p /etc/unbounded
-  cat > /etc/unbounded/image-inputs <<EOF
+  if [ "$TARGETARCH" = arm64 ]; then
+    mkdir -p /etc/unbounded
+    cat > /etc/unbounded/image-inputs <<EOF
 architecture=$TARGETARCH
 kernel=$AZURELINUX_KERNEL_VERSION
 kernel_hwe=$AZURELINUX_KERNEL_HWE_VERSION
@@ -200,6 +201,7 @@ grub=$AZURELINUX_GRUB_VERSION
 cuda_open_hwe=$AZURELINUX_CUDA_OPEN_HWE_VERSION
 agentbaker_reference=31804b47b7eb6d6999c7ffa6f643590f7b130bab
 EOF
+  fi
 fi
 
 # Use DHCP on wired interfaces by default. The Metalman installer replaces
