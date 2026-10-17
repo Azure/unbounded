@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -814,5 +815,165 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseKeepsRemotePeeredMeshPeer
 
 	if peerNames["worker-site1"] {
 		t.Fatalf("expected same-site worker to be skipped when manageCniPlugin=false, got peers %#v", gotPeers)
+	}
+}
+
+func TestUpdateWireGuardFromSlices_UnmanagedSiteGatewayWithoutPodCIDRIsTunnelReady(t *testing.T) {
+	mySiteName := "flex-site"
+	myPubKey := "pub-flex"
+	unmanaged := false
+
+	siteInformer := newInformerWithObjects(
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "flex-site"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{
+			ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+			Spec:       unboundedv1alpha3.SiteSpec{ManageCniPlugin: &unmanaged},
+		}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "managed"}}),
+	)
+	sliceInformer := newInformerWithObjects(
+		toUnstructured(t, &unboundednetv1alpha1.SiteNodeSlice{
+			ObjectMeta: metav1.ObjectMeta{Name: "slice-flex-site"},
+			SiteName:   mySiteName,
+			SliceIndex: 0,
+			Nodes: []unboundednetv1alpha1.NodeInfo{{
+				Name:               "node-flex",
+				WireGuardPublicKey: myPubKey,
+				InternalIPs:        []string{"10.3.0.10"},
+				PodCIDRs:           []string{"10.244.3.0/24"},
+			}},
+		}),
+	)
+	gatewayPoolInformer := newInformerWithObjects(
+		toUnstructured(t, &unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-cluster"},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type:        "Internal",
+				RoutedCidrs: []string{"10.224.0.0/16"},
+			},
+			Status: unboundednetv1alpha1.GatewayPoolStatus{
+				Nodes: []unboundednetv1alpha1.GatewayNodeInfo{
+					{
+						Name:                 "gw-unmanaged",
+						SiteName:             "cluster",
+						WireGuardPublicKey:   "pub-gw-unmanaged",
+						GatewayWireguardPort: 51821,
+						InternalIPs:          []string{"10.1.0.20"},
+					},
+					{
+						Name:                 "gw-managed-pending",
+						SiteName:             "managed",
+						WireGuardPublicKey:   "pub-gw-managed",
+						GatewayWireguardPort: 51822,
+						InternalIPs:          []string{"10.2.0.20"},
+					},
+				},
+			},
+		}),
+	)
+	assignmentInformer := newInformerWithObjects(
+		toUnstructured(t, &unboundednetv1alpha1.SiteGatewayPoolAssignment{
+			ObjectMeta: metav1.ObjectMeta{Name: "assign-flex-site"},
+			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+				Sites:        []string{mySiteName},
+				GatewayPools: []string{"pool-cluster"},
+			},
+		}),
+	)
+
+	state := &wireGuardState{
+		clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-flex"}}),
+		nodeName:  "node-flex",
+	}
+	cfg := &config{NodeName: "node-flex", WireGuardPort: 51820}
+
+	var gotGatewayPeers []gatewayPeerInfo
+
+	origConfigure := configureWireGuardFunc
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, _ []meshPeerInfo, gatewayPeers []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
+		gotGatewayPeers = append([]gatewayPeerInfo(nil), gatewayPeers...)
+		return nil
+	}
+
+	defer func() { configureWireGuardFunc = origConfigure }()
+
+	if err := updateWireGuardFromSlices(context.Background(), nil, siteInformer, sliceInformer, gatewayPoolInformer, newInformerWithObjects(), newInformerWithObjects(), assignmentInformer, newInformerWithObjects(), cfg, mySiteName, "priv", myPubKey, true, state); err != nil {
+		t.Fatalf("updateWireGuardFromSlices() error = %v", err)
+	}
+
+	peers := map[string]gatewayPeerInfo{}
+	for _, peer := range gotGatewayPeers {
+		peers[peer.Name] = peer
+	}
+
+	unmanagedGW, ok := peers["gw-unmanaged"]
+	if !ok {
+		t.Fatalf("expected gateway peer gw-unmanaged, got %#v", gotGatewayPeers)
+	}
+
+	if !unmanagedGW.UnmanagedCNISite {
+		t.Fatalf("expected gw-unmanaged to be marked as an unmanaged CNI site gateway, got %#v", unmanagedGW)
+	}
+
+	if !gatewayPeerReadyForTunnel(unmanagedGW) {
+		t.Fatalf("expected gateway in unmanaged site without podCIDRs to be tunnel ready, got %#v", unmanagedGW)
+	}
+
+	prefixes := gatewayBPFPrefixes(unmanagedGW, nil)
+	if !slices.Contains(prefixes, "10.224.0.0/16") || !slices.Contains(prefixes, "10.1.0.20/32") {
+		t.Fatalf("expected routed CIDR and gateway host CIDR in BPF prefixes, got %v", prefixes)
+	}
+
+	managedGW, ok := peers["gw-managed-pending"]
+	if !ok {
+		t.Fatalf("expected gateway peer gw-managed-pending, got %#v", gotGatewayPeers)
+	}
+
+	if managedGW.UnmanagedCNISite {
+		t.Fatalf("expected gw-managed-pending to stay a managed CNI site gateway, got %#v", managedGW)
+	}
+
+	if gatewayPeerReadyForTunnel(managedGW) {
+		t.Fatalf("expected managed-site gateway without podCIDRs to wait for podCIDR assignment, got %#v", managedGW)
+	}
+}
+
+func TestGatewayPeerReadyForTunnel(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		peer gatewayPeerInfo
+		want bool
+	}{
+		{
+			name: "managed gateway with podCIDRs",
+			peer: gatewayPeerInfo{InternalIPs: []string{"10.1.0.20"}, PodCIDRs: []string{"10.244.2.0/24"}},
+			want: true,
+		},
+		{
+			name: "managed gateway waiting for podCIDRs",
+			peer: gatewayPeerInfo{InternalIPs: []string{"10.1.0.20"}, RoutedCidrs: []string{"10.224.0.0/16"}},
+			want: false,
+		},
+		{
+			name: "unmanaged site gateway with routed CIDRs",
+			peer: gatewayPeerInfo{InternalIPs: []string{"10.1.0.20"}, RoutedCidrs: []string{"10.224.0.0/16"}, UnmanagedCNISite: true},
+			want: true,
+		},
+		{
+			name: "unmanaged site gateway without routed CIDRs",
+			peer: gatewayPeerInfo{InternalIPs: []string{"10.1.0.20"}, UnmanagedCNISite: true},
+			want: false,
+		},
+		{
+			name: "gateway without internal IPs",
+			peer: gatewayPeerInfo{PodCIDRs: []string{"10.244.2.0/24"}, RoutedCidrs: []string{"10.224.0.0/16"}, UnmanagedCNISite: true},
+			want: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := gatewayPeerReadyForTunnel(tt.peer); got != tt.want {
+				t.Fatalf("gatewayPeerReadyForTunnel(%#v) = %v, want %v", tt.peer, got, tt.want)
+			}
+		})
 	}
 }
