@@ -53,7 +53,9 @@ or `nvlink5` packages. NVIDIA's packaged `nvidia-persistenced` and
 `nvidia-powerd` services remain disabled or absent so the driver A/B preserves
 the existing idle-service baseline. The exact `ocl-icd` and
 `opencl-filesystem` dependencies come from Microsoft's signed Azure Linux 3
-extended repository. AMD64 retains its existing package path.
+extended repository. The build also pins and checks the complete native DKMS
+toolchain instead of relying on minimal-package transitive dependencies.
+AMD64 retains its existing package path.
 
 Build and offline-inspect the disk without publishing it:
 

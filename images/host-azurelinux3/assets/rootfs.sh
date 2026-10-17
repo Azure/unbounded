@@ -112,8 +112,14 @@ verify_nvidia_localrepo_driver() {
   done
 
   for package_and_version in \
+    "binutils:$AZURELINUX_BINUTILS_VERSION" \
+    "elfutils-libelf-devel:$AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION" \
+    "gcc:$AZURELINUX_GCC_VERSION" \
+    "gcc-c++:$AZURELINUX_GCC_VERSION" \
+    "make:$AZURELINUX_MAKE_VERSION" \
     "ocl-icd:$AZURELINUX_OCL_ICD_VERSION" \
-    "opencl-filesystem:$AZURELINUX_OPENCL_FILESYSTEM_VERSION"; do
+    "opencl-filesystem:$AZURELINUX_OPENCL_FILESYSTEM_VERSION" \
+    "patch:$AZURELINUX_PATCH_VERSION"; do
     package=${package_and_version%%:*}
     expected_version=${package_and_version#*:}
     version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$package")
@@ -188,6 +194,11 @@ install_nvidia_localrepo_driver() {
   : "${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION is required}"
   : "${AZURELINUX_OCL_ICD_VERSION:?AZURELINUX_OCL_ICD_VERSION is required}"
   : "${AZURELINUX_OPENCL_FILESYSTEM_VERSION:?AZURELINUX_OPENCL_FILESYSTEM_VERSION is required}"
+  : "${AZURELINUX_BINUTILS_VERSION:?AZURELINUX_BINUTILS_VERSION is required}"
+  : "${AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION:?AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION is required}"
+  : "${AZURELINUX_GCC_VERSION:?AZURELINUX_GCC_VERSION is required}"
+  : "${AZURELINUX_MAKE_VERSION:?AZURELINUX_MAKE_VERSION is required}"
+  : "${AZURELINUX_PATCH_VERSION:?AZURELINUX_PATCH_VERSION is required}"
   : "${NVIDIA_DRIVER_VERSION:?NVIDIA_DRIVER_VERSION is required}"
   : "${NVIDIA_DRIVER_RPM_VERSION:?NVIDIA_DRIVER_RPM_VERSION is required}"
   : "${NVIDIA_DKMS_RPM_VERSION:?NVIDIA_DKMS_RPM_VERSION is required}"
@@ -212,8 +223,20 @@ repo_gpgcheck=1
 enabled=1
 EOF
   retry tdnf install -y \
+    "binutils-${AZURELINUX_BINUTILS_VERSION}" \
+    "elfutils-libelf-devel-${AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION}" \
+    "gcc-${AZURELINUX_GCC_VERSION}" \
+    "gcc-c++-${AZURELINUX_GCC_VERSION}" \
+    "make-${AZURELINUX_MAKE_VERSION}" \
     "ocl-icd-${AZURELINUX_OCL_ICD_VERSION}" \
-    "opencl-filesystem-${AZURELINUX_OPENCL_FILESYSTEM_VERSION}"
+    "opencl-filesystem-${AZURELINUX_OPENCL_FILESYSTEM_VERSION}" \
+    "patch-${AZURELINUX_PATCH_VERSION}"
+  for command in as gcc g++ ld make patch; do
+    command -v "$command" >/dev/null 2>&1 || {
+      echo "NVIDIA DKMS toolchain command is missing: $command" >&2
+      exit 1
+    }
+  done
 
   repo_rpm=/tmp/nvidia-driver-local-repo.rpm
   retry curl --fail --location --silent --show-error \
@@ -480,6 +503,11 @@ mlnx_ofa_kernel_hwe_devel=$AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION
 mlnx_ofa_kernel_hwe_modules=$AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION
 ocl_icd=$AZURELINUX_OCL_ICD_VERSION
 opencl_filesystem=$AZURELINUX_OPENCL_FILESYSTEM_VERSION
+binutils=$AZURELINUX_BINUTILS_VERSION
+elfutils_libelf_devel=$AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION
+gcc=$AZURELINUX_GCC_VERSION
+make=$AZURELINUX_MAKE_VERSION
+patch=$AZURELINUX_PATCH_VERSION
 nvidia_persistenced_service=$NVIDIA_PERSISTENCED_SERVICE_STATE
 nvidia_powerd_service=$NVIDIA_POWERD_SERVICE_STATE
 EOF

@@ -43,6 +43,11 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 		"AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION=26.01-2_6.18.48.1.1.azl3",
 		"AZURELINUX_OCL_ICD_VERSION=2.2.13-2.azl3",
 		"AZURELINUX_OPENCL_FILESYSTEM_VERSION=1.0-13.azl3",
+		"AZURELINUX_BINUTILS_VERSION=2.41-13.azl3",
+		"AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION=0.189-6.azl3",
+		"AZURELINUX_GCC_VERSION=13.2.0-7.azl3",
+		"AZURELINUX_MAKE_VERSION=4.4.1-2.azl3",
+		"AZURELINUX_PATCH_VERSION=2.7.6-10.azl3",
 		"NVIDIA_DRIVER_VERSION=580.178.04",
 		"NVIDIA_DRIVER_RPM_VERSION=580.178.04-1.azl3",
 		"NVIDIA_DKMS_RPM_VERSION=3.4.1-1.azl3",
@@ -99,6 +104,14 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`baseurl=https://packages.microsoft.com/azurelinux/$releasever/prod/extended/$basearch`,
 		`ocl-icd-${AZURELINUX_OCL_ICD_VERSION}`,
 		`opencl-filesystem-${AZURELINUX_OPENCL_FILESYSTEM_VERSION}`,
+		`binutils-${AZURELINUX_BINUTILS_VERSION}`,
+		`elfutils-libelf-devel-${AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION}`,
+		`gcc-${AZURELINUX_GCC_VERSION}`,
+		`gcc-c++-${AZURELINUX_GCC_VERSION}`,
+		`make-${AZURELINUX_MAKE_VERSION}`,
+		`patch-${AZURELINUX_PATCH_VERSION}`,
+		`for command in as gcc g++ ld make patch`,
+		`NVIDIA DKMS toolchain command is missing: $command`,
 	} {
 		require.Contains(t, rootfs, expected)
 	}

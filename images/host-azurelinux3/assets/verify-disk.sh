@@ -81,7 +81,12 @@ for expected in \
   mlnx_ofa_kernel_hwe_devel=26.01-2_6.18.48.1.1.azl3 \
   mlnx_ofa_kernel_hwe_modules=26.01-2_6.18.48.1.1.azl3 \
   ocl_icd=2.2.13-2.azl3 \
-  opencl_filesystem=1.0-13.azl3; do
+  opencl_filesystem=1.0-13.azl3 \
+  binutils=2.41-13.azl3 \
+  elfutils_libelf_devel=0.189-6.azl3 \
+  gcc=13.2.0-7.azl3 \
+  make=4.4.1-2.azl3 \
+  patch=2.7.6-10.azl3; do
   printf '%s\n' "$INPUTS" | grep -Fx "$expected" >/dev/null || {
     echo "missing image input: $expected" >&2
     exit 1
