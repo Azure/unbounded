@@ -1,0 +1,72 @@
+#!/bin/sh
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Adapted from Azure/AgentBaker commit
+# 31804b47b7eb6d6999c7ffa6f643590f7b130bab.
+
+set -e
+
+BOOT_DIR="${BOOT_DIR:-/boot}"
+GRUB_LINUX_SCRIPT="${GRUB_LINUX_SCRIPT:-/etc/grub.d/10_linux}"
+
+boot_device_id=
+reverse_sorted_list=
+grub_probe=
+if [ -r "$GRUB_LINUX_SCRIPT" ]; then
+	# shellcheck source=/etc/grub.d/10_linux
+	# shellcheck disable=SC1091
+	. "$GRUB_LINUX_SCRIPT" >/dev/null 2>&1
+fi
+
+NVIDIA=
+OTHER=
+rpm_kernels=false
+
+if command -v rpm >/dev/null 2>&1; then
+	for linux in "${BOOT_DIR}"/vmlinuz-*; do
+		[ -f "$linux" ] || continue
+		package=$(rpm -qf --queryformat '%{NAME}' "$linux" 2>/dev/null || true)
+
+		case $package in
+			kernel-hwe) NVIDIA=$(printf '%s\n%s\n' "$NVIDIA" "$linux" | sed '/^$/d' | sort -V | tail -n1) ;;
+			kernel) OTHER=$(printf '%s\n%s\n' "$OTHER" "$linux" | sed '/^$/d' | sort -V | tail -n1) ;;
+		esac
+	done
+	if [ -n "$NVIDIA" ] && [ -n "$OTHER" ]; then
+		rpm_kernels=true
+	fi
+fi
+
+if [ -z "$NVIDIA" ] || [ -z "$OTHER" ]; then
+	NVIDIA=
+	OTHER=
+	# shellcheck disable=SC2086
+	for linux in ${reverse_sorted_list}; do
+		case $linux in
+			*-azure-nvidia) : "${NVIDIA:="${linux}"}" ;;
+			*) : "${OTHER:="${linux}"}" ;;
+		esac
+	done
+fi
+
+if [ -z "$NVIDIA" ] || [ -z "$OTHER" ]; then
+	echo "Only one image type (NVIDIA or non-NVIDIA) found" >&2
+	exit 0
+fi
+
+NVIDIA=${NVIDIA##*/}
+NVIDIA=${NVIDIA#vmlinuz-}
+OTHER=${OTHER##*/}
+OTHER=${OTHER#vmlinuz-}
+
+if [ -z "$boot_device_id" ]; then
+	echo "Could not determine boot_device_id from $GRUB_LINUX_SCRIPT" >&2
+	exit 0
+fi
+
+echo "Default NVIDIA image: $NVIDIA, recovery image: $OTHER, boot_device_id: $boot_device_id" >&2
+
+cat <<EOF
+set default="gnulinux-${NVIDIA}-advanced-${boot_device_id}"
+EOF
