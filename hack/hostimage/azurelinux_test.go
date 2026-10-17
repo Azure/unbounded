@@ -315,6 +315,8 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "nvidia-persistence-mode.service is masked")
 	require.Contains(t, verify, "legacy NVIDIA persistence mode is unexpectedly enabled by systemd")
 	require.Contains(t, verify, "ExecStart=/usr/bin/nvidia-smi -pm 0")
+	require.Contains(t, verify, "$WORK/systemd-etc/system/nvidia-persistence-mode.service")
+	require.Contains(t, verify, "$WORK/systemd-etc/system/multi-user.target.wants/nvidia-device-setup.service")
 	require.Contains(t, verify, "PASS specialized NVIDIA GRUB policy:")
 	require.Contains(t, verify, "PASS MANA-compatible kernel command line:")
 	require.Contains(t, verify, "GICv3 LPI/ITS MSI-X remains enabled")

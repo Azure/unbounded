@@ -136,11 +136,11 @@ if printf '%s\n' "$DEVICE_SETUP" | grep -Fx 'RemainAfterExit=yes' >/dev/null; th
   echo "NVIDIA device setup unexpectedly remains active after exit" >&2
   exit 1
 fi
-if [ "$(readlink "$WORK/systemd-etc/nvidia-persistence-mode.service")" != /dev/null ]; then
+if [ "$(readlink "$WORK/systemd-etc/system/nvidia-persistence-mode.service")" != /dev/null ]; then
   echo "legacy NVIDIA persistence mode service is not masked" >&2
   exit 1
 fi
-if [ "$(readlink "$WORK/systemd-etc/multi-user.target.wants/nvidia-device-setup.service")" != \
+if [ "$(readlink "$WORK/systemd-etc/system/multi-user.target.wants/nvidia-device-setup.service")" != \
     /etc/systemd/system/nvidia-device-setup.service ]; then
   echo "NVIDIA device setup service is not enabled" >&2
   exit 1
