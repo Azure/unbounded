@@ -84,6 +84,10 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`NVIDIA DKMS did not install for $NVIDIA_KVER`,
 		`for module in nvidia nvidia-modeset nvidia-drm nvidia-uvm nvidia-peermem`,
 		`"$module vermagic is $vermagic, expected kernel $NVIDIA_KVER"`,
+		`disable_nvidia_vendor_service nvidia-persistenced.service`,
+		`disable_nvidia_vendor_service nvidia-powerd.service`,
+		`"$unit enablement is $state, expected disabled or not-found"`,
+		`"$unit is linked into a boot target"`,
 		`R580 A/B image unexpectedly contains another NVIDIA driver or fabric component`,
 		`mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}`,
 		`mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}`,
@@ -265,6 +269,9 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "PASS package inputs:")
 	require.Contains(t, verify, "PASS NVIDIA 580.178.04 target-kernel DKMS modules:")
 	require.Contains(t, verify, "GSP firmware=580.178.04")
+	require.Contains(t, verify, "PASS idle-service baseline:")
+	require.Contains(t, verify, "nvidia-persistenced.service is disabled or absent")
+	require.Contains(t, verify, "nvidia-powerd.service is disabled or absent")
 	require.Contains(t, verify, "PASS specialized NVIDIA GRUB policy:")
 	require.Contains(t, verify, "PASS MANA-compatible kernel command line:")
 	require.Contains(t, verify, "GICv3 LPI/ITS MSI-X remains enabled")

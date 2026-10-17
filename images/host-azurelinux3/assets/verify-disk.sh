@@ -10,7 +10,7 @@ DISK_GZ="${1:-/disk/disk.img.gz}"
   exit 1
 }
 
-for command in basename debugfs gzip modinfo mtype python3 sfdisk sha256sum; do
+for command in basename debugfs find gzip modinfo mtype python3 sfdisk sha256sum; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "required inspection command is missing: $command" >&2
     exit 1
@@ -88,6 +88,29 @@ done
 echo "PASS package inputs:"
 printf '%s\n' "$INPUTS" | sed 's/^/  /'
 
+for service in nvidia_persistenced_service nvidia_powerd_service; do
+  state=$(printf '%s\n' "$INPUTS" | sed -n "s/^$service=//p")
+  case "$state" in
+    disabled|not-found) ;;
+    *)
+      echo "$service is $state, expected disabled or not-found" >&2
+      exit 1
+      ;;
+  esac
+done
+mkdir -p "$WORK/systemd-etc" "$WORK/systemd-usr"
+debugfs -R "rdump /etc/systemd/system $WORK/systemd-etc" "$ROOT" >/dev/null 2>&1
+debugfs -R "rdump /usr/lib/systemd/system $WORK/systemd-usr" "$ROOT" >/dev/null 2>&1
+if find "$WORK/systemd-etc" "$WORK/systemd-usr" -type l \
+    \( -name nvidia-persistenced.service -o -name nvidia-powerd.service \) |
+    grep -q .; then
+  echo "NVIDIA vendor service is unexpectedly linked into a boot target" >&2
+  exit 1
+fi
+echo "PASS idle-service baseline:"
+echo "  nvidia-persistenced.service is disabled or absent"
+echo "  nvidia-powerd.service is disabled or absent"
+
 DRIVER_MANIFEST=$(debugfs -R "cat /etc/unbounded/nvidia-driver-manifest" "$ROOT" 2>/dev/null)
 for expected in \
   driver_source=nvidia-localrepo \
@@ -97,6 +120,16 @@ for expected in \
     echo "missing NVIDIA driver manifest value: $expected" >&2
     exit 1
   }
+done
+for service in persistenced_service powerd_service; do
+  state=$(printf '%s\n' "$DRIVER_MANIFEST" | sed -n "s/^$service=//p")
+  case "$state" in
+    disabled|not-found) ;;
+    *)
+      echo "NVIDIA driver manifest $service is $state, expected disabled or not-found" >&2
+      exit 1
+      ;;
+  esac
 done
 
 manifest_value() {

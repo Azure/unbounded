@@ -49,7 +49,9 @@ repository archive and key hashes, checks every embedded RPM signature, then
 builds and installs all five open GPU modules explicitly for
 `6.18.48.1-1.azl3`. The build rejects missing modules, mixed userspace or GSP
 firmware versions, wrong vermagic, and the unrequested Fabric Manager, IMEX,
-or `nvlink5` packages. AMD64 retains its existing package path.
+or `nvlink5` packages. NVIDIA's packaged `nvidia-persistenced` and
+`nvidia-powerd` services remain disabled or absent so the driver A/B preserves
+the existing idle-service baseline. AMD64 retains its existing package path.
 
 Build and offline-inspect the disk without publishing it:
 

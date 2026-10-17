@@ -70,6 +70,28 @@ find_nvidia_module() {
     \( -name "$module.ko" -o -name "$module.ko.xz" -o -name "$module.ko.zst" \)
 }
 
+disable_nvidia_vendor_service() {
+  unit="$1"
+  if systemctl cat "$unit" >/dev/null 2>&1; then
+    systemctl disable "$unit" >/dev/null
+  fi
+  state=$(systemctl is-enabled "$unit" 2>/dev/null || :)
+  case "$state" in
+    disabled|not-found) ;;
+    *)
+      echo "$unit enablement is $state, expected disabled or not-found" >&2
+      exit 1
+      ;;
+  esac
+  if find /etc/systemd/system /usr/lib/systemd/system -type l \
+      \( -path "*/.wants/$unit" -o -path "*/.requires/$unit" \) |
+      grep -q .; then
+    echo "$unit is linked into a boot target" >&2
+    exit 1
+  fi
+  printf '%s\n' "$state"
+}
+
 verify_nvidia_localrepo_driver() {
   for package in \
     nvidia-open \
@@ -105,8 +127,11 @@ verify_nvidia_localrepo_driver() {
   manifest=/etc/unbounded/nvidia-driver-manifest
   mkdir -p /etc/unbounded
   : > "$manifest"
-  printf 'driver_source=%s\ndriver_version=%s\nkernel=%s\n' \
-    "$NVIDIA_DRIVER_SOURCE" "$NVIDIA_DRIVER_RPM_VERSION" "$NVIDIA_KVER" >> "$manifest"
+  NVIDIA_PERSISTENCED_SERVICE_STATE=$(disable_nvidia_vendor_service nvidia-persistenced.service)
+  NVIDIA_POWERD_SERVICE_STATE=$(disable_nvidia_vendor_service nvidia-powerd.service)
+  printf 'driver_source=%s\ndriver_version=%s\nkernel=%s\npersistenced_service=%s\npowerd_service=%s\n' \
+    "$NVIDIA_DRIVER_SOURCE" "$NVIDIA_DRIVER_RPM_VERSION" "$NVIDIA_KVER" \
+    "$NVIDIA_PERSISTENCED_SERVICE_STATE" "$NVIDIA_POWERD_SERVICE_STATE" >> "$manifest"
 
   for module in nvidia nvidia-modeset nvidia-drm nvidia-uvm nvidia-peermem; do
     paths=$(find_nvidia_module "$module")
@@ -420,6 +445,8 @@ nvidia_fabric_probe_sha256=$NVIDIA_FABRIC_PROBE_SHA256
 mlnx_ofa_kernel=$AZURELINUX_MLNX_OFA_KERNEL_VERSION
 mlnx_ofa_kernel_hwe_devel=$AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION
 mlnx_ofa_kernel_hwe_modules=$AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION
+nvidia_persistenced_service=$NVIDIA_PERSISTENCED_SERVICE_STATE
+nvidia_powerd_service=$NVIDIA_POWERD_SERVICE_STATE
 EOF
     else
       printf 'cuda_open_hwe=%s\n' "$AZURELINUX_CUDA_OPEN_HWE_VERSION" \

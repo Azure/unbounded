@@ -99,7 +99,8 @@ The ARM64 image pins NVIDIA R580.178.04 from NVIDIA's signed Azure Linux 3
 local repository and explicitly builds its five open GPU modules for the
 pinned HWE kernel. This is an image-only driver A/B: it preserves the existing
 GRUB, OFED, CDMM, and MANA-safe command-line behavior and does not add Fabric
-Manager, IMEX, or `nvlink5`.
+Manager, IMEX, or `nvlink5`. NVIDIA's packaged persistence and power services
+remain disabled or absent to preserve the existing idle baseline.
 Use `make verify-host-azurelinux3-nvidia` to build and offline-inspect its
 `/disk/disk.img.gz` artifact. This command does not publish the image or alter
 any Machine.
