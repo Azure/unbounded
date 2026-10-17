@@ -46,6 +46,6 @@ jobs:
 
       - name: Inspect ARM64 disk image
         run: |
-          images/host-azurelinux3/assets/verify-disk.sh \
+          sh images/host-azurelinux3/assets/verify-disk.sh \
             tmp/host-azurelinux3-nvidia/disk/disk.img.gz
           sha256sum tmp/host-azurelinux3-nvidia/disk/disk.img.gz
