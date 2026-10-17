@@ -43,6 +43,7 @@ menuentry "Azure Linux" --id standard {
 }
 
 menuentry "Azure Linux NVIDIA Grace" --id nvidia-grace {
+  # MANA MSI-X interrupts use the GICv3 LPI/ITS path. Do not disable LPIs.
   linux /boot/vmlinuz-$NVIDIA_KVER root=UUID=$ROOT_UUID rw $CONSOLE
   initrd /boot/initramfs-$NVIDIA_KVER.img
 }

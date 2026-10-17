@@ -36,7 +36,9 @@ standard Azure Linux kernel and `kernel-hwe`, then defaults unconditionally to
 `kernel-hwe` without hardware-specific kernel arguments. The standard kernel
 remains available as a recovery entry. The separate generic
 `host-azurelinux3` ARM64 image defaults to the standard kernel without those
-arguments.
+arguments. In particular, the NVIDIA image must not set
+`irqchip.gicv3_nolpi=y`: MANA NIC MSI-X interrupts use the GICv3 LPI/ITS path,
+so disabling LPIs prevents host networking during boot.
 
 The package inputs are recorded in
 `images/host-azurelinux3-nvidia/versions.env`. Builds fail if the kernel,

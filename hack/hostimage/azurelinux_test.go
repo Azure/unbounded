@@ -214,4 +214,6 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "NVIDIA image unexpectedly uses runtime SMBIOS selection")
 	require.Contains(t, verify, "PASS package inputs:")
 	require.Contains(t, verify, "PASS specialized NVIDIA GRUB policy:")
+	require.Contains(t, verify, "PASS MANA-compatible kernel command line:")
+	require.Contains(t, verify, "GICv3 LPI/ITS MSI-X remains enabled")
 }

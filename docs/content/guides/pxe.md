@@ -91,7 +91,10 @@ The `host-azurelinux3-nvidia` machine image remains available for AMD64 and
 ARM64. AMD64 keeps its single-HWE-kernel layout. ARM64 contains both Azure
 Linux kernel tracks and defaults to `kernel-hwe` without hardware-specific
 kernel arguments. Its standard kernel remains available as a recovery entry.
-The generic `host-azurelinux3` image defaults to the standard kernel.
+The generic `host-azurelinux3` image defaults to the standard kernel. Do not
+add `irqchip.gicv3_nolpi=y` to the NVIDIA image: MANA NIC MSI-X interrupts use
+the GICv3 LPI/ITS path, and disabling LPIs prevents the host from establishing
+network connectivity after boot.
 Use `make verify-host-azurelinux3-nvidia` to build and offline-inspect its
 `/disk/disk.img.gz` artifact. This command does not publish the image or alter
 any Machine.
