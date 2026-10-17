@@ -42,7 +42,7 @@ ROOT_SIZE=$(partition_field 1 size)
 dd if="$DISK" of="$ROOT" bs=512 skip="$ROOT_START" count="$ROOT_SIZE" status=none
 
 debugfs_exists() {
-  debugfs -R "stat $1" "$ROOT" >/dev/null 2>&1
+  debugfs -R "stat $1" "$ROOT" 2>/dev/null | grep -q '^Inode:'
 }
 
 for path in \
@@ -56,6 +56,8 @@ for path in \
   /usr/bin/nvidia-smi \
   /usr/lib/firmware/nvidia/580.178.04/gsp_ga10x.bin \
   /usr/lib/firmware/nvidia/580.178.04/gsp_tu10x.bin \
+  /usr/lib/modules/6.18.48.1-1.azl3/kernel/drivers/gpu/drm/drm_ttm_helper.ko.xz \
+  /usr/lib/modules/6.18.48.1-1.azl3/kernel/drivers/gpu/drm/ttm/ttm.ko.xz \
   /usr/lib/grub/arm64-efi/smbios.mod; do
   debugfs_exists "$path" || {
     echo "missing expected file in root partition: $path" >&2
@@ -70,6 +72,7 @@ for expected in \
   boot_profile=nvidia-hwe \
   kernel=6.6.157.1-1.azl3 \
   kernel_hwe=6.18.48.1-1.azl3 \
+  kernel_hwe_drivers_gpu=6.18.48.1-1.azl3 \
   grub=2.06-27.azl3 \
   nvidia_driver_source=nvidia-localrepo \
   nvidia_driver=580.178.04-1.azl3 \
@@ -143,6 +146,20 @@ manifest_value() {
   key="$1"
   printf '%s\n' "$DRIVER_MANIFEST" | sed -n "s/^$key=//p"
 }
+
+MODULES_DEP=$(debugfs -R \
+  "cat /usr/lib/modules/6.18.48.1-1.azl3/modules.dep" "$ROOT" 2>/dev/null)
+NVIDIA_DRM_DEP=$(printf '%s\n' "$MODULES_DEP" | grep '/nvidia-drm\.ko')
+for dependency in \
+  kernel/drivers/gpu/drm/ttm/ttm.ko \
+  kernel/drivers/gpu/drm/drm_ttm_helper.ko; do
+  printf '%s\n' "$NVIDIA_DRM_DEP" | grep -F "$dependency" >/dev/null || {
+    echo "published nvidia_drm dependency is missing: $dependency" >&2
+    exit 1
+  }
+done
+echo "PASS NVIDIA DRM dependency closure:"
+echo "  kernel-hwe-drivers-gpu provides ttm and drm_ttm_helper"
 
 for module in nvidia nvidia_modeset nvidia_drm nvidia_uvm nvidia_peermem; do
   module_path=$(manifest_value "module_${module}_path")

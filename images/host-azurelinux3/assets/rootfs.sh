@@ -117,6 +117,7 @@ verify_nvidia_localrepo_driver() {
     "gcc:$AZURELINUX_GCC_VERSION" \
     "gcc-c++:$AZURELINUX_GCC_VERSION" \
     "kernel-devel:$AZURELINUX_KERNEL_VERSION" \
+    "kernel-hwe-drivers-gpu:$AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION" \
     "make:$AZURELINUX_MAKE_VERSION" \
     "ocl-icd:$AZURELINUX_OCL_ICD_VERSION" \
     "opencl-filesystem:$AZURELINUX_OPENCL_FILESYSTEM_VERSION" \
@@ -190,6 +191,7 @@ verify_nvidia_localrepo_driver() {
 }
 
 install_nvidia_localrepo_driver() {
+  : "${AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION:?AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION is required}"
   : "${AZURELINUX_MLNX_OFA_KERNEL_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_VERSION is required}"
   : "${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION is required}"
   : "${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION is required}"
@@ -211,6 +213,7 @@ install_nvidia_localrepo_driver() {
   retry tdnf install -y \
     "kernel-devel-${AZURELINUX_KERNEL_VERSION}" \
     "kernel-hwe-devel-${AZURELINUX_KERNEL_HWE_VERSION}" \
+    "kernel-hwe-drivers-gpu-${AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION}" \
     "mlnx-ofa_kernel-${AZURELINUX_MLNX_OFA_KERNEL_VERSION}" \
     "mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}" \
     "mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}"
@@ -302,6 +305,18 @@ EOF
     exit 1
   }
   depmod "$NVIDIA_KVER"
+
+  nvidia_drm_dependencies=$(modprobe --show-depends \
+    --set-version "$NVIDIA_KVER" nvidia_drm)
+  for dependency in \
+    kernel/drivers/gpu/drm/ttm/ttm.ko \
+    kernel/drivers/gpu/drm/drm_ttm_helper.ko; do
+    printf '%s\n' "$nvidia_drm_dependencies" | grep -F "$dependency" >/dev/null || {
+      echo "nvidia_drm dependency is missing from $NVIDIA_KVER: $dependency" >&2
+      exit 1
+    }
+  done
+
   verify_nvidia_localrepo_driver
 
   rpm -e "nvidia-driver-local-repo-azl3-$NVIDIA_DRIVER_VERSION"
@@ -497,6 +512,7 @@ image_variant=$IMAGE_VARIANT
 boot_profile=nvidia-hwe
 kernel=$AZURELINUX_KERNEL_VERSION
 kernel_hwe=$AZURELINUX_KERNEL_HWE_VERSION
+kernel_hwe_drivers_gpu=$AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION
 grub=$AZURELINUX_GRUB_VERSION
 nvidia_driver_source=$NVIDIA_DRIVER_SOURCE
 agentbaker_reference=31804b47b7eb6d6999c7ffa6f643590f7b130bab

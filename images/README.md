@@ -49,15 +49,17 @@ repository archive and key hashes, checks every embedded RPM signature, then
 builds and installs all five open GPU modules explicitly for
 `6.18.48.1-1.azl3`. The build rejects missing modules, mixed userspace or GSP
 firmware versions, wrong vermagic, and the unrequested Fabric Manager, IMEX,
-or `nvlink5` packages. NVIDIA's packaged `nvidia-persistenced` and
-`nvidia-powerd` services remain disabled or absent so the driver A/B preserves
-the existing idle-service baseline. The exact `ocl-icd` and
-`opencl-filesystem` dependencies come from Microsoft's signed Azure Linux 3
-extended repository. The build also pins and checks the complete native DKMS
-toolchain instead of relying on minimal-package transitive dependencies. It
-suppresses NVIDIA's implicit RPM-scriptlet build and performs one explicit,
-fail-closed build for the pinned HWE kernel. AMD64 retains its existing
-package path.
+or `nvlink5` packages. The image also pins `kernel-hwe-drivers-gpu` to the HWE
+kernel version and verifies that its `ttm` and `drm_ttm_helper` modules close
+the runtime dependency chain required by `nvidia_drm`. NVIDIA's packaged
+`nvidia-persistenced` and `nvidia-powerd` services remain disabled or absent
+so the driver A/B preserves the existing idle-service baseline. The exact
+`ocl-icd` and `opencl-filesystem` dependencies come from Microsoft's signed
+Azure Linux 3 extended repository. The build also pins and checks the complete
+native DKMS toolchain instead of relying on minimal-package transitive
+dependencies. It suppresses NVIDIA's implicit RPM-scriptlet build and
+performs one explicit, fail-closed build for the pinned HWE kernel. AMD64
+retains its existing package path.
 
 Build and offline-inspect the disk without publishing it:
 

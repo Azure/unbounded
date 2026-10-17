@@ -36,6 +36,7 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 	for _, expected := range []string{
 		"AZURELINUX_KERNEL_VERSION=6.6.157.1-1.azl3",
 		"AZURELINUX_KERNEL_HWE_VERSION=6.18.48.1-1.azl3",
+		"AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION=6.18.48.1-1.azl3",
 		"AZURELINUX_GRUB_VERSION=2.06-27.azl3",
 		"AZURELINUX_CUDA_OPEN_HWE_VERSION=580.159.04-2_6.18.48.1.1.azl3",
 		"AZURELINUX_MLNX_OFA_KERNEL_VERSION=26.01-1_6.6.158.1.1.azl3",
@@ -102,6 +103,7 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`"$unit is linked into a boot target"`,
 		`R580 A/B image unexpectedly contains another NVIDIA driver or fabric component`,
 		`kernel-devel-${AZURELINUX_KERNEL_VERSION}`,
+		`kernel-hwe-drivers-gpu-${AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION}`,
 		`mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}`,
 		`mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}`,
 		`baseurl=https://packages.microsoft.com/azurelinux/$releasever/prod/extended/$basearch`,
@@ -115,6 +117,8 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`patch-${AZURELINUX_PATCH_VERSION}`,
 		`for command in as gcc g++ ld make patch`,
 		`NVIDIA DKMS toolchain command is missing: $command`,
+		`modprobe --show-depends`,
+		`nvidia_drm dependency is missing from $NVIDIA_KVER`,
 	} {
 		require.Contains(t, rootfs, expected)
 	}
@@ -124,6 +128,12 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		strings.Index(rootfs, `"mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}"`),
 		strings.Index(rootfs, `rpm --install --nodeps --noscripts "$kmod_rpm"`),
 		"OFED must be installed before the NVIDIA driver",
+	)
+	require.Less(
+		t,
+		strings.Index(rootfs, `"kernel-hwe-drivers-gpu-${AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION}"`),
+		strings.Index(rootfs, `rpm --install --nodeps --noscripts "$kmod_rpm"`),
+		"NVIDIA DRM dependencies must be installed before the NVIDIA driver",
 	)
 
 	for _, forbidden := range []string{
@@ -290,8 +300,11 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "ordinary ARM64 entry unexpectedly contains Grace arguments")
 	require.Contains(t, verify, "NVIDIA Grace entry does not select kernel-hwe")
 	require.Contains(t, verify, "NVIDIA image unexpectedly uses runtime SMBIOS selection")
+	require.Contains(t, verify, `grep -q '^Inode:'`)
 	require.Contains(t, verify, "PASS package inputs:")
 	require.Contains(t, verify, "PASS NVIDIA 580.178.04 target-kernel DKMS modules:")
+	require.Contains(t, verify, "PASS NVIDIA DRM dependency closure:")
+	require.Contains(t, verify, "kernel-hwe-drivers-gpu provides ttm and drm_ttm_helper")
 	require.Contains(t, verify, "GSP firmware=580.178.04")
 	require.Contains(t, verify, "PASS idle-service baseline:")
 	require.Contains(t, verify, "nvidia-persistenced.service is disabled or absent")
