@@ -13,12 +13,22 @@
 # Environment:
 #   KERNEL_PACKAGE  single kernel package to install (default: kernel)
 #   NVIDIA          set to 1 to install the NVIDIA open GPU driver
+#   IMAGE_VARIANT    generic or nvidia
 #   TARGETARCH      target architecture
 set -eu
 
 KERNEL_PACKAGE="${KERNEL_PACKAGE:-kernel}"
 NVIDIA="${NVIDIA:-0}"
+IMAGE_VARIANT="${IMAGE_VARIANT:-generic}"
 TARGETARCH="${TARGETARCH:-}"
+
+case "$IMAGE_VARIANT:$NVIDIA" in
+  generic:0|nvidia:1) ;;
+  *)
+    echo "inconsistent image variant and NVIDIA setting: $IMAGE_VARIANT:$NVIDIA" >&2
+    exit 1
+    ;;
+esac
 
 retry() {
   n=1
@@ -137,18 +147,23 @@ if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
     /etc/grub.d/10_azure_nvidia
   install -D -m 0644 /usr/local/share/unbounded/51-azure-nvidia.cfg \
     /etc/default/grub.d/51-azure-nvidia.cfg
-  printf 'standard=%s\nnvidia=%s\n' "$STANDARD_KVER" "$NVIDIA_KVER" > /rootfs.kernels
+  printf 'image_variant=%s\nstandard=%s\nnvidia=%s\n' \
+    "$IMAGE_VARIANT" "$STANDARD_KVER" "$NVIDIA_KVER" > /rootfs.kernels
 else
   KVER=$(ls /usr/lib/modules)
   case "$KVER" in
     *" "*|"") echo "expected one kernel, found: $KVER" >&2; exit 1 ;;
   esac
-  printf 'standard=%s\n' "$KVER" > /rootfs.kernels
+  printf 'image_variant=%s\nstandard=%s\n' "$IMAGE_VARIANT" "$KVER" > /rootfs.kernels
 fi
 
 # Build a generic initramfs. The image must boot on any machine, so do not
 # limit it to the build host's hardware. The GPU driver loads after boot.
 while IFS= read -r entry; do
+  case "$entry" in
+    standard=*|nvidia=*) ;;
+    *) continue ;;
+  esac
   KVER=${entry#*=}
   dracut --force --no-hostonly --no-hostonly-cmdline \
     --omit-drivers "nvidia nvidia_modeset nvidia_uvm nvidia_drm nvidia_peermem" \
@@ -197,6 +212,8 @@ EOF
     mkdir -p /etc/unbounded
     cat > /etc/unbounded/image-inputs <<EOF
 architecture=$TARGETARCH
+image_variant=$IMAGE_VARIANT
+boot_profile=nvidia-grace
 kernel=$AZURELINUX_KERNEL_VERSION
 kernel_hwe=$AZURELINUX_KERNEL_HWE_VERSION
 grub=$AZURELINUX_GRUB_VERSION

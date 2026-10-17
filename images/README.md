@@ -32,9 +32,10 @@ machine disk image.
 
 `host-azurelinux3-nvidia` is a multi-architecture Metalman machine image.
 AMD64 retains the existing single-HWE-kernel layout. ARM64 installs both the
-standard Azure Linux kernel and `kernel-hwe`, then uses the SMBIOS CPU
-manufacturer at boot to select `kernel-hwe` with the required NVIDIA Grace
-arguments. Non-NVIDIA ARM64 hardware boots the standard kernel without those
+standard Azure Linux kernel and `kernel-hwe`, then defaults unconditionally to
+`kernel-hwe` with the required NVIDIA Grace arguments. The standard kernel
+remains available as a recovery entry. The separate generic
+`host-azurelinux3` ARM64 image defaults to the standard kernel without those
 arguments.
 
 The package inputs are recorded in

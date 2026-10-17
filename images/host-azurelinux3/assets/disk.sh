@@ -7,9 +7,16 @@
 #
 # Environment:
 #   TARGETARCH  amd64 or arm64
+#   IMAGE_VARIANT  generic or nvidia
 set -eu
 
 : "${TARGETARCH:?TARGETARCH is required}"
+: "${IMAGE_VARIANT:?IMAGE_VARIANT is required}"
+
+case "$IMAGE_VARIANT" in
+  generic|nvidia) ;;
+  *) echo "unsupported image variant: $IMAGE_VARIANT" >&2; exit 1 ;;
+esac
 
 WORK=/tmp/disk
 ROOT="$WORK/root"
@@ -25,6 +32,11 @@ esac
 
 STANDARD_KVER=$(sed -n 's/^standard=//p' /rootfs.kernels)
 NVIDIA_KVER=$(sed -n 's/^nvidia=//p' /rootfs.kernels)
+ROOTFS_IMAGE_VARIANT=$(sed -n 's/^image_variant=//p' /rootfs.kernels)
+[ "$ROOTFS_IMAGE_VARIANT" = "$IMAGE_VARIANT" ] || {
+  echo "rootfs image variant $ROOTFS_IMAGE_VARIANT does not match disk image variant $IMAGE_VARIANT" >&2
+  exit 1
+}
 [ -n "$STANDARD_KVER" ] || {
   echo "standard kernel is missing from /rootfs.kernels" >&2
   exit 1
@@ -48,9 +60,11 @@ EOF
 
 # The ESP holds shim and GRUB. The signed Azure Linux GRUB reads the config
 # from the ESP, while kernels and package-owned GRUB modules remain on root.
-if [ -n "$NVIDIA_KVER" ]; then
-  [ "$TARGETARCH" = arm64 ] || {
-    echo "dual-kernel NVIDIA image requires arm64" >&2
+BOOT_PROFILE=standard
+if [ "$IMAGE_VARIANT" = nvidia ] && [ "$TARGETARCH" = arm64 ]; then
+  BOOT_PROFILE=nvidia-grace
+  [ -n "$NVIDIA_KVER" ] || {
+    echo "NVIDIA ARM64 image requires kernel-hwe" >&2
     exit 1
   }
   [ -s "$ROOT/usr/lib/grub/arm64-efi/smbios.mod" ] || {
@@ -59,8 +73,24 @@ if [ -n "$NVIDIA_KVER" ]; then
   }
 fi
 OUTPUT="$WORK/grub.cfg" ROOT_UUID="$ROOT_UUID" STANDARD_KVER="$STANDARD_KVER" \
-  NVIDIA_KVER="$NVIDIA_KVER" CONSOLE="$CONSOLE" \
+  NVIDIA_KVER="$NVIDIA_KVER" CONSOLE="$CONSOLE" BOOT_PROFILE="$BOOT_PROFILE" \
   sh /usr/local/bin/write-grub-config
+
+case "$BOOT_PROFILE" in
+  nvidia-grace)
+    grep -F 'set default=nvidia-grace' "$WORK/grub.cfg" >/dev/null
+    grep -F "linux /boot/vmlinuz-$NVIDIA_KVER" "$WORK/grub.cfg" >/dev/null
+    grep -F 'iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1' \
+      "$WORK/grub.cfg" >/dev/null
+    ;;
+  standard)
+    grep -F "linux /boot/vmlinuz-$STANDARD_KVER" "$WORK/grub.cfg" >/dev/null
+    if grep -F 'iommu.passthrough=1' "$WORK/grub.cfg" >/dev/null; then
+      echo "standard image unexpectedly contains NVIDIA Grace arguments" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 ESP_IMG="$WORK/esp.img"
 truncate -s "${ESP_MIB}M" "$ESP_IMG"

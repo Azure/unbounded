@@ -46,6 +46,8 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 
 	containerfile := readRepoFile(t, "images/host-azurelinux3-nvidia/Containerfile")
 	require.Contains(t, containerfile, "versions.env")
+	require.Contains(t, containerfile, "ARG IMAGE_VARIANT=nvidia")
+	require.Contains(t, containerfile, `IMAGE_VARIANT="${IMAGE_VARIANT}"`)
 	require.NotContains(t, containerfile, "host-ubuntu")
 
 	rootfs := readRepoFile(t, "images/host-azurelinux3/assets/rootfs.sh")
@@ -53,9 +55,11 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 	require.Contains(t, rootfs, `KERNEL_PACKAGE="${KERNEL_PACKAGE:-kernel}"`)
 	require.Contains(t, rootfs, `retry tdnf install -y "$KERNEL_PACKAGE"`)
 	require.Contains(t, rootfs, "retry tdnf install -y grub2-efi-binary cuda-open-hwe")
+	require.Contains(t, rootfs, "inconsistent image variant and NVIDIA setting")
+	require.Contains(t, rootfs, "boot_profile=nvidia-grace")
 }
 
-func TestAzureLinuxGraceGRUBConfig(t *testing.T) {
+func TestAzureLinuxNVIDIAGRUBConfigDefaultsToGrace(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "grub.cfg")
 	script := filepath.Join(repoRoot(t), "images/host-azurelinux3/assets/grub-config.sh")
 	command := exec.Command("sh", script)
@@ -66,6 +70,7 @@ func TestAzureLinuxGraceGRUBConfig(t *testing.T) {
 		"ROOT_UUID=test-root",
 		"STANDARD_KVER=6.6.157.1-1.azl3",
 		"NVIDIA_KVER=6.18.48.1-1.azl3",
+		"BOOT_PROFILE=nvidia-grace",
 	)
 	result, err := command.CombinedOutput()
 	require.NoError(t, err, string(result))
@@ -75,17 +80,17 @@ func TestAzureLinuxGraceGRUBConfig(t *testing.T) {
 
 	grub := string(config)
 	for _, expected := range []string{
-		"insmod smbios",
-		"smbios --type 4 --get-string 7 --set cpu_manufacturer",
-		"if [ x$cpu_manufacturer = xNVIDIA ]; then",
 		"set default=nvidia-grace",
-		"set default=standard",
 		"iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1",
-		"linux /boot/vmlinuz-6.18.48.1-1.azl3 root=UUID=test-root rw  $nvidia_args",
+		"linux /boot/vmlinuz-6.18.48.1-1.azl3 root=UUID=test-root rw  iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1",
 		"linux /boot/vmlinuz-6.6.157.1-1.azl3 root=UUID=test-root rw ",
 	} {
 		require.Contains(t, grub, expected)
 	}
+
+	require.NotContains(t, grub, "smbios")
+	require.NotContains(t, grub, "cpu_manufacturer")
+	require.NotContains(t, grub, "$nvidia_args")
 }
 
 func TestAzureLinuxStandardGRUBConfigHasNoGraceBehavior(t *testing.T) {
@@ -98,6 +103,7 @@ func TestAzureLinuxStandardGRUBConfigHasNoGraceBehavior(t *testing.T) {
 		"OUTPUT="+output,
 		"ROOT_UUID=test-root",
 		"STANDARD_KVER=6.6.157.1-1.azl3",
+		"BOOT_PROFILE=standard",
 	)
 	result, err := command.CombinedOutput()
 	require.NoError(t, err, string(result))
@@ -110,6 +116,23 @@ func TestAzureLinuxStandardGRUBConfigHasNoGraceBehavior(t *testing.T) {
 	require.NotContains(t, grub, "smbios")
 	require.NotContains(t, grub, "nvidia_args")
 	require.NotContains(t, grub, "iommu.passthrough")
+}
+
+func TestAzureLinuxGraceGRUBConfigRequiresHWEKernel(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "grub.cfg")
+	script := filepath.Join(repoRoot(t), "images/host-azurelinux3/assets/grub-config.sh")
+	command := exec.Command("sh", script)
+
+	command.Env = append(
+		os.Environ(),
+		"OUTPUT="+output,
+		"ROOT_UUID=test-root",
+		"STANDARD_KVER=6.6.157.1-1.azl3",
+		"BOOT_PROFILE=nvidia-grace",
+	)
+	result, err := command.CombinedOutput()
+	require.Error(t, err)
+	require.Contains(t, string(result), "nvidia-grace boot profile requires NVIDIA_KVER")
 }
 
 func TestAzureLinuxGRUBSelectorUsesRPMOwnership(t *testing.T) {
@@ -153,9 +176,9 @@ esac
 
 	output := string(result)
 	require.Contains(t, output, `set default="gnulinux-6.18.48.1-1.azl3-advanced-test-root"`)
-	require.Contains(t, output, `set default="gnulinux-6.6.157.1-1.azl3-advanced-test-root"`)
-	require.Contains(t, output, "insmod smbios")
 	require.Contains(t, output, "iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1")
+	require.NotContains(t, output, "smbios")
+	require.NotContains(t, output, "cpu_manufacturer")
 }
 
 func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
@@ -175,11 +198,15 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, disk, `mkdir -p /disk`)
 	require.Contains(t, disk, `> /disk/disk.img.gz`)
 	require.Contains(t, disk, "required GRUB smbios.mod is missing")
+	require.Contains(t, disk, "rootfs image variant")
+	require.Contains(t, disk, "NVIDIA ARM64 image requires kernel-hwe")
+	require.Contains(t, disk, "standard image unexpectedly contains NVIDIA Grace arguments")
 
 	verify := readRepoFile(t, "images/host-azurelinux3/assets/verify-disk.sh")
 	require.Contains(t, verify, `STANDARD_ENTRY=$(printf '%s\n' "$GRUB"`)
 	require.Contains(t, verify, "ordinary ARM64 entry unexpectedly contains Grace arguments")
 	require.Contains(t, verify, "NVIDIA Grace entry does not select kernel-hwe")
+	require.Contains(t, verify, "NVIDIA image unexpectedly uses runtime SMBIOS selection")
 	require.Contains(t, verify, "PASS package inputs:")
-	require.Contains(t, verify, "PASS GRUB hardware selection:")
+	require.Contains(t, verify, "PASS specialized NVIDIA GRUB policy:")
 }

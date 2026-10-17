@@ -7,11 +7,12 @@ set -eu
 : "${OUTPUT:?OUTPUT is required}"
 : "${ROOT_UUID:?ROOT_UUID is required}"
 : "${STANDARD_KVER:?STANDARD_KVER is required}"
+: "${BOOT_PROFILE:?BOOT_PROFILE is required}"
 
 CONSOLE="${CONSOLE:-}"
 NVIDIA_KVER="${NVIDIA_KVER:-}"
 
-if [ -z "$NVIDIA_KVER" ]; then
+if [ "$BOOT_PROFILE" = standard ]; then
   cat > "$OUTPUT" <<EOF
 set timeout=0
 search --no-floppy --fs-uuid --set=root $ROOT_UUID
@@ -22,22 +23,19 @@ EOF
   exit 0
 fi
 
+[ "$BOOT_PROFILE" = nvidia-grace ] || {
+  echo "unsupported boot profile: $BOOT_PROFILE" >&2
+  exit 1
+}
+[ -n "$NVIDIA_KVER" ] || {
+  echo "nvidia-grace boot profile requires NVIDIA_KVER" >&2
+  exit 1
+}
+
 cat > "$OUTPUT" <<EOF
 set timeout=0
 search --no-floppy --fs-uuid --set=root $ROOT_UUID
-set azure_nvidia_saved_prefix="\$prefix"
-set prefix="(\$root)/usr/lib/grub/arm64-efi"
-insmod smbios
-set prefix="\$azure_nvidia_saved_prefix"
-unset azure_nvidia_saved_prefix
-
-smbios --type 4 --get-string 7 --set cpu_manufacturer
-if [ x\$cpu_manufacturer = xNVIDIA ]; then
-  set default=nvidia-grace
-  set nvidia_args="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1"
-else
-  set default=standard
-fi
+set default=nvidia-grace
 
 menuentry "Azure Linux" --id standard {
   linux /boot/vmlinuz-$STANDARD_KVER root=UUID=$ROOT_UUID rw $CONSOLE
@@ -45,7 +43,7 @@ menuentry "Azure Linux" --id standard {
 }
 
 menuentry "Azure Linux NVIDIA Grace" --id nvidia-grace {
-  linux /boot/vmlinuz-$NVIDIA_KVER root=UUID=$ROOT_UUID rw $CONSOLE \$nvidia_args
+  linux /boot/vmlinuz-$NVIDIA_KVER root=UUID=$ROOT_UUID rw $CONSOLE iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1
   initrd /boot/initramfs-$NVIDIA_KVER.img
 }
 EOF

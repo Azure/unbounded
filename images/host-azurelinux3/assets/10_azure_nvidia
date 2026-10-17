@@ -65,39 +65,9 @@ if [ -z "$boot_device_id" ]; then
 	exit 0
 fi
 
-echo "Default NVIDIA image: $NVIDIA, non-NVIDIA image: $OTHER, boot_device_id: $boot_device_id" >&2
-
-if "$rpm_kernels"; then
-	module_directory=/usr/lib/grub/arm64-efi
-	if ! is_path_readable_by_grub "$module_directory"; then
-		echo "GRUB cannot read module directory: $module_directory" >&2
-		exit 1
-	fi
-	module_device=$("$grub_probe" --target=device "$module_directory")
-	module_access=$(prepare_grub_to_access_device "$module_device")
-	module_prefix=$(make_system_path_relative_to_its_root "${module_directory%/*}")
-	cat <<EOF
-set azure_nvidia_saved_root="\$root"
-set azure_nvidia_saved_prefix="\$prefix"
-${module_access}
-set prefix="(\$root)${module_prefix}"
-insmod smbios
-set prefix="\$azure_nvidia_saved_prefix"
-set root="\$azure_nvidia_saved_root"
-unset azure_nvidia_saved_prefix
-unset azure_nvidia_saved_root
-EOF
-else
-	echo 'insmod smbios'
-fi
+echo "Default NVIDIA image: $NVIDIA, recovery image: $OTHER, boot_device_id: $boot_device_id" >&2
 
 cat <<EOF
-smbios --type 4 --get-string 7 --set cpu_manufacturer
-
-if [ x\$cpu_manufacturer = xNVIDIA ]; then
-	set default="gnulinux-${NVIDIA}-advanced-${boot_device_id}"
-	set nvidia_args="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1"
-else
-	set default="gnulinux-${OTHER}-advanced-${boot_device_id}"
-fi
+set default="gnulinux-${NVIDIA}-advanced-${boot_device_id}"
+set nvidia_args="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1"
 EOF
