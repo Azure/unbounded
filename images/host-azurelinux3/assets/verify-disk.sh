@@ -79,7 +79,9 @@ for expected in \
   nvidia_fabric_probe_sha256=ebb6fa74a476dd7a55b7e705c2ad19c00bd20e31fb984babcbc114130efe05b5 \
   mlnx_ofa_kernel=26.01-1_6.6.158.1.1.azl3 \
   mlnx_ofa_kernel_hwe_devel=26.01-2_6.18.48.1.1.azl3 \
-  mlnx_ofa_kernel_hwe_modules=26.01-2_6.18.48.1.1.azl3; do
+  mlnx_ofa_kernel_hwe_modules=26.01-2_6.18.48.1.1.azl3 \
+  ocl_icd=2.2.13-2.azl3 \
+  opencl_filesystem=1.0-13.azl3; do
   printf '%s\n' "$INPUTS" | grep -Fx "$expected" >/dev/null || {
     echo "missing image input: $expected" >&2
     exit 1

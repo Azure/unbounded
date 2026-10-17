@@ -41,6 +41,8 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 		"AZURELINUX_MLNX_OFA_KERNEL_VERSION=26.01-1_6.6.158.1.1.azl3",
 		"AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION=26.01-2_6.18.48.1.1.azl3",
 		"AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION=26.01-2_6.18.48.1.1.azl3",
+		"AZURELINUX_OCL_ICD_VERSION=2.2.13-2.azl3",
+		"AZURELINUX_OPENCL_FILESYSTEM_VERSION=1.0-13.azl3",
 		"NVIDIA_DRIVER_VERSION=580.178.04",
 		"NVIDIA_DRIVER_RPM_VERSION=580.178.04-1.azl3",
 		"NVIDIA_DKMS_RPM_VERSION=3.4.1-1.azl3",
@@ -93,6 +95,9 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`R580 A/B image unexpectedly contains another NVIDIA driver or fabric component`,
 		`mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}`,
 		`mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}`,
+		`baseurl=https://packages.microsoft.com/azurelinux/$releasever/prod/extended/$basearch`,
+		`ocl-icd-${AZURELINUX_OCL_ICD_VERSION}`,
+		`opencl-filesystem-${AZURELINUX_OPENCL_FILESYSTEM_VERSION}`,
 	} {
 		require.Contains(t, rootfs, expected)
 	}

@@ -111,6 +111,18 @@ verify_nvidia_localrepo_driver() {
     }
   done
 
+  for package_and_version in \
+    "ocl-icd:$AZURELINUX_OCL_ICD_VERSION" \
+    "opencl-filesystem:$AZURELINUX_OPENCL_FILESYSTEM_VERSION"; do
+    package=${package_and_version%%:*}
+    expected_version=${package_and_version#*:}
+    version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$package")
+    [ "$version" = "$expected_version" ] || {
+      echo "$package resolved to $version, expected $expected_version" >&2
+      exit 1
+    }
+  done
+
   if rpm -q cuda-open-hwe nvidia-imex nvidia-fabricmanager nvlink5 nvlink5-580 \
       >/dev/null 2>&1; then
     echo "R580 A/B image unexpectedly contains another NVIDIA driver or fabric component" >&2
@@ -174,6 +186,8 @@ install_nvidia_localrepo_driver() {
   : "${AZURELINUX_MLNX_OFA_KERNEL_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_VERSION is required}"
   : "${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION is required}"
   : "${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION is required}"
+  : "${AZURELINUX_OCL_ICD_VERSION:?AZURELINUX_OCL_ICD_VERSION is required}"
+  : "${AZURELINUX_OPENCL_FILESYSTEM_VERSION:?AZURELINUX_OPENCL_FILESYSTEM_VERSION is required}"
   : "${NVIDIA_DRIVER_VERSION:?NVIDIA_DRIVER_VERSION is required}"
   : "${NVIDIA_DRIVER_RPM_VERSION:?NVIDIA_DRIVER_RPM_VERSION is required}"
   : "${NVIDIA_DKMS_RPM_VERSION:?NVIDIA_DKMS_RPM_VERSION is required}"
@@ -187,6 +201,19 @@ install_nvidia_localrepo_driver() {
     "mlnx-ofa_kernel-${AZURELINUX_MLNX_OFA_KERNEL_VERSION}" \
     "mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}" \
     "mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}"
+
+  cat > /etc/yum.repos.d/azurelinux-extended.repo <<'EOF'
+[azurelinux-official-extended]
+name=Azure Linux Official Extended $releasever $basearch
+baseurl=https://packages.microsoft.com/azurelinux/$releasever/prod/extended/$basearch
+gpgkey=file:///etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+gpgcheck=1
+repo_gpgcheck=1
+enabled=1
+EOF
+  retry tdnf install -y \
+    "ocl-icd-${AZURELINUX_OCL_ICD_VERSION}" \
+    "opencl-filesystem-${AZURELINUX_OPENCL_FILESYSTEM_VERSION}"
 
   repo_rpm=/tmp/nvidia-driver-local-repo.rpm
   retry curl --fail --location --silent --show-error \
@@ -448,6 +475,8 @@ nvidia_fabric_probe_sha256=$NVIDIA_FABRIC_PROBE_SHA256
 mlnx_ofa_kernel=$AZURELINUX_MLNX_OFA_KERNEL_VERSION
 mlnx_ofa_kernel_hwe_devel=$AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION
 mlnx_ofa_kernel_hwe_modules=$AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION
+ocl_icd=$AZURELINUX_OCL_ICD_VERSION
+opencl_filesystem=$AZURELINUX_OPENCL_FILESYSTEM_VERSION
 nvidia_persistenced_service=$NVIDIA_PERSISTENCED_SERVICE_STATE
 nvidia_powerd_service=$NVIDIA_POWERD_SERVICE_STATE
 EOF

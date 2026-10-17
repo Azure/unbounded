@@ -51,7 +51,9 @@ builds and installs all five open GPU modules explicitly for
 firmware versions, wrong vermagic, and the unrequested Fabric Manager, IMEX,
 or `nvlink5` packages. NVIDIA's packaged `nvidia-persistenced` and
 `nvidia-powerd` services remain disabled or absent so the driver A/B preserves
-the existing idle-service baseline. AMD64 retains its existing package path.
+the existing idle-service baseline. The exact `ocl-icd` and
+`opencl-filesystem` dependencies come from Microsoft's signed Azure Linux 3
+extended repository. AMD64 retains its existing package path.
 
 Build and offline-inspect the disk without publishing it:
 
