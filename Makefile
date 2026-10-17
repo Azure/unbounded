@@ -1042,12 +1042,12 @@ image-machina-local: ## Build the machina container image locally (single-arch)
 		-f ./images/machina/Containerfile .
 	$(call trivy-maybe,$(MACHINA_IMAGE))
 
-image-host-azurelinux3-nvidia-local: ## Build the Azure Linux NVIDIA ARM64 host image locally
+image-host-azurelinux3-nvidia-local: ## Build the Azure Linux NVIDIA R580.178.04 ARM64 host image locally
 	$(CONTAINER_ENGINE) build --platform linux/arm64 \
 		-t host-azurelinux3-nvidia:$(VERSION_TAG) \
 		-f ./images/host-azurelinux3-nvidia/Containerfile .
 
-verify-host-azurelinux3-nvidia: image-host-azurelinux3-nvidia-local ## Offline-inspect the Azure Linux NVIDIA ARM64 disk
+verify-host-azurelinux3-nvidia: image-host-azurelinux3-nvidia-local ## Offline-inspect the Azure Linux NVIDIA R580.178.04 ARM64 disk
 	@mkdir -p tmp/host-azurelinux3-nvidia
 	@set -eu; \
 	cid=$$($(CONTAINER_ENGINE) create host-azurelinux3-nvidia:$(VERSION_TAG)); \

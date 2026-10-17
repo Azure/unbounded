@@ -10,7 +10,7 @@ DISK_GZ="${1:-/disk/disk.img.gz}"
   exit 1
 }
 
-for command in debugfs gzip mtype python3 sfdisk; do
+for command in basename debugfs gzip modinfo mtype python3 sfdisk sha256sum; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "required inspection command is missing: $command" >&2
     exit 1
@@ -52,6 +52,10 @@ for path in \
   /etc/modprobe.d/nvidia-gb.conf \
   /etc/systemd/system/nvidia-persistence-mode.service \
   /etc/unbounded/image-inputs \
+  /etc/unbounded/nvidia-driver-manifest \
+  /usr/bin/nvidia-smi \
+  /usr/lib/firmware/nvidia/580.178.04/gsp_ga10x.bin \
+  /usr/lib/firmware/nvidia/580.178.04/gsp_tu10x.bin \
   /usr/lib/grub/arm64-efi/smbios.mod; do
   debugfs_exists "$path" || {
     echo "missing expected file in root partition: $path" >&2
@@ -67,7 +71,15 @@ for expected in \
   kernel=6.6.157.1-1.azl3 \
   kernel_hwe=6.18.48.1-1.azl3 \
   grub=2.06-27.azl3 \
-  cuda_open_hwe=580.159.04-2_6.18.48.1.1.azl3; do
+  nvidia_driver_source=nvidia-localrepo \
+  nvidia_driver=580.178.04-1.azl3 \
+  nvidia_dkms=3.4.1-1.azl3 \
+  nvidia_local_repo_sha256=7c734d8daa0876d3c5731622e78fe20811ee8c9f61a805b74b0b09576b992df4 \
+  nvidia_local_repo_key_sha256=43464fc9a8371860b10b81edbd95ab95f28aa1dc1cc988ec15d2369e10d1fc7b \
+  nvidia_fabric_probe_sha256=ebb6fa74a476dd7a55b7e705c2ad19c00bd20e31fb984babcbc114130efe05b5 \
+  mlnx_ofa_kernel=26.01-1_6.6.158.1.1.azl3 \
+  mlnx_ofa_kernel_hwe_devel=26.01-2_6.18.48.1.1.azl3 \
+  mlnx_ofa_kernel_hwe_modules=26.01-2_6.18.48.1.1.azl3; do
   printf '%s\n' "$INPUTS" | grep -Fx "$expected" >/dev/null || {
     echo "missing image input: $expected" >&2
     exit 1
@@ -75,6 +87,59 @@ for expected in \
 done
 echo "PASS package inputs:"
 printf '%s\n' "$INPUTS" | sed 's/^/  /'
+
+DRIVER_MANIFEST=$(debugfs -R "cat /etc/unbounded/nvidia-driver-manifest" "$ROOT" 2>/dev/null)
+for expected in \
+  driver_source=nvidia-localrepo \
+  driver_version=580.178.04-1.azl3 \
+  kernel=6.18.48.1-1.azl3; do
+  printf '%s\n' "$DRIVER_MANIFEST" | grep -Fx "$expected" >/dev/null || {
+    echo "missing NVIDIA driver manifest value: $expected" >&2
+    exit 1
+  }
+done
+
+manifest_value() {
+  key="$1"
+  printf '%s\n' "$DRIVER_MANIFEST" | sed -n "s/^$key=//p"
+}
+
+for module in nvidia nvidia_modeset nvidia_drm nvidia_uvm nvidia_peermem; do
+  module_path=$(manifest_value "module_${module}_path")
+  module_sha256=$(manifest_value "module_${module}_sha256")
+  [ -n "$module_path" ] && [ -n "$module_sha256" ] || {
+    echo "missing $module path or sha256 in NVIDIA driver manifest" >&2
+    exit 1
+  }
+  debugfs_exists "$module_path" || {
+    echo "missing NVIDIA module in root partition: $module_path" >&2
+    exit 1
+  }
+  module_file="$WORK/$(basename "$module_path")"
+  debugfs -R "dump $module_path $module_file" "$ROOT" >/dev/null 2>&1
+  actual_sha256=$(sha256sum "$module_file" | cut -d' ' -f1)
+  [ "$actual_sha256" = "$module_sha256" ] || {
+    echo "$module sha256 is $actual_sha256, expected $module_sha256" >&2
+    exit 1
+  }
+  version=$(modinfo -F version "$module_file")
+  [ "$version" = 580.178.04 ] || {
+    echo "$module version is $version, expected 580.178.04" >&2
+    exit 1
+  }
+  vermagic=$(modinfo -F vermagic "$module_file")
+  case "$vermagic" in
+    "6.18.48.1-1.azl3 "*) ;;
+    *)
+      echo "$module vermagic is $vermagic, expected kernel 6.18.48.1-1.azl3" >&2
+      exit 1
+      ;;
+  esac
+done
+echo "PASS NVIDIA 580.178.04 target-kernel DKMS modules:"
+echo "  nvidia, nvidia-modeset, nvidia-drm, nvidia-uvm, nvidia-peermem"
+echo "  kernel=6.18.48.1-1.azl3, source=verified NVIDIA AZL3 local repository"
+echo "  GSP firmware=580.178.04"
 
 for kver in 6.6.157.1-1.azl3 6.18.48.1-1.azl3; do
   debugfs_exists "/boot/vmlinuz-$kver" || {

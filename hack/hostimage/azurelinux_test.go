@@ -38,6 +38,15 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 		"AZURELINUX_KERNEL_HWE_VERSION=6.18.48.1-1.azl3",
 		"AZURELINUX_GRUB_VERSION=2.06-27.azl3",
 		"AZURELINUX_CUDA_OPEN_HWE_VERSION=580.159.04-2_6.18.48.1.1.azl3",
+		"AZURELINUX_MLNX_OFA_KERNEL_VERSION=26.01-1_6.6.158.1.1.azl3",
+		"AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION=26.01-2_6.18.48.1.1.azl3",
+		"AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION=26.01-2_6.18.48.1.1.azl3",
+		"NVIDIA_DRIVER_VERSION=580.178.04",
+		"NVIDIA_DRIVER_RPM_VERSION=580.178.04-1.azl3",
+		"NVIDIA_DKMS_RPM_VERSION=3.4.1-1.azl3",
+		"NVIDIA_LOCAL_REPO_SHA256=7c734d8daa0876d3c5731622e78fe20811ee8c9f61a805b74b0b09576b992df4",
+		"NVIDIA_LOCAL_REPO_KEY_SHA256=43464fc9a8371860b10b81edbd95ab95f28aa1dc1cc988ec15d2369e10d1fc7b",
+		"NVIDIA_FABRIC_PROBE_SHA256=ebb6fa74a476dd7a55b7e705c2ad19c00bd20e31fb984babcbc114130efe05b5",
 	} {
 		require.Contains(t, versions, expected)
 	}
@@ -47,7 +56,9 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 	containerfile := readRepoFile(t, "images/host-azurelinux3-nvidia/Containerfile")
 	require.Contains(t, containerfile, "versions.env")
 	require.Contains(t, containerfile, "ARG IMAGE_VARIANT=nvidia")
+	require.Contains(t, containerfile, "ARG NVIDIA_DRIVER_SOURCE=nvidia-localrepo")
 	require.Contains(t, containerfile, `IMAGE_VARIANT="${IMAGE_VARIANT}"`)
+	require.Contains(t, containerfile, `NVIDIA_DRIVER_SOURCE="${NVIDIA_DRIVER_SOURCE}"`)
 	require.NotContains(t, containerfile, "host-ubuntu")
 
 	rootfs := readRepoFile(t, "images/host-azurelinux3/assets/rootfs.sh")
@@ -56,7 +67,44 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 	require.Contains(t, rootfs, `retry tdnf install -y "$KERNEL_PACKAGE"`)
 	require.Contains(t, rootfs, "retry tdnf install -y grub2-efi-binary cuda-open-hwe")
 	require.Contains(t, rootfs, "inconsistent image variant and NVIDIA setting")
+	require.Contains(t, rootfs, "unsupported NVIDIA driver source")
 	require.Contains(t, rootfs, "boot_profile=nvidia-hwe")
+}
+
+func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
+	rootfs := readRepoFile(t, "images/host-azurelinux3/assets/rootfs.sh")
+	for _, expected := range []string{
+		`verify_file_sha256 "$repo_rpm" "$NVIDIA_LOCAL_REPO_SHA256"`,
+		`verify_file_sha256 "$repo_key" "$NVIDIA_LOCAL_REPO_KEY_SHA256"`,
+		`rpm --checksig "$package"`,
+		`verify_file_sha256 "$fabric_probe" "$NVIDIA_FABRIC_PROBE_SHA256"`,
+		`dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION"`,
+		`-k "$NVIDIA_KVER" --force`,
+		`dkms install -m nvidia -v "$NVIDIA_DRIVER_VERSION"`,
+		`NVIDIA DKMS did not install for $NVIDIA_KVER`,
+		`for module in nvidia nvidia-modeset nvidia-drm nvidia-uvm nvidia-peermem`,
+		`"$module vermagic is $vermagic, expected kernel $NVIDIA_KVER"`,
+		`R580 A/B image unexpectedly contains another NVIDIA driver or fabric component`,
+		`mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}`,
+		`mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}`,
+	} {
+		require.Contains(t, rootfs, expected)
+	}
+
+	require.Less(
+		t,
+		strings.Index(rootfs, `"mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}"`),
+		strings.Index(rootfs, `"kmod-nvidia-open-dkms-${NVIDIA_DRIVER_RPM_VERSION}"`),
+		"OFED must be installed before the NVIDIA driver",
+	)
+
+	for _, forbidden := range []string{
+		`tdnf install -y nvidia-imex`,
+		`tdnf install -y nvidia-fabricmanager`,
+		`tdnf install -y nvlink5`,
+	} {
+		require.NotContains(t, rootfs, forbidden)
+	}
 }
 
 func TestAzureLinuxNVIDIAGRUBConfigDefaultsToHWEWithoutGraceArgs(t *testing.T) {
@@ -192,6 +240,8 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 		"GRUB module /usr/lib/grub/arm64-efi/smbios.mod",
 		"cuda-open-hwe resolved to",
 		"cuda-open-hwe is not matched to kernel-hwe",
+		"NVIDIA DKMS did not install for",
+		"NVIDIA local repository payload is incomplete",
 		"/etc/modprobe.d/blacklist-nouveau.conf",
 		"nvidia-persistence-mode.service",
 	} {
@@ -213,6 +263,8 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "NVIDIA Grace entry does not select kernel-hwe")
 	require.Contains(t, verify, "NVIDIA image unexpectedly uses runtime SMBIOS selection")
 	require.Contains(t, verify, "PASS package inputs:")
+	require.Contains(t, verify, "PASS NVIDIA 580.178.04 target-kernel DKMS modules:")
+	require.Contains(t, verify, "GSP firmware=580.178.04")
 	require.Contains(t, verify, "PASS specialized NVIDIA GRUB policy:")
 	require.Contains(t, verify, "PASS MANA-compatible kernel command line:")
 	require.Contains(t, verify, "GICv3 LPI/ITS MSI-X remains enabled")

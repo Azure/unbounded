@@ -42,8 +42,14 @@ so disabling LPIs prevents host networking during boot.
 
 The package inputs are recorded in
 `images/host-azurelinux3-nvidia/versions.env`. Builds fail if the kernel,
-matched `cuda-open-hwe`, or GRUB package versions differ, or if the package
-matched `smbios.mod` is absent.
+NVIDIA driver, OFED, DKMS, or GRUB package versions differ, or if the package
+matched `smbios.mod` is absent. The ARM64 image uses NVIDIA's versioned,
+signed Azure Linux 3 local repository for R580.178.04. It verifies the
+repository archive and key hashes, checks every embedded RPM signature, then
+builds and installs all five open GPU modules explicitly for
+`6.18.48.1-1.azl3`. The build rejects missing modules, mixed userspace or GSP
+firmware versions, wrong vermagic, and the unrequested Fabric Manager, IMEX,
+or `nvlink5` packages. AMD64 retains its existing package path.
 
 Build and offline-inspect the disk without publishing it:
 

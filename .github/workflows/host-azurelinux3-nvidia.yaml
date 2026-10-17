@@ -25,7 +25,7 @@ jobs:
       - name: Install offline inspection tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends e2fsprogs fdisk mtools
+          sudo apt-get install -y --no-install-recommends e2fsprogs fdisk kmod mtools
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:

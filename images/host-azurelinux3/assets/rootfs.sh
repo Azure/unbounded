@@ -13,13 +13,15 @@
 # Environment:
 #   KERNEL_PACKAGE  single kernel package to install (default: kernel)
 #   NVIDIA          set to 1 to install the NVIDIA open GPU driver
-#   IMAGE_VARIANT    generic or nvidia
+#   IMAGE_VARIANT   generic or nvidia
+#   NVIDIA_DRIVER_SOURCE  azurelinux or nvidia-localrepo
 #   TARGETARCH      target architecture
 set -eu
 
 KERNEL_PACKAGE="${KERNEL_PACKAGE:-kernel}"
 NVIDIA="${NVIDIA:-0}"
 IMAGE_VARIANT="${IMAGE_VARIANT:-generic}"
+NVIDIA_DRIVER_SOURCE="${NVIDIA_DRIVER_SOURCE:-azurelinux}"
 TARGETARCH="${TARGETARCH:-}"
 
 case "$IMAGE_VARIANT:$NVIDIA" in
@@ -29,6 +31,16 @@ case "$IMAGE_VARIANT:$NVIDIA" in
     exit 1
     ;;
 esac
+
+if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
+  case "$NVIDIA_DRIVER_SOURCE" in
+    azurelinux|nvidia-localrepo) ;;
+    *)
+      echo "unsupported NVIDIA driver source: $NVIDIA_DRIVER_SOURCE" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 retry() {
   n=1
@@ -42,14 +54,178 @@ retry() {
   done
 }
 
+verify_file_sha256() {
+  path="$1"
+  expected="$2"
+  actual=$(sha256sum "$path" | cut -d' ' -f1)
+  [ "$actual" = "$expected" ] || {
+    echo "$path sha256 is $actual, expected $expected" >&2
+    exit 1
+  }
+}
+
+find_nvidia_module() {
+  module="$1"
+  find "/usr/lib/modules/$NVIDIA_KVER" -type f \
+    \( -name "$module.ko" -o -name "$module.ko.xz" -o -name "$module.ko.zst" \)
+}
+
+verify_nvidia_localrepo_driver() {
+  for package in \
+    nvidia-open \
+    kmod-nvidia-open-dkms \
+    nvidia-driver-cuda \
+    nvidia-driver-cuda-libs \
+    nvidia-kmod-common \
+    nvidia-modprobe \
+    nvidia-persistenced \
+    libnvidia-cfg \
+    libnvidia-gpucomp \
+    libnvidia-ml; do
+    version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$package")
+    [ "$version" = "$NVIDIA_DRIVER_RPM_VERSION" ] || {
+      echo "$package resolved to $version, expected $NVIDIA_DRIVER_RPM_VERSION" >&2
+      exit 1
+    }
+  done
+
+  if rpm -q cuda-open-hwe nvidia-imex nvidia-fabricmanager nvlink5 nvlink5-580 \
+      >/dev/null 2>&1; then
+    echo "R580 A/B image unexpectedly contains another NVIDIA driver or fabric component" >&2
+    exit 1
+  fi
+
+  for firmware in gsp_ga10x.bin gsp_tu10x.bin; do
+    [ -s "/usr/lib/firmware/nvidia/$NVIDIA_DRIVER_VERSION/$firmware" ] || {
+      echo "missing NVIDIA $NVIDIA_DRIVER_VERSION firmware: $firmware" >&2
+      exit 1
+    }
+  done
+
+  manifest=/etc/unbounded/nvidia-driver-manifest
+  mkdir -p /etc/unbounded
+  : > "$manifest"
+  printf 'driver_source=%s\ndriver_version=%s\nkernel=%s\n' \
+    "$NVIDIA_DRIVER_SOURCE" "$NVIDIA_DRIVER_RPM_VERSION" "$NVIDIA_KVER" >> "$manifest"
+
+  for module in nvidia nvidia-modeset nvidia-drm nvidia-uvm nvidia-peermem; do
+    paths=$(find_nvidia_module "$module")
+    path_count=$(printf '%s\n' "$paths" | sed '/^$/d' | wc -l | tr -d ' ')
+    [ "$path_count" = 1 ] || {
+      echo "expected one $module module for $NVIDIA_KVER, found $path_count: $paths" >&2
+      exit 1
+    }
+    path=$paths
+    version=$(modinfo -F version "$path")
+    [ "$version" = "$NVIDIA_DRIVER_VERSION" ] || {
+      echo "$module version is $version, expected $NVIDIA_DRIVER_VERSION" >&2
+      exit 1
+    }
+    vermagic=$(modinfo -F vermagic "$path")
+    case "$vermagic" in
+      "$NVIDIA_KVER "*) ;;
+      *)
+        echo "$module vermagic is $vermagic, expected kernel $NVIDIA_KVER" >&2
+        exit 1
+        ;;
+    esac
+    module_key=$(printf '%s' "$module" | tr '-' '_')
+    module_sha256=$(sha256sum "$path" | cut -d' ' -f1)
+    printf 'module_%s_path=%s\nmodule_%s_sha256=%s\n' \
+      "$module_key" "$path" "$module_key" "$module_sha256" >> "$manifest"
+  done
+
+  for firmware in \
+    "nvidia/$NVIDIA_DRIVER_VERSION/gsp_ga10x.bin" \
+    "nvidia/$NVIDIA_DRIVER_VERSION/gsp_tu10x.bin"; do
+    modinfo -F firmware "$(find_nvidia_module nvidia)" | grep -Fx "$firmware" >/dev/null || {
+      echo "nvidia module does not declare firmware $firmware" >&2
+      exit 1
+    }
+  done
+}
+
+install_nvidia_localrepo_driver() {
+  : "${AZURELINUX_MLNX_OFA_KERNEL_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_VERSION is required}"
+  : "${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION is required}"
+  : "${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION:?AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION is required}"
+  : "${NVIDIA_DRIVER_VERSION:?NVIDIA_DRIVER_VERSION is required}"
+  : "${NVIDIA_DRIVER_RPM_VERSION:?NVIDIA_DRIVER_RPM_VERSION is required}"
+  : "${NVIDIA_DKMS_RPM_VERSION:?NVIDIA_DKMS_RPM_VERSION is required}"
+  : "${NVIDIA_LOCAL_REPO_URL:?NVIDIA_LOCAL_REPO_URL is required}"
+  : "${NVIDIA_LOCAL_REPO_SHA256:?NVIDIA_LOCAL_REPO_SHA256 is required}"
+  : "${NVIDIA_LOCAL_REPO_KEY_SHA256:?NVIDIA_LOCAL_REPO_KEY_SHA256 is required}"
+  : "${NVIDIA_FABRIC_PROBE_SHA256:?NVIDIA_FABRIC_PROBE_SHA256 is required}"
+
+  retry tdnf install -y \
+    "kernel-hwe-devel-${AZURELINUX_KERNEL_HWE_VERSION}" \
+    "mlnx-ofa_kernel-${AZURELINUX_MLNX_OFA_KERNEL_VERSION}" \
+    "mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}" \
+    "mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}"
+
+  repo_rpm=/tmp/nvidia-driver-local-repo.rpm
+  retry curl --fail --location --silent --show-error \
+    "$NVIDIA_LOCAL_REPO_URL" --output "$repo_rpm"
+  verify_file_sha256 "$repo_rpm" "$NVIDIA_LOCAL_REPO_SHA256"
+  retry tdnf install -y "$repo_rpm"
+
+  repo_dir="/var/nvidia-driver-local-repo-azl3-$NVIDIA_DRIVER_VERSION"
+  repo_key="$repo_dir/F2192135.pub"
+  [ -d "$repo_dir" ] && [ -s "$repo_key" ] || {
+    echo "NVIDIA local repository payload is incomplete" >&2
+    exit 1
+  }
+  verify_file_sha256 "$repo_key" "$NVIDIA_LOCAL_REPO_KEY_SHA256"
+  rpm --import "$repo_key"
+
+  for package in "$repo_dir"/*.rpm; do
+    signature=$(rpm --checksig "$package")
+    case "$signature" in
+      *"digests signatures OK") ;;
+      *)
+        echo "NVIDIA package signature verification failed: $signature" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  retry tdnf install -y \
+    "dkms-${NVIDIA_DKMS_RPM_VERSION}" \
+    "kmod-nvidia-open-dkms-${NVIDIA_DRIVER_RPM_VERSION}" \
+    "nvidia-open-${NVIDIA_DRIVER_RPM_VERSION}"
+
+  fabric_probe="/usr/src/nvidia-$NVIDIA_DRIVER_VERSION/src/nvidia/src/kernel/gpu/gpu_fabric_probe.c"
+  [ -s "$fabric_probe" ] || {
+    echo "missing NVIDIA fabric probe source: $fabric_probe" >&2
+    exit 1
+  }
+  verify_file_sha256 "$fabric_probe" "$NVIDIA_FABRIC_PROBE_SHA256"
+
+  dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION" \
+    -k "$NVIDIA_KVER" --force
+  dkms install -m nvidia -v "$NVIDIA_DRIVER_VERSION" \
+    -k "$NVIDIA_KVER" --force
+  dkms status -m nvidia -v "$NVIDIA_DRIVER_VERSION" -k "$NVIDIA_KVER" |
+    grep -F "nvidia/$NVIDIA_DRIVER_VERSION, $NVIDIA_KVER, aarch64: installed" >/dev/null || {
+    echo "NVIDIA DKMS did not install for $NVIDIA_KVER" >&2
+    exit 1
+  }
+  depmod "$NVIDIA_KVER"
+  verify_nvidia_localrepo_driver
+
+  rpm -e "nvidia-driver-local-repo-azl3-$NVIDIA_DRIVER_VERSION"
+  rm -f "$repo_rpm"
+}
+
 install_packages() {
 if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
   : "${AZURELINUX_KERNEL_VERSION:?AZURELINUX_KERNEL_VERSION is required}"
   : "${AZURELINUX_KERNEL_HWE_VERSION:?AZURELINUX_KERNEL_HWE_VERSION is required}"
   : "${AZURELINUX_GRUB_VERSION:?AZURELINUX_GRUB_VERSION is required}"
-  : "${AZURELINUX_CUDA_OPEN_HWE_VERSION:?AZURELINUX_CUDA_OPEN_HWE_VERSION is required}"
 
-  cat > /etc/yum.repos.d/azurelinux-nvidia.repo <<'EOF'
+  if [ "$NVIDIA_DRIVER_SOURCE" = azurelinux ]; then
+    : "${AZURELINUX_CUDA_OPEN_HWE_VERSION:?AZURELINUX_CUDA_OPEN_HWE_VERSION is required}"
+    cat > /etc/yum.repos.d/azurelinux-nvidia.repo <<'EOF'
 [azurelinux-official-nvidia]
 name=Azure Linux Official NVIDIA $releasever $basearch
 baseurl=https://packages.microsoft.com/azurelinux/$releasever/prod/nvidia/$basearch
@@ -60,6 +236,7 @@ enabled=1
 skip_if_unavailable=False
 sslverify=1
 EOF
+  fi
 fi
 
 if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
@@ -86,7 +263,16 @@ if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
     "grub2-${AZURELINUX_GRUB_VERSION}" \
     "grub2-efi-binary-${AZURELINUX_GRUB_VERSION}" \
     "grub2-efi-${AZURELINUX_GRUB_VERSION}"
-  retry tdnf install -y "cuda-open-hwe-${AZURELINUX_CUDA_OPEN_HWE_VERSION}"
+  if [ "$NVIDIA_DRIVER_SOURCE" = nvidia-localrepo ]; then
+    NVIDIA_KVER=$(rpm -ql kernel-hwe | sed -n 's#^/boot/vmlinuz-##p' | sort -V | tail -n1)
+    [ -n "$NVIDIA_KVER" ] || {
+      echo "kernel-hwe must provide a bootable kernel before the NVIDIA DKMS build" >&2
+      exit 1
+    }
+    install_nvidia_localrepo_driver
+  else
+    retry tdnf install -y "cuda-open-hwe-${AZURELINUX_CUDA_OPEN_HWE_VERSION}"
+  fi
 elif [ "$NVIDIA" = 1 ]; then
   retry tdnf install -y grub2-efi-binary cuda-open-hwe
 else
@@ -129,19 +315,23 @@ if [ "$NVIDIA" = 1 ] && [ "$TARGETARCH" = arm64 ]; then
     exit 1
   }
 
-  driver_version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' cuda-open-hwe)
-  [ "$driver_version" = "$AZURELINUX_CUDA_OPEN_HWE_VERSION" ] || {
-    echo "cuda-open-hwe resolved to $driver_version, expected $AZURELINUX_CUDA_OPEN_HWE_VERSION" >&2
-    exit 1
-  }
-  driver_kernel_version=$(printf '%s' "$AZURELINUX_KERNEL_HWE_VERSION" | tr '-' '.')
-  case "$AZURELINUX_CUDA_OPEN_HWE_VERSION" in
-    *"_${driver_kernel_version}") ;;
-    *)
-      echo "cuda-open-hwe is not matched to kernel-hwe $AZURELINUX_KERNEL_HWE_VERSION" >&2
+  if [ "$NVIDIA_DRIVER_SOURCE" = nvidia-localrepo ]; then
+    verify_nvidia_localrepo_driver
+  else
+    driver_version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' cuda-open-hwe)
+    [ "$driver_version" = "$AZURELINUX_CUDA_OPEN_HWE_VERSION" ] || {
+      echo "cuda-open-hwe resolved to $driver_version, expected $AZURELINUX_CUDA_OPEN_HWE_VERSION" >&2
       exit 1
-      ;;
-  esac
+    }
+    driver_kernel_version=$(printf '%s' "$AZURELINUX_KERNEL_HWE_VERSION" | tr '-' '.')
+    case "$AZURELINUX_CUDA_OPEN_HWE_VERSION" in
+      *"_${driver_kernel_version}") ;;
+      *)
+        echo "cuda-open-hwe is not matched to kernel-hwe $AZURELINUX_KERNEL_HWE_VERSION" >&2
+        exit 1
+        ;;
+    esac
+  fi
 
   install -D -m 0755 /usr/local/share/unbounded/10_azure_nvidia \
     /etc/grub.d/10_azure_nvidia
@@ -217,9 +407,24 @@ boot_profile=nvidia-hwe
 kernel=$AZURELINUX_KERNEL_VERSION
 kernel_hwe=$AZURELINUX_KERNEL_HWE_VERSION
 grub=$AZURELINUX_GRUB_VERSION
-cuda_open_hwe=$AZURELINUX_CUDA_OPEN_HWE_VERSION
+nvidia_driver_source=$NVIDIA_DRIVER_SOURCE
 agentbaker_reference=31804b47b7eb6d6999c7ffa6f643590f7b130bab
 EOF
+    if [ "$NVIDIA_DRIVER_SOURCE" = nvidia-localrepo ]; then
+      cat >> /etc/unbounded/image-inputs <<EOF
+nvidia_driver=$NVIDIA_DRIVER_RPM_VERSION
+nvidia_dkms=$NVIDIA_DKMS_RPM_VERSION
+nvidia_local_repo_sha256=$NVIDIA_LOCAL_REPO_SHA256
+nvidia_local_repo_key_sha256=$NVIDIA_LOCAL_REPO_KEY_SHA256
+nvidia_fabric_probe_sha256=$NVIDIA_FABRIC_PROBE_SHA256
+mlnx_ofa_kernel=$AZURELINUX_MLNX_OFA_KERNEL_VERSION
+mlnx_ofa_kernel_hwe_devel=$AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION
+mlnx_ofa_kernel_hwe_modules=$AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION
+EOF
+    else
+      printf 'cuda_open_hwe=%s\n' "$AZURELINUX_CUDA_OPEN_HWE_VERSION" \
+        >> /etc/unbounded/image-inputs
+    fi
   fi
 fi
 
