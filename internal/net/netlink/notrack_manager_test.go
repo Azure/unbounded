@@ -105,3 +105,69 @@ func TestNotrackJumpRuleSpec(t *testing.T) {
 		}
 	}
 }
+
+// TestReconcileFamilyTracksRoutedSources covers a non-gateway node in the
+// gateway's site reaching a remote site through the gateway. A request from
+// the gateway's routedCidrs arrives on the tunnel with a local source and its
+// reply comes back with a local destination; both must stay tracked so the
+// reply is not INVALID. Node IPs are not routed through the gateway, so their
+// replies may bypass it and they must stay untracked by source.
+func TestReconcileFamilyTracksRoutedSources(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podCIDR    = "10.244.1.0/24"
+		podSubnet  = "10.0.2.0/23"
+		nodeSubnet = "10.0.0.0/27"
+		remotePods = "192.168.20.0/24"
+	)
+
+	ipt := &fakeIPTables{}
+	m := &NotrackManager{}
+
+	err := m.reconcileFamily(ipt, "IPv4", true,
+		[]string{podCIDR},
+		[]string{podSubnet, nodeSubnet},
+		[]string{podSubnet},
+		[]string{remotePods},
+	)
+	if err != nil {
+		t.Fatalf("reconcileFamily: %v", err)
+	}
+
+	index := func(match, cidr, target string) int {
+		for i, rule := range ipt.appended {
+			if len(rule) > 1 && rule[0] == match && rule[1] == cidr && rule[len(rule)-1] == target {
+				return i
+			}
+		}
+
+		return -1
+	}
+
+	notrack := index("-d", remotePods, "--notrack")
+	if notrack < 0 {
+		t.Fatalf("missing supernet NOTRACK rule: %v", ipt.appended)
+	}
+
+	for _, want := range []struct{ match, cidr string }{
+		{"-d", podSubnet},
+		{"-d", nodeSubnet},
+		{"-s", podSubnet},
+	} {
+		i := index(want.match, want.cidr, "RETURN")
+		if i < 0 {
+			t.Fatalf("missing %s %s RETURN rule: %v", want.match, want.cidr, ipt.appended)
+		}
+
+		if i > notrack {
+			t.Fatalf("%s %s RETURN at %d comes after NOTRACK at %d", want.match, want.cidr, i, notrack)
+		}
+	}
+
+	for _, cidr := range []string{nodeSubnet, podCIDR} {
+		if index("-s", cidr, "RETURN") >= 0 {
+			t.Fatalf("%s must not be tracked by source: %v", cidr, ipt.appended)
+		}
+	}
+}
