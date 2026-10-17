@@ -304,4 +304,13 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, workflow, "timeout-minutes: 120")
 	require.Contains(t, workflow, "runs-on: ubuntu-24.04-arm")
 	require.NotContains(t, workflow, "docker/setup-qemu-action")
+	require.Contains(t, workflow, "- .github/workflows/images.yaml")
+
+	publishWorkflow := readRepoFile(t, ".github/workflows/images.yaml")
+	require.Contains(
+		t,
+		publishWorkflow,
+		"needs.resolve.outputs.platforms == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest'",
+	)
+	require.Contains(t, publishWorkflow, "if: needs.resolve.outputs.platforms != 'linux/arm64'")
 }

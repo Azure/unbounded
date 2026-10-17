@@ -9,6 +9,7 @@ on:
       - images/host-azurelinux3/**
       - images/host-azurelinux3-nvidia/**
       - hack/hostimage/**
+      - .github/workflows/images.yaml
       - .github/workflows/host-azurelinux3-nvidia.yaml
   workflow_dispatch:
 
