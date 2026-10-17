@@ -84,6 +84,7 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`verify_file_sha256 "$fabric_probe" "$NVIDIA_FABRIC_PROBE_SHA256"`,
 		`dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION"`,
 		`-k "$NVIDIA_KVER" --force`,
+		`cat "/var/lib/dkms/nvidia/$NVIDIA_DRIVER_VERSION/build/make.log"`,
 		`dkms install -m nvidia -v "$NVIDIA_DRIVER_VERSION"`,
 		`NVIDIA DKMS did not install for $NVIDIA_KVER`,
 		`for module in nvidia nvidia-modeset nvidia-drm nvidia-uvm nvidia-peermem`,

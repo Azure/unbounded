@@ -256,8 +256,11 @@ EOF
   }
   verify_file_sha256 "$fabric_probe" "$NVIDIA_FABRIC_PROBE_SHA256"
 
-  dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION" \
-    -k "$NVIDIA_KVER" --force
+  if ! dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION" \
+      -k "$NVIDIA_KVER" --force; then
+    cat "/var/lib/dkms/nvidia/$NVIDIA_DRIVER_VERSION/build/make.log" >&2 || true
+    exit 1
+  fi
   dkms install -m nvidia -v "$NVIDIA_DRIVER_VERSION" \
     -k "$NVIDIA_KVER" --force
   dkms status -m nvidia -v "$NVIDIA_DRIVER_VERSION" -k "$NVIDIA_KVER" |
