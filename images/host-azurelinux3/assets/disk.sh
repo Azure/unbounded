@@ -62,7 +62,7 @@ EOF
 # from the ESP, while kernels and package-owned GRUB modules remain on root.
 BOOT_PROFILE=standard
 if [ "$IMAGE_VARIANT" = nvidia ] && [ "$TARGETARCH" = arm64 ]; then
-  BOOT_PROFILE=nvidia-grace
+  BOOT_PROFILE=nvidia-hwe
   [ -n "$NVIDIA_KVER" ] || {
     echo "NVIDIA ARM64 image requires kernel-hwe" >&2
     exit 1
@@ -77,11 +77,18 @@ OUTPUT="$WORK/grub.cfg" ROOT_UUID="$ROOT_UUID" STANDARD_KVER="$STANDARD_KVER" \
   sh /usr/local/bin/write-grub-config
 
 case "$BOOT_PROFILE" in
-  nvidia-grace)
+  nvidia-hwe)
     grep -F 'set default=nvidia-grace' "$WORK/grub.cfg" >/dev/null
     grep -F "linux /boot/vmlinuz-$NVIDIA_KVER" "$WORK/grub.cfg" >/dev/null
-    grep -F 'iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1' \
-      "$WORK/grub.cfg" >/dev/null
+    for unexpected in \
+      'iommu.passthrough=1' \
+      'irqchip.gicv3_nolpi=y' \
+      'arm_smmu_v3.disable_msipolling=1'; do
+      if grep -F "$unexpected" "$WORK/grub.cfg" >/dev/null; then
+        echo "NVIDIA HWE image unexpectedly contains Grace argument: $unexpected" >&2
+        exit 1
+      fi
+    done
     ;;
   standard)
     grep -F "linux /boot/vmlinuz-$STANDARD_KVER" "$WORK/grub.cfg" >/dev/null

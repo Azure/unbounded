@@ -56,10 +56,10 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 	require.Contains(t, rootfs, `retry tdnf install -y "$KERNEL_PACKAGE"`)
 	require.Contains(t, rootfs, "retry tdnf install -y grub2-efi-binary cuda-open-hwe")
 	require.Contains(t, rootfs, "inconsistent image variant and NVIDIA setting")
-	require.Contains(t, rootfs, "boot_profile=nvidia-grace")
+	require.Contains(t, rootfs, "boot_profile=nvidia-hwe")
 }
 
-func TestAzureLinuxNVIDIAGRUBConfigDefaultsToGrace(t *testing.T) {
+func TestAzureLinuxNVIDIAGRUBConfigDefaultsToHWEWithoutGraceArgs(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "grub.cfg")
 	script := filepath.Join(repoRoot(t), "images/host-azurelinux3/assets/grub-config.sh")
 	command := exec.Command("sh", script)
@@ -70,7 +70,7 @@ func TestAzureLinuxNVIDIAGRUBConfigDefaultsToGrace(t *testing.T) {
 		"ROOT_UUID=test-root",
 		"STANDARD_KVER=6.6.157.1-1.azl3",
 		"NVIDIA_KVER=6.18.48.1-1.azl3",
-		"BOOT_PROFILE=nvidia-grace",
+		"BOOT_PROFILE=nvidia-hwe",
 	)
 	result, err := command.CombinedOutput()
 	require.NoError(t, err, string(result))
@@ -81,8 +81,7 @@ func TestAzureLinuxNVIDIAGRUBConfigDefaultsToGrace(t *testing.T) {
 	grub := string(config)
 	for _, expected := range []string{
 		"set default=nvidia-grace",
-		"iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1",
-		"linux /boot/vmlinuz-6.18.48.1-1.azl3 root=UUID=test-root rw  iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1",
+		"linux /boot/vmlinuz-6.18.48.1-1.azl3 root=UUID=test-root rw ",
 		"linux /boot/vmlinuz-6.6.157.1-1.azl3 root=UUID=test-root rw ",
 	} {
 		require.Contains(t, grub, expected)
@@ -91,6 +90,9 @@ func TestAzureLinuxNVIDIAGRUBConfigDefaultsToGrace(t *testing.T) {
 	require.NotContains(t, grub, "smbios")
 	require.NotContains(t, grub, "cpu_manufacturer")
 	require.NotContains(t, grub, "$nvidia_args")
+	require.NotContains(t, grub, "iommu.passthrough")
+	require.NotContains(t, grub, "irqchip.gicv3_nolpi")
+	require.NotContains(t, grub, "arm_smmu_v3.disable_msipolling")
 }
 
 func TestAzureLinuxStandardGRUBConfigHasNoGraceBehavior(t *testing.T) {
@@ -118,7 +120,7 @@ func TestAzureLinuxStandardGRUBConfigHasNoGraceBehavior(t *testing.T) {
 	require.NotContains(t, grub, "iommu.passthrough")
 }
 
-func TestAzureLinuxGraceGRUBConfigRequiresHWEKernel(t *testing.T) {
+func TestAzureLinuxNVIDIAGRUBConfigRequiresHWEKernel(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "grub.cfg")
 	script := filepath.Join(repoRoot(t), "images/host-azurelinux3/assets/grub-config.sh")
 	command := exec.Command("sh", script)
@@ -128,11 +130,11 @@ func TestAzureLinuxGraceGRUBConfigRequiresHWEKernel(t *testing.T) {
 		"OUTPUT="+output,
 		"ROOT_UUID=test-root",
 		"STANDARD_KVER=6.6.157.1-1.azl3",
-		"BOOT_PROFILE=nvidia-grace",
+		"BOOT_PROFILE=nvidia-hwe",
 	)
 	result, err := command.CombinedOutput()
 	require.Error(t, err)
-	require.Contains(t, string(result), "nvidia-grace boot profile requires NVIDIA_KVER")
+	require.Contains(t, string(result), "nvidia-hwe boot profile requires NVIDIA_KVER")
 }
 
 func TestAzureLinuxGRUBSelectorUsesRPMOwnership(t *testing.T) {
@@ -176,7 +178,9 @@ esac
 
 	output := string(result)
 	require.Contains(t, output, `set default="gnulinux-6.18.48.1-1.azl3-advanced-test-root"`)
-	require.Contains(t, output, "iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1")
+	require.NotContains(t, output, "iommu.passthrough")
+	require.NotContains(t, output, "irqchip.gicv3_nolpi")
+	require.NotContains(t, output, "arm_smmu_v3.disable_msipolling")
 	require.NotContains(t, output, "smbios")
 	require.NotContains(t, output, "cpu_manufacturer")
 }
@@ -200,6 +204,7 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, disk, "required GRUB smbios.mod is missing")
 	require.Contains(t, disk, "rootfs image variant")
 	require.Contains(t, disk, "NVIDIA ARM64 image requires kernel-hwe")
+	require.Contains(t, disk, "NVIDIA HWE image unexpectedly contains Grace argument")
 	require.Contains(t, disk, "standard image unexpectedly contains NVIDIA Grace arguments")
 
 	verify := readRepoFile(t, "images/host-azurelinux3/assets/verify-disk.sh")

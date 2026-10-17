@@ -63,7 +63,7 @@ INPUTS=$(debugfs -R "cat /etc/unbounded/image-inputs" "$ROOT" 2>/dev/null)
 for expected in \
   architecture=arm64 \
   image_variant=nvidia \
-  boot_profile=nvidia-grace \
+  boot_profile=nvidia-hwe \
   kernel=6.6.157.1-1.azl3 \
   kernel_hwe=6.18.48.1-1.azl3 \
   grub=2.06-27.azl3 \
@@ -93,7 +93,6 @@ echo "  nvidia-grace=6.18.48.1-1.azl3"
 GRUB=$(mtype -i "$DISK@@$((ESP_START * 512))" ::/EFI/BOOT/grub.cfg)
 for expected in \
   'set default=nvidia-grace' \
-  'iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1' \
   'linux /boot/vmlinuz-6.18.48.1-1.azl3'; do
   printf '%s\n' "$GRUB" | grep -F "$expected" >/dev/null || {
     echo "missing GRUB contract: $expected" >&2
@@ -104,7 +103,10 @@ for unexpected in \
   'insmod smbios' \
   'smbios --type 4' \
   'cpu_manufacturer' \
-  'if [ x$cpu_manufacturer'; do
+  'if [ x$cpu_manufacturer' \
+  'iommu.passthrough=1' \
+  'irqchip.gicv3_nolpi=y' \
+  'arm_smmu_v3.disable_msipolling=1'; do
   if printf '%s\n' "$GRUB" | grep -F "$unexpected" >/dev/null; then
     echo "NVIDIA image unexpectedly uses runtime SMBIOS selection: $unexpected" >&2
     exit 1
@@ -129,18 +131,9 @@ printf '%s\n' "$GRACE_ENTRY" | grep -F \
   echo "NVIDIA Grace entry does not select kernel-hwe" >&2
   exit 1
 }
-printf '%s\n' "$GRACE_ENTRY" | grep -F \
-  'iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1' >/dev/null || {
-  echo "NVIDIA Grace entry does not contain the required arguments" >&2
-  exit 1
-}
-
 echo "PASS specialized NVIDIA GRUB policy:"
 echo "  default=nvidia-grace (no runtime SMBIOS decision)"
 echo "  recovery entry -> vmlinuz-6.6.157.1-1.azl3, no Grace arguments"
-echo "  default entry -> vmlinuz-6.18.48.1-1.azl3"
-echo "  iommu.passthrough=1"
-echo "  irqchip.gicv3_nolpi=y"
-echo "  arm_smmu_v3.disable_msipolling=1"
+echo "  default entry -> vmlinuz-6.18.48.1-1.azl3, no extra Grace arguments"
 echo "PASS GRUB package module: /usr/lib/grub/arm64-efi/smbios.mod"
 echo "verified Azure Linux NVIDIA ARM64 disk: $DISK_GZ"

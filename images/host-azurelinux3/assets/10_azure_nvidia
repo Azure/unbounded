@@ -69,5 +69,4 @@ echo "Default NVIDIA image: $NVIDIA, recovery image: $OTHER, boot_device_id: $bo
 
 cat <<EOF
 set default="gnulinux-${NVIDIA}-advanced-${boot_device_id}"
-set nvidia_args="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1"
 EOF

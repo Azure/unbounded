@@ -213,7 +213,7 @@ EOF
     cat > /etc/unbounded/image-inputs <<EOF
 architecture=$TARGETARCH
 image_variant=$IMAGE_VARIANT
-boot_profile=nvidia-grace
+boot_profile=nvidia-hwe
 kernel=$AZURELINUX_KERNEL_VERSION
 kernel_hwe=$AZURELINUX_KERNEL_HWE_VERSION
 grub=$AZURELINUX_GRUB_VERSION

@@ -23,12 +23,12 @@ EOF
   exit 0
 fi
 
-[ "$BOOT_PROFILE" = nvidia-grace ] || {
+[ "$BOOT_PROFILE" = nvidia-hwe ] || {
   echo "unsupported boot profile: $BOOT_PROFILE" >&2
   exit 1
 }
 [ -n "$NVIDIA_KVER" ] || {
-  echo "nvidia-grace boot profile requires NVIDIA_KVER" >&2
+  echo "nvidia-hwe boot profile requires NVIDIA_KVER" >&2
   exit 1
 }
 
@@ -43,7 +43,7 @@ menuentry "Azure Linux" --id standard {
 }
 
 menuentry "Azure Linux NVIDIA Grace" --id nvidia-grace {
-  linux /boot/vmlinuz-$NVIDIA_KVER root=UUID=$ROOT_UUID rw $CONSOLE iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1
+  linux /boot/vmlinuz-$NVIDIA_KVER root=UUID=$ROOT_UUID rw $CONSOLE
   initrd /boot/initramfs-$NVIDIA_KVER.img
 }
 EOF
