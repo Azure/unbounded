@@ -49,12 +49,13 @@ func TestAzureLinuxNVIDIAInputsArePinned(t *testing.T) {
 		"AZURELINUX_GCC_VERSION=13.2.0-7.azl3",
 		"AZURELINUX_MAKE_VERSION=4.4.1-2.azl3",
 		"AZURELINUX_PATCH_VERSION=2.7.6-10.azl3",
-		"NVIDIA_DRIVER_VERSION=580.178.04",
-		"NVIDIA_DRIVER_RPM_VERSION=580.178.04-1.azl3",
+		"NVIDIA_DRIVER_VERSION=595.91.07",
+		"NVIDIA_DRIVER_RPM_VERSION=595.91.07-1.azl3",
 		"NVIDIA_DKMS_RPM_VERSION=3.4.1-1.azl3",
-		"NVIDIA_LOCAL_REPO_SHA256=7c734d8daa0876d3c5731622e78fe20811ee8c9f61a805b74b0b09576b992df4",
-		"NVIDIA_LOCAL_REPO_KEY_SHA256=43464fc9a8371860b10b81edbd95ab95f28aa1dc1cc988ec15d2369e10d1fc7b",
-		"NVIDIA_FABRIC_PROBE_SHA256=ebb6fa74a476dd7a55b7e705c2ad19c00bd20e31fb984babcbc114130efe05b5",
+		"NVIDIA_LOCAL_REPO_SHA256=e49c4eab0f07f9737897eb7595fef9200d65a038f4061965f3cfcf664fd82407",
+		"NVIDIA_LOCAL_REPO_KEY_FILE=8806481F.pub",
+		"NVIDIA_LOCAL_REPO_KEY_SHA256=d3139840cd5ba220eefc2110470521767e928a0f3b793551435236c74b186781",
+		"NVIDIA_FABRIC_PROBE_SHA256=6370ab719a3bb318fb865afff79c0eb67d3d23f094029379c9321250486d24c7",
 	} {
 		require.Contains(t, versions, expected)
 	}
@@ -83,6 +84,7 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 	rootfs := readRepoFile(t, "images/host-azurelinux3/assets/rootfs.sh")
 	for _, expected := range []string{
 		`verify_file_sha256 "$repo_rpm" "$NVIDIA_LOCAL_REPO_SHA256"`,
+		`repo_key="$repo_dir/$NVIDIA_LOCAL_REPO_KEY_FILE"`,
 		`verify_file_sha256 "$repo_key" "$NVIDIA_LOCAL_REPO_KEY_SHA256"`,
 		`rpm --install --nodeps --nosignature "$repo_rpm"`,
 		`for package in "$repo_rpm" "$repo_dir"/*.rpm`,
@@ -103,7 +105,7 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`ExecStart=/usr/bin/nvidia-smi -pm 0`,
 		`"$unit enablement is $state, expected disabled or not-found"`,
 		`"$unit is linked into a boot target"`,
-		`R580 A/B image unexpectedly contains another NVIDIA driver or fabric component`,
+		`NVIDIA driver A/B image unexpectedly contains another driver or fabric component`,
 		`kernel-devel-${AZURELINUX_KERNEL_VERSION}`,
 		`kernel-hwe-drivers-gpu-${AZURELINUX_KERNEL_HWE_DRIVERS_GPU_VERSION}`,
 		`mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}`,
@@ -305,10 +307,13 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "NVIDIA image unexpectedly uses runtime SMBIOS selection")
 	require.Contains(t, verify, `grep -q '^Inode:'`)
 	require.Contains(t, verify, "PASS package inputs:")
-	require.Contains(t, verify, "PASS NVIDIA 580.178.04 target-kernel DKMS modules:")
+	require.Contains(t, verify, "PASS NVIDIA 595.91.07 target-kernel DKMS modules:")
 	require.Contains(t, verify, "PASS NVIDIA DRM dependency closure:")
 	require.Contains(t, verify, "kernel-hwe-drivers-gpu provides ttm and drm_ttm_helper")
-	require.Contains(t, verify, "GSP firmware=580.178.04")
+	require.Contains(t, verify, "GSP firmware=595.91.07")
+	require.Contains(t, verify, "failed to enumerate regular systemd unit files")
+	require.Contains(t, verify, "failed to scan regular systemd unit file")
+	require.Contains(t, verify, `done < "$unit_list"`)
 	require.Contains(t, verify, "PASS idle-service baseline:")
 	require.Contains(t, verify, "nvidia-persistenced.service is disabled or absent")
 	require.Contains(t, verify, "nvidia-powerd.service is disabled or absent")

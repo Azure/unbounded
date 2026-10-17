@@ -54,8 +54,8 @@ for path in \
   /etc/unbounded/image-inputs \
   /etc/unbounded/nvidia-driver-manifest \
   /usr/bin/nvidia-smi \
-  /usr/lib/firmware/nvidia/580.178.04/gsp_ga10x.bin \
-  /usr/lib/firmware/nvidia/580.178.04/gsp_tu10x.bin \
+  /usr/lib/firmware/nvidia/595.91.07/gsp_ga10x.bin \
+  /usr/lib/firmware/nvidia/595.91.07/gsp_tu10x.bin \
   /usr/lib/modules/6.18.48.1-1.azl3/kernel/drivers/gpu/drm/drm_ttm_helper.ko.xz \
   /usr/lib/modules/6.18.48.1-1.azl3/kernel/drivers/gpu/drm/ttm/ttm.ko.xz \
   /usr/lib/grub/arm64-efi/smbios.mod; do
@@ -75,11 +75,12 @@ for expected in \
   kernel_hwe_drivers_gpu=6.18.48.1-1.azl3 \
   grub=2.06-27.azl3 \
   nvidia_driver_source=nvidia-localrepo \
-  nvidia_driver=580.178.04-1.azl3 \
+  nvidia_driver=595.91.07-1.azl3 \
   nvidia_dkms=3.4.1-1.azl3 \
-  nvidia_local_repo_sha256=7c734d8daa0876d3c5731622e78fe20811ee8c9f61a805b74b0b09576b992df4 \
-  nvidia_local_repo_key_sha256=43464fc9a8371860b10b81edbd95ab95f28aa1dc1cc988ec15d2369e10d1fc7b \
-  nvidia_fabric_probe_sha256=ebb6fa74a476dd7a55b7e705c2ad19c00bd20e31fb984babcbc114130efe05b5 \
+  nvidia_local_repo_sha256=e49c4eab0f07f9737897eb7595fef9200d65a038f4061965f3cfcf664fd82407 \
+  nvidia_local_repo_key_file=8806481F.pub \
+  nvidia_local_repo_key_sha256=d3139840cd5ba220eefc2110470521767e928a0f3b793551435236c74b186781 \
+  nvidia_fabric_probe_sha256=6370ab719a3bb318fb865afff79c0eb67d3d23f094029379c9321250486d24c7 \
   mlnx_ofa_kernel=26.01-1_6.6.158.1.1.azl3 \
   mlnx_ofa_kernel_hwe_devel=26.01-2_6.18.48.1.1.azl3 \
   mlnx_ofa_kernel_hwe_modules=26.01-2_6.18.48.1.1.azl3 \
@@ -145,11 +146,51 @@ if [ "$(readlink "$WORK/systemd-etc/system/multi-user.target.wants/nvidia-device
   echo "NVIDIA device setup service is not enabled" >&2
   exit 1
 fi
-if grep -R -E -- 'nvidia-smi[[:space:]]+-pm[[:space:]]+1([[:space:]]|$)' \
-    "$WORK/systemd-etc" "$WORK/systemd-usr" >/dev/null; then
-  echo "legacy NVIDIA persistence mode is unexpectedly enabled by systemd" >&2
+unit_list="$WORK/regular-systemd-units.list"
+scan_stderr="$WORK/systemd-scan.stderr"
+if ! find "$WORK/systemd-etc" "$WORK/systemd-usr" -type f -print \
+    > "$unit_list" 2> "$scan_stderr"; then
+  echo "failed to enumerate regular systemd unit files" >&2
+  cat "$scan_stderr" >&2
   exit 1
 fi
+[ ! -s "$scan_stderr" ] || {
+  echo "regular systemd unit enumeration wrote unexpected stderr" >&2
+  cat "$scan_stderr" >&2
+  exit 1
+}
+regular_unit_count=0
+while IFS= read -r unit; do
+  regular_unit_count=$((regular_unit_count + 1))
+  : > "$scan_stderr"
+  if grep -E -- 'nvidia-smi[[:space:]]+-pm[[:space:]]+1([[:space:]]|$)' \
+      "$unit" >/dev/null 2> "$scan_stderr"; then
+    grep_status=0
+  else
+    grep_status=$?
+  fi
+  case "$grep_status" in
+    0)
+      echo "legacy NVIDIA persistence mode is unexpectedly enabled by systemd: $unit" >&2
+      exit 1
+      ;;
+    1) ;;
+    *)
+      echo "failed to scan regular systemd unit file: $unit" >&2
+      cat "$scan_stderr" >&2
+      exit 1
+      ;;
+  esac
+  [ ! -s "$scan_stderr" ] || {
+    echo "regular systemd unit scan wrote unexpected stderr: $unit" >&2
+    cat "$scan_stderr" >&2
+    exit 1
+  }
+done < "$unit_list"
+[ "$regular_unit_count" -gt 0 ] || {
+  echo "no regular systemd unit files were scanned" >&2
+  exit 1
+}
 if find "$WORK/systemd-etc" "$WORK/systemd-usr" -type l \
     \( -name nvidia-persistenced.service -o -name nvidia-powerd.service \) |
     grep -q .; then
@@ -161,11 +202,12 @@ echo "  nvidia-persistenced.service is disabled or absent"
 echo "  nvidia-powerd.service is disabled or absent"
 echo "  nvidia-persistence-mode.service is masked"
 echo "  nvidia-device-setup.service creates nodes with legacy persistence mode off"
+echo "  regular systemd unit files scanned=$regular_unit_count"
 
 DRIVER_MANIFEST=$(debugfs -R "cat /etc/unbounded/nvidia-driver-manifest" "$ROOT" 2>/dev/null)
 for expected in \
   driver_source=nvidia-localrepo \
-  driver_version=580.178.04-1.azl3 \
+  driver_version=595.91.07-1.azl3 \
   kernel=6.18.48.1-1.azl3; do
   printf '%s\n' "$DRIVER_MANIFEST" | grep -Fx "$expected" >/dev/null || {
     echo "missing NVIDIA driver manifest value: $expected" >&2
@@ -221,8 +263,8 @@ for module in nvidia nvidia_modeset nvidia_drm nvidia_uvm nvidia_peermem; do
     exit 1
   }
   version=$(modinfo -F version "$module_file")
-  [ "$version" = 580.178.04 ] || {
-    echo "$module version is $version, expected 580.178.04" >&2
+  [ "$version" = 595.91.07 ] || {
+    echo "$module version is $version, expected 595.91.07" >&2
     exit 1
   }
   vermagic=$(modinfo -F vermagic "$module_file")
@@ -234,10 +276,10 @@ for module in nvidia nvidia_modeset nvidia_drm nvidia_uvm nvidia_peermem; do
       ;;
   esac
 done
-echo "PASS NVIDIA 580.178.04 target-kernel DKMS modules:"
+echo "PASS NVIDIA 595.91.07 target-kernel DKMS modules:"
 echo "  nvidia, nvidia-modeset, nvidia-drm, nvidia-uvm, nvidia-peermem"
 echo "  kernel=6.18.48.1-1.azl3, source=verified NVIDIA AZL3 local repository"
-echo "  GSP firmware=580.178.04"
+echo "  GSP firmware=595.91.07"
 
 for kver in 6.6.157.1-1.azl3 6.18.48.1-1.azl3; do
   debugfs_exists "/boot/vmlinuz-$kver" || {

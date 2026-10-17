@@ -133,7 +133,7 @@ verify_nvidia_localrepo_driver() {
 
   if rpm -q cuda-open-hwe nvidia-imex nvidia-fabricmanager nvlink5 nvlink5-580 \
       >/dev/null 2>&1; then
-    echo "R580 A/B image unexpectedly contains another NVIDIA driver or fabric component" >&2
+    echo "NVIDIA driver A/B image unexpectedly contains another driver or fabric component" >&2
     exit 1
   fi
 
@@ -207,6 +207,7 @@ install_nvidia_localrepo_driver() {
   : "${NVIDIA_DKMS_RPM_VERSION:?NVIDIA_DKMS_RPM_VERSION is required}"
   : "${NVIDIA_LOCAL_REPO_URL:?NVIDIA_LOCAL_REPO_URL is required}"
   : "${NVIDIA_LOCAL_REPO_SHA256:?NVIDIA_LOCAL_REPO_SHA256 is required}"
+  : "${NVIDIA_LOCAL_REPO_KEY_FILE:?NVIDIA_LOCAL_REPO_KEY_FILE is required}"
   : "${NVIDIA_LOCAL_REPO_KEY_SHA256:?NVIDIA_LOCAL_REPO_KEY_SHA256 is required}"
   : "${NVIDIA_FABRIC_PROBE_SHA256:?NVIDIA_FABRIC_PROBE_SHA256 is required}"
 
@@ -253,7 +254,7 @@ EOF
   rpm --install --nodeps --nosignature "$repo_rpm"
 
   repo_dir="/var/nvidia-driver-local-repo-azl3-$NVIDIA_DRIVER_VERSION"
-  repo_key="$repo_dir/F2192135.pub"
+  repo_key="$repo_dir/$NVIDIA_LOCAL_REPO_KEY_FILE"
   [ -d "$repo_dir" ] && [ -s "$repo_key" ] || {
     echo "NVIDIA local repository payload is incomplete" >&2
     exit 1
@@ -543,6 +544,7 @@ EOF
 nvidia_driver=$NVIDIA_DRIVER_RPM_VERSION
 nvidia_dkms=$NVIDIA_DKMS_RPM_VERSION
 nvidia_local_repo_sha256=$NVIDIA_LOCAL_REPO_SHA256
+nvidia_local_repo_key_file=$NVIDIA_LOCAL_REPO_KEY_FILE
 nvidia_local_repo_key_sha256=$NVIDIA_LOCAL_REPO_KEY_SHA256
 nvidia_fabric_probe_sha256=$NVIDIA_FABRIC_PROBE_SHA256
 mlnx_ofa_kernel=$AZURELINUX_MLNX_OFA_KERNEL_VERSION

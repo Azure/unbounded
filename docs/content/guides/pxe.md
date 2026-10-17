@@ -95,13 +95,16 @@ The generic `host-azurelinux3` image defaults to the standard kernel. Do not
 add `irqchip.gicv3_nolpi=y` to the NVIDIA image: MANA NIC MSI-X interrupts use
 the GICv3 LPI/ITS path, and disabling LPIs prevents the host from establishing
 network connectivity after boot.
-The ARM64 image pins NVIDIA R580.178.04 from NVIDIA's signed Azure Linux 3
+The ARM64 image pins NVIDIA R595.91.07 from NVIDIA's signed Azure Linux 3
 local repository and explicitly builds its five open GPU modules for the
 pinned HWE kernel. It also installs the matching
 `kernel-hwe-drivers-gpu` package so `nvidia_drm` can load its `ttm` and
 `drm_ttm_helper` dependencies during boot. This is an image-only driver A/B:
 it preserves the existing GRUB, OFED, CDMM, and MANA-safe command-line
-behavior and does not add Fabric Manager, IMEX, or `nvlink5`. NVIDIA's
+behavior and does not add Fabric Manager, IMEX, or `nvlink5`. R595 is used as
+a controlled production-branch discriminator after R580.178.04 reproduced
+delayed Xid149 with legacy persistence both enabled and disabled; it is not a
+claim that R595 fixes Xid149. NVIDIA's
 packaged persistence and power services remain disabled or absent to preserve
 the existing idle baseline.
 Use `make verify-host-azurelinux3-nvidia` to build and offline-inspect its

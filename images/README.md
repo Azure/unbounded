@@ -44,7 +44,7 @@ The package inputs are recorded in
 `images/host-azurelinux3-nvidia/versions.env`. Builds fail if the kernel,
 NVIDIA driver, OFED, DKMS, or GRUB package versions differ, or if the package
 matched `smbios.mod` is absent. The ARM64 image uses NVIDIA's versioned,
-signed Azure Linux 3 local repository for R580.178.04. It verifies the
+signed Azure Linux 3 local repository for R595.91.07. It verifies the
 repository archive and key hashes, checks every embedded RPM signature, then
 builds and installs all five open GPU modules explicitly for
 `6.18.48.1-1.azl3`. The build rejects missing modules, mixed userspace or GSP
@@ -56,7 +56,8 @@ the runtime dependency chain required by `nvidia_drm`. NVIDIA's packaged
 On ARM64, the legacy `nvidia-persistence-mode.service` is masked and a
 one-shot device setup unit creates the NVIDIA device nodes while explicitly
 leaving legacy persistence mode off. AMD64 retains its existing persistence
-service behavior. This is an intentional no-persistence A/B contract:
+service behavior. This is an intentional no-persistence driver/GSP branch
+discriminator:
 NVIDIA's multi-node NVLink verification guide separately expects the
 `nvidia-persistenced` daemon on compute trays, so a no-persistence result does
 not by itself establish the final production service policy. The exact
