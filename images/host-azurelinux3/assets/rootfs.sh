@@ -484,10 +484,30 @@ nvidia_modeset
 nvidia_uvm
 nvidia_drm
 EOF
-  # The unbounded agent checks for this unit. It creates the device nodes
-  # and keeps the driver loaded between GPU jobs. It is skipped on machines
-  # without a GPU bound to the driver.
-  cat > /etc/systemd/system/nvidia-persistence-mode.service <<'EOF'
+  if [ "$TARGETARCH" = arm64 ]; then
+    # Create the device nodes needed by bootstrap, but keep legacy persistence
+    # mode off for the GB200 driver A/B.
+    cat > /etc/systemd/system/nvidia-device-setup.service <<'EOF'
+[Unit]
+Description=Initialize NVIDIA device nodes without persistence mode
+After=systemd-modules-load.service
+ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-modprobe -u -c=0
+ExecStart=/usr/bin/nvidia-smi -pm 0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl enable nvidia-device-setup.service
+    systemctl mask nvidia-persistence-mode.service
+  else
+    # The unbounded agent checks for this unit. It creates the device nodes
+    # and keeps the driver loaded between GPU jobs. It is skipped on machines
+    # without a GPU bound to the driver.
+    cat > /etc/systemd/system/nvidia-persistence-mode.service <<'EOF'
 [Unit]
 Description=Enable NVIDIA persistence mode
 After=systemd-modules-load.service
@@ -502,7 +522,8 @@ ExecStart=/usr/bin/nvidia-smi -pm 1
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl enable nvidia-persistence-mode.service
+    systemctl enable nvidia-persistence-mode.service
+  fi
 
   if [ "$TARGETARCH" = arm64 ]; then
     mkdir -p /etc/unbounded
@@ -536,6 +557,9 @@ make=$AZURELINUX_MAKE_VERSION
 patch=$AZURELINUX_PATCH_VERSION
 nvidia_persistenced_service=$NVIDIA_PERSISTENCED_SERVICE_STATE
 nvidia_powerd_service=$NVIDIA_POWERD_SERVICE_STATE
+nvidia_device_setup_service=enabled
+nvidia_persistence_mode_service=masked
+legacy_persistence_mode=off
 EOF
     else
       printf 'cuda_open_hwe=%s\n' "$AZURELINUX_CUDA_OPEN_HWE_VERSION" \

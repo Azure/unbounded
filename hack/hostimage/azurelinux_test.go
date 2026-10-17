@@ -99,6 +99,8 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`"$module vermagic is $vermagic, expected kernel $NVIDIA_KVER"`,
 		`disable_nvidia_vendor_service nvidia-persistenced.service`,
 		`disable_nvidia_vendor_service nvidia-powerd.service`,
+		`systemctl mask nvidia-persistence-mode.service`,
+		`ExecStart=/usr/bin/nvidia-smi -pm 0`,
 		`"$unit enablement is $state, expected disabled or not-found"`,
 		`"$unit is linked into a boot target"`,
 		`R580 A/B image unexpectedly contains another NVIDIA driver or fabric component`,
@@ -281,7 +283,8 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 		"NVIDIA DKMS did not install for",
 		"NVIDIA local repository payload is incomplete",
 		"/etc/modprobe.d/blacklist-nouveau.conf",
-		"nvidia-persistence-mode.service",
+		"nvidia-device-setup.service",
+		"legacy_persistence_mode=off",
 	} {
 		require.True(t, strings.Contains(rootfs, expected), "missing fail-closed check %q", expected)
 	}
@@ -309,6 +312,9 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "PASS idle-service baseline:")
 	require.Contains(t, verify, "nvidia-persistenced.service is disabled or absent")
 	require.Contains(t, verify, "nvidia-powerd.service is disabled or absent")
+	require.Contains(t, verify, "nvidia-persistence-mode.service is masked")
+	require.Contains(t, verify, "legacy NVIDIA persistence mode is unexpectedly enabled by systemd")
+	require.Contains(t, verify, "ExecStart=/usr/bin/nvidia-smi -pm 0")
 	require.Contains(t, verify, "PASS specialized NVIDIA GRUB policy:")
 	require.Contains(t, verify, "PASS MANA-compatible kernel command line:")
 	require.Contains(t, verify, "GICv3 LPI/ITS MSI-X remains enabled")
@@ -326,4 +332,26 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 		"needs.resolve.outputs.platforms == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest'",
 	)
 	require.Contains(t, publishWorkflow, "if: needs.resolve.outputs.platforms != 'linux/arm64'")
+}
+
+func TestAzureLinuxNVIDIAARM64DisablesLegacyPersistenceMode(t *testing.T) {
+	rootfs := readRepoFile(t, "images/host-azurelinux3/assets/rootfs.sh")
+	start := strings.Index(rootfs, `    # Create the device nodes needed by bootstrap`)
+	require.NotEqual(t, -1, start)
+	end := strings.Index(rootfs[start:], `  if [ "$TARGETARCH" = arm64 ]; then
+    mkdir -p /etc/unbounded`)
+	require.NotEqual(t, -1, end)
+	servicePolicy := rootfs[start : start+end]
+	amd64Start := strings.Index(servicePolicy, "  else")
+	require.NotEqual(t, -1, amd64Start)
+	arm64Policy := servicePolicy[:amd64Start]
+	amd64Policy := servicePolicy[amd64Start:]
+
+	require.Contains(t, arm64Policy, "nvidia-device-setup.service")
+	require.Contains(t, arm64Policy, "ExecStart=/usr/bin/nvidia-smi -pm 0")
+	require.Contains(t, arm64Policy, "systemctl mask nvidia-persistence-mode.service")
+	require.NotContains(t, arm64Policy, "RemainAfterExit=yes")
+	require.Contains(t, amd64Policy, "nvidia-persistence-mode.service")
+	require.Contains(t, amd64Policy, "RemainAfterExit=yes")
+	require.Contains(t, amd64Policy, "ExecStart=/usr/bin/nvidia-smi -pm 1")
 }

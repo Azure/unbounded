@@ -52,8 +52,14 @@ firmware versions, wrong vermagic, and the unrequested Fabric Manager, IMEX,
 or `nvlink5` packages. The image also pins `kernel-hwe-drivers-gpu` to the HWE
 kernel version and verifies that its `ttm` and `drm_ttm_helper` modules close
 the runtime dependency chain required by `nvidia_drm`. NVIDIA's packaged
-`nvidia-persistenced` and `nvidia-powerd` services remain disabled or absent
-so the driver A/B preserves the existing idle-service baseline. The exact
+`nvidia-persistenced` and `nvidia-powerd` services remain disabled or absent.
+On ARM64, the legacy `nvidia-persistence-mode.service` is masked and a
+one-shot device setup unit creates the NVIDIA device nodes while explicitly
+leaving legacy persistence mode off. AMD64 retains its existing persistence
+service behavior. This is an intentional no-persistence A/B contract:
+NVIDIA's multi-node NVLink verification guide separately expects the
+`nvidia-persistenced` daemon on compute trays, so a no-persistence result does
+not by itself establish the final production service policy. The exact
 `ocl-icd` and `opencl-filesystem` dependencies come from Microsoft's signed
 Azure Linux 3 extended repository. The build also pins and checks the complete
 native DKMS toolchain instead of relying on minimal-package transitive

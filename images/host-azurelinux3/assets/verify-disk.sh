@@ -50,7 +50,7 @@ for path in \
   /etc/grub.d/10_azure_nvidia \
   /etc/modprobe.d/blacklist-nouveau.conf \
   /etc/modprobe.d/nvidia-gb.conf \
-  /etc/systemd/system/nvidia-persistence-mode.service \
+  /etc/systemd/system/nvidia-device-setup.service \
   /etc/unbounded/image-inputs \
   /etc/unbounded/nvidia-driver-manifest \
   /usr/bin/nvidia-smi \
@@ -98,6 +98,16 @@ done
 echo "PASS package inputs:"
 printf '%s\n' "$INPUTS" | sed 's/^/  /'
 
+for expected in \
+  nvidia_device_setup_service=enabled \
+  nvidia_persistence_mode_service=masked \
+  legacy_persistence_mode=off; do
+  printf '%s\n' "$INPUTS" | grep -Fx "$expected" >/dev/null || {
+    echo "missing NVIDIA idle policy: $expected" >&2
+    exit 1
+  }
+done
+
 for service in nvidia_persistenced_service nvidia_powerd_service; do
   state=$(printf '%s\n' "$INPUTS" | sed -n "s/^$service=//p")
   case "$state" in
@@ -111,6 +121,35 @@ done
 mkdir -p "$WORK/systemd-etc" "$WORK/systemd-usr"
 debugfs -R "rdump /etc/systemd/system $WORK/systemd-etc" "$ROOT" >/dev/null 2>&1
 debugfs -R "rdump /usr/lib/systemd/system $WORK/systemd-usr" "$ROOT" >/dev/null 2>&1
+DEVICE_SETUP=$(debugfs -R \
+  "cat /etc/systemd/system/nvidia-device-setup.service" "$ROOT" 2>/dev/null)
+for expected in \
+  'Type=oneshot' \
+  'ExecStart=/usr/bin/nvidia-modprobe -u -c=0' \
+  'ExecStart=/usr/bin/nvidia-smi -pm 0'; do
+  printf '%s\n' "$DEVICE_SETUP" | grep -Fx "$expected" >/dev/null || {
+    echo "NVIDIA device setup is missing: $expected" >&2
+    exit 1
+  }
+done
+if printf '%s\n' "$DEVICE_SETUP" | grep -Fx 'RemainAfterExit=yes' >/dev/null; then
+  echo "NVIDIA device setup unexpectedly remains active after exit" >&2
+  exit 1
+fi
+if [ "$(readlink "$WORK/systemd-etc/nvidia-persistence-mode.service")" != /dev/null ]; then
+  echo "legacy NVIDIA persistence mode service is not masked" >&2
+  exit 1
+fi
+if [ "$(readlink "$WORK/systemd-etc/multi-user.target.wants/nvidia-device-setup.service")" != \
+    /etc/systemd/system/nvidia-device-setup.service ]; then
+  echo "NVIDIA device setup service is not enabled" >&2
+  exit 1
+fi
+if grep -R -E -- 'nvidia-smi[[:space:]]+-pm[[:space:]]+1([[:space:]]|$)' \
+    "$WORK/systemd-etc" "$WORK/systemd-usr" >/dev/null; then
+  echo "legacy NVIDIA persistence mode is unexpectedly enabled by systemd" >&2
+  exit 1
+fi
 if find "$WORK/systemd-etc" "$WORK/systemd-usr" -type l \
     \( -name nvidia-persistenced.service -o -name nvidia-powerd.service \) |
     grep -q .; then
@@ -120,6 +159,8 @@ fi
 echo "PASS idle-service baseline:"
 echo "  nvidia-persistenced.service is disabled or absent"
 echo "  nvidia-powerd.service is disabled or absent"
+echo "  nvidia-persistence-mode.service is masked"
+echo "  nvidia-device-setup.service creates nodes with legacy persistence mode off"
 
 DRIVER_MANIFEST=$(debugfs -R "cat /etc/unbounded/nvidia-driver-manifest" "$ROOT" 2>/dev/null)
 for expected in \
