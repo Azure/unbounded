@@ -75,8 +75,15 @@ jobs:
 
           if [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
+          elif [[ "$name" == "host-azurelinux3-nvidia" ]]; then
+            platforms="linux/arm64"
           else
             platforms="linux/amd64,linux/arm64"
+          fi
+
+          if [[ "$name" == "host-azurelinux3-nvidia" && "$platforms" != "linux/arm64" ]]; then
+            echo "::error::host-azurelinux3-nvidia supports only linux/arm64"
+            exit 1
           fi
 
           echo "name=${name}" >> "$GITHUB_OUTPUT"

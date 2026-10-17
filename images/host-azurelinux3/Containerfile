@@ -25,8 +25,9 @@ RUN apt-get update && \
       apt-get update; \
     done && $ok && \
     rm -rf /var/lib/apt/lists/*
-COPY --from=rootfs /rootfs.tar /rootfs.kver /
+COPY --from=rootfs /rootfs.tar /rootfs.kernels /
 COPY images/host-azurelinux3/assets/disk.sh /usr/local/bin/build-disk
+COPY images/host-azurelinux3/assets/grub-config.sh /usr/local/bin/write-grub-config
 RUN TARGETARCH="${TARGETARCH}" sh /usr/local/bin/build-disk && rm /rootfs.tar
 
 FROM scratch

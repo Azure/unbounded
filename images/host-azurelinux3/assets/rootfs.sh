@@ -11,12 +11,12 @@
 # and writes the archive. Separate steps let the build cache the slow step.
 #
 # Environment:
-#   KERNEL_PACKAGE  kernel package to install (default: kernel)
 #   NVIDIA          set to 1 to install the NVIDIA open GPU driver
+#   TARGETARCH      target architecture
 set -eu
 
-KERNEL_PACKAGE="${KERNEL_PACKAGE:-kernel}"
 NVIDIA="${NVIDIA:-0}"
+TARGETARCH="${TARGETARCH:-}"
 
 retry() {
   n=1
@@ -32,6 +32,15 @@ retry() {
 
 install_packages() {
 if [ "$NVIDIA" = 1 ]; then
+  [ "$TARGETARCH" = arm64 ] || {
+    echo "the Azure Linux NVIDIA host image supports only arm64" >&2
+    exit 1
+  }
+  : "${AZURELINUX_KERNEL_VERSION:?AZURELINUX_KERNEL_VERSION is required}"
+  : "${AZURELINUX_KERNEL_HWE_VERSION:?AZURELINUX_KERNEL_HWE_VERSION is required}"
+  : "${AZURELINUX_GRUB_VERSION:?AZURELINUX_GRUB_VERSION is required}"
+  : "${AZURELINUX_CUDA_OPEN_HWE_VERSION:?AZURELINUX_CUDA_OPEN_HWE_VERSION is required}"
+
   cat > /etc/yum.repos.d/azurelinux-nvidia.repo <<'EOF'
 [azurelinux-official-nvidia]
 name=Azure Linux Official NVIDIA $releasever $basearch
@@ -45,11 +54,16 @@ sslverify=1
 EOF
 fi
 
-# Install the kernel first so that driver packages build against it.
-retry tdnf install -y "$KERNEL_PACKAGE"
+if [ "$NVIDIA" = 1 ]; then
+  retry tdnf install -y \
+    "kernel-${AZURELINUX_KERNEL_VERSION}" \
+    "kernel-hwe-${AZURELINUX_KERNEL_HWE_VERSION}"
+else
+  retry tdnf install -y kernel
+fi
 
 retry tdnf install -y \
-  shim grub2-efi-binary dracut \
+  shim dracut \
   systemd systemd-udev systemd-networkd systemd-resolved systemd-container dbus \
   cloud-init cloud-utils-growpart gptfdisk e2fsprogs \
   openssh-server sudo shadow-utils \
@@ -58,26 +72,99 @@ retry tdnf install -y \
   efibootmgr chrony less
 
 if [ "$NVIDIA" = 1 ]; then
-  retry tdnf install -y cuda-open-hwe
+  retry tdnf install -y \
+    "grub2-${AZURELINUX_GRUB_VERSION}" \
+    "grub2-efi-binary-${AZURELINUX_GRUB_VERSION}" \
+    "grub2-efi-${AZURELINUX_GRUB_VERSION}"
+  retry tdnf install -y "cuda-open-hwe-${AZURELINUX_CUDA_OPEN_HWE_VERSION}"
+else
+  retry tdnf install -y grub2-efi-binary
 fi
 
 tdnf clean all
 }
 
 finish() {
-KVER=$(ls /usr/lib/modules)
-case "$KVER" in
-  *" "*|"") echo "expected one kernel, found: $KVER" >&2; exit 1 ;;
-esac
+if [ "$NVIDIA" = 1 ]; then
+  for package_and_version in \
+    "kernel:$AZURELINUX_KERNEL_VERSION" \
+    "kernel-hwe:$AZURELINUX_KERNEL_HWE_VERSION"; do
+    package=${package_and_version%%:*}
+    expected_version=${package_and_version#*:}
+    version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$package")
+    [ "$version" = "$expected_version" ] || {
+      echo "$package resolved to $version, expected $expected_version" >&2
+      exit 1
+    }
+  done
+
+  STANDARD_KVER=$(rpm -ql kernel | sed -n 's#^/boot/vmlinuz-##p' | sort -V | tail -n1)
+  NVIDIA_KVER=$(rpm -ql kernel-hwe | sed -n 's#^/boot/vmlinuz-##p' | sort -V | tail -n1)
+  [ -n "$STANDARD_KVER" ] && [ -n "$NVIDIA_KVER" ] || {
+    echo "both kernel and kernel-hwe must provide a bootable kernel" >&2
+    exit 1
+  }
+
+  for package in grub2 grub2-efi-binary grub2-efi; do
+    version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$package")
+    [ "$version" = "$AZURELINUX_GRUB_VERSION" ] || {
+      echo "$package resolved to $version, expected $AZURELINUX_GRUB_VERSION" >&2
+      exit 1
+    }
+  done
+  [ -s /usr/lib/grub/arm64-efi/smbios.mod ] || {
+    echo "required GRUB module /usr/lib/grub/arm64-efi/smbios.mod is missing" >&2
+    exit 1
+  }
+
+  driver_version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' cuda-open-hwe)
+  [ "$driver_version" = "$AZURELINUX_CUDA_OPEN_HWE_VERSION" ] || {
+    echo "cuda-open-hwe resolved to $driver_version, expected $AZURELINUX_CUDA_OPEN_HWE_VERSION" >&2
+    exit 1
+  }
+  driver_kernel_version=$(printf '%s' "$AZURELINUX_KERNEL_HWE_VERSION" | tr '-' '.')
+  case "$AZURELINUX_CUDA_OPEN_HWE_VERSION" in
+    *"_${driver_kernel_version}") ;;
+    *)
+      echo "cuda-open-hwe is not matched to kernel-hwe $AZURELINUX_KERNEL_HWE_VERSION" >&2
+      exit 1
+      ;;
+  esac
+
+  install -D -m 0755 /usr/local/share/unbounded/10_azure_nvidia \
+    /etc/grub.d/10_azure_nvidia
+  install -D -m 0644 /usr/local/share/unbounded/51-azure-nvidia.cfg \
+    /etc/default/grub.d/51-azure-nvidia.cfg
+  printf 'standard=%s\nnvidia=%s\n' "$STANDARD_KVER" "$NVIDIA_KVER" > /rootfs.kernels
+else
+  KVER=$(ls /usr/lib/modules)
+  case "$KVER" in
+    *" "*|"") echo "expected one kernel, found: $KVER" >&2; exit 1 ;;
+  esac
+  printf 'standard=%s\n' "$KVER" > /rootfs.kernels
+fi
 
 # Build a generic initramfs. The image must boot on any machine, so do not
 # limit it to the build host's hardware. The GPU driver loads after boot.
-dracut --force --no-hostonly --no-hostonly-cmdline \
-  --omit-drivers "nvidia nvidia_modeset nvidia_uvm nvidia_drm nvidia_peermem" \
-  --kver "$KVER" "/boot/initramfs-$KVER.img"
-chmod 0644 "/boot/vmlinuz-$KVER" "/boot/initramfs-$KVER.img"
+while IFS= read -r entry; do
+  KVER=${entry#*=}
+  dracut --force --no-hostonly --no-hostonly-cmdline \
+    --omit-drivers "nvidia nvidia_modeset nvidia_uvm nvidia_drm nvidia_peermem" \
+    --kver "$KVER" "/boot/initramfs-$KVER.img"
+  chmod 0644 "/boot/vmlinuz-$KVER" "/boot/initramfs-$KVER.img"
+done < /rootfs.kernels
 
 if [ "$NVIDIA" = 1 ]; then
+  cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+  cat > /etc/modprobe.d/nvidia-gb.conf <<'EOF'
+options nvidia NVreg_RestrictProfilingToAdminUsers=0
+options nvidia NVreg_CreateImexChannel0=1
+options nvidia NVreg_CoherentGPUMemoryMode=driver
+options nvidia NVreg_RegistryDwords="RMBug5172204War=4"
+EOF
   cat > /etc/modules-load.d/nvidia.conf <<'EOF'
 nvidia
 nvidia_modeset
@@ -103,6 +190,16 @@ ExecStart=/usr/bin/nvidia-smi -pm 1
 WantedBy=multi-user.target
 EOF
   systemctl enable nvidia-persistence-mode.service
+
+  mkdir -p /etc/unbounded
+  cat > /etc/unbounded/image-inputs <<EOF
+architecture=$TARGETARCH
+kernel=$AZURELINUX_KERNEL_VERSION
+kernel_hwe=$AZURELINUX_KERNEL_HWE_VERSION
+grub=$AZURELINUX_GRUB_VERSION
+cuda_open_hwe=$AZURELINUX_CUDA_OPEN_HWE_VERSION
+agentbaker_reference=31804b47b7eb6d6999c7ffa6f643590f7b130bab
+EOF
 fi
 
 # Use DHCP on wired interfaces by default. The Metalman installer replaces
@@ -143,12 +240,12 @@ rm -f /etc/ssh/ssh_host_*
 
 tar --create --file=/rootfs.tar --numeric-owner --xattrs \
   --one-file-system \
-  --exclude=./rootfs.tar --exclude=./proc --exclude=./sys --exclude=./dev \
+  --exclude=./rootfs.tar --exclude=./rootfs.kernels \
+  --exclude=./proc --exclude=./sys --exclude=./dev \
   --exclude=./run --exclude=./tmp --exclude=./var/cache/tdnf \
   --exclude=./etc/resolv.conf --exclude=./etc/hostname --exclude=./etc/hosts \
   --exclude=./.dockerenv --exclude=./usr/local/bin/build-rootfs \
   -C / .
-echo "$KVER" > /rootfs.kver
 }
 
 case "${1:-}" in

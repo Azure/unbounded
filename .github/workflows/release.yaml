@@ -889,7 +889,7 @@ jobs:
             trivy: false
           - name: host-azurelinux3-nvidia
             file: images/host-azurelinux3-nvidia/Containerfile
-            platforms: linux/amd64,linux/arm64
+            platforms: linux/arm64
             trivy: false
           - name: inventory-aggregator
             file: images/inventory/aggregator/Containerfile

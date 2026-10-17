@@ -28,6 +28,25 @@ GRUB and cloud-init templates, and metadata. The cloud-init template downloads a
 `unbounded-agent` from the configured release/source during first boot. It does not contain a
 machine disk image.
 
+### Azure Linux NVIDIA Grace Host Image
+
+`host-azurelinux3-nvidia` is an ARM64-only Metalman machine image. It installs
+both the standard Azure Linux kernel and `kernel-hwe`, then uses the SMBIOS CPU
+manufacturer at boot to select `kernel-hwe` with the required NVIDIA Grace
+arguments. Non-NVIDIA ARM64 hardware boots the standard kernel without those
+arguments.
+
+The package inputs are recorded in
+`images/host-azurelinux3-nvidia/versions.env`. Builds fail if the kernel,
+matched `cuda-open-hwe`, or GRUB package versions differ, or if the package
+matched `smbios.mod` is absent.
+
+Build and offline-inspect the disk without publishing it:
+
+```bash
+make verify-host-azurelinux3-nvidia
+```
+
 ### Tagged Release
 
 Push a git tag matching the pattern `images/<image-name>/<version>`:

@@ -87,6 +87,14 @@ docker push ghcr.io/azure/host-ubuntu2404:v1
 docker push ghcr.io/azure/netboot:v1
 ```
 
+The `host-azurelinux3-nvidia` machine image is ARM64-only. It contains both
+Azure Linux kernel tracks and selects `kernel-hwe` with
+`iommu.passthrough=1 irqchip.gicv3_nolpi=y
+arm_smmu_v3.disable_msipolling=1` only when GRUB detects an NVIDIA Grace CPU.
+Use `make verify-host-azurelinux3-nvidia` to build and offline-inspect its
+`/disk/disk.img.gz` artifact. This command does not publish the image or alter
+any Machine.
+
 Template context includes `.Machine`, `.ApiserverURL`, `.ServeURL`, `.KubernetesVersion`, and `.ClusterDNS`.
 
 See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Machine spec.
