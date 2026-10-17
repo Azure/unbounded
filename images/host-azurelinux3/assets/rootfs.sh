@@ -116,6 +116,7 @@ verify_nvidia_localrepo_driver() {
     "elfutils-libelf-devel:$AZURELINUX_ELFUTILS_LIBELF_DEVEL_VERSION" \
     "gcc:$AZURELINUX_GCC_VERSION" \
     "gcc-c++:$AZURELINUX_GCC_VERSION" \
+    "kernel-devel:$AZURELINUX_KERNEL_VERSION" \
     "make:$AZURELINUX_MAKE_VERSION" \
     "ocl-icd:$AZURELINUX_OCL_ICD_VERSION" \
     "opencl-filesystem:$AZURELINUX_OPENCL_FILESYSTEM_VERSION" \
@@ -208,6 +209,7 @@ install_nvidia_localrepo_driver() {
   : "${NVIDIA_FABRIC_PROBE_SHA256:?NVIDIA_FABRIC_PROBE_SHA256 is required}"
 
   retry tdnf install -y \
+    "kernel-devel-${AZURELINUX_KERNEL_VERSION}" \
     "kernel-hwe-devel-${AZURELINUX_KERNEL_HWE_VERSION}" \
     "mlnx-ofa_kernel-${AZURELINUX_MLNX_OFA_KERNEL_VERSION}" \
     "mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}" \

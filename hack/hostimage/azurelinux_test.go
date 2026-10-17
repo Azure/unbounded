@@ -101,6 +101,7 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`"$unit enablement is $state, expected disabled or not-found"`,
 		`"$unit is linked into a boot target"`,
 		`R580 A/B image unexpectedly contains another NVIDIA driver or fabric component`,
+		`kernel-devel-${AZURELINUX_KERNEL_VERSION}`,
 		`mlnx-ofa_kernel-hwe-devel-${AZURELINUX_MLNX_OFA_KERNEL_HWE_DEVEL_VERSION}`,
 		`mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}`,
 		`baseurl=https://packages.microsoft.com/azurelinux/$releasever/prod/extended/$basearch`,
@@ -301,4 +302,6 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 
 	workflow := readRepoFile(t, ".github/workflows/host-azurelinux3-nvidia.yaml")
 	require.Contains(t, workflow, "timeout-minutes: 120")
+	require.Contains(t, workflow, "runs-on: ubuntu-24.04-arm")
+	require.NotContains(t, workflow, "docker/setup-qemu-action")
 }
