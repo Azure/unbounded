@@ -87,6 +87,8 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 		`for package in "$repo_rpm" "$repo_dir"/*.rpm`,
 		`rpm --checksig "$package"`,
 		`verify_file_sha256 "$fabric_probe" "$NVIDIA_FABRIC_PROBE_SHA256"`,
+		`rpm --install --nodeps --noscripts "$kmod_rpm"`,
+		`dkms add -m nvidia -v "$NVIDIA_DRIVER_VERSION" --rpm_safe_upgrade`,
 		`dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION"`,
 		`-k "$NVIDIA_KVER" --force`,
 		`cat "/var/lib/dkms/nvidia/$NVIDIA_DRIVER_VERSION/build/make.log"`,
@@ -119,7 +121,7 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 	require.Less(
 		t,
 		strings.Index(rootfs, `"mlnx-ofa_kernel-hwe-modules-${AZURELINUX_MLNX_OFA_KERNEL_HWE_MODULES_VERSION}"`),
-		strings.Index(rootfs, `"kmod-nvidia-open-dkms-${NVIDIA_DRIVER_RPM_VERSION}"`),
+		strings.Index(rootfs, `rpm --install --nodeps --noscripts "$kmod_rpm"`),
 		"OFED must be installed before the NVIDIA driver",
 	)
 
@@ -296,4 +298,7 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, verify, "PASS specialized NVIDIA GRUB policy:")
 	require.Contains(t, verify, "PASS MANA-compatible kernel command line:")
 	require.Contains(t, verify, "GICv3 LPI/ITS MSI-X remains enabled")
+
+	workflow := readRepoFile(t, ".github/workflows/host-azurelinux3-nvidia.yaml")
+	require.Contains(t, workflow, "timeout-minutes: 120")
 }

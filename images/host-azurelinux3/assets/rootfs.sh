@@ -267,10 +267,17 @@ EOF
     esac
   done
 
-  retry tdnf install -y \
-    "dkms-${NVIDIA_DKMS_RPM_VERSION}" \
-    "kmod-nvidia-open-dkms-${NVIDIA_DRIVER_RPM_VERSION}" \
-    "nvidia-open-${NVIDIA_DRIVER_RPM_VERSION}"
+  retry tdnf install -y "dkms-${NVIDIA_DKMS_RPM_VERSION}"
+  kmod_rpm="$repo_dir/kmod-nvidia-open-dkms-${NVIDIA_DRIVER_RPM_VERSION}.noarch.rpm"
+  [ -s "$kmod_rpm" ] || {
+    echo "missing exact NVIDIA DKMS source RPM: $kmod_rpm" >&2
+    exit 1
+  }
+  # NVIDIA's RPM scriptlet builds against discovered kernels and masks errors.
+  # Install the already signature-verified source without scriptlets, then run
+  # exactly one fail-closed build for the image's pinned HWE kernel.
+  rpm --install --nodeps --noscripts "$kmod_rpm"
+  retry tdnf install -y "nvidia-open-${NVIDIA_DRIVER_RPM_VERSION}"
 
   fabric_probe="/usr/src/nvidia-$NVIDIA_DRIVER_VERSION/src/nvidia/src/kernel/gpu/gpu_fabric_probe.c"
   [ -s "$fabric_probe" ] || {
@@ -279,6 +286,7 @@ EOF
   }
   verify_file_sha256 "$fabric_probe" "$NVIDIA_FABRIC_PROBE_SHA256"
 
+  dkms add -m nvidia -v "$NVIDIA_DRIVER_VERSION" --rpm_safe_upgrade
   if ! dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION" \
       -k "$NVIDIA_KVER" --force; then
     cat "/var/lib/dkms/nvidia/$NVIDIA_DRIVER_VERSION/build/make.log" >&2 || true

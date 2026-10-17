@@ -54,8 +54,10 @@ or `nvlink5` packages. NVIDIA's packaged `nvidia-persistenced` and
 the existing idle-service baseline. The exact `ocl-icd` and
 `opencl-filesystem` dependencies come from Microsoft's signed Azure Linux 3
 extended repository. The build also pins and checks the complete native DKMS
-toolchain instead of relying on minimal-package transitive dependencies.
-AMD64 retains its existing package path.
+toolchain instead of relying on minimal-package transitive dependencies. It
+suppresses NVIDIA's implicit RPM-scriptlet build and performs one explicit,
+fail-closed build for the pinned HWE kernel. AMD64 retains its existing
+package path.
 
 Build and offline-inspect the disk without publishing it:
 
