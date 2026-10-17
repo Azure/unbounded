@@ -192,7 +192,10 @@ install_nvidia_localrepo_driver() {
   retry curl --fail --location --silent --show-error \
     "$NVIDIA_LOCAL_REPO_URL" --output "$repo_rpm"
   verify_file_sha256 "$repo_rpm" "$NVIDIA_LOCAL_REPO_SHA256"
-  retry tdnf install -y "$repo_rpm"
+  # The wrapper bootstraps the repository key, so tdnf cannot authenticate the
+  # local-file transaction yet. Install only the hash-pinned wrapper directly,
+  # then verify its signature before consuming any repository package.
+  rpm --install --nodeps --nosignature "$repo_rpm"
 
   repo_dir="/var/nvidia-driver-local-repo-azl3-$NVIDIA_DRIVER_VERSION"
   repo_key="$repo_dir/F2192135.pub"
@@ -203,7 +206,7 @@ install_nvidia_localrepo_driver() {
   verify_file_sha256 "$repo_key" "$NVIDIA_LOCAL_REPO_KEY_SHA256"
   rpm --import "$repo_key"
 
-  for package in "$repo_dir"/*.rpm; do
+  for package in "$repo_rpm" "$repo_dir"/*.rpm; do
     signature=$(rpm --checksig "$package")
     case "$signature" in
       *"digests signatures OK") ;;

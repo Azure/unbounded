@@ -76,6 +76,8 @@ func TestAzureLinuxNVIDIALocalRepoBuildFailsClosed(t *testing.T) {
 	for _, expected := range []string{
 		`verify_file_sha256 "$repo_rpm" "$NVIDIA_LOCAL_REPO_SHA256"`,
 		`verify_file_sha256 "$repo_key" "$NVIDIA_LOCAL_REPO_KEY_SHA256"`,
+		`rpm --install --nodeps --nosignature "$repo_rpm"`,
+		`for package in "$repo_rpm" "$repo_dir"/*.rpm`,
 		`rpm --checksig "$package"`,
 		`verify_file_sha256 "$fabric_probe" "$NVIDIA_FABRIC_PROBE_SHA256"`,
 		`dkms build -m nvidia -v "$NVIDIA_DRIVER_VERSION"`,
