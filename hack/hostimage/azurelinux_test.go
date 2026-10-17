@@ -175,4 +175,11 @@ func TestAzureLinuxImageBuildChecksFailClosed(t *testing.T) {
 	require.Contains(t, disk, `mkdir -p /disk`)
 	require.Contains(t, disk, `> /disk/disk.img.gz`)
 	require.Contains(t, disk, "required GRUB smbios.mod is missing")
+
+	verify := readRepoFile(t, "images/host-azurelinux3/assets/verify-disk.sh")
+	require.Contains(t, verify, `STANDARD_ENTRY=$(printf '%s\n' "$GRUB"`)
+	require.Contains(t, verify, "ordinary ARM64 entry unexpectedly contains Grace arguments")
+	require.Contains(t, verify, "NVIDIA Grace entry does not select kernel-hwe")
+	require.Contains(t, verify, "PASS package inputs:")
+	require.Contains(t, verify, "PASS GRUB hardware selection:")
 }

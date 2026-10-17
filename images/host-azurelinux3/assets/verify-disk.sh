@@ -71,6 +71,8 @@ for expected in \
     exit 1
   }
 done
+echo "PASS package inputs:"
+printf '%s\n' "$INPUTS" | sed 's/^/  /'
 
 for kver in 6.6.157.1-1.azl3 6.18.48.1-1.azl3; do
   debugfs_exists "/boot/vmlinuz-$kver" || {
@@ -82,6 +84,9 @@ for kver in 6.6.157.1-1.azl3 6.18.48.1-1.azl3; do
     exit 1
   }
 done
+echo "PASS kernels:"
+echo "  standard=6.6.157.1-1.azl3"
+echo "  nvidia-grace=6.18.48.1-1.azl3"
 
 GRUB=$(mtype -i "$DISK@@$((ESP_START * 512))" ::/EFI/BOOT/grub.cfg)
 for expected in \
@@ -97,4 +102,34 @@ for expected in \
   }
 done
 
+STANDARD_ENTRY=$(printf '%s\n' "$GRUB" | sed -n \
+  '/menuentry "Azure Linux" --id standard {/,/^}/p')
+GRACE_ENTRY=$(printf '%s\n' "$GRUB" | sed -n \
+  '/menuentry "Azure Linux NVIDIA Grace" --id nvidia-grace {/,/^}/p')
+printf '%s\n' "$STANDARD_ENTRY" | grep -F \
+  'linux /boot/vmlinuz-6.6.157.1-1.azl3' >/dev/null || {
+  echo "ordinary ARM64 entry does not select the standard kernel" >&2
+  exit 1
+}
+if printf '%s\n' "$STANDARD_ENTRY" | grep -F 'nvidia_args' >/dev/null; then
+  echo "ordinary ARM64 entry unexpectedly contains Grace arguments" >&2
+  exit 1
+fi
+printf '%s\n' "$GRACE_ENTRY" | grep -F \
+  'linux /boot/vmlinuz-6.18.48.1-1.azl3' >/dev/null || {
+  echo "NVIDIA Grace entry does not select kernel-hwe" >&2
+  exit 1
+}
+printf '%s\n' "$GRACE_ENTRY" | grep -F '$nvidia_args' >/dev/null || {
+  echo "NVIDIA Grace entry does not expand nvidia_args" >&2
+  exit 1
+}
+
+echo "PASS GRUB hardware selection:"
+echo "  ordinary ARM64 -> vmlinuz-6.6.157.1-1.azl3, no Grace arguments"
+echo "  NVIDIA Grace -> vmlinuz-6.18.48.1-1.azl3"
+echo "  iommu.passthrough=1"
+echo "  irqchip.gicv3_nolpi=y"
+echo "  arm_smmu_v3.disable_msipolling=1"
+echo "PASS GRUB package module: /usr/lib/grub/arm64-efi/smbios.mod"
 echo "verified Azure Linux NVIDIA ARM64 disk: $DISK_GZ"
