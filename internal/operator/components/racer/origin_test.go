@@ -468,3 +468,81 @@ func TestOriginWatchPredicates(t *testing.T) {
 		require.Equal(t, tc.want, match(&corev1.ServiceAccount{ObjectMeta: ds.ObjectMeta}), "%s/%s", tc.namespace, tc.name)
 	}
 }
+
+func planHasObject(plan *component.Plan, kind, name string) bool {
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() == kind && op.Object.GetName() == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestOriginWaitsForDataplaneOnInitialInstall(t *testing.T) {
+	env := testEnv(t, originCache("cache", nil))
+
+	var plan *component.Plan
+
+	for range 9 {
+		var result component.Result
+
+		plan, result = planResult(t, env)
+		if planHasObject(plan, "DaemonSet", dataplaneName) {
+			require.Equal(t, "OriginPending", result.Reason)
+			break
+		}
+
+		persist(t, env, plan)
+	}
+
+	require.True(t, planHasObject(plan, "DaemonSet", dataplaneName), "dataplane never planned")
+	require.False(t, planHasObject(plan, "DaemonSet", originName("cache")))
+	require.False(t, planHasObject(plan, "ServiceAccount", originName("cache")))
+	persist(t, env, plan)
+	requireNoOrigin(t, env, "cache")
+
+	// Simulate restrictive placement overrides applied to the dataplane.
+	dataplane := liveDataplane(t, env)
+	dataplane.Spec.Template.Spec.NodeSelector = map[string]string{"pool": "gpu"}
+	dataplane.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+		NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}}},
+	}}}
+	require.NoError(t, env.Client.Update(t.Context(), dataplane))
+
+	plan, result := planResult(t, env)
+	require.NotEqual(t, "OriginPending", result.Reason)
+	persist(t, env, plan)
+
+	ds, _ := liveOrigin(t, env, "cache")
+	require.Equal(t, map[string]string{"pool": "gpu"}, ds.Spec.Template.Spec.NodeSelector)
+	require.Equal(t, dataplane.Spec.Template.Spec.Affinity.NodeAffinity, ds.Spec.Template.Spec.Affinity.NodeAffinity)
+}
+
+func TestOriginPruneProceedsWhileDataplaneWithheld(t *testing.T) {
+	env := testEnv(t, originCache("keep", nil), originCache("stale", nil))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+	liveOrigin(t, env, "keep")
+	liveOrigin(t, env, "stale")
+
+	updateCache(t, env, "stale", func(cache *racerv1.ClusterCache) { cache.Spec.Origin = nil })
+	require.NoError(t, env.Client.Delete(t.Context(), liveDataplane(t, env)))
+
+	plan, result := planResult(t, env)
+	require.Equal(t, "OriginPending", result.Reason)
+	require.False(t, planHasObject(plan, "DaemonSet", originName("keep")))
+
+	// Execute only the origin operations, as if the dataplane were withheld.
+	filtered := &component.Plan{}
+
+	for _, op := range plan.Operations {
+		if strings.HasPrefix(op.Object.GetName(), originPrefix) {
+			filtered.Add(op)
+		}
+	}
+
+	persist(t, env, filtered)
+	requireNoOrigin(t, env, "stale")
+	liveOrigin(t, env, "keep")
+}

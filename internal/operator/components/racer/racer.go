@@ -169,7 +169,7 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 		return plan, pending(), nil
 	}
 
-	invalid, err := runtimePlan(ctx, env, plan, marker, secret)
+	invalid, waiting, err := runtimePlan(ctx, env, plan, marker, secret)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
@@ -187,6 +187,10 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 		return plan, component.NotReadyAfter("OriginInvalid", "Racer origins not reconciled for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
 	}
 
+	if waiting {
+		return plan, component.NotReadyAfter("OriginPending", "Racer origins wait for the racer-dataplane DaemonSet placement", 30*time.Second), nil
+	}
+
 	return plan, component.ReconciledAfter("Racer controller installation reconciled", time.Hour), nil
 }
 
@@ -194,10 +198,10 @@ func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, e
 	return env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml", "mutating-webhook.yaml"}, nil)
 }
 
-func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) ([]string, error) {
+func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) (invalid []string, waiting bool, err error) {
 	objects, err := decodeRuntimeManifests(env)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var (
@@ -225,20 +229,20 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			}
 			for key, value := range values {
 				if err := unstructured.SetNestedField(obj.Object, value, "data", key); err != nil {
-					return nil, err
+					return nil, false, err
 				}
 			}
 
 			cm := &corev1.ConfigMap{}
 			if err := env.Scheme.Convert(obj, cm, nil); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			bindRuntime(cm, marker.UID)
 
 			cm, err = preservedConfig(ctx, env, plan, cm, values)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			configHash = component.ConfigMapPayloadHash(cm)
@@ -254,7 +258,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 				return value, ok
 			})
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			prerequisites = append(prerequisites, component.RefOf(component.ToUnstructured(cm)))
@@ -264,15 +268,15 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			// Publish the same roots as the bootstrap trust so CA rotation and
 			// cross-signing also reach the API server's webhook client.
 			if err := setWebhookCABundle(obj, servingRoots(secret)); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		case "Deployment":
 			if err := component.SetNamedContainerImage(obj, "controller", env.Config.Image(controllerName)); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			if err := unstructured.SetNestedStringMap(obj.Object, map[string]string{"unbounded-cloud.io/racer-config-hash": configHash}, "spec", "template", "metadata", "annotations"); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		}
 
@@ -293,7 +297,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 		op, err = ownedRuntimeOperation(ctx, env, op, marker.UID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		plan.Add(op)
@@ -307,17 +311,17 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	op, err := ownedRuntimeOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(trust), Component: name}, marker.UID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	plan.Add(op)
 
 	if runtimeConfig == nil {
-		return nil, fmt.Errorf("racer runtime manifests contain no %s", configName)
+		return nil, false, fmt.Errorf("racer runtime manifests contain no %s", configName)
 	}
 
 	if err := planDataplane(ctx, env, plan, marker, runtimeConfig); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	return planOrigins(ctx, env, plan, marker)

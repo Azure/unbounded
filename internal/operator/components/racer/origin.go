@@ -26,7 +26,6 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/racer/workload"
 	"github.com/Azure/unbounded/internal/racerobject"
 )
 
@@ -197,29 +196,31 @@ func (o originSpec) hash() (string, error) {
 // originPlacement follows the node-level constraints (node affinity, node
 // selector, tolerations) of the live dataplane DaemonSet, including user
 // overrides, so origins run wherever the dataplane serving their cache runs.
+// found is false while the dataplane DaemonSet does not exist yet: placement
+// overrides are applied after planning, so no safe placement is known and
+// callers must defer origins rather than guess one.
 // Pod affinity and anti-affinity are not copied: they are relative to
 // dataplane Pods, and a rule such as hostname anti-affinity against
 // racer-dataplane would otherwise exclude origins from every dataplane node.
-func originPlacement(ctx context.Context, env *component.Env) (*corev1.Affinity, map[string]string, []corev1.Toleration, error) {
+func originPlacement(ctx context.Context, env *component.Env) (affinity *corev1.Affinity, nodeSelector map[string]string, tolerations []corev1.Toleration, found bool, err error) {
 	ds := &appsv1.DaemonSet{}
 
-	err := env.LiveReader().Get(ctx, objectKey(env, dataplaneName), ds)
+	err = env.LiveReader().Get(ctx, objectKey(env, dataplaneName), ds)
 	if apierrors.IsNotFound(err) {
-		return workload.DataplaneAffinity(), nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	pod := ds.Spec.Template.Spec
 
-	var affinity *corev1.Affinity
 	if pod.Affinity != nil && pod.Affinity.NodeAffinity != nil {
 		affinity = &corev1.Affinity{NodeAffinity: pod.Affinity.NodeAffinity.DeepCopy()}
 	}
 
-	return affinity, maps.Clone(pod.NodeSelector), slices.Clone(pod.Tolerations), nil
+	return affinity, maps.Clone(pod.NodeSelector), slices.Clone(pod.Tolerations), true, nil
 }
 
 func cacheOwnerReference(cache *racerv1.ClusterCache) metav1.OwnerReference {
@@ -346,10 +347,13 @@ func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, m
 // spec.origin and prunes origins of caches that no longer request one. Invalid
 // or conflicting caches are skipped, keep their existing objects, and are
 // returned for status; they never block other caches or the dataplane.
-func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap) ([]string, error) {
+// waiting reports that some cache wants an origin but the dataplane DaemonSet
+// does not exist yet; no origin is applied until its placement is known, while
+// pruning still proceeds and existing origins of wanted caches are kept.
+func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap) (invalid []string, waiting bool, err error) {
 	caches := &racerv1.ClusterCacheList{}
 	if err := env.LiveReader().List(ctx, caches); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	slices.SortFunc(caches.Items, func(a, b racerv1.ClusterCache) int { return strings.Compare(a.Name, b.Name) })
@@ -357,8 +361,8 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 	wanted := map[string]bool{}
 
 	var (
-		invalid   []string
 		placement bool
+		found     bool
 		affinity  *corev1.Affinity
 		selector  map[string]string
 		tolerate  []corev1.Toleration
@@ -380,12 +384,17 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 		}
 
 		if !placement {
-			affinity, selector, tolerate, err = originPlacement(ctx, env)
+			affinity, selector, tolerate, found, err = originPlacement(ctx, env)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			placement = true
+		}
+
+		if !found {
+			waiting = true
+			continue
 		}
 
 		err = planOrigin(ctx, env, plan, marker, cache, spec, affinity.DeepCopy(), maps.Clone(selector), slices.Clone(tolerate))
@@ -395,15 +404,15 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 		}
 
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
 	if err := pruneOrigins(ctx, env, plan, marker, wanted); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return invalid, nil
+	return invalid, waiting, nil
 }
 
 func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, wanted map[string]bool) error {
