@@ -30,12 +30,14 @@ class RootfsContractTest(unittest.TestCase):
         self.packages = "linux-image\t7.0\tarm64\nnvidia-utils-580-server\t580.178.04\tarm64"
         self.put(f"/boot/config-{self.kernel}", "CONFIG_ARM64_64K_PAGES=y\nCONFIG_MICROSOFT_MANA=m\n")
         self.put("/etc/machine-id", "")
+        self.put(f"/boot/initrd.img-{self.kernel}", "initramfs fixture")
+        self.put("/etc/initramfs-tools/update-initramfs.conf", "update_initramfs=yes\n")
         self.put("/usr/share/unbounded/efi-packages.tsv", "shim-signed\t1\tarm64\n")
         self.put("/usr/share/unbounded/efi-packages.sha256", "test-package-hash\n")
         self.put("/var/lib/apt/lists/ubuntu_InRelease", "signed release fixture\n")
         for name in ("mana", "mana_ib", "nvidia", "nvidia_uvm"):
             self.put(f"/lib/modules/{self.kernel}/{name}.ko", "module fixture")
-        for name in ("BOOTAA64.EFI", "grubaa64.efi"):
+        for name in ("BOOTAA64.EFI", "grubaa64.efi", "mmaa64.efi"):
             data = bytearray(256)
             data[:2] = b"MZ"
             struct.pack_into("<I", data, 0x3C, 128)
@@ -94,6 +96,16 @@ class RootfsContractTest(unittest.TestCase):
         self.assertIn('test -s "/boot/initrd.img-$KVER"', phases[1])
         self.assertNotIn('"nvidia-kernel-common-', phases[1])
         self.assertIn('"nvidia-kernel-common-', phases[2])
+        self.assertIn("update_initramfs=no", phases[1])
+        self.assertIn("update_initramfs=yes", phases[2])
+
+    def test_builder_kernel_initramfs_rejected(self):
+        self.put("/boot/initrd.img-builder-kernel", "wrong initramfs")
+        self.rejected("unexpected builder-kernel")
+
+    def test_initramfs_updates_must_be_restored(self):
+        self.put("/etc/initramfs-tools/update-initramfs.conf", "update_initramfs=no\n")
+        self.rejected("not restored")
 
     def test_wrong_kernel_abi(self):
         self.vermagic = "wrong-kernel SMP aarch64"

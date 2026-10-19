@@ -36,6 +36,14 @@ def verify():
         "expected exactly the pinned kernel",
     )
     config = Path(f"/boot/config-{kernel}").read_text()
+    require(
+        sorted(p.name for p in Path("/boot").glob("initrd.img-*")) == [f"initrd.img-{kernel}"],
+        "unexpected builder-kernel initramfs",
+    )
+    require(
+        "update_initramfs=yes" in Path("/etc/initramfs-tools/update-initramfs.conf").read_text().splitlines(),
+        "automatic initramfs updates were not restored",
+    )
     for setting in ("CONFIG_ARM64_64K_PAGES=y", "CONFIG_MICROSOFT_MANA=m"):
         require(setting in config.splitlines(), f"missing kernel setting: {setting}")
     modules = {}
@@ -63,7 +71,7 @@ def verify():
         "MANA is absent from the initramfs",
     )
     firmware = {}
-    for name in ("BOOTAA64.EFI", "grubaa64.efi"):
+    for name in ("BOOTAA64.EFI", "grubaa64.efi", "mmaa64.efi"):
         path = Path("/boot/efi/EFI/BOOT") / name
         data = path.read_bytes()
         require(data[:2] == b"MZ", f"{name} is not PE/COFF")

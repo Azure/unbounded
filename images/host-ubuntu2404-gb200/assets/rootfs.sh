@@ -27,11 +27,18 @@ install_packages() {
     # first, rather than letting it select the running builder's kernel.
     test -s /etc/initramfs-tools/initramfs.conf
     test -s "/boot/initrd.img-$KVER"
+    # Its chroot path also explicitly targets uname -r. Defer automatic
+    # updates; finish rebuilds and verifies only the pinned target initrd.
+    sed -i 's/^update_initramfs=.*/update_initramfs=no/' \
+        /etc/initramfs-tools/update-initramfs.conf
+    grep -qx 'update_initramfs=no' /etc/initramfs-tools/update-initramfs.conf
     apt-get install -y --no-install-recommends \
         "linux-modules-nvidia-580-server-open-${KVER}=${NVIDIA_MODULES_VERSION}" \
         "nvidia-kernel-common-580-server=${NVIDIA_VERSION}" \
         "nvidia-headless-no-dkms-580-server-open=${NVIDIA_VERSION}" \
         "nvidia-utils-580-server=${NVIDIA_VERSION}" nvidia-modprobe
+    sed -i 's/^update_initramfs=.*/update_initramfs=yes/' \
+        /etc/initramfs-tools/update-initramfs.conf
 
     # Extract signed EFI binaries without running grub-install against the builder.
     efi=$(mktemp -d)
@@ -47,12 +54,15 @@ install_packages() {
         done
         sha256sum ./*.deb > /usr/share/unbounded/efi-packages.sha256
     )
-    install -m 644 "$efi/extracted/usr/lib/shim/shimaa64.efi.signed" \
+    install -m 644 "$efi/extracted/usr/lib/shim/shimaa64.efi.signed.latest" \
         /boot/efi/EFI/BOOT/BOOTAA64.EFI
+    install -m 644 "$efi/extracted/usr/lib/shim/mmaa64.efi" \
+        /boot/efi/EFI/BOOT/mmaa64.efi
     install -m 644 "$efi/extracted/usr/lib/grub/arm64-efi-signed/grubaa64.efi.signed" \
         /boot/efi/EFI/BOOT/grubaa64.efi
     cp /boot/efi/EFI/BOOT/BOOTAA64.EFI /boot/efi/EFI/ubuntu/shimaa64.efi
     cp /boot/efi/EFI/BOOT/grubaa64.efi /boot/efi/EFI/ubuntu/grubaa64.efi
+    cp /boot/efi/EFI/BOOT/mmaa64.efi /boot/efi/EFI/ubuntu/mmaa64.efi
     rm -rf "$efi"
 }
 
