@@ -209,7 +209,9 @@ further:
 - Each worker's page index grows to the larger of its estimated full-page capacity
   after reserves and its configured share of `RACER_DISK_PAGE_ENTRIES`, capped at
   1,000,000 entries. The estimate includes the largest record header, AEAD tag,
-  and direct-I/O alignment. Small objects can exhaust the index before disk bytes.
+  and direct-I/O alignment. This value sizes the version table and bounds
+  storage holds; it does not cap how many pages are stored. Disk capacity is
+  limited by slots: small objects are packed into shared slots.
 - Checkpoint working memory grows from a conservative estimate of page entries,
   metadata entries, and slots, never below `RACER_CHECKPOINT_BYTES`, and is
   capped at 512 MiB node-wide. Encoded checkpoint files still have a 64 MiB cap.

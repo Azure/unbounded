@@ -307,11 +307,7 @@ impl Application {
 /// Full-page capacity of a volume at actual direct-I/O alignment, conservatively
 /// allowing the largest supported record header, and the slot tail space left
 /// by full-page records. The meta slot holds no pages.
-fn payload_capacity(
-    slot_count: u64,
-    alignment: page_alloc::Alignment,
-    page_entries: usize,
-) -> Result<(u64, u64)> {
+fn payload_capacity(slot_count: u64, alignment: page_alloc::Alignment) -> Result<(u64, u64)> {
     use page_alloc::volume::SLOT_BYTES;
     let record = alignment
         .extent(0, crate::store::MAX_RECORD_BYTES)?
@@ -319,7 +315,7 @@ fn payload_capacity(
     let pages = SLOT_BYTES / record;
     let usable = slot_count.saturating_sub(1);
     Ok((
-        (usable * pages).min(page_entries as u64) * crate::model::PAGE_BYTES,
+        usable * pages * crate::model::PAGE_BYTES,
         usable * (SLOT_BYTES - pages * record),
     ))
 }
@@ -2392,8 +2388,7 @@ impl WorkerApplication {
             .index()
             .volume()
             .map_or(0, |volume| volume.slot_count());
-        let (payload, tail) =
-            payload_capacity(slots, alignment, self.store.writer.index().page_capacity())?;
+        let (payload, tail) = payload_capacity(slots, alignment)?;
         self.telemetry
             .metrics
             .add_gauge(Gauge::EffectivePayloadBytes, payload);

@@ -268,7 +268,9 @@ entries.
   the value's generation.
 - Held pages are stored in the storage tier with `retain_until` set to the hold
   expiry. Holds are rebuilt from the tree at mount. Storage-tier writes with no
-  live hold use `retain_until` 0.
+  live hold use `retain_until` 0. Eviction compares `retain_until` with wall
+  clock time, while hold liveness also uses monotonic time, so a forward
+  wall-clock jump can expire storage retention early.
 - `release_hold` only gives back unused hold capacity after a partial failure.
   Pages already written stay held until the hold expires. Nothing resets
   `retain_until` to 0. Removing a cache, or dropping a page whose record is
