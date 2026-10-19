@@ -1,8 +1,11 @@
 # Racer extent volume
 
-This document describes the on-disk allocator and index that replaces the
+This document describes the on-disk allocator and index that replaced the
 log-structured segments, the in-memory `PageIndex`, and the page part of the
-checkpoint file in `cmd/racer-dataplane`.
+checkpoint file in `cmd/racer-dataplane`. The old segment table and
+`PageIndex` were removed from `page-alloc`. See
+[racer-page-alloc.md](racer-page-alloc.md) for the buffer and slab layers
+under the volume.
 
 ## Goals
 
@@ -21,8 +24,9 @@ checkpoint file in `cmd/racer-dataplane`.
 
 ## Ownership
 
-Each I/O worker owns one volume, backed by its existing `Slab` (a file or a
-list of device ranges). The volume is single threaded and uses `Rc` and
+Each I/O worker owns one volume, backed by its own `Slab` (a file or a list of
+device ranges). There are no fixed partitions: the number of volumes equals
+the number of I/O workers. The volume is single threaded and uses `Rc` and
 `Cell`, like the rest of the store. Routing of pages to workers does not
 change.
 
@@ -67,8 +71,10 @@ Each worker keeps at most one open (partly filled) slot per tier and class.
 Per slot: kind, class, tier, used record count, lease count, generation, a
 CLOCK reference bit, a free bitmap (only for classes with more than one record
 per slot), and the list of index keys stored in the slot. The keys let eviction
-remove a whole slot from the index without scanning the tree. Cost is about
-32 bytes per slot plus 24 bytes per record.
+remove a whole slot from the index without scanning the tree. Cost is a 24 byte
+entry plus a 4 byte lease count per slot, plus 26 bytes per record in
+multi-record slots, or 24 bytes for a whole-slot record (see
+`alloc/src/volume/slots.rs`).
 
 ### Leases
 
@@ -256,8 +262,13 @@ entries.
 - The record format keeps its self-describing header. Its generation field is
   the value's generation.
 - Held pages are stored in the storage tier with `retain_until` set to the hold
-  expiry. Holds are rebuilt from the tree at mount. Releasing a hold sets
-  `retain_until` to 0, which makes the entries evictable.
+  expiry. Holds are rebuilt from the tree at mount. Storage-tier writes with no
+  live hold use `retain_until` 0.
+- `release_hold` only gives back unused hold capacity after a partial failure.
+  Pages already written stay held until the hold expires. Nothing resets
+  `retain_until` to 0. Removing a cache, or dropping a page whose record is
+  invalid, deletes its entries from the tree instead (see
+  `cmd/racer-dataplane/src/store/disk.rs`).
 - The checkpoint file keeps only object metadata. It no longer stores segments,
   pages, or holds.
 - An in-memory table maps version hashes to object identities for features
