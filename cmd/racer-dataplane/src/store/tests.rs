@@ -611,6 +611,64 @@ fn read_io_error_on_held_storage_page_misses_without_removing_it() {
     );
 }
 #[test]
+fn corrupt_held_storage_record_is_removed_and_rewritten_to_storage_tier() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    // Each edit makes the record definitely unusable: a damaged header and a
+    // record of another format version.
+    let edits: [fn(&mut [u8]); 2] = [|bytes| bytes[40] ^= 1, |bytes| bytes[8] ^= 0x80];
+    for (case, edit) in edits.into_iter().enumerate() {
+        let f = Fixture::new();
+        let _ = f.open().unwrap();
+        f.reactor.init().unwrap();
+        let copy = f.copy(1, 113);
+        let id = copy.ciphertext.envelope().page.clone();
+        let index = f.store.writer.index();
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        index.reserve_hold(&id.version, 1, until).unwrap();
+        drive(
+            &f.reactor,
+            f.store.writer.persist_held(copy.clone(), &scope()),
+        )
+        .unwrap();
+        let first = index.lookup(&id).unwrap().unwrap();
+        assert_eq!(first.tier, Tier::Storage);
+        drive(
+            &f.reactor,
+            f.store.writer.rewrite_record(&id, &scope(), edit),
+        )
+        .unwrap();
+        assert!(
+            drive(&f.reactor, f.store.reader.read(&id, &scope()))
+                .unwrap()
+                .is_none(),
+            "case {case}"
+        );
+        // The entry and its hold publication are gone; the hold remains.
+        assert!(index.lookup(&id).unwrap().is_none(), "case {case}");
+        assert_eq!(index.held_page_expiry(&id), None);
+        assert_eq!(index.hold_expiry(&id.version), Some(until));
+        assert!(index.is_held(&id));
+        // The removal is committed through the normal path.
+        assert!(index.is_dirty());
+        drive(&f.reactor, f.store.writer.commit(&scope())).unwrap();
+        assert!(!index.is_dirty());
+        // The one reserved hold page is free again, so a new fill rewrites
+        // the page to the storage tier with the hold deadline.
+        drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
+        let repaired = index.lookup(&id).unwrap().unwrap();
+        assert_eq!(repaired.tier, Tier::Storage);
+        assert_ne!(repaired.generation, first.generation);
+        assert_eq!(repaired.retain_until, first.retain_until);
+        assert_eq!(index.held_page_expiry(&id), Some(until));
+        assert!(!index.is_dirty());
+        let read = drive(&f.reactor, f.store.reader.read(&id, &scope()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.ciphertext.bytes(), vec![1; 129]);
+    }
+}
+#[test]
 fn second_sight_queue_owned_bias_hot_nonowned_and_pressure_discard() {
     for hot_nonowned in [false, true] {
         let f = Fixture::new();

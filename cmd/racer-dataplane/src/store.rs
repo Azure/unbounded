@@ -146,16 +146,36 @@ impl StoreReader {
     fn corrupt_miss(&self) {
         self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
     }
-    /// Miss on a read that failed or found an unusable record. A cache-tier
-    /// entry is removed. A storage-tier entry is a hard hold's durable copy, so
-    /// a transient I/O error or a damaged record must not delete it or drop it
-    /// from its hold; the read just misses.
-    fn miss(&self, token: &ReadToken, tier: Tier) -> Result<Option<(CiphertextCopy, ReadToken)>> {
+    /// Miss on a read that failed with a transient I/O error. A cache-tier
+    /// entry is removed. A storage-tier entry is a hard hold's durable copy
+    /// that may still be intact, so it stays in the index and in its hold; the
+    /// read just misses.
+    fn transient_miss(
+        &self,
+        token: &ReadToken,
+        tier: Tier,
+    ) -> Result<Option<(CiphertextCopy, ReadToken)>> {
         if tier == Tier::Cache {
             self.invalidate(token)?;
         }
         Ok(None)
     }
+    /// Miss on a record that is definitely unusable (damaged, of another
+    /// format version, or contradicting the known version metadata). The entry
+    /// is removed whatever its tier, so the next fill can repair it.
+    fn corrupt_record(&self, token: &ReadToken) -> Result<Option<(CiphertextCopy, ReadToken)>> {
+        self.invalidate(token)?;
+        Ok(None)
+    }
+    /// Remove the entry `token` read, unless a newer write replaced it.
+    ///
+    /// This applies to both tiers. Removing a held storage-tier page drops
+    /// only its publication: the hold (keyed by version) stays, and the page
+    /// returns to the hold's unused capacity, so the next fill or warm of the
+    /// page writes it again to the storage tier with the hold's deadline as
+    /// `retain_until`. The removal becomes durable with the next volume
+    /// commit; until then a crash may bring back the bad entry, which the next
+    /// read detects again.
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
         self.index
             .remove_if_generation(&token.key, token.generation);
@@ -222,32 +242,32 @@ impl StoreReader {
             // it mid-transfer; the header check below catches earlier reuse.
             let buffer = match volume.read(&*self.reactor, &value, buffer, scope).await {
                 Ok(b) => b,
-                Err(error @ (Error::Io | Error::Os(_) | Error::CorruptRecord)) => {
-                    if error == Error::CorruptRecord {
-                        self.corrupt_miss();
-                    }
-                    return self.miss(&token, value.tier);
+                Err(Error::Io | Error::Os(_)) => return self.transient_miss(&token, value.tier),
+                Err(Error::CorruptRecord) => {
+                    self.corrupt_miss();
+                    return self.corrupt_record(&token);
                 }
                 Err(Error::Unavailable) => return Ok(None),
                 Err(e) => return Err(e),
             };
             // A record with this magic but a different format version (for
-            // example, written by a newer release) is a cold cache miss, not
-            // evidence of damaged storage. Never parse its remaining fields.
+            // example, written by a newer release) is a cold miss, not evidence
+            // of damaged storage. Never parse its remaining fields. This release
+            // cannot use it, so drop it and let the next fill rewrite the page.
             let bytes = buffer.bytes()?;
             if bytes.get(..8) == Some(MAGIC)
                 && bytes
                     .get(8..12)
                     .is_some_and(|version| version != FORMAT_VERSION.to_le_bytes())
             {
-                return self.miss(&token, value.tier);
+                return self.corrupt_record(&token);
             }
             let extent = Extent::new(0, length)?;
             let decoded = match parse(&buffer, extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();
-                    return self.miss(&token, value.tier);
+                    return self.corrupt_record(&token);
                 }
             };
             if decoded.header.generation.0 != value.generation
@@ -272,7 +292,7 @@ impl StoreReader {
                 .is_some_and(|known| !known.compatible(&decoded.header.metadata))
             {
                 self.corrupt_miss();
-                return self.miss(&token, value.tier);
+                return self.corrupt_record(&token);
             }
             // A concurrent retirement/removal must not resurrect a completed copy.
             if self
