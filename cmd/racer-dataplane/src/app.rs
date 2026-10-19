@@ -328,15 +328,19 @@ fn payload_capacity(
 const DISK_COMMIT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Whether to start a lazy disk commit: changes are pending, none is running,
-/// and the interval passed since the last one started.
+/// the worker is not stopping, and the interval passed since the last one
+/// started. Once shutdown begins, the final shutdown commit owns any remaining
+/// changes, so repeated failing attempts cannot hold drain open.
 fn lazy_commit_due(
     last: Option<std::time::Instant>,
     now: std::time::Instant,
     dirty: bool,
     running: bool,
+    stopping: bool,
 ) -> bool {
     dirty
         && !running
+        && !stopping
         && last.is_none_or(|last| now.saturating_duration_since(last) >= DISK_COMMIT_INTERVAL)
 }
 
@@ -1676,6 +1680,7 @@ impl WorkerApplication {
             now,
             self.store.writer.index().is_dirty(),
             self.commit_task.is_some(),
+            self.stopping,
         ) {
             self.last_commit = Some(now);
             let writer = self.store.writer.clone();

@@ -1233,27 +1233,31 @@ fn assembled_worker_exports_live_quota_gauges() {
 #[test]
 fn lazy_disk_commit_waits_for_interval_and_pending_changes() {
     let now = Instant::now();
-    assert!(!lazy_commit_due(None, now, false, false));
-    assert!(lazy_commit_due(None, now, true, false));
-    assert!(!lazy_commit_due(None, now, true, true));
+    assert!(!lazy_commit_due(None, now, false, false, false));
+    assert!(lazy_commit_due(None, now, true, false, false));
+    assert!(!lazy_commit_due(None, now, true, true, false));
     assert!(!lazy_commit_due(
         Some(now),
         now + DISK_COMMIT_INTERVAL - Duration::from_millis(1),
         true,
+        false,
         false
     ));
     assert!(lazy_commit_due(
         Some(now),
         now + DISK_COMMIT_INTERVAL,
         true,
+        false,
         false
     ));
     assert!(!lazy_commit_due(
         Some(now),
         now + DISK_COMMIT_INTERVAL,
         false,
+        false,
         false
     ));
+    assert!(!lazy_commit_due(None, now, true, false, true));
 }
 
 #[test]
@@ -1304,6 +1308,77 @@ fn worker_lazily_commits_cache_index_changes() {
     // Nothing is pending, so polling starts no further commit.
     worker.poll_writer(&mut cx).unwrap();
     assert!(worker.commit_task.is_none());
+}
+
+#[test]
+fn stopping_worker_starts_no_lazy_commit_but_finishes_in_flight_one() {
+    use page_alloc::volume::{Key, Tier};
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let mut worker = wake_test_worker();
+    worker.runtime.reactor.init().unwrap();
+    let startup = scope(Duration::from_secs(5)).unwrap();
+    drive_peer(&worker.runtime.reactor, worker.prepare_storage(&startup)).unwrap();
+    let index = worker.store.writer.index().clone();
+    let volume = index.volume().unwrap();
+    macro_rules! publish {
+        ($seed:expr) => {{
+            let seed: u8 = $seed;
+            let reservation = volume.allocate(Tier::Cache, 4096).unwrap();
+            let charge = worker
+                .runtime
+                .admission
+                .reserve(None, ResourceClass::Ciphertext, 4096)
+                .unwrap();
+            let buffer = worker.store.writer.slabs().allocate(4096, charge).unwrap();
+            let _ = drive_peer(
+                &worker.runtime.reactor,
+                volume.write(&*worker.runtime.reactor, &reservation, buffer, &startup),
+            )
+            .unwrap();
+            let generation = volume.next_generation();
+            volume
+                .publish(
+                    Key::new([seed; 8], [2; 12], 0),
+                    reservation,
+                    4096,
+                    generation,
+                    0,
+                )
+                .unwrap();
+        }};
+    }
+    publish!(1);
+    assert!(index.is_dirty());
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    // Start a lazy commit, then begin stopping while it is in flight.
+    worker.poll_writer(&mut cx).unwrap();
+    assert!(worker.commit_task.is_some());
+    worker.stopping = true;
+    // Stopping still polls the in-flight commit to completion.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worker.commit_task.is_some() {
+        worker.poll_writer(&mut cx).unwrap();
+        worker.runtime.reactor.poll_budgeted(64).unwrap();
+        assert!(Instant::now() < deadline, "in-flight commit did not finish");
+    }
+    // New changes leave the index dirty, as a failing commit would. With
+    // the interval elapsed, stopping must still start no new attempt.
+    publish!(3);
+    assert!(index.is_dirty());
+    worker.last_commit = None;
+    for _ in 0..4 {
+        worker.poll_writer(&mut cx).unwrap();
+        worker.runtime.reactor.poll_budgeted(64).unwrap();
+    }
+    assert!(
+        index.is_dirty(),
+        "remaining changes are left to the final commit"
+    );
+    assert!(
+        worker.commit_task.is_none(),
+        "stopping starts no new lazy commit"
+    );
 }
 
 #[test]
