@@ -65,6 +65,8 @@ pub struct Slab<C: Charge> {
     writes: Rc<WriteState>,
 
     idle_buffer: Rc<RefCell<crate::BufferPool<C>>>,
+
+    resize_mismatched: bool,
 }
 
 impl<C: Charge> Slab<C> {
@@ -83,7 +85,18 @@ impl<C: Charge> Slab<C> {
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
             idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
+            resize_mismatched: false,
         }
+    }
+
+    /// Accept an existing nonempty file of another size (for example one left
+    /// by an older layout) and resize it to the configured capacity, discarding
+    /// its contents. The resize happens only after the file is opened through
+    /// the validated path and the exclusive lock is held, so a running owner's
+    /// file is never changed.
+    pub fn resize_mismatched(mut self) -> Self {
+        self.resize_mismatched = true;
+        self
     }
 
     /// Describe device ranges in logical segment order, without creating, sizing,
@@ -330,8 +343,9 @@ impl<C: Charge> Slab<C> {
             // The virtual filesystem has a fixed root owner, independent of host uid.
             validate_file(stat.stx_mode as u32, stat.stx_uid, 0, stat.stx_nlink as u64)?;
             let a = alignment_from_stat(&stat)?;
-            let segment_count = self.validate_layout(a, stat.stx_size)?;
-            if stat.stx_size == 0 {
+            let size = self.accepted_size(path, stat.stx_size);
+            let segment_count = self.validate_layout(a, size)?;
+            if size == 0 {
                 handle
                     .set_len(self.capacity_bytes)
                     .map_err(|e| system_error("ftruncate", e))?;
@@ -391,6 +405,7 @@ impl<C: Charge> Slab<C> {
             ));
         }
         let a = probe(&file)?;
+        let size = self.accepted_size(path, size);
         let segment_count = self.validate_layout(a, size)?;
         if size == 0 {
             file.set_len(self.capacity_bytes)
@@ -406,6 +421,20 @@ impl<C: Charge> Slab<C> {
         }
         self.publish(file.into(), a, segment_count);
         Ok(a)
+    }
+
+    /// Size to validate for a locked file: a mismatched nonempty file accepted
+    /// for resizing is treated as new, so it is sized and synced like one.
+    fn accepted_size(&self, path: &Path, size: u64) -> u64 {
+        if !self.resize_mismatched || size == 0 || size == self.capacity_bytes {
+            return size;
+        }
+        eprintln!(
+            "page-alloc: resizing slab {} from {size} to {} bytes; its contents are discarded",
+            path.display(),
+            self.capacity_bytes
+        );
+        0
     }
 
     /// Publish geometry with its owning file, initially without I/O authority.
@@ -1918,6 +1947,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Geometry for resize tests, or None when the filesystem lacks direct I/O.
+    fn resize_geometry(path: &Path) -> Option<(u64, u64)> {
+        let probe_file = open_private_file(path).unwrap();
+        let alignment = real_alignment(probe(&probe_file))?;
+        let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
+        Some((segment_bytes, segment_bytes * 2))
+    }
+
+    /// A mismatched file is resized only through the validated, locked open,
+    /// and the lock stays held afterward.
+    #[test]
+    fn resize_mismatched_resizes_under_lock() {
+        let directory = Directory::new();
+        let path = directory.0.join("data");
+        let Some((segment_bytes, capacity)) = resize_geometry(&path) else {
+            return;
+        };
+        for size in [segment_bytes, capacity * 3 + 1] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            assert_eq!(
+                Slab::<()>::new(path.clone(), capacity, segment_bytes, 512).open_now(),
+                Err(Error::InvalidConfiguration)
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+            let slab =
+                Slab::<()>::new(path.clone(), capacity, segment_bytes, 512).resize_mismatched();
+            assert!(slab.open_now().is_ok());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), capacity);
+            let observer = File::open(&path).unwrap();
+            // SAFETY: flock borrows a live descriptor owned by this test.
+            assert_ne!(
+                unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            drop(slab);
+        }
+    }
+
+    /// A second opener cannot resize a file another owner holds locked.
+    #[test]
+    fn resize_mismatched_leaves_locked_file_unchanged() {
+        let directory = Directory::new();
+        let path = directory.0.join("data");
+        let Some((segment_bytes, capacity)) = resize_geometry(&path) else {
+            return;
+        };
+        let owner = Slab::<()>::new(path.clone(), capacity * 2, segment_bytes, 512);
+        assert!(owner.open_now().is_ok());
+        let second =
+            Slab::<()>::new(path.clone(), capacity, segment_bytes, 512).resize_mismatched();
+        assert_eq!(second.open_now(), Err(Error::Unavailable));
+        assert!(second.opened.borrow().is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), capacity * 2);
+    }
+
+    /// A symlinked slab path is rejected and its target is never resized.
+    #[test]
+    fn resize_mismatched_rejects_symlink_without_touching_target() {
+        let directory = Directory::new();
+        let target = directory.0.join("target");
+        let Some((segment_bytes, capacity)) = resize_geometry(&target) else {
+            return;
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_len(capacity * 3)
+            .unwrap();
+        let link = directory.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let slab = Slab::<()>::new(link, capacity, segment_bytes, 512).resize_mismatched();
+        assert!(slab.open_now().is_err());
+        assert!(slab.opened.borrow().is_none());
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), capacity * 3);
     }
 
     /// Descriptor traversal rejects symlinks, FIFOs, and parent-directory escapes.
