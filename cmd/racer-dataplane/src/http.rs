@@ -79,6 +79,12 @@ impl http1::connection::Context for HttpContext {
     fn outbound_slot(&self) -> Result<ConnectionReservation> {
         crate::admission::reserve_connection(&self.0, ResourceClass::OutboundConnection)
     }
+    fn outbound_priority_slot(&self) -> Result<ConnectionReservation> {
+        crate::admission::reserve_metadata_connection(&self.0)
+    }
+    fn reclassify_slot(&self, slot: &mut ConnectionReservation, priority: bool) -> Result<()> {
+        slot.reclassify(&self.0, priority)
+    }
     fn stopped(&self) -> bool {
         self.0.is_stopped()
     }
@@ -1978,10 +1984,25 @@ pub(crate) mod tests {
             endpoint: &Endpoint,
             listener: &Listener,
         ) -> (ConnectionLease, ConnectionLease) {
+            exchanged(pool, reactor, admission, endpoint, listener, true)
+        }
+        /// Complete one real exchange through an ordinary or metadata checkout.
+        fn exchanged(
+            pool: &HttpPool,
+            reactor: &Rc<Reactor>,
+            admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+            endpoint: &Endpoint,
+            listener: &Listener,
+            metadata: bool,
+        ) -> (ConnectionLease, ConnectionLease) {
             let scope = scope();
             let io = new_io(reactor.clone(), Codec::new(4096), admission.clone(), 16);
             let client = async {
-                let connection = pool.checkout_metadata(endpoint, &scope).await?;
+                let connection = if metadata {
+                    pool.checkout_metadata(endpoint, &scope).await?
+                } else {
+                    pool.checkout_wait(endpoint, &scope).await?
+                };
                 let request = MessageHead {
                     start: StartLine::Request {
                         method: "GET".into(),
@@ -2218,6 +2239,157 @@ pub(crate) mod tests {
             pool.close();
             assert_eq!(admission.used(ResourceClass::Connection), 0);
             assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        }
+        #[test]
+        fn metadata_keeps_shared_outbound_reserve_when_two_caches_saturate_pages() {
+            let (admission, reactor, mut pool) = setup();
+            let outbound = admission.limit(ResourceClass::OutboundConnection);
+            assert!(outbound >= 2, "test needs a metadata reserve");
+            pool.config_mut().secondary_cap = outbound;
+            let (listener, endpoint) = Listener::origin();
+            let Endpoint::Unix(path) = endpoint else {
+                unreachable!()
+            };
+            let origin = |cache: &str| Endpoint::Origin {
+                cache: racer_control_wire::CacheId(cache.into()),
+                path: path.clone(),
+            };
+            let (a, b) = (origin("cache-a"), origin("cache-b"));
+            // Ordinary page connections from both caches fill shared admission.
+            let mut pages = Vec::new();
+            for endpoint in [&a, &b].into_iter().cycle() {
+                match pool.prepare_connection(endpoint) {
+                    Ok((lease, _)) => pages.push(lease),
+                    Err(Error::Overloaded) => break,
+                    Err(e) => panic!("unexpected page admission error: {e:?}"),
+                }
+            }
+            assert_eq!(
+                pages.len(),
+                outbound - crate::admission::METADATA_OUTBOUND_RESERVE
+            );
+            assert!(pool.snapshot().entries[&a].0 > 0 && pool.snapshot().entries[&b].0 > 0);
+            let scope = scope();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut page = pool.checkout_wait(&a, &scope);
+            assert!(page.as_mut().poll(&mut cx).is_pending());
+            // Metadata completes a real exchange without any page releasing.
+            let (metadata, peer) = held(&pool, &reactor, &admission, &b, &listener);
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
+            assert!(page.as_mut().poll(&mut cx).is_pending());
+            // A pooled metadata socket cannot be reused to bypass the ordinary cap.
+            drop(metadata);
+            assert!(matches!(
+                pool.prepare_connection(&b),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(
+                admission.used(ResourceClass::OrdinaryOutboundConnection),
+                outbound - crate::admission::METADATA_OUTBOUND_RESERVE
+            );
+            drop((page, pages.pop()));
+            let (lease, _) = pool
+                .prepare_connection(&a)
+                .expect("page admitted once an ordinary slot frees");
+            drop((lease, pages, peer));
+            pool.close();
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+        #[test]
+        fn ordinary_checkout_reuses_page_sockets_beneath_idle_metadata_socket() {
+            let (admission, reactor, mut pool) = setup();
+            let outbound = admission.limit(ResourceClass::OutboundConnection);
+            assert!(outbound >= 2, "test needs a metadata reserve");
+            pool.config_mut().secondary_cap = outbound;
+            let (listener, endpoint) = Listener::origin();
+            let Endpoint::Unix(path) = endpoint else {
+                unreachable!()
+            };
+            let origin = Endpoint::Origin {
+                cache: racer_control_wire::CacheId("cache".into()),
+                path,
+            };
+            let ordinary = outbound - crate::admission::METADATA_OUTBOUND_RESERVE;
+            // Real page connections fill the ordinary quota.
+            let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
+                .map(|_| exchanged(&pool, &reactor, &admission, &origin, &listener, false))
+                .unzip();
+            let (metadata, peer) = held(&pool, &reactor, &admission, &origin, &listener);
+            peers.push(peer);
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
+            // Pages return idle before the metadata socket, which lands on top.
+            drop(pages);
+            drop(metadata);
+            assert_eq!(pool.snapshot().entries[&origin].1, outbound);
+            // Every page socket beneath the metadata socket is reused at once.
+            let reused: Vec<_> = (0..ordinary)
+                .map(|_| {
+                    let (lease, address) = pool
+                        .prepare_connection(&origin)
+                        .expect("idle page socket reused beneath metadata socket");
+                    assert!(address.is_none(), "page reused an idle socket");
+                    lease
+                })
+                .collect();
+            assert_eq!(
+                admission.used(ResourceClass::OrdinaryOutboundConnection),
+                ordinary
+            );
+            // Only the metadata socket remains, still pooled for metadata.
+            assert_eq!(pool.snapshot().entries[&origin], (ordinary, 1));
+            assert!(matches!(
+                pool.prepare_connection(&origin),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(pool.snapshot().entries[&origin], (ordinary, 1));
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
+            drop(reused);
+            drop(peers);
+            pool.close();
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+        #[test]
+        fn ordinary_checkout_reclaims_other_cache_idle_pages_before_metadata_overload() {
+            let (admission, reactor, mut pool) = setup();
+            let outbound = admission.limit(ResourceClass::OutboundConnection);
+            assert!(outbound >= 2, "test needs a metadata reserve");
+            pool.config_mut().secondary_cap = outbound;
+            let (listener, endpoint) = Listener::origin();
+            let Endpoint::Unix(path) = endpoint else {
+                unreachable!()
+            };
+            let origin = |cache: &str| Endpoint::Origin {
+                cache: racer_control_wire::CacheId(cache.into()),
+                path: path.clone(),
+            };
+            let (a, b) = (origin("cache-a"), origin("cache-b"));
+            let ordinary = outbound - crate::admission::METADATA_OUTBOUND_RESERVE;
+            // Cache B's pages hold every ordinary charge; cache A holds only metadata.
+            let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
+                .map(|_| exchanged(&pool, &reactor, &admission, &b, &listener, false))
+                .unzip();
+            let (metadata, peer) = exchanged(&pool, &reactor, &admission, &a, &listener, true);
+            peers.push(peer);
+            drop(metadata);
+            assert_eq!(pool.snapshot().entries[&a].1, 1);
+            // While B's pages are active, A's metadata socket stays pooled.
+            assert!(matches!(
+                pool.prepare_connection(&a),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(pool.snapshot().entries[&a], (0, 1));
+            // Once B's pages idle, A reclaims them instead of waiting for idle expiry.
+            drop(pages);
+            assert_eq!(pool.snapshot().entries[&b].1, ordinary);
+            let (lease, address) = pool
+                .prepare_connection(&a)
+                .expect("idle pages in another cache are reclaimed");
+            assert!(address.is_none(), "metadata socket reclassified and reused");
+            assert_eq!(pool.snapshot().entries[&b].1, 0);
+            assert_eq!(admission.used(ResourceClass::OrdinaryOutboundConnection), 1);
+            drop((lease, peers));
+            pool.close();
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
         #[test]
         fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {

@@ -18,6 +18,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub const DEFAULT_MAX_THREADS: usize = usize::MAX;
+/// Default per-cache, per-worker origin connection cap. Remote object stores
+/// deliver roughly 30 MB/s per connection, so filling a fast NIC needs a few
+/// hundred page fetches in flight across all workers.
+pub const DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE: usize = 32;
 /// Not a Node UID. Only verified enrollment/local identity recovery may replace it.
 pub const UNRESOLVED_NODE_ID: &str = "";
 const MIB: u64 = 1024 * 1024;
@@ -181,7 +185,7 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
-        let config = Self {
+        let mut config = Self {
             warm: crate::read::warm::Config {
                 max_ttl: Duration::from_secs(raw.warm_max_ttl_secs.unwrap_or(3600)),
                 fill_timeout: Duration::from_secs(raw.warm_fill_timeout_secs.unwrap_or(600)),
@@ -315,7 +319,8 @@ impl Config {
                 relay_transfers: raw.relay_transfers.is_none(),
             },
             origin_connections_per_cache: nonzero_usize(
-                raw.origin_connections_per_cache.unwrap_or(8),
+                raw.origin_connections_per_cache
+                    .unwrap_or(DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE as u64),
             )?,
             request_timeout: Duration::from_millis(raw.request_timeout_ms.unwrap_or(30_000)),
             peer_attempt_timeout: Duration::from_millis(
@@ -326,6 +331,12 @@ impl Config {
             ),
             shutdown_timeout: Duration::from_millis(raw.shutdown_timeout_ms.unwrap_or(30_000)),
         };
+        if raw.origin_connections_per_cache.is_none() {
+            // The default must not reject a smaller explicit client budget.
+            config.origin_connections_per_cache = config
+                .origin_connections_per_cache
+                .min(config.limits.client_connections);
+        }
         config.validate()?;
         Ok(config)
     }
@@ -1550,7 +1561,10 @@ mod tests {
         assert!(config.diagnostics_listen.ip().is_loopback());
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.peer_attempt_timeout, Duration::from_secs(30));
-        assert_eq!(config.origin_connections_per_cache.get(), 8);
+        assert_eq!(
+            config.origin_connections_per_cache.get(),
+            DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE
+        );
         assert_eq!(config.limits.connections_per_neighbor.get(), 2);
         assert_eq!(config.validate(), Ok(()));
         crate::app::Application::assemble(config).unwrap();
@@ -1846,6 +1860,43 @@ mod tests {
             ])
             .is_ok()
         );
+        let small = parse(&[("RACER_CLIENT_CONNECTIONS", "12")]).unwrap();
+        assert_eq!(small.origin_connections_per_cache.get(), 12);
+        assert!(
+            parse(&[
+                ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "13"),
+                ("RACER_CLIENT_CONNECTIONS", "12")
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn origin_pool_keeps_metadata_headroom_under_outbound_saturation() {
+        use crate::admission::AdmissionPolicy;
+        use crate::admission::ResourceClass;
+        use flow_control::Policy;
+        let effective = |config: &Config| {
+            let outbound = AdmissionPolicy::new(config.limits.clone())
+                .limit(ResourceClass::OutboundConnection);
+            let cap = crate::app::origin_pool_capacity(
+                config.origin_connections_per_cache.get(),
+                outbound,
+            );
+            (cap, outbound)
+        };
+        // Stock budget: page GETs stop at cap - 1 active, before outbound
+        // admission is exhausted, so a HEAD can still open a connection.
+        let (cap, outbound) = effective(&parse(&[]).unwrap());
+        assert!(cap <= outbound, "{cap} > {outbound}");
+        assert!(cap - 1 < outbound);
+        // An explicit cap above outbound admission is bounded the same way.
+        let explicit = parse(&[("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "64")]).unwrap();
+        assert_eq!(effective(&explicit), (outbound, outbound));
+        // Large budgets keep the full default.
+        let large = parse(&[("RACER_CLIENT_CONNECTIONS", "16384")]).unwrap();
+        assert_eq!(effective(&large).0, DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE);
+        assert_eq!(crate::app::origin_pool_capacity(8, 0), 1);
     }
 
     #[test]

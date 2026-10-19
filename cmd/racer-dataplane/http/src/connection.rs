@@ -159,6 +159,24 @@ pub trait Context: 'static {
     where
         Self: Sized;
 
+    /// Reserve admission for a new priority (metadata) outbound connection.
+    /// Contexts may let these use capacity withheld from ordinary connections.
+    fn outbound_priority_slot(&self) -> Result<Self, Self::Slot>
+    where
+        Self: Sized,
+    {
+        self.outbound_slot()
+    }
+
+    /// Reclassify a reused idle reservation for the checkout's priority class.
+    /// Overloaded keeps the idle connection pooled and fails the checkout.
+    fn reclassify_slot(&self, _slot: &mut Self::Slot, _priority: bool) -> Result<Self, ()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+
     /// Whether new work must be rejected.
     fn stopped(&self) -> bool;
 }
@@ -1263,7 +1281,7 @@ impl<C: Context> HttpPool<C> {
     ) -> Operation<'a, C, ConnectionLease<C>> {
         Box::pin(async move {
             scope.check()?;
-            let (mut connection, address) = self.prepare_connection_inner(endpoint)?;
+            let (mut connection, address) = self.prepare_connection_inner(endpoint, false)?;
             connection.state_mut().attach(checkout);
             self.connect(connection, address, scope).await
         })
@@ -1319,7 +1337,7 @@ impl<C: Context> HttpPool<C> {
                         .is_some_and(|w| Rc::ptr_eq(first, &w.entry))
                 });
                 if turn && self.class_available(endpoint, priority) {
-                    match self.prepare_connection_inner(endpoint) {
+                    match self.prepare_connection_inner(endpoint, priority) {
                         Err(e) if e == C::Error::from(uring_runtime::Error::Overloaded) => (),
                         result => return Poll::Ready(result),
                     }
@@ -1394,13 +1412,14 @@ impl<C: Context> HttpPool<C> {
         &self,
         endpoint: &C::Endpoint,
     ) -> Result<C, (ConnectionLease<C>, Option<SocketAddress>)> {
-        self.prepare_connection_inner(endpoint)
+        self.prepare_connection_inner(endpoint, false)
     }
 
     /// Reserve capacity and reuse healthy idle storage or create an admitted socket.
     fn prepare_connection_inner(
         &self,
         endpoint: &C::Endpoint,
+        priority: bool,
     ) -> Result<C, (ConnectionLease<C>, Option<SocketAddress>)> {
         if self.context.stopped() {
             return Err(uring_runtime::Error::Unavailable.into());
@@ -1462,18 +1481,89 @@ impl<C: Context> HttpPool<C> {
             generation,
         };
         let mut slot = ConnectingSlot(Some(target));
-        if let Some(idle) = idle
-            && idle.fd.idle_healthy()
+        // Search the idle stack top-down for a healthy socket this class may reuse.
+        // Sockets that cannot be reclassified (metadata sockets while ordinary admission
+        // is full) stay pooled in their original order so reusable ordinary sockets
+        // below them are not shadowed.
+        let mut next = idle;
+        let mut skipped = Vec::new();
+        let mut rejected = None;
+        let reused = loop {
+            let Some(mut idle) = next.take() else {
+                break None;
+            };
+            if idle.fd.idle_healthy() {
+                match self
+                    .context
+                    .reclassify_slot(&mut idle.reservation, priority)
+                {
+                    Ok(()) => break Some(idle),
+                    Err(e) => {
+                        skipped.push(idle);
+                        rejected = Some(e);
+                    }
+                }
+            }
+            // Unhealthy sockets are dropped outside the pool borrow.
+            next = self
+                .state
+                .borrow_mut()
+                .entries
+                .get_mut(endpoint)
+                .and_then(|entry| entry.idle.pop());
+        };
+        let mut reused = reused;
+        if reused.is_none()
+            && rejected
+                .as_ref()
+                .is_some_and(|e| *e == C::Error::from(uring_runtime::Error::Overloaded))
         {
+            // Idle sockets elsewhere in the pool (for example another cache's pages)
+            // may hold the ordinary charges. Reclaim them like the fresh path does,
+            // then retry once. Skipped sockets are held here, so they survive.
+            self.clear_idle();
+            let mut idle = skipped.remove(0);
+            match self
+                .context
+                .reclassify_slot(&mut idle.reservation, priority)
+            {
+                Ok(()) => {
+                    reused = Some(idle);
+                    rejected = None;
+                }
+                Err(e) => {
+                    skipped.insert(0, idle);
+                    rejected = Some(e);
+                }
+            }
+        }
+        if !skipped.is_empty()
+            && let Some(entry) = self.state.borrow_mut().entries.get_mut(endpoint)
+        {
+            entry.idle.extend(skipped.drain(..).rev());
+        }
+        drop(skipped);
+        if let Some(idle) = reused {
             return Ok((
                 ConnectionLease::new(idle.fd, idle.reservation, idle.state, slot.0.take()),
                 None,
             ));
         }
-        let reservation = match self.context.outbound_slot() {
+        if let Some(e) = rejected {
+            // Ordinary admission is held by active connections; the slot guard releases `active`.
+            return Err(e);
+        }
+        let reserve = || {
+            if priority {
+                self.context.outbound_priority_slot()
+            } else {
+                self.context.outbound_slot()
+            }
+        };
+        let reservation = match reserve() {
             Err(e) if e == C::Error::from(uring_runtime::Error::Overloaded) => {
                 self.clear_idle();
-                self.context.outbound_slot()?
+                reserve()?
             }
             result => result?,
         };
