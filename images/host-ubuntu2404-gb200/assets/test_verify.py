@@ -39,8 +39,8 @@ class RootfsContractTest(unittest.TestCase):
         self.put(
             "/etc/systemd/system/nvidia-persistence-mode.service",
             "[Unit]\nAfter=systemd-modules-load.service\n"
-            "ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*\n"
-            "[Service]\nExecStart=/usr/bin/nvidia-smi -pm 1\n",
+            "[Service]\nTimeoutStartSec=130\n"
+            "ExecStart=/bin/sh -c 'while true; do /usr/bin/nvidia-smi -pm 1 && exit 0; done'\n",
         )
         enabled = self.path(
             "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
@@ -193,6 +193,14 @@ class RootfsContractTest(unittest.TestCase):
             "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
         ).unlink()
         self.rejected("NVIDIA persistence service is not enabled")
+
+    def test_skip_prone_persistence_condition_rejected(self):
+        path = self.path("/etc/systemd/system/nvidia-persistence-mode.service")
+        path.write_text(
+            path.read_text()
+            + "ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*\n"
+        )
+        self.rejected("invalid NVIDIA persistence service")
 
     def test_missing_apt_provenance_rejected(self):
         self.path("/var/lib/apt/lists/ubuntu_InRelease").unlink()

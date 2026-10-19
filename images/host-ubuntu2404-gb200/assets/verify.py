@@ -109,9 +109,9 @@ def verify():
     require(
         persistence_path.exists()
         and "After=systemd-modules-load.service" in persistence_path.read_text()
-        and "ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*"
-        in persistence_path.read_text()
-        and "ExecStart=/usr/bin/nvidia-smi -pm 1" in persistence_path.read_text(),
+        and "ConditionPathExists" not in persistence_path.read_text()
+        and "TimeoutStartSec=130" in persistence_path.read_text()
+        and "/usr/bin/nvidia-smi -pm 1 && exit 0" in persistence_path.read_text(),
         "invalid NVIDIA persistence service",
     )
     require(
