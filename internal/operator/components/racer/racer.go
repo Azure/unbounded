@@ -355,7 +355,7 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&admissionv1.ValidatingAdmissionPolicy{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&admissionv1.ValidatingAdmissionPolicyBinding{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&admissionv1.MutatingWebhookConfiguration{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == webhookName })))
-	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(clusterCachePredicate()))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(runtimeWorkload(env))))
 	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(runtimeWorkload(env))))
@@ -380,6 +380,27 @@ func startupConfigPredicate(env *component.Env) predicate.Predicate {
 			CreateFunc:  func(e event.CreateEvent) bool { return version(e.Object) },
 			DeleteFunc:  func(e event.DeleteEvent) bool { return version(e.Object) },
 			UpdateFunc:  func(event.UpdateEvent) bool { return false },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+		},
+	)
+}
+
+// clusterCachePredicate passes spec changes and the transition into
+// termination. A finalizer-held cache only gains a deletionTimestamp, which
+// does not bump the generation, but origin planning must prune it right away.
+func clusterCachePredicate() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.Funcs{
+			CreateFunc: func(event.CreateEvent) bool { return false },
+			DeleteFunc: func(event.DeleteEvent) bool { return false },
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				if e.ObjectOld == nil || e.ObjectNew == nil {
+					return false
+				}
+
+				return e.ObjectOld.GetDeletionTimestamp() == nil && e.ObjectNew.GetDeletionTimestamp() != nil
+			},
 			GenericFunc: func(event.GenericEvent) bool { return false },
 		},
 	)
