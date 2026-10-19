@@ -83,7 +83,14 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
     let config = fixture_io::default_config("11111111-1111-4111-8111-111111111111");
     let cache = CacheId("44444444-4444-4444-8444-444444444444".into());
     for ciphertext in [false, true] {
-        for scenario in ["retained", "small", "full", "stopped", "destroyed"] {
+        for scenario in [
+            "retained",
+            "trimmed",
+            "small",
+            "full",
+            "stopped",
+            "destroyed",
+        ] {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 config.limits.clone(),
             )));
@@ -167,6 +174,20 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
                 assert_eq!(admission.used(class), capacity);
                 admission.reclaim_buffers();
                 assert_eq!(admission.used(class), 0);
+            }
+            if scenario == "trimmed" {
+                // Demand maintenance frees an entry left idle for a whole window.
+                assert!(!FREED.load(Ordering::SeqCst));
+                let admission = admission.as_ref().unwrap();
+                assert_eq!(admission.used(class), capacity);
+                let start = std::time::Instant::now();
+                assert_eq!(admission.maintain_buffers(start), 0);
+                assert_eq!(
+                    admission.maintain_buffers(start + std::time::Duration::from_secs(1)),
+                    capacity
+                );
+                assert_eq!(admission.used(class), 0);
+                assert_eq!(admission.buffer_pool_stats().trimmed, 1);
             }
             assert!(FREED.load(Ordering::SeqCst), "{ciphertext} {scenario}");
             assert_eq!(
