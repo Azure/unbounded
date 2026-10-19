@@ -103,6 +103,8 @@ class RootfsContractTest(unittest.TestCase):
         source = Path(__file__).resolve().parents[1].joinpath("verify-boot.sh").read_text()
         self.assertIn("-device virtio-net-device,netdev=net0", source)
         self.assertNotIn("-device virtio-net-pci", source)
+        self.assertIn("-cpu cortex-a72", source)
+        self.assertNotIn("-cpu max", source)
 
     def test_builder_kernel_initramfs_rejected(self):
         self.put("/boot/initrd.img-builder-kernel", "wrong initramfs")

@@ -38,8 +38,10 @@ EOF
 truncate -s 16M seed.img
 mkfs.vfat -n CIDATA seed.img >/dev/null
 mcopy -i seed.img seed/meta-data seed/user-data seed/network-config ::/
+# QEMU 8.2 TCG's max CPU advertises MOPS, which faults in clear_page on this
+# 64K kernel. Use a stable server CPU profile for the architecture boot gate.
 timeout --signal=TERM --kill-after=10s 300s \
-    qemu-system-aarch64 -machine virt,gic-version=3 -cpu max -smp 2 -m 4096 \
+    qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -smp 2 -m 4096 \
     -accel tcg,thread=multi -nographic -no-reboot \
     -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
     -drive file=disk.img,format=raw,if=virtio \
