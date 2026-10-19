@@ -129,6 +129,16 @@ impl StoreReader {
     fn corrupt_miss(&self) {
         self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
     }
+    /// Miss on a read that failed or found an unusable record. A cache-tier
+    /// entry is removed. A storage-tier entry is a hard hold's durable copy, so
+    /// a transient I/O error or a damaged record must not delete it or drop it
+    /// from its hold; the read just misses.
+    fn miss(&self, token: &ReadToken, tier: Tier) -> Result<Option<(CiphertextCopy, ReadToken)>> {
+        if tier == Tier::Cache {
+            self.invalidate(token)?;
+        }
+        Ok(None)
+    }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
         self.index
             .remove_if_generation(&token.key, token.generation);
@@ -199,8 +209,7 @@ impl StoreReader {
                     if error == Error::CorruptRecord {
                         self.corrupt_miss();
                     }
-                    self.invalidate(&token)?;
-                    return Ok(None);
+                    return self.miss(&token, value.tier);
                 }
                 Err(Error::Unavailable) => return Ok(None),
                 Err(e) => return Err(e),
@@ -214,16 +223,14 @@ impl StoreReader {
                     .get(8..12)
                     .is_some_and(|version| version != FORMAT_VERSION.to_le_bytes())
             {
-                self.invalidate(&token)?;
-                return Ok(None);
+                return self.miss(&token, value.tier);
             }
             let extent = Extent::new(0, length)?;
             let decoded = match parse(&buffer, extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();
-                    self.invalidate(&token)?;
-                    return Ok(None);
+                    return self.miss(&token, value.tier);
                 }
             };
             if decoded.header.generation.0 != value.generation
@@ -248,8 +255,7 @@ impl StoreReader {
                 .is_some_and(|known| !known.compatible(&decoded.header.metadata))
             {
                 self.corrupt_miss();
-                self.invalidate(&token)?;
-                return Ok(None);
+                return self.miss(&token, value.tier);
             }
             // A concurrent retirement/removal must not resurrect a completed copy.
             if self

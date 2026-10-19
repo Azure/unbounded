@@ -579,6 +579,38 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     );
 }
 #[test]
+fn read_io_error_on_held_storage_page_misses_without_removing_it() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = f.open().unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let index = f.store.writer.index();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    index.reserve_hold(&id.version, 1, until).unwrap();
+    drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
+    let value = index.lookup(&id).unwrap().unwrap();
+    assert_eq!(value.tier, Tier::Storage);
+    for fault in [Fault::Errno(libc::EIO), Fault::Short(1)] {
+        simulation.inject("read", fault).unwrap();
+        assert!(
+            drive(&f.reactor, f.store.reader.read(&id, &scope()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(index.lookup(&id).unwrap(), Some(value));
+        assert_eq!(index.held_page_expiry(&id), Some(until));
+    }
+    assert!(
+        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+            .unwrap()
+            .is_some()
+    );
+}
+#[test]
 fn second_sight_queue_owned_bias_hot_nonowned_and_pressure_discard() {
     for hot_nonowned in [false, true] {
         let f = Fixture::new();
