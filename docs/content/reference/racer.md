@@ -132,6 +132,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
+| `RACER_MEMORY_PRESSURE` | `true` | Respond to cgroup v2 memory pressure; see [memory-pressure response](#memory-pressure-response); only the exact values `true` and `false` are accepted |
 
 Exact sizing requires both count settings. Their sum must fit `RACER_MAX_THREADS`;
 the cap is never raised implicitly. The first NUMA node in the normal placement
@@ -177,6 +178,63 @@ before workers start. Large buffers, such as 16 MiB pages, are then mapped
 individually and returned to the kernel when freed, instead of staying in heap
 arenas. To choose a different threshold, set `MALLOC_MMAP_THRESHOLD_` in the
 container environment; the dataplane then leaves glibc's value unchanged.
+
+#### Idle buffer pools
+
+Each I/O worker keeps two small pools of idle buffers so that steady traffic reuses
+memory instead of allocating it: a recycler for released admission buffers and a
+pool of zeroed disk staging buffers. Both are sized by demand rather than held at a
+fixed depth. A pool starts with a target of 2 entries and is reviewed once per
+second. When a window had both allocations that missed the pool and returns the
+pool refused because it was full, the target grows. Each window releases half of
+the entries that sat unused for the whole window. After 10 consecutive windows
+without a miss, the target shrinks by one entry. A pool never holds more than 8
+entries or 128 MiB, and the recycler never retains more than half of any one
+admission class limit. Retained idle buffers still count against admission.
+
+#### Memory-pressure response
+
+Unless `RACER_MEMORY_PRESSURE=false`, one worker samples the dataplane's cgroup v2
+memory state once per second: `memory.current`, the lower of `memory.high` and
+`memory.max`, and the `some avg10` value from `memory.pressure`. If none of these
+files can be read, it treats the level as normal and retries every 30 seconds.
+The level is the more severe of two signals, each with hysteresis:
+
+| Level | Usage of the lower limit | PSI `some avg10` |
+|-------|--------------------------|------------------|
+| Elevated | Enter at 80%, leave below 70% | Enter at 10, leave below 5 |
+| Critical | Enter at 90%, leave below 85% | Enter at 40, leave below 20 |
+
+The managed DaemonSet sets no memory limit, so usage applies only when you add
+one; PSI applies either way. Every worker reacts to the shared level:
+
+- **Elevated**: idle buffer pools are held empty and refuse returns, retained
+  recycler and staging buffers are freed, and idle origin and peer HTTP connections
+  are closed. The sampling worker also asks glibc to return free heap memory to the
+  kernel, then repeats this at most every 10 seconds while pressure lasts.
+- **Critical**: everything above, and each worker also evicts idle memory-cache
+  entries every 100 ms, one bounded batch of at most 256 candidates. Entries in use
+  by readers or queued disk writes are never evicted.
+- **Normal**: the pools resume demand sizing. Evicted entries refill on demand.
+
+Queued disk writes are never dropped to relieve memory pressure.
+
+#### Memory metrics
+
+| Metric | Meaning |
+|--------|---------|
+| `racer_worker_admission_used{worker,class}` / `racer_worker_admission_limit{worker,class}` | Admission charge and limit for every resource class, including retained idle buffers |
+| `racer_worker_recycler_entries`, `_bytes`, `_target` | Idle admission buffers retained per worker, and their demand target |
+| `racer_worker_recycler_hits_total`, `_misses_total`, `_rejects_total`, `_trimmed_total` | Reuses, allocations that missed, refused returns, and released entries |
+| `racer_worker_staging_pool_*` | The same series for the disk staging pool, updated every 100 ms |
+| `racer_process_resident_bytes` | Process resident set size, sampled at most once per second |
+| `racer_cgroup_memory_current_bytes` / `racer_cgroup_memory_limit_bytes` | cgroup usage and the lower of `memory.high` and `memory.max`; omitted when unavailable |
+| `racer_cgroup_memory_pressure_some_avg10` | PSI `some avg10` percentage; omitted when unavailable |
+| `racer_memory_pressure_level` | `0` normal, `1` elevated, `2` critical |
+| `racer_memory_pressure_transitions_total` / `racer_allocator_trims_total` | Level changes and heap trims |
+
+The `racer_worker_relay_*` and `racer_worker_ciphertext_*` series remain for
+compatibility.
 
 ### Raw-device storage
 
