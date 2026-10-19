@@ -831,13 +831,20 @@ mod tests {
         assert!(fresh.is_held(&page(&held, 0)));
         let deadline = fresh.held_page_expiry(&page(&held, 1)).unwrap();
         assert!(deadline >= until && deadline < until + Duration::from_secs(1));
+        // Both pages of one version merge into a single hold.
+        {
+            let holds = fresh.holds.borrow();
+            let hold = holds.entries.get(&version_key(&held.version)).unwrap();
+            assert_eq!(hold.pages, 2);
+            assert_eq!(hold.published.len(), 2);
+            assert_eq!(holds.entries.len(), 2, "held and long only");
+        }
+        // The deadline is clamped to the maximum TTL from the mount time.
         let clamped = fresh.hold_expiry(&long.version).unwrap();
-        assert!(
-            clamped
-                <= uring_runtime::environment::wall_now()
-                    + super::super::holds::MAX_HOLD_TTL
-                    + Duration::from_secs(1)
-        );
+        let ceiling = uring_runtime::environment::wall_now() + super::super::holds::MAX_HOLD_TTL;
+        assert!(clamped <= ceiling + Duration::from_secs(1));
+        assert!(clamped + Duration::from_secs(1) >= ceiling);
+        // An expired deadline is skipped: the page stays as a plain entry.
         assert_eq!(fresh.hold_expiry(&expired.version), None);
         assert!(fresh.lookup(&page(&expired, 0)).unwrap().is_some());
         assert_eq!(fresh.hold_expiry(&lost.version), None);
@@ -849,6 +856,37 @@ mod tests {
             Err(Error::InvalidConfiguration)
         );
         assert_eq!(fresh.release_hold(&held.version), Ok(()));
+        assert!(fresh.is_held(&page(&held, 0)));
+    }
+
+    #[test]
+    fn hold_extension_is_durable_only_after_commit() {
+        let index = index(8);
+        let disk = TestDisk::mount(&index, 16);
+        let held = descriptor("held", 17);
+        let first = until();
+        assert!(!index.reserve_hold(&held.version, 1, first).unwrap());
+        put_held(&disk, &index, &held, 0);
+        disk.commit(&index);
+        let second = first + Duration::from_secs(600);
+        assert!(index.extend_hold(&held.version, second).unwrap());
+        assert!(index.is_dirty());
+        // Repeating the same deadline changes nothing on disk.
+        assert!(!index.extend_hold(&held.version, second).unwrap());
+
+        // A crash before the commit rebuilds the hold from the old deadline.
+        let lost = Index::new(WorkerId(0), 8, crate::test_support::availability());
+        let disk = disk.crash(&lost);
+        let deadline = lost.hold_expiry(&held.version).unwrap();
+        assert!(deadline >= first && deadline < first + Duration::from_secs(1));
+
+        // After a commit the extension survives a restart.
+        assert!(lost.extend_hold(&held.version, second).unwrap());
+        disk.commit(&lost);
+        let fresh = Index::new(WorkerId(0), 8, crate::test_support::availability());
+        let _disk = disk.crash(&fresh);
+        let deadline = fresh.hold_expiry(&held.version).unwrap();
+        assert!(deadline >= second && deadline < second + Duration::from_secs(1));
         assert!(fresh.is_held(&page(&held, 0)));
     }
 

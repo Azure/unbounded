@@ -578,12 +578,18 @@ impl Index {
     /// Repeated versions share capacity; extension never shortens an existing hold.
     /// Existing storage-tier pages are protected atomically, or this call fails
     /// unchanged. Cache-tier pages are protected once rewritten by `persist_held`.
+    ///
+    /// Returns whether the `retain_until` of a storage-tier page was raised.
+    /// That change is in memory only until the next volume commit (the lazy
+    /// commit runs about once a second); a crash before it rebuilds the hold
+    /// from the previous deadline. Callers that report the extension as
+    /// durable must commit first.
     pub fn reserve_hold(
         &self,
         version: &ObjectVersion,
         pages: usize,
         until: SystemTime,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let monotonic = Holds::deadline(until)?;
         if !self.available(&version.object.cache) {
             return Err(Error::MissingKey);
@@ -609,7 +615,7 @@ impl Index {
             .max(old.map_or(0, |hold| hold.pages));
         // Zero-page objects need no disk guarantee or retained reservation entry.
         if count == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let total = holds
             .entries
@@ -645,15 +651,17 @@ impl Index {
             },
         );
         drop(holds);
+        let mut raised = false;
         if let Some(volume) = self.volume() {
             let retain = ceil_unix(until);
             for (key, value) in existing {
                 if value.retain_until < retain {
                     volume.set_retain(&key, retain);
+                    raised = true;
                 }
             }
         }
-        Ok(())
+        Ok(raised)
     }
 
     /// Active reservation deadline, not proof that every requested page is on disk.
@@ -705,8 +713,10 @@ impl Index {
         snapshot
     }
 
-    /// Extend an existing reservation without adding page capacity.
-    pub fn extend_hold(&self, version: &ObjectVersion, until: SystemTime) -> Result<()> {
+    /// Extend an existing reservation without adding page capacity. Returns
+    /// whether a storage-tier deadline changed; see [`Index::reserve_hold`] for
+    /// when that becomes durable.
+    pub fn extend_hold(&self, version: &ObjectVersion, until: SystemTime) -> Result<bool> {
         let pages = self
             .holds
             .borrow()
