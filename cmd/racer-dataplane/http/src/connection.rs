@@ -1686,6 +1686,12 @@ impl<C: Context> HttpPool<C> {
         drop(garbage);
     }
 
+    /// Release every idle connection and its admission charges without
+    /// closing the pool. Active leases and queued checkouts are unaffected.
+    pub fn release_idle(&self) {
+        self.clear_idle();
+    }
+
     /// Reject new work, wake queued checkouts, and release idle connections.
     pub fn close(&self) {
         {
