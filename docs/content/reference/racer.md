@@ -223,10 +223,11 @@ Queued disk writes are never dropped to relieve memory pressure.
 
 | Metric | Meaning |
 |--------|---------|
-| `racer_worker_admission_used{worker,class}` / `racer_worker_admission_limit{worker,class}` | Admission charge and limit for every resource class, including retained idle buffers |
-| `racer_worker_recycler_entries`, `_bytes`, `_target` | Idle admission buffers retained per worker, and their demand target |
-| `racer_worker_recycler_hits_total`, `_misses_total`, `_rejects_total`, `_trimmed_total` | Reuses, allocations that missed, refused returns, and released entries |
-| `racer_worker_staging_pool_*` | The same series for the disk staging pool, updated every 100 ms |
+| `racer_admission_used{class}` / `racer_admission_limit{class}` | Admission charge and limit for every resource class, summed over workers, including retained idle buffers |
+| `racer_recycler_entries`, `_bytes`, `_target` | Idle admission buffers retained, and the demand target, summed over workers |
+| `racer_recycler_hits_total`, `_misses_total`, `_rejects_total`, `_trimmed_total` | Reuses, allocations that missed, refused returns, and released entries |
+| `racer_staging_pool_*` | The same series for the disk staging pools, updated every 100 ms |
+| `racer_worker_recycler_bytes{worker}` / `racer_worker_staging_pool_bytes{worker}` | Retained idle bytes per worker |
 | `racer_process_resident_bytes` | Process resident set size, sampled at most once per second |
 | `racer_cgroup_memory_current_bytes` / `racer_cgroup_memory_limit_bytes` | cgroup usage and the lower of `memory.high` and `memory.max`; omitted when unavailable |
 | `racer_cgroup_memory_pressure_some_avg10` | PSI `some avg10` percentage; omitted when unavailable |
