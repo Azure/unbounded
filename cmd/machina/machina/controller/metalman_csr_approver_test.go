@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	certificatesv1 "k8s.io/api/certificates/v1"
@@ -221,4 +222,46 @@ func TestMetalmanCSRApproverReconcileWritesCondition(t *testing.T) {
 			require.Equal(t, corev1.ConditionTrue, got.Status.Conditions[0].Status)
 		})
 	}
+}
+
+func TestMetalmanCSRApproverRetriesYoungCSRWithoutMachine(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
+		Build()
+	checker := &metalmanCSRClaimChecker{Client: c, clock: func() time.Time { return now }}
+
+	csr := metalmanKubeletCSR(t, metalmanBootstrapUsername(), "node-a", "JTI=a")
+
+	csr.CreationTimestamp = metav1.NewTime(now.Add(-metalmanCSRCacheGrace + time.Second))
+	_, _, err := checker.credentialMayClaimNode(context.Background(), csr, "node-a", "JTI=a")
+	require.ErrorContains(t, err, "retrying")
+
+	csr.CreationTimestamp = metav1.NewTime(now.Add(-metalmanCSRCacheGrace))
+	allowed, reason, err := checker.credentialMayClaimNode(context.Background(), csr, "node-a", "JTI=a")
+	require.NoError(t, err)
+	require.False(t, allowed)
+	require.Contains(t, reason, "no Machine was issued")
+}
+
+func TestMetalmanCSRApproverReconcileRequeuesYoungCSR(t *testing.T) {
+	csr := metalmanKubeletCSR(t, metalmanBootstrapUsername(), "node-a", "JTI=a")
+	csr.CreationTimestamp = metav1.Now()
+	kube := kubefake.NewSimpleClientset(csr.DeepCopy())
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(csr).
+		WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
+		Build()
+
+	r, err := NewMetalmanCSRApprover(c, kube)
+	require.NoError(t, err)
+
+	_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: csr.Name}})
+	require.Error(t, err)
+
+	got, err := kube.CertificatesV1().CertificateSigningRequests().Get(context.Background(), csr.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, got.Status.Conditions)
 }

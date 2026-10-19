@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	"k8s.io/client-go/kubernetes"
@@ -22,6 +23,12 @@ const (
 	metalmanBootstrapServiceAccount = "metalman-bootstrap"
 
 	machineBootstrapCredentialIDField = "status.bootstrap.credentialID"
+
+	// metalmanCSRCacheGrace is how long a CSR with no matching Machine is
+	// retried instead of denied. Metalman records the credential ID before it
+	// returns the token, but the controller cache may not have observed that
+	// write yet when the CSR arrives, and a denial is terminal.
+	metalmanCSRCacheGrace = 2 * time.Minute
 )
 
 // metalmanBootstrapUsername returns the CSR requester username of tokens
@@ -32,6 +39,17 @@ func metalmanBootstrapUsername() string {
 
 type metalmanCSRClaimChecker struct {
 	client.Client
+
+	// clock returns the current time. Defaults to time.Now.
+	clock func() time.Time
+}
+
+func (c *metalmanCSRClaimChecker) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+
+	return time.Now()
 }
 
 // NewMetalmanCSRApprover returns a reconciler that approves kubelet client
@@ -63,7 +81,7 @@ func NewMetalmanCSRApprover(
 
 func (c *metalmanCSRClaimChecker) credentialMayClaimNode(
 	ctx context.Context,
-	_ *certificatesv1.CertificateSigningRequest,
+	csr *certificatesv1.CertificateSigningRequest,
 	nodeName, credentialID string,
 ) (bool, string, error) {
 	var machines unboundedv1alpha3.MachineList
@@ -73,6 +91,10 @@ func (c *metalmanCSRClaimChecker) credentialMayClaimNode(
 
 	switch len(machines.Items) {
 	case 0:
+		if c.now().Sub(csr.CreationTimestamp.Time) < metalmanCSRCacheGrace {
+			return false, "", fmt.Errorf("no Machine records credential %q yet; retrying while the cache catches up", credentialID)
+		}
+
 		return false, "no Machine was issued this credential", nil
 	case 1:
 	default:
