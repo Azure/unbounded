@@ -12,6 +12,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     task::{Context, Poll, Waker},
+    time::{Duration, Instant},
 };
 use uring_runtime::{Scope, reactor::Reactor};
 
@@ -61,9 +62,15 @@ pub type TestReactor = Reactor<TestScope, ()>;
 /// Boxed local future.
 pub type Task<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-/// Drive one future to completion with a bounded number of reactor turns.
+/// Wall-clock bound for driving futures. Real io_uring work such as fsync can
+/// need many non-blocking reactor turns on a loaded host, so a turn count is
+/// not a reliable bound.
+const DRIVE_LIMIT: Duration = Duration::from_secs(120);
+
+/// Drive one future to completion within `DRIVE_LIMIT`.
 pub fn drive<T>(reactor: &TestReactor, mut operation: Task<'_, T>) -> T {
-    for _ in 0..1_000_000 {
+    let deadline = Instant::now() + DRIVE_LIMIT;
+    while Instant::now() < deadline {
         if let Poll::Ready(value) = operation
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -79,7 +86,8 @@ pub fn drive<T>(reactor: &TestReactor, mut operation: Task<'_, T>) -> T {
 pub fn drive_all<'a, T>(reactor: &TestReactor, operations: Vec<Task<'a, T>>) -> Vec<T> {
     let mut slots: Vec<(Option<Task<'a, T>>, Option<T>)> =
         operations.into_iter().map(|op| (Some(op), None)).collect();
-    for _ in 0..1_000_000 {
+    let deadline = Instant::now() + DRIVE_LIMIT;
+    while Instant::now() < deadline {
         let mut pending = false;
         for (operation, output) in &mut slots {
             if let Some(op) = operation {
