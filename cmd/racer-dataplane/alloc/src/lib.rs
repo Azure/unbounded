@@ -162,6 +162,7 @@ pub mod retention;
 mod segments;
 
 mod slab;
+pub mod volume;
 
 pub use segments::{
     FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,

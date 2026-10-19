@@ -11,6 +11,7 @@ default = []
 simulation = ["uring-runtime/simulation"]
 
 [dependencies]
+crc64fast = "1.1.0"
 libc = "0.2"
 zeroize = "1"
 uring-runtime = { path = "../runtime" }
