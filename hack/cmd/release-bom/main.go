@@ -29,6 +29,8 @@ const bomSchemaVersion = 2
 
 var releaseImageNames = []string{
 	"gantry",
+	"host-azurelinux3",
+	"host-azurelinux3-nvidia",
 	"host-ubuntu2404",
 	"inventory-aggregator",
 	"inventory-inspector",
@@ -37,8 +39,11 @@ var releaseImageNames = []string{
 	"machine-ops-controller",
 	"metalman",
 	"netboot",
+	"netboot-azurelinux",
 	"orca",
 	"racer-controller",
+	"racer-dataplane",
+	"racer-object",
 	"token-refresher",
 	"unbounded-net-controller",
 	"unbounded-net-node",

@@ -352,6 +352,10 @@ func hostDistroFromOSRelease(path string) (string, error) {
 }
 
 func hostDistroFromOSReleaseData(data []byte) string {
+	return hostDistroFromOSReleaseValues(osReleaseValues(data))
+}
+
+func osReleaseValues(data []byte) map[string]string {
 	values := make(map[string]string)
 
 	for _, rawLine := range strings.Split(string(data), "\n") {
@@ -368,7 +372,7 @@ func hostDistroFromOSReleaseData(data []byte) string {
 		values[key] = normalizeOSReleaseValue(value)
 	}
 
-	return hostDistroFromOSReleaseValues(values)
+	return values
 }
 
 func hostDistroFromOSReleaseValues(values map[string]string) string {

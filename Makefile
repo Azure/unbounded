@@ -368,7 +368,12 @@ help: ## Show this help
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
 	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
 	@echo "  racer-loadgen-test                Race-test racer-loadgen"
+	@echo "  racer-object | racer-object-build  Build racer-object (with/without focused tests)"
+	@echo "  racer-object-test                 Race-test racer-object"
+	@echo "  image-racer-controller-local      Build the racer-controller container image"
+	@echo "  image-racer-dataplane-local       Build the racer-dataplane container image"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
+	@echo "  image-racer-object-local          Build the racer-object container image"
 	@echo ""
 	@echo "Common variables (override with VAR=value):"
 	@echo "  VERSION=$(VERSION)"
@@ -586,6 +591,25 @@ racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
 
+RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
+RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
+
+.PHONY: image-racer-controller-local image-racer-dataplane-local
+image-racer-controller-local: ## Build the racer-controller container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t racer-controller:$(VERSION_TAG) -t $(RACER_CONTROLLER_IMAGE) \
+		-f ./images/racer-controller/Containerfile .
+	$(call trivy-maybe,$(RACER_CONTROLLER_IMAGE))
+
+image-racer-dataplane-local: ## Build the racer-dataplane container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		-t racer-dataplane:$(VERSION_TAG) -t $(RACER_DATAPLANE_IMAGE) \
+		-f ./images/racer-dataplane/Containerfile .
+	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
+
 RACER_LOADGEN_BIN=bin/racer-loadgen
 RACER_LOADGEN_CMD=./cmd/racer-loadgen
 RACER_LOADGEN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-loadgen:$(VERSION_TAG)
@@ -601,10 +625,33 @@ racer-loadgen-test: ## Race-test racer-loadgen
 	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_LOADGEN_CMD)/...
 
 image-racer-loadgen-local: ## Build the loadgen container image locally (single-arch)
-	timeout --signal=TERM --kill-after=10s 300s $(CONTAINER_ENGINE) build \
+	$(CONTAINER_ENGINE) build \
 		-t racer-loadgen:$(VERSION_TAG) -t $(RACER_LOADGEN_IMAGE) \
 		-f ./images/racer-loadgen/Containerfile .
 	$(call trivy-maybe,$(RACER_LOADGEN_IMAGE))
+
+RACER_OBJECT_BIN=bin/racer-object
+RACER_OBJECT_CMD=./cmd/racer-object
+RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
+
+.PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
+racer-object: racer-object-test racer-object-build ## Test and build racer-object
+
+racer-object-build: ## Build racer-object without lint/test
+	@mkdir -p bin
+	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(RACER_OBJECT_BIN) $(RACER_OBJECT_CMD)
+
+racer-object-test: ## Race-test racer-object
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_OBJECT_CMD)/...
+
+image-racer-object-local: ## Build the racer-object container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
+		-f ./images/racer-object/Containerfile .
+	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
 
 build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...

@@ -4,6 +4,7 @@ use super::*;
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
 use zeroize::Zeroize;
 
+pub mod checkpoint;
 pub mod operations;
 
 /// Stable, quota-owning I/O storage with a cursor for partial writes.
@@ -137,7 +138,15 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             loop {
                 buffer.end = (probe - out.buffer.end).min(buffer.data.len());
                 let completion = self
-                    .read_at(fd.clone(), out.buffer.end as u64, buffer, (), scope)
+                    .buffer_io(
+                        fd.clone(),
+                        buffer,
+                        (),
+                        scope,
+                        super::BufferOperation::Read(out.buffer.end as u64),
+                        super::IssuePolicy::Offload,
+                        None,
+                    )
                     .await?;
                 let n = completion.bytes;
                 buffer = completion.buffer;

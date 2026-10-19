@@ -49,7 +49,7 @@ func TestRacerSecurityRegistryPayloads(t *testing.T) {
 
 					return metadata, body, err
 				})
-				server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+				server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
 				resp := racerRequest(t, server, mode.method, "blobs", d, mode.rangeHeader, "")
 				assertRacerDownloadHeaders(t, resp.Header)
 

@@ -54,7 +54,7 @@ func runRacerAgent(c *config.Config, logger *slog.Logger) error {
 }
 
 // serveRacerAgent owns client and keeps origin service alive while HTTP drains.
-// There is deliberately no fallback to the legacy agent on any failure.
+// There is deliberately no fallback to the p2p agent on any failure.
 func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger, cache string, deps racerAgentDeps) (retErr error) {
 	if deps.client != nil {
 		defer func() { retErr = errors.Join(retErr, deps.client.Close()) }()

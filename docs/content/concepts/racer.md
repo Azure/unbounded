@@ -1,15 +1,8 @@
 ---
 title: "Racer Distributed Cache"
 weight: 4
-description: "How Racer is designed to let nodes share cached object data and reduce repeated reads from its source."
+description: "How Racer lets nodes share cached object data and reduce repeated reads from its source."
 ---
-
-{{< callout type="note" >}}
-Racer is under development. The `ClusterCache` API, Go SDK, and controller are
-on `main`; the dataplane application and operator deployment integration are
-still pending. This page describes the intended architecture, not a deployment
-available from `main` today.
-{{< /callout >}}
 
 ## Why Racer?
 
@@ -21,7 +14,7 @@ its own copy from the same registry or object store. This:
 - Overloads the source when a large job starts.
 - Makes scale-out as slow as the slowest download.
 
-**Racer** is a read-through cache designed to run on each participating node.
+**Racer** is a read-through cache that runs on each participating node.
 Nodes share cached data with each other to reduce repeated reads from the
 source. Apps read through a local Unix socket. When no node has the data yet,
 Racer asks an **origin**, an adapter that fetches objects from your storage.
@@ -33,7 +26,7 @@ another fetch.
 
 ## Architecture
 
-Racer's planned deployment has two components:
+Racer has two components:
 
 **Controller** (`racer-controller`) -- A Deployment with one elected leader:
 
@@ -55,9 +48,8 @@ Racer's planned deployment has two components:
 Apps and origins use the Go SDK (`pkg/racersdk`). It provides a `Client` for
 reads and `ServeOrigin` for origins.
 
-The planned operator integration will deploy the controller and dataplane
-when the first `ClusterCache` is created. Creating a `ClusterCache` on `main`
-does not yet install these workloads.
+The Unbounded operator deploys the controller and dataplane when any
+`ClusterCache` exists.
 
 ## Core Concepts
 
@@ -109,7 +101,7 @@ An origin answers two kinds of requests:
 - **GET** -- Returns one page-aligned range of a version.
 
 Origins do not push data into Racer. Any participating node can own a page, so
-the planned deployment runs the origin on each such node, usually as a DaemonSet
+Racer runs the origin on each such node, usually as a DaemonSet
 that mounts the cache's origin socket directory.
 
 The client can pass `Metadata` and `Authorization` values with each read. Racer
@@ -123,7 +115,7 @@ the request reaches Racer.
 
 ### Owners and Shares
 
-Each page is intended to have up to **three owner nodes**. Racer picks them
+Each page has up to **three owner nodes**. Racer picks them
 with weighted rendezvous hashing over node IDs. Each node has a weight called
 **shares** (default `4`). A node with more shares owns more pages. Set it with
 the Node annotation `racer.unbounded-cloud.io/shares`.
@@ -136,7 +128,7 @@ To keep a node out of Racer, label it `racer.unbounded-cloud.io/exclude`.
 
 ## How a Read Works
 
-The planned dataplane read path is:
+The read path is:
 
 1. The app calls `Get` on the cache's client socket.
 2. The local dataplane checks memory, then local disk.
@@ -149,24 +141,24 @@ The planned dataplane read path is:
    Racer confirms the whole range arrived intact.
 
 If many readers on one node want the same page at the same time, the dataplane
-is designed to combine their requests and share the result.
+combines their requests and share the result.
 
 ### What Stays on Disk
 
-The planned disk policy makes owner pages eligible for retention on the first
+The disk policy makes owner pages eligible for retention on the first
 read. Other nodes' pages become eligible after a second read. This reduces the
 chance of one-off reads pushing out useful data. This policy is called
 **second-sight**. Eligibility does not guarantee retention: admission limits,
 available capacity, and eviction still apply.
 
-The planned default storage is slab files under `/var/lib/racer/slabs`, with
-raw block devices as an alternative. Checkpoints are intended to let a node
+The default storage is slab files under `/var/lib/racer/slabs`, with
+raw block devices as an alternative. Checkpoints let a node
 recover cached pages after a restart. The cache is not durable storage; keep
 the source available to refill missing pages.
 
 ## Security
 
-The security model combines controller-issued credentials with planned
+The security model combines controller-issued credentials with
 dataplane protections:
 
 - **Enrollment** -- Each dataplane pod proves its identity to the controller
@@ -177,7 +169,7 @@ dataplane protections:
   nodes and on disk. The controller rotates keys every 24 hours by default.
 - **Signed requests** -- Every node signs each request it sends or forwards to
   another node.
-- **Credentials** -- `Authorization` and `Metadata` are intended to be sealed
+- **Credentials** -- `Authorization` and `Metadata` are sealed
   when they cross nodes and kept out of disk storage. They do not authorize
   cache hits; access to the cache socket remains a trust boundary.
 

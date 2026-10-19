@@ -79,7 +79,7 @@ func TestLiveConcurrencyOptions(t *testing.T) {
 	for _, n := range []int{0, maxLiveConcurrency, maxLiveConcurrency + 1} {
 		opts.pull.Concurrency = n
 
-		p, err := newPuller(opts.image.Repository, opts.pull, pullTestMetrics())
+		p, err := newPuller(&syntheticImage{}, opts.pull, pullTestMetrics())
 		if n > maxLiveConcurrency {
 			require.Error(t, err)
 			continue
@@ -89,16 +89,16 @@ func TestLiveConcurrencyOptions(t *testing.T) {
 		require.Equal(t, maxLiveConcurrency*opts.pull.BlobConcurrency, p.transport.MaxIdleConnsPerHost)
 		p.transport.CloseIdleConnections()
 	}
-	// The optional mode must not impose a new limit on legacy CLI-only runs.
+	// The optional mode must not impose a new limit on runs configured only by CLI flags.
 	opts.pull.ConcurrencyFile = ""
-	p, err := newPuller(opts.image.Repository, opts.pull, pullTestMetrics())
+	p, err := newPuller(&syntheticImage{}, opts.pull, pullTestMetrics())
 	require.NoError(t, err)
 	p.transport.CloseIdleConnections()
 
 	opts.pull.ConcurrencyFile = "/control/concurrency"
 	opts.pull.Concurrency = 0
 	opts.pull.BlobConcurrency = int(^uint(0) >> 1)
-	_, err = newPuller(opts.image.Repository, opts.pull, pullTestMetrics())
+	_, err = newPuller(&syntheticImage{}, opts.pull, pullTestMetrics())
 	require.ErrorContains(t, err, "too large")
 }
 

@@ -91,7 +91,7 @@ func TestRacerRegistryContentType(t *testing.T) {
 
 						return metadata, body, err
 					})
-					server := racerServer(t, cfg, client, &racerLegacyTrap{})
+					server := racerServer(t, cfg, client, &racerDirectTrap{})
 					resp := racerRequest(t, server, method, tc.route, d, "", "")
 					body := handlerReadBody(t, resp)
 

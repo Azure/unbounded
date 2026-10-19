@@ -446,7 +446,7 @@ fn weighted_index<M: Member>(
         .map(|path| u64::from(membership.weight(path[1]).get()))
         .collect();
     let total = weights.iter().sum();
-    let mut digest = hash::domain::<M>(b"/next-hop/v5\0");
+    let mut digest = hash::domain::<M>(b"/next-hop/v1\0");
     hash::bytes(&mut digest, seed);
     let path = &alternatives[0];
     hash::bytes(&mut digest, membership.id(path[0]));
@@ -958,7 +958,7 @@ mod tests {
                 seed: &seed,
                 ..query(0, 1499, 4)
             };
-            let mut bytes = b"racer/next-hop/v5\0".to_vec();
+            let mut bytes = b"racer/next-hop/v1\0".to_vec();
             for field in [seed.as_slice(), members.id(0), members.id(1499)] {
                 bytes.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
                 bytes.extend_from_slice(field);
@@ -1093,10 +1093,9 @@ mod tests {
         assert!(alternatives.iter().all(|p| p.len() <= 5));
     }
 
-    /// Small graphs match the from-scratch ring graph.
+    /// Small graphs match the from-scratch ID-ring graph.
     #[test]
-    fn exhaustive_inverse_matches_definition() {
-        // Retain the historical test name, now checking the ID-ring definition.
+    fn small_graphs_match_ring_definition() {
         for n in 1..=160 {
             let members = membership(n);
             let expected = graph(n);

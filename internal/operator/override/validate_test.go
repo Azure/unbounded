@@ -29,13 +29,13 @@ func validateFragment(t *testing.T, fragment string) error {
 	return ValidateErr([]SourcedEntry{entryFrom(t, fragment)})
 }
 
-func TestRacerOverrideIsControllerOnly(t *testing.T) {
+func TestRacerOverrideTargetsControllerAndDataplane(t *testing.T) {
 	for _, tc := range []struct {
 		name, fragment string
 		wantErr        bool
 	}{
 		{name: "controller", fragment: "component: racer\nkind: Deployment"},
-		{name: "no dataplane", fragment: "component: racer\nkind: DaemonSet", wantErr: true},
+		{name: "dataplane", fragment: "component: racer\nkind: DaemonSet"},
 		{name: "no Sites", fragment: "component: racer\nkind: Deployment\nsites: [west]", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -300,7 +300,7 @@ func TestBootstrapLifetimeIncreaseAllowsRuntimeRollout(t *testing.T) {
 	require.NoError(t, err)
 
 	owner := authority.New(cfg, authority.Dependencies{Reader: env.LiveReader()})
-	require.Error(t, owner.Observe(t.Context()), "regression requires signing readiness to fail")
+	require.Error(t, owner.Observe(t.Context()), "this test requires signing readiness to fail")
 	plan := planPass(t, env)
 	kinds := map[string]bool{}
 

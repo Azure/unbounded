@@ -1,6 +1,41 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
+# INSTALLER_KERNEL picks the installer kernel. The default, ubuntu, runs the
+# Ubuntu generic kernel, which the Ubuntu shim and GRUB verify, so the
+# installer boots with Secure Boot enabled. azurelinux runs the Azure Linux
+# kernel instead. It is published as the netboot-azurelinux image for arm64
+# hosts with the Microsoft MANA NIC, whose driver the arm64 Ubuntu kernel lacks.
+# The Ubuntu shim does not trust that kernel, so it needs Secure Boot turned off.
+ARG INSTALLER_KERNEL=ubuntu
+
+FROM docker.io/library/ubuntu:24.04 AS kernel-ubuntu
+
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends linux-image-generic; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    mkdir -p /out && \
+    cp -a /boot /out/boot && \
+    cp -a /lib/modules /out/modules && \
+    rm -rf /var/lib/apt/lists/*
+
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS kernel-azurelinux
+
+RUN tdnf install -y kernel && \
+    tdnf clean all && \
+    mkdir -p /out && \
+    cp -a /boot /out/boot && \
+    cp -a /usr/lib/modules /out/modules
+
+FROM kernel-${INSTALLER_KERNEL} AS kernel
+
 FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
@@ -9,7 +44,7 @@ RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if apt-get install -y --no-install-recommends \
-           ca-certificates cpio curl efibootmgr kmod linux-image-generic xz-utils; then \
+           ca-certificates cpio curl efibootmgr kmod xz-utils; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
@@ -18,9 +53,18 @@ RUN apt-get update && \
     done && $ok && \
     rm -rf /var/lib/apt/lists/*
 
+# Azure Linux ships xz-compressed modules. Decompress them so that any kmod
+# build in the Ubuntu initrd can load them, then rebuild the module index.
+COPY --from=kernel /out/modules /usr/lib/modules
+COPY --from=kernel /out/boot /tmp/kernel-boot
+RUN KVER=$(ls /lib/modules | head -1) && \
+    find "/lib/modules/${KVER}" -name '*.ko.xz' -exec xz -d {} + && \
+    depmod "${KVER}"
+
 RUN mkdir -p /artifacts && \
     KVER=$(ls /lib/modules | head -1) && \
-    cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
+    cp "/tmp/kernel-boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
+    chmod 644 /artifacts/vmlinuz && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
         NETBOOT_BASE="https://releases.ubuntu.com/noble/netboot/amd64"; \
         curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
@@ -42,10 +86,14 @@ RUN mkdir -p /artifacts && \
     fi
 
 COPY images/netboot/assets/init /tmp/initrd-root/init
+# The installer copies whole driver directories, then adds any module they
+# depend on from other directories, such as net/psample and net/tls for
+# mlx5_core. modules.dep lists the full dependency closure of each module, so
+# one pass is enough.
 RUN chmod 755 /tmp/initrd-root/init && \
     mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
-    cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
-    for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
+    cp /usr/bin/efibootmgr /usr/bin/curl /tmp/initrd-root/usr/bin/ && \
+    for lib in $(ldd /usr/bin/efibootmgr /usr/bin/curl | awk '/=>/{print $3}'); do \
         mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
         cp "$lib" "/tmp/initrd-root${lib}"; \
     done && \
@@ -54,20 +102,23 @@ RUN chmod 755 /tmp/initrd-root/init && \
     cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
     KVER=$(ls /lib/modules | head -1) && \
     KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
-    mkdir -p "${KMOD}/kernel/drivers/net" \
-             "${KMOD}/kernel/drivers/scsi" \
-             "${KMOD}/kernel/drivers/ata" \
-             "${KMOD}/kernel/drivers/nvme" \
-             "${KMOD}/kernel/drivers/virtio" \
-             "${KMOD}/kernel/drivers/block" \
-             "${KMOD}/kernel/fs" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/net/." "${KMOD}/kernel/drivers/net/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." "${KMOD}/kernel/drivers/scsi/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/ata/." "${KMOD}/kernel/drivers/ata/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/nvme/." "${KMOD}/kernel/drivers/nvme/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." "${KMOD}/kernel/drivers/virtio/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/block/." "${KMOD}/kernel/drivers/block/" && \
-    cp -a "/lib/modules/${KVER}/kernel/fs/." "${KMOD}/kernel/fs/" && \
+    for dir in drivers/net drivers/scsi drivers/ata drivers/nvme \
+               drivers/virtio drivers/block fs crypto lib; do \
+        mkdir -p "${KMOD}/kernel/${dir}" && \
+        cp -a "/lib/modules/${KVER}/kernel/${dir}/." "${KMOD}/kernel/${dir}/" || exit 1; \
+    done && \
+    (cd "${KMOD}" && find kernel -name '*.ko*') > /tmp/initrd-modules && \
+    awk -F': ' 'NR==FNR { want[$1] = 1; next } ($1 in want) { n = split($2, d, " "); for (i = 1; i <= n; i++) print d[i] }' \
+        /tmp/initrd-modules "/lib/modules/${KVER}/modules.dep" | sort -u > /tmp/initrd-deps && \
+    while read -r dep; do \
+        [ -e "${KMOD}/${dep}" ] && continue; \
+        mkdir -p "$(dirname "${KMOD}/${dep}")" && \
+        cp -a "/lib/modules/${KVER}/${dep}" "${KMOD}/${dep}" || exit 1; \
+    done < /tmp/initrd-deps && \
+    rm -f /tmp/initrd-modules /tmp/initrd-deps && \
+    for f in modules.builtin modules.builtin.modinfo modules.order; do \
+        [ ! -e "/lib/modules/${KVER}/$f" ] || cp "/lib/modules/${KVER}/$f" "${KMOD}/$f"; \
+    done && \
     depmod -b /tmp/initrd-root "${KVER}" && \
     cd /tmp/initrd-root && \
     find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
@@ -77,10 +128,10 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
 	if [ "${TARGETARCH}" = "amd64" ]; then \
 		cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
 		cp /artifacts/shimx64.efi /disk/bootx64.efi && \
-		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" "mediaFormat: unbounded-uefi-v1" > /disk/metadata.yaml; \
 	elif [ "${TARGETARCH}" = "arm64" ]; then \
 		cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" "mediaFormat: unbounded-uefi-v1" > /disk/metadata.yaml; \
 	fi
 
 COPY images/netboot/assets/grub.cfg.tmpl /disk/grub/grub.cfg.tmpl

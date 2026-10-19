@@ -145,9 +145,9 @@ func (b *originBlobBody) Close() error {
 // Provision only missing directories. Refuse symlinks and untrusted writable
 // ancestors, and leave ownership/modes of existing directories untouched. The
 // SDK additionally checks final directory ownership before acquiring its lock.
-func prepareOriginDirectory(volume string) error {
+func prepareOriginDirectory(cache string) error {
 	path := "/"
-	for _, part := range []string{"run", "racer", volume, "origin"} {
+	for _, part := range []string{"run", "racer", cache, "origin"} {
 		path = filepath.Join(path, part)
 		if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 			return err

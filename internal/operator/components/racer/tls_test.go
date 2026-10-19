@@ -5,7 +5,6 @@ package racer
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -460,44 +459,11 @@ func TestDerivedBundleAndRetainedTrustRepair(t *testing.T) {
 	require.Zero(t, planPass(t, env).Len())
 }
 
-func legacyTLS(t *testing.T, now time.Time) *corev1.Secret {
-	t.Helper()
-
-	secret, err := newTLS("custom-system", now)
-	require.NoError(t, err)
-	caPair, err := tls.X509KeyPair(secret.Data["ca.crt"], secret.Data["ca.key"])
-	require.NoError(t, err)
-	ca, err := singleCertificate(secret.Data["ca.crt"])
-	require.NoError(t, err)
-
-	ca.NotAfter = now.Add(legacyCALifetime)
-	key := caPair.PrivateKey.(*ecdsa.PrivateKey)
-	der, err := x509.CreateCertificate(rand.Reader, ca, ca, ca.PublicKey, key)
-	require.NoError(t, err)
-
-	secret.Data["ca.crt"] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	leaf, err := singleCertificate(secret.Data[corev1.TLSCertKey])
-	require.NoError(t, err)
-
-	leaf.NotAfter = now.Add(14 * day)
-	der, err = x509.CreateCertificate(rand.Reader, leaf, ca, leaf.PublicKey, key)
-	require.NoError(t, err)
-
-	secret.Data[corev1.TLSCertKey] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	require.NoError(t, writeTLSState(secret, tlsState{Version: 1, CreatedAt: now}))
-
-	return secret
-}
-
 func TestTLSExpiredCAReissue(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	for _, legacy := range []bool{false, true} {
+	{
 		original, err := newTLS("custom-system", now)
 		require.NoError(t, err)
-
-		if legacy {
-			original = legacyTLS(t, now)
-		}
 
 		ca, err := singleCertificate(original.Data["ca.crt"])
 		require.NoError(t, err)
@@ -520,36 +486,6 @@ func TestTLSExpiredCAReissue(t *testing.T) {
 			require.NoError(t, err)
 			require.Nil(t, unchanged)
 		}
-	}
-}
-
-func TestTLSLegacyRotationMigration(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	previous := legacyTLS(t, now)
-	current := legacyTLS(t, now.Add(7*day))
-	parent, err := singleCertificate(previous.Data["ca.crt"])
-	require.NoError(t, err)
-	child, err := singleCertificate(current.Data["ca.crt"])
-	require.NoError(t, err)
-	pair, err := tls.X509KeyPair(previous.Data["ca.crt"], previous.Data["ca.key"])
-	require.NoError(t, err)
-	cross, err := crossSign(child, parent, pair.PrivateKey.(*ecdsa.PrivateKey))
-	require.NoError(t, err)
-	state := stateOf(t, current)
-	state.Previous = []previousCA{{Root: previous.Data["ca.crt"], Cross: cross, RetireAt: now.Add(21 * day)}}
-	require.NoError(t, writeTLSState(current, state))
-
-	for _, at := range []time.Time{now.Add(14 * day), now.Add(60 * day)} {
-		next, err := renewTLS(current, "custom-system", at)
-		require.NoError(t, err)
-		require.NotNil(t, next)
-		require.NoError(t, verifyServing(t, next, next.Data[caBundleKey], at))
-		ca, err := singleCertificate(next.Data["ca.crt"])
-		require.NoError(t, err)
-		require.Equal(t, at.Add(caLifetime), ca.NotAfter)
-		unchanged, err := renewTLS(next, "custom-system", at)
-		require.NoError(t, err)
-		require.Nil(t, unchanged)
 	}
 }
 

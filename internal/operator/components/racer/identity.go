@@ -90,8 +90,8 @@ func checkNewInstallation(ctx context.Context, env *component.Env) error {
 	return checkInstallationResources(ctx, env, false)
 }
 
-// Existing controller state cannot be adopted or overwritten with a new identity.
-// External dataplane workloads are not installation evidence owned by this component.
+// Existing controller or dataplane state cannot be adopted or overwritten with a
+// new identity.
 func checkInstallationResources(ctx context.Context, env *component.Env, stagedMarker bool) error {
 	manifests, err := decodeRuntimeManifests(env)
 	if err != nil {
@@ -111,6 +111,8 @@ func checkInstallationResources(ctx context.Context, env *component.Env, stagedM
 	for _, obj := range manifests {
 		objects = append(objects, obj)
 	}
+
+	objects = append(objects, dataplaneObjects(env)...)
 
 	for _, obj := range objects {
 		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(obj), obj)
