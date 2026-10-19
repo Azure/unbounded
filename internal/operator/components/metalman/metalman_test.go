@@ -373,7 +373,7 @@ Apply ClusterRole/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
 Apply ClusterRole/metalman-bootstrap [shared]
-Apply ClusterRoleBinding/metalman:bootstrap-machine [shared] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction]
+Apply ClusterRoleBinding/metalman:bootstrap-machine [shared] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction] [revoke on dependency failure]
 Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
 Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
 Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
@@ -662,5 +662,104 @@ func TestRestrictionFailureWithholdsBootstrapAccess(t *testing.T) {
 				t.Fatal("independent RBAC was not applied; a failure must not abort the pass")
 			}
 		})
+	}
+}
+
+// upgradeClient returns a client seeded with the bootstrap grant and the
+// Deployment an earlier release installed. Applies of failing are rejected,
+// other applies succeed without being stored, and deletes are counted.
+func upgradeClient(t *testing.T, failing string, deletes map[string]int) client.Client {
+	t.Helper()
+
+	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: BootstrapMachineBindingName}}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name: DeploymentName("rack-a"), Namespace: component.DefaultNamespace,
+	}}
+
+	return fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(crb, dep).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				named, ok := obj.(interface {
+					GetKind() string
+					GetName() string
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				if named.GetKind()+"/"+named.GetName() == failing {
+					return errors.New("admission policy rejected")
+				}
+
+				return nil
+			},
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				deletes[obj.GetObjectKind().GroupVersionKind().Kind+"/"+obj.GetName()]++
+
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+}
+
+// TestRestrictionFailureRevokesExistingBootstrapAccess verifies that on an
+// upgrade, where an earlier release already installed the bootstrap grant, a
+// failure to install either admission object deletes the grant rather than
+// leaving bootstrap tokens able to write any Machine's status.
+func TestRestrictionFailureRevokesExistingBootstrapAccess(t *testing.T) {
+	for _, failing := range []string{
+		"ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction",
+		"ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction",
+	} {
+		t.Run(failing, func(t *testing.T) {
+			deletes := map[string]int{}
+			cl := upgradeClient(t, failing, deletes)
+			env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+			res := reconcile(t, env, enabledSite())
+			if res.Ready {
+				t.Fatalf("result = %+v, want not ready", res)
+			}
+
+			err := cl.Get(t.Context(), client.ObjectKey{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{})
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("get bootstrap grant = %v, want NotFound; the grant outlived its restriction", err)
+			}
+
+			// The Deployment is left running: without the grant its tokens
+			// cannot write Machine status, and deleting it would stop PXE
+			// service for the Site over an admission install failure.
+			err = cl.Get(t.Context(), client.ObjectKey{
+				Name: DeploymentName("rack-a"), Namespace: component.DefaultNamespace,
+			}, &appsv1.Deployment{})
+			if err != nil {
+				t.Fatalf("get Deployment: %v, want it left in place", err)
+			}
+		})
+	}
+}
+
+// TestRestrictionSuccessKeepsBootstrapAccess verifies that when the admission
+// objects install, an existing bootstrap grant is applied in place and never
+// deleted, so steady-state passes do not interrupt in-flight bootstraps.
+func TestRestrictionSuccessKeepsBootstrapAccess(t *testing.T) {
+	deletes := map[string]int{}
+	cl := upgradeClient(t, "", deletes)
+	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	for pass := range 3 {
+		if res := reconcile(t, env, enabledSite()); !res.Ready {
+			t.Fatalf("pass %d: result = %+v, want ready", pass, res)
+		}
+	}
+
+	if n := deletes["ClusterRoleBinding/"+BootstrapMachineBindingName]; n != 0 {
+		t.Fatalf("bootstrap grant deleted %d times in the steady state, want 0", n)
+	}
+
+	if err := cl.Get(t.Context(), client.ObjectKey{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{}); err != nil {
+		t.Fatalf("get bootstrap grant: %v", err)
 	}
 }

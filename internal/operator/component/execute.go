@@ -12,6 +12,7 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -336,7 +337,12 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 
 	for _, op := range ordered {
 		if reason, blocked := blockedBy(op, brokenRef, brokenNS, brokenSub); blocked {
-			fail(op, OpSkipped, errors.New(reason))
+			err := errors.New(reason)
+			if revokeErr := e.revoke(ctx, op, brokenRef); revokeErr != nil {
+				err = fmt.Errorf("%s; revoking it failed: %w", reason, revokeErr)
+			}
+
+			fail(op, OpSkipped, err)
 
 			continue
 		}
@@ -444,6 +450,30 @@ func blockedBy(op plannedOp, brokenRef map[ObjectRef]bool, brokenNS map[string]b
 	}
 
 	return "", false
+}
+
+// revoke deletes the object of a skipped operation marked
+// RevokeOnDependencyFailure when one of its declared dependencies failed, so a
+// grant written by an earlier pass does not outlive the restriction it relies
+// on. Other skip reasons leave the object alone. The delete carries no UID or
+// resourceVersion precondition, because whatever copy exists must go.
+func (e *Env) revoke(ctx context.Context, op plannedOp, brokenRef map[ObjectRef]bool) error {
+	if !op.RevokeOnDependencyFailure || op.Kind != OpApply {
+		return nil
+	}
+
+	for _, dep := range op.DependsOn {
+		if dep != op.Ref() && brokenRef[dep] {
+			target := &unstructured.Unstructured{}
+			target.SetGroupVersionKind(op.Object.GroupVersionKind())
+			target.SetNamespace(op.Object.GetNamespace())
+			target.SetName(op.Object.GetName())
+
+			return e.DeleteIfExists(ctx, target)
+		}
+	}
+
+	return nil
 }
 
 // execute performs a single operation.
@@ -572,6 +602,11 @@ func sharedOperationsEqual(a, b Operation) error {
 	if a.Ref() != b.Ref() {
 		return fmt.Errorf("shared operation %q targets %s and %s from %s: a shared key must identify one object",
 			a.SharedKey, a.Ref(), b.Ref(), contributors)
+	}
+
+	if a.RevokeOnDependencyFailure != b.RevokeOnDependencyFailure {
+		return fmt.Errorf("shared operation %q on %s disagrees on RevokeOnDependencyFailure between %s",
+			a.SharedKey, a.Ref(), contributors)
 	}
 
 	if !apiequality.Semantic.DeepEqual(a.Object.Object, b.Object.Object) {

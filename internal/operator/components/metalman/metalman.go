@@ -70,7 +70,11 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 			SharedKey: sharedSupportKey(obj),
 		}
 		if obj.GetKind() == "ClusterRoleBinding" && obj.GetName() == BootstrapMachineBindingName {
+			// An earlier release may already have installed the grant, so
+			// skipping the apply is not enough: revoke it until the
+			// restriction is back.
 			op.DependsOn = restriction
+			op.RevokeOnDependencyFailure = true
 		}
 
 		plan.Add(op)
