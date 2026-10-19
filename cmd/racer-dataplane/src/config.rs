@@ -127,6 +127,8 @@ pub struct Config {
     /// multi-segment signed heads, so Nagle stalls every round on a delayed ACK.
     /// Defaults on; set false only to reproduce the pre-nodelay socket behavior.
     pub peer_tcp_nodelay: bool,
+    /// cgroup v2 memory-pressure monitoring and reclaim. Defaults on.
+    pub memory_pressure: bool,
     pub pprof_enabled: bool,
     pub control_endpoint: String,
     pub peer_listen: std::net::SocketAddr,
@@ -238,6 +240,7 @@ impl Config {
             enable_rdma,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
+            memory_pressure: raw.memory_pressure.unwrap_or(true),
             pprof_enabled: raw.pprof_enabled.unwrap_or(false),
             control_endpoint: raw.control_endpoint,
             peer_listen: parse_listener_address(
@@ -582,6 +585,7 @@ const ENV_NAMES: &[&str] = &[
     "ALLOW_SMT",
     "OPAQUE_RELAY",
     "PEER_TCP_NODELAY",
+    "MEMORY_PRESSURE",
     "PPROF_ENABLED",
     "PEER_LISTEN",
     "DIAGNOSTICS_LISTEN",
@@ -655,6 +659,7 @@ struct RawConfig {
     allow_smt: Option<bool>,
     opaque_relay: Option<bool>,
     peer_tcp_nodelay: Option<bool>,
+    memory_pressure: Option<bool>,
     pprof_enabled: Option<bool>,
     peer_listen: Option<String>,
     diagnostics_listen: Option<String>,
@@ -945,7 +950,8 @@ mod tests {
             .iter()
             .map(|name| {
                 let value = match *name {
-                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "PPROF_ENABLED" => "true",
+                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "MEMORY_PRESSURE"
+                    | "PPROF_ENABLED" => "true",
                     _ => "1",
                 };
                 ((*name).to_owned(), value.to_owned())
@@ -1780,6 +1786,11 @@ mod tests {
     #[test]
     fn pprof_requires_exact_boolean_and_defaults_off() {
         exact_boolean("RACER_PPROF_ENABLED", |c| c.pprof_enabled);
+    }
+
+    #[test]
+    fn memory_pressure_requires_exact_boolean_and_defaults_on() {
+        exact_boolean_default("RACER_MEMORY_PRESSURE", |c| c.memory_pressure, true);
     }
 
     #[test]
