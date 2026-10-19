@@ -6,6 +6,7 @@ package metalman
 
 import (
 	"context"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -140,11 +141,16 @@ func DeploymentName(site string) string { return "metalman-controller-" + site }
 // exactly the objects the metalman component owns and applies.
 const SupportObjectNameSubstring = "metalman"
 
-// IsSupportObject reports whether obj is the metalman RBAC that ships in the
-// machina manifests. The machina component skips these; the metalman component
-// applies them.
+// IsSupportObject reports whether obj is the metalman RBAC or admission policy
+// that ships in the machina manifests. The machina component skips these; the
+// metalman component applies them.
 func IsSupportObject(obj *unstructured.Unstructured) bool {
-	return component.IsRBACObject(obj, SupportObjectNameSubstring)
+	switch obj.GetKind() {
+	case "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding":
+		return strings.Contains(obj.GetName(), SupportObjectNameSubstring)
+	default:
+		return component.IsRBACObject(obj, SupportObjectNameSubstring)
+	}
 }
 
 // mutateSupportObject keeps only the metalman RBAC objects from the machina

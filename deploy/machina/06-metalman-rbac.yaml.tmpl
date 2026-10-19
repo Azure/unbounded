@@ -202,3 +202,64 @@ roleRef:
   kind: ClusterRole
   name: metalman-bootstrap
   apiGroup: rbac.authorization.k8s.io
+
+---
+# Restrict tokens minted for the metalman-bootstrap SA to their own Machine.
+# RBAC cannot scope machines/status by name, so without this policy one
+# attested node's token could rewrite any Machine's status, including the TPM
+# endorsement key pinned on first attestation. Metalman records the token's
+# credential ID (KEP-4193, "JTI=<jti>") in status.bootstrap.credentialID of
+# the Machine it attested; only a request carrying that credential ID may
+# update that Machine's status, and it may not change status.tpm or
+# status.bootstrap. Writes to the main machines resource are denied outright.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: metalman-bootstrap-machine-restriction
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["unbounded-cloud.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["machines", "machines/status"]
+  matchConditions:
+    - name: is-metalman-bootstrap-sa
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:metalman-bootstrap'"
+  validations:
+    - expression: "request.subResource == 'status'"
+      message: "metalman-bootstrap tokens may not create, update, or delete Machines"
+      reason: Forbidden
+    - expression: >-
+        request.subResource != 'status' ||
+        (has(oldObject.status) && has(oldObject.status.bootstrap) &&
+        has(oldObject.status.bootstrap.credentialID) &&
+        oldObject.status.bootstrap.credentialID != '' &&
+        'authentication.kubernetes.io/credential-id' in request.userInfo.extra &&
+        oldObject.status.bootstrap.credentialID in request.userInfo.extra['authentication.kubernetes.io/credential-id'])
+      message: "metalman-bootstrap tokens may only update the status of the Machine they were issued for"
+      reason: Forbidden
+    - expression: >-
+        request.subResource != 'status' ||
+        ((has(oldObject.status) && has(oldObject.status.tpm)) ?
+        (has(object.status) && has(object.status.tpm) && object.status.tpm == oldObject.status.tpm) :
+        !(has(object.status) && has(object.status.tpm)))
+      message: "metalman-bootstrap tokens may not modify status.tpm"
+      reason: Forbidden
+    - expression: >-
+        request.subResource != 'status' ||
+        ((has(oldObject.status) && has(oldObject.status.bootstrap)) ?
+        (has(object.status) && has(object.status.bootstrap) && object.status.bootstrap == oldObject.status.bootstrap) :
+        !(has(object.status) && has(object.status.bootstrap)))
+      message: "metalman-bootstrap tokens may not modify status.bootstrap"
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: metalman-bootstrap-machine-restriction
+spec:
+  policyName: metalman-bootstrap-machine-restriction
+  validationActions: ["Deny"]

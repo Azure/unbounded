@@ -372,6 +372,8 @@ Apply ClusterRoleBinding/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
 Apply ClusterRole/metalman-bootstrap [shared]
 Apply ClusterRoleBinding/metalman:bootstrap-machine [shared]
+Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
+Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
 Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
 Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable]
 `
