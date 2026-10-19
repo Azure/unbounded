@@ -5,6 +5,7 @@ package racer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -15,6 +16,9 @@ import (
 )
 
 const runtimeInstallationAnnotation = "unbounded-cloud.io/racer-installation-uid"
+
+// errNotOwned marks a resource this installation does not own and must not adopt.
+var errNotOwned = errors.New("not owned by this installation; refusing adoption")
 
 func bindRuntime(obj client.Object, installation types.UID) {
 	annotations := obj.GetAnnotations()
@@ -29,7 +33,7 @@ func bindRuntime(obj client.Object, installation types.UID) {
 
 func validateRuntimeOwner(obj client.Object, installation types.UID) error {
 	if installation == "" || obj.GetUID() == "" || obj.GetResourceVersion() == "" || obj.GetDeletionTimestamp() != nil || obj.GetAnnotations()[managerAnnotation] != component.FieldOwner || obj.GetAnnotations()[runtimeInstallationAnnotation] != string(installation) {
-		return fmt.Errorf("racer resource %s is not owned by this installation; refusing adoption", obj.GetName())
+		return fmt.Errorf("racer resource %s is %w", obj.GetName(), errNotOwned)
 	}
 
 	return nil
