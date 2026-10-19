@@ -31,7 +31,6 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
-	"github.com/Azure/unbounded/internal/metalman/peeraddr"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -2336,6 +2335,9 @@ func TestClientIP(t *testing.T) {
 		{"forwarded ignored", "10.0.1.10", "192.168.1.1:1234", "192.168.1.1"},
 		{"forwarded multiple ignored", "10.0.1.10, 192.168.1.1", "192.168.1.2:1234", "192.168.1.2"},
 		{"remote only", "", "10.0.1.10:1234", "10.0.1.10"},
+		{"ipv6", "", "[2001:db8::1]:1234", "2001:db8::1"},
+		{"missing port", "", "10.0.1.10", "10.0.1.10"},
+		{"empty", "", "", ""},
 	}
 
 	for _, tt := range tests {
@@ -2346,9 +2348,11 @@ func TestClientIP(t *testing.T) {
 			}
 			if tt.fwdFor != "" {
 				r.Header.Set("X-Forwarded-For", tt.fwdFor)
+				r.Header.Set("X-Real-IP", tt.fwdFor)
+				r.Header.Set("Forwarded", "for="+tt.fwdFor)
 			}
 
-			got := peeraddr.Host(r)
+			got := clientIP(r)
 			if got != tt.expected {
 				t.Errorf("ClientIP: got %q, want %q", got, tt.expected)
 			}
