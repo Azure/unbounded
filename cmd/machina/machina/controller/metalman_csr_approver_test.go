@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
@@ -75,7 +77,7 @@ func testMetalmanApprover(t *testing.T, objs ...client.Object) *daemoncred.CSRAp
 		WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
 		Build()
 
-	r, err := NewMetalmanCSRApprover(c, kubefake.NewSimpleClientset())
+	r, err := NewMetalmanCSRApprover(c, c, kubefake.NewSimpleClientset())
 	require.NoError(t, err)
 	require.Equal(t, "metalman-csr-approver", r.Name)
 
@@ -209,7 +211,7 @@ func TestMetalmanCSRApproverReconcileWritesCondition(t *testing.T) {
 				WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
 				Build()
 
-			r, err := NewMetalmanCSRApprover(c, kube)
+			r, err := NewMetalmanCSRApprover(c, c, kube)
 			require.NoError(t, err)
 
 			_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: csr.Name}})
@@ -230,7 +232,7 @@ func TestMetalmanCSRApproverRetriesYoungCSRWithoutMachine(t *testing.T) {
 		WithScheme(scheme).
 		WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
 		Build()
-	checker := &metalmanCSRClaimChecker{Client: c, clock: func() time.Time { return now }}
+	checker := &metalmanCSRClaimChecker{Client: c, apiReader: c, clock: func() time.Time { return now }}
 
 	csr := metalmanKubeletCSR(t, metalmanBootstrapUsername(), "node-a", "JTI=a")
 
@@ -255,7 +257,7 @@ func TestMetalmanCSRApproverReconcileRequeuesYoungCSR(t *testing.T) {
 		WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
 		Build()
 
-	r, err := NewMetalmanCSRApprover(c, kube)
+	r, err := NewMetalmanCSRApprover(c, c, kube)
 	require.NoError(t, err)
 
 	_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: csr.Name}})
@@ -264,4 +266,90 @@ func TestMetalmanCSRApproverReconcileRequeuesYoungCSR(t *testing.T) {
 	got, err := kube.CertificatesV1().CertificateSigningRequests().Get(context.Background(), csr.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Empty(t, got.Status.Conditions)
+}
+
+func TestMetalmanCSRApproverConfirmsLiveMachine(t *testing.T) {
+	user := metalmanBootstrapUsername()
+
+	withUID := func(m *unboundedv1alpha3.Machine, uid types.UID) *unboundedv1alpha3.Machine {
+		m.UID = uid
+		return m
+	}
+
+	cached := func() *unboundedv1alpha3.Machine { return withUID(attestedMachine("node-a", "", "JTI=a"), "uid-1") }
+
+	tests := map[string]struct {
+		live     []client.Object
+		approve  bool
+		contains string
+	}{
+		"approves when live matches": {
+			live:    []client.Object{cached()},
+			approve: true,
+		},
+		"denies superseded credential": {
+			live:     []client.Object{withUID(attestedMachine("node-a", "", "JTI=b"), "uid-1")},
+			contains: "superseded",
+		},
+		"denies cleared bootstrap status": {
+			live:     []client.Object{withUID(attestedMachine("node-a", "", ""), "uid-1")},
+			contains: "superseded",
+		},
+		"denies deleted machine": {
+			contains: "no longer exists",
+		},
+		"denies recreated machine": {
+			live:     []client.Object{withUID(attestedMachine("node-a", "", "JTI=a"), "uid-2")},
+			contains: "recreated",
+		},
+		"denies changed node name": {
+			live:     []client.Object{withUID(attestedMachine("node-a", "node-z", "JTI=a"), "uid-1")},
+			contains: `issued to Machine "node-a"`,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cache := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(cached()).
+				WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
+				Build()
+			live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.live...).Build()
+
+			r, err := NewMetalmanCSRApprover(cache, live, kubefake.NewSimpleClientset())
+			require.NoError(t, err)
+
+			decision, err := r.Approver.Evaluate(context.Background(), metalmanKubeletCSR(t, user, "node-a", "JTI=a"))
+			require.NoError(t, err)
+			require.False(t, decision.Ignore)
+			require.Equal(t, tt.approve, decision.Approve, decision.Message)
+			require.Contains(t, decision.Message, tt.contains)
+		})
+	}
+}
+
+func TestMetalmanCSRApproverLiveReadErrorRetries(t *testing.T) {
+	cache := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(attestedMachine("node-a", "", "JTI=a")).
+		WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
+		Build()
+	live := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return errors.New("boom")
+		},
+	}).Build()
+	checker := &metalmanCSRClaimChecker{Client: cache, apiReader: live}
+
+	csr := metalmanKubeletCSR(t, metalmanBootstrapUsername(), "node-a", "JTI=a")
+	allowed, _, err := checker.credentialMayClaimNode(context.Background(), csr, "node-a", "JTI=a")
+	require.ErrorContains(t, err, "boom")
+	require.False(t, allowed)
+}
+
+func TestNewMetalmanCSRApproverRequiresAPIReader(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	_, err := NewMetalmanCSRApprover(c, nil, kubefake.NewSimpleClientset())
+	require.Error(t, err)
 }

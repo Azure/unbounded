@@ -9,6 +9,7 @@ import (
 	"time"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,6 +41,11 @@ func metalmanBootstrapUsername() string {
 type metalmanCSRClaimChecker struct {
 	client.Client
 
+	// apiReader reads directly from the API server. The cache index finds the
+	// candidate Machine, but the binding is confirmed against the live object
+	// so a stale cache cannot authorize a superseded credential.
+	apiReader client.Reader
+
 	// clock returns the current time. Defaults to time.Now.
 	clock func() time.Time
 }
@@ -57,9 +63,14 @@ func (c *metalmanCSRClaimChecker) now() time.Time {
 // of the single Machine the token was issued to.
 func NewMetalmanCSRApprover(
 	c client.Client,
+	apiReader client.Reader,
 	kubeClient kubernetes.Interface,
 ) (*daemoncred.CSRApproverReconciler, error) {
-	claims := &metalmanCSRClaimChecker{Client: c}
+	if apiReader == nil {
+		return nil, fmt.Errorf("metalman CSR approver requires an API reader")
+	}
+
+	claims := &metalmanCSRClaimChecker{Client: c, apiReader: apiReader}
 
 	approver, err := daemoncred.NewKubeletClientCSRApprover(daemoncred.KubeletClientCSRApproverOptions{
 		Requester:     metalmanBootstrapUsername(),
@@ -104,6 +115,39 @@ func (c *metalmanCSRClaimChecker) credentialMayClaimNode(
 	machine := &machines.Items[0]
 	if machine.NodeName() != nodeName {
 		return false, fmt.Sprintf("credential was issued to Machine %q", machine.Name), nil
+	}
+
+	return c.confirmLiveBinding(ctx, machine, nodeName, credentialID)
+}
+
+// confirmLiveBinding re-reads the cached candidate Machine from the API server
+// and approves only if it is the same object and still binds the credential to
+// the node. Re-attestation replaces the credential ID, so any change means the
+// CSR's token was superseded. Transient read errors are returned for retry.
+func (c *metalmanCSRClaimChecker) confirmLiveBinding(
+	ctx context.Context,
+	cached *unboundedv1alpha3.Machine,
+	nodeName, credentialID string,
+) (bool, string, error) {
+	var live unboundedv1alpha3.Machine
+	if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(cached), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, fmt.Sprintf("Machine %q no longer exists", cached.Name), nil
+		}
+
+		return false, "", fmt.Errorf("get live Machine %q: %w", cached.Name, err)
+	}
+
+	if live.UID != cached.UID {
+		return false, fmt.Sprintf("Machine %q was recreated", cached.Name), nil
+	}
+
+	if live.Status.Bootstrap == nil || live.Status.Bootstrap.CredentialID != credentialID {
+		return false, fmt.Sprintf("credential was superseded on Machine %q", cached.Name), nil
+	}
+
+	if live.NodeName() != nodeName {
+		return false, fmt.Sprintf("credential was issued to Machine %q", live.Name), nil
 	}
 
 	return true, "", nil

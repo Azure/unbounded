@@ -107,7 +107,7 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("setup daemon CSR approver controller: %w", err)
 	}
 
-	metalmanCSRApprover, err := NewMetalmanCSRApprover(mgr.GetClient(), kubeClient)
+	metalmanCSRApprover, err := NewMetalmanCSRApprover(mgr.GetClient(), mgr.GetAPIReader(), kubeClient)
 	if err != nil {
 		return fmt.Errorf("create metalman CSR approver controller: %w", err)
 	}
