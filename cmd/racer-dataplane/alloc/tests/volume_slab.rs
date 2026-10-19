@@ -70,7 +70,7 @@ mod simulation {
     use super::*;
     use page_alloc::{Segments, volume::MAX_SLOTS};
     use std::rc::Rc;
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation, disk::DiskState};
 
     const SEGMENT: u64 = 8192;
     const PATH: &str = "/volume/slab";
@@ -133,6 +133,27 @@ mod simulation {
             read(&slab, &reactor, offset) == vec![9; 4096],
             "synced write lost"
         );
+    }
+
+    /// A freshly created slab file and its directory entries survive a crash
+    /// without a fixture-level sync.
+    #[test]
+    fn new_file_survives_crash() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let reactor = Reactor::<TestScope, ()>::new(16, ());
+        let slab = open(4);
+        write(&slab, &reactor, SEGMENT, 5);
+        drive(&reactor, slab.sync(&reactor, &TestScope)).unwrap();
+        drop(slab);
+        sim.disk().crash().unwrap();
+        assert!(
+            sim.disk()
+                .read(PATH.as_ref(), 0, 1, DiskState::Durable)
+                .is_ok()
+        );
+        let slab = open(4);
+        assert!(read(&slab, &reactor, SEGMENT) == vec![5; 4096]);
     }
 
     /// A failed fsync reports the runtime error and keeps the data volatile.

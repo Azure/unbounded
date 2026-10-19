@@ -405,6 +405,14 @@ impl<C: Charge> Slab<C> {
                 handle
                     .set_len(self.capacity_bytes)
                     .map_err(|e| system_error("ftruncate", e))?;
+                // A new file must survive a crash: sync its length and every
+                // directory entry leading to it.
+                handle.sync().map_err(|e| system_error("fsync", e))?;
+                for directory in parent_directories(path) {
+                    sim.disk()
+                        .sync(&directory)
+                        .map_err(|e| system_error("fsync-directory", e))?;
+                }
             }
             self.publish(file, geometry);
             return Ok(a);
@@ -457,6 +465,14 @@ impl<C: Charge> Slab<C> {
         if size == 0 {
             file.set_len(self.capacity_bytes)
                 .map_err(|e| system_error("ftruncate", e))?;
+            // A new file must survive a crash: sync its length and every
+            // directory entry leading to it.
+            file.sync_all().map_err(|e| system_error("fsync", e))?;
+            for directory in parent_directories(path) {
+                File::open(&directory)
+                    .and_then(|d| d.sync_all())
+                    .map_err(|e| system_error("fsync-directory", e))?;
+            }
         }
         self.publish(file.into(), geometry);
         Ok(a)
@@ -1109,6 +1125,21 @@ fn validate_file(mode: u32, owner: u32, expected_owner: u32, links: u64) -> Resu
 
 /// Resolve each directory relative to its already-open predecessor. Unlike
 /// create_dir_all plus open, this never follows an intermediate symlink.
+/// Directories from the parent of `path` up to the root (or `.`), whose
+/// entries must be synced after creating `path`.
+fn parent_directories(path: &Path) -> Vec<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .collect()
+}
+
 fn open_private_file(path: &Path) -> Result<File> {
     let name = path.file_name().ok_or(Error::InvalidConfiguration)?;
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
