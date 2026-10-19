@@ -204,7 +204,14 @@ func TestDeploymentAllowsZeroReplicas(t *testing.T) {
 func TestCleanupDeletesDeployment(t *testing.T) {
 	deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "metalman-controller-rack-a", Namespace: component.DefaultNamespace}}
 	env := &component.Env{
-		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(deploy).Build(),
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(deploy).
+			WithInterceptorFuncs(interceptor.Funcs{
+				// The fake client cannot apply admission objects; the
+				// support set is covered by the upgrade tests.
+				Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+					return nil
+				},
+			}).Build(),
 		Namespace: component.DefaultNamespace,
 	}
 
@@ -385,10 +392,12 @@ Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable] [afte
 	}
 }
 
-// TestCleanupPlanGolden pins what disabling metalman for a Site removes. The
-// shared RBAC is deliberately left behind: it is harmless unreferenced and may
-// still be in use by another Site. The stale auto-approve binding is removed
-// because it is never safe to keep.
+// TestCleanupPlanGolden pins what disabling metalman for a Site plans. The
+// per-Site Deployment is removed. The shared support set is planned exactly as
+// in TestPlanGolden, because other Sites may use it and bootstrap tokens minted
+// earlier outlive the Deployment: the bootstrap grant stays behind the
+// admission restriction and is revoked if the restriction fails. The stale
+// auto-approve binding is removed because it is never safe to keep.
 func TestCleanupPlanGolden(t *testing.T) {
 	env := &component.Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
@@ -405,8 +414,24 @@ func TestCleanupPlanGolden(t *testing.T) {
 		t.Fatalf("result = %+v, want ready with reason %q", res, component.ReasonDisabled)
 	}
 
-	want := "Delete Deployment/unbounded-system/metalman-controller-rack-a\n" +
-		"Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]\n"
+	want := `Delete Deployment/unbounded-system/metalman-controller-rack-a
+Apply ServiceAccount/unbounded-system/metalman-controller [shared]
+Apply ServiceAccount/unbounded-system/metalman-bootstrap [shared]
+Apply Role/unbounded-system/metalman-controller [shared]
+Apply RoleBinding/unbounded-system/metalman-controller [shared]
+Apply Role/kube-public/metalman-controller [shared]
+Apply RoleBinding/kube-public/metalman-controller [shared]
+Apply Role/kube-system/metalman-controller [shared]
+Apply RoleBinding/kube-system/metalman-controller [shared]
+Apply ClusterRole/metalman-controller [shared]
+Apply ClusterRoleBinding/metalman-controller [shared]
+Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
+Apply ClusterRole/metalman-bootstrap [shared]
+Apply ClusterRoleBinding/metalman:bootstrap-machine [shared] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction] [revoke on dependency failure]
+Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
+Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
+Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
+`
 
 	if got := plan.Summary(); got != want {
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
@@ -761,5 +786,149 @@ func TestRestrictionSuccessKeepsBootstrapAccess(t *testing.T) {
 
 	if err := cl.Get(t.Context(), client.ObjectKey{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{}); err != nil {
 		t.Fatalf("get bootstrap grant: %v", err)
+	}
+}
+
+// disabledSite returns a Site with metalman not enabled.
+func disabledSite(name string) *unboundedv1alpha3.Site {
+	return &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: name}}
+}
+
+// passPlan builds one reconciler pass over sites: enabled Sites contribute
+// Plan, disabled Sites contribute CleanupPlan, merged into one plan.
+func passPlan(t *testing.T, env *component.Env, sites ...*unboundedv1alpha3.Site) *component.Plan {
+	t.Helper()
+
+	c := Component{}
+	plan := component.NewPlan()
+
+	for _, site := range sites {
+		planFn := c.CleanupPlan
+		if c.Enabled(site) {
+			planFn = c.Plan
+		}
+
+		p, _, err := planFn(t.Context(), env, site)
+		if err != nil {
+			t.Fatalf("plan site %s: %v", site.Name, err)
+		}
+
+		plan.Merge(p)
+	}
+
+	return plan
+}
+
+// TestCleanupRestrictsRetainedBootstrapAccess verifies the upgrade where every
+// Site has metalman disabled: the bootstrap grant an earlier release installed
+// is kept behind the admission restriction, which cleanup installs, and is
+// never deleted across passes while the restriction holds.
+func TestCleanupRestrictsRetainedBootstrapAccess(t *testing.T) {
+	deletes := map[string]int{}
+	applied := map[string]int{}
+	cl := upgradeClient(t, "", deletes)
+	cl = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Apply: func(ctx context.Context, c client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+			named := obj.(interface {
+				GetKind() string
+				GetName() string
+			})
+			applied[named.GetKind()+"/"+named.GetName()]++
+
+			return c.Apply(ctx, obj, opts...)
+		},
+	})
+	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	for pass := range 3 {
+		exec, err := env.Execute(t.Context(), passPlan(t, env, disabledSite("rack-a"), disabledSite("rack-b")))
+		if err != nil {
+			t.Fatalf("pass %d: execute: %v", pass, err)
+		}
+
+		if err := exec.Err(); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+
+	for _, name := range []string{
+		"ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction",
+		"ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction",
+	} {
+		if applied[name] != 3 {
+			t.Fatalf("%s applied %d times, want once per pass", name, applied[name])
+		}
+	}
+
+	if n := deletes["ClusterRoleBinding/"+BootstrapMachineBindingName]; n != 0 {
+		t.Fatalf("bootstrap grant deleted %d times, want 0", n)
+	}
+
+	if err := cl.Get(t.Context(), client.ObjectKey{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{}); err != nil {
+		t.Fatalf("get bootstrap grant: %v", err)
+	}
+
+	err := cl.Get(t.Context(), client.ObjectKey{Name: DeploymentName("rack-a"), Namespace: component.DefaultNamespace}, &appsv1.Deployment{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("get Deployment = %v, want NotFound", err)
+	}
+}
+
+// TestCleanupRestrictionFailureRevokesBootstrapAccess verifies that when every
+// Site has metalman disabled and the restriction fails to install, cleanup
+// revokes the bootstrap grant an earlier release left behind.
+func TestCleanupRestrictionFailureRevokesBootstrapAccess(t *testing.T) {
+	for _, failing := range []string{
+		"ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction",
+		"ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction",
+	} {
+		t.Run(failing, func(t *testing.T) {
+			deletes := map[string]int{}
+			cl := upgradeClient(t, failing, deletes)
+			env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+			if err := cleanup(t, env, disabledSite("rack-a")); err == nil {
+				t.Fatal("cleanup succeeded, want the restriction failure reported")
+			}
+
+			err := cl.Get(t.Context(), client.ObjectKey{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{})
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("get bootstrap grant = %v, want NotFound; the grant outlived its restriction", err)
+			}
+		})
+	}
+}
+
+// TestMixedSitesShareBootstrapRestriction verifies that enabled and disabled
+// Sites plan the shared support set identically, so one pass dedupes it,
+// keeps the enabled Site's Deployment and grant, and removes only the
+// disabled Site's Deployment.
+func TestMixedSitesShareBootstrapRestriction(t *testing.T) {
+	deletes := map[string]int{}
+	cl := upgradeClient(t, "", deletes)
+	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	enabled := enabledSite()
+	enabled.Name = "rack-b"
+
+	exec, err := env.Execute(t.Context(), passPlan(t, env, disabledSite("rack-a"), enabled))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if err := exec.Err(); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+
+	if n := deletes["ClusterRoleBinding/"+BootstrapMachineBindingName]; n != 0 {
+		t.Fatalf("bootstrap grant deleted %d times, want 0", n)
+	}
+
+	if n := deletes["Deployment/"+DeploymentName("rack-a")]; n != 1 {
+		t.Fatalf("disabled Site Deployment deleted %d times, want 1", n)
+	}
+
+	if n := deletes["Deployment/"+DeploymentName("rack-b")]; n != 0 {
+		t.Fatalf("enabled Site Deployment deleted %d times, want 0", n)
 	}
 }

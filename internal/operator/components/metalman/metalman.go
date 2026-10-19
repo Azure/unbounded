@@ -55,36 +55,7 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 
 	plan := component.NewPlan()
 
-	// The executor ranks RBAC and Deployments ahead of admission policies, so
-	// without an explicit dependency the bootstrap grant and the token-minting
-	// Deployment would go live before the policy that restricts them, and stay
-	// live if the policy failed to apply.
-	restriction := admissionRefs(support)
-
-	for _, obj := range support {
-		op := component.Operation{
-			Kind:      component.OpApply,
-			Object:    obj,
-			Component: c.Name(),
-			Site:      site.Name,
-			SharedKey: sharedSupportKey(obj),
-		}
-		if obj.GetKind() == "ClusterRoleBinding" && obj.GetName() == BootstrapMachineBindingName {
-			// An earlier release may already have installed the grant, so
-			// skipping the apply is not enough: revoke it until the
-			// restriction is back.
-			op.DependsOn = restriction
-			op.RevokeOnDependencyFailure = true
-		}
-
-		plan.Add(op)
-	}
-
-	// Remove RBAC that earlier releases installed and that is now unsafe to
-	// keep. Deletes are idempotent, so they run on every pass.
-	for _, op := range staleSupportDeletes(c.Name(), site.Name) {
-		plan.Add(op)
-	}
+	restriction := addSupportOps(plan, support, c.Name(), site.Name)
 
 	plan.Add(component.Operation{
 		Kind:        component.OpApply,
@@ -103,6 +74,45 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 // be applied until the admission policy restricting that access is in place.
 const BootstrapMachineBindingName = "metalman:bootstrap-machine"
 
+// addSupportOps adds the shared support RBAC, the admission restriction, and
+// the stale RBAC deletes to plan, and returns the admission refs that anything
+// relying on the restriction must depend on. Plan and CleanupPlan emit the same
+// operations, so the shared keys dedupe whether a Site is enabled or not.
+func addSupportOps(plan *component.Plan, support []*unstructured.Unstructured, componentName, site string) []component.ObjectRef {
+	// The executor ranks RBAC and Deployments ahead of admission policies, so
+	// without an explicit dependency the bootstrap grant and the token-minting
+	// Deployment would go live before the policy that restricts them, and stay
+	// live if the policy failed to apply.
+	restriction := admissionRefs(support)
+
+	for _, obj := range support {
+		op := component.Operation{
+			Kind:      component.OpApply,
+			Object:    obj,
+			Component: componentName,
+			Site:      site,
+			SharedKey: sharedSupportKey(obj),
+		}
+		if obj.GetKind() == "ClusterRoleBinding" && obj.GetName() == BootstrapMachineBindingName {
+			// An earlier release may already have installed the grant, so
+			// skipping the apply is not enough: revoke it until the
+			// restriction is back.
+			op.DependsOn = restriction
+			op.RevokeOnDependencyFailure = true
+		}
+
+		plan.Add(op)
+	}
+
+	// Remove RBAC that earlier releases installed and that is now unsafe to
+	// keep. Deletes are idempotent, so they run on every pass.
+	for _, op := range staleSupportDeletes(componentName, site) {
+		plan.Add(op)
+	}
+
+	return restriction
+}
+
 // admissionRefs returns the refs of the admission policy objects in support.
 func admissionRefs(support []*unstructured.Unstructured) []component.ObjectRef {
 	var refs []component.ObjectRef
@@ -118,19 +128,23 @@ func admissionRefs(support []*unstructured.Unstructured) []component.ObjectRef {
 }
 
 // CleanupPlan removes the per-site metalman Deployment. The shared metalman
-// RBAC is left in place; it is harmless when unreferenced and may still be used
-// by other sites. RBAC that is no longer shipped is still removed because it
-// is never safe to keep.
+// RBAC is kept because other Sites may use it, and bootstrap tokens minted
+// earlier stay valid after the Deployment is gone. The shared support set is
+// therefore planned exactly as in Plan: the admission restriction is applied,
+// the retained bootstrap grant is revoked if the restriction fails, and RBAC
+// that is no longer shipped is removed.
 func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
 	plan := component.NewPlan()
 	plan.Add(component.DeleteOperation(&appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace},
 	}, c.Name(), site.Name))
-
-	for _, op := range staleSupportDeletes(c.Name(), site.Name) {
-		plan.Add(op)
-	}
+	addSupportOps(plan, support, c.Name(), site.Name)
 
 	return plan, component.Disabled("component disabled"), nil
 }
