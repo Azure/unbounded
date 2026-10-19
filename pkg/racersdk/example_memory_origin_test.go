@@ -13,7 +13,7 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-func TestExampleMemoryOriginRanges4210611540(t *testing.T) {
+func TestExampleMemoryOriginRanges(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		content string

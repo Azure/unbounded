@@ -12,8 +12,8 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// Workspace members use the root lock. Explicit relative members make partial
-// workspaces independent of future crates; missing declared inputs fail closed.
+// Workspace members use the root lock. Only explicitly declared relative members
+// are read; missing declared inputs fail closed.
 func workspaceVersions(root string) (map[string]string, error) {
 	base := filepath.Join(root, cratePath)
 

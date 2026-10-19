@@ -56,7 +56,14 @@ func createSession(ctx context.Context, httpClient *http.Client, baseURL, user, 
 		return "", "", redfishResponseError(http.MethodPost, "/redfish/v1/SessionService/Sessions", resp.StatusCode, body, nil)
 	}
 
-	io.Copy(io.Discard, resp.Body) //nolint:errcheck // Best-effort drain of response body.
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+
+	if err := checkCompletion(data); err != nil {
+		return "", "", redfishResponseError(http.MethodPost, "/redfish/v1/SessionService/Sessions", resp.StatusCode, data, err)
+	}
 
 	token = resp.Header.Get("X-Auth-Token")
 	if token == "" {
@@ -74,7 +81,7 @@ func createSession(ctx context.Context, httpClient *http.Client, baseURL, user, 
 func (s *bmcSession) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
 	data, status, err := s.doOnce(ctx, method, path, body)
 	if err != nil {
-		return nil, 0, err
+		return data, status, err
 	}
 
 	// If the session token expired, re-authenticate and retry once.
@@ -131,6 +138,12 @@ func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("reading Redfish %s %s response body: %w", method, path, err)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := checkCompletion(data); err != nil {
+			return data, resp.StatusCode, redfishResponseError(method, path, resp.StatusCode, data, err)
+		}
 	}
 
 	return data, resp.StatusCode, nil

@@ -336,8 +336,8 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 		// The endpoint and reaper flag are cluster policy and are preserved across
 		// reinstalls; the image registry is a build-artifact locator and is not.
 		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
-		previousImageRegistry = data["UNBOUNDED_IMAGE_REGISTRY"]
 
+		previousImageRegistry = data["UNBOUNDED_IMAGE_REGISTRY"]
 		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
 			parsed, err := strconv.ParseBool(value)
 			if err != nil {

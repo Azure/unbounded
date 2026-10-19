@@ -59,8 +59,10 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import datetime
 import functools
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -70,13 +72,17 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable
+from xml.etree import ElementTree
 
 import ukiboot
 
@@ -1585,6 +1591,10 @@ class HostImage:
     # Credential needed to read the image, for sources that are not public.
     auth: str = ""
 
+    # A shared gallery image version to export, for an image that is published
+    # nowhere it can be downloaded from; see export_gallery_image.
+    gallery: str = ""
+
 
 def host_image() -> HostImage:
     """Return the selected host image.
@@ -1648,10 +1658,35 @@ def host_image() -> HostImage:
     )
 
 
-# Azure Container Linux publishes no image to a public mirror, so the harness
-# resolves one from a manifest in the storage account that builds it. The
-# manifest names the blob, its size and its sha256, which is what lets the
-# download be verified and named for its build.
+# Azure Container Linux publishes no image to a public mirror. ACL_IMAGE_SOURCE
+# chooses where the harness gets one:
+#
+#   gallery   (default) the Azure build of the image in a shared compute
+#             gallery, exported through a temporary managed disk; see
+#             export_gallery_image.
+#   manifest  the generic build in the storage account that builds it, through
+#             a manifest that names the blob, its size and its sha256.
+#
+# HOST_IMAGE_PATH, a local file, takes precedence over both.
+ACL_IMAGE_SOURCES = ("gallery", "manifest")
+ACL_IMAGE_SOURCE = os.environ.get("ACL_IMAGE_SOURCE", "gallery")
+
+# The gallery source. The version is "latest" unless ACL_IMAGE_VERSION pins one;
+# resolve-host-image exports the one it resolved, so CI uses one per job. The
+# image is replicated to one region, which is where the disk has to be made.
+ACL_IMAGE_GALLERY_IMAGE = os.environ.get(
+    "ACL_IMAGE_GALLERY_IMAGE",
+    "/SharedGalleries/b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL/Images/acl-1es-eval",
+)
+ACL_IMAGE_GALLERY_LOCATION = os.environ.get("ACL_IMAGE_GALLERY_LOCATION", "westus2")
+ACL_IMAGE_VERSION = os.environ.get("ACL_IMAGE_VERSION", "")
+# Where the export's temporary disk is created, and the subscription to use if
+# not the az default.
+ACL_IMAGE_RESOURCE_GROUP = os.environ.get("ACL_IMAGE_RESOURCE_GROUP", "")
+ACL_IMAGE_SUBSCRIPTION = os.environ.get("ACL_IMAGE_SUBSCRIPTION", "")
+ACL_GALLERY_IMAGE_PATTERN = re.compile(r"/SharedGalleries/([^/]+)/Images/([^/]+)")
+
+# The manifest source.
 ACL_IMAGE_MANIFEST_URL = os.environ.get(
     "ACL_IMAGE_MANIFEST_URL",
     "https://aksflexaclimagestme.blob.core.windows.net/images/latest.json",
@@ -1683,7 +1718,7 @@ def acl_host_image() -> HostImage:
             die(f"HOST_IMAGE_PATH does not exist: {path}")
         url, file_name, digest = f"file://{Path(path).resolve()}", Path(path).name, ""
     else:
-        # Filled in by resolved_host_image: naming the blob needs the manifest,
+        # Filled in by resolved_host_image: naming the image needs a lookup,
         # and host_image is called at import.
         url, file_name, digest = "", "", ""
 
@@ -1697,8 +1732,85 @@ def acl_host_image() -> HostImage:
         packages=[],
         provisioning="ignition",
         sha256=digest,
-        auth="" if path else "azure-storage",
     )
+
+
+def acl_image_source() -> str:
+    """Return the configured source, refusing settings that belong to the
+    other one: they would otherwise be ignored, and the run would boot an
+    image other than the one asked for."""
+    if ACL_IMAGE_SOURCE not in ACL_IMAGE_SOURCES:
+        die(f"ACL_IMAGE_SOURCE={ACL_IMAGE_SOURCE!r} is not one of {', '.join(ACL_IMAGE_SOURCES)}")
+    if ACL_IMAGE_SOURCE == "gallery" and any((ACL_IMAGE_URL, ACL_IMAGE_SHA256, ACL_IMAGE_BUILD_ID)):
+        die("ACL_IMAGE_URL, ACL_IMAGE_SHA256 and ACL_IMAGE_BUILD_ID select a manifest build; "
+            "set ACL_IMAGE_SOURCE=manifest to use them")
+    if ACL_IMAGE_SOURCE == "manifest" and ACL_IMAGE_VERSION:
+        die("ACL_IMAGE_VERSION selects a gallery version; set ACL_IMAGE_SOURCE=gallery to use it")
+
+    return ACL_IMAGE_SOURCE
+
+
+# Compute api-version for sharedGalleries lookups, pinned to one Azure lists as
+# supported in every region rather than whatever the runner's az CLI defaults to.
+ACL_SHARED_GALLERY_API_VERSION = "2024-03-03"
+
+
+def acl_gallery_image() -> tuple[str, str]:
+    """Return the gallery's unique name and the image definition."""
+    match = ACL_GALLERY_IMAGE_PATTERN.fullmatch(ACL_IMAGE_GALLERY_IMAGE)
+    if not match:
+        die(f"ACL_IMAGE_GALLERY_IMAGE={ACL_IMAGE_GALLERY_IMAGE!r} is not "
+            "/SharedGalleries/<gallery>/Images/<image>")
+        raise AssertionError("unreachable")
+
+    return match.group(1), match.group(2)
+
+
+@functools.cache
+def acl_gallery_version() -> str:
+    """Return the gallery image version to boot: ACL_IMAGE_VERSION, or the one
+    "latest" names now. It names the image file in VM_DIR, so a newer version
+    is picked up without a code change and never masked by an earlier export."""
+    version = ACL_IMAGE_VERSION
+    if not version:
+        gallery, image = acl_gallery_image()
+        # az rest with a pinned api-version, not az sig image-version
+        # show-shared: newer az CLIs call an api-version that Azure has not
+        # rolled out for sharedGalleries in every region, which fails with
+        # NoRegisteredProviderFound. The service resolves "latest" itself.
+        subscription = urllib.parse.quote(ACL_IMAGE_SUBSCRIPTION, safe="") or "{subscriptionId}"
+        path = "/".join(urllib.parse.quote(part, safe="") for part in (
+            ACL_IMAGE_GALLERY_LOCATION, "sharedGalleries", gallery, "images", image, "versions", "latest"))
+        version = acl_az([
+            "rest", "--method", "get",
+            "--url", f"https://management.azure.com/subscriptions/{subscription}/providers/"
+                     f"Microsoft.Compute/locations/{path}?api-version={ACL_SHARED_GALLERY_API_VERSION}",
+            "--query", "name", "-o", "tsv",
+        ], subscription=False)
+        log(f"Azure Container Linux gallery version {version} is the latest of {ACL_IMAGE_GALLERY_IMAGE}")
+
+    _check_acl_build_id(version, "ACL_IMAGE_VERSION" if ACL_IMAGE_VERSION else "the gallery's latest version")
+
+    return version
+
+
+def acl_az(args: list[str], subscription: bool = True) -> str:
+    """Run az for the gallery source and return its output. A failure reports
+    az's own error, which never holds a SAS: only grant-access prints one, to
+    stdout."""
+    try:
+        return capture(_acl_az_command(args, subscription))
+    except subprocess.CalledProcessError as exc:
+        die(f"az {' '.join(args[:3])} failed (exit {exc.returncode}): {(exc.stderr or '').strip()[-2000:]}")
+        raise AssertionError("unreachable") from exc
+
+
+def _acl_az_command(args: list[str], subscription: bool = True) -> list[str]:
+    """az rest takes no --subscription; its URL names the subscription."""
+    if not subscription:
+        return ["az", *args, "--only-show-errors"]
+    subscription = ["--subscription", ACL_IMAGE_SUBSCRIPTION] if ACL_IMAGE_SUBSCRIPTION else []
+    return ["az", *args, *subscription, "--only-show-errors"]
 
 
 @functools.cache
@@ -1764,16 +1876,22 @@ def resolve_host_image() -> None:
     """Resolve the Azure Container Linux image once and export it.
 
     In GitHub Actions it is written to $GITHUB_ENV, so every later e2e.py
-    process in the job uses the same build instead of reading the manifest
-    again. CI downloads the image on every run rather than caching it, since a
-    pull request from a fork can restore the base branch's Actions caches.
+    process in the job uses the same build or gallery version instead of
+    resolving it again. CI downloads or exports the image on every run rather
+    than caching it, since a pull request from a fork can restore the base
+    branch's Actions caches.
     """
     if HOST_BASE_OS != "acl":
         die("resolve-host-image only applies to HOST_BASE_OS=acl")
 
-    url, file_name, digest = acl_image_from_manifest()
-    build = file_name.removeprefix("acl-").removesuffix(".qcow2")
-    exports = f"ACL_IMAGE_URL={url}\nACL_IMAGE_SHA256={digest}\nACL_IMAGE_BUILD_ID={build}\n"
+    if acl_image_source() == "gallery":
+        version = acl_gallery_version()
+        exports = f"ACL_IMAGE_SOURCE=gallery\nACL_IMAGE_VERSION={version}\n"
+    else:
+        url, file_name, digest = acl_image_from_manifest()
+        build = file_name.removeprefix("acl-").removesuffix(".qcow2")
+        exports = (f"ACL_IMAGE_SOURCE=manifest\nACL_IMAGE_URL={url}\n"
+                   f"ACL_IMAGE_SHA256={digest}\nACL_IMAGE_BUILD_ID={build}\n")
 
     github_env = os.environ.get("GITHUB_ENV", "")
     if github_env:
@@ -1806,15 +1924,22 @@ def ubuntu_netplan_write_files() -> str:
 
 
 def resolved_host_image() -> HostImage:
-    """Return the host image with its download location filled in, which only
-    the places that fetch or open the image need."""
+    """Return the host image with its source filled in, which only the places
+    that fetch or open the image need."""
     image = host_image()
     if image.url:
         return image
 
+    if acl_image_source() == "gallery":
+        version = acl_gallery_version()
+        return replace(image, file_name=f"acl-gallery-{version}.qcow2",
+                       gallery=f"{ACL_IMAGE_GALLERY_IMAGE}/Versions/{version}")
+
     url, file_name, digest = acl_image_from_manifest()
 
-    return replace(image, url=url, file_name=file_name, sha256=digest)
+    # The account disables anonymous access and shared keys alike, so the
+    # image needs a token as well as the manifest.
+    return replace(image, url=url, file_name=file_name, sha256=digest, auth="azure-storage")
 
 
 # The SSH user is a property of the image, but SSH_TARGET is referenced as a
@@ -2084,6 +2209,20 @@ def initramfs_ip_karg() -> str:
             f"{IGNITION_INITRAMFS_INTERFACE}:none:8.8.8.8:8.8.4.4")
 
 
+# On the Azure platform the initramfs fetches the hostname from Azure's
+# metadata endpoint on the first boot, and retries it with no limit; under QEMU
+# nothing answers. The generic build of the image masks it already, the Azure
+# build does not. The harness writes /etc/hostname through Ignition instead.
+IGNITION_METADATA_HOSTNAME_MASK = "rd.systemd.mask=flatcar-metadata-hostname.service"
+
+
+def ignition_first_boot_kargs(config_url: str) -> str:
+    """Return what the harness adds to the first boot's command line: where
+    Ignition fetches its config, the initramfs address it fetches it over, and
+    the metadata hostname mask. None of it is needed on a later boot."""
+    return f"ignition.config.url={config_url} {initramfs_ip_karg()} {IGNITION_METADATA_HOSTNAME_MASK}"
+
+
 def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
     """Add what the harness needs to drive the VM, and keep the image's own intent.
 
@@ -2104,9 +2243,10 @@ def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -
     files = doc.setdefault("storage", {}).setdefault("files", [])
 
     # The node registers under the host's hostname, and this image leaves it as
-    # "localhost": it masks the metadata hostname service and has no cloud-init
-    # to apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so
-    # set the same thing here or the node joins under the wrong name.
+    # "localhost": the metadata hostname service is masked, by the generic
+    # build or by ignition_first_boot_kargs, and there is no cloud-init to
+    # apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so set
+    # the same thing here or the node joins under the wrong name.
     files.append({
         "path": "/etc/hostname",
         "mode": 0o644,
@@ -2147,8 +2287,9 @@ def ovmf_firmware() -> tuple[Path, Path]:
 
 def launch_ignition_vm(ignition_json: str) -> None:
     """Boot the VM through its own bootloader with an Ignition config in place.
-    The config source and the initramfs address go on the command line through a
-    patched UKI addon; see ukiboot for why the boot chain is left intact.
+    The config source and the initramfs address go on the first boot's command
+    line through the patched first-boot addon; see ukiboot for why the boot
+    chain is left intact.
     """
     _, vm_disk = _create_vm_disk()
 
@@ -2161,9 +2302,8 @@ def launch_ignition_vm(ignition_json: str) -> None:
     serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
     config_url = f"{serve_base}/{IGNITION_CONFIG_NAME}"
 
-    log(f"Patching the ESP boot command line in {vm_disk}...")
-    patched = ukiboot.patch_uki_cmdline_addon(
-        vm_disk, f"ignition.config.url={config_url} {initramfs_ip_karg()}")
+    log(f"Patching the ESP first-boot command line in {vm_disk}...")
+    patched = ukiboot.patch_firstboot_cmdline(vm_disk, ignition_first_boot_kargs(config_url))
     log(f"Patched {patched.addon} ({patched.used}/{patched.capacity} bytes)")
 
     code, vars_template = ovmf_firmware()
@@ -2273,21 +2413,299 @@ def acquire_host_image(image: HostImage) -> Path:
         log(f"Using existing image: {image_file}")
     else:
         if image_file.exists():
-            log(f"{image_file} does not match its published sha256; downloading it again")
+            log(f"{image_file} does not match its published sha256; replacing it")
             image_file.unlink()
-        log(f"Downloading {HOST_BASE_OS} host image...")
-        # Downloaded under another name and renamed only once verified, so an
+        # Made under another name and renamed only once verified, so an
         # interrupted download never sits under the name that is trusted.
         partial = image_file.with_name(image_file.name + ".part")
         partial.unlink(missing_ok=True)
-        download_file(image.url, partial, auth=image.auth)
-        if image.sha256:
-            verify_sha256(partial, image.sha256)
+        if image.gallery:
+            export_gallery_image(image.gallery, partial)
+        else:
+            log(f"Downloading {HOST_BASE_OS} host image...")
+            download_file(image.url, partial, auth=image.auth)
+            if image.sha256:
+                verify_sha256(partial, image.sha256)
         partial.replace(image_file)
 
     run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
 
     return image_file
+
+
+# The gallery export's temporary disks carry this tag, and only disks with it
+# are ever swept.
+ACL_EXPORT_DISK_TAG = "unbounded-acl-e2e"
+# A disk older than this was left by a job that is gone: a canceled job does
+# not run its cleanup. It is far longer than any job, so a running export is
+# never touched.
+ACL_EXPORT_STALE_AFTER = 6 * 3600
+# The download takes seconds in CI and under a minute locally, and the SAS is
+# revoked as soon as it ends; this only bounds a SAS that outlives a dead job.
+ACL_EXPORT_SAS_SECONDS = 600
+ACL_EXPORT_CHUNK = 8 << 20
+ACL_EXPORT_WORKERS = 16
+VHD_FOOTER_SIZE = 512
+
+
+def export_gallery_image(version_id: str, destination: Path) -> None:
+    """Write a shared gallery image version to destination as qcow2.
+
+    A gallery image cannot be downloaded as such. It is copied to a temporary
+    managed disk in ACL_IMAGE_RESOURCE_GROUP and read through a read-only SAS,
+    and the disk is deleted whether or not that worked. Only the pages the disk
+    has written are fetched, about 850 MiB of a 32.5 GiB disk, into a sparse
+    fixed VHD, which is the raw disk followed by a footer.
+
+    The footer is cut off and the raw disk converted, rather than the VHD.
+    qemu-img before 10.0 sizes a VHD Azure wrote from its CHS geometry, not
+    its footer's size, and loses 640 KiB off the end of this one, and with it
+    the GPT's backup header; the guest then finds no partitions at all. Ubuntu
+    24.04 ships 8.2. The qcow2 has to come out at the disk's exact size,
+    whatever qemu-img the host has.
+
+    The gallery publishes no digest to check the result against. The transfer
+    is TLS from Azure, the VHD footer and the qcow2 are checked, and the
+    qcow2's sha256 is logged.
+    """
+    if not ACL_IMAGE_RESOURCE_GROUP:
+        die("ACL_IMAGE_RESOURCE_GROUP must name the resource group, in "
+            f"{ACL_IMAGE_GALLERY_LOCATION}, where the gallery image is exported")
+
+    sweep_stale_export_disks()
+
+    run_label = os.environ.get("GITHUB_RUN_ID", "local")
+    disk = f"{ACL_EXPORT_DISK_TAG}-{run_label}-{secrets.token_hex(3)}"
+    vhd = destination.with_name(destination.name + ".vhd")
+    started = time.monotonic()
+    log(f"Exporting {version_id} through disk {disk} in {ACL_IMAGE_RESOURCE_GROUP}...")
+
+    try:
+        try:
+            acl_az(["disk", "create", "-g", ACL_IMAGE_RESOURCE_GROUP, "-n", disk,
+                    "--location", ACL_IMAGE_GALLERY_LOCATION, "--sku", "Standard_LRS",
+                    "--gallery-image-reference", version_id,
+                    "--tags", f"purpose={ACL_EXPORT_DISK_TAG}", f"run={run_label}",
+                    "--query", "id", "-o", "tsv"])
+            try:
+                download_page_blob(_grant_export_sas(disk), vhd)
+            finally:
+                # Azure does not delete a disk while a SAS on it is active.
+                _acl_az_best_effort(["disk", "revoke-access", "-g", ACL_IMAGE_RESOURCE_GROUP, "-n", disk],
+                                    f"revoke access to disk {disk}")
+        finally:
+            _acl_az_best_effort(["disk", "delete", "-g", ACL_IMAGE_RESOURCE_GROUP, "-n", disk, "--yes"],
+                                f"delete disk {disk}")
+
+        log("Converting the exported disk to qcow2...")
+        disk_bytes = vhd.stat().st_size - VHD_FOOTER_SIZE
+        os.truncate(vhd, disk_bytes)
+        run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(vhd), str(destination)])
+        run(["qemu-img", "check", "-f", "qcow2", str(destination)])
+        info = json.loads(capture(["qemu-img", "info", "-f", "qcow2", "--output=json", str(destination)]))
+        if info.get("virtual-size") != disk_bytes:
+            raise RuntimeError(f"the qcow2 is {info.get('virtual-size')} bytes, the disk {disk_bytes}")
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        destination.unlink(missing_ok=True)
+        die(f"exporting {version_id} failed: {exc}")
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        vhd.unlink(missing_ok=True)
+
+    log(f"Exported {version_id} in {time.monotonic() - started:.0f}s: {destination.stat().st_size} bytes, "
+        f"sha256 {file_sha256(destination)}")
+
+
+def _grant_export_sas(disk: str) -> str:
+    """Return a read SAS on the disk. It goes nowhere but this process's own
+    requests, and is masked in GitHub's log in case anything prints it."""
+    granted = json.loads(acl_az([
+        "disk", "grant-access", "-g", ACL_IMAGE_RESOURCE_GROUP, "-n", disk,
+        "--access-level", "Read", "--duration-in-seconds", str(ACL_EXPORT_SAS_SECONDS), "-o", "json",
+    ]))
+    sas = granted.get("accessSas") or granted.get("accessSAS") or ""
+    if not sas.startswith("https://"):
+        die(f"grant-access on disk {disk} returned no SAS")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        for secret in sas_secrets(sas):
+            print(f"::add-mask::{secret}", flush=True)
+
+    return sas
+
+
+def sas_secrets(sas: str) -> list[str]:
+    """Return what to mask for a SAS: the whole URL, and its signature on its
+    own, both as the URL carries it, percent-encoded, and decoded. Either form
+    of the signature is all an error that prints part of the URL, or the URL
+    decoded, would need to leak; GitHub masks only exact matches."""
+    query = urllib.parse.urlsplit(sas).query
+    encoded = [value for key, _, value in (part.partition("=") for part in query.split("&")) if key == "sig"]
+    decoded = urllib.parse.parse_qs(query).get("sig", [])
+
+    return list(dict.fromkeys(secret for secret in [sas, *encoded, *decoded] if secret))
+
+
+def _acl_az_best_effort(args: list[str], what: str) -> str | None:
+    """Run az for cleanup, which must not fail the run: whatever it leaves, the
+    next export's sweep removes."""
+    try:
+        return capture(_acl_az_command(args))
+    except subprocess.CalledProcessError as exc:
+        # Through warn(), which escapes it: az's stderr is not ours, and a line
+        # break in it would otherwise start a workflow command.
+        warn(f"could not {what}: {(exc.stderr or '').strip()[-500:]}")
+        return None
+
+
+def sweep_stale_export_disks(now: float | None = None) -> None:
+    """Delete export disks that jobs which are gone left behind."""
+    listed = _acl_az_best_effort([
+        "disk", "list", "-g", ACL_IMAGE_RESOURCE_GROUP,
+        "--query", f"[?tags.purpose=='{ACL_EXPORT_DISK_TAG}'].{{name:name,created:timeCreated,state:diskState}}",
+        "-o", "json",
+    ], "list earlier export disks")
+    if listed is None:
+        return
+
+    cutoff = (time.time() if now is None else now) - ACL_EXPORT_STALE_AFTER
+    for disk in json.loads(listed or "[]"):
+        # A disk whose age is unknown is left alone: it could be a running
+        # export's. The sweep is cleanup, and must not fail the export.
+        try:
+            created = _azure_timestamp(disk["created"])
+        except (KeyError, TypeError, ValueError):
+            warn(f"not sweeping export disk {disk.get('name')!r}: its creation time {disk.get('created')!r} "
+                 "cannot be read")
+            continue
+        if created > cutoff:
+            continue
+        log(f"Deleting export disk {disk['name']}, created {disk['created']} by an earlier job")
+        if disk.get("state") == "ActiveSAS":
+            _acl_az_best_effort(["disk", "revoke-access", "-g", ACL_IMAGE_RESOURCE_GROUP, "-n", disk["name"]],
+                                f"revoke access to disk {disk['name']}")
+        _acl_az_best_effort(["disk", "delete", "-g", ACL_IMAGE_RESOURCE_GROUP, "-n", disk["name"], "--yes"],
+                            f"delete disk {disk['name']}")
+
+
+def _azure_timestamp(text: str) -> float:
+    """Parse an ARM timestamp, which can carry seven fractional digits."""
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text).replace("Z", "+00:00")
+    return datetime.datetime.fromisoformat(text).timestamp()
+
+
+BlobFetch = Callable[[str, dict[str, str]], tuple[bytes, dict[str, str]]]
+
+
+def download_page_blob(sas: str, destination: Path, fetch: BlobFetch | None = None) -> None:
+    """Download the written pages of a page blob, such as a managed disk read
+    through its SAS, into a sparse file of the blob's size.
+
+    The SAS never leaves this process: it is on no command line, and no error
+    raised here names it.
+    """
+    fetch = fetch or _blob_request
+    ranges: list[tuple[int, int]] = []
+    marker = ""
+    size = 0
+    while True:
+        query = "&comp=pagelist" + (f"&marker={urllib.parse.quote(marker)}" if marker else "")
+        body, headers = fetch(sas + query, {})
+        size = int(headers.get("x-ms-blob-content-length", "0"))
+        root = ElementTree.fromstring(body)
+        ranges += [(int(r.findtext("Start") or 0), int(r.findtext("End") or 0)) for r in root.findall("PageRange")]
+        marker = root.findtext("NextMarker") or ""
+        if not marker:
+            break
+
+    if size < VHD_FOOTER_SIZE:
+        raise RuntimeError(f"the exported disk reports a size of {size} bytes")
+    chunks = page_chunks(ranges)
+    total = sum(stop - start + 1 for start, stop in chunks)
+    log(f"Downloading {total >> 20} MiB written in a {size >> 20} MiB disk...")
+
+    started = time.monotonic()
+    lock = threading.Lock()
+    fetched = [0, 0]
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.ftruncate(fd, size)
+
+        def fetch_chunk(chunk: tuple[int, int]) -> None:
+            start, stop = chunk
+            data, _headers = fetch(sas, {"Range": f"bytes={start}-{stop}"})
+            if len(data) != stop - start + 1:
+                raise RuntimeError(f"read {len(data)} bytes at offset {start}, expected {stop - start + 1}")
+            # The file is sparse, so a zero chunk is already there.
+            if data.count(0) != len(data):
+                os.pwrite(fd, data, start)
+            with lock:
+                fetched[0] += len(data)
+                step = total // 10 or 1
+                if fetched[0] // step != fetched[1]:
+                    fetched[1] = fetched[0] // step
+                    log(f"  {fetched[0] >> 20} of {total >> 20} MiB")
+
+        with concurrent.futures.ThreadPoolExecutor(ACL_EXPORT_WORKERS) as pool:
+            futures = [pool.submit(fetch_chunk, chunk) for chunk in chunks]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    elapsed = time.monotonic() - started
+    log(f"Downloaded {total >> 20} MiB in {elapsed:.0f}s ({total / max(elapsed, 0.001) / (1 << 20):.0f} MiB/s)")
+    check_fixed_vhd(destination, size)
+
+
+def page_chunks(ranges: list[tuple[int, int]], chunk: int = ACL_EXPORT_CHUNK) -> list[tuple[int, int]]:
+    """Split inclusive page ranges into inclusive ranges of at most chunk bytes."""
+    out = []
+    for start, end in ranges:
+        while start <= end:
+            stop = min(end, start + chunk - 1)
+            out.append((start, stop))
+            start = stop + 1
+    return out
+
+
+def check_fixed_vhd(path: Path, size: int) -> None:
+    """Fail unless path ends in the footer of a fixed VHD of its size, which is
+    what a managed disk is and what qemu-img's vpc driver reads."""
+    with path.open("rb") as handle:
+        handle.seek(size - VHD_FOOTER_SIZE)
+        footer = handle.read(VHD_FOOTER_SIZE)
+    cookie, current, kind = footer[:8], int.from_bytes(footer[48:56], "big"), int.from_bytes(footer[60:64], "big")
+    if cookie != b"conectix" or kind != 2 or current != size - VHD_FOOTER_SIZE:
+        raise RuntimeError(f"the exported disk is not a fixed VHD of {size} bytes "
+                           f"(cookie {cookie!r}, type {kind}, size {current})")
+
+
+def _blob_request(url: str, headers: dict[str, str]) -> tuple[bytes, dict[str, str]]:
+    """GET from blob storage, retrying what may pass. Errors name the status or
+    the failure, never the URL, which carries the SAS."""
+    request = urllib.request.Request(url, headers={"x-ms-version": "2021-12-02", **headers})
+    attempts = 5
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.read(), {k.lower(): v for k, v in response.headers.items()}
+        except urllib.error.HTTPError as exc:
+            if (exc.code < 500 and exc.code != 429) or attempt == attempts:
+                raise RuntimeError(f"blob storage answered HTTP {exc.code} {exc.reason}") from None
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+            if attempt == attempts:
+                raise RuntimeError(f"blob storage request failed: {type(exc).__name__}") from None
+        time.sleep(2 * attempt)
+
+    raise AssertionError("unreachable")
 
 
 def create_vm() -> None:
@@ -3857,6 +4275,40 @@ def wait_for_nspawn_machine(machine: str, timeout_secs: int = 300) -> None:
     die(f"timed out waiting for nspawn machine '{machine}' after host reboot")
 
 
+def wait_for_machine_shell_success(
+    machine: str,
+    command: str,
+    description: str,
+    timeout_secs: int = 180,
+    interval_secs: int = 3,
+) -> None:
+    """Poll *command* inside *machine* until it succeeds or the deadline passes."""
+
+    log(f"Waiting until {description} (timeout: {timeout_secs}s)...")
+    deadline = time.monotonic() + timeout_secs
+    attempt = 0
+    last_error = ""
+    while True:
+        attempt += 1
+        result = machine_shell_quiet(machine, command)
+        if result.returncode == 0:
+            log(f"Confirmed {description} after {attempt} attempt(s)")
+            return
+        last_error = (
+            f"exit {result.returncode}; stdout={result.stdout.strip()!r}; "
+            f"stderr={result.stderr.strip()!r}"
+        )
+        log(f"  attempt {attempt}: {description} not yet true ({last_error})")
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval_secs)
+
+    die(
+        f"timed out after {timeout_secs}s and {attempt} attempt(s) waiting until "
+        f"{description} in nspawn machine '{machine}'; last error: {last_error}"
+    )
+
+
 def validate_device_refresh_after_host_reboot() -> None:
     """Verify a device appearing during host boot is usable inside nspawn."""
 
@@ -3928,10 +4380,15 @@ EOF
 
     # The manager property verifies the service-level permission was reloaded;
     # reading the device verifies that the refreshed bind is usable in nspawn.
-    machine_shell(
+    # `machinectl show` succeeds as soon as nspawn registers the machine, and
+    # the node's Ready condition can still be the stale pre-reboot value, so
+    # the container's init may not accept `machinectl shell` yet. Poll the
+    # in-container check instead of running it once.
+    wait_for_machine_shell_success(
         machine,
         f"test -c {DEVICE_REFRESH_PATH} && "
         f"dd if={DEVICE_REFRESH_PATH} of=/dev/null bs=1 count=1 status=none",
+        "refreshed device is usable inside nspawn",
     )
 
     log("Device discovery refresh after VM host reboot validated")
@@ -5222,6 +5679,63 @@ def _daemon_executable() -> str:
     ).stdout.strip()
 
 
+def _daemon_process() -> tuple[str, str]:
+    """Return the daemon unit's main PID and its resolved executable, or "" for
+    each that cannot be read."""
+
+    out = ssh_capture_quiet(
+        "sudo sh -c 'pid=$(systemctl show -p MainPID --value unbounded-agent-daemon.service); "
+        'echo "$pid"; [ "${pid:-0}" -gt 0 ] && readlink -f /proc/$pid/exe\''
+    ).stdout.split()
+    pid = out[0] if out and out[0] != "0" else ""
+    return pid, out[1] if len(out) > 1 else ""
+
+
+def restarted_in_place_problem(pid_before: str, pid_after: str, exe_after: str, current: str) -> str:
+    """Why a daemon an AgentUpgrade staged a binary for did not restart in
+    place, or "" if it did: it must keep its PID and run the new current slot.
+    The daemon re-executes itself rather than letting systemd restart it, so a
+    new PID means it fell back to exiting, or systemd restarted it for another
+    reason. Slots are compared by name: on a linked host, the daemon the
+    upgrade starts may move the files to the host root, and the same slot then
+    has a new path."""
+    if not pid_before or pid_after != pid_before:
+        return (f"the daemon's PID went from {pid_before or 'none'} to {pid_after or 'none'}; "
+                "it did not restart in place")
+    if not exe_after or os.path.basename(exe_after) != os.path.basename(current):
+        return f"the daemon runs {exe_after!r}, not the current slot {current!r}"
+    return ""
+
+
+# Logged by the daemon command when it re-executes, and when it falls back to
+# exiting for systemd to restart it; see cmd/agent/internal/cmd/daemon.go.
+DAEMON_REEXEC_LOG = "re-executing the daemon in place"
+DAEMON_REEXEC_FALLBACK_LOGS = ("could not re-execute the daemon", "could not resolve the daemon unit's binary")
+
+
+def reexec_journal_problem(journal: str, binary_dir: str) -> str:
+    """Why the daemon's current systemd invocation does not show it re-executing
+    in place into *binary_dir*, or "" if it does. A restart by systemd starts a
+    new invocation, so a re-execution logged in the current one happened in
+    place."""
+    for fallback in DAEMON_REEXEC_FALLBACK_LOGS:
+        if fallback in journal:
+            return f"the daemon fell back to a systemd restart: {fallback!r} in its journal"
+    for line in journal.splitlines():
+        if DAEMON_REEXEC_LOG in line and f"path={binary_dir}/" in line:
+            return ""
+    return f"the daemon's current invocation has no {DAEMON_REEXEC_LOG!r} into {binary_dir}"
+
+
+def _daemon_invocation_journal() -> str:
+    """Return the journal of the daemon unit's current systemd invocation."""
+
+    return ssh_capture_quiet(
+        "sudo sh -c 'id=$(systemctl show -p InvocationID --value unbounded-agent-daemon.service); "
+        '[ -n "$id" ] && journalctl --no-pager -o cat _SYSTEMD_INVOCATION_ID="$id"\''
+    ).stdout
+
+
 def validate_host_root_moved() -> None:
     """Assert a host an older agent installed has been moved to the host root.
 
@@ -5239,6 +5753,10 @@ def validate_host_root_moved() -> None:
     log("Waiting for the daemon to run from the host root...")
     _wait_until(lambda: "" if (executable := _daemon_executable()).startswith(f"{DAEMON_BIN_DIR}/")
                 else f"daemon runs {executable!r}, not a binary under {DAEMON_BIN_DIR}", 180)
+
+    # The move's restart, like an AgentUpgrade's, re-executes in place.
+    if problem := reexec_journal_problem(_daemon_invocation_journal(), DAEMON_BIN_DIR):
+        die(problem)
 
     validate_host_root()
     log(f"The agent's files moved from {LEGACY_HOST_ROOT} to {HOST_ROOT}")
@@ -5335,8 +5853,13 @@ def validate_agent_downgrade_to_legacy() -> None:
 # ---------------------------------------------------------------------------
 # validate-agent-upgrade-operation
 # ---------------------------------------------------------------------------
-def validate_agent_upgrade_operation() -> None:
-    """Validate AgentUpgrade stages a new daemon binary and updates symlinks."""
+def validate_agent_upgrade_operation(in_place: bool = True) -> None:
+    """Validate AgentUpgrade stages a new daemon binary and updates symlinks.
+
+    With *in_place*, the daemon that performs the upgrade must also restart in
+    place: the same process, running the new binary. An agent released before
+    that asks systemd to restart it instead, so the migration suite turns it off
+    for the upgrades such an agent performs."""
 
     operation_name = f"e2e-agent-upgrade-{int(time.time())}"
     root_before = host_root_state()
@@ -5344,6 +5867,7 @@ def validate_agent_upgrade_operation() -> None:
     if not before_current:
         die("daemon current binary symlink target was empty")
     log(f"Current daemon binary before upgrade: {before_current}")
+    pid_before = _daemon_process()[0] if in_place else ""
 
     tarball = VM_DIR / "unbounded-agent-upgrade-good.tar.gz"
     _build_agent_upgrade_tarball(tarball)
@@ -5373,6 +5897,12 @@ def validate_agent_upgrade_operation() -> None:
         die(f"AgentUpgrade did not switch the daemon current symlink (still points to {after_current})")
     if slot(last_good) != slot(before_current):
         die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
+
+    if in_place:
+        pid_after, exe_after = _daemon_process()
+        if problem := restarted_in_place_problem(pid_before, pid_after, exe_after, after_current):
+            die(problem)
+        log(f"The daemon restarted in place as PID {pid_after}, running {exe_after}")
 
     log("============================================")
     log("  AgentUpgrade operation validation PASSED")
@@ -5971,10 +6501,10 @@ SUITES: dict[str, list[str]] = {
     # A host installed before the host root, linked and then moved; see README.
     # Files staged beside the host root before the install must survive each
     # change to it.
-    "migration": ["stage-host-files", "run-legacy-agent", "wait-for-node", "validate-agent-upgrade-operation",
+    "migration": ["stage-host-files", "run-legacy-agent", "wait-for-node", "validate-agent-upgrade-from-legacy",
                   "validate-host-root-linked", "validate-host-staged-files", "validate-host-reboot",
                   "validate-host-root-linked", "validate-agent-downgrade-to-legacy",
-                  "validate-agent-upgrade-operation", "validate-host-root-linked",
+                  "validate-agent-upgrade-from-legacy", "validate-host-root-linked",
                   "validate-agent-upgrade-operation", "validate-host-root-moved", "validate-host-staged-files",
                   "validate-host-reboot", "validate-host-root", "reset-agent", "validate-host-staged-files"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
@@ -6053,6 +6583,8 @@ COMMANDS: dict[str, Command] = {
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
     "validate-host-agent-upgrade": _without_node_config(validate_host_agent_upgrade),
     "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
+    # An agent released before the in-place restart performs this upgrade.
+    "validate-agent-upgrade-from-legacy": _without_node_config(lambda: validate_agent_upgrade_operation(in_place=False)),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),

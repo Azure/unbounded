@@ -202,3 +202,43 @@ func (e *nvidiaPreflightTestEnv) write(path, content string) {
 		panic(err)
 	}
 }
+
+func TestParseLdconfigLibrariesArchTag(t *testing.T) {
+	out := []byte(`3 libs found in cache ` + "`/etc/ld.so.cache'" + `
+	libcuda.so.1 (libc6,AArch64) => /usr/lib/libcuda.so.1
+	libnvidia-ml.so.1 (libc6,x86-64) => /usr/lib64/libnvidia-ml.so.1
+	libfoo.so.1 (libc6) => /usr/lib/libfoo.so.1
+`)
+
+	tests := []struct {
+		name    string
+		archTag string
+		want    map[string]string
+	}{
+		{
+			name:    "arm64 matches glibc AArch64 tag",
+			archTag: "aarch64",
+			want:    map[string]string{"libcuda.so.1": "/usr/lib/libcuda.so.1"},
+		},
+		{
+			name:    "amd64 matches x86-64 tag",
+			archTag: "x86-64",
+			want:    map[string]string{"libnvidia-ml.so.1": "/usr/lib64/libnvidia-ml.so.1"},
+		},
+		{
+			name:    "empty tag keeps every library",
+			archTag: "",
+			want: map[string]string{
+				"libcuda.so.1":      "/usr/lib/libcuda.so.1",
+				"libnvidia-ml.so.1": "/usr/lib64/libnvidia-ml.so.1",
+				"libfoo.so.1":       "/usr/lib/libfoo.so.1",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseLdconfigLibraries(out, tt.archTag))
+		})
+	}
+}

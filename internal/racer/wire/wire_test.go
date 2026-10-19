@@ -748,7 +748,7 @@ func TestKeyIDsRequireCurrentNamespaceAndValidGeneration(t *testing.T) {
 		ref := bundle.CacheKeys[0].Key
 		ref.ID = id
 		_, err := NewCacheKey(ref, ActiveKey, [32]byte{})
-		require.Error(t, err, "legacy ID accepted")
+		require.Error(t, err, "malformed key ID accepted")
 	}
 }
 
@@ -1050,7 +1050,7 @@ func TestTokenValidationDepthBoundary(t *testing.T) {
 	}
 }
 
-// NIC reports, persisted member migration, and Site boundaries.
+// NIC reports, admitted members, and Site boundaries.
 
 func TestRDMANICStrictFieldsAndBounds(t *testing.T) {
 	valid := `{"device":"mlx5_0","port":1,"rail":0}`
@@ -1131,12 +1131,8 @@ func TestBootstrapRDMANICRequiredCanonicalAndBounded(t *testing.T) {
 	require.ErrorIs(t, err, InvalidRequest)
 }
 
-func TestAdmittedMemberMigrationAndHardBreak(t *testing.T) {
-	legacy := `{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"192.0.2.1:7443","rails":[{"rail":0,"fabric":"old"}],"alignment_enabled":false,"site":""}`
-	member, err := DecodeAdmittedMember(strings.NewReader(legacy))
-	require.ErrorIs(t, err, InvalidRequest)
-	require.Zero(t, member)
-	member = Member{Node: "22222222-2222-4222-8222-222222222222", Shares: 4, PeerEndpoint: "192.0.2.1:7443", RDMANICs: []RDMANIC{{Device: "a", Port: 1}}}
+func TestAdmittedMemberNICValidation(t *testing.T) {
+	member := Member{Node: "22222222-2222-4222-8222-222222222222", Shares: 4, PeerEndpoint: "192.0.2.1:7443", RDMANICs: []RDMANIC{{Device: "a", Port: 1}}}
 	raw, err := json.Marshal(member)
 	require.NoError(t, err)
 	_, err = DecodeAdmittedMember(bytes.NewReader(raw))
@@ -1151,9 +1147,6 @@ func TestAdmittedMemberMigrationAndHardBreak(t *testing.T) {
 		_, err = DecodeAdmittedMember(strings.NewReader(bad))
 		require.ErrorIs(t, err, InvalidRequest)
 	}
-
-	_, err = DecodePublication(strings.NewReader(`{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[` + legacy + `],"caches":[]}`))
-	require.ErrorIs(t, err, InvalidRequest)
 }
 
 func TestMemberSiteWireValidation(t *testing.T) {
@@ -1380,7 +1373,7 @@ func TestAdmittedMemberReadFailures(t *testing.T) {
 		{"read error", failingReader{}, InvalidRequest},
 		{"over bound", &repeatedReader{remaining: MaxBootstrapBytes + 1}, TooLarge},
 		{"malformed JSON", strings.NewReader("{"), InvalidRequest},
-		{"invalid legacy", strings.NewReader(`{"rails":[]}`), InvalidRequest},
+		{"unknown field", strings.NewReader(`{"rails":[]}`), InvalidRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := DecodeAdmittedMember(tc.reader)
@@ -1466,7 +1459,7 @@ func TestSharedSiteVectors(t *testing.T) {
 	var vectors []siteVector
 	require.NoError(t, json.Unmarshal(fixture(t, "site-vectors.json"), &vectors))
 	require.Len(t, vectors, 4)
-	legacy, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
+	base, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
 	require.NoError(t, err)
 
 	var previous Publication
@@ -1480,7 +1473,7 @@ func TestSharedSiteVectors(t *testing.T) {
 			p, err := DecodePublication(bytes.NewBufferString(v.Publication))
 			require.NoError(t, err)
 
-			want := canonicalPublication(legacy)
+			want := canonicalPublication(base)
 			want.Sequence, want.MembershipVersion = Sequence(i+1), MembershipVersion(i+1)
 			want.Members[0].Site = step.site
 			require.Equal(t, want, p, "only Site and counters change")
@@ -1555,27 +1548,7 @@ func regenerateSharedVectors(t *testing.T) {
 
 	var p Publication
 	require.NoError(t, json.Unmarshal(fixture(t, "publication.json"), &p))
-	// Preserve unsorted members/NICs and escaped text when upgrading old input.
-	var old struct {
-		Members []struct {
-			Rails []struct {
-				Rail     uint16
-				Fabric   string
-				NUMANode *uint32 `json:"numa_node"`
-			}
-		}
-	}
-	require.NoError(t, json.Unmarshal(fixture(t, "publication.json"), &old))
-
-	for i := range p.Members {
-		if p.Members[i].RDMANICs == nil {
-			p.Members[i].RDMANICs = []RDMANIC{}
-			for _, rail := range old.Members[i].Rails {
-				p.Members[i].RDMANICs = append(p.Members[i].RDMANICs, RDMANIC{Device: rail.Fabric, Port: 1, Rail: rail.Rail, NUMANode: rail.NUMANode})
-			}
-		}
-	}
-
+	// Re-encode without sorting so unsorted members/NICs and escaped text remain.
 	b, err := json.Marshal(p)
 	require.NoError(t, err)
 	writeSharedVector(t, "publication.json", b)
@@ -1623,15 +1596,8 @@ func regenerateSharedVectors(t *testing.T) {
 
 func writeSharedVector(t *testing.T, name string, b []byte) {
 	t.Helper()
+	// Rust reads this directory directly.
 	require.NoError(t, os.WriteFile("testdata/"+name, append(b, '\n'), 0o644))
-
-	if name == "publication.json" || name == "bootstrap-request.json" || name == "bootstrap-response.json" || name == "bundle.json" {
-		// Rust reads this directory directly. Remove old generated copies too.
-		err := os.Remove("../../../cmd/racer-dataplane/src/control/testdata/" + name)
-		if !os.IsNotExist(err) {
-			require.NoError(t, err)
-		}
-	}
 }
 
 type rejectionVector struct {
@@ -1648,23 +1614,9 @@ func regenerateRejections(t *testing.T) {
 	var rejections []rejectionVector
 	require.NoError(t, json.Unmarshal(fixture(t, "rejections.json"), &rejections))
 
-	for i := range rejections {
-		switch rejections[i].Name {
-		case "missing required field":
-			rejections[i].Old, rejections[i].New = `"rdma_nics":[]`, `"ignored_nics":[]`
-		case "duplicate rail":
-			rejections[i].Name = "zero NIC port"
-			rejections[i].Old, rejections[i].New = `"port":1`, `"port":0`
-		case "empty fabric":
-			rejections[i].Name = "empty device"
-		}
-	}
-
 	for _, addition := range []struct{ name, file, old, new string }{
 		{"missing bootstrap NIC report", "bootstrap-request.json", `"rdma_nics":[],`, ""},
 		{"null bootstrap NIC report", "bootstrap-request.json", `"rdma_nics":[]`, `"rdma_nics":null`},
-		{"legacy bootstrap rails", "bootstrap-request.json", `"rdma_nics":[]`, `"rails":[]`},
-		{"legacy member rails", "publication.json", `"rdma_nics":[]`, `"rails":[],"alignment_enabled":true`},
 		{"overflow NIC port", "publication.json", `"port":1`, `"port":256`},
 		{"null NIC GID", "publication.json", `"port":1`, `"port":1,"gid":null`},
 		{"empty NIC GID", "publication.json", `"port":1`, `"port":1,"gid":""`},

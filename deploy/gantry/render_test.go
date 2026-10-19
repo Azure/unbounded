@@ -157,6 +157,94 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 	}
 }
 
+func TestRendersOptionalMetricsService(t *testing.T) {
+	t.Parallel()
+
+	if _, err := os.Stat(filepath.Join(renderChart(t, false), "metrics-service.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("metrics Service rendered by default (stat err: %v)", err)
+	}
+
+	outputDir := renderChart(t, false,
+		"--set", "metricsService.enabled=true",
+		"--set-string", "metricsService.annotations.prometheus\\.io/scrape=true",
+	)
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "metrics-service.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered metrics Service: %v", err)
+	}
+
+	var service struct {
+		Metadata struct {
+			Name        string            `yaml:"name"`
+			Annotations map[string]string `yaml:"annotations"`
+		} `yaml:"metadata"`
+		Spec struct {
+			ClusterIP                string            `yaml:"clusterIP"`
+			PublishNotReadyAddresses bool              `yaml:"publishNotReadyAddresses"`
+			Selector                 map[string]string `yaml:"selector"`
+			Ports                    []struct {
+				Port       int    `yaml:"port"`
+				TargetPort string `yaml:"targetPort"`
+			} `yaml:"ports"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(raw, &service); err != nil {
+		t.Fatalf("decode metrics Service: %v", err)
+	}
+
+	if service.Metadata.Name != "gantry-metrics" {
+		t.Fatalf("metrics Service name = %q", service.Metadata.Name)
+	}
+
+	if service.Metadata.Annotations["prometheus.io/scrape"] != "true" {
+		t.Fatalf("metrics Service annotations = %v", service.Metadata.Annotations)
+	}
+
+	if service.Spec.ClusterIP != "None" || !service.Spec.PublishNotReadyAddresses {
+		t.Fatal("metrics Service must be headless and publish NotReady addresses")
+	}
+
+	if service.Spec.Selector["app.kubernetes.io/name"] != "gantry" || service.Spec.Selector["app.kubernetes.io/component"] != "agent" {
+		t.Fatalf("metrics Service selector = %v", service.Spec.Selector)
+	}
+
+	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 9095 || service.Spec.Ports[0].TargetPort != "metrics" {
+		t.Fatalf("metrics Service ports = %+v", service.Spec.Ports)
+	}
+}
+
+func TestRendersConfiguredPeerTransferSettings(t *testing.T) {
+	t.Parallel()
+
+	defaultConfig, err := os.ReadFile(filepath.Join(renderChart(t, false), "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read default rendered config: %v", err)
+	}
+
+	for _, want := range []string{`peer_fetch_timeout: "15m"`, "transfer_max_concurrent_serves: 10\n"} {
+		if !bytes.Contains(defaultConfig, []byte(want)) {
+			t.Fatalf("default rendered config does not contain %q", want)
+		}
+	}
+
+	outputDir := renderChart(t, false,
+		"--set-string", "gantry.peerFetchTimeout=60s",
+		"--set", "gantry.transferMaxConcurrentServes=100",
+	)
+
+	rawConfig, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered config: %v", err)
+	}
+
+	for _, want := range []string{`peer_fetch_timeout: "60s"`, "transfer_max_concurrent_serves: 100\n"} {
+		if !bytes.Contains(rawConfig, []byte(want)) {
+			t.Fatalf("rendered config does not contain %q", want)
+		}
+	}
+}
+
 func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
 	t.Parallel()
 
@@ -706,4 +794,39 @@ func sourceFile(t *testing.T) string {
 	}
 
 	return file
+}
+
+func TestRendersConfiguredAgentUpdateStrategy(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "default", want: "maxUnavailable: 50%"},
+		{
+			name: "override",
+			args: []string{"--set-string", "updateStrategy.rollingUpdate.maxUnavailable=10%"},
+			want: "maxUnavailable: 10%",
+		},
+		{
+			name: "count",
+			args: []string{"--set", "updateStrategy.rollingUpdate.maxUnavailable=3"},
+			want: "maxUnavailable: 3\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := os.ReadFile(filepath.Join(renderChart(t, false, tc.args...), "daemonset.yaml"))
+			if err != nil {
+				t.Fatalf("read rendered agent DaemonSet: %v", err)
+			}
+
+			if !bytes.Contains(raw, []byte(tc.want)) {
+				t.Fatalf("rendered agent DaemonSet does not contain %q", tc.want)
+			}
+		})
+	}
 }

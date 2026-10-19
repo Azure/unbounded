@@ -61,14 +61,11 @@ type nodeOperator interface {
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
 	// StageAgentUpgrade stages a new host-side agent binary.
 	StageAgentUpgrade(context.Context, *slog.Logger, agentUpgradeRequest) error
-	// RestartAgentDaemon restarts the host-side agent daemon after an upgrade
-	// operation has been recorded as complete.
-	RestartAgentDaemon(context.Context, *slog.Logger) error
 	// ReconcileHostRoot moves the agent's files to the host root on a host an
 	// older agent installed, once that cannot strand a rollback, and finishes
 	// an interrupted move. The caller holds installation ownership. It reports
-	// whether it queued the daemon's restart, after which the daemon must not
-	// take any work.
+	// whether the daemon has to be restarted from the moved files, which it
+	// is by stopping rather than taking any work; see ErrRestartRequested.
 	ReconcileHostRoot(context.Context, *slog.Logger, *ActiveMachine) (bool, error)
 }
 
@@ -300,15 +297,6 @@ func (nspawnNodeOperator) RepaveNode(
 
 func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
 	return upgradeDaemonBinary(ctx, log, request)
-}
-
-func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logger) error {
-	sc := executil.Systemctl()
-	if err := executil.RunCmd(ctx, log, sc, "restart", "--no-block", goalstates.DaemonUnit); err != nil {
-		return fmt.Errorf("systemctl restart %s: %w", goalstates.DaemonUnit, err)
-	}
-
-	return nil
 }
 
 func (op nspawnNodeOperator) ReconcileHostRoot(ctx context.Context, log *slog.Logger, active *ActiveMachine) (bool, error) {

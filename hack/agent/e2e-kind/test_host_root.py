@@ -59,17 +59,19 @@ class TestAgentUpgradeSlots(unittest.TestCase):
     """The upgrade check compares slots by name only when the host root moved
     while it ran; otherwise a last-good under the wrong root would pass."""
 
-    def _validate(self, states, before, after, last_good):
+    def _validate(self, states, before, after, last_good, processes=None, in_place=True):
         targets = iter([before, after])
+        processes = iter(processes or [("1234", before), ("1234", after)])
         with patch.object(e2e, "host_root_state", side_effect=states), \
                 patch.object(e2e, "read_daemon_current_target", side_effect=lambda: next(targets)), \
                 patch.object(e2e, "read_daemon_last_good_target", return_value=last_good), \
+                patch.object(e2e, "_daemon_process", side_effect=lambda: next(processes)), \
                 patch.object(e2e, "_build_agent_upgrade_tarball"), \
                 patch.object(e2e, "_serve_agent_upgrade_tarball",
                              return_value={"status": {"message": "AgentUpgrade completed"}}), \
                 patch.object(e2e, "wait_for_daemon_active"), \
                 patch.object(e2e, "kubectl"):
-            e2e.validate_agent_upgrade_operation()
+            e2e.validate_agent_upgrade_operation(in_place=in_place)
 
     def test_paths_must_match_while_the_root_stays(self):
         blue, green = f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue", f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-green"
@@ -81,6 +83,79 @@ class TestAgentUpgradeSlots(unittest.TestCase):
         legacy_blue = f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-blue"
         self._validate([f"link:{e2e.LEGACY_HOST_ROOT}", "moving"], legacy_blue,
                        f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-green", f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue")
+
+    def test_the_daemon_must_restart_in_place(self):
+        """A new PID means the daemon fell back to a systemd restart; the same
+        PID running the old slot means it never restarted."""
+        blue, green = f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue", f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-green"
+        for name, processes in {
+            "a new PID": [("1234", blue), ("5678", green)],
+            "the old slot": [("1234", blue), ("1234", blue)],
+        }.items():
+            with self.subTest(name), self.assertRaises(SystemExit):
+                self._validate(["dir", "dir"], blue, green, blue, processes)
+
+    def test_an_older_agent_may_restart_through_systemd(self):
+        """The migration suite's upgrades from a release before the in-place
+        restart do not check it, and do not read the process at all."""
+        blue, green = f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-blue", f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-green"
+        link = f"link:{e2e.LEGACY_HOST_ROOT}"
+        self._validate([link, link], blue, green, blue, processes=[], in_place=False)
+
+
+class TestRestartedInPlace(unittest.TestCase):
+    def test_problems(self):
+        blue = f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue"
+        green = f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-green"
+        moved_green = green
+        legacy_green = f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-green"
+        cases = {
+            "same PID, new slot": ("1", "1", green, green, ""),
+            "same PID, the slot moved to the host root": ("1", "1", moved_green, legacy_green, ""),
+            "new PID": ("1", "2", green, green, "did not restart in place"),
+            "no PID before": ("", "2", green, green, "did not restart in place"),
+            "no daemon after": ("1", "", "", green, "did not restart in place"),
+            "old slot": ("1", "1", blue, green, "not the current slot"),
+            "no executable": ("1", "1", "", green, "not the current slot"),
+        }
+        for name, (before, after, exe, current, want) in cases.items():
+            with self.subTest(name):
+                problem = e2e.restarted_in_place_problem(before, after, exe, current)
+                if want:
+                    self.assertIn(want, problem)
+                else:
+                    self.assertEqual(problem, "")
+
+
+class TestReexecJournal(unittest.TestCase):
+    REEXEC = f"[I] re-executing the daemon in place [path={e2e.DAEMON_BIN_DIR}/unbounded-agent-current]"
+
+    def test_problems(self):
+        legacy = f"[I] re-executing the daemon in place [path={e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-current]"
+        cases = {
+            "re-executed into the host root": (f"started\n{self.REEXEC}\n", ""),
+            "re-executed under the legacy root only": (f"{legacy}\n", "no 're-executing"),
+            "no re-execution": ("started\n", "no 're-executing"),
+            "fell back after failing to exec": (
+                f"{self.REEXEC}\n[W] could not re-execute the daemon; exiting for systemd to restart it\n",
+                "fell back"),
+            "fell back without a path": (
+                "[W] could not resolve the daemon unit's binary; exiting for systemd to restart the daemon\n",
+                "fell back"),
+        }
+        for name, (journal, want) in cases.items():
+            with self.subTest(name):
+                problem = e2e.reexec_journal_problem(journal, e2e.DAEMON_BIN_DIR)
+                if want:
+                    self.assertIn(want, problem)
+                else:
+                    self.assertEqual(problem, "")
+
+    def test_the_log_lines_match_the_daemon(self):
+        """The check reads lines the daemon command writes; keep them in step."""
+        source = (Path(e2e.REPO_ROOT) / "cmd" / "agent" / "internal" / "cmd" / "daemon.go").read_text()
+        for line in (e2e.DAEMON_REEXEC_LOG, *e2e.DAEMON_REEXEC_FALLBACK_LOGS):
+            self.assertIn(f'"{line}', source, line)
 
 
 class TestHostRootStates(unittest.TestCase):
@@ -162,12 +237,28 @@ class TestHostRootMoved(unittest.TestCase):
         running = subprocess.CompletedProcess([], 0, f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue\n", "")
         with patch.object(e2e, "host_root_state", side_effect=states), \
                 patch.object(e2e, "ssh_capture_quiet", return_value=running), \
+                patch.object(e2e, "_daemon_invocation_journal", return_value=TestReexecJournal.REEXEC + "\n"), \
                 patch.object(e2e, "validate_host_root") as validate, \
                 patch.object(e2e.time, "sleep") as slept:
             e2e.validate_host_root_moved()
 
         self.assertEqual(slept.call_count, 2)
         validate.assert_called_once()
+
+    def test_the_move_must_restart_in_place(self):
+        """The daemon restarting through systemd after the move starts a new
+        invocation, whose journal has no re-execution."""
+        running = subprocess.CompletedProcess([], 0, f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue\n", "")
+        with patch.object(e2e, "host_root_state", return_value="dir"), \
+                patch.object(e2e, "ssh_capture_quiet", return_value=running), \
+                patch.object(e2e, "_daemon_invocation_journal", return_value="started\n"), \
+                patch.object(e2e, "validate_host_root") as validate, \
+                patch.object(e2e, "die", side_effect=SystemExit) as died:
+            with self.assertRaises(SystemExit):
+                e2e.validate_host_root_moved()
+
+        self.assertIn("no 're-executing", died.call_args.args[0])
+        validate.assert_not_called()
 
 
 class TestLegacyAgent(unittest.TestCase):
@@ -272,7 +363,11 @@ class TestSuites(unittest.TestCase):
         moved = steps.index("validate-host-root-moved")
         self.assertLess(downgrade, moved, "a return to the older release happens while the host is linked")
         self.assertNotIn("validate-agent-downgrade-to-legacy", steps[moved:], "it is not supported after the move")
-        self.assertEqual(steps[downgrade:moved].count("validate-agent-upgrade-operation"), 2)
+        upgrades = [step for step in steps[downgrade:moved]
+                    if step in ("validate-agent-upgrade-operation", "validate-agent-upgrade-from-legacy")]
+        # The older release performs the first, so only the second, by this
+        # build, can restart in place.
+        self.assertEqual(upgrades, ["validate-agent-upgrade-from-legacy", "validate-agent-upgrade-operation"])
         self.assertIn("validate-host-root-linked", steps[downgrade:moved],
                       "one upgrade after the older release still leaves it in last-good")
         self.assertIn("validate-host-reboot", steps[moved:], "a moved host has to boot from its new units")

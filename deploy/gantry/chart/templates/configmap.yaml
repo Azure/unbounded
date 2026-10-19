@@ -59,10 +59,10 @@ data:
     coord_require_chair_assignment: false
     coord_max_digests_per_request: 256
     coord_max_concurrent_pulls: 16
-    peer_fetch_timeout: "15m"
+    peer_fetch_timeout: {{ .Values.gantry.peerFetchTimeout | quote }}
     peer_rediscover_budget: "5m"
     peer_rediscover_backoff: "1s"
-    transfer_max_concurrent_serves: 10
+    transfer_max_concurrent_serves: {{ .Values.gantry.transferMaxConcurrentServes | int }}
     advertise_reconcile_interval: "1m"
 
     nf5_jitter_base: "3s"

@@ -293,6 +293,8 @@ jobs:
             file: images/gantry/Containerfile
           - name: racer-controller
             file: images/racer-controller/Containerfile
+          - name: racer-dataplane
+            file: images/racer-dataplane/Containerfile
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator

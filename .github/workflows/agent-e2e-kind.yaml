@@ -64,13 +64,17 @@ permissions:
   contents: read
   packages: read
 
+env:
+  ACL_IMAGE_SOURCE: gallery
+  ACL_IMAGE_RESOURCE_GROUP: unbounded-dev-infra-westus2
+
 jobs:
   # The Azure Container Linux image needs a federated Azure login, which forks
   # do not get, and a static matrix cannot drop one entry conditionally. The ACL
   # entry is left out rather than failed; see hack/agent/e2e-kind/README.md.
   select-hosts:
     name: select host matrix
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -81,9 +85,10 @@ jobs:
           # Absent for non-pull_request events, where secrets are available.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           # Checked for presence only; the Azure login needs all three.
-          ACL_CLIENT_ID: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
-          ACL_TENANT_ID: ${{ secrets.ACL_IMAGE_TENANT_ID }}
-          ACL_SUBSCRIPTION_ID: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+          ACL_SECRET_PREFIX: ${{ env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY' }}
+          ACL_CLIENT_ID: ${{ secrets[format('{0}_CLIENT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          ACL_TENANT_ID: ${{ secrets[format('{0}_TENANT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          ACL_SUBSCRIPTION_ID: ${{ secrets[format('{0}_SUBSCRIPTION_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
         run: |
           set -euo pipefail
 
@@ -105,7 +110,7 @@ jobs:
           if [ -n "${HEAD_REPO}" ] && [ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
             echo "::notice::Azure Container Linux is skipped for forks: its image needs Azure credentials"
           elif [ -z "${ACL_CLIENT_ID}" ] || [ -z "${ACL_TENANT_ID}" ] || [ -z "${ACL_SUBSCRIPTION_ID}" ]; then
-            echo "::notice::Azure Container Linux is skipped: ACL_IMAGE_CLIENT_ID, ACL_IMAGE_TENANT_ID and ACL_IMAGE_SUBSCRIPTION_ID are not all configured"
+            echo "::notice::Azure Container Linux is skipped: ${ACL_SECRET_PREFIX}_CLIENT_ID, ${ACL_SECRET_PREFIX}_TENANT_ID and ${ACL_SECRET_PREFIX}_SUBSCRIPTION_ID are not all configured"
           else
             hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
           fi
@@ -115,7 +120,7 @@ jobs:
   agent-e2e:
     name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
     needs: select-hosts
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
@@ -143,9 +148,9 @@ jobs:
         if: matrix.host-base-os == 'acl'
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
-          client-id: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
-          tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
-          subscription-id: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets[format('{0}_CLIENT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          tenant-id: ${{ secrets[format('{0}_TENANT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          subscription-id: ${{ secrets[format('{0}_SUBSCRIPTION_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
 
       # Exported for later e2e.py processes, so the job uses one build. The
       # image is downloaded and verified on every run, never put in the Actions
@@ -185,7 +190,7 @@ jobs:
 
   agent-bootstrap-recovery:
     name: agent ${{ matrix.title }} (Ubuntu)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -233,7 +238,7 @@ jobs:
 
   agent-config-e2e:
     name: agent config e2e
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       KIND_CLUSTER_NAME: agent-config-e2e

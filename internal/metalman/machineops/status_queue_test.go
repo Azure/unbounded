@@ -94,6 +94,88 @@ func TestStatusQueueDropsBestEffortUpdatesWhenFull(t *testing.T) {
 	require.Len(t, queue.updates, 1)
 }
 
+func TestStatusQueueReportsAfterSiteMove(t *testing.T) {
+	t.Parallel()
+
+	for _, sites := range []struct{ old, serving string }{
+		{old: "old-site", serving: "local-site"},
+		{old: "old-site", serving: ""},
+		{old: "", serving: "local-site"},
+	} {
+		for _, state := range []string{"retained", "terminal-retained", "ordinary"} {
+			for _, report := range []string{"BootImageWritten", "CloudInitDone", "PXEDisabled"} {
+				t.Run(sites.old+"/"+sites.serving+"/"+state+"/"+report, func(t *testing.T) {
+					t.Parallel()
+
+					machine := &v1alpha3.Machine{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "machine-1", UID: "unchanged-uid",
+							Labels: map[string]string{"unbounded-cloud.io/site": sites.serving},
+						},
+						Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{
+							Netboot: &v1alpha3.PXESpec{BootProtocol: v1alpha3.PXEBootProtocolHTTP},
+						}},
+					}
+					foreign := testOperation("old-operation", v1alpha3.OperationHostReplace)
+					foreign.CreationTimestamp = fixedNow()
+					foreign.Status.Phase = v1alpha3.OperationPhaseInProgress
+
+					foreign.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+						MachineRef: machine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+						BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+							Site: sites.old, MachineUID: machine.UID,
+							ImageWritten: true, Cleaned: true, Released: true,
+							RebootRequestedAt: ptrTo(fixedNow()),
+						},
+					}}
+					if state == "terminal-retained" {
+						foreign.Status.Phase = v1alpha3.OperationPhaseFailed
+						foreign.Status.Targets[0].Phase = v1alpha3.OperationPhaseFailed
+					}
+
+					if state == "ordinary" {
+						foreign.Status.Targets[0].BootMedia.Abandoned = true
+					}
+
+					local := testOperation("local-operation", v1alpha3.OperationHostReplace)
+					local.CreationTimestamp = metav1.NewTime(fixedNow().Add(time.Hour))
+					local.Status.Phase = v1alpha3.OperationPhaseInProgress
+					local.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+						MachineRef: machine.Name, Phase: v1alpha3.OperationPhaseInProgress,
+					}}
+					c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+						WithObjects(machine, foreign, local).WithStatusSubresource(foreign, local).Build()
+					queue := &StatusQueue{Client: c, Site: sites.serving, Now: fixedNow}
+
+					var before v1alpha3.MachineOperation
+					require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(foreign), &before))
+
+					condition := v1alpha3.MachineOperationConditionBootImageWritten
+
+					switch report {
+					case "BootImageWritten":
+						require.NoError(t, queue.RecordBootImageWritten(t.Context(), machine.Name))
+						require.True(t, queue.processNextUpdate(t.Context()))
+					case "CloudInitDone":
+						condition = v1alpha3.MachineOperationConditionCloudInitDone
+
+						require.NoError(t, queue.RecordCloudInitDone(t.Context(), machine.Name))
+						require.True(t, queue.processNextUpdate(t.Context()))
+					case "PXEDisabled":
+						require.NoError(t, queue.RecordPXEDisabled(t.Context(), machine.Name, "image"))
+					}
+
+					var updatedLocal, updatedForeign v1alpha3.MachineOperation
+					require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(local), &updatedLocal))
+					require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(foreign), &updatedForeign))
+					require.Equal(t, before, updatedForeign, "foreign operation must remain untouched")
+					require.True(t, apimeta.IsStatusConditionTrue(updatedLocal.Status.Conditions, condition), "local operation must receive %s", condition)
+				})
+			}
+		}
+	}
+}
+
 func TestStatusQueueRecordsPXEDisabledSynchronously(t *testing.T) {
 	t.Parallel()
 
@@ -117,6 +199,56 @@ func TestStatusQueueRecordsPXEDisabledSynchronously(t *testing.T) {
 	require.NotNil(t, bootImage)
 	require.Equal(t, metav1.ConditionTrue, bootImage.Status)
 	require.Equal(t, "Machine machine-1 finished writing image ghcr.io/test/image:v1 to disk", bootImage.Message)
+}
+
+func TestStatusQueueMediaSiteSelection(t *testing.T) {
+	t.Parallel()
+
+	for _, site := range []string{"", "local-site"} {
+		for _, state := range []string{"retained", "ordinary", "no-media", "no-targets", "foreign"} {
+			t.Run(site+"/"+state, func(t *testing.T) {
+				t.Parallel()
+
+				op := testOperation("op-site", v1alpha3.OperationHostReplace)
+				op.Spec.MachineRef = "machine-1"
+				op.Status.Phase = v1alpha3.OperationPhaseInProgress
+				op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+					MachineRef: "machine-1", Phase: v1alpha3.OperationPhaseInProgress,
+					BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Site: site},
+				}}
+
+				switch state {
+				case "retained":
+					op.Status.Phase = v1alpha3.OperationPhaseFailed
+					op.Status.Targets[0].Phase = v1alpha3.OperationPhaseFailed
+				case "ordinary":
+					op.Status.Targets[0].BootMedia.Released = true
+				case "no-media":
+					op.Status.Targets[0].BootMedia = nil
+					op.Status.Targets = append(op.Status.Targets, v1alpha3.MachineOperationTargetStatus{
+						MachineRef: "other-machine", BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Site: "foreign-site"},
+					})
+				case "no-targets":
+					op.Status.Targets = nil
+				case "foreign":
+					op.Status.Targets[0].BootMedia.Site = "foreign-site"
+				}
+
+				c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(op).Build()
+				queue := &StatusQueue{Client: c, Site: site}
+				selected, ok, err := queue.activeOperationForMachine(t.Context(), "machine-1")
+				require.NoError(t, err)
+
+				if state == "foreign" {
+					require.False(t, ok)
+					require.Nil(t, selected)
+				} else {
+					require.True(t, ok)
+					require.Equal(t, op.Name, selected.Name)
+				}
+			})
+		}
+	}
 }
 
 func TestStatusQueueLatchesTrueOperationConditions(t *testing.T) {

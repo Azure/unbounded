@@ -2,7 +2,7 @@
 
 ## Summary
 
-`page-alloc` is the storage layer under the new Racer dataplane. It lives in
+`page-alloc` is the storage layer under the Racer dataplane. It lives in
 `cmd/racer-dataplane/alloc/`. It gives one worker thread three things:
 
 1. Memory buffers that are aligned for direct I/O and wiped before reuse.
@@ -12,8 +12,7 @@
 
 The crate stores bytes only. It does not know about page keys, record headers,
 encryption, checksums, or versions. The caller owns the page index and
-tells the crate how to remove entries when a segment is evicted. No Racer
-binary uses the crate yet. The dataplane executable is still a placeholder.
+tells the crate how to remove entries when a segment is evicted.
 
 ## Goals and non-goals
 

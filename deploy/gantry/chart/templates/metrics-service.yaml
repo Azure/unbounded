@@ -1,0 +1,29 @@
+{{- if .Values.metricsService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: gantry-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gantry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+  {{- with .Values.metricsService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Headless so each agent is a separate endpoint: gantry metrics are per
+  # node, and scraping through a ClusterIP would sample an arbitrary agent.
+  clusterIP: None
+  # Agents gate readiness on /readyz; keep NotReady agents scrapeable so
+  # their failures remain visible.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: agent
+  ports:
+    - name: metrics
+      port: 9095
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

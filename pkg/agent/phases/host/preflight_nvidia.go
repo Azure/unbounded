@@ -527,7 +527,9 @@ func parseLdconfigLibraries(out []byte, archTag string) map[string]string {
 			continue
 		}
 
-		if archTag != "" && !strings.Contains(line, archTag) {
+		// glibc prints "x86-64" on amd64 but "AArch64" on arm64, so
+		// compare without regard to case.
+		if archTag != "" && !strings.Contains(strings.ToLower(line), archTag) {
 			continue
 		}
 

@@ -328,3 +328,25 @@ func TestMachinaControllerClusterRoleKeepsClusterInfoRead(t *testing.T) {
 
 	t.Fatal("no machina-controller ClusterRole found in the rendered machina manifests")
 }
+
+func TestMetalmanClusterRoleAllowsVirtualMediaFinalizers(t *testing.T) {
+	_, clusterRoles := loadMachinaRBAC(t)
+
+	for _, clusterRole := range clusterRoles {
+		if clusterRole.Name != "metalman-controller" {
+			continue
+		}
+
+		for _, resource := range []string{"machineoperations", "machineoperations/finalizers"} {
+			for _, verb := range []string{"update", "patch"} {
+				if !clusterRoleGrants(&clusterRole, "unbounded-cloud.io", resource, verb) {
+					t.Errorf("metalman-controller ClusterRole must grant %s on %s for virtual-media cleanup finalizers", verb, resource)
+				}
+			}
+		}
+
+		return
+	}
+
+	t.Fatal("no metalman-controller ClusterRole found in the rendered machina manifests")
+}

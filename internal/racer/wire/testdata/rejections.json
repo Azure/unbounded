@@ -1,6 +1,6 @@
 [
   {
-    "name": "legacy key id",
+    "name": "zero key id",
     "file": "bundle.json",
     "old": "UktHMQAAAAAAAAABAAAAAA==",
     "new": "AAAAAAAAAAAAAAAAAAAAAA==",
@@ -354,20 +354,6 @@
     "file": "bootstrap-request.json",
     "old": "\"rdma_nics\":[]",
     "new": "\"rdma_nics\":null",
-    "code": "invalid_request"
-  },
-  {
-    "name": "legacy bootstrap rails",
-    "file": "bootstrap-request.json",
-    "old": "\"rdma_nics\":[]",
-    "new": "\"rails\":[]",
-    "code": "invalid_request"
-  },
-  {
-    "name": "legacy member rails",
-    "file": "publication.json",
-    "old": "\"rdma_nics\":[]",
-    "new": "\"rails\":[],\"alignment_enabled\":true",
     "code": "invalid_request"
   },
   {
