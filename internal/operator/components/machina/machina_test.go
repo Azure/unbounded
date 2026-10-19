@@ -67,6 +67,42 @@ func TestEnabledFor(t *testing.T) {
 	}
 }
 
+func TestRequiredBy(t *testing.T) {
+	enabled, disabled := true, false
+	spec := func(v *bool) unboundedv1alpha3.SiteComponentSpec {
+		return unboundedv1alpha3.SiteComponentSpec{Enabled: v}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		components unboundedv1alpha3.SiteComponents
+		want       bool
+	}{
+		{name: "neither", want: false},
+		{name: "machina only", components: unboundedv1alpha3.SiteComponents{
+			Machina: &unboundedv1alpha3.MachinaComponentSpec{SiteComponentSpec: spec(&enabled)},
+		}, want: true},
+		{name: "metalman only", components: unboundedv1alpha3.SiteComponents{
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: spec(&enabled)},
+		}, want: true},
+		{name: "metalman with machina disabled", components: unboundedv1alpha3.SiteComponents{
+			Machina:  &unboundedv1alpha3.MachinaComponentSpec{SiteComponentSpec: spec(&disabled)},
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: spec(&enabled)},
+		}, want: true},
+		{name: "both disabled", components: unboundedv1alpha3.SiteComponents{
+			Machina:  &unboundedv1alpha3.MachinaComponentSpec{SiteComponentSpec: spec(&disabled)},
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: spec(&disabled)},
+		}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			site := &unboundedv1alpha3.Site{Spec: unboundedv1alpha3.SiteSpec{Components: tc.components}}
+			if got := RequiredBy(site); got != tc.want {
+				t.Fatalf("RequiredBy = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestApplyMutatorSkipsMetalmanSupportAndCRD(t *testing.T) {
 	for _, obj := range []*unstructured.Unstructured{
 		{Object: map[string]any{
@@ -373,6 +409,42 @@ func TestReconcileAppliesWhenSiteEnables(t *testing.T) {
 
 	if appliedHashes[controllerName] != component.ConfigMapPayloadHash(&got) {
 		t.Fatalf("applied hash = %q, want %q", appliedHashes[controllerName], component.ConfigMapPayloadHash(&got))
+	}
+}
+
+// TestReconcileAppliesWhenSiteEnablesOnlyMetalman guards Metalman-only
+// installs: machina hosts the metalman kubelet client CSR approver, so it must
+// be installed even when no Site enables machina explicitly.
+func TestReconcileAppliesWhenSiteEnablesOnlyMetalman(t *testing.T) {
+	env, appliedHashes := retainedEnv(t)
+	enabled := true
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge"},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
+			},
+		}},
+	}
+
+	res := reconcile(t, env, []unboundedv1alpha3.Site{site})
+	if !res.Ready || res.Err != nil || res.Reason == component.ReasonDisabled {
+		t.Fatalf("Reconcile = %+v, want ready and reconciled", res)
+	}
+
+	if _, ok := appliedHashes[controllerName]; !ok {
+		t.Fatalf("machina controller not applied for Metalman-only Site: %#v", appliedHashes)
+	}
+}
+
+// TestReconcileSkipsSiteEnablingNeither checks that a Site enabling neither
+// machina nor metalman does not install machina.
+func TestReconcileSkipsSiteEnablingNeither(t *testing.T) {
+	env, appliedHashes := retainedEnv(t)
+
+	res := reconcile(t, env, []unboundedv1alpha3.Site{{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}})
+	if !res.Ready || res.Reason != component.ReasonDisabled || len(appliedHashes) != 0 {
+		t.Fatalf("Reconcile = %+v hashes=%#v, want Disabled with nothing applied", res, appliedHashes)
 	}
 }
 
