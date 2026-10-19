@@ -13,7 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -88,8 +87,9 @@ const BootstrapMachineBindingName = "metalman:bootstrap-machine"
 // another field manager added, and the executor skips applies whose desired
 // fields already match, so a live policy or binding with extra matching
 // constraints would otherwise be reported as applied. When the restriction
-// cannot be verified, the bootstrap grant is deleted rather than applied, and
-// drifted specs are replaced in full. The grant returns on a later pass once
+// cannot be verified, including when it is missing and about to be created,
+// the bootstrap grant is deleted rather than applied, and drifted specs are
+// replaced in full. The grant returns on a later pass once
 // the live restriction matches.
 func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan, support []*unstructured.Unstructured, componentName, site string) []component.ObjectRef {
 	// The executor ranks RBAC and Deployments ahead of admission policies, so
@@ -145,9 +145,12 @@ func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan
 // verifyRestriction compares the live admission policy and binding with the
 // desired support objects. It returns merge patch repairs, keyed by object,
 // that replace a drifted spec in full, and whether the grant may be applied in
-// this pass. A missing object is safe to grant alongside, because its apply
-// creates it exactly as desired and the grant depends on that apply. Drift, a
-// terminating object, or a failed read withholds the grant.
+// this pass. A missing object, drift, a terminating object, or a failed read
+// withholds the grant. A missing object is not granted alongside its create:
+// the executor compares applies against the cached client, so while the cache
+// still holds a deleted object the create is skipped as already applied and
+// the grant would go live without its restriction. The create event of each
+// admission object re-runs the plan, which grants once both read back live.
 func verifyRestriction(ctx context.Context, env *component.Env, support []*unstructured.Unstructured) (map[component.ObjectRef]component.Operation, bool) {
 	repairs := map[component.ObjectRef]component.Operation{}
 	verified := true
@@ -177,7 +180,6 @@ func verifyRestriction(ctx context.Context, env *component.Env, support []*unstr
 		err := reader.Get(ctx, client.ObjectKeyFromObject(expected), current)
 
 		switch {
-		case apierrors.IsNotFound(err):
 		case err != nil, current.GetDeletionTimestamp() != nil:
 			verified = false
 		case !equality.Semantic.DeepEqual(component.EffectiveAdmissionSpec(expected), component.EffectiveAdmissionSpec(current)):

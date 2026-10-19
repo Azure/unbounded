@@ -81,7 +81,8 @@ func bootstrapGrant() *rbacv1.ClusterRoleBinding {
 
 // TestBootstrapZeroSitesRestrictsLegacyAccess verifies the upgrade where the
 // last Site was deleted earlier: the stale auto-approval binding is removed and
-// the retained grant is kept behind the admission restriction, stably.
+// the retained grant is revoked until the admission restriction is live, then
+// kept behind it, stably.
 func TestBootstrapZeroSitesRestrictsLegacyAccess(t *testing.T) {
 	for name, objs := range map[string][]client.Object{
 		"stale binding":   {staleAutoApprove(), bootstrapGrant()},
@@ -93,10 +94,9 @@ func TestBootstrapZeroSitesRestrictsLegacyAccess(t *testing.T) {
 			cl := bootstrapClient(t, "", applied, deletes, objs...)
 			env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
 
-			for pass := range 2 {
-				if _, err := runBootstrap(t, env, nil); err != nil {
-					t.Fatalf("pass %d: %v", pass, err)
-				}
+			// First pass: the restriction is created and the grant withheld.
+			if _, err := runBootstrap(t, env, nil); err != nil {
+				t.Fatalf("pass 0: %v", err)
 			}
 
 			err := cl.Get(t.Context(), client.ObjectKey{Name: StaleAutoApproveBindingName}, &rbacv1.ClusterRoleBinding{})
@@ -104,18 +104,49 @@ func TestBootstrapZeroSitesRestrictsLegacyAccess(t *testing.T) {
 				t.Fatalf("get stale binding = %v, want NotFound", err)
 			}
 
-			for _, want := range []string{
-				"ValidatingAdmissionPolicy/" + bootstrapPolicyName,
-				"ValidatingAdmissionPolicyBinding/" + bootstrapPolicyName,
-				"ClusterRoleBinding/" + BootstrapMachineBindingName,
-			} {
-				if applied[want] != 2 {
+			if applied[crbRef] != 0 {
+				t.Fatalf("grant applied %d times before the restriction was live, want 0", applied[crbRef])
+			}
+
+			err = cl.Get(t.Context(), client.ObjectKey{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{})
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("get grant = %v, want NotFound", err)
+			}
+
+			// The fake client does not store applies, so make the restriction
+			// and the bootstrap ServiceAccount live the way the first pass's
+			// applies would.
+			live := liveRestriction(t)
+			if name != "service account" {
+				live = append(live, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: BootstrapServiceAccountName, Namespace: component.DefaultNamespace}})
+			}
+
+			for _, obj := range live {
+				if err := cl.Create(t.Context(), obj); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Later passes: verified, so the grant is applied and never revoked.
+			for pass := 1; pass < 3; pass++ {
+				if _, err := runBootstrap(t, env, nil); err != nil {
+					t.Fatalf("pass %d: %v", pass, err)
+				}
+			}
+
+			for _, want := range []string{vapRef, vapbRef} {
+				if applied[want] != 3 {
 					t.Fatalf("%s applied %d times, want once per pass", want, applied[want])
 				}
 			}
 
-			if n := deletes["ClusterRoleBinding/"+BootstrapMachineBindingName]; n != 0 {
-				t.Fatalf("bootstrap grant deleted %d times, want 0", n)
+			if applied[crbRef] != 2 {
+				t.Fatalf("grant applied %d times, want once per verified pass", applied[crbRef])
+			}
+
+			// Only the first pass revokes.
+			if n := deletes[crbRef]; n != 1 {
+				t.Fatalf("bootstrap grant deleted %d times, want 1", n)
 			}
 		})
 	}
@@ -147,7 +178,9 @@ func TestBootstrapZeroSitesNoLegacyIsNoop(t *testing.T) {
 // only ones and nothing is duplicated or conflicting.
 func TestBootstrapWithSitesDefersToSiteComponent(t *testing.T) {
 	applied, deletes := map[string]int{}, map[string]int{}
-	cl := bootstrapClient(t, "", applied, deletes, staleAutoApprove(), bootstrapGrant())
+
+	objs := append([]client.Object{staleAutoApprove(), bootstrapGrant()}, liveRestriction(t)...)
+	cl := bootstrapClient(t, "", applied, deletes, objs...)
 	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
 
 	sites := []unboundedv1alpha3.Site{*enabledSite(), *disabledSite("rack-b")}

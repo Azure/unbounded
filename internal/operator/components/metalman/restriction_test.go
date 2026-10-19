@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -248,5 +249,56 @@ func TestTerminatingRestrictionWithholdsGrant(t *testing.T) {
 		if opsOf(plan, component.OpApply)[crbRef] > 0 || opsOf(plan, component.OpDelete)[crbRef] != 1 {
 			t.Errorf("%s: terminating restriction does not revoke the grant:\n%s", path, plan.Summary())
 		}
+	}
+}
+
+// TestMissingLiveRestrictionWithholdsGrantDespiteStaleCache verifies that a
+// restriction missing from the apiserver withholds the grant even while the
+// cached client still holds a matching copy. The executor compares applies
+// against the cache, so it may skip recreating the restriction this pass; the
+// grant must not go live alongside it.
+func TestMissingLiveRestrictionWithholdsGrantDespiteStaleCache(t *testing.T) {
+	for _, missing := range []string{vapRef, vapbRef, "both"} {
+		t.Run(missing, func(t *testing.T) {
+			policy, binding := livePolicy(t), liveBinding(t)
+			withDefaults(policy, binding)
+
+			var live []client.Object
+			if missing != vapRef && missing != "both" {
+				live = append(live, policy.DeepCopy())
+			}
+
+			if missing != vapbRef && missing != "both" {
+				live = append(live, binding.DeepCopy())
+			}
+
+			applied, deletes := map[string]int{}, map[string]int{}
+			cached := bootstrapClient(t, "", applied, deletes, policy, binding, bootstrapGrant())
+			apiReader := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(append(live, bootstrapGrant())...).Build()
+			env := &component.Env{Client: cached, APIReader: apiReader, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+			for path, plan := range planPaths(t, env) {
+				if opsOf(plan, component.OpApply)[crbRef] > 0 || opsOf(plan, component.OpDelete)[crbRef] != 1 {
+					t.Errorf("%s: missing live restriction does not revoke the grant:\n%s", path, plan.Summary())
+				}
+
+				for _, ref := range []string{vapRef, vapbRef} {
+					if opsOf(plan, component.OpApply)[ref] != 1 {
+						t.Errorf("%s: %s not applied:\n%s", path, ref, plan.Summary())
+					}
+				}
+			}
+
+			reconcile(t, env, enabledSite())
+
+			if applied[crbRef] != 0 {
+				t.Fatalf("grant applied %d times, want 0", applied[crbRef])
+			}
+
+			err := cached.Get(t.Context(), client.ObjectKey{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{})
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("grant after pass = %v, want NotFound", err)
+			}
+		})
 	}
 }

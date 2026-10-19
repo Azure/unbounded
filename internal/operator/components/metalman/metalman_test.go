@@ -345,6 +345,9 @@ func reconcile(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) c
 // The machina component skips exactly these objects (see
 // machina.applyMutator), so a change here without a matching change there
 // either double-applies or drops RBAC silently.
+//
+// The cluster is fresh, so the admission restriction is not live yet and the
+// bootstrap grant is withheld until a later pass reads it back.
 func TestPlanGolden(t *testing.T) {
 	env := &component.Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
@@ -381,7 +384,7 @@ Apply ClusterRole/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
 Apply ClusterRole/metalman-bootstrap [shared]
-Apply ClusterRoleBinding/metalman:bootstrap-machine [shared] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction] [revoke on dependency failure]
+Delete ClusterRoleBinding/metalman:bootstrap-machine [shared]
 Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
 Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
 Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
@@ -397,7 +400,8 @@ Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable] [afte
 // per-Site Deployment is removed. The shared support set is planned exactly as
 // in TestPlanGolden, because other Sites may use it and bootstrap tokens minted
 // earlier outlive the Deployment: the bootstrap grant stays behind the
-// admission restriction and is revoked if the restriction fails. The stale
+// admission restriction and is revoked while the restriction is not confirmed
+// live, as here on a fresh cluster. The stale
 // auto-approve binding is removed because it is never safe to keep.
 func TestCleanupPlanGolden(t *testing.T) {
 	env := &component.Env{
@@ -428,7 +432,7 @@ Apply ClusterRole/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
 Apply ClusterRole/metalman-bootstrap [shared]
-Apply ClusterRoleBinding/metalman:bootstrap-machine [shared] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction] [revoke on dependency failure]
+Delete ClusterRoleBinding/metalman:bootstrap-machine [shared]
 Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
 Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
 Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
@@ -591,10 +595,10 @@ func enabledSite() *unboundedv1alpha3.Site {
 // TestExecutionOrderInstallsRestrictionBeforeBootstrapAccess pins that the
 // bootstrap grant and the token-minting Deployment are written only after the
 // admission policy and its binding, even though the executor ranks admission
-// objects last.
+// objects last. The restriction is already live, so the grant is planned.
 func TestExecutionOrderInstallsRestrictionBeforeBootstrapAccess(t *testing.T) {
 	env := &component.Env{
-		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(liveRestriction(t)...).Build(),
 		Namespace: component.DefaultNamespace,
 	}
 
@@ -692,9 +696,10 @@ func TestRestrictionFailureWithholdsBootstrapAccess(t *testing.T) {
 }
 
 // upgradeClient returns a client seeded with the bootstrap grant and the
-// Deployment an earlier release installed. Applies of failing are rejected,
-// other applies succeed without being stored, and deletes are counted.
-func upgradeClient(t *testing.T, failing string, deletes map[string]int) client.Client {
+// Deployment an earlier release installed, plus any extra objects. Applies of
+// failing are rejected, other applies succeed without being stored, and
+// deletes are counted.
+func upgradeClient(t *testing.T, failing string, deletes map[string]int, extra ...client.Object) client.Client {
 	t.Helper()
 
 	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: BootstrapMachineBindingName}}
@@ -704,7 +709,7 @@ func upgradeClient(t *testing.T, failing string, deletes map[string]int) client.
 
 	return fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
-		WithObjects(crb, dep).
+		WithObjects(append([]client.Object{crb, dep}, extra...)...).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
 				named, ok := obj.(interface {
@@ -767,12 +772,24 @@ func TestRestrictionFailureRevokesExistingBootstrapAccess(t *testing.T) {
 	}
 }
 
+// liveRestriction returns the admission policy and binding as the apiserver
+// persists them, for tests that start from a cluster where the restriction is
+// already live.
+func liveRestriction(t *testing.T) []client.Object {
+	t.Helper()
+
+	policy, binding := livePolicy(t), liveBinding(t)
+	withDefaults(policy, binding)
+
+	return []client.Object{policy, binding}
+}
+
 // TestRestrictionSuccessKeepsBootstrapAccess verifies that when the admission
-// objects install, an existing bootstrap grant is applied in place and never
+// objects are live, an existing bootstrap grant is applied in place and never
 // deleted, so steady-state passes do not interrupt in-flight bootstraps.
 func TestRestrictionSuccessKeepsBootstrapAccess(t *testing.T) {
 	deletes := map[string]int{}
-	cl := upgradeClient(t, "", deletes)
+	cl := upgradeClient(t, "", deletes, liveRestriction(t)...)
 	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
 
 	for pass := range 3 {
@@ -827,7 +844,7 @@ func passPlan(t *testing.T, env *component.Env, sites ...*unboundedv1alpha3.Site
 func TestCleanupRestrictsRetainedBootstrapAccess(t *testing.T) {
 	deletes := map[string]int{}
 	applied := map[string]int{}
-	cl := upgradeClient(t, "", deletes)
+	cl := upgradeClient(t, "", deletes, liveRestriction(t)...)
 	cl = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
 		Apply: func(ctx context.Context, c client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
 			named := obj.(interface {
@@ -959,7 +976,7 @@ func TestCleanupDeploymentFailureStillRemovesAutoApproval(t *testing.T) {
 // disabled Site's Deployment.
 func TestMixedSitesShareBootstrapRestriction(t *testing.T) {
 	deletes := map[string]int{}
-	cl := upgradeClient(t, "", deletes)
+	cl := upgradeClient(t, "", deletes, liveRestriction(t)...)
 	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
 
 	enabled := enabledSite()
