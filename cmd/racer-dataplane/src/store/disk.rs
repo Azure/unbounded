@@ -604,8 +604,11 @@ impl Index {
     /// Returns whether the `retain_until` of a storage-tier page was raised.
     /// That change is in memory only until the next volume commit (the lazy
     /// commit runs about once a second); a crash before it rebuilds the hold
-    /// from the previous deadline. Callers that report the extension as
-    /// durable must commit first.
+    /// from the previous deadline. Callers that report the hold as durable
+    /// must commit after every successful call, not only when this one
+    /// returns `true`: a raise whose commit failed stays in memory, so a later
+    /// call with the same deadline returns `false` while the change is still
+    /// not durable. `StoreWriter::reserve_hold` does both.
     pub fn reserve_hold(
         &self,
         version: &ObjectVersion,

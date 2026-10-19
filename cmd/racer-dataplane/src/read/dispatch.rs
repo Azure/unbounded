@@ -891,11 +891,10 @@ async fn execute(
         Work::Hold(version, pages, until) => {
             let writer = &local.fill.dependencies.writer;
             let previous = writer.index().hold_expiry(&version);
-            // A raised deadline of pages already on disk is reported to the
-            // client, so make it durable before replying.
-            if writer.index().reserve_hold(&version, pages, until)? {
-                writer.commit(scope).await?;
-            }
+            // The reported deadline covers pages already on disk, so every
+            // retention change, including one left by an earlier failed
+            // commit, must be durable before replying.
+            writer.reserve_hold(&version, pages, until, scope).await?;
             Ok(Value::Held(
                 previous.is_none(),
                 previous.map_or(until, |old| old.max(until)),

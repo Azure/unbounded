@@ -231,6 +231,68 @@ fn hard_hold_persist_confirms_publication_and_protects_pending() {
 }
 
 #[test]
+fn hold_acknowledgment_commits_extension_left_by_failed_commit() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = f.open().unwrap();
+    let held = f.copy(1, 113);
+    let id = held.ciphertext.envelope().page.clone();
+    let first = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    drive(
+        &f.reactor,
+        f.store.writer.reserve_hold(&id.version, 1, first, &scope()),
+    )
+    .unwrap();
+    drive(&f.reactor, f.store.writer.persist_held(held, &scope())).unwrap();
+    let index = f.store.writer.index();
+    assert!(!index.is_dirty());
+
+    // The extension is raised in memory, but its commit fails.
+    let second = first + Duration::from_secs(600);
+    simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
+    assert_eq!(
+        drive(
+            &f.reactor,
+            f.store
+                .writer
+                .reserve_hold(&id.version, 1, second, &scope()),
+        ),
+        Err(Error::Os(libc::EIO))
+    );
+    assert!(index.is_dirty());
+    // The same deadline, rounded to the same second, changes nothing in
+    // memory, yet it still fails while the earlier raise cannot commit.
+    let repeat = second - Duration::from_millis(1);
+    simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
+    assert_eq!(
+        drive(
+            &f.reactor,
+            f.store
+                .writer
+                .reserve_hold(&id.version, 1, repeat, &scope()),
+        ),
+        Err(Error::Os(libc::EIO))
+    );
+    assert!(index.is_dirty());
+    // A shorter deadline is acknowledged only once the raise is durable.
+    drive(
+        &f.reactor,
+        f.store.writer.reserve_hold(&id.version, 1, first, &scope()),
+    )
+    .unwrap();
+    assert!(!index.is_dirty());
+
+    // The acknowledged deadline survives a crash.
+    let f = f.restart_with(|| simulation.disk().crash().unwrap());
+    let _ = f.open().unwrap();
+    let index = f.store.writer.index();
+    let deadline = index.held_page_expiry(&id).unwrap();
+    assert!(deadline >= second && deadline < second + Duration::from_secs(1));
+}
+
+#[test]
 fn hard_hold_page_survives_crash_but_uncommitted_cache_page_does_not() {
     let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();

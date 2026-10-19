@@ -1137,6 +1137,24 @@ impl StoreWriter {
             Ok(())
         })
     }
+    /// Reserve or extend a hold and make every retention change so far
+    /// durable before returning. The commit runs even when this call changed
+    /// nothing on disk: an earlier extension whose commit failed is still in
+    /// memory, and a caller acknowledging the same or a shorter deadline must
+    /// not report it before it is durable. Committing a clean volume returns
+    /// immediately.
+    pub fn reserve_hold<'a>(
+        &'a self,
+        version: &'a ObjectVersion,
+        pages: usize,
+        until: std::time::SystemTime,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            self.index.reserve_hold(version, pages, until)?;
+            self.commit(scope).await
+        })
+    }
     /// Make every disk index change so far durable. The commit's node buffers
     /// return to the slab's idle pool still charged; admission pressure and
     /// drain reclaim them.
