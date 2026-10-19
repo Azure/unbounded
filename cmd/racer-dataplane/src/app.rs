@@ -1575,12 +1575,12 @@ impl WorkerApplication {
             return;
         }
         self.pressure.next_memory_sample = now + crate::pressure::SAMPLE_INTERVAL;
-        let memory = match self.pressure.monitor.as_ref().and_then(|m| m.last_sample()) {
-            Some(sample) => crate::telemetry::ProcessMemory::from(sample),
-            None => crate::telemetry::ProcessMemory {
-                resident: crate::pressure::sample_resident(),
-                ..Default::default()
-            },
+        // cgroup fields come from the monitor's last sample; RSS is read fresh
+        // because the monitor backs off to 30 s when the cgroup is unavailable.
+        let cgroup = self.pressure.monitor.as_ref().and_then(|m| m.last_sample());
+        let memory = crate::telemetry::ProcessMemory {
+            resident: crate::pressure::sample_resident(),
+            ..cgroup.map(Into::into).unwrap_or_default()
         };
         metrics.observe_memory(memory);
     }
