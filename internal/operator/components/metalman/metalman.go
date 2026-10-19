@@ -24,7 +24,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -49,20 +48,16 @@ func (Component) Enabled(site *unboundedv1alpha3.Site) bool {
 	return unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Metalman.SiteComponentSpec)
 }
 
-// Plan deploys the per-site metalman PXE controller and its RBAC.
+// Plan deploys the per-site metalman PXE controller.
 //
-// The support RBAC ships in the machina manifest set and is identical for every
-// Site, so it carries a shared key and the executor writes it once per pass
-// rather than once per Site.
-func (c Component) Plan(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
-	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
+// The shared support RBAC, the admission restriction, and the bootstrap grant
+// are planned once per pass by BootstrapComponent, not here. Planning them per
+// Site verified the live restriction once per Site, so two Sites in one pass
+// could reach different verdicts and plan the same shared object both ways.
+// The Deployment still depends on the restriction, which the cluster component
+// adds to the same merged plan.
+func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
-
-	restriction, verifyErr := addSupportOps(ctx, env, plan, support, c.Name(), site.Name)
 
 	plan.Add(component.Operation{
 		Kind:        component.OpApply,
@@ -70,14 +65,21 @@ func (c Component) Plan(ctx context.Context, env *component.Env, site *unbounded
 		Component:   c.Name(),
 		Site:        site.Name,
 		Overridable: true,
-		DependsOn:   restriction,
+		DependsOn:   restrictionRefs(),
 	})
 
-	if verifyErr != nil {
-		return plan, component.Failed(verifyErr), nil
-	}
-
 	return plan, component.Reconciled(), nil
+}
+
+// restrictionRefs returns the refs of the admission policy and binding that
+// restrict the bootstrap ServiceAccount. Both share one name.
+func restrictionRefs() []component.ObjectRef {
+	group := admissionv1.SchemeGroupVersion
+
+	return []component.ObjectRef{
+		{GVK: group.WithKind("ValidatingAdmissionPolicy"), Name: BootstrapRestrictionPolicyName},
+		{GVK: group.WithKind("ValidatingAdmissionPolicyBinding"), Name: BootstrapRestrictionPolicyName},
+	}
 }
 
 // BootstrapMachineBindingName is the ClusterRoleBinding that grants the
@@ -87,8 +89,9 @@ const BootstrapMachineBindingName = "metalman:bootstrap-machine"
 
 // addSupportOps adds the shared support RBAC, the admission restriction, and
 // the stale RBAC deletes to plan, and returns the admission refs that anything
-// relying on the restriction must depend on. Plan and CleanupPlan emit the same
-// operations, so the shared keys dedupe whether a Site is enabled or not.
+// relying on the restriction must depend on. BootstrapComponent calls it once
+// per pass, so the live restriction is verified once and every shared object
+// has exactly one planned operation.
 //
 // The live restriction is verified first. An apply cannot remove fields that
 // another field manager added, and the executor skips applies whose desired
@@ -240,39 +243,18 @@ func admissionRefs(support []*unstructured.Unstructured) []component.ObjectRef {
 
 // CleanupPlan removes the per-site metalman Deployment. The shared metalman
 // RBAC is kept because other Sites may use it, and bootstrap tokens minted
-// earlier stay valid after the Deployment is gone. The shared support set is
-// therefore planned exactly as in Plan: the admission restriction is applied,
-// the retained bootstrap grant is revoked if the restriction fails, and RBAC
-// that is no longer shipped is removed.
-func (c Component) CleanupPlan(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
-	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
+// earlier stay valid after the Deployment is gone, so BootstrapComponent keeps
+// planning the restriction, the restricted grant, and the stale RBAC deletes.
+func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
 
-	// The Deployment delete gets its own failure domain. Removals of workloads
-	// rank ahead of RBAC removals and writes, so in the shared domain a failed
-	// Deployment delete would skip the stale auto-approval delete and the
-	// restriction applies below for as long as the failure persists.
-	remove := component.DeleteOperation(&appsv1.Deployment{
+	plan.Add(component.DeleteOperation(&appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace},
-	}, c.Name(), site.Name)
-	remove.FailureDomain = deploymentFailureDomain
-	plan.Add(remove)
-
-	if _, verifyErr := addSupportOps(ctx, env, plan, support, c.Name(), site.Name); verifyErr != nil {
-		return plan, component.Failed(verifyErr), nil
-	}
+	}, c.Name(), site.Name))
 
 	return plan, component.Disabled("component disabled"), nil
 }
-
-// deploymentFailureDomain isolates the per-site Deployment delete so its
-// failure does not gate the shared support operations.
-const deploymentFailureDomain = "deployment"
 
 // StaleAutoApproveBindingName is the ClusterRoleBinding that earlier releases
 // installed to let kube-controller-manager auto-approve kubelet client
@@ -282,8 +264,7 @@ const deploymentFailureDomain = "deployment"
 const StaleAutoApproveBindingName = "metalman:node-autoapprove-bootstrap"
 
 // staleSupportDeletes returns delete operations for shared metalman RBAC that
-// is no longer shipped. They carry a shared key so every Site plans the same
-// delete and the executor issues it once per pass.
+// is no longer shipped.
 func staleSupportDeletes(componentName, site string) []component.Operation {
 	op := component.DeleteOperation(&rbacv1.ClusterRoleBinding{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
@@ -294,8 +275,9 @@ func staleSupportDeletes(componentName, site string) []component.Operation {
 	return []component.Operation{op}
 }
 
-// sharedSupportKey identifies a support object across Sites. The objects are
-// byte-identical for every Site, so the key is just their identity.
+// sharedSupportKey identifies a support object. Only BootstrapComponent plans
+// these objects, so the key guards against another planner emitting a
+// conflicting operation on them rather than deduplicating across Sites.
 func sharedSupportKey(obj *unstructured.Unstructured) string {
 	return "metalman/support/" + component.RefOf(obj).String()
 }

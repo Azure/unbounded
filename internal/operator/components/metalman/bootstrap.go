@@ -29,16 +29,22 @@ const BootstrapServiceAccountName = "metalman-bootstrap"
 // restricts metalman bootstrap tokens and its binding.
 const BootstrapRestrictionPolicyName = "metalman-bootstrap-machine-restriction"
 
-// BootstrapComponent keeps the shared metalman bootstrap security posture
-// reconciled when no Site is left to do it.
+// BootstrapComponent reconciles the shared metalman bootstrap support set:
+// the support RBAC, the admission restriction, the restricted bootstrap grant,
+// and the stale RBAC deletes.
 //
-// The per-Site metalman component plans the shared support set (admission
-// restriction, restricted bootstrap grant, stale RBAC deletes) for every Site,
-// enabled or not. With zero Sites no per-Site planner runs, and the machina
-// component filters the support objects out of its own manifests, so an
-// upgrade after the last Site was deleted would otherwise leave the old
-// unrestricted grant and the legacy auto-approval binding in place while
-// previously minted bootstrap tokens are still valid.
+// It is cluster scoped so the set is planned exactly once per pass. The
+// reconciler plans a per-Site component once for each Site, and each plan
+// would verify the live restriction separately, so one pass could plan the
+// same shared grant as both an apply and a delete. The executor rejects such
+// conflicts before writing anything, which would also drop the revocation and
+// the stale auto-approval delete.
+//
+// It also covers the zero-Site case. With no Sites the machina component
+// filters the support objects out of its own manifests, so an upgrade after
+// the last Site was deleted would otherwise leave the old unrestricted grant
+// and the legacy auto-approval binding in place while previously minted
+// bootstrap tokens are still valid.
 type BootstrapComponent struct{}
 
 // NewBootstrap returns the cluster-scoped metalman bootstrap component.
@@ -57,8 +63,8 @@ type bootstrapWatch struct {
 	predicate predicate.Predicate
 }
 
-// bootstrapWatches lists the objects whose events must re-run the zero-Site
-// plan. With no Sites there is no Site event to trigger a reconcile, so the
+// bootstrapWatches lists the objects whose events must re-run the plan. No
+// Site event follows changes to these cluster-wide objects, so the
 // bootstrap ServiceAccount and bindings (including their initial create events
 // when the cache syncs) and admission policy deletion or drift must each
 // enqueue the singleton request themselves.
@@ -99,36 +105,33 @@ func (BootstrapComponent) SetupWatches(b *builder.Builder, env *component.Env) {
 	}
 }
 
-// Plan plans the shared support set only on the zero-Site pass and only when
-// metalman bootstrap resources are already live.
+// Plan plans the shared support set once for the pass.
 //
-// When any Site exists, the metalman Site component plans the same operations
-// under the same shared keys, so this component plans nothing to avoid
-// duplicate work. Note that the Site status this verdict is published on only
-// exists in that case.
+// While any Site exists the set is always planned, whether or not a Site
+// enables metalman, because bootstrap tokens minted earlier outlive the
+// Deployment that handed them out.
 //
-// The trigger for the zero-Site case is the live presence of any of: the
-// metalman-bootstrap ServiceAccount, the metalman:bootstrap-machine binding, or
-// the stale metalman:node-autoapprove-bootstrap binding. Any of them means a
-// previous release installed metalman bootstrap access that may still be
-// exercised by unexpired tokens. A cluster that never ran metalman has none of
-// them and is left untouched, so the operator does not install metalman RBAC
-// or admission policy there. Once applied, the ServiceAccount and binding stay
-// present, so the trigger is stable across passes and does not churn.
+// With zero Sites the set is planned only when metalman bootstrap resources
+// are already live: the metalman-bootstrap ServiceAccount, the
+// metalman:bootstrap-machine binding, or the stale
+// metalman:node-autoapprove-bootstrap binding. Any of them means a previous
+// release installed metalman bootstrap access that may still be exercised by
+// unexpired tokens. A cluster that never ran metalman has none of them and is
+// left untouched, so the operator does not install metalman RBAC or admission
+// policy there. Once applied, the ServiceAccount and binding stay present, so
+// the trigger is stable across passes and does not churn.
 func (c BootstrapComponent) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
 
-	if len(sites) > 0 {
-		return plan, component.Disabled("bootstrap restriction is reconciled by the metalman Site component"), nil
-	}
+	if len(sites) == 0 {
+		present, err := bootstrapResourcesPresent(ctx, env)
+		if err != nil {
+			return nil, component.Result{}, err
+		}
 
-	present, err := bootstrapResourcesPresent(ctx, env)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
-	if !present {
-		return plan, component.NoSites("no metalman bootstrap resources present"), nil
+		if !present {
+			return plan, component.NoSites("no metalman bootstrap resources present"), nil
+		}
 	}
 
 	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
@@ -140,7 +143,11 @@ func (c BootstrapComponent) Plan(ctx context.Context, env *component.Env, sites 
 		return plan, component.Failed(verifyErr), nil
 	}
 
-	return plan, component.NoSites("metalman bootstrap access restricted while no Sites exist"), nil
+	if len(sites) == 0 {
+		return plan, component.NoSites("metalman bootstrap access restricted while no Sites exist"), nil
+	}
+
+	return plan, component.Reconciled(), nil
 }
 
 // bootstrapResourcesPresent reports whether any metalman bootstrap resource

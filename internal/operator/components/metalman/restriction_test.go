@@ -82,32 +82,26 @@ func opsOf(plan *component.Plan, kind component.OpKind) map[string]int {
 	return out
 }
 
-// planPaths returns the plans of every path that emits the restriction.
+// planPaths returns the bootstrap component's plans with and without Sites,
+// the two paths that emit the restriction.
 func planPaths(t *testing.T, env *component.Env) map[string]*component.Plan {
 	t.Helper()
 
 	plans := map[string]*component.Plan{}
 
-	plan, _, err := Component{}.Plan(t.Context(), env, enabledSite())
+	plan, _, err := BootstrapComponent{}.Plan(t.Context(), env, []unboundedv1alpha3.Site{*enabledSite(), *disabledSite("rack-b")})
 	if err != nil {
-		t.Fatalf("plan: %v", err)
+		t.Fatalf("plan with Sites: %v", err)
 	}
 
-	plans["Plan"] = plan
-
-	plan, _, err = Component{}.CleanupPlan(t.Context(), env, disabledSite("rack-b"))
-	if err != nil {
-		t.Fatalf("cleanup plan: %v", err)
-	}
-
-	plans["CleanupPlan"] = plan
+	plans["Sites"] = plan
 
 	plan, _, err = BootstrapComponent{}.Plan(t.Context(), env, []unboundedv1alpha3.Site{})
 	if err != nil {
-		t.Fatalf("bootstrap plan: %v", err)
+		t.Fatalf("plan without Sites: %v", err)
 	}
 
-	plans["Bootstrap"] = plan
+	plans["NoSites"] = plan
 
 	return plans
 }
@@ -223,7 +217,7 @@ func TestDriftedRestrictionIsRepairedBeforeGrant(t *testing.T) {
 			}
 
 			// Second pass: verified, so the grant is applied and nothing is patched.
-			plan, _, err := Component{}.Plan(t.Context(), env, enabledSite())
+			plan, _, err := BootstrapComponent{}.Plan(t.Context(), env, []unboundedv1alpha3.Site{*enabledSite()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -309,7 +303,7 @@ func TestMissingLiveRestrictionWithholdsGrantDespiteStaleCache(t *testing.T) {
 
 // TestVerificationFailureFailsResultAndRecovers verifies that a failed live
 // read of the restriction keeps the grant withheld and reports a failed
-// result from every planner, so the pass is retried with backoff even when
+// result from every path, so the pass is retried with backoff even when
 // the grant is already absent and the pass writes nothing that fires a watch.
 // Once the read succeeds, the grant is applied.
 func TestVerificationFailureFailsResultAndRecovers(t *testing.T) {
@@ -337,13 +331,10 @@ func TestVerificationFailureFailsResultAndRecovers(t *testing.T) {
 	env := &component.Env{Client: cached, APIReader: apiReader, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
 
 	results := map[string]func() (*component.Plan, component.Result, error){
-		"Plan": func() (*component.Plan, component.Result, error) {
-			return Component{}.Plan(t.Context(), env, enabledSite())
+		"Sites": func() (*component.Plan, component.Result, error) {
+			return BootstrapComponent{}.Plan(t.Context(), env, []unboundedv1alpha3.Site{*enabledSite(), *disabledSite("rack-b")})
 		},
-		"CleanupPlan": func() (*component.Plan, component.Result, error) {
-			return Component{}.CleanupPlan(t.Context(), env, disabledSite("rack-b"))
-		},
-		"Bootstrap": func() (*component.Plan, component.Result, error) {
+		"NoSites": func() (*component.Plan, component.Result, error) {
 			return BootstrapComponent{}.Plan(t.Context(), env, nil)
 		},
 	}

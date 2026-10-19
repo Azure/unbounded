@@ -296,18 +296,12 @@ func assertSiteAffinity(t *testing.T, affinity *corev1.Affinity, siteName string
 	}
 }
 
-// cleanup plans and executes the component's cleanup, mirroring the reconciler.
+// cleanup plans and executes one pass over site with metalman disabled,
+// mirroring the reconciler.
 func cleanup(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) error {
 	t.Helper()
 
-	c := Component{}
-
-	plan, _, err := c.CleanupPlan(t.Context(), env, site)
-	if err != nil {
-		return err
-	}
-
-	exec, err := env.Execute(t.Context(), plan)
+	exec, err := env.Execute(t.Context(), passPlan(t, env, site))
 	if err != nil {
 		return err
 	}
@@ -315,13 +309,13 @@ func cleanup(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) err
 	return exec.Err()
 }
 
-// reconcile plans and executes the component, mirroring the reconciler.
+// reconcile plans and executes one pass over site, mirroring the reconciler,
+// and returns the first verdict that is not ready across the bootstrap and
+// per-Site components, or the per-Site verdict when both are ready.
 func reconcile(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) component.Result {
 	t.Helper()
 
-	c := Component{}
-
-	plan, res, err := c.Plan(t.Context(), env, site)
+	results, plan, err := planPass(t, env, site)
 	if err != nil {
 		return component.Failed(err)
 	}
@@ -331,16 +325,46 @@ func reconcile(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) c
 		return component.Failed(err)
 	}
 
-	return component.CombineResult(c.Name(), site.Name, res, exec)
+	var res component.Result
+
+	for _, name := range []string{BootstrapComponent{}.Name(), Component{}.Name()} {
+		res = component.CombineResult(name, site.Name, results[name], exec)
+		if !res.Ready {
+			return res
+		}
+	}
+
+	return res
 }
 
 // TestPlanGolden pins the complete set of operations the metalman component
-// plans for one Site.
-//
-// The support RBAC ships in the machina manifest set and is byte-identical for
-// every Site, so every entry carries a shared key and the executor writes it
-// once per pass rather than once per Site. Before plan-then-execute this set
-// was re-applied in full for every Site on every pass.
+// plans for one Site: only the per-Site Deployment, ordered after the
+// admission restriction that BootstrapComponent plans once per pass.
+func TestPlanGolden(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, enabledSite())
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	want := `Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction]
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestBootstrapPlanGolden pins the shared support set BootstrapComponent plans
+// once per pass while Sites exist.
 //
 // The machina component skips exactly these objects (see
 // machina.applyMutator), so a change here without a matching change there
@@ -348,22 +372,13 @@ func reconcile(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) c
 //
 // The cluster is fresh, so the admission restriction is not live yet and the
 // bootstrap grant is withheld until a later pass reads it back.
-func TestPlanGolden(t *testing.T) {
+func TestBootstrapPlanGolden(t *testing.T) {
 	env := &component.Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
 		Namespace: component.DefaultNamespace,
 	}
 
-	site := &unboundedv1alpha3.Site{
-		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
-		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
-			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
-				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)},
-			},
-		}},
-	}
-
-	plan, res, err := (Component{}).Plan(t.Context(), env, site)
+	plan, res, err := (BootstrapComponent{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*enabledSite(), *disabledSite("rack-b")})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -388,7 +403,6 @@ Delete ClusterRoleBinding/metalman:bootstrap-machine [shared]
 Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
 Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
 Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
-Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction]
 `
 
 	if got := plan.Summary(); got != want {
@@ -396,21 +410,17 @@ Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable] [afte
 	}
 }
 
-// TestCleanupPlanGolden pins what disabling metalman for a Site plans. The
-// per-Site Deployment is removed. The shared support set is planned exactly as
-// in TestPlanGolden, because other Sites may use it and bootstrap tokens minted
-// earlier outlive the Deployment: the bootstrap grant stays behind the
-// admission restriction and is revoked while the restriction is not confirmed
-// live, as here on a fresh cluster. The stale
-// auto-approve binding is removed because it is never safe to keep.
+// TestCleanupPlanGolden pins what disabling metalman for a Site plans: only
+// the per-Site Deployment is removed. The shared support set stays with
+// BootstrapComponent, because other Sites may use it and bootstrap tokens
+// minted earlier outlive the Deployment.
 func TestCleanupPlanGolden(t *testing.T) {
 	env := &component.Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
 		Namespace: component.DefaultNamespace,
 	}
 
-	plan, res, err := (Component{}).CleanupPlan(t.Context(), env,
-		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}})
+	plan, res, err := (Component{}).CleanupPlan(t.Context(), env, disabledSite("rack-a"))
 	if err != nil {
 		t.Fatalf("CleanupPlan: %v", err)
 	}
@@ -420,22 +430,6 @@ func TestCleanupPlanGolden(t *testing.T) {
 	}
 
 	want := `Delete Deployment/unbounded-system/metalman-controller-rack-a
-Apply ServiceAccount/unbounded-system/metalman-controller [shared]
-Apply ServiceAccount/unbounded-system/metalman-bootstrap [shared]
-Apply Role/unbounded-system/metalman-controller [shared]
-Apply RoleBinding/unbounded-system/metalman-controller [shared]
-Apply Role/kube-public/metalman-controller [shared]
-Apply RoleBinding/kube-public/metalman-controller [shared]
-Apply Role/kube-system/metalman-controller [shared]
-Apply RoleBinding/kube-system/metalman-controller [shared]
-Apply ClusterRole/metalman-controller [shared]
-Apply ClusterRoleBinding/metalman-controller [shared]
-Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
-Apply ClusterRole/metalman-bootstrap [shared]
-Delete ClusterRoleBinding/metalman:bootstrap-machine [shared]
-Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
-Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
-Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
 `
 
 	if got := plan.Summary(); got != want {
@@ -602,10 +596,7 @@ func TestExecutionOrderInstallsRestrictionBeforeBootstrapAccess(t *testing.T) {
 		Namespace: component.DefaultNamespace,
 	}
 
-	plan, _, err := (Component{}).Plan(t.Context(), env, enabledSite())
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
+	plan := passPlan(t, env, enabledSite())
 
 	order, err := plan.ExecutionOrder()
 	if err != nil {
@@ -812,13 +803,29 @@ func disabledSite(name string) *unboundedv1alpha3.Site {
 	return &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: name}}
 }
 
-// passPlan builds one reconciler pass over sites: enabled Sites contribute
-// Plan, disabled Sites contribute CleanupPlan, merged into one plan.
-func passPlan(t *testing.T, env *component.Env, sites ...*unboundedv1alpha3.Site) *component.Plan {
+// planPass builds one reconciler pass over sites: the bootstrap component
+// plans once for the pass, then enabled Sites contribute Plan and disabled
+// Sites contribute CleanupPlan, merged into one plan. The returned results are
+// the planning verdicts by component name; a per-Site verdict is the last
+// Site's.
+func planPass(t *testing.T, env *component.Env, sites ...*unboundedv1alpha3.Site) (map[string]component.Result, *component.Plan, error) {
 	t.Helper()
 
+	all := make([]unboundedv1alpha3.Site, 0, len(sites))
+	for _, site := range sites {
+		all = append(all, *site)
+	}
+
+	results := map[string]component.Result{}
+
+	plan, res, err := BootstrapComponent{}.Plan(t.Context(), env, all)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	results[BootstrapComponent{}.Name()] = res
+
 	c := Component{}
-	plan := component.NewPlan()
 
 	for _, site := range sites {
 		planFn := c.CleanupPlan
@@ -826,12 +833,26 @@ func passPlan(t *testing.T, env *component.Env, sites ...*unboundedv1alpha3.Site
 			planFn = c.Plan
 		}
 
-		p, _, err := planFn(t.Context(), env, site)
+		p, res, err := planFn(t.Context(), env, site)
 		if err != nil {
-			t.Fatalf("plan site %s: %v", site.Name, err)
+			return nil, nil, err
 		}
 
+		results[c.Name()] = res
+
 		plan.Merge(p)
+	}
+
+	return results, plan, nil
+}
+
+// passPlan is planPass for tests that only need the merged plan.
+func passPlan(t *testing.T, env *component.Env, sites ...*unboundedv1alpha3.Site) *component.Plan {
+	t.Helper()
+
+	_, plan, err := planPass(t, env, sites...)
+	if err != nil {
+		t.Fatalf("plan pass: %v", err)
 	}
 
 	return plan
@@ -919,7 +940,7 @@ func TestCleanupRestrictionFailureRevokesBootstrapAccess(t *testing.T) {
 
 // TestCleanupDeploymentFailureStillRemovesAutoApproval verifies that a failed
 // Deployment delete does not skip the stale auto-approval delete or the
-// restriction applies that CleanupPlan shares with Plan.
+// restriction applies that BootstrapComponent plans in the same pass.
 func TestCleanupDeploymentFailureStillRemovesAutoApproval(t *testing.T) {
 	stale := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: StaleAutoApproveBindingName}}
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
@@ -970,10 +991,9 @@ func TestCleanupDeploymentFailureStillRemovesAutoApproval(t *testing.T) {
 	}
 }
 
-// TestMixedSitesShareBootstrapRestriction verifies that enabled and disabled
-// Sites plan the shared support set identically, so one pass dedupes it,
-// keeps the enabled Site's Deployment and grant, and removes only the
-// disabled Site's Deployment.
+// TestMixedSitesShareBootstrapRestriction verifies that a pass over enabled
+// and disabled Sites keeps the enabled Site's Deployment and the grant, and
+// removes only the disabled Site's Deployment.
 func TestMixedSitesShareBootstrapRestriction(t *testing.T) {
 	deletes := map[string]int{}
 	cl := upgradeClient(t, "", deletes, liveRestriction(t)...)

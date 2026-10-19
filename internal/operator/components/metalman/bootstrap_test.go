@@ -8,6 +8,7 @@ import (
 	"errors"
 	"testing"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -173,33 +174,32 @@ func TestBootstrapZeroSitesNoLegacyIsNoop(t *testing.T) {
 	}
 }
 
-// TestBootstrapWithSitesDefersToSiteComponent verifies the cluster component
-// plans nothing when Sites exist, so the per-Site planner's shared ops are the
-// only ones and nothing is duplicated or conflicting.
-func TestBootstrapWithSitesDefersToSiteComponent(t *testing.T) {
+// TestBootstrapWithSitesPlansSupportOnce verifies that with Sites present the
+// cluster component plans the shared support set and the per-Site component
+// plans none of it, so each shared object has exactly one planned operation.
+func TestBootstrapWithSitesPlansSupportOnce(t *testing.T) {
 	applied, deletes := map[string]int{}, map[string]int{}
 
 	objs := append([]client.Object{staleAutoApprove(), bootstrapGrant()}, liveRestriction(t)...)
 	cl := bootstrapClient(t, "", applied, deletes, objs...)
 	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
 
-	sites := []unboundedv1alpha3.Site{*enabledSite(), *disabledSite("rack-b")}
+	sites := []*unboundedv1alpha3.Site{enabledSite(), disabledSite("rack-b")}
 
-	clusterPlan, res, err := BootstrapComponent{}.Plan(t.Context(), env, sites)
+	results, plan, err := planPass(t, env, sites...)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
 
-	if clusterPlan.Len() != 0 {
-		t.Fatalf("cluster plan has %d operations with Sites present, want 0", clusterPlan.Len())
+	if res := results[BootstrapComponent{}.Name()]; !res.Ready || res.Reason != component.ReasonReconciled {
+		t.Fatalf("bootstrap result = %+v, want reconciled", res)
 	}
 
-	if !res.Ready {
-		t.Fatalf("result = %+v, want ready", res)
+	for _, op := range plan.Operations {
+		if op.SharedKey != "" && op.Component != (BootstrapComponent{}).Name() {
+			t.Fatalf("%s planned shared %s; only the bootstrap component may", op.Component, op.Ref())
+		}
 	}
-
-	plan := passPlan(t, env, &sites[0], &sites[1])
-	plan.Merge(clusterPlan)
 
 	exec, err := env.Execute(t.Context(), plan)
 	if err != nil {
@@ -220,6 +220,78 @@ func TestBootstrapWithSitesDefersToSiteComponent(t *testing.T) {
 
 	if n := deletes["ClusterRoleBinding/"+BootstrapMachineBindingName]; n != 0 {
 		t.Fatalf("bootstrap grant deleted %d times, want 0", n)
+	}
+}
+
+// TestMultiSiteDifferingReadsStillRevoke verifies a pass over several Sites
+// where the live restriction read fails once and then succeeds. Verification
+// runs once per pass, so the grant is planned one way only: the pass executes,
+// the grant is revoked, the stale auto-approval binding is removed, and the
+// result fails so the pass is retried.
+//
+// When each Site verified separately, the first Site planned a delete of the
+// grant and the next an apply, and the executor rejected the whole plan.
+func TestMultiSiteDifferingReadsStillRevoke(t *testing.T) {
+	policy, binding := livePolicy(t), liveBinding(t)
+	withDefaults(policy, binding)
+
+	applied, deletes := map[string]int{}, map[string]int{}
+	cached := bootstrapClient(t, "", applied, deletes, policy, binding, staleAutoApprove(), bootstrapGrant())
+
+	readErr := errors.New("apiserver unavailable")
+	reads := 0
+	apiReader := interceptor.NewClient(
+		fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(policy.DeepCopy(), binding.DeepCopy()).Build(),
+		interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*admissionv1.ValidatingAdmissionPolicyBinding); ok {
+					reads++
+					if reads == 1 {
+						return readErr
+					}
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	)
+	env := &component.Env{Client: cached, APIReader: apiReader, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	second := enabledSite()
+	second.Name = "rack-b"
+
+	results, plan, err := planPass(t, env, enabledSite(), second, disabledSite("rack-c"))
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	if reads != 1 {
+		t.Fatalf("restriction binding read %d times in one pass, want once", reads)
+	}
+
+	if res := results[BootstrapComponent{}.Name()]; !errors.Is(res.Err, readErr) {
+		t.Fatalf("bootstrap result = %+v, want the read error", res)
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("execute: %v, want the plan accepted", err)
+	}
+
+	if err := exec.Err(); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+
+	if applied[crbRef] != 0 {
+		t.Fatalf("grant applied %d times while verification failed, want 0", applied[crbRef])
+	}
+
+	if n := deletes[crbRef]; n != 1 {
+		t.Fatalf("grant deleted %d times, want 1", n)
+	}
+
+	if n := deletes["ClusterRoleBinding/"+StaleAutoApproveBindingName]; n != 1 {
+		t.Fatalf("stale binding deleted %d times, want 1", n)
 	}
 }
 
