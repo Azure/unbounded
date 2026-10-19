@@ -9,6 +9,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -26,7 +28,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme, unboundedv1alpha3.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}
@@ -368,9 +370,9 @@ Apply RoleBinding/kube-system/metalman-controller [shared]
 Apply ClusterRole/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
-Apply ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
 Apply ClusterRole/metalman-bootstrap [shared]
 Apply ClusterRoleBinding/metalman:bootstrap-machine [shared]
+Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
 Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable]
 `
 
@@ -381,7 +383,8 @@ Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable]
 
 // TestCleanupPlanGolden pins what disabling metalman for a Site removes. The
 // shared RBAC is deliberately left behind: it is harmless unreferenced and may
-// still be in use by another Site.
+// still be in use by another Site. The stale auto-approve binding is removed
+// because it is never safe to keep.
 func TestCleanupPlanGolden(t *testing.T) {
 	env := &component.Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
@@ -398,7 +401,8 @@ func TestCleanupPlanGolden(t *testing.T) {
 		t.Fatalf("result = %+v, want ready with reason %q", res, component.ReasonDisabled)
 	}
 
-	want := "Delete Deployment/unbounded-system/metalman-controller-rack-a\n"
+	want := "Delete Deployment/unbounded-system/metalman-controller-rack-a\n" +
+		"Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]\n"
 
 	if got := plan.Summary(); got != want {
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
@@ -452,6 +456,93 @@ func TestReconcileAppliesPlannedObjects(t *testing.T) {
 	} {
 		if !applied[want] {
 			t.Fatalf("%s was planned but never applied", want)
+		}
+	}
+}
+
+// TestReconcileDeletesStaleAutoApproveBinding verifies an upgrade removes the
+// ClusterRoleBinding that let kube-controller-manager auto-approve kubelet
+// client certificates for any node requested with a metalman-bootstrap token,
+// and that the delete is idempotent once the binding is gone.
+func TestReconcileDeletesStaleAutoApproveBinding(t *testing.T) {
+	stale := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: StaleAutoApproveBindingName},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(stale).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+				return nil
+			},
+		}).
+		Build()
+
+	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)},
+			},
+		}},
+	}
+
+	for range 2 {
+		if res := reconcile(t, env, site); !res.Ready {
+			t.Fatalf("result = %+v, want ready", res)
+		}
+
+		err := cl.Get(t.Context(), client.ObjectKey{Name: StaleAutoApproveBindingName}, &rbacv1.ClusterRoleBinding{})
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("get stale binding: err = %v, want NotFound", err)
+		}
+	}
+}
+
+// TestSupportManifestsDoNotGrantAutoApproval guards against reintroducing the
+// nodeclient auto-approval or Machine create for the metalman-bootstrap SA.
+func TestSupportManifestsDoNotGrantAutoApproval(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	objs, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for _, obj := range objs {
+		if obj.GetKind() == "ClusterRoleBinding" {
+			name, _, _ := unstructured.NestedString(obj.Object, "roleRef", "name")
+			if name == "system:certificates.k8s.io:certificatesigningrequests:nodeclient" {
+				t.Fatalf("%s binds the nodeclient auto-approval role", obj.GetName())
+			}
+		}
+
+		if obj.GetKind() == "ClusterRole" && obj.GetName() == "metalman-bootstrap" {
+			rules, _, _ := unstructured.NestedSlice(obj.Object, "rules")
+			for _, r := range rules {
+				rule, _ := r.(map[string]any)
+				verbs, _, _ := unstructured.NestedStringSlice(rule, "verbs")
+				resources, _, _ := unstructured.NestedStringSlice(rule, "resources")
+
+				for _, res := range resources {
+					for _, v := range verbs {
+						if res == "machines" && v != "get" {
+							t.Fatalf("metalman-bootstrap grants %q on machines", v)
+						}
+					}
+				}
+			}
 		}
 	}
 }

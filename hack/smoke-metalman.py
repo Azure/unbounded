@@ -622,12 +622,45 @@ def machine_status() -> str | None:
     return result.stdout.strip() or None
 
 
+METALMAN_BOOTSTRAP_USER = "system:serviceaccount:unbounded-system:metalman-bootstrap"
+KUBELET_CLIENT_SIGNER = "kubernetes.io/kube-apiserver-client-kubelet"
+
+
+def approve_metalman_kubelet_csrs(name: str) -> None:
+    """Approve pending kubelet client CSRs for *name* from metalman tokens.
+
+    The smoke test runs metalman locally without the machina controller, which
+    is what approves these CSRs in a real deployment (after binding the token to
+    its attested Machine). Stand in for it here, restricted to the smoke node.
+    """
+    result = subprocess.run([KUBECTL, "get", "csr", "-o", "json"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return
+    for csr in json.loads(result.stdout).get("items", []):
+        spec = csr.get("spec", {})
+        if spec.get("signerName") != KUBELET_CLIENT_SIGNER or spec.get("username") != METALMAN_BOOTSTRAP_USER:
+            continue
+        if csr.get("status", {}).get("conditions"):
+            continue
+        subject = subprocess.run(
+            ["openssl", "req", "-noout", "-subject", "-nameopt", "RFC2253"],
+            input=base64.b64decode(spec.get("request", "")).decode(),
+            capture_output=True, text=True,
+        )
+        if subject.returncode != 0 or f"CN=system:node:{name}" not in subject.stdout.split(","):
+            continue
+        csr_name = csr["metadata"]["name"]
+        log(f"  Approving metalman kubelet client CSR {csr_name} for node '{name}'")
+        run_quiet([KUBECTL, "certificate", "approve", csr_name])
+
+
 def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     log(f"  Waiting for Kubernetes Node '{name}' to appear...")
     last_status: str | None = None
     net_diag_done = False
     for elapsed in range(timeout):
         check_procs()
+        approve_metalman_kubelet_csrs(name)
         result = subprocess.run(
             [KUBECTL, "get", "node", name, "-o", "json"],
             capture_output=True, text=True,
@@ -1137,6 +1170,8 @@ def main() -> None:
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
+    # Earlier releases auto-approved any kubelet client CSR from metalman tokens.
+    run_quiet([KUBECTL, "delete", "clusterrolebinding", "metalman:node-autoapprove-bootstrap", "--ignore-not-found"])
 
     log("Creating Kubernetes resources")
     kubectl(["-n", NODE_NS, "create", "secret", "generic",

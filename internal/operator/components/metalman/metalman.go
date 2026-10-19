@@ -9,6 +9,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -63,6 +64,12 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 		})
 	}
 
+	// Remove RBAC that earlier releases installed and that is now unsafe to
+	// keep. Deletes are idempotent, so they run on every pass.
+	for _, op := range staleSupportDeletes(c.Name(), site.Name) {
+		plan.Add(op)
+	}
+
 	plan.Add(component.Operation{
 		Kind:        component.OpApply,
 		Object:      component.ToUnstructured(deployment(site, env.Namespace, env.Config)),
@@ -76,7 +83,8 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 
 // CleanupPlan removes the per-site metalman Deployment. The shared metalman
 // RBAC is left in place; it is harmless when unreferenced and may still be used
-// by other sites.
+// by other sites. RBAC that is no longer shipped is still removed because it
+// is never safe to keep.
 func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
 	plan.Add(component.DeleteOperation(&appsv1.Deployment{
@@ -84,7 +92,31 @@ func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unbo
 		ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace},
 	}, c.Name(), site.Name))
 
+	for _, op := range staleSupportDeletes(c.Name(), site.Name) {
+		plan.Add(op)
+	}
+
 	return plan, component.Disabled("component disabled"), nil
+}
+
+// StaleAutoApproveBindingName is the ClusterRoleBinding that earlier releases
+// installed to let kube-controller-manager auto-approve kubelet client
+// certificates for any node requested with a metalman-bootstrap token. Machina
+// now approves those requests only for the attested Machine, so the binding
+// must be removed on upgrade.
+const StaleAutoApproveBindingName = "metalman:node-autoapprove-bootstrap"
+
+// staleSupportDeletes returns delete operations for shared metalman RBAC that
+// is no longer shipped. They carry a shared key so every Site plans the same
+// delete and the executor issues it once per pass.
+func staleSupportDeletes(componentName, site string) []component.Operation {
+	op := component.DeleteOperation(&rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: StaleAutoApproveBindingName},
+	}, componentName, site)
+	op.SharedKey = sharedSupportKey(op.Object)
+
+	return []component.Operation{op}
 }
 
 // sharedSupportKey identifies a support object across Sites. The objects are
