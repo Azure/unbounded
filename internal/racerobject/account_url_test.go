@@ -80,3 +80,34 @@ func TestAzureOriginIdentity(t *testing.T) {
 		t.Error("accepted unparsable URL")
 	}
 }
+
+func TestValidateOriginScope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		namespace string
+		buckets   []string
+		ok        bool
+	}{
+		{name: "valid", namespace: "https://account.blob.core.windows.net", buckets: []string{"models", "data.v1", "a_b-c"}, ok: true},
+		{name: "no buckets", namespace: "https://account.blob.core.windows.net", ok: true},
+		{name: "empty namespace", namespace: "", buckets: []string{"models"}},
+		{name: "namespace with space", namespace: "a b", buckets: []string{"models"}},
+		{name: "namespace too long", namespace: strings.Repeat("a", 257), buckets: []string{"models"}},
+		{name: "dot bucket", namespace: "ns", buckets: []string{"."}},
+		{name: "dot dot bucket", namespace: "ns", buckets: []string{".."}},
+		{name: "slash bucket", namespace: "ns", buckets: []string{"a/b"}},
+		{name: "empty bucket", namespace: "ns", buckets: []string{""}},
+		{name: "long bucket", namespace: "ns", buckets: []string{strings.Repeat("b", 256)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateOriginScope(tc.namespace, tc.buckets)
+			if tc.ok && err != nil {
+				t.Fatalf("rejected: %v", err)
+			}
+
+			if !tc.ok && err == nil {
+				t.Fatal("accepted invalid scope")
+			}
+		})
+	}
+}
