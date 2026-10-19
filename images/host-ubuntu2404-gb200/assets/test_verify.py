@@ -99,6 +99,11 @@ class RootfsContractTest(unittest.TestCase):
         self.assertIn("update_initramfs=no", phases[1])
         self.assertIn("update_initramfs=yes", phases[2])
 
+    def test_boot_uses_platform_virtio_network_device(self):
+        source = Path(__file__).resolve().parents[1].joinpath("verify-boot.sh").read_text()
+        self.assertIn("-device virtio-net-device,netdev=net0", source)
+        self.assertNotIn("-device virtio-net-pci", source)
+
     def test_builder_kernel_initramfs_rejected(self):
         self.put("/boot/initrd.img-builder-kernel", "wrong initramfs")
         self.rejected("unexpected builder-kernel")

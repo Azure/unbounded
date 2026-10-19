@@ -44,7 +44,7 @@ timeout --signal=TERM --kill-after=10s 300s \
     -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
     -drive file=disk.img,format=raw,if=virtio \
     -drive file=seed.img,format=raw,if=virtio \
-    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
     > boot.log 2>&1
 grep -Fq UNBOUNDED_GB200_UBUNTU_BOOT_PASS boot.log
 printf '%s\n' "ARM64 UEFI/kernel/64K/cloud-init/networkd/SSH boot check passed."
