@@ -54,15 +54,25 @@ A single buffer is at most 1 GiB (see `Alignment::extent` and
 `Alignment::MAX_TRANSFER_LENGTH` in `alloc/src/lib.rs`).
 
 Each buffer holds a caller-supplied `Charge`, so the caller can account for
-memory against its own budget. The slab keeps at most one idle buffer.
-After checking charge coverage, allocation reuses it only for an exact length
-match; otherwise it frees the idle buffer and allocates new storage
-(see `Slab::allocate` in `alloc/src/slab.rs`). On drop, a buffer fills the idle slot
-only if the pool still exists and the slot is empty and can be mutably borrowed; otherwise
-its storage is freed (see the `Drop` implementations for `AlignedBuffer` and
-`Allocation` in `alloc/src/lib.rs`).
-The retained size depends on return order, not necessarily the last size used.
-This is not a general size-class pool.
+memory against its own budget. The slab keeps a small list of idle buffers,
+oldest first, grouped in 64 KiB size classes and bounded by 128 MiB. After
+checking charge coverage, allocation reuses an idle buffer of the same size
+class and leaves mismatches pooled (see `Slab::allocate` in
+`alloc/src/slab.rs`). On drop, a buffer joins the pool only if the pool still
+exists, can be mutably borrowed, and admits it; otherwise its storage is freed
+(see the `Drop` implementations for `AlignedBuffer` and `Allocation` in
+`alloc/src/lib.rs`).
+
+The pool depth is not fixed. A `PoolDemand` controller (`alloc/src/demand.rs`)
+holds a target depth between 0 and 8, starting at 2. Returns beyond the target
+are refused. `Slab::maintain_idle` runs one observation window (1 s) at a time:
+when allocations missed and returns were refused for depth, the target grows by
+half the misses (at least 1); entries that stayed unused for the whole window
+are halved, oldest first; after 10 miss-free windows the target drops by 1.
+`Slab::constrain_idle` holds the pool empty under memory pressure. The flow
+recycler (`Quotas::maintain_buffers` in `flow/src/lib.rs`) uses the same
+controller and also retains at most half of each class limit. Workers drive
+both from `poll_services`.
 
 Each buffer tracks whether it is still all zeros. Any mutable access, including
 handing it to the kernel for a read, marks it dirty. On drop, a dirty buffer is
