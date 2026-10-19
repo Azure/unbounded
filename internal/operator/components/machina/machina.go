@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package machina implements the machina controller cluster component. Machina
-// is a singleton for now: it is deployed whenever any Site enables it or
-// metalman, and kept reconciled when an installation already exists.
+// is a singleton for now: it is deployed whenever any Site enables it and kept
+// reconciled when an installation already exists.
 package machina
 
 import (
@@ -43,13 +43,13 @@ func (Component) Name() string { return "machina" }
 // ConditionType implements component.ClusterComponent.
 func (Component) ConditionType() string { return "MachinaReady" }
 
-// Plan deploys the machina controller singleton whenever any Site requires it
-// (see RequiredBy) and keeps an existing installation reconciled when none do.
+// Reconcile deploys the machina controller singleton whenever any Site enables
+// it and keeps an existing installation reconciled when none do.
 func (c Component) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	enabled := false
 
 	for i := range sites {
-		if RequiredBy(&sites[i]) {
+		if EnabledFor(&sites[i]) {
 			enabled = true
 			break
 		}
@@ -126,16 +126,6 @@ func EnabledFor(site *unboundedv1alpha3.Site) bool {
 	}
 
 	return unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Machina.SiteComponentSpec)
-}
-
-// RequiredBy reports whether a Site requires the machina singleton. That is
-// the case when the Site enables machina, or when it enables metalman: machina
-// hosts the only approver for kubelet client CSRs from the metalman-bootstrap
-// ServiceAccount, so metalman nodes cannot finish bootstrap without it. A Site
-// that enables metalman therefore installs machina even if it explicitly sets
-// machina.enabled to false.
-func RequiredBy(site *unboundedv1alpha3.Site) bool {
-	return EnabledFor(site) || metalman.Component{}.Enabled(site)
 }
 
 func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {

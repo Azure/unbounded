@@ -138,6 +138,18 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # Kubelet client CSRs from metalman-bootstrap tokens, approved only for the
+  # node name recorded with the token's credential on its attested Machine
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["update"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["signers"]
+    resourceNames: ["kubernetes.io/kube-apiserver-client-kubelet"]
+    verbs: ["approve"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -175,7 +187,7 @@ roleRef:
 # Machines, so the agent's register-machine phase never needs to create one.
 #
 # Kubelet client certificates requested with these tokens are NOT
-# auto-approved. Machina approves them only for the node name of the single
+# auto-approved. Metalman approves them only for the node name of the single
 # Machine whose status.bootstrap.credentialID matches the requesting token.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

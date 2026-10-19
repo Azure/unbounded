@@ -6,6 +6,7 @@ package daemoncred
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -221,4 +222,19 @@ func TestKubeletClientCSRApproverPropagatesAuthorizationError(t *testing.T) {
 
 	_, err = a.Evaluate(context.Background(), csrFor(t, kubeletSpec(), kubeletSubject("node-a")))
 	require.ErrorContains(t, err, "boom")
+}
+
+func TestKubeletClientCSRApproverIgnoresUnknownCredential(t *testing.T) {
+	a, err := NewKubeletClientCSRApprover(KubeletClientCSRApproverOptions{
+		Requester: testKubeletRequester,
+		AuthorizeNode: func(context.Context, *certificatesv1.CertificateSigningRequest, string, string) (bool, string, error) {
+			return false, "", fmt.Errorf("lookup: %w", ErrUnknownCredential)
+		},
+	})
+	require.NoError(t, err)
+
+	decision, err := a.Evaluate(context.Background(), csrFor(t, kubeletSpec(), kubeletSubject("node-a")))
+	require.NoError(t, err)
+	require.True(t, decision.Ignore)
+	require.False(t, decision.Approve)
 }

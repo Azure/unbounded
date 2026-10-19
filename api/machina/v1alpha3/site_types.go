@@ -116,9 +116,7 @@ type SiteSpec struct {
 // component.ClusterComponent or component.SiteComponent in a package under
 // internal/operator/components, then register it in operator.DefaultRegistry.
 type SiteComponents struct {
-	// Machina configures the machina controller for this site. The machina
-	// controller is a cluster singleton; it is also installed when any Site
-	// enables Metalman, because machina approves Metalman kubelet client CSRs.
+	// Machina configures the machina controller for this site.
 	// +optional
 	Machina *MachinaComponentSpec `json:"machina,omitempty"`
 

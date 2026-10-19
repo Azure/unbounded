@@ -54,10 +54,8 @@ over SSH. Given a `Machine` custom resource with SSH connection details, it:
 4. Watches for the corresponding `Node` object and transitions the Machine
    through its lifecycle phases.
 
-machina is deployed by `unbounded-operator` when any Site enables it
-in `Site.spec.components`. It is also deployed when any Site enables metalman,
-because machina approves the kubelet client certificate requests of metalman
-nodes. Install the operator first with
+machina is deployed by `unbounded-operator` when it is enabled in
+`Site.spec.components`. Install the operator first with
 `kubectl unbounded install`, then `kubectl unbounded site init` creates the Site.
 
 See the [SSH guide]({{< relref "guides/ssh" >}}) for a hands-on walkthrough

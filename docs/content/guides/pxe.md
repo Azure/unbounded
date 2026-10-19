@@ -213,7 +213,7 @@ Metalman also sets the agent's node name to the Machine's node name (`spec.kuber
 
 The `metalman-bootstrap` ServiceAccount token is limited:
 
-- Kubelet client CSRs from this ServiceAccount are not auto-approved by kube-controller-manager. The machina controller approves a CSR only when its `authentication.kubernetes.io/credential-id` extra matches the `status.bootstrap.credentialID` of exactly one Machine, and the CN is `system:node:<status.bootstrap.nodeName of that Machine>`, the node name recorded when the token was issued. Otherwise it denies the CSR.
+- Kubelet client CSRs from this ServiceAccount are not auto-approved by kube-controller-manager. Metalman approves a CSR only when its `authentication.kubernetes.io/credential-id` extra matches the `status.bootstrap.credentialID` of exactly one Machine, and the CN is `system:node:<status.bootstrap.nodeName of that Machine>`, the node name recorded when the token was issued. Otherwise it denies the CSR. Each metalman instance decides only CSRs whose credential is recorded on a Machine in its own Site, and leaves other CSRs pending.
 - A ValidatingAdmissionPolicy lets the ServiceAccount update only the status of its own Machine (matched by credential ID), and never `status.tpm` or `status.bootstrap`. It cannot create Machines.
 
 Metalman identifies clients only by the TCP peer address. It ignores `X-Forwarded-For`, `X-Real-IP`, and `Forwarded` headers. Running metalman behind an HTTP proxy is not supported.
@@ -259,7 +259,7 @@ Running metalman's DHCP server on a network segment that already has an active D
 
 **TPM attestation rejected (403).** The EK public key has changed since the initial TOFU. If the TPM was legitimately replaced, clear `status.tpm.ekPublicKey` from the Machine CR to allow re-enrollment.
 
-**Node not joining.** Verify the target machine can reach the Kubernetes API on TCP/6443. Check that the `metalman-bootstrap` ServiceAccount and RBAC are in place, that the Machine has `status.bootstrap.credentialID` set, and that the machina controller is running to approve the kubelet CSR. Inspect kubelet logs on the target for certificate signing request errors.
+**Node not joining.** Verify the target machine can reach the Kubernetes API on TCP/6443. Check that the `metalman-bootstrap` ServiceAccount and RBAC are in place, that the Machine has `status.bootstrap.credentialID` set, and that the metalman controller for the Machine's Site is running to approve the kubelet CSR. Inspect kubelet logs on the target for certificate signing request errors.
 
 ## Limitations
 

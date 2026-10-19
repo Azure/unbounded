@@ -101,10 +101,8 @@ spec:
                         type: boolean
                     type: object
                   machina:
-                    description: |-
-                      Machina configures the machina controller for this site. The machina
-                      controller is a cluster singleton; it is also installed when any Site
-                      enables Metalman, because machina approves Metalman kubelet client CSRs.
+                    description: Machina configures the machina controller for this
+                      site.
                     properties:
                       enabled:
                         description: Enabled controls whether the component is reconciled.

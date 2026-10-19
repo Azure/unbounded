@@ -342,11 +342,7 @@ def start_metalman_and_replace() -> None:
     operation = smoke.create_machine_operation(
         "http-smoke-host-replace", "HostReplace", machine_ref=NODE
     )
-    csr_approver = smoke.start_metalman_csr_approver(NODE)
-    try:
-        smoke.wait_machine_operation_complete(operation, timeout=1800)
-    finally:
-        csr_approver.set()
+    smoke.wait_machine_operation_complete(operation, timeout=1800)
 
 
 def fixture_writes() -> list[dict[str, Any]]:

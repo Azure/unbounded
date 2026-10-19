@@ -107,15 +107,6 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("setup daemon CSR approver controller: %w", err)
 	}
 
-	metalmanCSRApprover, err := NewMetalmanCSRApprover(mgr.GetClient(), mgr.GetAPIReader(), kubeClient)
-	if err != nil {
-		return fmt.Errorf("create metalman CSR approver controller: %w", err)
-	}
-
-	if err := metalmanCSRApprover.SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("setup metalman CSR approver controller: %w", err)
-	}
-
 	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return fmt.Errorf("add healthz check: %w", err)
@@ -159,10 +150,6 @@ func setupMachineFieldIndexes(ctx context.Context, indexer client.FieldIndexer) 
 		return []string{machine.Spec.Kubernetes.NodeRef.Name}
 	}); err != nil {
 		return fmt.Errorf("index Machine node ref: %w", err)
-	}
-
-	if err := indexer.IndexField(ctx, &unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID); err != nil {
-		return fmt.Errorf("index Machine bootstrap credential ID: %w", err)
 	}
 
 	return nil

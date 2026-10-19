@@ -137,11 +137,12 @@ fails. The served agent config pins the node name to the Machine's node name
 
 The token is scoped to its Machine:
 
-- The machina controller approves kubelet client CSRs from
-  `metalman-bootstrap` only if the CSR's
-  `authentication.kubernetes.io/credential-id` extra matches exactly one
+- Metalman approves kubelet client CSRs from `metalman-bootstrap` only if the
+  CSR's `authentication.kubernetes.io/credential-id` extra matches exactly one
   Machine's `status.bootstrap.credentialID` and the CN is
-  `system:node:<node name>` for that Machine. Otherwise it denies them.
+  `system:node:<status.bootstrap.nodeName>` for that Machine. Otherwise it
+  denies them. Each instance decides only CSRs whose credential is recorded on
+  a Machine of its own Site and leaves the rest pending.
   kube-controller-manager does not auto-approve them.
 - A ValidatingAdmissionPolicy lets the ServiceAccount update only its own
   Machine's status, without changing `status.tpm` or `status.bootstrap`. It

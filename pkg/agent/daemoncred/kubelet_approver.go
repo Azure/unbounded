@@ -5,6 +5,7 @@ package daemoncred
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -21,9 +22,16 @@ const (
 	CredentialIDExtraKey = "authentication.kubernetes.io/credential-id"
 )
 
+// ErrUnknownCredential is returned, possibly wrapped, by a
+// KubeletNodeAuthorizationFunc that has no record of the credential. The CSR
+// is left undecided rather than denied, so an approver that does know the
+// credential, or a later evaluation once the record is observed, decides it.
+var ErrUnknownCredential = errors.New("unknown credential")
+
 // KubeletNodeAuthorizationFunc decides whether the credential identified by
 // credentialID may obtain a kubelet client certificate for nodeName. A false
-// result must carry a human-readable denial reason.
+// result must carry a human-readable denial reason. An error wrapping
+// ErrUnknownCredential leaves the CSR undecided.
 type KubeletNodeAuthorizationFunc func(ctx context.Context, csr *certificatesv1.CertificateSigningRequest, nodeName, credentialID string) (bool, string, error)
 
 // KubeletClientCSRApproverOptions configures KubeletClientCSRApprover.
@@ -42,7 +50,8 @@ type KubeletClientCSRApproverOptions struct {
 
 // KubeletClientCSRApprover approves kubelet client CSRs submitted by a single
 // requester identity, typically a ServiceAccount whose tokens are minted per
-// Machine. Every handled CSR is either approved or denied.
+// Machine. Every handled CSR is either approved or denied, unless AuthorizeNode
+// reports ErrUnknownCredential.
 type KubeletClientCSRApprover struct {
 	opts KubeletClientCSRApproverOptions
 }
@@ -128,6 +137,10 @@ func (a *KubeletClientCSRApprover) Evaluate(ctx context.Context, csr *certificat
 	}
 
 	allowed, reason, err := a.opts.AuthorizeNode(ctx, csr, nodeName, credentialIDs[0])
+	if errors.Is(err, ErrUnknownCredential) {
+		return CSRDecision{Ignore: true}, nil
+	}
+
 	if err != nil {
 		return CSRDecision{}, err
 	}

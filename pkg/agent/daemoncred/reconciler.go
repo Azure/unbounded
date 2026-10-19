@@ -41,10 +41,6 @@ type CSRApproverReconciler struct {
 	// Approver evaluates CSR requests.
 	Approver CSREvaluator
 
-	// Name optionally sets the controller name. It must be unique per manager
-	// when more than one CSRApproverReconciler is registered.
-	Name string
-
 	// EventFilter optionally customizes which CSR events enqueue reconcile work.
 	// When nil, create, update, and generic events are processed and deletes are ignored.
 	EventFilter predicate.Predicate
@@ -121,12 +117,7 @@ func (r *CSRApproverReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		filter = defaultCSRApproverEventFilter()
 	}
 
-	b := ctrl.NewControllerManagedBy(mgr)
-	if r.Name != "" {
-		b = b.Named(r.Name)
-	}
-
-	return b.
+	return ctrl.NewControllerManagedBy(mgr).
 		For(&certificatesv1.CertificateSigningRequest{}).
 		WithEventFilter(filter).
 		Complete(r)

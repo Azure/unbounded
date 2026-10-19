@@ -48,3 +48,18 @@ func IndexNodeByIPFunc(obj client.Object) []string {
 
 	return ips
 }
+
+// IndexMachineByBootstrapCredentialID is the field index key used to look up
+// Machines by the credential ID of the last bootstrap token issued to them.
+const IndexMachineByBootstrapCredentialID = ".status.bootstrap.credentialID"
+
+// IndexMachineByBootstrapCredentialIDFunc is the field indexer function for
+// IndexMachineByBootstrapCredentialID.
+func IndexMachineByBootstrapCredentialIDFunc(obj client.Object) []string {
+	node := obj.(*v1alpha3.Machine) //nolint:errcheck // Indexer is registered for Machine type only.
+	if node.Status.Bootstrap == nil || node.Status.Bootstrap.CredentialID == "" {
+		return nil
+	}
+
+	return []string{node.Status.Bootstrap.CredentialID}
+}

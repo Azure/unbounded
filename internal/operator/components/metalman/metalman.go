@@ -258,7 +258,7 @@ func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unbo
 
 // StaleAutoApproveBindingName is the ClusterRoleBinding that earlier releases
 // installed to let kube-controller-manager auto-approve kubelet client
-// certificates for any node requested with a metalman-bootstrap token. Machina
+// certificates for any node requested with a metalman-bootstrap token. Metalman
 // now approves those requests only for the attested Machine, so the binding
 // must be removed on upgrade.
 const StaleAutoApproveBindingName = "metalman:node-autoapprove-bootstrap"
