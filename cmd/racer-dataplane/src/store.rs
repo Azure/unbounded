@@ -1107,6 +1107,18 @@ impl StoreWriter {
     pub fn retained_staging_bytes(&self) -> usize {
         self.slabs.idle_bytes()
     }
+    /// Run idle staging demand maintenance; O(1) between windows.
+    pub fn maintain_staging(&self, now: std::time::Instant) -> usize {
+        self.slabs.maintain_idle(now)
+    }
+    /// Hold idle staging empty while memory is constrained.
+    pub fn constrain_staging(&self, constrained: bool) {
+        self.slabs.constrain_idle(constrained);
+    }
+    /// Idle staging size, demand target, and cumulative counters.
+    pub fn staging_pool_stats(&self) -> flow_control::PoolStats {
+        self.slabs.idle_pool_stats()
+    }
     #[cfg(test)]
     fn reclaim_idle_buffer(&self) -> usize {
         self.slabs.reclaim_idle()

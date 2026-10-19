@@ -1445,6 +1445,7 @@ impl WorkerApplication {
         stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
         stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
         self.http.poll_waiters(budget);
+        self.maintain_pools(now);
         if let Some(gate) = self.node.peer_receive.get() {
             gate.poll_deadlines(budget);
         }
@@ -1468,6 +1469,29 @@ impl WorkerApplication {
             self.next_health = now + Duration::from_millis(100);
         }
         Ok(())
+    }
+
+    /// Advance demand sizing of the idle recycler and staging pools.
+    /// Each pool is O(1) until its observation window elapses.
+    fn maintain_pools(&self, now: std::time::Instant) {
+        self.runtime.admission.maintain_buffers(now);
+        self.store.writer.maintain_staging(now);
+    }
+
+    /// Hold both idle pools at their minimum while memory is constrained.
+    #[allow(dead_code, reason = "consumed by the memory-pressure handler")]
+    pub(crate) fn constrain_pools(&self, constrained: bool) {
+        self.runtime.admission.constrain_buffers(constrained);
+        self.store.writer.constrain_staging(constrained);
+    }
+
+    /// Idle pool statistics as `(recycler, staging slab)`.
+    #[allow(dead_code, reason = "consumed by worker pool telemetry")]
+    pub(crate) fn pool_stats(&self) -> (flow_control::PoolStats, flow_control::PoolStats) {
+        (
+            self.runtime.admission.buffer_pool_stats(),
+            self.store.writer.staging_pool_stats(),
+        )
     }
 
     /// Schedule placement progress or back off pinned capacity with a bounded warning rate.
