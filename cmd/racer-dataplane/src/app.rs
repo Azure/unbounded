@@ -175,6 +175,9 @@ pub struct NodeState {
     native: native::NativePairs,
 
     cache_rollout: controlplane::Rollout<WorkerId, Vec<CacheDefinition>>,
+
+    /// Process-wide memory-pressure level, written only by the control worker.
+    pressure: crate::pressure::SharedPressure,
 }
 
 impl Default for NodeState {
@@ -225,6 +228,7 @@ impl NodeState {
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
             native: native::NativePairs::default(),
+            pressure: Default::default(),
         })
     }
 }
@@ -532,6 +536,8 @@ pub struct WorkerApplication {
 
     next_health: std::time::Instant,
 
+    pressure: WorkerPressure,
+
     environment: racer_platform::environment::Environment,
 
     drivers: Rc<racer_platform::drivers::DriverQueue>,
@@ -803,6 +809,8 @@ impl WorkerApplication {
         ));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
+        let is_sampler = worker == node.control_worker;
+        let node_pressure = node.pressure.clone();
         let control = if worker == node.control_worker {
             Some(Self::assemble_control(
                 config,
@@ -1102,6 +1110,7 @@ impl WorkerApplication {
             cache_preparing_generation: 0,
             control_scope: None,
             next_health: racer_platform::environment::now(),
+            pressure: WorkerPressure::new(config.memory_pressure, &node_pressure, is_sampler),
         })
     }
 
@@ -1445,6 +1454,7 @@ impl WorkerApplication {
         stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
         stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
         self.http.poll_waiters(budget);
+        self.poll_pressure(now);
         self.maintain_pools(now);
         if let Some(gate) = self.node.peer_receive.get() {
             gate.poll_deadlines(budget);
@@ -1465,6 +1475,8 @@ impl WorkerApplication {
         }
         let now = racer_platform::environment::now();
         if now >= self.next_health {
+            self.observe_memory(now);
+            self.reclaim_cache_under_pressure();
             stage_result(worker, "health", self.observe_health())?;
             self.next_health = now + Duration::from_millis(100);
         }
@@ -1478,15 +1490,109 @@ impl WorkerApplication {
         self.store.writer.maintain_staging(now);
     }
 
+    /// Sample memory pressure on the sampling worker, then apply any level
+    /// change on this worker. O(1) between samples and level changes.
+    fn poll_pressure(&mut self, now: std::time::Instant) {
+        let Some(shared) = self.pressure.shared.clone() else {
+            return;
+        };
+        if let Some(monitor) = self.pressure.monitor.as_mut() {
+            let from = monitor.level();
+            let changed = monitor.poll(now);
+            let level = monitor.level();
+            if let Some(level) = changed {
+                let sample = monitor.last_sample().copied().unwrap_or_default();
+                eprintln!(
+                    "racer-dataplane: worker={} stage=memory-pressure from={from:?} to={level:?} cgroup_current_bytes={} cgroup_limit_bytes={} psi_some_avg10={} resident_bytes={}",
+                    self.worker.0,
+                    sample.current.map_or(-1, |v| v as i128),
+                    sample.limit.map_or(-1, |v| v as i128),
+                    sample.some_avg10.unwrap_or(-1.0),
+                    sample.resident.map_or(-1, |v| v as i128),
+                );
+                let metrics = &self.telemetry.metrics;
+                metrics.record(crate::telemetry::Event::MemoryPressureTransitions, 1);
+                metrics.set_gauge(crate::telemetry::Gauge::MemoryPressureLevel, level as u64);
+            }
+            let entered = changed.is_some_and(|level| level > from);
+            if self.pressure.trims.due(now, level, entered) {
+                crate::pressure::trim_allocator();
+                self.telemetry
+                    .metrics
+                    .record(crate::telemetry::Event::AllocatorTrims, 1);
+            }
+        }
+        if let Some(transition) = self.pressure.responder.on_level(shared.level()) {
+            self.apply_pressure(transition, now);
+        }
+    }
+
+    /// Apply one worker-local level change: constrain or release both idle
+    /// pools and, when severity rose, drop retained idle buffers and connections.
+    fn apply_pressure(&self, transition: crate::pressure::Transition, now: std::time::Instant) {
+        let actions = transition.actions;
+        self.constrain_pools(actions.constrain_pools);
+        if transition.reclaim {
+            if actions.reclaim_idle_buffers {
+                self.runtime.admission.reclaim_buffers();
+                // Constrained maintenance releases idle staging immediately.
+                self.maintain_pools(now);
+            }
+            if actions.clear_idle_connections {
+                self.http.release_idle();
+            }
+        }
+    }
+
+    /// While Critical, release a bounded number of idle memory-cache quanta.
+    /// Entries still referenced by readers or queued writes are never evicted.
+    fn reclaim_cache_under_pressure(&self) {
+        let level = self.pressure.responder.level();
+        let quanta = crate::pressure::pressure_actions(level).reclaim_cache_quanta;
+        if quanta == 0 {
+            return;
+        }
+        for _ in 0..quanta {
+            let released = self.memory.reclaim_idle(
+                crate::admission::ResourceClass::Plaintext,
+                None,
+                usize::MAX,
+                |_| 0,
+            );
+            if released == 0 {
+                break;
+            }
+        }
+        self.runtime.admission.reclaim_buffers();
+    }
+
+    /// Publish this worker's staging pool and, on the sampling worker, the
+    /// process memory sample at most once per second.
+    fn observe_memory(&mut self, now: std::time::Instant) {
+        let metrics = &self.telemetry.metrics;
+        metrics.observe_staging_pool(self.worker, self.store.writer.staging_pool_stats());
+        if !self.pressure.samples_memory || now < self.pressure.next_memory_sample {
+            return;
+        }
+        self.pressure.next_memory_sample = now + crate::pressure::SAMPLE_INTERVAL;
+        let memory = match self.pressure.monitor.as_ref().and_then(|m| m.last_sample()) {
+            Some(sample) => crate::telemetry::ProcessMemory::from(sample),
+            None => crate::telemetry::ProcessMemory {
+                resident: crate::pressure::sample_resident(),
+                ..Default::default()
+            },
+        };
+        metrics.observe_memory(memory);
+    }
+
     /// Hold both idle pools at their minimum while memory is constrained.
-    #[allow(dead_code, reason = "consumed by the memory-pressure handler")]
     pub(crate) fn constrain_pools(&self, constrained: bool) {
         self.runtime.admission.constrain_buffers(constrained);
         self.store.writer.constrain_staging(constrained);
     }
 
     /// Idle pool statistics as `(recycler, staging slab)`.
-    #[allow(dead_code, reason = "consumed by worker pool telemetry")]
+    #[cfg(test)]
     pub(crate) fn pool_stats(&self) -> (flow_control::PoolStats, flow_control::PoolStats) {
         (
             self.runtime.admission.buffer_pool_stats(),
@@ -2867,4 +2973,31 @@ mod lifecycle_policy_tests {
 /// metadata reservation engages before page fetches hold every outbound slot.
 pub(crate) fn origin_pool_capacity(configured: usize, outbound: usize) -> usize {
     configured.min(outbound).max(1)
+}
+
+/// Per-worker memory-pressure state. Every worker applies the shared level;
+/// only the sampling worker owns the cgroup monitor and trims the allocator.
+struct WorkerPressure {
+    /// None when `RACER_MEMORY_PRESSURE=false`.
+    shared: Option<crate::pressure::SharedPressure>,
+    responder: crate::pressure::PressureResponder,
+    monitor: Option<crate::pressure::PressureMonitor>,
+    trims: crate::pressure::TrimSchedule,
+    /// Whether this worker publishes process memory telemetry.
+    samples_memory: bool,
+    next_memory_sample: std::time::Instant,
+}
+
+impl WorkerPressure {
+    fn new(enabled: bool, shared: &crate::pressure::SharedPressure, sampler: bool) -> Self {
+        Self {
+            shared: enabled.then(|| shared.clone()),
+            responder: Default::default(),
+            monitor: (enabled && sampler)
+                .then(|| crate::pressure::PressureMonitor::new(shared.clone())),
+            trims: Default::default(),
+            samples_memory: sampler,
+            next_memory_sample: racer_platform::environment::now(),
+        }
+    }
 }

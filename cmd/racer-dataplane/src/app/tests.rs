@@ -4603,3 +4603,91 @@ mod lifecycle {
 }
 
 mod dst;
+
+#[test]
+fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
+    use crate::admission::ResourceClass;
+    use crate::pressure::PressureLevel;
+    let mut worker = wake_test_worker();
+    // Drive the shared level directly instead of sampling this host's cgroup.
+    worker.pressure.monitor = None;
+    let shared = worker.node.pressure.clone();
+    let admission = worker.runtime.admission.clone();
+    let mut reservation = admission
+        .reserve(None, ResourceClass::Ciphertext, 1 << 20)
+        .unwrap();
+    let bytes = reservation.buffer(1 << 20).unwrap();
+    reservation.recycle(bytes);
+    drop(reservation);
+    let (recycler, staging) = worker.pool_stats();
+    assert!(recycler.bytes >= 1 << 20);
+    assert!(!recycler.constrained && !staging.constrained);
+    let now = racer_platform::environment::now();
+    // Normal is the initial level: polling changes nothing.
+    worker.poll_pressure(now);
+    assert!(worker.pool_stats().0.bytes >= 1 << 20);
+
+    shared.store(PressureLevel::Elevated);
+    worker.poll_pressure(now);
+    let (recycler, staging) = worker.pool_stats();
+    assert!(recycler.constrained && staging.constrained);
+    assert_eq!(recycler.bytes, 0);
+    assert_eq!(staging.bytes, 0);
+    assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    // Repeated polls at the same level are idempotent.
+    worker.poll_pressure(now);
+    assert!(worker.pool_stats().0.constrained);
+
+    shared.store(PressureLevel::Critical);
+    worker.poll_pressure(now);
+    assert_eq!(worker.pressure.responder.level(), PressureLevel::Critical);
+    // Critical cache reclaim on an empty cache is a no-op, not an error.
+    worker.reclaim_cache_under_pressure();
+    assert!(worker.pool_stats().1.constrained);
+
+    shared.store(PressureLevel::Normal);
+    worker.poll_pressure(now);
+    let (recycler, staging) = worker.pool_stats();
+    assert!(!recycler.constrained && !staging.constrained);
+    assert_eq!(
+        worker
+            .telemetry
+            .metrics
+            .count(crate::telemetry::Event::AllocatorTrims),
+        0
+    );
+}
+
+#[test]
+fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
+    use crate::pressure::PressureLevel;
+    let mut worker = wake_test_worker();
+    worker.pressure = WorkerPressure::new(false, &worker.node.pressure, true);
+    assert!(worker.pressure.monitor.is_none());
+    worker.node.pressure.store(PressureLevel::Critical);
+    let now = racer_platform::environment::now();
+    worker.poll_pressure(now);
+    assert_eq!(worker.pressure.responder.level(), PressureLevel::Normal);
+    assert!(!worker.pool_stats().0.constrained);
+    worker.observe_memory(now);
+    let mut output = String::new();
+    worker
+        .telemetry
+        .metrics
+        .write_prometheus(&mut output)
+        .unwrap();
+    assert!(output.contains("racer_worker_staging_pool_entries{worker=\"0\"}"));
+    if cfg!(target_os = "linux") {
+        assert!(output.contains("# TYPE racer_process_resident_bytes gauge\n"));
+    }
+    assert!(!output.contains("racer_cgroup_memory_current_bytes"));
+}
+
+#[test]
+fn sampling_worker_owns_the_monitor_and_others_do_not() {
+    let shared = crate::pressure::SharedPressure::default();
+    let sampler = WorkerPressure::new(true, &shared, true);
+    assert!(sampler.monitor.is_some() && sampler.shared.is_some() && sampler.samples_memory);
+    let other = WorkerPressure::new(true, &shared, false);
+    assert!(other.monitor.is_none() && other.shared.is_some() && !other.samples_memory);
+}
