@@ -544,6 +544,28 @@ fn invalidated_active_generation_cannot_reenter_idle_and_expiry_releases_quota()
 }
 
 #[test]
+fn release_idle_drops_idle_connections_but_keeps_active_and_pool_open() {
+    let (admission, reactor, pool) = setup();
+    let (listener, endpoint) = listener();
+    // Nothing idle yet: release is a no-op.
+    pool.release_idle();
+    let (active, peer) = held(&pool, &reactor, &admission, &endpoint, &listener);
+    let used = admission.used(Resource::Connection);
+    // An active lease is never released.
+    pool.release_idle();
+    assert_eq!(admission.used(Resource::Connection), used);
+    drop((active, peer));
+    assert_eq!(admission.used(Resource::Connection), 1);
+    assert_eq!(pool.snapshot().entries.len(), 1);
+    pool.release_idle();
+    assert_eq!(admission.used(Resource::Connection), 0);
+    // The pool remains open and can still connect.
+    let (again, peer) = held(&pool, &reactor, &admission, &endpoint, &listener);
+    drop((again, peer));
+    assert_eq!(admission.used(Resource::Connection), 1);
+}
+
+#[test]
 fn tcp_pool_reuses_only_finished_exchanges_and_enforces_capacity() {
     let (admission, reactor, pool) = setup();
     let io = new_io(reactor.clone(), admission.clone());
