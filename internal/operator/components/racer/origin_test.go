@@ -406,6 +406,13 @@ func TestOriginPlacementMirrorsDataplane(t *testing.T) {
 	dataplane.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
 		NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}}},
 	}}}
+	nodeAffinity := dataplane.Spec.Template.Spec.Affinity.NodeAffinity.DeepCopy()
+	dataplaneTerm := corev1.PodAffinityTerm{
+		TopologyKey:   corev1.LabelHostname,
+		LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": dataplaneName}},
+	}
+	dataplane.Spec.Template.Spec.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{dataplaneTerm}}
+	dataplane.Spec.Template.Spec.Affinity.PodAffinity = &corev1.PodAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{dataplaneTerm}}
 	require.NoError(t, env.Client.Update(t.Context(), dataplane))
 
 	plan := planPass(t, env)
@@ -416,7 +423,9 @@ func TestOriginPlacementMirrorsDataplane(t *testing.T) {
 			require.NoError(t, env.Scheme.Convert(op.Object, obj, nil))
 			require.Equal(t, dataplane.Spec.Template.Spec.NodeSelector, obj.Spec.Template.Spec.NodeSelector)
 			require.Equal(t, dataplane.Spec.Template.Spec.Tolerations, obj.Spec.Template.Spec.Tolerations)
-			require.Equal(t, dataplane.Spec.Template.Spec.Affinity, obj.Spec.Template.Spec.Affinity)
+			require.Equal(t, &corev1.Affinity{NodeAffinity: nodeAffinity}, obj.Spec.Template.Spec.Affinity)
+			require.Nil(t, obj.Spec.Template.Spec.Affinity.PodAffinity)
+			require.Nil(t, obj.Spec.Template.Spec.Affinity.PodAntiAffinity)
 
 			return
 		}

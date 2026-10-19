@@ -194,8 +194,12 @@ func (o originSpec) hash() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// originPlacement follows the live dataplane DaemonSet, including user
+// originPlacement follows the node-level constraints (node affinity, node
+// selector, tolerations) of the live dataplane DaemonSet, including user
 // overrides, so origins run wherever the dataplane serving their cache runs.
+// Pod affinity and anti-affinity are not copied: they are relative to
+// dataplane Pods, and a rule such as hostname anti-affinity against
+// racer-dataplane would otherwise exclude origins from every dataplane node.
 func originPlacement(ctx context.Context, env *component.Env) (*corev1.Affinity, map[string]string, []corev1.Toleration, error) {
 	ds := &appsv1.DaemonSet{}
 
@@ -210,7 +214,12 @@ func originPlacement(ctx context.Context, env *component.Env) (*corev1.Affinity,
 
 	pod := ds.Spec.Template.Spec
 
-	return pod.Affinity.DeepCopy(), pod.NodeSelector, slices.Clone(pod.Tolerations), nil
+	var affinity *corev1.Affinity
+	if pod.Affinity != nil && pod.Affinity.NodeAffinity != nil {
+		affinity = &corev1.Affinity{NodeAffinity: pod.Affinity.NodeAffinity.DeepCopy()}
+	}
+
+	return affinity, maps.Clone(pod.NodeSelector), slices.Clone(pod.Tolerations), nil
 }
 
 func cacheOwnerReference(cache *racerv1.ClusterCache) metav1.OwnerReference {
