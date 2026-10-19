@@ -98,6 +98,30 @@ def verify():
         ),
         "missing pinned NVIDIA utilities",
     )
+    for package in ("nvidia-fabricmanager-580", "libnvidia-nscq-580"):
+        require(
+            re.search(
+                rf"^{package}\t{re.escape(driver)}(?:[-+~][^\t]*)?\tarm64$",
+                packages,
+                re.MULTILINE,
+            ),
+            f"missing pinned {package}",
+        )
+    require(Path("/usr/bin/nv-fabricmanager").is_file(), "missing Fabric Manager binary")
+    require(
+        any(Path("/usr/share/nvidia/nvswitch").glob("gb200_*_topology")),
+        "missing GB200 Fabric Manager topology",
+    )
+    require(
+        Path("/usr/lib/aarch64-linux-gnu/libnvidia-nscq.so").exists(),
+        "missing NVSwitch configuration library",
+    )
+    require(
+        Path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-fabricmanager.service"
+        ).is_symlink(),
+        "NVIDIA Fabric Manager service is not enabled",
+    )
     module_load_path = Path("/etc/modules-load.d/nvidia.conf")
     require(
         module_load_path.exists()
@@ -109,6 +133,7 @@ def verify():
     require(
         persistence_path.exists()
         and "After=systemd-modules-load.service" in persistence_path.read_text()
+        and "nvidia-fabricmanager.service" in persistence_path.read_text()
         and "ConditionPathExists" not in persistence_path.read_text()
         and "StartLimitIntervalSec=0" in persistence_path.read_text()
         and "ExecStart=/usr/bin/nvidia-smi -pm 1" in persistence_path.read_text()
@@ -143,7 +168,7 @@ def verify():
         },
         "qualification": "offline rootfs checks only; no physical GPU, MANA traffic or NVLink qualification",
         "secure_boot": "signed distribution binaries; platform trust/enrollment not qualified",
-        "fabric_services": "IMEX/Fabric Manager/NVLSM not installed or activated",
+        "fabric_services": "NVIDIA Fabric Manager and NSCQ installed; IMEX/NVLSM not activated",
     }
     require(result["apt_inrelease_sha256"], "missing signed APT release provenance")
     Path("/usr/share/unbounded/image-inputs.json").write_text(json.dumps(result, indent=2) + "\n")

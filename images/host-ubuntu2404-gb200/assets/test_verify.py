@@ -27,7 +27,12 @@ class RootfsContractTest(unittest.TestCase):
         self.license = "Dual MIT/GPL"
         self.signer = "Canonical Ltd. Secure Boot Signing"
         self.module_version = self.driver
-        self.packages = "linux-image\t7.0\tarm64\nnvidia-utils-580-server\t580.178.04\tarm64"
+        self.packages = (
+            "linux-image\t7.0\tarm64\n"
+            "nvidia-utils-580-server\t580.178.04\tarm64\n"
+            "nvidia-fabricmanager-580\t580.178.04\tarm64\n"
+            "libnvidia-nscq-580\t580.178.04\tarm64"
+        )
         self.put(f"/boot/config-{self.kernel}", "CONFIG_ARM64_64K_PAGES=y\nCONFIG_MICROSOFT_MANA=m\n")
         self.put("/etc/machine-id", "")
         self.put(f"/boot/initrd.img-{self.kernel}", "initramfs fixture")
@@ -38,7 +43,8 @@ class RootfsContractTest(unittest.TestCase):
         )
         self.put(
             "/etc/systemd/system/nvidia-persistence-mode.service",
-            "[Unit]\nAfter=systemd-modules-load.service\nStartLimitIntervalSec=0\n"
+            "[Unit]\nAfter=systemd-modules-load.service nvidia-fabricmanager.service\n"
+            "Wants=nvidia-fabricmanager.service\nStartLimitIntervalSec=0\n"
             "[Service]\nExecStart=/usr/bin/nvidia-smi -pm 1\n"
             "Restart=on-failure\nRestartSec=5\n",
         )
@@ -47,6 +53,19 @@ class RootfsContractTest(unittest.TestCase):
         )
         enabled.parent.mkdir(parents=True, exist_ok=True)
         enabled.symlink_to("../nvidia-persistence-mode.service")
+        fabric_enabled = self.path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-fabricmanager.service"
+        )
+        fabric_enabled.symlink_to("/lib/systemd/system/nvidia-fabricmanager.service")
+        self.put("/usr/bin/nv-fabricmanager", "fabric manager fixture")
+        self.put(
+            "/usr/share/nvidia/nvswitch/gb200_nvl4r1_c2g2_etf_topology",
+            "topology fixture",
+        )
+        self.put(
+            "/usr/lib/aarch64-linux-gnu/libnvidia-nscq.so",
+            "NSCQ fixture",
+        )
         self.put("/usr/share/unbounded/efi-packages.tsv", "shim-signed\t1\tarm64\n")
         self.put("/usr/share/unbounded/efi-packages.sha256", "test-package-hash\n")
         self.put("/var/lib/apt/lists/ubuntu_InRelease", "signed release fixture\n")
@@ -183,6 +202,24 @@ class RootfsContractTest(unittest.TestCase):
     def test_missing_nvidia_utilities_rejected(self):
         self.packages = "linux-image\t7.0\tarm64"
         self.rejected("missing pinned NVIDIA utilities")
+
+    def test_missing_fabric_manager_package_rejected(self):
+        self.packages = self.packages.replace(
+            "nvidia-fabricmanager-580\t580.178.04\tarm64\n", ""
+        )
+        self.rejected("missing pinned nvidia-fabricmanager-580")
+
+    def test_missing_fabric_manager_topology_rejected(self):
+        self.path(
+            "/usr/share/nvidia/nvswitch/gb200_nvl4r1_c2g2_etf_topology"
+        ).unlink()
+        self.rejected("missing GB200 Fabric Manager topology")
+
+    def test_disabled_fabric_manager_rejected(self):
+        self.path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-fabricmanager.service"
+        ).unlink()
+        self.rejected("NVIDIA Fabric Manager service is not enabled")
 
     def test_missing_nvidia_boot_module_configuration_rejected(self):
         self.path("/etc/modules-load.d/nvidia.conf").unlink()

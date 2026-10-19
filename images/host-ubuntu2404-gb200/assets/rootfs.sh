@@ -36,7 +36,10 @@ install_packages() {
         "linux-modules-nvidia-580-server-open-${KVER}=${NVIDIA_MODULES_VERSION}" \
         "nvidia-kernel-common-580-server=${NVIDIA_VERSION}" \
         "nvidia-headless-no-dkms-580-server-open=${NVIDIA_VERSION}" \
-        "nvidia-utils-580-server=${NVIDIA_VERSION}" nvidia-modprobe
+        "nvidia-utils-580-server=${NVIDIA_VERSION}" \
+        "nvidia-fabricmanager-580=${NVIDIA_VERSION}" \
+        "libnvidia-nscq-580=${NVIDIA_VERSION}" \
+        nvidia-modprobe
     sed -i 's/^update_initramfs=.*/update_initramfs=yes/' \
         /etc/initramfs-tools/update-initramfs.conf
 
@@ -103,7 +106,8 @@ EOF
     cat > /etc/systemd/system/nvidia-persistence-mode.service <<'EOF'
 [Unit]
 Description=Enable NVIDIA persistence mode
-After=systemd-modules-load.service systemd-udev-trigger.service
+Wants=nvidia-fabricmanager.service
+After=systemd-modules-load.service systemd-udev-trigger.service nvidia-fabricmanager.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -118,7 +122,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     systemctl enable systemd-networkd.service systemd-resolved.service \
-        ssh.service chrony.service nvidia-persistence-mode.service
+        ssh.service chrony.service nvidia-fabricmanager.service \
+        nvidia-persistence-mode.service
     for unit in cloud-init-local.service cloud-init.service cloud-init-network.service \
         cloud-config.service cloud-final.service; do
         if [ -f "/usr/lib/systemd/system/$unit" ]; then
