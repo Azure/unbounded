@@ -269,6 +269,16 @@ entries.
   `retain_until` to 0. Removing a cache, or dropping a page whose record is
   invalid, deletes its entries from the tree instead (see
   `cmd/racer-dataplane/src/store/disk.rs`).
+- Reading a held storage-tier page treats failures by kind. A transient
+  failure (I/O or OS error, unavailable, overloaded, canceled) keeps the entry
+  and the read misses. A definitely bad record (damaged header or record,
+  another format version, metadata that contradicts the known version, or an
+  AEAD or CRC failure in fill) is removed like a cache-tier entry. The hold,
+  keyed by version, stays; the page returns to its unused capacity, so the
+  next fill or warm writes the page again to the storage tier with the hold's
+  `retain_until`. The removal is made durable by the next volume commit, and
+  the old record's space follows the normal reuse rule (see
+  `StoreReader::invalidate` in `cmd/racer-dataplane/src/store.rs`).
 - The checkpoint file keeps only object metadata. It no longer stores segments,
   pages, or holds.
 - An in-memory table maps version hashes to object identities for features

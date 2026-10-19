@@ -288,7 +288,9 @@ Progress means verified ciphertext has been published on disk, not merely queued
 for writing. If a later page fails, completed disk pages keep their admitted
 deadlines; unused reservation capacity is released after outstanding persistence
 finishes. Retention is not a guarantee against corruption, key loss, cache removal,
-or storage failure.
+or storage failure. A held page whose disk record fails validation is dropped from
+disk while its hold stays; the next read or warm of the page refetches it and
+writes it back as a held page. A transient disk read error keeps the held page.
 
 The background job owns a charged, zeroizing copy of `Authorization` and `Metadata`
 in memory only. It uses the fill timeout (600 seconds by default), separate from
