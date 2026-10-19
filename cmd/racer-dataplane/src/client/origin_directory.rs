@@ -52,6 +52,8 @@ pub struct Outcome {
 
 /// Changes made by [`prepare`]. A seam so tests can check the order.
 trait Ops {
+    /// List the names in `directory`. Any read error fails the whole list.
+    fn read_entries(&mut self, directory: &File) -> io::Result<Vec<CString>>;
     /// Re-own one entry of `directory` without following symlinks.
     fn chown_entry(&mut self, directory: &File, name: &CStr, owner: Owner) -> io::Result<()>;
     fn chmod(&mut self, directory: &File, mode: u32) -> io::Result<()>;
@@ -61,6 +63,17 @@ trait Ops {
 struct System;
 
 impl Ops for System {
+    fn read_entries(&mut self, directory: &File) -> io::Result<Vec<CString>> {
+        let path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let name = entry?.file_name();
+            // Directory entry names never contain NUL.
+            names.push(CString::new(name.as_bytes()).map_err(io::Error::other)?);
+        }
+        Ok(names)
+    }
+
     fn chown_entry(&mut self, directory: &File, name: &CStr, owner: Owner) -> io::Result<()> {
         // SAFETY: terminated name and live directory descriptor; no symlink follow.
         check(unsafe {
@@ -106,12 +119,12 @@ fn check(result: libc::c_int) -> io::Result<()> {
 /// 2. Set the mode.
 /// 3. Hand the directory to `owner`.
 ///
-/// If a run stops before step 3, the directory is still trusted, so the next
-/// run repeats the migration.
+/// If step 1 fails, steps 2 and 3 do not run. If a run stops before step 3,
+/// the directory is still trusted, so the next run repeats the migration.
 ///
 /// # Errors
-/// Returns the open/mkdir/stat/chmod error, or a chown error other than an
-/// unprivileged `EPERM`.
+/// Returns the open/mkdir/stat/chmod error, a migration error, or a chown
+/// error other than an unprivileged `EPERM`.
 pub fn prepare(cache: &File, owner: Owner) -> io::Result<Outcome> {
     let euid = effective_uid();
     prepare_with(cache, owner, euid, euid == 0, &mut System)
@@ -134,7 +147,7 @@ fn prepare_with(
     let mut outcome = Outcome::default();
     let reown = before.uid() != owner.uid || before.gid() != owner.gid;
     if reown && trusted_previous_owner(before.uid(), before.mode(), euid, privileged) {
-        outcome.adopted = adopt_entries(&directory, owner, ops);
+        outcome.adopted = adopt_entries(&directory, owner, ops)?;
     }
     if before.mode() & 0o7777 != ORIGIN_MODE {
         ops.chmod(&directory, ORIGIN_MODE)?;
@@ -186,33 +199,36 @@ fn trusted_previous_owner(uid: u32, mode: u32, euid: u32, privileged: bool) -> b
 /// so leftovers are re-owned rather than removed; the SDK's own stale-socket
 /// recovery then decides what to delete. Symlinks are never followed or
 /// changed, and regular files with extra hard links are skipped. Only entries
-/// whose owner differs from `owner` are changed. Failures are logged and
-/// skipped so a single bad entry cannot block the client endpoint.
-fn adopt_entries(directory: &File, owner: Owner, ops: &mut impl Ops) -> usize {
-    let path = format!("/proc/self/fd/{}", directory.as_raw_fd());
-    let entries = match std::fs::read_dir(&path) {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!("racer-dataplane: stage=origin-directory-migrate error={error}");
-            return 0;
-        }
-    };
+/// whose owner differs from `owner` are changed. These skipped entries are
+/// not errors.
+///
+/// A list or ownership error is logged, the remaining entries are still
+/// tried, and the first error is returned. The caller then keeps the
+/// directory with its old owner, so the next run retries the migration.
+/// Entries that were already moved are skipped on retry.
+fn adopt_entries(directory: &File, owner: Owner, ops: &mut impl Ops) -> io::Result<usize> {
+    let names = ops.read_entries(directory).inspect_err(|error| {
+        eprintln!("racer-dataplane: stage=origin-directory-migrate error={error}");
+    })?;
     let mut adopted = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Ok(name) = CString::new(name.as_bytes()) else {
-            continue;
-        };
+    let mut failure = None;
+    for name in names {
         match adopt_entry(directory, &name, owner, ops) {
             Ok(true) => adopted += 1,
             Ok(false) => {}
-            Err(error) => eprintln!(
-                "racer-dataplane: stage=origin-directory-migrate entry={:?} error={error}",
-                name
-            ),
+            Err(error) => {
+                eprintln!(
+                    "racer-dataplane: stage=origin-directory-migrate entry={:?} error={error}",
+                    name
+                );
+                failure.get_or_insert(error);
+            }
         }
     }
-    adopted
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(adopted),
+    }
 }
 
 fn adopt_entry(
@@ -472,6 +488,10 @@ mod tests {
     struct Recorder {
         events: Vec<Event>,
         chown_error: Option<i32>,
+        /// Fail the next directory listing with this errno.
+        list_error: Option<i32>,
+        /// Fail the next re-own of this entry with this errno.
+        entry_error: Option<(&'static str, i32)>,
     }
 
     impl Recorder {
@@ -479,6 +499,8 @@ mod tests {
             Self {
                 events: Vec::new(),
                 chown_error: None,
+                list_error: None,
+                entry_error: None,
             }
         }
     }
@@ -489,9 +511,25 @@ mod tests {
     }
 
     impl Ops for Recorder {
+        fn read_entries(&mut self, directory: &File) -> io::Result<Vec<CString>> {
+            if let Some(code) = self.list_error.take() {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            // Sort so event order does not depend on the file system.
+            let mut names = System.read_entries(directory)?;
+            names.sort();
+            Ok(names)
+        }
+
         fn chown_entry(&mut self, directory: &File, name: &CStr, _: Owner) -> io::Result<()> {
             let (uid, mode) = state(directory);
             let name = name.to_string_lossy().into_owned();
+            if let Some((failing, code)) = self.entry_error
+                && failing == name
+            {
+                self.entry_error = None;
+                return Err(io::Error::from_raw_os_error(code));
+            }
             self.events.push(Event::Entry(name, uid, mode));
             Ok(())
         }
@@ -633,5 +671,134 @@ mod tests {
         let outcome = prepare_with(&scratch.open(), me(), effective_uid(), true, &mut ops).unwrap();
         assert!(ops.events.is_empty());
         assert_eq!(outcome, Outcome::default());
+    }
+
+    #[test]
+    fn failed_listing_blocks_handoff_until_retry() {
+        let scratch = Scratch::new();
+        let origin = legacy(&scratch, 0o755);
+        let euid = effective_uid();
+        let mut ops = Recorder::new();
+        ops.list_error = Some(libc::EIO);
+        let error = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        // No chmod or chown ran, so the directory keeps its old owner and mode.
+        assert!(ops.events.is_empty());
+        assert_eq!(fs::metadata(&origin).unwrap().mode() & 0o7777, 0o755);
+
+        let outcome = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap();
+        assert_eq!(
+            ops.events,
+            vec![
+                Event::Entry(".racer-origin.lock".into(), euid, 0o755),
+                Event::Chmod(euid, 0o755),
+                Event::Chown(euid, ORIGIN_MODE),
+            ]
+        );
+        assert!(outcome.chowned && outcome.chmodded && outcome.adopted == 1);
+    }
+
+    #[test]
+    fn failed_entry_blocks_handoff_until_retry() {
+        let scratch = Scratch::new();
+        let origin = legacy(&scratch, 0o755);
+        fs::write(origin.join("socket"), b"").unwrap();
+        let euid = effective_uid();
+        let mut ops = Recorder::new();
+        ops.entry_error = Some((".racer-origin.lock", libc::EIO));
+        let error = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        // Other entries are still tried, but nothing is published.
+        assert_eq!(ops.events, vec![Event::Entry("socket".into(), euid, 0o755)]);
+        assert_eq!(fs::metadata(&origin).unwrap().mode() & 0o7777, 0o755);
+
+        let mut ops = Recorder::new();
+        let outcome = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap();
+        assert_eq!(ops.events.last(), Some(&Event::Chown(euid, ORIGIN_MODE)));
+        assert!(
+            ops.events
+                .contains(&Event::Entry(".racer-origin.lock".into(), euid, 0o755))
+        );
+        assert!(outcome.chowned && outcome.chmodded);
+    }
+
+    #[test]
+    fn skipped_entries_are_not_migration_errors() {
+        let scratch = Scratch::new();
+        let origin = legacy(&scratch, 0o755);
+        fs::write(scratch.0.join("outside"), b"").unwrap();
+        fs::hard_link(scratch.0.join("outside"), origin.join("linked")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", origin.join("link")).unwrap();
+        // SAFETY: valid NUL-terminated path; creates a FIFO inside the scratch tree.
+        let fifo = CString::new(origin.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let euid = effective_uid();
+        let mut ops = Recorder::new();
+        let outcome = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap();
+        assert_eq!(
+            ops.events,
+            vec![
+                Event::Entry(".racer-origin.lock".into(), euid, 0o755),
+                Event::Chmod(euid, 0o755),
+                Event::Chown(euid, ORIGIN_MODE),
+            ]
+        );
+        assert_eq!(outcome.adopted, 1);
+    }
+
+    #[test]
+    fn real_listing_failure_is_returned() {
+        // Without read permission the real listing fails. Root bypasses this.
+        if effective_uid() == 0 {
+            return;
+        }
+        let scratch = Scratch::new();
+        let path = scratch.0.join("unreadable");
+        fs::create_dir(&path).unwrap();
+        let directory = File::open(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+        assert!(System.read_entries(&directory).is_err());
+        assert!(adopt_entries(&directory, TARGET, &mut Recorder::new()).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn root_lock_failure_keeps_root_directory_until_retry_when_root() {
+        if effective_uid() != 0 {
+            return;
+        }
+        let scratch = Scratch::new();
+        let origin = legacy(&scratch, 0o755);
+        let lock = origin.join(".racer-origin.lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        struct FailOnce(bool);
+        impl Ops for FailOnce {
+            fn read_entries(&mut self, directory: &File) -> io::Result<Vec<CString>> {
+                System.read_entries(directory)
+            }
+            fn chown_entry(&mut self, d: &File, name: &CStr, owner: Owner) -> io::Result<()> {
+                if std::mem::replace(&mut self.0, false) {
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                System.chown_entry(d, name, owner)
+            }
+            fn chmod(&mut self, d: &File, mode: u32) -> io::Result<()> {
+                System.chmod(d, mode)
+            }
+            fn chown(&mut self, d: &File, owner: Owner) -> io::Result<()> {
+                System.chown(d, owner)
+            }
+        }
+        let mut ops = FailOnce(true);
+        assert!(prepare_with(&scratch.open(), TARGET, 0, true, &mut ops).is_err());
+        let meta = fs::metadata(&origin).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o7777), (0, 0o755));
+        assert_eq!(fs::metadata(&lock).unwrap().uid(), 0);
+
+        let outcome = prepare_with(&scratch.open(), TARGET, 0, true, &mut ops).unwrap();
+        assert!(outcome.chowned && outcome.adopted == 1);
+        let meta = fs::metadata(&origin).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o7777), (4242, ORIGIN_MODE));
+        assert_eq!(fs::metadata(&lock).unwrap().uid(), 4242);
     }
 }
