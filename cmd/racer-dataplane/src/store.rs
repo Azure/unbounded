@@ -378,9 +378,6 @@ fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
 pub struct StoreWriter {
     metrics: crate::telemetry::Metrics,
     disk_groups: Vec<(std::sync::Arc<str>, usize)>,
-    /// File-mode slab path, resized at open when an older layout left a file
-    /// of another size.
-    slab_file: Option<std::path::PathBuf>,
     index: Rc<Index>,
     slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -415,7 +412,6 @@ impl StoreWriter {
         Self {
             metrics: crate::telemetry::Metrics::default(),
             disk_groups: Vec::new(),
-            slab_file: None,
             index,
             slabs,
             admission,
@@ -462,9 +458,6 @@ impl StoreWriter {
                 return Ok(volume.alignment());
             }
             let slots = self.slabs.capacity_bytes() / SLOT_BYTES;
-            if let Some(path) = &self.slab_file {
-                resize_legacy_slab(path, self.slabs.capacity_bytes())?;
-            }
             if !self.disk_groups.is_empty()
                 && self
                     .disk_groups
@@ -496,11 +489,6 @@ impl StoreWriter {
             self.slabs.reclaim_idle();
             Ok(alignment)
         })
-    }
-    /// Remember the file-mode slab path for legacy size repair at open.
-    pub(crate) fn with_slab_file(mut self, path: std::path::PathBuf) -> Self {
-        self.slab_file = Some(path);
-        self
     }
     pub(crate) fn with_disk_groups(mut self, groups: Vec<(std::sync::Arc<str>, usize)>) -> Self {
         self.disk_groups = groups;
@@ -1609,28 +1597,3 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests;
-
-/// Give a file-mode slab of another size (left by an older layout) the
-/// configured size, so the volume mount formats it fresh. A missing or empty
-/// file is created by the slab itself.
-fn resize_legacy_slab(path: &std::path::Path, capacity: u64) -> Result<()> {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return Ok(());
-    };
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() == capacity {
-        return Ok(());
-    }
-    eprintln!(
-        "racer: resizing slab {} from {} to {capacity} bytes for the extent volume; its pages are discarded",
-        path.display(),
-        metadata.len()
-    );
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_len(capacity))
-        .map_err(|error| {
-            eprintln!("racer: cannot resize slab {}: {error}", path.display());
-            Error::Io
-        })
-}

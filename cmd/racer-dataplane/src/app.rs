@@ -1307,11 +1307,14 @@ impl WorkerApplication {
             )?
         } else {
             page_alloc::Slab::new(
-                slab_file.clone(),
+                slab_file,
                 slab_bytes,
                 page_alloc::volume::SLOT_BYTES,
                 crate::store::MAX_RECORD_BYTES,
             )
+            // An older layout may have left a file of another size; resize it
+            // only under the slab's exclusive lock, held through mount.
+            .resize_mismatched()
         });
         let reader = Rc::new(
             StoreReader::new(
@@ -1340,11 +1343,7 @@ impl WorkerApplication {
             },
             |devices| devices.disk_groups.clone(),
         ));
-        let writer = Rc::new(if devices.is_none() {
-            writer.with_slab_file(slab_file)
-        } else {
-            writer
-        });
+        let writer = Rc::new(writer);
         let disk_page_entries = devices
             .map_or((config.disk_page_entries.get() / node.count).max(1), |d| {
                 d.page_entries
