@@ -455,15 +455,8 @@ impl Index {
             let Some(volume) = volume else {
                 return Ok(());
             };
-            // A failed commit leaves the volume usable; report it as an I/O
-            // failure so callers treat it like any other cache I/O error.
-            volume
-                .commit(reactor, scope)
-                .await
-                .map_err(|error| match error {
-                    Error::CorruptRecord => Error::Io,
-                    other => other,
-                })
+            // Callers classify failures with `is_disposable_commit_error`.
+            volume.commit(reactor, scope).await
         })
     }
 

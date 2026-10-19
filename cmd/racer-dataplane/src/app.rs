@@ -1664,18 +1664,10 @@ impl WorkerApplication {
     /// are any. Storage-tier writes commit before they are acknowledged, so a
     /// crash loses at most the cache pages of the last interval.
     fn poll_disk_commit(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        if let Some(result) = poll_task(&mut self.commit_task, cx)
-            && !matches!(
-                result,
-                Err(Error::Io
-                    | Error::Os(_)
-                    | Error::Unavailable
-                    | Error::Overloaded
-                    | Error::Cancelled
-                    | Error::DeadlineExceeded)
-            )
+        if let Some(Err(error)) = poll_task(&mut self.commit_task, cx)
+            && !crate::store::is_disposable_commit_error(&error)
         {
-            result?;
+            return Err(error);
         }
         let now = uring_runtime::environment::now();
         if lazy_commit_due(
@@ -1994,19 +1986,10 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             .await;
             // Make the last cache inserts durable on a clean shutdown. A cache
             // commit failure only loses those pages.
-            match self.store.writer.commit(&deadline).await {
-                Ok(())
-                | Err(
-                    Error::Io
-                    | Error::Os(_)
-                    | Error::Unavailable
-                    | Error::Overloaded
-                    | Error::Cancelled
-                    | Error::DeadlineExceeded,
-                ) => {}
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
+            if let Err(error) = self.store.writer.commit(&deadline).await
+                && !crate::store::is_disposable_commit_error(&error)
+            {
+                first_error.get_or_insert(error);
             }
             if let Some(rdma) = &self.rdma {
                 rdma.drain().await?;

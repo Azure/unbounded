@@ -48,6 +48,23 @@ pub(crate) mod key;
 pub(crate) mod test_disk;
 pub mod versions;
 
+/// Whether a failed disk index commit only costs cache contents and must not
+/// fail the worker. A failed commit leaves the volume usable and the previous
+/// commit durable, so the next mount just finds fewer cache pages; storage
+/// writes report their own commit failure to the caller.
+pub fn is_disposable_commit_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Io
+            | Error::Os(_)
+            | Error::CorruptRecord
+            | Error::Unavailable
+            | Error::Overloaded
+            | Error::Cancelled
+            | Error::DeadlineExceeded
+    )
+}
+
 /// Write id stored in a record header; equals the volume entry's generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Generation(pub u64);
@@ -1085,27 +1102,28 @@ impl StoreWriter {
             // Make cache writes durable on a clean shutdown. Cache I/O failures
             // are not fatal; the next mount simply finds fewer pages.
             match self.commit(scope).await {
-                Ok(())
-                | Err(
-                    Error::Io
-                    | Error::Os(_)
-                    | Error::Unavailable
-                    | Error::Overloaded
-                    | Error::InvalidConfiguration,
-                ) => {}
-                Err(error) => return Err(error),
+                Err(error) if !is_disposable_commit_error(&error) => return Err(error),
+                _ => {}
             }
+            // Commit node buffers return to the slab's idle pool still charged.
             self.slabs.reclaim_idle();
             Ok(())
         })
     }
-    /// Make every disk index change so far durable, then release the commit's
-    /// node buffers, which return to the slab's idle pool still charged.
+    /// Make every disk index change so far durable. The commit's node buffers
+    /// return to the slab's idle pool still charged; admission pressure and
+    /// drain reclaim them.
+    /// A failure that is not an I/O error of its own (for example a damaged
+    /// node read back) is reported as `Io`: the commit failed, not the data.
     pub fn commit<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
-            let result = self.index.commit(&self.reactor, scope).await;
-            self.slabs.reclaim_idle();
-            result
+            self.index
+                .commit(&self.reactor, scope)
+                .await
+                .map_err(|error| match error {
+                    Error::CorruptRecord => Error::Io,
+                    other => other,
+                })
         })
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
