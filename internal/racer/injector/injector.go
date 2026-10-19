@@ -102,6 +102,10 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		}
 	}
 
+	if pod.Spec.OS != nil && pod.Spec.OS.Name != corev1.Linux {
+		return fmt.Errorf("pod spec.os.name %q conflicts with the racer-object sidecar, which requires linux", pod.Spec.OS.Name)
+	}
+
 	if v, ok := pod.Spec.NodeSelector[osLabel]; ok && v != "linux" {
 		return fmt.Errorf("pod nodeSelector %s=%q conflicts with the racer-object sidecar, which requires linux", osLabel, v)
 	}

@@ -192,6 +192,58 @@ func TestMutateErrors(t *testing.T) {
 	}
 }
 
+func TestMutatePodOS(t *testing.T) {
+	tests := []struct {
+		name         string
+		os           *corev1.PodOS
+		nodeSelector map[string]string
+		want         string
+	}{
+		{name: "nil os", os: nil},
+		{name: "linux os", os: &corev1.PodOS{Name: corev1.Linux}},
+		{name: "windows os", os: &corev1.PodOS{Name: corev1.Windows}, want: "spec.os.name"},
+		{name: "unknown os", os: &corev1.PodOS{Name: "plan9"}, want: "spec.os.name"},
+		{name: "empty os name", os: &corev1.PodOS{}, want: "spec.os.name"},
+		{
+			name: "linux os with windows nodeSelector", os: &corev1.PodOS{Name: corev1.Linux},
+			nodeSelector: map[string]string{osLabel: "windows"}, want: osLabel,
+		},
+		{
+			name: "windows os with linux nodeSelector", os: &corev1.PodOS{Name: corev1.Windows},
+			nodeSelector: map[string]string{osLabel: "linux"}, want: "spec.os.name",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := newPod(nil)
+			pod.Spec.OS = tt.os
+			pod.Spec.NodeSelector = tt.nodeSelector
+			original := pod.DeepCopy()
+
+			err := Mutate(pod, testCfg)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Mutate() error = %v", err)
+				}
+
+				if len(pod.Spec.InitContainers) != 1 || pod.Spec.InitContainers[0].Name != ContainerName {
+					t.Fatalf("sidecar not injected: %+v", pod.Spec.InitContainers)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want mention of %q", err, tt.want)
+			}
+
+			if !reflect.DeepEqual(pod, original) {
+				t.Fatal("rejected pod was modified")
+			}
+		})
+	}
+}
+
 func TestMutateResources(t *testing.T) {
 	q := resource.MustParse
 
