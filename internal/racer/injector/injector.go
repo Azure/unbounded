@@ -165,7 +165,10 @@ type sidecarSpec struct {
 }
 
 func (s sidecarSpec) args() []string {
-	args := []string{"sidecar", "--cache=" + s.cache, "--namespace=" + s.namespace}
+	// Kubelet expands $(VAR) in container args, and the namespace may contain
+	// "$". Write each "$" as "$$" so the sidecar gets the namespace unchanged.
+	// Cache, bucket, api, and listen values are validated and cannot contain "$".
+	args := []string{"sidecar", "--cache=" + s.cache, "--namespace=" + strings.ReplaceAll(s.namespace, "$", "$$")}
 	for _, b := range s.buckets {
 		args = append(args, "--bucket="+b)
 	}

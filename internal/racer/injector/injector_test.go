@@ -244,6 +244,102 @@ func TestMutatePodOS(t *testing.T) {
 	}
 }
 
+// kubeletExpand copies the rules kubelet uses to expand container args
+// (third_party/forked/golang/expansion in Kubernetes): "$$" becomes "$",
+// "$(NAME)" becomes the variable value when NAME is defined and stays as written
+// otherwise, and any other "$" is kept.
+func kubeletExpand(input string, env map[string]string) string {
+	var out strings.Builder
+
+	for i := 0; i < len(input); i++ {
+		if input[i] != '$' || i+1 >= len(input) {
+			out.WriteByte(input[i])
+			continue
+		}
+
+		switch next := input[i+1]; next {
+		case '$':
+			out.WriteByte('$')
+
+			i++
+		case '(':
+			end := strings.IndexByte(input[i+2:], ')')
+			if end < 0 {
+				out.WriteString("$(")
+
+				i++
+
+				continue
+			}
+
+			name := input[i+2 : i+2+end]
+			if v, ok := env[name]; ok {
+				out.WriteString(v)
+			} else {
+				out.WriteString("$(" + name + ")")
+			}
+
+			i += 2 + end
+		default:
+			out.WriteByte('$')
+		}
+	}
+
+	return out.String()
+}
+
+func TestKubeletExpand(t *testing.T) {
+	env := map[string]string{"HOST": "10.0.0.1"}
+	for in, want := range map[string]string{
+		"a$(HOST)b": "a10.0.0.1b",
+		"$(NOPE)":   "$(NOPE)",
+		"$$(HOST)":  "$(HOST)",
+		"$$$$":      "$$",
+		"a$b$":      "a$b$",
+		"$(open":    "$(open",
+	} {
+		if got := kubeletExpand(in, env); got != want {
+			t.Errorf("kubeletExpand(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestMutateNamespaceSurvivesKubeletExpansion(t *testing.T) {
+	env := map[string]string{"KUBERNETES_SERVICE_HOST": "10.0.0.1", "X": "y"}
+
+	for _, ns := range []string{
+		"store",
+		"store$(KUBERNETES_SERVICE_HOST)",
+		"$(X)$(X)",
+		"$$(X)",
+		"a$b",
+		"$",
+		"$$",
+		"cost$$$",
+		"$(",
+		"$(UNDEFINED)",
+	} {
+		t.Run(ns, func(t *testing.T) {
+			pod := newPod(map[string]string{NamespaceAnnotation: ns})
+			if err := Mutate(pod, testCfg); err != nil {
+				t.Fatal(err)
+			}
+
+			var got string
+
+			for _, arg := range pod.Spec.InitContainers[0].Args {
+				if v, ok := strings.CutPrefix(arg, "--namespace="); ok {
+					got = kubeletExpand(v, env)
+				}
+			}
+
+			if got != ns {
+				t.Fatalf("namespace after kubelet expansion = %q, want %q", got, ns)
+			}
+		})
+	}
+}
+
 func TestMutateResources(t *testing.T) {
 	q := resource.MustParse
 
