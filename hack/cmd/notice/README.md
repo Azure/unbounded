@@ -107,8 +107,8 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   including paths in development and target-specific development dependencies.
   Packages under `crates/` are first-party and get no entry of their own; their
   normal registry dependencies (and their own path dependencies) are resolved
-  against the Racer `Cargo.lock` like workspace members, and `crates/Cargo.lock`
-  is ignored. These development edges are checked only for
+  against the Racer `Cargo.lock` like workspace members, and their own
+  `Cargo.lock` files are ignored. These development edges are checked only for
   membership; registry development dependencies remain excluded. Members'
   normal registry dependencies are collected separately and
   deduplicated. Conflicting direct versions fail collection. Member manifests
