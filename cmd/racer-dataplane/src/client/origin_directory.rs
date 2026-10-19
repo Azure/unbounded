@@ -202,10 +202,11 @@ fn trusted_previous_owner(uid: u32, mode: u32, euid: u32, privileged: bool) -> b
 /// whose owner differs from `owner` are changed. These skipped entries are
 /// not errors.
 ///
-/// A list or ownership error is logged, the remaining entries are still
-/// tried, and the first error is returned. The caller then keeps the
-/// directory with its old owner, so the next run retries the migration.
-/// Entries that were already moved are skipped on retry.
+/// A listing error is logged and returned before any entry changes owner.
+/// A per-entry error is logged, the remaining entries are still tried, and
+/// the first error is returned. On any error the caller does not hand off
+/// the directory, so it keeps its old owner and the next run retries the
+/// migration. Entries that were already moved are skipped on retry.
 fn adopt_entries(directory: &File, owner: Owner, ops: &mut impl Ops) -> io::Result<usize> {
     let names = ops.read_entries(directory).inspect_err(|error| {
         eprintln!("racer-dataplane: stage=origin-directory-migrate error={error}");
