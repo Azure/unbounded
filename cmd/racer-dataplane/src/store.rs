@@ -585,6 +585,13 @@ impl StoreWriter {
             }
             self.slabs.fence_writes().await?;
             scope.check()?;
+            // `_hold` keeps the hold entry from being dropped while this call
+            // runs, but not its deadline from passing. If the hold expires
+            // during the write, the record is published without a retention
+            // deadline (an ordinary evictable storage entry) and is not added
+            // to the hold, so this reports `Unavailable` instead of a durable
+            // held copy. The same applies when the page lost its storage-tier
+            // publication for another reason, such as cache or key removal.
             let value = self.index.lookup(&id)?.ok_or(Error::Io)?;
             if value.tier != Tier::Storage || self.index.held_page_expiry(&id).is_none() {
                 return Err(Error::Unavailable);

@@ -304,7 +304,6 @@ impl Application {
     }
 }
 
-/// Create a bounded scope for application-owned lifecycle operations.
 /// Full-page capacity of a volume at actual direct-I/O alignment, conservatively
 /// allowing the largest supported record header, and the slot tail space left
 /// by full-page records. The meta slot holds no pages.
@@ -341,6 +340,7 @@ fn lazy_commit_due(
         && last.is_none_or(|last| now.saturating_duration_since(last) >= DISK_COMMIT_INTERVAL)
 }
 
+/// Create a bounded scope for application-owned lifecycle operations.
 fn scope(timeout: Duration) -> Result<RequestScope> {
     RequestScope::new(
         RequestId([0; 16]),
@@ -1351,7 +1351,8 @@ impl WorkerApplication {
             disk_page_entries,
         )?;
         // Install once before Fill attaches current-membership ownership. The
-        // writer, index, and segment clock all consult this same worker policy.
+        // writer, index, and volume eviction accounting all consult this same
+        // worker policy.
         writer.set_retention(Rc::new(crate::retention::Retention::configured(
             config.admission_history_per_worker(node.count)?,
             disk_page_entries
@@ -2392,9 +2393,7 @@ impl WorkerApplication {
         self.telemetry
             .metrics
             .add_gauge(Gauge::EffectivePayloadBytes, payload);
-        self.telemetry
-            .metrics
-            .add_gauge(Gauge::SegmentTailBytes, tail);
+        self.telemetry.metrics.add_gauge(Gauge::SlotTailBytes, tail);
         self.telemetry.metrics.add_gauge(
             Gauge::DiskPageEntries,
             self.store.writer.index().page_capacity() as u64,

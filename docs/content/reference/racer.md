@@ -220,9 +220,12 @@ checkpoint scratch, not just the configured admission budgets. The automatic
 checkpoint budget is not an RSS limit or a guarantee that a full cache can be
 checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
 
-Each worker's disk keeps its own page index and hold deadlines, so disk pages
-survive a restart without a checkpoint. Cache pages written in the last second
-before a crash can be lost; held pages are acknowledged only after they are durable.
+Each worker's disk holds an index of its pages and the hold deadlines of held
+pages. The index is made durable by periodic commits, normally about once a
+second, so pages and holds from the last successful commit survive a restart
+without a checkpoint. Cache pages written since the last successful commit can
+be lost in a crash or power failure. Held pages are acknowledged only after a
+commit makes them durable.
 A slab with no valid disk index, including one from an older release, is
 reformatted and its old pages are discarded. Checkpoints only store object
 metadata and bind each worker to file mode or its raw-device IDs, sizes, and slot
@@ -290,11 +293,15 @@ or storage failure.
 The background job owns a charged, zeroizing copy of `Authorization` and `Metadata`
 in memory only. It uses the fill timeout (600 seconds by default), separate from
 the HEAD deadline and retention TTL. Credentials are never checkpointed. On
-restart, jobs, waiters, and unused reservations are gone. Checkpoints restore
-only unexpired holds for completed disk records. Live hold expiry waits for both
-wall and monotonic deadlines; restart has only the saved wall-clock deadline.
-Neither payload nor checkpoint publication adds `fsync`, so process or host
-failure can lose pages or holds.
+restart, jobs, waiters, and unused reservations are gone. Holds are rebuilt from
+the disk index: each held page that is on disk with an unexpired deadline is
+held again until that deadline, capped at 30 days from the restart. Live hold
+expiry waits for both wall and monotonic deadlines; restart has only the saved
+wall-clock deadline. A `HEAD` that extends the hold of pages already on disk
+commits the new deadline before it replies. Other deadline changes, such as
+the clamp at restart, become durable at the next commit, normally about a
+second later; a crash before that restores the previous deadline. Checkpoint
+publication adds no `fsync`; a lost checkpoint only makes metadata cold.
 
 Warm gauges refresh on worker health ticks (normally every 100 ms). They report
 the shared node registry once, without worker, object, or version labels. A
@@ -307,7 +314,7 @@ storage or request state.
 | `racer_warm_waiters` | Registered GET page waits for warm progress; excludes HEAD admissions and unregistered reads |
 | `racer_warm_held_pages` | Published indexed pages under live hard holds; excludes unused reservations and pending writes |
 | `racer_warm_held_payload_bytes` | Logical payload bytes of those pages, excluding tags, headers, and padding |
-| `racer_warm_held_segments` | Distinct disk slots containing those pages, summed across storage workers |
+| `racer_warm_held_segments` | Distinct disk slots containing those pages, summed across storage workers; the name is kept for compatibility |
 
 Held gauges use each storage worker's latest health snapshot. Expired holds are
 excluded after both wall and monotonic deadlines pass. Recovered holds count even
@@ -389,7 +396,7 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_disk_class_published_payload_bytes_total{classification}` | Logical page payload bytes in those publications |
 | `racer_disk_class_index_evicted_pages_total{classification}` | Victim mappings removed to reserve page-index capacity |
 | `racer_disk_class_index_evicted_payload_bytes_total{classification}` | Logical payload bytes of those index victims |
-| `racer_disk_class_segment_evicted_pages_total{classification}` | Pages removed by disk slot eviction |
+| `racer_disk_class_segment_evicted_pages_total{classification}` | Pages removed by disk slot eviction; the name is kept for compatibility |
 | `racer_disk_class_segment_evicted_payload_bytes_total{classification}` | Logical payload bytes of those pages, not physical reclaimed disk space |
 | `racer_disk_class_read_payload_bytes_total{classification}` | Logical page payload bytes returned successfully by StoreReader after framing and mapping checks |
 | `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |

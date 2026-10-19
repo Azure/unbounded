@@ -38,7 +38,7 @@ pub struct HeldSnapshot {
     pub pages: u64,
     pub payload_bytes: u64,
     /// Distinct data slots holding those pages.
-    pub segments: u64,
+    pub slots: u64,
 }
 
 /// Disk page bound until `set_page_capacity` configures the worker's value.
@@ -640,11 +640,8 @@ mod tests {
             reservations.push(index.allocate(Tier::Cache, SLOT_BYTES).unwrap());
         }
         assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
-        assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 1);
-        assert_eq!(
-            retention.snapshot().disk[0].segment_evicted_payload_bytes,
-            17
-        );
+        assert_eq!(retention.snapshot().disk[0].slot_evicted_pages, 1);
+        assert_eq!(retention.snapshot().disk[0].slot_evicted_payload_bytes, 17);
         assert!(index.disk_pages().is_empty());
     }
 
@@ -666,7 +663,7 @@ mod tests {
         let expected = HeldSnapshot {
             pages: 2,
             payload_bytes: 20,
-            segments: 1,
+            slots: 1,
         };
         assert_eq!(index.held_snapshot(), expected);
         index.release_hold(&first.version).unwrap();
@@ -678,7 +675,7 @@ mod tests {
             HeldSnapshot {
                 pages: 1,
                 payload_bytes: 17,
-                segments: 1
+                slots: 1
             }
         );
         let key = version_key(&first.version);

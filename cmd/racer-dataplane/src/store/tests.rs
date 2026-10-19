@@ -177,7 +177,7 @@ mod volume_pressure {
         // A small record needs a new slot: the volume evicts the cache page.
         let first = persist(&f, 1);
         assert!(index.lookup(&resident_id).unwrap().is_none());
-        assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 1);
+        assert_eq!(retention.snapshot().disk[0].slot_evicted_pages, 1);
         assert!(index.lookup(&first).unwrap().is_some());
         // A larger record needs another slot, but only open and leased slots
         // remain: the write is discarded without failing progress.
@@ -571,7 +571,7 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     assert_eq!(retention.snapshot().disk[0].read_payload_bytes, 0);
     assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
     assert_eq!(retention.snapshot().disk[0].index_evicted_pages, 0);
-    assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 0);
+    assert_eq!(retention.snapshot().disk[0].slot_evicted_pages, 0);
     assert_eq!(
         volume.usage().records,
         0,

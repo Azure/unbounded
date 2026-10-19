@@ -709,7 +709,7 @@ impl Index {
                 slots.insert(value.slot);
             }
         }
-        snapshot.segments = slots.len() as u64;
+        snapshot.slots = slots.len() as u64;
         snapshot
     }
 
