@@ -5,6 +5,8 @@ package metalman
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -371,11 +373,11 @@ Apply ClusterRole/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman-controller [shared]
 Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
 Apply ClusterRole/metalman-bootstrap [shared]
-Apply ClusterRoleBinding/metalman:bootstrap-machine [shared]
+Apply ClusterRoleBinding/metalman:bootstrap-machine [shared] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction]
 Apply ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction [shared]
 Apply ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction [shared]
 Delete ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
-Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable]
+Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable] [after ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction]
 `
 
 	if got := plan.Summary(); got != want {
@@ -546,5 +548,119 @@ func TestSupportManifestsDoNotGrantAutoApproval(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func enabledSite() *unboundedv1alpha3.Site {
+	return &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)},
+			},
+		}},
+	}
+}
+
+// TestExecutionOrderInstallsRestrictionBeforeBootstrapAccess pins that the
+// bootstrap grant and the token-minting Deployment are written only after the
+// admission policy and its binding, even though the executor ranks admission
+// objects last.
+func TestExecutionOrderInstallsRestrictionBeforeBootstrapAccess(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, enabledSite())
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	order, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(order), "\n")
+	index := func(suffix string) int {
+		for i, l := range lines {
+			if strings.HasSuffix(l, suffix) {
+				return i
+			}
+		}
+
+		t.Fatalf("%s not in execution order:\n%s", suffix, order)
+
+		return -1
+	}
+
+	vap := index("ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction")
+	vapb := index("ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction")
+
+	for _, dependent := range []string{
+		"ClusterRoleBinding/" + BootstrapMachineBindingName,
+		"Deployment/unbounded-system/metalman-controller-rack-a",
+	} {
+		if i := index(dependent); i < vap || i < vapb {
+			t.Fatalf("%s ordered before the admission restriction:\n%s", dependent, order)
+		}
+	}
+}
+
+// TestRestrictionFailureWithholdsBootstrapAccess verifies that when either
+// admission object fails to apply, the bootstrap grant and the Deployment are
+// not applied.
+func TestRestrictionFailureWithholdsBootstrapAccess(t *testing.T) {
+	for _, failing := range []string{
+		"ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction",
+		"ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction",
+	} {
+		t.Run(failing, func(t *testing.T) {
+			applied := map[string]bool{}
+
+			cl := fake.NewClientBuilder().
+				WithScheme(testScheme(t)).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+						named, ok := obj.(interface {
+							GetKind() string
+							GetName() string
+						})
+						if !ok {
+							t.Fatalf("applied object has unexpected type %T", obj)
+						}
+
+						name := named.GetKind() + "/" + named.GetName()
+						if name == failing {
+							return errors.New("admission policy rejected")
+						}
+
+						applied[name] = true
+
+						return nil
+					},
+				}).
+				Build()
+
+			env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+			if res := reconcile(t, env, enabledSite()); res.Ready {
+				t.Fatalf("result = %+v, want not ready", res)
+			}
+
+			for _, withheld := range []string{
+				"ClusterRoleBinding/" + BootstrapMachineBindingName,
+				"Deployment/metalman-controller-rack-a",
+			} {
+				if applied[withheld] {
+					t.Fatalf("%s applied although the restriction failed", withheld)
+				}
+			}
+
+			if !applied["ClusterRole/metalman-controller"] {
+				t.Fatal("independent RBAC was not applied; a failure must not abort the pass")
+			}
+		})
 	}
 }

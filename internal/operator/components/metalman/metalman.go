@@ -55,14 +55,25 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 
 	plan := component.NewPlan()
 
+	// The executor ranks RBAC and Deployments ahead of admission policies, so
+	// without an explicit dependency the bootstrap grant and the token-minting
+	// Deployment would go live before the policy that restricts them, and stay
+	// live if the policy failed to apply.
+	restriction := admissionRefs(support)
+
 	for _, obj := range support {
-		plan.Add(component.Operation{
+		op := component.Operation{
 			Kind:      component.OpApply,
 			Object:    obj,
 			Component: c.Name(),
 			Site:      site.Name,
 			SharedKey: sharedSupportKey(obj),
-		})
+		}
+		if obj.GetKind() == "ClusterRoleBinding" && obj.GetName() == BootstrapMachineBindingName {
+			op.DependsOn = restriction
+		}
+
+		plan.Add(op)
 	}
 
 	// Remove RBAC that earlier releases installed and that is now unsafe to
@@ -77,9 +88,29 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 		Component:   c.Name(),
 		Site:        site.Name,
 		Overridable: true,
+		DependsOn:   restriction,
 	})
 
 	return plan, component.Reconciled(), nil
+}
+
+// BootstrapMachineBindingName is the ClusterRoleBinding that grants the
+// metalman-bootstrap ServiceAccount write access to Machine status. It must not
+// be applied until the admission policy restricting that access is in place.
+const BootstrapMachineBindingName = "metalman:bootstrap-machine"
+
+// admissionRefs returns the refs of the admission policy objects in support.
+func admissionRefs(support []*unstructured.Unstructured) []component.ObjectRef {
+	var refs []component.ObjectRef
+
+	for _, obj := range support {
+		switch obj.GetKind() {
+		case "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding":
+			refs = append(refs, component.RefOf(obj))
+		}
+	}
+
+	return refs
 }
 
 // CleanupPlan removes the per-site metalman Deployment. The shared metalman
