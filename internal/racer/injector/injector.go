@@ -353,18 +353,26 @@ func addExclusionAffinity(spec *corev1.PodSpec) {
 
 	na := spec.Affinity.NodeAffinity
 	if na.RequiredDuringSchedulingIgnoredDuringExecution == nil {
-		na.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{}
+		na.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{exclusionRequirement()},
+			}},
+		}
+
+		return
 	}
 
+	// An existing selector with no terms, and any empty term, match no
+	// nodes. Leave them unchanged: adding the exclusion would make them
+	// match every node without the exclusion label.
 	sel := na.RequiredDuringSchedulingIgnoredDuringExecution
-	if len(sel.NodeSelectorTerms) == 0 {
-		sel.NodeSelectorTerms = []corev1.NodeSelectorTerm{{}}
-	}
-
 	want := exclusionRequirement()
 
 	for i := range sel.NodeSelectorTerms {
 		term := &sel.NodeSelectorTerms[i]
+		if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
+			continue
+		}
 
 		present := false
 
