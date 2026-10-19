@@ -156,6 +156,11 @@ impl PoolDemand {
         self.misses_total += 1;
     }
 
+    /// Record a return refused by an owner-specific budget.
+    pub fn record_reject(&mut self) {
+        self.rejects_total += 1;
+    }
+
     /// Record entries released outside [`Self::tick`], such as explicit reclaim.
     pub fn record_trim(&mut self, entries: usize, len_after: usize) {
         self.trimmed_total += entries as u64;
