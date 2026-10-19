@@ -634,13 +634,15 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
     // A new registry job expands this existing partial hold, then fails again.
     let mut failed_retry = local.read(request(), &f.scope);
     let mut admitted = false;
-    for _ in 0..1024 {
+    // Raising the deadline of a page on disk commits it before admission.
+    for _ in 0..8192 {
         if let Poll::Ready(result) = failed_retry.as_mut().poll(&mut cx) {
             assert!(result.unwrap().retain_until.is_some());
             admitted = true;
             break;
         }
         pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
     }
     assert!(admitted);
     drop(failed_retry);
