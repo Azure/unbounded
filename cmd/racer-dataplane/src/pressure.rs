@@ -309,10 +309,12 @@ impl PressureMonitor {
         self.level
     }
 
+    #[cfg(test)]
     pub(crate) fn interval(&self) -> Duration {
         self.interval
     }
 
+    #[cfg(test)]
     pub(crate) fn shared(&self) -> &SharedPressure {
         &self.shared
     }
@@ -360,6 +362,71 @@ pub(crate) fn pressure_actions(level: PressureLevel) -> PressureActions {
             reclaim_cache_quanta: 1,
             ..pressured
         },
+    }
+}
+
+/// Read only the process resident set size from `/proc/self/statm`.
+/// Used for telemetry when the cgroup monitor is disabled.
+pub(crate) fn sample_resident() -> Option<u64> {
+    read_small(Path::new(PROC_SELF_STATM)).and_then(|text| parse_statm_resident(&text, page_size()))
+}
+
+/// One worker-observed level change and the work it implies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Transition {
+    pub(crate) from: PressureLevel,
+    pub(crate) to: PressureLevel,
+    /// Steady-state actions for `to`.
+    pub(crate) actions: PressureActions,
+    /// True when severity increased: run one-shot reclaim of idle buffers and
+    /// connections. Repeated polls at the same level never repeat it.
+    pub(crate) reclaim: bool,
+}
+
+/// Per-worker edge detector over the shared level. Each worker owns one, so
+/// one-shot reclaim runs exactly once per worker per increase in severity.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PressureResponder {
+    last: PressureLevel,
+}
+
+impl PressureResponder {
+    /// The level this worker most recently applied.
+    pub(crate) fn level(&self) -> PressureLevel {
+        self.last
+    }
+
+    /// Record `level`; return the transition only when it differs from the last applied level.
+    pub(crate) fn on_level(&mut self, level: PressureLevel) -> Option<Transition> {
+        let from = std::mem::replace(&mut self.last, level);
+        (from != level).then(|| Transition {
+            from,
+            to: level,
+            actions: pressure_actions(level),
+            reclaim: level > from,
+        })
+    }
+}
+
+/// Process-wide allocator trim schedule for the monitor-owning worker.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TrimSchedule {
+    next: Option<Instant>,
+}
+
+impl TrimSchedule {
+    /// Whether to trim now. Trims on entering pressure (`entered`) and at most
+    /// once per [`TRIM_INTERVAL`] while `level` stays above Normal.
+    pub(crate) fn due(&mut self, now: Instant, level: PressureLevel, entered: bool) -> bool {
+        if !pressure_actions(level).trim_allocator {
+            self.next = None;
+            return false;
+        }
+        if entered || self.next.is_none_or(|next| now >= next) {
+            self.next = Some(now + TRIM_INTERVAL);
+            return true;
+        }
+        false
     }
 }
 
@@ -630,5 +697,60 @@ mod tests {
             }
         );
         assert!(Normal < Elevated && Elevated < Critical);
+    }
+
+    #[test]
+    fn responder_reports_only_changes_and_reclaims_on_increase() {
+        let mut responder = PressureResponder::default();
+        assert_eq!(responder.level(), Normal);
+        assert_eq!(responder.on_level(Normal), None);
+        let up = responder.on_level(Elevated).expect("change");
+        assert_eq!((up.from, up.to, up.reclaim), (Normal, Elevated, true));
+        assert!(up.actions.constrain_pools);
+        // Repeated observations of the same level are not transitions.
+        assert_eq!(responder.on_level(Elevated), None);
+        let critical = responder.on_level(Critical).expect("change");
+        assert!(critical.reclaim);
+        assert_eq!(critical.actions.reclaim_cache_quanta, 1);
+        let down = responder.on_level(Elevated).expect("change");
+        assert!(!down.reclaim && down.actions.constrain_pools);
+        let normal = responder.on_level(Normal).expect("change");
+        assert_eq!((normal.from, normal.reclaim), (Elevated, false));
+        assert_eq!(normal.actions, PressureActions::default());
+        assert_eq!(responder.level(), Normal);
+        // Jumping straight to Critical also reclaims once.
+        assert!(responder.on_level(Critical).expect("change").reclaim);
+        assert_eq!(responder.on_level(Critical), None);
+    }
+
+    #[test]
+    fn trim_schedule_trims_on_entry_then_at_interval() {
+        let start = Instant::now();
+        let mut schedule = TrimSchedule::default();
+        assert!(!schedule.due(start, Normal, false));
+        assert!(schedule.due(start, Elevated, true));
+        assert!(!schedule.due(start + Duration::from_secs(1), Elevated, false));
+        assert!(!schedule.due(
+            start + TRIM_INTERVAL - Duration::from_millis(1),
+            Critical,
+            false
+        ));
+        // A severity increase trims immediately even inside the interval.
+        assert!(schedule.due(start + Duration::from_secs(2), Critical, true));
+        assert!(schedule.due(
+            start + Duration::from_secs(2) + TRIM_INTERVAL,
+            Critical,
+            false
+        ));
+        // Returning to Normal resets the schedule.
+        assert!(!schedule.due(start + Duration::from_secs(60), Normal, false));
+        assert!(schedule.due(start + Duration::from_secs(61), Elevated, false));
+    }
+
+    #[test]
+    fn sample_resident_reads_statm_on_linux() {
+        if cfg!(target_os = "linux") {
+            assert!(sample_resident().is_some_and(|rss| rss > 0));
+        }
     }
 }
