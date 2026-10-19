@@ -30,31 +30,31 @@ changes.
 
 ```
 crates/
-  Cargo.toml            # standalone Cargo workspace (edition 2024, resolver 3)
-  Cargo.lock
-  uring-runtime/        # core library (lib name `uring_runtime`)
-  uring-runtime-sim/    # deterministic simulation backend (lib name `uring_runtime_sim`)
+  uring-runtime/        # core library (lib name `uring_runtime`), own Cargo.toml + Cargo.lock
+  uring-runtime-sim/    # deterministic simulation backend (lib name `uring_runtime_sim`), own Cargo.toml + Cargo.lock
 cmd/racer-dataplane/
   platform/             # new internal crate `racer-platform`: Racer policy that used to live in the runtime
 ```
 
-`crates/` is its own workspace so the library is built, linted and tested with
-no knowledge of Racer. Racer depends on it with
-`uring-runtime = { path = "../../crates/uring-runtime", version = "0.1.0" }`.
+`crates/` is its own workspace so tEach crate under `crates/` is a standalone package: its manifest has an empty
+`[workspace]` table, so it is its own workspace root with its own `Cargo.lock`,
+and it can be copied out of the repository and built on its own. The library
+is built, linted and tested with no knowledge of Racer. The simulation crate
+depends on the core with
+`uring-runtime = { path = "../uring-runtime", version = "0.1.0" }`, and Racer
+with `uring-runtime = { path = "../../crates/uring-runtime", version = "0.1.0" }`.
 
-Workspace settings (`crates/Cargo.toml`):
+Package settings, repeated in each crate's `Cargo.toml` (no inheritance):
 
 - `edition = "2024"`, `rust-version = "1.88"`, `license = "Apache-2.0"`,
-  `repository = "https://github.com/Azure/unbounded"`, shared through `[workspace.package]`.
-- `[workspace.lints.rust]`: `missing_docs`, `unsafe_op_in_unsafe_fn`,
+  `repository = "https://github.com/Azure/unbounded"`.
+- `[lints.rust]`: `missing_docs`, `unsafe_op_in_unsafe_fn`,
   `unreachable_pub`, `rust_2018_idioms` (`deny`/`warn` as appropriate).
-- `[workspace.lints.clippy]`: `undocumented_unsafe_blocks = "deny"`,
+- `[lints.clippy]`: `undocumented_unsafe_blocks = "deny"`,
   `missing_safety_doc = "deny"`.
-- No `panic = "abort"`: the group relies on `catch_unwind`.
+- No `panic = "abort"` in consumers: the group relies on `catch_unwind`.
 
-## Crate: `uring-runtime`
-
-Dependencies are kept minimal: `io-uring`, `libc`, and `futures-core`/
+cies are kept minimal: `io-uring`, `libc`, and `futures-core`/
 `atomic-waker`-style helpers only if they pay for themselves. No `getrandom`
 types in the public API.
 
@@ -648,7 +648,7 @@ resolves).
 - Reactor state-machine tests use a scripted backend (`reactor/tests.rs`)
   and run under Miri (Stacked and Tree Borrows); real-kernel tests live in
   `uring-runtime/tests/uring.rs`.
-- `crates/`: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
+- Each crate under `crates/` (CI matrix): `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
   `cargo test` (io_uring tests fail, not skip, when `URING_RUNTIME_REQUIRE_KERNEL=1`),
   `cargo doc -D warnings`, Miri on the pure state-machine, buffer and executor
   tests, MSRV check.
