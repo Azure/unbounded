@@ -3169,7 +3169,7 @@ fn fixture_with_caches(
         directory.join(format!("worker-{}-slab-0.dat", worker.0)),
         16 * page_alloc::volume::SLOT_BYTES,
         page_alloc::volume::SLOT_BYTES,
-        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+        crate::store::MAX_RECORD_BYTES,
     ));
     let metrics = Metrics::default();
     let disk = Rc::new(

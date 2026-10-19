@@ -424,10 +424,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
         guarded_capacity(device.bytes, SLOT_BYTES, alignment)?;
     }
     let record = alignment
-        .extent(
-            0,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-        )?
+        .extent(0, crate::store::MAX_RECORD_BYTES)?
         .length() as u64;
     if record > SLOT_BYTES {
         return Err(Error::InvalidConfiguration);
@@ -1023,10 +1020,7 @@ mod tests {
         let p = plan(vec![device("a", 9, s)], &c, 2).unwrap();
         let record = p.workers[0]
             .alignment
-            .extent(
-                0,
-                crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-            )
+            .extent(0, crate::store::MAX_RECORD_BYTES)
             .unwrap()
             .length() as u64;
         assert_eq!(p.workers[0].page_entries as u64, (5 - 1) * (s / record));

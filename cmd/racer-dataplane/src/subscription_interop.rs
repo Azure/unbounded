@@ -278,7 +278,7 @@ impl SubscriptionFixture {
             root.join("slabs/worker-0-slab-0.dat"),
             16 * page_alloc::volume::SLOT_BYTES,
             page_alloc::volume::SLOT_BYTES,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            crate::store::MAX_RECORD_BYTES,
         ));
         let writer = Rc::new(StoreWriter::new(
             index.clone(),

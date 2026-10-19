@@ -633,7 +633,7 @@ impl StoreWriter {
             || !self.admission.owns(&dirty)
             || dirty.key() != Some(&page.metadata.version.object.cache)
             || dirty.amount() < page.ciphertext.bytes().len()
-            || logical > crate::model::PAGE_BYTES as usize + MAX_HEADER_BYTES + 16
+            || logical > MAX_RECORD_BYTES
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -1278,6 +1278,10 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 pub const MAX_HEADER_BYTES: usize = 16384;
+
+/// Largest encoded page record: a full page of ciphertext, its 16-byte AEAD
+/// tag, and the largest header.
+pub const MAX_RECORD_BYTES: usize = crate::model::PAGE_BYTES as usize + 16 + MAX_HEADER_BYTES;
 
 /// Large records share capacity classes while their disk extents stay exact.
 fn staging_capacity(length: usize) -> Result<usize> {

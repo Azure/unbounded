@@ -315,10 +315,7 @@ fn payload_capacity(
 ) -> Result<(u64, u64)> {
     use page_alloc::volume::SLOT_BYTES;
     let record = alignment
-        .extent(
-            0,
-            crate::model::PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES,
-        )?
+        .extent(0, crate::store::MAX_RECORD_BYTES)?
         .length() as u64;
     let pages = SLOT_BYTES / record;
     let usable = slot_count.saturating_sub(1);
@@ -1301,7 +1298,7 @@ impl WorkerApplication {
                     })
                     .collect(),
                 page_alloc::volume::SLOT_BYTES,
-                crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                crate::store::MAX_RECORD_BYTES,
                 devices.alignment,
             )?
         } else {
@@ -1309,7 +1306,7 @@ impl WorkerApplication {
                 slab_file.clone(),
                 slab_bytes,
                 page_alloc::volume::SLOT_BYTES,
-                crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                crate::store::MAX_RECORD_BYTES,
             )
         });
         let reader = Rc::new(

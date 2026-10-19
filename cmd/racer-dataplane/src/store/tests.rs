@@ -999,7 +999,7 @@ impl Fixture {
             directory.0.join("worker-0-slab-0.dat"),
             slots * SLOT_BYTES,
             SLOT_BYTES,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            crate::store::MAX_RECORD_BYTES,
         ));
         let reader = Rc::new(
             StoreReader::new(

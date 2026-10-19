@@ -948,7 +948,7 @@ fn metadata_coordinator_with_newer_publication(
         "unused/absence-slabs/worker-0-slab-0.dat".into(),
         64 * page_alloc::volume::SLOT_BYTES,
         page_alloc::volume::SLOT_BYTES,
-        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+        crate::store::MAX_RECORD_BYTES,
     ));
     let disk = Rc::new(StoreReader::new(
         index.clone(),

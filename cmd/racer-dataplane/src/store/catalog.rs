@@ -41,6 +41,15 @@ pub struct HeldSnapshot {
     pub segments: u64,
 }
 
+/// Disk page bound until `set_page_capacity` configures the worker's value.
+const DEFAULT_PAGE_CAPACITY: usize = 65536;
+
+/// Placeholder retention policy bounds until `set_retention` installs the
+/// worker's policy: second-sight history bytes, and heat entries (the default
+/// page capacity plus slack for pending writes).
+const DEFAULT_RETENTION_HISTORY_BYTES: usize = 256 * 1024;
+const DEFAULT_RETENTION_HEAT_ENTRIES: usize = DEFAULT_PAGE_CAPACITY + 64;
+
 /// One storage shard. The metadata catalog budget is independent of disk
 /// pages; evicting a catalog item cannot remove a page's version descriptor.
 pub struct Index {
@@ -132,7 +141,7 @@ impl Index {
         metadata_capacity: usize,
         availability: Rc<crate::control::Availability>,
     ) -> Self {
-        let page_capacity = 65536;
+        let page_capacity = DEFAULT_PAGE_CAPACITY;
         Self {
             worker,
             metadata_capacity,
@@ -141,7 +150,11 @@ impl Index {
             availability,
             residency: Rc::new(Residency {
                 retention: RefCell::new(Rc::new(
-                    Retention::new(256 * 1024, 65536 + 64).expect("valid bounded retention"),
+                    Retention::new(
+                        DEFAULT_RETENTION_HISTORY_BYTES,
+                        DEFAULT_RETENTION_HEAT_ENTRIES,
+                    )
+                    .expect("valid bounded retention"),
                 )),
                 counts: RefCell::new(HashMap::default()),
             }),
@@ -231,13 +244,16 @@ impl Index {
         }
         Self::validate_descriptor(&metadata)?;
         self.check_length(&metadata)?;
-        let mut s = self.state.borrow_mut();
+        self.insert_metadata(&mut self.state.borrow_mut(), metadata)
+    }
+    /// Insert a validated descriptor, evicting the oldest past the catalog bound.
+    fn insert_metadata(&self, s: &mut State, metadata: VersionMetadata) -> Result<()> {
         if self.metadata_capacity == 0 {
             return Err(Error::Overloaded);
         }
         if !s.metadata.contains_key(&metadata.version) {
             while s.metadata.len() >= self.metadata_capacity {
-                Self::evict_one(&mut s);
+                Self::evict_one(s);
             }
             s.order.push_back(metadata.version.clone());
         }
@@ -369,19 +385,26 @@ impl Index {
     /// are kept only for versions that still have pages on the mounted volume.
     pub fn restore(&self, snapshot: IndexSnapshot) -> Result<()> {
         self.validate_snapshot(&snapshot)?;
-        let mut replacement = Index::new(
-            self.worker,
-            self.metadata_capacity,
-            self.availability.clone(),
-        );
+        // Rebuild the catalog aside so a rejected snapshot leaves it untouched.
+        let mut rebuilt = State::default();
         for m in snapshot.metadata {
-            replacement.publish_version(m)?;
+            if !self.available(&m.version.object.cache) {
+                continue;
+            }
+            Self::validate_descriptor(&m)?;
+            if rebuilt
+                .metadata
+                .get(&m.version)
+                .is_some_and(|old| !old.compatible(&m))
+            {
+                return Err(Error::CorruptRecord);
+            }
+            self.insert_metadata(&mut rebuilt, m)?;
         }
-        let replacement = std::mem::take(&mut *replacement.state.get_mut());
         self.restore_versions(snapshot.versions);
         let mut state = self.state.borrow_mut();
-        state.metadata = replacement.metadata;
-        state.order = replacement.order;
+        state.metadata = rebuilt.metadata;
+        state.order = rebuilt.order;
         state.current.clear();
         Ok(())
     }

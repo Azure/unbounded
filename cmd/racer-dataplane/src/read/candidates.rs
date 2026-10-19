@@ -2903,7 +2903,7 @@ pub(super) mod tests {
                         .join("target/ownership-unopened-slab"),
                     config.slab_bytes,
                     page_alloc::volume::SLOT_BYTES,
-                    crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                    crate::store::MAX_RECORD_BYTES,
                 )),
                 admission.clone(),
                 reactor.clone(),

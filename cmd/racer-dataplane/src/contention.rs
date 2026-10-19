@@ -1557,7 +1557,7 @@ mod fidelity {
                 .join("target/contention-fidelity-unopened/worker-0-slab-0.dat"),
             8 * page_alloc::volume::SLOT_BYTES,
             page_alloc::volume::SLOT_BYTES,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            crate::store::MAX_RECORD_BYTES,
         ));
         let disk = Rc::new(StoreReader::new(
             index.clone(),
