@@ -277,6 +277,16 @@ func (s *MachineSpec) Netboot() *PXESpec {
 	return s.PXE
 }
 
+// NodeName returns the Kubernetes Node name expected for the Machine:
+// spec.kubernetes.nodeRef.name when set, otherwise the Machine name.
+func (m *Machine) NodeName() string {
+	if m.Spec.Kubernetes != nil && m.Spec.Kubernetes.NodeRef != nil && m.Spec.Kubernetes.NodeRef.Name != "" {
+		return m.Spec.Kubernetes.NodeRef.Name
+	}
+
+	return m.Name
+}
+
 // External provider names.
 const (
 	ExternalProviderAzureVM     = "AzureVM"
