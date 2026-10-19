@@ -46,6 +46,143 @@ spec:
             type: string
           metadata:
             type: object
+          spec:
+            description: Spec configures optional cache features.
+            properties:
+              origin:
+                description: |-
+                  Origin deploys a managed racer-object origin for this cache. The operator runs
+                  one origin pod per dataplane node and removes it when origin is unset.
+                properties:
+                  azure:
+                    description: Azure reads from Azure Blob Storage. Buckets name
+                      blob containers.
+                    properties:
+                      accountURL:
+                        description: |-
+                          AccountURL is the blob service endpoint, for example
+                          https://account.blob.core.windows.net. Azurite-style URLs may carry one
+                          account path segment.
+                        maxLength: 256
+                        minLength: 1
+                        type: string
+                        x-kubernetes-validations:
+                        - message: accountURL must be an http or https URL
+                          rule: isURL(self) && url(self).getScheme() in ['http', 'https']
+                        - message: accountURL must not contain credentials, a query,
+                            or a fragment
+                          rule: '!self.contains(''?'') && !self.contains(''#'') &&
+                            !self.contains(''@'')'
+                      credential:
+                        description: Credential selects how the origin authenticates.
+                          When omitted, requests are anonymous.
+                        properties:
+                          default:
+                            description: |-
+                              Default uses DefaultAzureCredential, such as a managed identity or
+                              service principal environment variables from a Secret.
+                            properties:
+                              clientID:
+                                description: ClientID selects a user-assigned managed
+                                  identity.
+                                pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+                                type: string
+                              secretRef:
+                                description: |-
+                                  SecretRef names a Secret in the operator namespace whose keys are
+                                  injected as environment variables, for example AZURE_CLIENT_ID,
+                                  AZURE_TENANT_ID, and AZURE_CLIENT_SECRET.
+                                properties:
+                                  name:
+                                    description: Name of the Secret.
+                                    maxLength: 253
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                            type: object
+                            x-kubernetes-validations:
+                            - message: clientID and secretRef are mutually exclusive
+                              rule: '!(has(self.clientID) && has(self.secretRef))'
+                          workloadIdentity:
+                            description: |-
+                              WorkloadIdentity uses Microsoft Entra Workload ID. The cluster must run
+                              the Azure Workload Identity webhook, and the identity must trust the
+                              origin's ServiceAccount.
+                            properties:
+                              clientID:
+                                description: ClientID is the client ID of the federated
+                                  identity.
+                                pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+                                type: string
+                              tenantID:
+                                description: TenantID overrides the tenant configured
+                                  by the webhook.
+                                pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+                                type: string
+                            required:
+                            - clientID
+                            type: object
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of default or workloadIdentity is required
+                          rule: '[has(self.default), has(self.workloadIdentity)].filter(x,
+                            x).size() == 1'
+                    required:
+                    - accountURL
+                    type: object
+                    x-kubernetes-validations:
+                    - message: accountURL must use https when a credential is configured
+                      rule: '!has(self.credential) || self.accountURL.startsWith(''https://'')'
+                  buckets:
+                    description: Buckets lists the buckets or containers the origin
+                      may read.
+                    items:
+                      description: BucketName names an object storage bucket or blob
+                        container.
+                      maxLength: 255
+                      minLength: 1
+                      pattern: ^[a-zA-Z0-9._-]+$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: bucket must not be . or ..
+                        rule: self != '.' && self != '..'
+                    maxItems: 64
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: set
+                  maxConcurrentRequests:
+                    description: |-
+                      MaxConcurrentRequests bounds concurrent upstream requests per origin pod.
+                      When unset, the racer-object default applies.
+                    format: int32
+                    maximum: 65536
+                    minimum: 1
+                    type: integer
+                  metadataTTL:
+                    description: |-
+                      MetadataTTL bounds how long object metadata is reused before it is revalidated.
+                      It must not be negative. When unset, the racer-object default applies.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: metadataTTL must not be negative
+                      rule: duration(self) >= duration('0s')
+                  requestTimeout:
+                    description: |-
+                      RequestTimeout bounds each upstream request. It must be positive.
+                      When unset, the racer-object default applies.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: requestTimeout must be positive
+                      rule: duration(self) > duration('0s')
+                required:
+                - buckets
+                type: object
+                x-kubernetes-validations:
+                - message: azure is required
+                  rule: has(self.azure)
+            type: object
         type: object
         x-kubernetes-validations:
         - message: name must fit the canonical Unix socket path
