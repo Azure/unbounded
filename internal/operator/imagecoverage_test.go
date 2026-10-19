@@ -67,6 +67,12 @@ var componentImages = map[string][]string{
 	"racer":           {"racer-controller", "racer-dataplane"},
 }
 
+// imagelessComponents are registered components that apply no workloads, only
+// RBAC or admission policy, so they have no image to cover.
+var imagelessComponents = map[string]struct{}{
+	"metalman-bootstrap": {},
+}
+
 // releaseBOMSource is the tool whose hardcoded image list feeds the signed
 // release BOM. It legitimately carries images the operator does not manage
 // (netboot, orca, the operator itself), so it is checked for containment.
@@ -332,6 +338,10 @@ func TestComponentImagesCoversRegistry(t *testing.T) {
 	}
 
 	for name := range registered {
+		if _, ok := imagelessComponents[name]; ok {
+			continue
+		}
+
 		repositories, ok := componentImages[name]
 		if !ok {
 			t.Errorf(
