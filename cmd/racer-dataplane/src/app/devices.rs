@@ -522,7 +522,7 @@ fn lcm(a: u64, b: u64) -> Result<u64> {
 }
 
 #[cfg(test)]
-pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::CheckpointGeometry> {
+pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::CheckpointLayout> {
     let c = crate::test_support::cluster::config(false);
     let bytes = 6 * c.segment_bytes + 2 * GUARD_BYTES;
     let devices: Vec<_> = ["cache-a", "cache-b"]
@@ -539,15 +539,9 @@ pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::Checkpo
         .into_iter()
         .map(|worker| {
             assert_eq!(worker.placements.len(), 6);
-            let mut geometry = crate::store::checkpoint::CheckpointGeometry::new(
-                6 * c.segment_bytes,
-                c.segment_bytes,
-                6,
-                worker.alignment,
-            )
-            .unwrap();
-            geometry.layout_digest = worker.digest;
-            geometry
+            crate::store::checkpoint::CheckpointLayout {
+                layout_digest: worker.digest,
+            }
         })
         .collect()
 }

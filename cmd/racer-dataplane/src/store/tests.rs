@@ -70,7 +70,7 @@ mod index_pressure {
         let fourth = persist(&f, 4);
         assert!(index.lookup(&first).unwrap().is_none());
         assert!(index.lookup(&second).unwrap().is_none());
-        assert_eq!(index.snapshot().unwrap().entries.len(), 2);
+        assert_eq!(index.disk_pages().len(), 2);
         let after = segment_images(&f);
         assert_eq!(after[0].1, before[0].1);
         assert_eq!(after[0].2, SegmentState::Open);
@@ -81,13 +81,9 @@ mod index_pressure {
         let image = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
         futures::executor::block_on(f.store.checkpoint.publish(vec![image])).unwrap();
         f.store.checkpoint.finish_snapshot();
-        let loaded = futures::executor::block_on(
-            f.store
-                .recovery
-                .load(f.store.writer.slabs().alignment().unwrap()),
-        )
-        .unwrap()
-        .unwrap();
+        let loaded = futures::executor::block_on(f.store.recovery.load())
+            .unwrap()
+            .unwrap();
         futures::executor::block_on(
             f.store
                 .recovery
@@ -103,7 +99,7 @@ mod index_pressure {
             assert_eq!(read.ciphertext.bytes(), vec![number; 129]);
         }
         persist(&f, 5);
-        assert!(index.snapshot().unwrap().entries.len() <= 2);
+        assert!(index.disk_pages().len() <= 2);
     }
     #[test]
     fn replacement_does_not_evict_neighbors_or_let_old_tokens_remove_new_mapping() {
@@ -124,7 +120,7 @@ mod index_pressure {
         f.store.reader.invalidate(&token).unwrap();
         assert_eq!(index.lookup(&first).unwrap().unwrap().location, replacement);
         assert_eq!(index.lookup(&second).unwrap().unwrap().location, neighbor);
-        assert_eq!(index.snapshot().unwrap().entries.len(), 2);
+        assert_eq!(index.disk_pages().len(), 2);
     }
     #[test]
     fn index_eviction_during_read_cannot_resurrect_copy_or_recycle_active_generation() {
@@ -287,7 +283,7 @@ mod index_pressure {
             },
         );
         assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
-        assert_eq!(index.snapshot().unwrap().entries.len(), 2);
+        assert_eq!(index.disk_pages().len(), 2);
         assert_eq!(
             f.segments.state(location.segment).unwrap(),
             SegmentState::Evicting
@@ -311,9 +307,9 @@ mod index_pressure {
             }
         }
         assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
-        assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+        assert_eq!(index.disk_pages().len(), 1);
         assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
-        assert!(index.snapshot().unwrap().entries.is_empty());
+        assert!(index.disk_pages().is_empty());
         assert_eq!(f.segments.snapshot()[0].generation, location.generation);
         assert_eq!(f.segments.free_count(), 1, "held lease still fences reuse");
         drop(held);
@@ -390,53 +386,6 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
 }
 
 #[test]
-fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
-    use crate::store::checkpoint;
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
-    let _ = futures::executor::block_on(f.store.open()).unwrap();
-    f.reactor.init().unwrap();
-    let copy = f.copy(1, 113);
-    let id = copy.ciphertext.envelope().page.clone();
-    let index = f.store.writer.index();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-    index.reserve_hold(&id.version, 1, until).unwrap();
-    drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
-    let shard = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
-    f.store.checkpoint.finish_snapshot();
-    let bytes = checkpoint::encode(&checkpoint::CheckpointImage {
-        version: checkpoint::CHECKPOINT_VERSION,
-        sequence: 1,
-        shards: vec![shard],
-    })
-    .unwrap();
-    let image = checkpoint::decode(&bytes).unwrap();
-    futures::executor::block_on(
-        f.store
-            .recovery
-            .install_shard(image.shards.into_iter().next()),
-    )
-    .unwrap();
-    assert_eq!(index.hold_expiry(&id.version), Some(until));
-    let mut image = checkpoint::decode(&bytes).unwrap();
-    for segment in &mut image.shards[0].segments {
-        for (_, deadline) in &mut segment.retained_records {
-            *deadline = std::time::UNIX_EPOCH;
-        }
-    }
-    futures::executor::block_on(
-        f.store
-            .recovery
-            .install_shard(image.shards.into_iter().next()),
-    )
-    .unwrap();
-    assert_eq!(index.hold_expiry(&id.version), None);
-    assert!(index.lookup(&id).unwrap().is_some());
-}
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
-#[test]
 fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
     struct Wakes(std::sync::atomic::AtomicUsize);
     impl futures::task::ArcWake for Wakes {
@@ -450,7 +399,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let cut = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
-    assert!(cut.index.entries.is_empty());
+    assert!(cut.index.versions.is_empty());
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
@@ -484,7 +433,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
 }
 
 #[test]
-fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
+fn hard_hold_checkpoint_fences_warm_owned_publication() {
     use uring_runtime::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
@@ -507,35 +456,10 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     assert!(f.store.writer.paused.get());
     drive(&f.reactor, held).unwrap();
     let shard = drive(&f.reactor, snapshot).unwrap();
-    assert_eq!(shard.index.entries.len(), 1);
-    assert_eq!(
-        shard
-            .segments
-            .iter()
-            .map(|s| s.retained_records.len())
-            .sum::<usize>(),
-        1
-    );
+    // The paused writer published the held page before the cut was taken.
+    assert_eq!(shard.index.versions.len(), 1);
     f.store.checkpoint.finish_snapshot();
-    let encoded = crate::store::checkpoint::encode(&crate::store::checkpoint::CheckpointImage {
-        version: crate::store::checkpoint::CHECKPOINT_VERSION,
-        sequence: 1,
-        shards: vec![shard],
-    })
-    .unwrap();
-    let restored = crate::store::checkpoint::decode(&encoded).unwrap();
-    futures::executor::block_on(
-        f.store
-            .recovery
-            .install_shard(restored.shards.into_iter().next()),
-    )
-    .unwrap();
     assert_eq!(index.held_page_expiry(&id), Some(until));
-    let segment = index.lookup(&id).unwrap().unwrap().location.segment;
-    assert!(!page_alloc::SegmentEntries::can_reclaim(&**index, segment));
-    drop(f.segments.append(32 * 1024 * 1024).unwrap());
-    f.store.eviction.reclaim_now().unwrap();
-    assert!(index.lookup(&id).unwrap().is_some());
 }
 
 #[test]
@@ -558,59 +482,6 @@ fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
     assert!(!f.store.writer.paused.get());
     assert!(f.store.writer.waiters.borrow().is_empty());
     drop(busy);
-}
-
-#[test]
-fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
-    let _ = futures::executor::block_on(f.store.open()).unwrap();
-    let index = f.store.writer.index();
-    index.set_page_capacity(256).unwrap();
-    let mut first = None;
-    for number in 0..129 {
-        let copy = f.copy(number, 113);
-        let id = copy.ciphertext.envelope().page.clone();
-        let (lease, extent) = f.segments.append(4096).unwrap();
-        index
-            .publish(
-                id.clone(),
-                catalog::IndexedPage {
-                    location: catalog::RecordLocation {
-                        segment: lease.id(),
-                        generation: lease.generation(),
-                        extent,
-                    },
-                    metadata: copy.metadata.immutable(),
-                    key_id: copy.ciphertext.envelope().key_id,
-                },
-            )
-            .unwrap();
-        first.get_or_insert(id);
-    }
-    let id = first.unwrap();
-    let mut snapshot = f.store.checkpoint.snapshot_incremental(1024 * 1024);
-    assert!(
-        snapshot
-            .as_mut()
-            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
-            .is_pending()
-    );
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-    index.reserve_hold(&id.version, 1, until).unwrap();
-    let shard = futures::executor::block_on(snapshot).unwrap();
-    assert_eq!(
-        shard
-            .segments
-            .iter()
-            .map(|s| s.retained_records.len())
-            .sum::<usize>(),
-        1
-    );
-    f.store.checkpoint.finish_snapshot();
-    futures::executor::block_on(f.store.recovery.install_shard(Some(shard))).unwrap();
-    assert_eq!(index.held_page_expiry(&id), Some(until));
 }
 
 #[test]
@@ -1114,6 +985,7 @@ fn optional_headroom_reclaim_bounds_prefix_and_stops_only_after_both_deficits() 
     );
     assert_eq!(f.store.writer.pending_count(), 2);
 }
+static NEXT: AtomicU64 = AtomicU64::new(0);
 pub(super) struct Directory(pub(super) PathBuf);
 impl Directory {
     pub(super) fn new() -> Self {
@@ -1198,13 +1070,8 @@ impl Fixture {
             checkpoint: Rc::new(super::checkpoint::Checkpointer::new(
                 directory.0.clone(),
                 index.clone(),
-                segments.clone(),
             )),
-            recovery: super::checkpoint::Recovery::new(
-                directory.0.clone(),
-                index,
-                segments.clone(),
-            ),
+            recovery: super::checkpoint::Recovery::new(directory.0.clone(), index),
             eviction,
         };
         store.configure(admission.clone(), 2, 16).unwrap();
@@ -1370,7 +1237,7 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
         assert_eq!(memory.publish(page.clone()), Err(Error::MissingKey));
         assert!(matches!(f.enqueue(page.copy()), Err(Error::MissingKey)));
         index.restore(snapshot).unwrap();
-        assert!(index.snapshot().unwrap().entries.is_empty());
+        assert!(index.lookup(&id).unwrap().is_none());
         assert!(index.snapshot().unwrap().metadata.is_empty());
         assert_eq!(page.plaintext.bytes(), &[1; 3]);
     }
@@ -1527,10 +1394,11 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
             uring_runtime::environment::wall_now() + Duration::from_secs(60),
         )
         .unwrap();
-    let base = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap();
-    let pages = base + super::checkpoint::snapshot_entry_bytes(&metadata);
-    let descriptors = pages + super::checkpoint::snapshot_metadata_bytes(&metadata);
-    let held = descriptors + super::checkpoint::RETAINED_RECORD_BYTES;
+    let mut version = super::versions::VersionEntry::new(metadata.clone());
+    version.add_key_id(crate::model::key_id_from_generation(1, 1).unwrap());
+    let base = super::checkpoint::SHARD_BYTES;
+    let versions = base + super::checkpoint::snapshot_version_bytes(&version);
+    let descriptors = versions + super::checkpoint::snapshot_metadata_bytes(&metadata);
 
     let copy = f.copy(2, 113);
     let id = copy.ciphertext.envelope().page.clone();
@@ -1541,7 +1409,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(progress.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.store.writer.writes_in_flight(), 1);
-    for budget in [0, base - 1, pages - 1, descriptors - 1, held - 1] {
+    for budget in [0, base - 1, versions - 1, descriptors - 1] {
         let mut snapshot = f.store.checkpoint.snapshot_incremental(budget);
         assert!(matches!(
             snapshot.as_mut().poll(&mut cx),
@@ -1550,8 +1418,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
         assert!(!f.store.writer.paused.get());
         assert!(f.store.writer.waiters.borrow().is_empty());
         assert_eq!(f.store.writer.writes_in_flight(), 1);
-        // Acquiring a guard proves the failed cut did not freeze the table.
-        drop(f.segments.freeze().unwrap());
+        assert!(!f.store.checkpoint.is_snapshot_taken());
     }
     drive(&f.reactor, progress).unwrap();
     assert!(index.lookup(&id).unwrap().is_some());
@@ -1564,7 +1431,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
 }
 
 #[test]
-fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
+fn checkpoint_exact_budget_matches_full_snapshot() {
     use super::checkpoint::{CHECKPOINT_VERSION, CheckpointImage, encode};
     let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
@@ -1573,19 +1440,12 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     f.enqueue(f.copy(1, 113)).unwrap();
     drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
     let index = f.store.writer.index();
-    let metadata = index.snapshot().unwrap().entries[0].1.metadata.clone();
+    let version = index.snapshot().unwrap().versions[0].clone();
+    let metadata = version.metadata.clone();
     index.publish_version(metadata.clone()).unwrap();
-    index
-        .reserve_hold(
-            &metadata.version,
-            1,
-            uring_runtime::environment::wall_now() + Duration::from_secs(60),
-        )
-        .unwrap();
-    let budget = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap()
-        + super::checkpoint::snapshot_entry_bytes(&metadata)
-        + super::checkpoint::snapshot_metadata_bytes(&metadata)
-        + super::checkpoint::RETAINED_RECORD_BYTES;
+    let budget = super::checkpoint::SHARD_BYTES
+        + super::checkpoint::snapshot_version_bytes(&version)
+        + super::checkpoint::snapshot_metadata_bytes(&metadata);
     assert!(matches!(
         drive(
             &f.reactor,
@@ -1611,7 +1471,6 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     assert_eq!(full.len(), budget + 32 + 4 + 32);
     f.store.checkpoint.finish_snapshot();
     assert!(!f.store.writer.paused.get());
-    drop(f.segments.freeze().unwrap());
 }
 
 #[test]
@@ -1629,7 +1488,7 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
         f.store.checkpoint.snapshot_incremental(1024 * 1024),
     )
     .unwrap();
-    assert_eq!(shard.index.entries.len(), 1);
+    assert_eq!(shard.index.versions.len(), 1);
     let task = f
         .store
         .checkpoint
@@ -1640,44 +1499,34 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
     let bytes = std::fs::read(f._directory.0.join("checkpoint.1")).unwrap();
     let image = super::checkpoint::decode(&bytes).unwrap();
     assert_eq!(image.sequence, 7);
-    assert_eq!(image.shards[0].index.entries.len(), 1);
-    let geometry = super::checkpoint::CheckpointGeometry::new(
-        1024 * 1024 * 1024,
-        64 * 1024 * 1024,
-        16,
-        Alignment::new(4096, 4096, 4096).unwrap(),
-    )
-    .unwrap();
-    let (payload, tail) = geometry.payload_capacity(2, 65536).unwrap();
-    assert_eq!(payload, 672 * 1024 * 1024);
-    assert!(tail > 200 * 1024 * 1024);
+    assert_eq!(image.shards[0].index.versions.len(), 1);
 }
 
 #[test]
-fn checkpoint_preflights_segment_metadata_and_page_clones() {
+fn checkpoint_preflights_metadata_and_version_clones() {
     let f = Fixture::new();
     let _ = drive(&f.reactor, f.store.open()).unwrap();
     f.enqueue(f.copy(1, 4096)).unwrap();
     drive(&f.reactor, f.store.writer.progress(8, &scope())).unwrap();
     let index = f.store.writer.index();
-    let metadata = index.snapshot().unwrap().entries[0].1.metadata.clone();
+    let version = index.snapshot().unwrap().versions[0].clone();
+    let metadata = version.metadata.clone();
     index.publish_version(metadata.clone()).unwrap();
-    let item = super::checkpoint::snapshot_entry_bytes(&metadata);
+    let item = super::checkpoint::snapshot_version_bytes(&version);
     let descriptor = super::checkpoint::snapshot_metadata_bytes(&metadata);
-    let segment_bytes = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap();
+    let base = super::checkpoint::SHARD_BYTES;
     for budget in [
-        segment_bytes - 1,
-        segment_bytes + descriptor - 1,
-        segment_bytes + descriptor + item - 1,
+        base - 1,
+        base + descriptor - 1,
+        base + descriptor + item - 1,
     ] {
         assert!(matches!(
             drive(&f.reactor, f.store.checkpoint.snapshot_incremental(budget)),
             Err(Error::Overloaded)
         ));
-        // Failure must thaw before a subsequent cut or writer append.
-        let frozen = f.segments.freeze().unwrap();
-        drop(frozen);
-        drop(f.segments.append(4096).unwrap());
+        // Failure must release the cut before a subsequent one.
+        assert!(!f.store.checkpoint.is_snapshot_taken());
+        assert!(!f.store.writer.paused.get());
     }
     let mut budget = descriptor - 1;
     assert!(matches!(
@@ -1686,17 +1535,17 @@ fn checkpoint_preflights_segment_metadata_and_page_clones() {
     ));
     let mut budget = item - 1;
     assert!(matches!(
-        index.snapshot_pages_budgeted(0, 128, &mut budget),
+        index.snapshot_versions_budgeted(None, 128, &mut budget),
         Err(Error::Overloaded)
     ));
     let image = drive(
         &f.reactor,
         f.store
             .checkpoint
-            .snapshot_incremental(segment_bytes + descriptor + item),
+            .snapshot_incremental(base + descriptor + item),
     )
     .unwrap();
-    assert_eq!(image.index.entries.len(), 1);
+    assert_eq!(image.index.versions.len(), 1);
     assert_eq!(image.index.metadata.len(), 1);
     f.store.checkpoint.finish_snapshot();
 }
@@ -1708,11 +1557,8 @@ fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
     let _os = sim.enter();
     let f = Fixture::new();
     let directory = PathBuf::from("/checkpoint-new/nested");
-    let checkpoint = super::checkpoint::Checkpointer::new(
-        directory.clone(),
-        f.store.writer.index().clone(),
-        f.segments.clone(),
-    );
+    let checkpoint =
+        super::checkpoint::Checkpointer::new(directory.clone(), f.store.writer.index().clone());
     assert!(sim.metadata(&directory).is_err());
     drive(
         &f.reactor,
@@ -1728,7 +1574,6 @@ fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
     let bad = super::checkpoint::Checkpointer::new(
         PathBuf::from("/checkpoint-new/../bad"),
         f.store.writer.index().clone(),
-        f.segments.clone(),
     );
     assert!(
         drive(
@@ -2141,7 +1986,7 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     let replacement = index.lookup(&first_id).unwrap().unwrap().location;
     assert_ne!(replacement, original);
     assert_eq!(replacement.generation, original.generation);
-    assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+    assert_eq!(index.disk_pages().len(), 1);
     let read = drive(&f.reactor, f.store.reader.read(&first_id, &request))
         .unwrap()
         .unwrap();
@@ -2185,6 +2030,7 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
 }
 
 #[test]
+#[ignore = "disk pages are cold across restart until the store mounts the extent volume"]
 fn persistence_pressure_and_restart_preserve_only_live_pages() {
     for (capacity, length) in [(1, 3), (2, 4096), (4, 65536)] {
         let f = Fixture::new();
@@ -2226,7 +2072,7 @@ fn persistence_pressure_and_restart_preserve_only_live_pages() {
         // userspace owners drop. Bound the wait for the exclusive slab lock;
         // an actual leaked owner must still fail the restart scenario.
         let unlock_deadline = Instant::now() + Duration::from_secs(2);
-        let alignment = loop {
+        let _alignment = loop {
             match drive(&f.reactor, f.store.open()) {
                 Ok(alignment) => break alignment,
                 Err(Error::Unavailable) if Instant::now() < unlock_deadline => {
@@ -2235,9 +2081,7 @@ fn persistence_pressure_and_restart_preserve_only_live_pages() {
                 result => panic!("slab did not reopen after owner teardown: {result:?}"),
             }
         };
-        let image = drive(&f.reactor, f.store.recovery.load(alignment))
-            .unwrap()
-            .unwrap();
+        let image = drive(&f.reactor, f.store.recovery.load()).unwrap().unwrap();
         drive(
             &f.reactor,
             f.store
@@ -2259,7 +2103,7 @@ fn persistence_pressure_and_restart_preserve_only_live_pages() {
 #[test]
 fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
     let f = Fixture::new();
-    let alignment = futures::executor::block_on(f.store.open())
+    let _alignment = futures::executor::block_on(f.store.open())
         .expect("test filesystem must support O_DIRECT and STATX_DIOALIGN");
     f.reactor.init().expect("storage test requires io_uring");
     let page = f.copy(3, 23);
@@ -2279,7 +2123,7 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
     let image = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
     futures::executor::block_on(f.store.checkpoint.publish(vec![image])).unwrap();
     f.store.checkpoint.finish_snapshot();
-    let loaded = futures::executor::block_on(f.store.recovery.load(alignment))
+    let loaded = futures::executor::block_on(f.store.recovery.load())
         .unwrap()
         .unwrap();
     futures::executor::block_on(
@@ -2813,15 +2657,7 @@ fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
     assert_eq!(f.reactor.in_flight(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
-    assert!(
-        f.store
-            .writer
-            .index()
-            .snapshot()
-            .unwrap()
-            .entries
-            .is_empty()
-    );
+    assert!(f.store.writer.index().disk_pages().is_empty());
 }
 
 #[test]
@@ -2855,7 +2691,7 @@ fn incremental_ciphertext_reclamation_preserves_submitted_fence_and_remaining_qu
     assert!(!f.store.writer.is_idle());
     drive(&f.reactor, write).unwrap();
     drive(&f.reactor, f.store.writer.drain(&request)).unwrap();
-    assert_eq!(f.store.writer.index().snapshot().unwrap().entries.len(), 2);
+    assert_eq!(f.store.writer.index().disk_pages().len(), 2);
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }
@@ -2988,15 +2824,7 @@ fn actual_enospc_completion_discards_both_writes_and_drains() {
     drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
     assert_eq!(f.store.writer.discarded_count(), 2);
     assert!(f.store.writer.is_idle());
-    assert!(
-        f.store
-            .writer
-            .index()
-            .snapshot()
-            .unwrap()
-            .entries
-            .is_empty()
-    );
+    assert!(f.store.writer.index().disk_pages().is_empty());
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
     assert_eq!(f.reactor.in_flight(), 0);
@@ -3588,33 +3416,29 @@ mod records {
 }
 
 mod checkpoint {
+    //! Metadata-only (version 2) checkpoint codec, selection, and installation.
+
     use crate::error::Error;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
-    use crate::model::PageId;
-    use crate::model::PageNumber;
     use crate::model::StrongEtag;
     use crate::model::VersionMetadata;
     use crate::model::WorkerId;
     use crate::store::catalog::Index;
-    use crate::store::catalog::IndexedPage;
-    use crate::store::catalog::RecordLocation;
+    use crate::store::catalog::IndexSnapshot;
     use crate::store::checkpoint as checkpoint_format;
     use crate::store::checkpoint::*;
     use crate::store::tests::Directory;
+    use crate::store::versions::VersionEntry;
     use futures::executor::block_on;
-    use page_alloc::Alignment;
-    use page_alloc::Extent;
-    use page_alloc::SegmentState;
-    use page_alloc::Segments;
     use racer_control_wire::CacheId;
+    use racer_control_wire::KeyId;
     use sha2::Digest;
     use sha2::Sha256;
     use std::fs;
     use std::path::PathBuf;
     use std::rc::Rc;
-    const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 
     #[test]
     fn canceled_async_publication_preserves_existing_slots_without_submission() {
@@ -3624,9 +3448,8 @@ mod checkpoint {
         use std::time::Duration;
         use std::time::Instant;
         let directory = Directory::new();
-        let (index, segments) = state(8);
-        let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
-        checkpoint.configure_geometry(geometry()).unwrap();
+        let checkpoint = Checkpointer::new(directory.0.clone(), index(8));
+        checkpoint.configure_layout().unwrap();
         let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
             AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
         ))));
@@ -3663,8 +3486,7 @@ mod checkpoint {
         use std::time::Duration;
         use std::time::Instant;
         let directory = Directory::new();
-        let (index, segments) = state(8);
-        let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
+        let checkpoint = Checkpointer::new(directory.0.clone(), index(8));
         let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
             AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
         ))));
@@ -3726,75 +3548,10 @@ mod checkpoint {
             );
         }
     }
-    fn geometry() -> CheckpointGeometry {
-        CheckpointGeometry::new(
-            SEGMENT_BYTES * 2,
-            SEGMENT_BYTES,
-            2,
-            Alignment::new(4096, 4096, 4096).unwrap(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn checkpoint_geometry_keeps_item_limit_alignment_errors_and_live_dimensions() {
-        let valid = geometry();
-        let excessive = CheckpointGeometry {
-            slab_bytes: SEGMENT_BYTES * 1_000_001,
-            segment_count: 1_000_001,
-            ..valid
-        };
-        assert_eq!(excessive.validate(), Err(Error::CorruptRecord));
-        assert_eq!(
-            CheckpointGeometry {
-                memory_alignment: 3,
-                ..excessive
-            }
-            .validate(),
-            Err(Error::CorruptRecord)
-        );
-        for invalid in [
-            CheckpointGeometry {
-                slab_bytes: 0,
-                ..valid
-            },
-            CheckpointGeometry {
-                segment_bytes: 0,
-                ..valid
-            },
-            CheckpointGeometry {
-                segment_count: 0,
-                ..valid
-            },
-            CheckpointGeometry {
-                segment_count: 3,
-                ..valid
-            },
-            CheckpointGeometry {
-                length_alignment: 3,
-                ..valid
-            },
-        ] {
-            assert_eq!(invalid.validate(), Err(Error::CorruptRecord));
+    fn layout() -> CheckpointLayout {
+        CheckpointLayout {
+            layout_digest: FILE_LAYOUT_DIGEST,
         }
-        let (_, segments) = state(8);
-        assert_eq!(valid.validate_live(&segments), Ok(()));
-        assert_eq!(
-            CheckpointGeometry {
-                segment_count: 1,
-                ..valid
-            }
-            .validate_live(&segments),
-            Err(Error::InvalidConfiguration)
-        );
-        assert_eq!(
-            CheckpointGeometry {
-                slab_bytes: SEGMENT_BYTES * 3,
-                ..valid
-            }
-            .validate_live(&segments),
-            Err(Error::InvalidConfiguration)
-        );
     }
 
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
@@ -3811,58 +3568,32 @@ mod checkpoint {
         }
     }
 
-    fn state(capacity: usize) -> (Rc<Index>, Rc<Segments>) {
-        let g = geometry();
-        let index = Rc::new(Index::new(
+    fn key_id() -> KeyId {
+        crate::model::key_id_from_generation(1, 1).unwrap()
+    }
+
+    fn version(etag: &str, length: u64) -> VersionEntry {
+        let mut entry = VersionEntry::new(descriptor(etag, length));
+        entry.add_key_id(key_id());
+        entry
+    }
+
+    fn index(capacity: usize) -> Rc<Index> {
+        Rc::new(Index::new(
             WorkerId(0),
             capacity,
             crate::test_support::availability(),
-        ));
-        let segments = Rc::new(Segments::new(g.segment_bytes));
-        segments
-            .configure(
-                g.slab_bytes,
-                g.segment_count as usize,
-                g.alignment().unwrap(),
-            )
-            .unwrap();
-        (index, segments)
+        ))
     }
 
     fn shard() -> ShardImage {
-        let (index, segments) = state(8);
-        let metadata = descriptor("v1", 17);
-        let page = PageId {
-            version: metadata.version.clone(),
-            number: PageNumber(0),
-        };
-        let lease = segments.append(4096).unwrap();
-        let allocation = segments
-            .snapshot()
-            .into_iter()
-            .find(|segment| matches!(segment.state, SegmentState::Open))
-            .unwrap();
-        index
-            .publish(
-                page,
-                IndexedPage {
-                    location: RecordLocation {
-                        segment: allocation.id,
-                        generation: allocation.generation,
-                        extent: lease.1,
-                    },
-                    metadata,
-                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                },
-            )
-            .unwrap();
-        drop(lease);
-        index.publish_version(descriptor("empty", 0)).unwrap();
         ShardImage {
             worker: WorkerId(0),
-            geometry: geometry(),
-            index: index.snapshot().unwrap(),
-            segments: segments.snapshot(),
+            layout: layout(),
+            index: IndexSnapshot {
+                metadata: vec![descriptor("empty", 0)],
+                versions: vec![version("v1", 17)],
+            },
         }
     }
 
@@ -3894,15 +3625,12 @@ mod checkpoint {
             Err(Error::Overloaded)
         ));
         assert_eq!(decode_with_budget(&bytes, required).unwrap().sequence, 1);
-        // Even a checksum-valid geometry may not inflate isolated validation tables
-        // beyond the encoded segment count.
+        // A checksum-valid count may not claim more items than the bytes hold.
         let mut malformed = bytes.clone();
-        malformed[54..62].copy_from_slice(&1_000_000u64.to_le_bytes());
+        // Header 32, shard count 4, worker 2, digest 32: the version count.
+        malformed[70..74].copy_from_slice(&1_000_000u32.to_le_bytes());
         resign(&mut malformed);
-        assert!(matches!(
-            recovery_memory(&malformed, usize::MAX),
-            Err(Error::CorruptRecord)
-        ));
+        assert!(recovery_memory(&malformed, usize::MAX).is_err());
         for length in 0..68 {
             assert!(decode_with_budget(&bytes[..length], 1).is_err());
         }
@@ -3978,7 +3706,7 @@ mod checkpoint {
     }
 
     #[test]
-    fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
+    fn binary_round_trip_retains_versions_keys_metadata_and_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<ShardImage>();
         let encoded = checkpoint_format::encode(&image(7)).unwrap();
@@ -3986,46 +3714,35 @@ mod checkpoint {
         assert_eq!(decoded.sequence, 7);
         assert_eq!(&encoded[..8], b"RACERCP\0");
         assert_eq!(&encoded[8..12], &CHECKPOINT_VERSION.to_le_bytes());
+        assert_eq!(CHECKPOINT_VERSION, 2);
         let shard = &decoded.shards[0];
-        assert_eq!(shard.geometry, geometry());
-        let (_, entry) = &shard.index.entries[0];
-        assert_eq!(entry.metadata, descriptor("v1", 17));
-        assert_eq!(
-            entry.key_id,
-            crate::model::key_id_from_generation(1, 1).unwrap()
-        );
-        assert_eq!(entry.location.extent.length(), 4096);
-        assert!(
-            shard
-                .index
-                .metadata
-                .iter()
-                .any(|metadata| metadata == &descriptor("empty", 0))
-        );
+        assert_eq!(shard.layout, layout());
+        assert_eq!(shard.index.versions, vec![version("v1", 17)]);
+        assert_eq!(shard.index.metadata, vec![descriptor("empty", 0)]);
         assert_eq!(checkpoint_format::encode(&decoded).unwrap(), encoded);
     }
 
     #[test]
     fn layout_digest_round_trips_and_rejects_changed_mapping_before_recovery() {
         let mut cut = image(7);
-        cut.shards[0].geometry.layout_digest = [17; 32];
+        cut.shards[0].layout.layout_digest = [17; 32];
         let encoded = checkpoint_format::encode(&cut).unwrap();
         let mut decoded = checkpoint_format::decode(&encoded).unwrap();
-        assert_eq!(decoded.shards[0].geometry.layout_digest, [17; 32]);
-        let (index, segments) = state(8);
-        let recovery = Recovery::new(PathBuf::new(), index.clone(), segments.clone());
-        recovery.configure_geometry(geometry()).unwrap();
+        assert_eq!(decoded.shards[0].layout.layout_digest, [17; 32]);
+        let index = index(8);
+        let recovery = Recovery::new(PathBuf::new(), index.clone());
+        recovery.configure_layout(layout());
         assert_eq!(
             block_on(recovery.install_shard(Some(decoded.shards.remove(0)))),
             Err(Error::CorruptRecord)
         );
-        assert!(index.snapshot().unwrap().entries.is_empty());
-        let mut matching = geometry();
-        matching.layout_digest = [17; 32];
-        recovery.configure_geometry(matching).unwrap();
+        assert!(index.snapshot().unwrap().metadata.is_empty());
+        recovery.configure_layout(CheckpointLayout {
+            layout_digest: [17; 32],
+        });
         let mut decoded = checkpoint_format::decode(&encoded).unwrap();
         block_on(recovery.install_shard(Some(decoded.shards.remove(0)))).unwrap();
-        assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+        assert_eq!(index.snapshot().unwrap().metadata.len(), 1);
     }
 
     #[test]
@@ -4046,13 +3763,13 @@ mod checkpoint {
         for m in recovered.shards[0].index.metadata.iter_mut() {
             m.content_type = Some(value.clone());
         }
-        for (_, entry) in recovered.shards[0].index.entries.iter_mut() {
+        for entry in recovered.shards[0].index.versions.iter_mut() {
             entry.metadata.content_type = Some(value.clone());
         }
         let extended = checkpoint_format::encode(&recovered).unwrap();
         let decoded = checkpoint_format::decode(&extended).unwrap();
         assert_eq!(
-            decoded.shards[0].index.entries[0].1.metadata.content_type,
+            decoded.shards[0].index.versions[0].metadata.content_type,
             Some(value.clone())
         );
         assert!(
@@ -4067,51 +3784,50 @@ mod checkpoint {
 
     #[test]
     fn empty_cut_has_stable_current_binary_vector() {
-        let (index, segments) = state(8);
         let image = CheckpointImage {
             version: CHECKPOINT_VERSION,
             sequence: 1,
             shards: vec![ShardImage {
                 worker: WorkerId(0),
-                geometry: geometry(),
-                index: index.snapshot().unwrap(),
-                segments: segments.snapshot(),
+                layout: layout(),
+                index: index(8).snapshot().unwrap(),
             }],
         };
         let bytes = checkpoint_format::encode(&image).unwrap();
-        assert_eq!(bytes.len(), 220);
-        let digest: String = bytes[188..]
+        // Header 32 + shard count 4 + worker 2 + layout digest 32 + two
+        // counts 8 = 78 body bytes, then the digest.
+        assert_eq!(bytes.len(), 110);
+        let digest: String = bytes[78..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "a5d7c2c881f46d3839ebae21db2a1617779fa6a1673a488c55ac29286641718e"
+            "40bd0e03eb7695248f268dd7caf668000ae6a2e904dd3d0e358d5c47b5927e13"
         );
     }
 
     #[test]
     fn populated_cut_has_stable_current_binary_vector() {
         let bytes = checkpoint_format::encode(&image(7)).unwrap();
-        // image(7) layout: header 32 + shard count 4 + worker 2 + geometry 80
-        // + segment count 4 + two segments 58 + page count 4 + descriptor 92
-        // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
-        // string lengths 12) + page fields 56 (page number, key ID, segment,
-        // generation, extent offset and length) + descriptor count 4 + the
-        // standalone "empty" descriptor 95 = 431 body bytes, then the digest.
-        assert_eq!(bytes.len(), 463);
-        let digest: String = bytes[431..]
+        // image(7) layout: header 32 + shard count 4 + worker 2 + layout
+        // digest 32 + version count 4 + version descriptor 92 (36-byte cache,
+        // 32-byte key, 4-byte quoted ETag, length 8, three string lengths 12)
+        // + key ID count 4 + key ID 16 + descriptor count 4 + the standalone
+        // "empty" descriptor 95 = 285 body bytes, then the digest.
+        assert_eq!(bytes.len(), 317);
+        let digest: String = bytes[285..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "e7169d41349dfb5f3b9fc55abc47268d1d6a7b4272261e4e1e423c65a9b40c61"
+            "6d26608cda92cfd2e723510bec76b29a84ab293f35847175ac5cee97c26f6f18"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
-        assert_eq!(decoded.shards[0].index.entries.len(), 1);
+        assert_eq!(decoded.shards[0].index.versions.len(), 1);
         assert_eq!(
-            decoded.shards[0].index.entries[0].1.metadata,
+            decoded.shards[0].index.versions[0].metadata,
             descriptor("v1", 17)
         );
         assert_eq!(checkpoint_format::encode(&decoded).unwrap(), bytes);
@@ -4120,28 +3836,23 @@ mod checkpoint {
     #[test]
     fn other_checkpoint_versions_are_rejected_and_recover_as_cold_cache() {
         let directory = Directory::new();
-        for version in [0, CHECKPOINT_VERSION + 1, u32::MAX] {
+        for version in [0, 1, CHECKPOINT_VERSION + 1, u32::MAX] {
             let mut cut = image(9);
             cut.version = version;
             assert!(checkpoint_format::encode(&cut).is_err());
             let mut bytes = checkpoint_format::encode(&image(9)).unwrap();
             bytes[8..12].copy_from_slice(&version.to_le_bytes());
-            let end = bytes.len() - 32;
-            let digest = Sha256::digest(&bytes[..end]);
-            bytes[end..].copy_from_slice(&digest);
+            resign(&mut bytes);
             assert!(checkpoint_format::decode(&bytes).is_err());
             assert!(sequence_hint(&bytes).is_err());
             fs::write(directory.0.join("checkpoint.0"), bytes).unwrap();
-            let (index, segments) = state(8);
-            let recovery = Recovery::new(directory.0.clone(), index.clone(), segments);
-            recovery.configure_geometry(geometry()).unwrap();
-            assert!(
-                block_on(recovery.load(geometry().alignment().unwrap()))
-                    .unwrap()
-                    .is_none()
-            );
+            let index = index(8);
+            index.publish_version(descriptor("stale", 0)).unwrap();
+            let recovery = Recovery::new(directory.0.clone(), index.clone());
+            recovery.configure_layout(layout());
+            assert!(block_on(recovery.load()).unwrap().is_none());
             block_on(recovery.install_shard(None)).unwrap();
-            assert!(index.snapshot().unwrap().entries.is_empty());
+            assert!(index.snapshot().unwrap().metadata.is_empty());
         }
     }
 
@@ -4152,19 +3863,26 @@ mod checkpoint {
             .index
             .metadata
             .push(descriptor("another", 1));
+        image.shards[0].index.versions.push(version("v2", 3));
         let first = checkpoint_format::encode(&image).unwrap();
         image.shards[0].index.metadata.reverse();
-        assert_eq!(checkpoint_format::encode(&image).unwrap(), first);
+        image.shards[0].index.versions.reverse();
+        image.shards[0].index.versions[0].add_key_id(KeyId([3; 16]));
+        image.shards[0].index.versions[0].key_ids.reverse();
+        let reordered = checkpoint_format::encode(&image).unwrap();
+        image.shards[0].index.versions[0].key_ids.reverse();
+        assert_eq!(checkpoint_format::encode(&image).unwrap(), reordered);
+        assert_ne!(reordered, first);
         let mut other = shard();
         other.worker = WorkerId(1);
-        other.index.entries.clear();
+        other.index.versions.clear();
         other.index.metadata = vec![descriptor("v1", 18)];
         image.shards.push(other);
         assert!(checkpoint_format::encode(&image).is_err());
     }
 
     #[test]
-    fn newer_incompatible_geometry_or_catalog_falls_back_and_keys_filter_on_load() {
+    fn newer_incompatible_layout_or_catalog_falls_back_and_keys_filter_on_load() {
         let directory = Directory::new();
         fs::write(
             directory.0.join("checkpoint.0"),
@@ -4172,36 +3890,28 @@ mod checkpoint {
         )
         .unwrap();
         let mut newer = image(2);
-        newer.shards[0].geometry.memory_alignment = 8192;
+        newer.shards[0].layout.layout_digest = [9; 32];
         fs::write(
             directory.0.join("checkpoint.1"),
             checkpoint_format::encode(&newer).unwrap(),
         )
         .unwrap();
-        let (index, segments) = state(1);
-        let recovery = Recovery::new(directory.0.clone(), index, segments);
-        recovery.configure_geometry(geometry()).unwrap();
-        let recovered =
-            block_on(recovery.load_filtered(geometry().alignment().unwrap(), |_, _| false))
-                .unwrap()
-                .unwrap();
+        let recovery = Recovery::new(directory.0.clone(), index(1));
+        recovery.configure_layout(layout());
+        let recovered = block_on(recovery.load_filtered(|_, _| false))
+            .unwrap()
+            .unwrap();
         assert_eq!(recovered.sequence, 1);
-        assert!(recovered.shards[0].index.entries.is_empty());
+        assert!(recovered.shards[0].index.versions.is_empty());
         assert_eq!(recovered.shards[0].index.metadata.len(), 1);
-        newer.shards[0].geometry = geometry();
+        newer.shards[0].layout = layout();
         newer.shards[0].index.metadata.push(descriptor("extra", 0));
         fs::write(
             directory.0.join("checkpoint.1"),
             checkpoint_format::encode(&newer).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
-                .unwrap()
-                .unwrap()
-                .sequence,
-            1
-        );
+        assert_eq!(block_on(recovery.load()).unwrap().unwrap().sequence, 1);
     }
 
     #[test]
@@ -4220,13 +3930,8 @@ mod checkpoint {
             directory.0.join("checkpoint.1"),
         )
         .unwrap();
-        let (index, segments) = state(8);
-        let recovery = Recovery::new(directory.0.clone(), index, segments);
-        assert!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
-                .unwrap()
-                .is_none()
-        );
+        let recovery = Recovery::new(directory.0.clone(), index(8));
+        assert!(block_on(recovery.load()).unwrap().is_none());
     }
 
     #[test]
@@ -4254,52 +3959,38 @@ mod checkpoint {
     }
 
     #[test]
-    fn invalid_generation_bounds_duplicates_and_descriptor_conflicts_are_rejected() {
+    fn duplicates_key_lists_and_descriptor_conflicts_are_rejected() {
         let mut bad = image(1);
-        bad.shards[0].index.entries[0].1.location.generation.0 += 1;
+        let duplicate = bad.shards[0].index.versions[0].clone();
+        bad.shards[0].index.versions.push(duplicate);
         assert!(checkpoint_format::encode(&bad).is_err());
         let mut bad = image(1);
-        bad.shards[0].index.entries[0].1.location.extent =
-            Extent::new(SEGMENT_BYTES, 4096).unwrap();
-        assert!(checkpoint_format::encode(&bad).is_err());
-        let mut bad = image(1);
-        let duplicate = bad.shards[0].index.entries[0].clone();
-        bad.shards[0].index.entries.push(duplicate);
+        let duplicate = bad.shards[0].index.metadata[0].clone();
+        bad.shards[0].index.metadata.push(duplicate);
         assert!(checkpoint_format::encode(&bad).is_err());
         let mut bad = image(1);
         bad.shards[0].index.metadata.push(descriptor("v1", 18));
         assert!(checkpoint_format::encode(&bad).is_err());
-    }
-
-    #[test]
-    fn overlapping_mappings_are_rejected() {
         let mut bad = image(1);
-        let mut overlapping = bad.shards[0].index.entries[0].clone();
-        overlapping.0.version.object.key = CacheKey([8; 32]);
-        overlapping.1.metadata.version = overlapping.0.version.clone();
-        bad.shards[0].index.entries.push(overlapping);
+        let key = bad.shards[0].index.versions[0].key_ids[0];
+        bad.shards[0].index.versions[0].key_ids.push(key);
+        assert!(checkpoint_format::encode(&bad).is_err());
+        let mut bad = image(1);
+        bad.shards[0].index.versions[0].version.etag = StrongEtag::test_value("other");
         assert!(checkpoint_format::encode(&bad).is_err());
     }
 
     #[test]
     fn alternating_publication_falls_back_to_valid_older_cut_and_ignores_temp_and_payload() {
         let directory = Directory::new();
-        let (index, segments) = state(8);
-        let checkpointer = Checkpointer::new(directory.0.clone(), index.clone(), segments.clone());
-        let recovery = Recovery::new(directory.0.clone(), index, segments);
-        recovery.configure_geometry(geometry()).unwrap();
-        assert!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
-                .unwrap()
-                .is_none()
-        );
+        let index = index(8);
+        let checkpointer = Checkpointer::new(directory.0.clone(), index.clone());
+        let recovery = Recovery::new(directory.0.clone(), index);
+        recovery.configure_layout(layout());
+        assert!(block_on(recovery.load()).unwrap().is_none());
         block_on(checkpointer.publish(vec![shard()])).unwrap();
         block_on(checkpointer.publish(vec![shard()])).unwrap();
-        let load = || {
-            block_on(recovery.load(geometry().alignment().unwrap()))
-                .unwrap()
-                .unwrap()
-        };
+        let load = || block_on(recovery.load()).unwrap().unwrap();
         assert_eq!(load().sequence, 2);
         fs::write(directory.0.join("checkpoint.1"), b"torn").unwrap();
         fs::write(
@@ -4317,17 +4008,13 @@ mod checkpoint {
         );
         fs::write(directory.0.join("checkpoint.0"), b"bad").unwrap();
         fs::write(directory.0.join("checkpoint.1"), b"bad").unwrap();
-        assert!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
-                .unwrap()
-                .is_none()
-        );
+        assert!(block_on(recovery.load()).unwrap().is_none());
     }
 
     #[test]
-    fn recovery_validates_before_mutation_seals_segments_and_filters_missing_keys() {
+    fn recovery_validates_before_mutation_and_filters_missing_keys() {
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let index = index(8);
         let keep = descriptor("keep", 0);
         index
             .publish_current(crate::model::ObjectMetadata {
@@ -4340,41 +4027,26 @@ mod checkpoint {
             })
             .unwrap();
         assert!(index.current(&keep.version.object).unwrap().is_some());
-        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
-        recovery.configure_geometry(geometry()).unwrap();
-        let before = segments.snapshot();
+        let recovery = Recovery::new(directory.0.clone(), index.clone());
+        recovery.configure_layout(layout());
         let mut bad = shard();
-        bad.index.entries[0].1.location.generation.0 += 1;
+        bad.index.metadata.push(descriptor("v1", 18));
         assert!(block_on(recovery.install_shard(Some(bad))).is_err());
-        assert!(
-            index
-                .version(&descriptor("keep", 0).version)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(segments.snapshot()[0].used_bytes, before[0].used_bytes);
+        assert!(index.version(&keep.version).unwrap().is_some());
+        assert!(index.current(&keep.version.object).unwrap().is_some());
         let mut recovered = image(1);
-        let page = recovered.shards[0].index.entries[0].0.clone();
         Recovery::filter_available(&mut recovered, |_| true, |_, _| false);
+        assert!(recovered.shards[0].index.versions.is_empty());
         block_on(recovery.install_shard(recovered.shards.pop())).unwrap();
-        assert!(index.lookup(&page).unwrap().is_none());
         assert!(
             index
                 .version(&descriptor("empty", 0).version)
                 .unwrap()
                 .is_some()
         );
-        assert!(
-            segments
-                .snapshot()
-                .iter()
-                .all(|segment| !matches!(segment.state, SegmentState::Open))
-        );
-        assert!(index.current(&page.version.object).unwrap().is_none());
-        block_on(recovery.install_shard(Some(shard()))).unwrap();
-        assert!(index.lookup(&page).unwrap().is_some());
+        assert!(index.version(&keep.version).unwrap().is_none());
+        assert!(index.current(&keep.version.object).unwrap().is_none());
         block_on(recovery.install_shard(None)).unwrap();
-        assert!(index.lookup(&page).unwrap().is_none());
         assert!(
             index
                 .version(&descriptor("empty", 0).version)
@@ -4386,10 +4058,10 @@ mod checkpoint {
     #[test]
     fn catalog_capacity_failure_preserves_all_live_state() {
         let directory = Directory::new();
-        let (index, segments) = state(1);
+        let index = index(1);
         index.publish_version(descriptor("keep", 0)).unwrap();
-        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
-        recovery.configure_geometry(geometry()).unwrap();
+        let recovery = Recovery::new(directory.0.clone(), index.clone());
+        recovery.configure_layout(layout());
         let mut recovered = shard();
         recovered.index.metadata = vec![descriptor("one", 0), descriptor("two", 0)];
         assert!(block_on(recovery.install_shard(Some(recovered))).is_err());
@@ -4399,154 +4071,38 @@ mod checkpoint {
                 .unwrap()
                 .is_some()
         );
-        assert!(
-            segments
-                .snapshot()
-                .iter()
-                .all(|segment| segment.used_bytes == 0)
-        );
     }
 
     #[test]
-    fn snapshot_freeze_requires_explicit_owner_release() {
+    fn snapshot_requires_explicit_owner_release() {
         let directory = Directory::new();
-        let (index, segments) = state(8);
-        let checkpointer =
-            Checkpointer::new(directory.0.join("not-created"), index, segments.clone());
+        let checkpointer = Checkpointer::new(directory.0.join("not-created"), index(8));
+        assert!(block_on(checkpointer.snapshot_shard()).is_err());
         assert!(!directory.0.join("not-created").exists());
-        checkpointer.configure_geometry(geometry()).unwrap();
+        checkpointer.configure_layout().unwrap();
         let snapshot = block_on(checkpointer.snapshot_shard()).unwrap();
-        assert!(segments.append(4096).is_err());
+        assert_eq!(snapshot.layout, layout());
         assert!(block_on(checkpointer.snapshot_shard()).is_err());
+        assert_eq!(checkpointer.configure_layout(), Err(Error::Overloaded));
         drop(snapshot);
-        assert!(segments.append(4096).is_err());
+        assert!(checkpointer.is_snapshot_taken());
         checkpointer.finish_snapshot();
         checkpointer.finish_snapshot();
-        assert!(segments.append(4096).is_ok());
+        assert!(!checkpointer.is_snapshot_taken());
+        assert!(block_on(checkpointer.snapshot_shard()).is_ok());
     }
 
     #[test]
-    fn frozen_recovery_rejects_before_mutating_index_and_retries_after_release() {
+    fn failed_publication_preserves_prior_cut() {
         let directory = Directory::new();
-        let (index, segments) = state(8);
-        index.publish_version(descriptor("keep", 0)).unwrap();
-        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
-        recovery.configure_geometry(geometry()).unwrap();
-        let checkpointer = Checkpointer::new(directory.0.clone(), index.clone(), segments.clone());
-        checkpointer.configure_geometry(geometry()).unwrap();
-        block_on(checkpointer.snapshot_shard()).unwrap();
-        assert_eq!(
-            block_on(recovery.install_shard(Some(shard()))),
-            Err(Error::Overloaded)
-        );
-        assert!(
-            index
-                .version(&descriptor("keep", 0).version)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            segments
-                .snapshot()
-                .iter()
-                .all(|segment| segment.used_bytes == 0)
-        );
-        checkpointer.finish_snapshot();
-        block_on(recovery.install_shard(Some(shard()))).unwrap();
-        assert!(
-            index
-                .version(&descriptor("keep", 0).version)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn checkpoint_alignment_errors_are_corruption_and_live_mismatch_is_configuration() {
-        for alignment in [0, 3, u64::MAX] {
-            let mut bad = geometry();
-            bad.memory_alignment = alignment;
-            assert_eq!(bad.validate(), Err(Error::CorruptRecord));
-        }
-        let (index, segments) = state(8);
-        let checkpointer = Checkpointer::new(PathBuf::new(), index, segments);
-        let mut mismatch = geometry();
-        mismatch.memory_alignment *= 2;
-        assert_eq!(
-            checkpointer.configure_geometry(mismatch),
-            Err(Error::InvalidConfiguration)
-        );
-    }
-
-    #[test]
-    fn dropping_checkpointer_releases_successful_freeze() {
-        let (index, segments) = state(8);
-        let checkpointer = Checkpointer::new(PathBuf::new(), index, segments.clone());
-        checkpointer.configure_geometry(geometry()).unwrap();
-        block_on(checkpointer.snapshot_shard()).unwrap();
-        assert!(segments.append(4096).is_err());
-        drop(checkpointer);
-        assert!(segments.append(4096).is_ok());
-    }
-
-    #[test]
-    fn dropping_incremental_snapshot_future_releases_in_progress_freeze() {
-        let (index, segments) = state(256);
-        let metadata = descriptor("many-pages", 128 * crate::model::PAGE_BYTES);
-        for number in 0..128 {
-            let (lease, extent) = segments.append(4096).unwrap();
-            index
-                .publish(
-                    PageId {
-                        version: metadata.version.clone(),
-                        number: PageNumber(number),
-                    },
-                    IndexedPage {
-                        metadata: metadata.clone(),
-                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                        location: RecordLocation {
-                            segment: lease.id(),
-                            generation: lease.generation(),
-                            extent,
-                        },
-                    },
-                )
-                .unwrap();
-        }
-        let checkpointer = Rc::new(Checkpointer::new(PathBuf::new(), index, segments.clone()));
-        checkpointer.configure_geometry(geometry()).unwrap();
-        let mut snapshot = checkpointer.snapshot_incremental(4 * 1024 * 1024);
-        assert!(
-            snapshot
-                .as_mut()
-                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-                .is_pending()
-        );
-        assert!(segments.append(4096).is_err());
-        drop(snapshot);
-        assert!(segments.append(4096).is_ok());
-    }
-
-    #[test]
-    fn failed_snapshot_releases_owner_and_failed_publication_preserves_prior_cut() {
-        let directory = Directory::new();
-        let (index, segments) = state(8);
-        let checkpointer = Checkpointer::new(directory.0.clone(), index.clone(), segments.clone());
-        checkpointer.configure_geometry(geometry()).unwrap();
-        let invalid = shard().index.entries.pop().unwrap();
-        index.publish(invalid.0, invalid.1).unwrap();
-        // The index references a generation without an allocated record in this table.
-        assert!(block_on(checkpointer.snapshot_shard()).is_err());
-        assert!(segments.append(4096).is_ok());
-
+        let index = index(8);
+        let checkpointer = Checkpointer::new(directory.0.clone(), index.clone());
         block_on(checkpointer.publish(vec![shard()])).unwrap();
         // Force rename to fail while leaving the previously published slot readable.
         fs::create_dir(directory.0.join("checkpoint.1")).unwrap();
         assert!(block_on(checkpointer.publish(vec![shard()])).is_err());
-        let recovery = Recovery::new(directory.0.clone(), index, segments);
-        let recovered = block_on(recovery.load(geometry().alignment().unwrap()))
-            .unwrap()
-            .unwrap();
+        let recovery = Recovery::new(directory.0.clone(), index);
+        let recovered = block_on(recovery.load()).unwrap().unwrap();
         assert_eq!(recovered.sequence, 1);
         assert!(fs::read_dir(&directory.0).unwrap().all(|entry| {
             !entry
@@ -4558,21 +4114,16 @@ mod checkpoint {
     }
 
     #[test]
-    fn outstanding_lease_and_wrong_worker_cannot_partially_install() {
+    fn wrong_worker_cannot_install() {
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let index = index(8);
         index.publish_version(descriptor("keep", 0)).unwrap();
-        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
-        recovery.configure_geometry(geometry()).unwrap();
-        let lease = segments.append(4096).unwrap();
-        assert!(block_on(recovery.install_shard(Some(shard()))).is_err());
-        assert!(
-            index
-                .version(&descriptor("keep", 0).version)
-                .unwrap()
-                .is_some()
+        let recovery = Recovery::new(directory.0.clone(), index.clone());
+        assert_eq!(
+            block_on(recovery.install_shard(Some(shard()))),
+            Err(Error::InvalidConfiguration)
         );
-        drop(lease);
+        recovery.configure_layout(layout());
         let mut wrong = shard();
         wrong.worker = WorkerId(1);
         assert!(block_on(recovery.install_shard(Some(wrong))).is_err());

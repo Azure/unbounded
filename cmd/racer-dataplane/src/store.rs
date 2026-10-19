@@ -47,7 +47,7 @@ pub mod holds;
 #[allow(dead_code)]
 pub(crate) mod key;
 #[allow(dead_code)]
-pub(crate) mod versions;
+pub mod versions;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
@@ -74,15 +74,13 @@ impl Store {
         )
     }
 
-    /// Open slabs and configure the actual live shard and checkpoint geometry.
+    /// Open slabs and configure the checkpoint layout.
     pub fn open(&self) -> Operation<'_, Alignment> {
         Box::pin(async move {
             self.checkpoint.bind_writer(&self.writer);
             let alignment = self.writer.open().await?;
-            let geometry = checkpoint::CheckpointGeometry::from(self.writer.slabs().geometry()?);
-            self.checkpoint.configure_geometry(geometry)?;
-            self.recovery
-                .configure_geometry(self.checkpoint.geometry()?)?;
+            let layout = self.checkpoint.configure_layout()?;
+            self.recovery.configure_layout(layout);
             Ok(alignment)
         })
     }

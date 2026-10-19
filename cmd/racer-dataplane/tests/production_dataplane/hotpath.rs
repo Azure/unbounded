@@ -280,7 +280,7 @@ impl Service {
                 self.rig.memory.evict_idle(usize::MAX)?;
                 assert_eq!(self.rig.admission.used(ResourceClass::Plaintext), 0);
             }
-            let entries = self.rig.writer.index().snapshot()?.entries.len();
+            let entries = self.rig.writer.index().disk_pages().len();
             let _ = reply.send(Stats {
                 records: entries,
                 discarded: self.rig.writer.discarded_count(),

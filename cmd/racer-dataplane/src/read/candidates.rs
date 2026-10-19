@@ -2733,7 +2733,7 @@ pub(super) mod tests {
     #[test]
     fn ownership_refresh_recovers_idle_pages_and_rejects_obsolete_results() {
         use crate::model::{PageId, VersionMetadata, WorkerId};
-        use crate::store::catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation};
+        use crate::store::catalog::{Index, IndexedPage, RecordLocation};
         use crate::topology::tests::fixtures;
         let members = fixtures::membership(1000);
         let page = PageId {
@@ -2755,25 +2755,22 @@ pub(super) mod tests {
         let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
         index.set_page_capacity(1).unwrap();
         index
-            .restore(IndexSnapshot {
-                entries: vec![(
-                    page.clone(),
-                    IndexedPage {
-                        location: RecordLocation {
-                            segment: page_alloc::SegmentId(0),
-                            generation: page_alloc::Generation(1),
-                            extent: page_alloc::Extent::new(0, 512).unwrap(),
-                        },
-                        metadata: VersionMetadata {
-                            content_type: None,
-                            version: page.version.clone(),
-                            length: 1,
-                        },
-                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+            .publish(
+                page.clone(),
+                IndexedPage {
+                    location: RecordLocation {
+                        segment: page_alloc::SegmentId(0),
+                        generation: page_alloc::Generation(1),
+                        extent: page_alloc::Extent::new(0, 512).unwrap(),
                     },
-                )],
-                metadata: vec![],
-            })
+                    metadata: VersionMetadata {
+                        content_type: None,
+                        version: page.version.clone(),
+                        length: 1,
+                    },
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                },
+            )
             .unwrap();
         assert_eq!(index.snapshot_pages(0, 1).1.len(), 1);
         assert!(!policy.owns_current(&page));

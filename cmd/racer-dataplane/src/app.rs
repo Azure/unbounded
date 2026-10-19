@@ -68,7 +68,7 @@ use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::store::catalog::Index;
 use crate::store::catalog::SegmentClock;
-use crate::store::checkpoint::CheckpointGeometry;
+use crate::store::checkpoint::CheckpointLayout;
 use crate::store::checkpoint::Checkpointer;
 use crate::store::checkpoint::Recovery;
 use crate::store::checkpoint::ShardImage;
@@ -306,6 +306,28 @@ impl Application {
 }
 
 /// Create a bounded scope for application-owned lifecycle operations.
+/// Full-page capacity at actual direct-I/O alignment, conservatively allowing
+/// the largest supported record header. Short records can use tail space.
+fn payload_capacity(
+    geometry: page_alloc::SegmentGeometry,
+    reserve: usize,
+    page_entries: usize,
+) -> Result<(u64, u64)> {
+    let record = geometry
+        .alignment()
+        .extent(
+            0,
+            crate::model::PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES,
+        )?
+        .length() as u64;
+    let pages = geometry.segment_bytes() / record;
+    let usable = geometry.segment_count().saturating_sub(reserve as u64);
+    Ok((
+        (usable * pages).min(page_entries as u64) * crate::model::PAGE_BYTES,
+        usable * (geometry.segment_bytes() - pages * record),
+    ))
+}
+
 fn scope(timeout: Duration) -> Result<RequestScope> {
     RequestScope::new(
         RequestId([0; 16]),
@@ -1326,16 +1348,11 @@ impl WorkerApplication {
             reader,
             writer,
             checkpoint: Rc::new(
-                Checkpointer::new(
-                    config.slab_directory.clone(),
-                    index.clone(),
-                    segments.clone(),
-                )
-                .with_layout(
+                Checkpointer::new(config.slab_directory.clone(), index.clone()).with_layout(
                     devices.map_or(crate::store::checkpoint::FILE_LAYOUT_DIGEST, |d| d.digest),
                 ),
             ),
-            recovery: Recovery::new(config.slab_directory.clone(), index, segments),
+            recovery: Recovery::new(config.slab_directory.clone(), index),
             eviction,
         })
     }
@@ -2313,10 +2330,11 @@ impl WorkerApplication {
     }
 
     /// Open storage and publish the effective disk capacity metrics.
-    async fn prepare_storage(&self) -> Result<CheckpointGeometry> {
+    async fn prepare_storage(&self) -> Result<CheckpointLayout> {
         let _ = self.store.open().await?;
-        let geometry = self.store.checkpoint.geometry()?;
-        let (payload, tail) = geometry.payload_capacity(
+        let layout = self.store.checkpoint.layout()?;
+        let (payload, tail) = payload_capacity(
+            self.store.writer.slabs().geometry()?,
             self.store.eviction.reserve(),
             self.store.writer.index().page_capacity(),
         )?;
@@ -2330,7 +2348,7 @@ impl WorkerApplication {
             Gauge::DiskPageEntries,
             self.store.writer.index().page_capacity() as u64,
         );
-        Ok(geometry)
+        Ok(layout)
     }
 
     /// Drive enrollment and local installation until the first publication is accepted.

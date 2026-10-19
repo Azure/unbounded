@@ -1235,12 +1235,10 @@ fn disk_usage_worker_samples_recovery_and_reset() {
     let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let worker = wake_test_worker();
-    let geometry = futures::executor::block_on(worker.prepare_storage()).unwrap();
-    let mut image = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
+    futures::executor::block_on(worker.prepare_storage()).unwrap();
+    let slab_bytes = worker.store.writer.slabs().geometry().unwrap().slab_bytes();
+    let image = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
     worker.store.checkpoint.finish_snapshot();
-    image.segments[0].state = page_alloc::SegmentState::Sealed;
-    image.segments[0].used_bytes = geometry.alignment().unwrap().length() as u64;
-    let used = image.segments[0].used_bytes;
     futures::executor::block_on(worker.store.recovery.install_shard(Some(image))).unwrap();
     worker.observe_health().unwrap();
     let scrape = || {
@@ -1254,12 +1252,9 @@ fn disk_usage_worker_samples_recovery_and_reset() {
     };
     let output = scrape();
     assert!(output.contains(&format!(
-        "racer_disk_size_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {}\n",
-        geometry.slab_bytes
+        "racer_disk_size_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {slab_bytes}\n"
     )));
-    assert!(output.contains(&format!(
-        "racer_disk_used_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {used}\n"
-    )));
+    assert!(output.contains("racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} 0\n"));
     futures::executor::block_on(worker.store.recovery.install_shard(None)).unwrap();
     assert_eq!(scrape(), output, "samples change only on observation");
     worker.observe_health().unwrap();

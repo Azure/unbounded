@@ -314,14 +314,13 @@ mod faults {
                                 .store
                                 .writer
                                 .index()
-                                .snapshot()
-                                .unwrap()
-                                .entries
+                                .disk_pages()
                                 .into_iter()
                                 .map(move |entry| (n, w, entry))
                         })
                 })
-                .filter(|(node, worker, (page, entry))| {
+                .filter(|(node, worker, entry)| {
+                    let page = &entry.page;
                     let object =
                         usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
                     object > 1
@@ -351,7 +350,8 @@ mod faults {
                 self.traffic(1, false);
                 return;
             }
-            let (node, worker, (page, entry)) = &entries[self.rng.pick(entries.len())];
+            let (node, worker, entry) = &entries[self.rng.pick(entries.len())];
+            let page = &entry.page;
             let object = usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
             let mut client = self.request_on(object, true, false, *node);
             // The corruption probe must request the selected persisted page rather
@@ -364,7 +364,7 @@ mod faults {
                 .slab_directory
                 .join(format!("worker-{worker}-slab-0.dat"));
             self.sim.disk().sync_all().unwrap();
-            let offset = entry.location.extent.offset();
+            let offset = entry.offset;
             let original = self
                 .sim
                 .disk()
@@ -1719,9 +1719,9 @@ mod traffic {
             }
             for node in &self.nodes {
                 for worker in &node.workers {
-                    let snapshot = worker.app.store.writer.index().snapshot().unwrap();
-                    assert!(snapshot.entries.len() <= node.config.limits.metadata_entries.get());
-                    self.coverage.persisted += snapshot.entries.len();
+                    let pages = worker.app.store.writer.index().disk_pages().len();
+                    assert!(pages <= node.config.limits.metadata_entries.get());
+                    self.coverage.persisted += pages;
                 }
             }
             self.cache_obligations();

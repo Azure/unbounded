@@ -16,16 +16,16 @@ use std::collections::BTreeMap;
 
 /// Full identity and metadata of one disk-resident version.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VersionEntry {
-    pub(crate) version: ObjectVersion,
-    pub(crate) metadata: VersionMetadata,
+pub struct VersionEntry {
+    pub version: ObjectVersion,
+    pub metadata: VersionMetadata,
     /// Distinct page keys that encrypted pages of this version. Small in practice.
-    pub(crate) key_ids: Vec<KeyId>,
+    pub key_ids: Vec<KeyId>,
 }
 
 impl VersionEntry {
     /// Entry for `metadata.version` with no known page keys.
-    pub(crate) fn new(metadata: VersionMetadata) -> Self {
+    pub fn new(metadata: VersionMetadata) -> Self {
         Self {
             version: metadata.version.clone(),
             metadata,
@@ -34,7 +34,7 @@ impl VersionEntry {
     }
 
     /// Record a page key, ignoring duplicates.
-    pub(crate) fn add_key_id(&mut self, key_id: KeyId) {
+    pub fn add_key_id(&mut self, key_id: KeyId) {
         if !self.key_ids.contains(&key_id) {
             self.key_ids.push(key_id);
         }

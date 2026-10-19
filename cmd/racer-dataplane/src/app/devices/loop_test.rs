@@ -336,15 +336,10 @@ fn disposable_loop_devices_read_only_bind_restart() {
         16,
         crate::test_support::availability(),
     ));
-    let checkpoint = crate::store::checkpoint::Checkpointer::new(
-        config.slab_directory.clone(),
-        index.clone(),
-        segments.clone(),
-    )
-    .with_layout(worker.digest);
-    checkpoint
-        .configure_geometry(slab.geometry().unwrap().into())
-        .unwrap();
+    let checkpoint =
+        crate::store::checkpoint::Checkpointer::new(config.slab_directory.clone(), index.clone())
+            .with_layout(worker.digest);
+    checkpoint.configure_layout().unwrap();
     let image = futures::executor::block_on(checkpoint.snapshot_shard()).unwrap();
     drive(
         &reactor,
@@ -390,11 +385,10 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let (_, mut recovered) = crate::store::checkpoint::read_candidates(&config.slab_directory)
         .unwrap()
         .remove(0);
-    let recovery =
-        crate::store::checkpoint::Recovery::new(config.slab_directory.clone(), index, segments);
-    let mut geometry = checkpoint.geometry().unwrap();
+    let recovery = crate::store::checkpoint::Recovery::new(config.slab_directory.clone(), index);
+    let mut geometry = checkpoint.layout().unwrap();
     geometry.layout_digest = restarted.workers[0].digest;
-    recovery.configure_geometry(geometry).unwrap();
+    recovery.configure_layout(geometry);
     futures::executor::block_on(recovery.install_shard(Some(recovered.shards.remove(0)))).unwrap();
     drop(restarted);
     command("umount", &[config.device_directory.as_os_str()]);
@@ -412,7 +406,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
         .unwrap()
         .remove(0);
     geometry.layout_digest = changed.workers[0].digest;
-    recovery.configure_geometry(geometry).unwrap();
+    recovery.configure_layout(geometry);
     assert_eq!(
         futures::executor::block_on(recovery.install_shard(Some(recovered.shards.remove(0)))),
         Err(Error::CorruptRecord)

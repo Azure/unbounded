@@ -28,6 +28,18 @@ pub struct RecordLocation {
     pub extent: Extent,
 }
 
+/// One page on a worker's disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskPage {
+    pub page: PageId,
+    /// Page key that encrypted the record.
+    pub key_id: KeyId,
+    /// Byte offset of the record in the worker's slab address space.
+    pub offset: u64,
+    /// Bytes of the record on disk.
+    pub length: u64,
+}
+
 /// Published pages under live hard holds on one storage worker.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HeldSnapshot {
@@ -141,23 +153,24 @@ pub struct IndexedPage {
     pub metadata: VersionMetadata,
     pub key_id: KeyId,
 }
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct IndexSnapshot {
-    /// Every entry owns its descriptor: no cross-shard catalog reference can dangle.
-    pub entries: Vec<(PageId, IndexedPage)>,
     /// Bounded standalone descriptors, including HEAD-only and zero-length objects,
     /// on their page-zero owner. Current-version freshness is never recovered.
     pub metadata: Vec<VersionMetadata>,
+    /// Descriptors of versions with pages on this worker's disk, with the page
+    /// keys seen for them.
+    pub versions: Vec<super::versions::VersionEntry>,
 }
 impl IndexSnapshot {
     /// Structural checkpoint validation, in addition to checksum, ownership,
-    /// capacity, geometry, and generation checks performed during recovery.
+    /// capacity, and layout checks performed during recovery.
     pub fn validate_metadata(&self) -> Result<()> {
         let mut lengths: HashMap<&ObjectVersion, &VersionMetadata> = HashMap::default();
         for metadata in self
             .metadata
             .iter()
-            .chain(self.entries.iter().map(|(_, entry)| &entry.metadata))
+            .chain(self.versions.iter().map(|entry| &entry.metadata))
         {
             if let Some(old) = lengths.get(&metadata.version)
                 && !old.compatible(metadata)
@@ -165,9 +178,6 @@ impl IndexSnapshot {
                 return Err(Error::CorruptRecord);
             }
             lengths.insert(&metadata.version, metadata);
-        }
-        for (page, entry) in &self.entries {
-            entry.metadata.page_length(page)?;
         }
         Ok(())
     }
@@ -399,104 +409,6 @@ impl Index {
                 &location.extent,
             )?;
             hold.locations.insert(page.number, location.clone());
-        }
-        Ok(())
-    }
-
-    pub(super) fn snapshot_holds(
-        &self,
-        segments: &mut [page_alloc::SegmentSnapshot],
-        remaining: &mut usize,
-    ) -> Result<()> {
-        let holds = self.holds.borrow();
-        for hold in holds.entries.values().filter(|hold| hold.live()) {
-            for location in hold.locations.values() {
-                *remaining = remaining
-                    .checked_sub(super::checkpoint::RETAINED_RECORD_BYTES)
-                    .ok_or(Error::Overloaded)?;
-                segments
-                    .get_mut(location.segment.0 as usize)
-                    .ok_or(Error::CorruptRecord)?
-                    .retained_records
-                    .push((location.extent.offset(), hold.until));
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn restore_holds(&self, segments: &[page_alloc::SegmentSnapshot]) -> Result<()> {
-        let now = uring_runtime::environment::wall_now();
-        let mut deadlines = HashMap::default();
-        for segment in segments {
-            for (offset, until) in &segment.retained_records {
-                if *until > now {
-                    deadlines.insert(*offset, *until);
-                }
-            }
-        }
-        let mut versions: HashMap<ObjectVersion, super::holds::Hold> = HashMap::default();
-        for (page, entry) in self.state.borrow().pages.iter() {
-            if let Some(until) = deadlines.get(&entry.location.extent.offset()) {
-                let Some(monotonic) = until
-                    .duration_since(now)
-                    .ok()
-                    .and_then(|ttl| uring_runtime::environment::now().checked_add(ttl))
-                else {
-                    continue;
-                };
-                let hold =
-                    versions
-                        .entry(page.version.clone())
-                        .or_insert_with(|| super::holds::Hold {
-                            until: *until,
-                            monotonic,
-                            pages: 0,
-                            inflight: Rc::new(Cell::new(0)),
-                            active: Rc::new(Cell::new(0)),
-                            locations: HashMap::default(),
-                        });
-                hold.until = hold.until.max(*until);
-                hold.monotonic = hold.monotonic.max(monotonic);
-                hold.pages += 1;
-                hold.locations.insert(page.number, entry.location.clone());
-            }
-        }
-        self.holds.borrow_mut().entries = versions;
-        Ok(())
-    }
-
-    pub(super) fn validate_restored_holds(
-        &self,
-        snapshot: &IndexSnapshot,
-        segments: &[page_alloc::SegmentSnapshot],
-    ) -> Result<()> {
-        let now = uring_runtime::environment::wall_now();
-        let mut offsets = HashSet::default();
-        for segment in segments {
-            for (offset, until) in &segment.retained_records {
-                if *until > now {
-                    super::holds::Holds::deadline(*until)?;
-                    offsets.insert(*offset);
-                }
-            }
-        }
-        let versions: HashSet<_> = snapshot
-            .entries
-            .iter()
-            .filter(|(_, entry)| offsets.contains(&entry.location.extent.offset()))
-            .map(|(page, _)| &page.version)
-            .collect();
-        let pages = snapshot
-            .entries
-            .iter()
-            .filter(|(page, _)| versions.contains(&page.version))
-            .count();
-        let holds = self.holds.borrow();
-        let limit = (segments.len() * holds.percent / 100)
-            .min(segments.len().saturating_sub(holds.free_reserve.max(1)))
-            .min(self.page_capacity.get() * holds.percent / 100);
-        if pages > limit || (pages != 0 && holds.segments.is_none()) {
-            return Err(Error::Overloaded);
         }
         Ok(())
     }
@@ -800,12 +712,8 @@ impl Index {
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
         let s = self.state.borrow();
         Ok(IndexSnapshot {
-            entries: s
-                .pages
-                .iter()
-                .map(|(p, e)| (p.clone(), e.clone()))
-                .collect(),
             metadata: s.metadata.values().cloned().collect(),
+            versions: self.snapshot_versions(),
         })
     }
     /// Owner-local bounded cut. Appends are frozen by Checkpointer; removals are
@@ -831,26 +739,17 @@ impl Index {
     pub(super) fn preflight_snapshot(&self, remaining: &mut usize) -> Result<()> {
         let state = self.state.borrow();
         for bytes in state
-            .pages
-            .iter()
-            .map(|(_, entry)| super::checkpoint::snapshot_entry_bytes(&entry.metadata))
-            .chain(
-                state
-                    .metadata
-                    .values()
-                    .map(super::checkpoint::snapshot_metadata_bytes),
-            )
+            .metadata
+            .values()
+            .map(super::checkpoint::snapshot_metadata_bytes)
         {
             *remaining = remaining.checked_sub(bytes).ok_or(Error::Overloaded)?;
         }
-        let holds = self.holds.borrow();
-        for hold in holds.entries.values().filter(|hold| hold.live()) {
-            let bytes = hold
-                .locations
-                .len()
-                .checked_mul(super::checkpoint::RETAINED_RECORD_BYTES)
+        drop(state);
+        for entry in self.snapshot_versions() {
+            *remaining = remaining
+                .checked_sub(super::checkpoint::snapshot_version_bytes(&entry))
                 .ok_or(Error::Overloaded)?;
-            *remaining = remaining.checked_sub(bytes).ok_or(Error::Overloaded)?;
         }
         Ok(())
     }
@@ -869,32 +768,56 @@ impl Index {
         Ok(state.metadata.values().cloned().collect())
     }
 
-    /// Check the whole bounded batch before cloning its first mapping.
-    pub(super) fn snapshot_pages_budgeted(
+    /// Version descriptors with pages on disk, after the cursor. Checks the
+    /// whole batch against the budget before returning it.
+    pub(super) fn snapshot_versions_budgeted(
         &self,
-        after: u64,
-        limit: usize,
+        after: Option<u64>,
+        _limit: usize,
         remaining: &mut usize,
-    ) -> Result<(u64, Vec<(PageId, IndexedPage)>)> {
-        let state = self.state.borrow();
-        for (_, _, entry) in state.pages.after(after, limit) {
+    ) -> Result<(Option<u64>, Vec<super::versions::VersionEntry>)> {
+        if after.is_some() {
+            return Ok((after, Vec::new()));
+        }
+        let versions = self.snapshot_versions();
+        for entry in &versions {
             *remaining = remaining
-                .checked_sub(super::checkpoint::snapshot_entry_bytes(&entry.metadata))
+                .checked_sub(super::checkpoint::snapshot_version_bytes(entry))
                 .ok_or(Error::Overloaded)?;
         }
-        let mut cursor = after;
-        let entries = state
-            .pages
-            .after(after, limit)
-            .map(|(age, page, entry)| {
-                cursor = age;
-                (page.clone(), entry.clone())
-            })
-            .collect();
-        Ok((cursor, entries))
+        Ok((None, versions))
     }
-    /// Install only with the matching recovered segment state before admission.
-    /// Validate identity/length agreement and catalog bounds; clear all freshness.
+
+    fn snapshot_versions(&self) -> Vec<super::versions::VersionEntry> {
+        let state = self.state.borrow();
+        let mut versions: HashMap<&ObjectVersion, super::versions::VersionEntry> =
+            HashMap::default();
+        for (page, entry) in state.pages.iter() {
+            versions
+                .entry(&page.version)
+                .or_insert_with(|| super::versions::VersionEntry::new(entry.metadata.clone()))
+                .add_key_id(entry.key_id);
+        }
+        versions.into_values().collect()
+    }
+
+    /// Every page on this worker's disk, for diagnostics and tests.
+    pub fn disk_pages(&self) -> Vec<DiskPage> {
+        self.state
+            .borrow()
+            .pages
+            .iter()
+            .map(|(page, entry)| DiskPage {
+                page: page.clone(),
+                key_id: entry.key_id,
+                offset: entry.location.extent.offset(),
+                length: entry.location.extent.length() as u64,
+            })
+            .collect()
+    }
+
+    /// Install recovered metadata before admission. Validate identity/length
+    /// agreement and catalog bounds; clear all freshness. Page entries stay.
     pub fn restore(&self, snapshot: IndexSnapshot) -> Result<()> {
         self.validate_snapshot(&snapshot)?;
         let mut replacement = Index::new(
@@ -902,15 +825,14 @@ impl Index {
             self.metadata_capacity,
             self.availability.clone(),
         );
-        replacement.residency = self.residency.clone();
-        replacement.set_page_capacity(self.page_capacity.get())?;
-        for (p, e) in snapshot.entries {
-            replacement.publish(p, e)?;
-        }
         for m in snapshot.metadata {
             replacement.publish_version(m)?;
         }
-        *self.state.borrow_mut() = replacement.state.into_inner();
+        let replacement = std::mem::take(&mut *replacement.state.get_mut());
+        let mut state = self.state.borrow_mut();
+        state.metadata = replacement.metadata;
+        state.order = replacement.order;
+        state.current.clear();
         Ok(())
     }
     pub fn validate_snapshot(&self, snapshot: &IndexSnapshot) -> Result<()> {
@@ -921,24 +843,27 @@ impl IndexSnapshot {
     pub fn validate_capacity(&self, page_capacity: usize, metadata_capacity: usize) -> Result<()> {
         let snapshot = self;
         // Reject downsized cuts before allocating descriptor/duplicate tables.
-        if snapshot.entries.len() > page_capacity || snapshot.metadata.len() > metadata_capacity {
+        if snapshot.versions.len() > page_capacity || snapshot.metadata.len() > metadata_capacity {
             return Err(Error::CorruptRecord);
         }
         snapshot.validate_metadata()?;
         for m in snapshot
             .metadata
             .iter()
-            .chain(snapshot.entries.iter().map(|(_, e)| &e.metadata))
+            .chain(snapshot.versions.iter().map(|entry| &entry.metadata))
         {
             Index::validate_descriptor(m)?;
         }
-        let mut pages = HashSet::default();
+        let mut metadata = HashSet::default();
         let mut versions = HashSet::default();
-        if snapshot.entries.iter().any(|(p, _)| !pages.insert(p))
+        if snapshot
+            .versions
+            .iter()
+            .any(|entry| !versions.insert(&entry.version))
             || snapshot
                 .metadata
                 .iter()
-                .any(|m| !versions.insert(&m.version))
+                .any(|m| !metadata.insert(&m.version))
         {
             return Err(Error::CorruptRecord);
         }
@@ -1246,7 +1171,7 @@ mod tests {
         let clock = SegmentClock::new(index.clone(), segments, 1);
         clock.reclaim_now().unwrap();
         assert_eq!(calls.get(), 2);
-        assert_eq!(index.snapshot().unwrap().entries.len(), 2);
+        assert_eq!(index.disk_pages().len(), 2);
     }
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         VersionMetadata {
@@ -1355,18 +1280,7 @@ mod tests {
                 segments: 1
             }
         );
-        let mut snapshots = segments.snapshot();
-        let mut remaining = usize::MAX;
-        index
-            .snapshot_holds(&mut snapshots, &mut remaining)
-            .unwrap();
-        index.holds.borrow_mut().entries.clear();
-        index.restore_holds(&snapshots).unwrap();
-        assert_eq!(
-            index.held_snapshot().payload_bytes,
-            17,
-            "recovered holds have no job"
-        );
+        assert_eq!(index.held_snapshot().payload_bytes, 17);
         {
             let mut holds = index.holds.borrow_mut();
             let hold = holds.entries.get_mut(&first.version).unwrap();
@@ -1705,9 +1619,9 @@ mod tests {
         // A conservative suffix is still evictable, and removal respects 256 per turn.
         let clock = SegmentClock::new(index.clone(), segments.clone(), 2);
         assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
-        assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+        assert_eq!(index.disk_pages().len(), 1);
         clock.reclaim_now().unwrap();
-        assert!(index.snapshot().unwrap().entries.is_empty());
+        assert!(index.disk_pages().is_empty());
     }
     #[test]
     fn second_sight_residency_replacement_restore_purge_and_drop_are_balanced() {
@@ -1754,13 +1668,7 @@ mod tests {
             index.publish(other.clone(), other_entry.clone()),
             Err(Error::Overloaded)
         );
-        assert_eq!(
-            index.restore(IndexSnapshot {
-                entries: vec![(other, other_entry)],
-                metadata: vec![]
-            }),
-            Err(Error::Overloaded)
-        );
+        assert_eq!(index.publish(other, other_entry), Err(Error::Overloaded));
         assert!(index.lookup(&page).unwrap().is_some());
         assert_eq!(retention.snapshot().heat_entries, 1);
         assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
@@ -1803,7 +1711,7 @@ mod tests {
     #[test]
     fn metadata_only_checkpoint_preserves_empty_and_old_versions_without_freshness() {
         let snapshot = IndexSnapshot {
-            entries: vec![],
+            versions: vec![],
             metadata: vec![descriptor("old", 17), descriptor("new", 0)],
         };
         assert_eq!(snapshot.validate_metadata(), Ok(()));
@@ -1822,7 +1730,7 @@ mod tests {
             ..first.clone()
         };
         let snapshot = IndexSnapshot {
-            entries: vec![],
+            versions: vec![],
             metadata: vec![first, conflicting],
         };
         assert_eq!(snapshot.validate_metadata(), Err(Error::CorruptRecord));
@@ -1857,7 +1765,7 @@ mod tests {
         let (other, other_entry) = indexed(descriptor("other", 17), 1);
         assert_eq!(index.preflight_capacity(&page), Ok(()));
         assert_eq!(index.preflight_capacity(&other), Ok(()));
-        assert!(index.snapshot().unwrap().entries.is_empty());
+        assert!(index.disk_pages().is_empty());
         index.publish(page.clone(), entry.clone()).unwrap();
         assert_eq!(index.preflight_capacity(&page), Ok(()));
         assert_eq!(index.preflight_capacity(&other), Err(Error::Overloaded));
@@ -1892,7 +1800,7 @@ mod tests {
         index.publish_current(current).unwrap();
         assert!(index.current(&m.version.object).unwrap().is_some());
         let bad = IndexSnapshot {
-            entries: vec![],
+            versions: vec![],
             metadata: vec![
                 m.clone(),
                 VersionMetadata {
