@@ -4676,7 +4676,7 @@ fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
         .metrics
         .write_prometheus(&mut output)
         .unwrap();
-    assert!(output.contains("racer_worker_staging_pool_entries{worker=\"0\"}"));
+    assert!(output.contains("racer_worker_staging_pool_bytes{worker=\"0\"}"));
     if cfg!(target_os = "linux") {
         assert!(output.contains("# TYPE racer_process_resident_bytes gauge\n"));
     }
