@@ -31,10 +31,16 @@ def verify():
     source = os.environ["SOURCE_COMMIT"]
     require(re.fullmatch(r"[0-9a-f]{40}", source), "missing exact source commit")
     require(command("dpkg", "--print-architecture") == "arm64", "not ARM64")
-    require(
-        sorted(p.name for p in Path("/lib/modules").iterdir()) == [kernel],
-        "expected exactly the pinned kernel",
-    )
+    # Canonical's signed NVIDIA package also ships an empty shared kernel/ directory.
+    shared = Path("/lib/modules/kernel")
+    if shared.exists() or shared.is_symlink():
+        require(
+            shared.is_dir() and not shared.is_symlink()
+            and all(p.is_dir() and not p.is_symlink() for p in shared.rglob("*")),
+            "unexpected files in unversioned module directory",
+        )
+    kernels = sorted(p.name for p in Path("/lib/modules").iterdir() if p.name != "kernel")
+    require(kernels == [kernel], f"expected exactly the pinned kernel {kernel}, found {kernels}")
     config = Path(f"/boot/config-{kernel}").read_text()
     require(
         sorted(p.name for p in Path("/boot").glob("initrd.img-*")) == [f"initrd.img-{kernel}"],

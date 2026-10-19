@@ -166,6 +166,18 @@ class RootfsContractTest(unittest.TestCase):
         self.path("/lib/modules/other-kernel").mkdir()
         self.rejected("exactly the pinned kernel")
 
+    def test_distribution_empty_shared_module_directory_accepted(self):
+        self.path("/lib/modules/kernel/nvidia-580srv-open").mkdir(parents=True)
+        verify.verify()
+
+    def test_unversioned_module_file_rejected(self):
+        self.put("/lib/modules/kernel/nvidia-580srv-open/nvidia.ko", "unbound module")
+        self.rejected("unexpected files in unversioned")
+
+    def test_unversioned_module_symlink_rejected(self):
+        self.path("/lib/modules/kernel").symlink_to(self.path(f"/lib/modules/{self.kernel}"))
+        self.rejected("unexpected files in unversioned")
+
     def test_unbound_source_rejected(self):
         os.environ["SOURCE_COMMIT"] = "latest"
         self.rejected("missing exact source commit")
