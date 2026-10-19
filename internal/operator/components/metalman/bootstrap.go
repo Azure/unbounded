@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -126,7 +127,7 @@ func (c BootstrapComponent) Plan(ctx context.Context, env *component.Env, sites 
 	if len(sites) == 0 {
 		present, err := bootstrapResourcesPresent(ctx, env)
 		if err != nil {
-			return nil, component.Result{}, err
+			return revokeBindingsPlan(c.Name()), component.Failed(err), nil
 		}
 
 		if !present {
@@ -136,7 +137,7 @@ func (c BootstrapComponent) Plan(ctx context.Context, env *component.Env, sites 
 
 	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
 	if err != nil {
-		return nil, component.Result{}, err
+		return revokeBindingsPlan(c.Name()), component.Failed(err), nil
 	}
 
 	if _, verifyErr := addSupportOps(ctx, env, plan, support, c.Name(), ""); verifyErr != nil {
@@ -148,6 +149,26 @@ func (c BootstrapComponent) Plan(ctx context.Context, env *component.Env, sites 
 	}
 
 	return plan, component.Reconciled(), nil
+}
+
+// revokeBindingsPlan returns the fail-closed plan used when the bootstrap
+// support objects cannot be planned: it deletes the bootstrap grant and the
+// stale auto-approve binding. Callers return it with a failed Result rather
+// than a planning error, because a planning error discards the plan and would
+// leave both bindings in place. Deleting an absent binding succeeds.
+func revokeBindingsPlan(componentName string) *component.Plan {
+	plan := component.NewPlan()
+
+	grant := component.DeleteOperation(&rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: BootstrapMachineBindingName},
+	}, componentName, "")
+	grant.SharedKey = sharedSupportKey(grant.Object)
+
+	plan.Add(grant)
+	plan.Add(staleSupportDeletes(componentName, "")...)
+
+	return plan
 }
 
 // bootstrapResourcesPresent reports whether any metalman bootstrap resource

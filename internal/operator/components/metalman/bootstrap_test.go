@@ -334,7 +334,44 @@ func TestBootstrapLookupErrorFailsPlan(t *testing.T) {
 	}).Build()
 	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
 
-	if _, _, err := (BootstrapComponent{}).Plan(t.Context(), env, nil); err == nil {
-		t.Fatal("plan succeeded, want lookup error")
+	plan, res, err := (BootstrapComponent{}).Plan(t.Context(), env, nil)
+	if err != nil {
+		t.Fatalf("plan returned planning error %v, want failed result", err)
+	}
+
+	if res.Err == nil {
+		t.Fatal("result has no error, want lookup failure for retry")
+	}
+
+	assertRevokesBindings(t, plan)
+}
+
+func TestRevokeBindingsPlanSharesKeysWithSupportOps(t *testing.T) {
+	assertRevokesBindings(t, revokeBindingsPlan(BootstrapComponent{}.Name()))
+}
+
+func assertRevokesBindings(t *testing.T, plan *component.Plan) {
+	t.Helper()
+
+	want := map[string]bool{BootstrapMachineBindingName: false, StaleAutoApproveBindingName: false}
+
+	for _, op := range plan.Operations {
+		if op.Kind != component.OpDelete || op.Object.GetKind() != "ClusterRoleBinding" {
+			t.Errorf("unexpected operation %v on %s", op.Kind, op.Object.GetName())
+
+			continue
+		}
+
+		if op.SharedKey != sharedSupportKey(op.Object) {
+			t.Errorf("delete of %s has shared key %q, want %q", op.Object.GetName(), op.SharedKey, sharedSupportKey(op.Object))
+		}
+
+		want[op.Object.GetName()] = true
+	}
+
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("plan does not delete ClusterRoleBinding %s", name)
+		}
 	}
 }
