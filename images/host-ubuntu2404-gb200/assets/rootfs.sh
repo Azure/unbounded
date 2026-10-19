@@ -21,7 +21,13 @@ install_packages() {
         efibootmgr chrony pciutils ethtool rdma-core ibverbs-providers \
         python3 file linux-firmware \
         "linux-image-${KVER}=${KERNEL_VERSION}" \
-        "linux-headers-${KVER}=${KERNEL_VERSION}" \
+        "linux-headers-${KVER}=${KERNEL_VERSION}"
+
+    # NVIDIA's postinst runs update-initramfs. Bootstrap the target kernel
+    # first, rather than letting it select the running builder's kernel.
+    test -s /etc/initramfs-tools/initramfs.conf
+    test -s "/boot/initrd.img-$KVER"
+    apt-get install -y --no-install-recommends \
         "linux-modules-nvidia-580-server-open-${KVER}=${NVIDIA_MODULES_VERSION}" \
         "nvidia-kernel-common-580-server=${NVIDIA_VERSION}" \
         "nvidia-headless-no-dkms-580-server-open=${NVIDIA_VERSION}" \

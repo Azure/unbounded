@@ -86,6 +86,15 @@ class RootfsContractTest(unittest.TestCase):
         self.assertEqual(set(result["modules"]), {"mana", "mana_ib", "nvidia", "nvidia_uvm"})
         self.assertTrue(result["apt_inrelease_sha256"])
 
+    def test_target_initramfs_bootstrapped_before_nvidia_postinst(self):
+        source = Path(__file__).with_name("rootfs.sh").read_text()
+        phases = source.split("apt-get install -y --no-install-recommends")
+        self.assertEqual(len(phases), 3)
+        self.assertIn('"linux-image-${KVER}=${KERNEL_VERSION}"', phases[1])
+        self.assertIn('test -s "/boot/initrd.img-$KVER"', phases[1])
+        self.assertNotIn('"nvidia-kernel-common-', phases[1])
+        self.assertIn('"nvidia-kernel-common-', phases[2])
+
     def test_wrong_kernel_abi(self):
         self.vermagic = "wrong-kernel SMP aarch64"
         self.rejected("kernel ABI mismatch")
