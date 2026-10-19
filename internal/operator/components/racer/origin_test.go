@@ -275,6 +275,26 @@ func TestOriginMultipleCachesAndPruning(t *testing.T) {
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, originName("gone")), &appsv1.DaemonSet{}))
 }
 
+func TestOriginPrunedWhileCacheTerminates(t *testing.T) {
+	cache := originCache("held", nil)
+	cache.Finalizers = []string{"test/hold"}
+
+	env := testEnv(t, cache, cacheObject("other"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+	liveOrigin(t, env, "held")
+
+	held := &racerv1.ClusterCache{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(&component.Env{}, "held"), held))
+	require.NoError(t, env.Client.Delete(t.Context(), held))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(&component.Env{}, "held"), held))
+	require.NotNil(t, held.DeletionTimestamp)
+
+	persist(t, env, planPass(t, env))
+	requireNoOrigin(t, env, "held")
+	liveDataplane(t, env)
+}
+
 func TestOriginInvalidCacheIsIsolated(t *testing.T) {
 	env := testEnv(t, originCache("bad", nil), originCache("good", nil))
 	initialize(t, env)

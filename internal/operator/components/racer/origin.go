@@ -357,7 +357,8 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	for i := range caches.Items {
 		cache := &caches.Items[i]
-		if cache.Spec.Origin == nil {
+		// A terminating cache keeps no origin, even while finalizers hold it.
+		if cache.Spec.Origin == nil || cache.DeletionTimestamp != nil {
 			continue
 		}
 
