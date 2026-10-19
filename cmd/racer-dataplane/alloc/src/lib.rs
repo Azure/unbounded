@@ -157,6 +157,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+mod demand;
 pub mod index;
 pub mod retention;
 mod segments;
@@ -167,6 +168,10 @@ use racer_platform::reactor::IoBuffer;
 pub use segments::{
     FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
     SegmentSnapshot, SegmentState, Segments,
+};
+pub use demand::{
+    DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
+    DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
 pub use slab::{DevicePlacement, Slab};
 use std::{
