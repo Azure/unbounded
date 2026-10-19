@@ -3,9 +3,9 @@
 //! The privileged dataplane creates this directory and assigns it to the
 //! unprivileged origin user so origins never need root or `mkdir` rights in
 //! /run/racer. The origin binds its socket here (pkg/racersdk ServeOrigin).
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
-use std::fs::Metadata;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -14,7 +14,8 @@ use std::os::unix::fs::MetadataExt;
 /// UID that Racer origins run as. Keep in sync with the nonroot user of
 /// images/racer-object/Containerfile and images/racer-loadgen/Containerfile,
 /// and with the origin directory checks in cmd/racer-object/main.go
-/// (prepareOriginDirectory) and cmd/racer-loadgen/origin_uds.go.
+/// (checkOriginDirectory) and cmd/racer-loadgen/origin_uds.go
+/// (checkOriginDirectory).
 pub const ORIGIN_UID: u32 = 65532;
 /// GID that Racer origins run as. See [`ORIGIN_UID`].
 pub const ORIGIN_GID: u32 = 65532;
@@ -49,6 +50,49 @@ pub struct Outcome {
     pub adopted: usize,
 }
 
+/// Changes made by [`prepare`]. A seam so tests can check the order.
+trait Ops {
+    /// Re-own one entry of `directory` without following symlinks.
+    fn chown_entry(&mut self, directory: &File, name: &CStr, owner: Owner) -> io::Result<()>;
+    fn chmod(&mut self, directory: &File, mode: u32) -> io::Result<()>;
+    fn chown(&mut self, directory: &File, owner: Owner) -> io::Result<()>;
+}
+
+struct System;
+
+impl Ops for System {
+    fn chown_entry(&mut self, directory: &File, name: &CStr, owner: Owner) -> io::Result<()> {
+        // SAFETY: terminated name and live directory descriptor; no symlink follow.
+        check(unsafe {
+            libc::fchownat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                owner.uid,
+                owner.gid,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+    }
+
+    fn chmod(&mut self, directory: &File, mode: u32) -> io::Result<()> {
+        // SAFETY: directory retains its descriptor throughout fchmod.
+        check(unsafe { libc::fchmod(directory.as_raw_fd(), mode) })
+    }
+
+    fn chown(&mut self, directory: &File, owner: Owner) -> io::Result<()> {
+        // SAFETY: directory retains its descriptor throughout fchown.
+        check(unsafe { libc::fchown(directory.as_raw_fd(), owner.uid, owner.gid) })
+    }
+}
+
+fn check(result: libc::c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Create or repair `<cache>/origin` so it is a real directory owned by
 /// `owner` with mode [`ORIGIN_MODE`].
 ///
@@ -56,63 +100,81 @@ pub struct Outcome {
 /// non-directory at that name is rejected, and every change is applied
 /// through the pinned descriptor.
 ///
+/// Steps run in this order, so the origin user gets no control until the end:
+/// 1. Re-own trusted leftover entries while the old owner still holds the
+///    directory.
+/// 2. Set the mode.
+/// 3. Hand the directory to `owner`.
+///
+/// If a run stops before step 3, the directory is still trusted, so the next
+/// run repeats the migration.
+///
 /// # Errors
 /// Returns the open/mkdir/stat/chmod error, or a chown error other than an
 /// unprivileged `EPERM`.
 pub fn prepare(cache: &File, owner: Owner) -> io::Result<Outcome> {
+    let euid = effective_uid();
+    prepare_with(cache, owner, euid, euid == 0, &mut System)
+}
+
+/// `privileged` says whether the dataplane can assign any owner. It is
+/// separate from `euid` so tests can run the root path without root.
+fn prepare_with(
+    cache: &File,
+    owner: Owner,
+    euid: u32,
+    privileged: bool,
+    ops: &mut impl Ops,
+) -> io::Result<Outcome> {
     let directory = uds_endpoint::child_directory(cache, b"origin", ORIGIN_MODE)?;
     let before = directory.metadata()?;
     if !before.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }
     let mut outcome = Outcome::default();
-    if before.uid() != owner.uid || before.gid() != owner.gid {
-        // SAFETY: directory retains its descriptor throughout fchown.
-        if unsafe { libc::fchown(directory.as_raw_fd(), owner.uid, owner.gid) } == 0 {
-            outcome.chowned = true;
-        } else {
-            let error = io::Error::last_os_error();
-            // The dataplane runs privileged in production. Without CAP_CHOWN
-            // (for example local tests), keep the directory usable by an
-            // origin running as the dataplane's own user instead of failing.
-            if error.raw_os_error() == Some(libc::EPERM) && effective_uid() != 0 {
+    let reown = before.uid() != owner.uid || before.gid() != owner.gid;
+    if reown && trusted_previous_owner(before.uid(), before.mode(), euid, privileged) {
+        outcome.adopted = adopt_entries(&directory, owner, ops);
+    }
+    if before.mode() & 0o7777 != ORIGIN_MODE {
+        ops.chmod(&directory, ORIGIN_MODE)?;
+        outcome.chmodded = true;
+    }
+    if reown {
+        match ops.chown(&directory, owner) {
+            Ok(()) => outcome.chowned = true,
+            // The dataplane runs as root in production. Without root (for
+            // example local tests), keep the directory usable by an origin
+            // running as the dataplane's own user instead of failing.
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) && !privileged => {
                 eprintln!(
                     "racer-dataplane: stage=origin-directory warning=unprivileged \
                      uid={} gid={} error={error}",
                     owner.uid, owner.gid
                 );
                 outcome.unprivileged = true;
-            } else {
-                return Err(error);
             }
+            Err(error) => return Err(error),
         }
-    }
-    let mode = directory.metadata()?.mode() & 0o7777;
-    if mode != ORIGIN_MODE {
-        // SAFETY: directory retains its descriptor throughout fchmod.
-        if unsafe { libc::fchmod(directory.as_raw_fd(), ORIGIN_MODE) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        outcome.chmodded = true;
-    }
-    if outcome.chowned && trusted_previous_owner(&before, effective_uid()) {
-        outcome.adopted = adopt_entries(&directory, owner);
     }
     Ok(outcome)
 }
 
-/// Whether entries left in a directory whose owner we just changed came from
-/// a trusted writer and may be re-owned.
+/// Whether entries in a directory we are about to re-own came from a trusted
+/// writer and may be re-owned too.
 ///
 /// Before this directory was dataplane-managed, root origins created it as
-/// root with mode 0755. Only the dataplane's own user (root) could create
-/// entries in such a directory, so they are leftovers from a previous root
-/// origin: `.racer-origin.lock`, the `.racer-origin.socket` witness, `socket`,
-/// and `.racer-origin-*` staging directories. If any other user could have
-/// written there, we do not touch the entries: re-owning a planted hard link
-/// would hand an arbitrary file to the origin user.
-fn trusted_previous_owner(before: &Metadata, euid: u32) -> bool {
-    before.uid() == euid && before.mode() & 0o022 == 0
+/// root with mode 0755. Only root could create entries in such a directory,
+/// so they are leftovers from a previous root origin: `.racer-origin.lock`,
+/// the `.racer-origin.socket` witness, `socket`, and `.racer-origin-*`
+/// staging directories. If any other user could have written there, we do
+/// not touch the entries: re-owning a planted hard link would hand an
+/// arbitrary file to the origin user.
+///
+/// The dataplane must also be privileged. Without privilege the directory
+/// handoff fails, and entries must not change when the directory does not.
+fn trusted_previous_owner(uid: u32, mode: u32, euid: u32, privileged: bool) -> bool {
+    privileged && uid == euid && mode & 0o022 == 0
 }
 
 /// Re-own top-level entries not already owned by `owner`.
@@ -126,7 +188,7 @@ fn trusted_previous_owner(before: &Metadata, euid: u32) -> bool {
 /// changed, and regular files with extra hard links are skipped. Only entries
 /// whose owner differs from `owner` are changed. Failures are logged and
 /// skipped so a single bad entry cannot block the client endpoint.
-fn adopt_entries(directory: &File, owner: Owner) -> usize {
+fn adopt_entries(directory: &File, owner: Owner, ops: &mut impl Ops) -> usize {
     let path = format!("/proc/self/fd/{}", directory.as_raw_fd());
     let entries = match std::fs::read_dir(&path) {
         Ok(entries) => entries,
@@ -141,7 +203,7 @@ fn adopt_entries(directory: &File, owner: Owner) -> usize {
         let Ok(name) = CString::new(name.as_bytes()) else {
             continue;
         };
-        match adopt_entry(directory, &name, owner) {
+        match adopt_entry(directory, &name, owner, ops) {
             Ok(true) => adopted += 1,
             Ok(false) => {}
             Err(error) => eprintln!(
@@ -153,37 +215,27 @@ fn adopt_entries(directory: &File, owner: Owner) -> usize {
     adopted
 }
 
-fn adopt_entry(directory: &File, name: &CString, owner: Owner) -> io::Result<bool> {
+fn adopt_entry(
+    directory: &File,
+    name: &CStr,
+    owner: Owner,
+    ops: &mut impl Ops,
+) -> io::Result<bool> {
     // SAFETY: zeroed stat is a valid out-parameter for fstatat.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: terminated name, live directory descriptor, valid out-pointer.
-    if unsafe {
+    check(unsafe {
         libc::fstatat(
             directory.as_raw_fd(),
             name.as_ptr(),
             &mut stat,
             libc::AT_SYMLINK_NOFOLLOW,
         )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
+    })?;
     if !should_adopt(stat.st_mode, stat.st_nlink as u64, stat.st_uid, owner) {
         return Ok(false);
     }
-    // SAFETY: terminated name and live directory descriptor; no symlink follow.
-    if unsafe {
-        libc::fchownat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            owner.uid,
-            owner.gid,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
+    ops.chown_entry(directory, name, owner)?;
     Ok(true)
 }
 
@@ -304,8 +356,19 @@ mod tests {
         for (mode, trusted) in [(0o755, true), (0o700, true), (0o775, false), (0o757, false)] {
             fs::set_permissions(&scratch.0, fs::Permissions::from_mode(mode)).unwrap();
             let meta = fs::metadata(&scratch.0).unwrap();
-            assert_eq!(trusted_previous_owner(&meta, euid), trusted, "{mode:o}");
-            assert!(!trusted_previous_owner(&meta, euid.wrapping_add(1)));
+            let (uid, mode_bits) = (meta.uid(), meta.mode());
+            assert_eq!(
+                trusted_previous_owner(uid, mode_bits, euid, true),
+                trusted,
+                "{mode:o}"
+            );
+            assert!(!trusted_previous_owner(
+                uid,
+                mode_bits,
+                euid.wrapping_add(1),
+                true
+            ));
+            assert!(!trusted_previous_owner(uid, mode_bits, euid, false));
         }
         fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -393,5 +456,182 @@ mod tests {
                 .uid(),
             0
         );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        /// Entry name, plus directory uid and mode when it was re-owned.
+        Entry(String, u32, u32),
+        Chmod(u32, u32),
+        Chown(u32, u32),
+    }
+
+    /// Records each change and the directory state seen at that moment.
+    /// Chmod is applied so later steps see the new mode. Chown calls are only
+    /// recorded, so these tests do not need root.
+    struct Recorder {
+        events: Vec<Event>,
+        chown_error: Option<i32>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                events: Vec::new(),
+                chown_error: None,
+            }
+        }
+    }
+
+    fn state(directory: &File) -> (u32, u32) {
+        let meta = directory.metadata().unwrap();
+        (meta.uid(), meta.mode() & 0o7777)
+    }
+
+    impl Ops for Recorder {
+        fn chown_entry(&mut self, directory: &File, name: &CStr, _: Owner) -> io::Result<()> {
+            let (uid, mode) = state(directory);
+            let name = name.to_string_lossy().into_owned();
+            self.events.push(Event::Entry(name, uid, mode));
+            Ok(())
+        }
+
+        fn chmod(&mut self, directory: &File, mode: u32) -> io::Result<()> {
+            let (uid, before) = state(directory);
+            self.events.push(Event::Chmod(uid, before));
+            System.chmod(directory, mode)
+        }
+
+        fn chown(&mut self, directory: &File, _: Owner) -> io::Result<()> {
+            let (uid, mode) = state(directory);
+            self.events.push(Event::Chown(uid, mode));
+            match self.chown_error {
+                Some(code) => Err(io::Error::from_raw_os_error(code)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn legacy(scratch: &Scratch, mode: u32) -> std::path::PathBuf {
+        let origin = scratch.0.join("origin");
+        fs::create_dir(&origin).unwrap();
+        fs::write(origin.join(".racer-origin.lock"), b"").unwrap();
+        fs::set_permissions(&origin, fs::Permissions::from_mode(mode)).unwrap();
+        origin
+    }
+
+    const TARGET: Owner = Owner {
+        uid: 4242,
+        gid: 4242,
+    };
+
+    #[test]
+    fn migrates_entries_before_mode_and_hands_off_last() {
+        let scratch = Scratch::new();
+        legacy(&scratch, 0o755);
+        let euid = effective_uid();
+        let mut ops = Recorder::new();
+        let outcome = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap();
+        assert_eq!(
+            ops.events,
+            vec![
+                Event::Entry(".racer-origin.lock".into(), euid, 0o755),
+                Event::Chmod(euid, 0o755),
+                Event::Chown(euid, ORIGIN_MODE),
+            ]
+        );
+        assert_eq!(
+            outcome,
+            Outcome {
+                chowned: true,
+                chmodded: true,
+                unprivileged: false,
+                adopted: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_handoff_is_retried_with_migration() {
+        let scratch = Scratch::new();
+        legacy(&scratch, 0o755);
+        let euid = effective_uid();
+        let mut ops = Recorder::new();
+        ops.chown_error = Some(libc::EIO);
+        assert!(prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).is_err());
+        // The directory is still old-owned and now 0700, so it stays trusted.
+        let mut ops = Recorder::new();
+        let outcome = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap();
+        assert_eq!(
+            ops.events,
+            vec![
+                Event::Entry(".racer-origin.lock".into(), euid, ORIGIN_MODE),
+                Event::Chown(euid, ORIGIN_MODE),
+            ]
+        );
+        assert!(outcome.chowned && !outcome.chmodded && outcome.adopted == 1);
+    }
+
+    #[test]
+    fn untrusted_directory_is_narrowed_without_migration() {
+        for mode in [0o775, 0o757, 0o777, 0o1777] {
+            let scratch = Scratch::new();
+            legacy(&scratch, mode);
+            let euid = effective_uid();
+            let mut ops = Recorder::new();
+            let outcome = prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap();
+            assert_eq!(
+                ops.events,
+                vec![Event::Chmod(euid, mode), Event::Chown(euid, ORIGIN_MODE)],
+                "{mode:o}"
+            );
+            assert_eq!(outcome.adopted, 0);
+        }
+    }
+
+    #[test]
+    fn foreign_previous_owner_is_not_migrated() {
+        let scratch = Scratch::new();
+        legacy(&scratch, 0o755);
+        let euid = effective_uid().wrapping_add(1);
+        let mut ops = Recorder::new();
+        prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).unwrap();
+        assert!(!ops.events.iter().any(|e| matches!(e, Event::Entry(..))));
+    }
+
+    #[test]
+    fn unprivileged_handoff_changes_no_entries() {
+        let scratch = Scratch::new();
+        let origin = legacy(&scratch, 0o755);
+        let euid = effective_uid();
+        let mut ops = Recorder::new();
+        ops.chown_error = Some(libc::EPERM);
+        let outcome = prepare_with(&scratch.open(), TARGET, euid, false, &mut ops).unwrap();
+        assert_eq!(
+            ops.events,
+            vec![Event::Chmod(euid, 0o755), Event::Chown(euid, ORIGIN_MODE)]
+        );
+        assert!(outcome.unprivileged && !outcome.chowned && outcome.adopted == 0);
+        assert_eq!(fs::metadata(origin).unwrap().mode() & 0o7777, ORIGIN_MODE);
+    }
+
+    #[test]
+    fn privileged_eperm_is_fatal() {
+        let scratch = Scratch::new();
+        legacy(&scratch, 0o700);
+        let mut ops = Recorder::new();
+        ops.chown_error = Some(libc::EPERM);
+        let euid = effective_uid();
+        assert!(prepare_with(&scratch.open(), TARGET, euid, true, &mut ops).is_err());
+    }
+
+    #[test]
+    fn owned_directory_is_left_alone() {
+        let scratch = Scratch::new();
+        legacy(&scratch, ORIGIN_MODE);
+        let mut ops = Recorder::new();
+        let outcome = prepare_with(&scratch.open(), me(), effective_uid(), true, &mut ops).unwrap();
+        assert!(ops.events.is_empty());
+        assert_eq!(outcome, Outcome::default());
     }
 }
