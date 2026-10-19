@@ -55,10 +55,12 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	wgCollector := unboundednetnetlink.NewWireGuardCollector()
 	prometheus.MustRegister(wgCollector)
 
+	initialSiteName, _ := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
+
 	state := &wireGuardState{
 		linkManager:                   linkManager,
 		nodePodCIDRs:                  nodePodCIDRs, // Store node's podCIDRs for cbr0 gateway IP calculation
-		siteName:                      findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey),
+		siteName:                      initialSiteName,
 		manageCniPlugin:               manageCniPlugin,
 		cniMTU:                        initialCNIConfigMTU,
 		cniConfigWritten:              manageCniPlugin,
@@ -259,7 +261,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 
 		start := time.Now()
 		// Find which site this node belongs to using CRD-based lookup
-		mySiteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
+		mySiteName, _ := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
 
 		// Store the site name for status endpoint
 		state.mu.Lock()
@@ -712,8 +714,12 @@ func shouldReconcileGatewayNodeUpdate(oldObj, newObj interface{}) bool {
 // findMySiteFromCRDs finds which site this node belongs to by searching CRDs.
 // For regular nodes, it searches SiteNodeSlices by WireGuard public key.
 // For gateway nodes, it searches GatewayPool status by WireGuard public key.
-// Returns empty string if not found in any CRD (node not yet added).
-func findMySiteFromCRDs(sliceInformer, gatewayPoolInformer cache.SharedIndexInformer, myPubKey string) string {
+// The boolean distinguishes published membership without a site from a node not yet added.
+func findMySiteFromCRDs(sliceInformer, gatewayPoolInformer cache.SharedIndexInformer, myPubKey string) (string, bool) {
+	if myPubKey == "" {
+		return "", false
+	}
+
 	// First, check SiteNodeSlices (for regular nodes)
 	for _, item := range sliceInformer.GetStore().List() {
 		unstr, ok := item.(*unstructured.Unstructured)
@@ -727,8 +733,8 @@ func findMySiteFromCRDs(sliceInformer, gatewayPoolInformer cache.SharedIndexInfo
 		}
 
 		for _, node := range slice.Nodes {
-			if node.WireGuardPublicKey == myPubKey {
-				return slice.SiteName
+			if node.WireGuardPublicKey == myPubKey && slice.SiteName != "" {
+				return slice.SiteName, true
 			}
 		}
 	}
@@ -747,20 +753,20 @@ func findMySiteFromCRDs(sliceInformer, gatewayPoolInformer cache.SharedIndexInfo
 
 		for _, gwNode := range pool.Status.Nodes {
 			if gwNode.WireGuardPublicKey == myPubKey {
-				if gwNode.SiteName != "" {
-					return gwNode.SiteName
-				}
-
-				return ""
+				return gwNode.SiteName, true
 			}
 		}
 	}
 
-	return ""
+	return "", false
 }
 
 // isGatewayNodeFromCRDs checks if this node is a gateway node by searching GatewayPool status.
 func isGatewayNodeFromCRDs(gatewayPoolInformer cache.SharedIndexInformer, myPubKey string) bool {
+	if myPubKey == "" {
+		return false
+	}
+
 	for _, item := range gatewayPoolInformer.GetStore().List() {
 		unstr, ok := item.(*unstructured.Unstructured)
 		if !ok {
@@ -787,9 +793,9 @@ func isGatewayNodeFromCRDs(gatewayPoolInformer cache.SharedIndexInformer, myPubK
 // Returns the site name once found, or empty string for gateway nodes without a site.
 func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInformer cache.SharedIndexInformer, myPubKey string) (string, error) {
 	// Check immediately first
-	siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
-	if siteName != "" {
-		klog.Infof("Node found in site %q", siteName)
+	siteName, resolved := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
+	if resolved {
+		klog.Infof("Node membership resolved with site %q", siteName)
 		return siteName, nil
 	}
 
@@ -801,7 +807,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 	// Add event handlers to detect when we appear in a slice or pool
 	sliceHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, resolved := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); resolved {
 				select {
 				case foundCh <- siteName:
 				default:
@@ -809,7 +815,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, resolved := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); resolved {
 				select {
 				case foundCh <- siteName:
 				default:
@@ -820,7 +826,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 
 	poolHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, resolved := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); resolved {
 				select {
 				case foundCh <- siteName:
 				default:
@@ -828,7 +834,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, resolved := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); resolved {
 				select {
 				case foundCh <- siteName:
 				default:
@@ -865,7 +871,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 	case <-ctx.Done():
 		return "", ctx.Err()
 	case siteName := <-foundCh:
-		klog.Infof("Node found in site %q", siteName)
+		klog.Infof("Node membership resolved with site %q", siteName)
 		return siteName, nil
 	}
 }

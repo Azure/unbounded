@@ -1,0 +1,100 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: net-node gateway hotfix
+
+on:
+  push:
+    branches: [chokevin-gb200-cuda-recovery]
+    paths:
+      - cmd/unbounded-net-node/site_watch_reconcile.go
+      - cmd/unbounded-net-node/site_watch_reconcile_test.go
+      - images/net/Containerfile.gateway-hotfix
+      - .github/workflows/net-node-gateway-hotfix.yaml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: net-node-gateway-hotfix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-publish:
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASELINE: aaa578eef55159817c61e1b720566c52f889d590
+      PRODUCTION_SHA256: 7e3c95384de2a08e4c43d23084d59946ccc64ac30ace00d22f4ac41daa90ef09
+      TEST_SHA256: 8d105b1d5ec05190e2a3dd8b50734cfb602cd7b9319bcb2dcb25b7b89c0efc76
+      IMAGE: ghcr.io/azure/unbounded-net-node
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare release-based source
+        id: source
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          context="$GITHUB_WORKSPACE/tmp/net-node-gateway-hotfix"
+          mkdir -p "$GITHUB_WORKSPACE/tmp"
+          mkdir "$context"
+          git archive "$BASELINE" | tar -x -C "$context"
+          for file in site_watch_reconcile.go site_watch_reconcile_test.go; do
+            cp "cmd/unbounded-net-node/$file" "$context/cmd/unbounded-net-node/$file"
+          done
+          printf '%s  %s\n' \
+            "$PRODUCTION_SHA256" "$context/cmd/unbounded-net-node/site_watch_reconcile.go" \
+            "$TEST_SHA256" "$context/cmd/unbounded-net-node/site_watch_reconcile_test.go" \
+            | sha256sum --check
+          tag="gateway-sitefix-${SOURCE_REVISION}-${RUN_ID}-${RUN_ATTEMPT}"
+          echo "context=$context" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          printf 'Baseline: %s\nFix recipe: %s\nImage: %s:%s\n' \
+            "$BASELINE" "$SOURCE_REVISION" "$IMAGE" "$tag"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test, build, and publish only the node hotfix
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ steps.source.outputs.context }}
+          file: images/net/Containerfile.gateway-hotfix
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.source.outputs.tag }}
+          build-args: |
+            VERSION=${{ steps.source.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.source.outputs.build_time }}
+          provenance: mode=max
+          cache-from: type=gha,scope=net-node-gateway-hotfix
+          cache-to: type=gha,scope=net-node-gateway-hotfix,mode=max
+
+      - name: Record immutable output
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'Image: `%s@%s`\n\nBaseline: `%s`\n\nFix recipe: `%s`\n' \
+            "$IMAGE" "$DIGEST" "$BASELINE" "$SOURCE_REVISION" >> "$GITHUB_STEP_SUMMARY"

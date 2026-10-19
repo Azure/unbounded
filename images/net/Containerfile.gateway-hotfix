@@ -1,0 +1,27 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# The workflow supplies v0.12.0 source plus only the membership regression fix.
+# Preserve the deployed runtime, init script, CNI plugins, and other binaries.
+FROM docker.io/library/golang:1.27.0-trixie AS builder
+WORKDIR /src
+ENV GOTOOLCHAIN=local
+COPY . .
+
+ARG VERSION
+ARG GIT_COMMIT
+ARG BUILD_TIME
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go test -race -mod=readonly -p=2 ./cmd/unbounded-net-node -count=1 -timeout=120s -json \
+    && go vet -mod=readonly -p=2 ./cmd/unbounded-net-node \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+       make unbounded-net-node-build \
+         VERSION="${VERSION}" GIT_COMMIT="${GIT_COMMIT}" BUILD_TIME="${BUILD_TIME}"
+
+FROM ghcr.io/azure/unbounded-net-node@sha256:84992edade20a5a6d1b9b6047e15dc7db49bc9ccab69776f14edd5fcae5ad7f9
+ARG GIT_COMMIT
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.base.digest="sha256:84992edade20a5a6d1b9b6047e15dc7db49bc9ccab69776f14edd5fcae5ad7f9" \
+      io.azure.unbounded.hotfix.baseline="aaa578eef55159817c61e1b720566c52f889d590"
+COPY --from=builder /src/bin/unbounded-net-node /usr/local/bin/unbounded-net-node
