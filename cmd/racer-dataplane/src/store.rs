@@ -46,6 +46,8 @@ pub mod holds;
 // Unused until the store switches to the extent volume.
 #[allow(dead_code)]
 pub(crate) mod key;
+#[allow(dead_code)]
+pub(crate) mod versions;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
