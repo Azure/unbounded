@@ -434,6 +434,33 @@ func TestOriginPlacementMirrorsDataplane(t *testing.T) {
 	t.Fatalf("no origin DaemonSet in plan:\n%s", plan.Summary())
 }
 
+func TestOriginMirrorsDataplanePullSecrets(t *testing.T) {
+	env := testEnv(t, originCache("cache", nil))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	ds, _ := liveOrigin(t, env, "cache")
+	require.Empty(t, ds.Spec.Template.Spec.ImagePullSecrets)
+
+	for _, secrets := range [][]corev1.LocalObjectReference{
+		{{Name: "registry-a"}},
+		{{Name: "registry-b"}, {Name: "registry-c"}},
+		nil,
+	} {
+		dataplane := liveDataplane(t, env)
+		dataplane.Spec.Template.Spec.ImagePullSecrets = secrets
+		require.NoError(t, env.Client.Update(t.Context(), dataplane))
+		persist(t, env, planPass(t, env))
+
+		ds, _ := liveOrigin(t, env, "cache")
+		if len(secrets) == 0 {
+			require.Empty(t, ds.Spec.Template.Spec.ImagePullSecrets)
+		} else {
+			require.Equal(t, secrets, ds.Spec.Template.Spec.ImagePullSecrets)
+		}
+	}
+}
+
 func TestOriginLongDottedCacheName(t *testing.T) {
 	name := strings.Repeat("a.", 40) + "bc"
 	require.Len(t, name, 82)

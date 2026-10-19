@@ -193,41 +193,66 @@ func (o originSpec) hash() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// originMirror holds the pod template fields an origin copies from the live
+// dataplane DaemonSet.
+type originMirror struct {
+	affinity     *corev1.Affinity
+	nodeSelector map[string]string
+	tolerations  []corev1.Toleration
+	pullSecrets  []corev1.LocalObjectReference
+}
+
+// clone returns a deep copy so each origin owns its slices and maps.
+func (m originMirror) clone() originMirror {
+	return originMirror{
+		affinity:     m.affinity.DeepCopy(),
+		nodeSelector: maps.Clone(m.nodeSelector),
+		tolerations:  slices.Clone(m.tolerations),
+		pullSecrets:  slices.Clone(m.pullSecrets),
+	}
+}
+
 // originPlacement follows the node-level constraints (node affinity, node
-// selector, tolerations) of the live dataplane DaemonSet, including user
-// overrides, so origins run wherever the dataplane serving their cache runs.
+// selector, tolerations) and image pull secrets of the live dataplane
+// DaemonSet, including user overrides, so origins run wherever the dataplane
+// serving their cache runs and can pull from the same registry. Origins share
+// the dataplane namespace, so the Secret references resolve.
 // found is false while the dataplane DaemonSet does not exist yet: placement
 // overrides are applied after planning, so no safe placement is known and
 // callers must defer origins rather than guess one.
 // Pod affinity and anti-affinity are not copied: they are relative to
 // dataplane Pods, and a rule such as hostname anti-affinity against
 // racer-dataplane would otherwise exclude origins from every dataplane node.
-func originPlacement(ctx context.Context, env *component.Env) (affinity *corev1.Affinity, nodeSelector map[string]string, tolerations []corev1.Toleration, found bool, err error) {
+func originPlacement(ctx context.Context, env *component.Env) (mirror originMirror, found bool, err error) {
 	ds := &appsv1.DaemonSet{}
 
 	err = env.LiveReader().Get(ctx, objectKey(env, dataplaneName), ds)
 	if apierrors.IsNotFound(err) {
-		return nil, nil, nil, false, nil
+		return originMirror{}, false, nil
 	}
 
 	if err != nil {
-		return nil, nil, nil, false, err
+		return originMirror{}, false, err
 	}
 
 	pod := ds.Spec.Template.Spec
 
 	if pod.Affinity != nil && pod.Affinity.NodeAffinity != nil {
-		affinity = &corev1.Affinity{NodeAffinity: pod.Affinity.NodeAffinity.DeepCopy()}
+		mirror.affinity = &corev1.Affinity{NodeAffinity: pod.Affinity.NodeAffinity.DeepCopy()}
 	}
 
-	return affinity, maps.Clone(pod.NodeSelector), slices.Clone(pod.Tolerations), true, nil
+	mirror.nodeSelector = maps.Clone(pod.NodeSelector)
+	mirror.tolerations = slices.Clone(pod.Tolerations)
+	mirror.pullSecrets = slices.Clone(pod.ImagePullSecrets)
+
+	return mirror, true, nil
 }
 
 func cacheOwnerReference(cache *racerv1.ClusterCache) metav1.OwnerReference {
 	return metav1.OwnerReference{APIVersion: racerv1.GroupVersion.String(), Kind: "ClusterCache", Name: cache.Name, UID: cache.UID, Controller: ptr.To(true)}
 }
 
-func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec originSpec, hash string, affinity *corev1.Affinity, nodeSelector map[string]string, tolerations []corev1.Toleration) *appsv1.DaemonSet {
+func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec originSpec, hash string, mirror originMirror) *appsv1.DaemonSet {
 	name := originName(cache.Name)
 	selector := map[string]string{"app.kubernetes.io/name": originAppName, originCacheLabel: originCacheValue(cache.Name)}
 
@@ -273,9 +298,10 @@ func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec origi
 						RunAsUser: ptr.To(int64(0)), RunAsGroup: ptr.To(int64(0)), RunAsNonRoot: ptr.To(false),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Affinity:     affinity,
-					NodeSelector: nodeSelector,
-					Tolerations:  tolerations,
+					Affinity:         mirror.affinity,
+					NodeSelector:     mirror.nodeSelector,
+					Tolerations:      mirror.tolerations,
+					ImagePullSecrets: mirror.pullSecrets,
 					Containers: []corev1.Container{{
 						Name:                     originContainerName,
 						Image:                    env.Config.Image(originImageName),
@@ -306,7 +332,7 @@ func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec origi
 }
 
 // planOrigin adds one cache's ServiceAccount and DaemonSet, or neither.
-func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, cache *racerv1.ClusterCache, spec originSpec, affinity *corev1.Affinity, nodeSelector map[string]string, tolerations []corev1.Toleration) error {
+func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, cache *racerv1.ClusterCache, spec originSpec, mirror originMirror) error {
 	hash, err := spec.hash()
 	if err != nil {
 		return err
@@ -327,7 +353,7 @@ func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, m
 		return err
 	}
 
-	ds := originDaemonSet(env, cache, spec, hash, affinity, nodeSelector, tolerations)
+	ds := originDaemonSet(env, cache, spec, hash, mirror)
 
 	dsOp, err := ownedRuntimeOperation(ctx, env, component.Operation{
 		Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, FailureDomain: domain,
@@ -363,9 +389,7 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 	var (
 		placement bool
 		found     bool
-		affinity  *corev1.Affinity
-		selector  map[string]string
-		tolerate  []corev1.Toleration
+		mirror    originMirror
 	)
 
 	for i := range caches.Items {
@@ -384,7 +408,7 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 		}
 
 		if !placement {
-			affinity, selector, tolerate, found, err = originPlacement(ctx, env)
+			mirror, found, err = originPlacement(ctx, env)
 			if err != nil {
 				return nil, false, err
 			}
@@ -397,7 +421,7 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 			continue
 		}
 
-		err = planOrigin(ctx, env, plan, marker, cache, spec, affinity.DeepCopy(), maps.Clone(selector), slices.Clone(tolerate))
+		err = planOrigin(ctx, env, plan, marker, cache, spec, mirror.clone())
 		if errors.Is(err, errNotOwned) {
 			invalid = append(invalid, fmt.Sprintf("%s (%v)", cache.Name, err))
 			continue
