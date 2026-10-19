@@ -3,6 +3,8 @@
 //! See `designs/racer-extent-volume.md`.
 
 mod format;
+mod node;
+mod tree;
 
 pub use format::{
     CLASSES, KEY_BYTES, Key, MAX_SLOTS, META_FIRST_NODE_UNIT, META_SLOT, MIN_SLOTS, NodeAddr,
@@ -10,3 +12,8 @@ pub use format::{
     VALUE_BYTES, Value, WHOLE_SLOT_CLASS, checksum, class_for, class_records, class_units,
     unit_offset,
 };
+pub use node::{
+    DecodedNode, Expect, INNER_CAPACITY, LEAF_CAPACITY, NODE_HEADER_BYTES, NODE_MAGIC,
+    NODE_VERSION, NodeBody, decode as decode_node, encode_inner, encode_leaf,
+};
+pub use tree::{CommitPlan, LoadReport, Loader, Range, Tree};
