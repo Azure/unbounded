@@ -170,8 +170,10 @@ fn relevant_quota_failure_still_reclaims_recycled_payload() {
     for completing in [false, true] {
         for cache_records in [false, true] {
             let length = 1 << 20;
+            // The recycler retains at most half a class limit, so the limit
+            // must be twice the retained length for one entry to be pooled.
             let admission = Quotas::new(Limits {
-                bytes: length,
+                bytes: 2 * length,
                 keys: 1,
             });
             let first = "first".to_owned();
@@ -186,7 +188,7 @@ fn relevant_quota_failure_still_reclaims_recycled_payload() {
             let (cache, class, amount) = if cache_records {
                 (Some(&second), Resource::Context, 1)
             } else {
-                (None, Resource::Staging, length)
+                (None, Resource::Staging, 2 * length)
             };
             let reservation = if completing {
                 admission.reserve_completion(cache, class, amount)
