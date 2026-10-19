@@ -120,10 +120,32 @@ A mostly-trusted network between the controller and the bare metal hosts is
 assumed. Bootstrap tokens (Kubernetes ServiceAccount tokens) are issued to
 nodes based on source IP - the controller looks up the Machine whose NIC
 matches the requesting IP and issues a short-lived token for that node.
+The source IP is the direct TCP peer address. `X-Forwarded-For`, `X-Real-IP`,
+and `Forwarded` headers are ignored, so metalman is not supported behind an
+HTTP proxy.
 
 Bootstrap tokens are delivered using the standard TPM 2.0 credential encryption workflow.
 The client's endorsement key (EK) public key is stored in `status.tpm.ekPublicKey` when first seen.
 So it's possible to prove that the bootstrap token was delivered only to trusted hosts.
+
+Before returning the token, metalman records its credential ID (`JTI=<jti>`)
+in `status.bootstrap.credentialID` and `status.bootstrap.issuedAt`, in the
+same status update as the EK pin. Re-attesting replaces it. This requires
+Kubernetes 1.30+ (ServiceAccount tokens with a `jti`); otherwise attestation
+fails. The served agent config pins the node name to the Machine's node name
+(`spec.kubernetes.nodeRef.name`, else the Machine name).
+
+The token is scoped to its Machine:
+
+- The machina controller approves kubelet client CSRs from
+  `metalman-bootstrap` only if the CSR's
+  `authentication.kubernetes.io/credential-id` extra matches exactly one
+  Machine's `status.bootstrap.credentialID` and the CN is
+  `system:node:<node name>` for that Machine. Otherwise it denies them.
+  kube-controller-manager does not auto-approve them.
+- A ValidatingAdmissionPolicy lets the ServiceAccount update only its own
+  Machine's status, without changing `status.tpm` or `status.bootstrap`. It
+  cannot create Machines.
 
 #### Sites
 

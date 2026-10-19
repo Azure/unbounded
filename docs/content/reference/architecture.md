@@ -189,7 +189,7 @@ For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 | SSH keys | Ed25519, RSA, and ECDSA supported (user-provided). Stored as Secrets in `unbounded-system`. |
 | SSH host verification | Currently disabled (`InsecureIgnoreHostKey`). The `status.ssh.fingerprint` field exists in the CRD but host key verification is not yet enforced. |
 | Bootstrap tokens | Standard kubeadm tokens (`token-id` + `token-secret`). SSH path passes as env var; PXE path encrypts via TPM. |
-| TPM attestation | TOFU EK pinning. AES-256-GCM encrypted service-account tokens with 1-hour expiry. |
+| TPM attestation | TOFU EK pinning. AES-256-GCM encrypted service-account tokens with 1-hour expiry. The token credential ID is recorded in `Machine.status.bootstrap`; machina approves kubelet CSRs only for the matching Machine's node name. Clients are identified by TCP peer address only (no proxy headers). Requires Kubernetes 1.30+. |
 | Redfish TLS | TOFU cert fingerprint pinning stored in `status.redfish.certFingerprint`. |
 | RBAC | Separate ServiceAccounts, Roles, and ClusterRoles per controller. |
 | Secret access | Via Kubernetes API only; never mounted as volumes. |

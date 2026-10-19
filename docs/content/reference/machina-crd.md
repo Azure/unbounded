@@ -261,6 +261,8 @@ after a controller restart. Each entry includes:
 | `ssh.fingerprint` | string | SSH host key fingerprint (not yet implemented). |
 | `redfish.certFingerprint` | string | BMC TLS certificate SHA-256 fingerprint. Set by metalman using TOFU. |
 | `tpm.ekPublicKey` | string | TPM endorsement key in PEM format. Set by metalman attestation using TOFU. |
+| `bootstrap.credentialID` | string | Credential ID (`JTI=<jti>`) of the last bootstrap token issued by metalman attestation. Used by machina to approve the node's kubelet CSR. |
+| `bootstrap.issuedAt` | time | When that bootstrap token was issued. |
 | `conditions` | []Condition | Standard Kubernetes conditions (see below). |
 
 ### Conditions
