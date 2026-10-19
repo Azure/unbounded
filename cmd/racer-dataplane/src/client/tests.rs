@@ -272,6 +272,52 @@ mod directory {
         assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o711);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o700);
     }
+    /// Installs `fd` as descriptor 3 without close-on-exec. `dup2(3, 3)` is a
+    /// no-op that keeps FD_CLOEXEC, so the flag is cleared explicitly.
+    /// Must only call async-signal-safe functions; it runs in `pre_exec`.
+    fn inherit_as_fd3(fd: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: dup2 and fcntl are async-signal-safe and touch only fds.
+        unsafe {
+            if libc::dup2(fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(3, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn inherit_as_fd3_survives_exec_for_self_and_other_descriptors() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        let root = Root::new();
+        let directory = open_directory(&root.0).unwrap();
+        let fd = directory.as_raw_fd();
+        for self_dup in [false, true] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "test -d /proc/self/fd/3"]);
+            // SAFETY: dup3 and inherit_as_fd3 only call async-signal-safe
+            // syscalls. The self-dup case first places a close-on-exec copy at
+            // fd 3 so inherit_as_fd3 deterministically sees dup2(3, 3).
+            unsafe {
+                command.pre_exec(move || {
+                    if !self_dup {
+                        return inherit_as_fd3(fd);
+                    }
+                    if fd != 3 && libc::dup3(fd, 3, libc::O_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    inherit_as_fd3(3)
+                });
+            }
+            assert!(command.status().unwrap().success(), "self_dup={self_dup}");
+        }
+    }
     #[test]
     fn nonroot_client_can_traverse_migrated_client_directory_when_root() {
         use std::os::unix::process::CommandExt;
@@ -292,15 +338,10 @@ mod directory {
             let fd = directory.as_raw_fd();
             let mut command = Command::new("/bin/sh");
             command.args(["-c", "test -e /proc/self/fd/3/probe"]);
-            // SAFETY: dup2 is async-signal-safe. Command drops supplementary
-            // groups itself when uid is set.
+            // SAFETY: inherit_as_fd3 only calls async-signal-safe syscalls.
+            // Command drops supplementary groups itself when uid is set.
             unsafe {
-                command.pre_exec(move || {
-                    if libc::dup2(fd, 3) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+                command.pre_exec(move || inherit_as_fd3(fd));
             }
             command.uid(65532).gid(65532).status().unwrap().success()
         };
