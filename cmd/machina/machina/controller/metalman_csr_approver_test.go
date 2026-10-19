@@ -37,7 +37,7 @@ func attestedMachine(name, nodeRef, credentialID string) *unboundedv1alpha3.Mach
 	}
 
 	if credentialID != "" {
-		m.Status.Bootstrap = &unboundedv1alpha3.BootstrapStatus{CredentialID: credentialID}
+		m.Status.Bootstrap = &unboundedv1alpha3.BootstrapStatus{CredentialID: credentialID, NodeName: m.NodeName()}
 	}
 
 	return m
@@ -329,32 +329,47 @@ func TestMetalmanCSRApproverConfirmsLiveMachine(t *testing.T) {
 	}
 }
 
-func TestMetalmanCSRApproverUsesLiveNodeName(t *testing.T) {
+// The approver matches the node name recorded with the credential, not the
+// live nodeRef, so a nodeRef edit during a replacement keeps approving the
+// name the host was configured with and the replacement waits for.
+func TestMetalmanCSRApproverUsesRecordedNodeName(t *testing.T) {
 	user := metalmanBootstrapUsername()
 
 	tests := map[string]struct {
-		cachedRef, liveRef string
-		approve            bool
-		contains           string
+		cachedRecorded, liveRecorded, liveRef, csrNode string
+		approve                                        bool
+		contains                                       string
 	}{
-		"approves stale cached name with matching live name": {
-			cachedRef: "node-old",
-			liveRef:   "node-new",
-			approve:   true,
+		"approves recorded name after nodeRef edit": {
+			cachedRecorded: "node-old", liveRecorded: "node-old", liveRef: "node-new", csrNode: "node-old",
+			approve: true,
 		},
-		"denies matching cached name with changed live name": {
-			cachedRef: "node-new",
-			liveRef:   "node-other",
-			contains:  `issued to Machine "m1"`,
+		"denies new nodeRef name not recorded": {
+			cachedRecorded: "node-old", liveRecorded: "node-old", liveRef: "node-new", csrNode: "node-new",
+			contains: `issued to Machine "m1"`,
+		},
+		"approves live record over stale cache": {
+			cachedRecorded: "node-old", liveRecorded: "node-new", liveRef: "node-new", csrNode: "node-new",
+			approve: true,
+		},
+		"denies stale cached record": {
+			cachedRecorded: "node-new", liveRecorded: "node-other", liveRef: "node-new", csrNode: "node-new",
+			contains: `issued to Machine "m1"`,
+		},
+		"denies empty recorded name": {
+			cachedRecorded: "", liveRecorded: "", liveRef: "node-new", csrNode: "node-new",
+			contains: `issued to Machine "m1"`,
 		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			cachedM := attestedMachine("m1", tt.cachedRef, "JTI=a")
+			cachedM := attestedMachine("m1", tt.liveRef, "JTI=a")
 			cachedM.UID = "uid-1"
+			cachedM.Status.Bootstrap.NodeName = tt.cachedRecorded
 			liveM := attestedMachine("m1", tt.liveRef, "JTI=a")
 			liveM.UID = "uid-1"
+			liveM.Status.Bootstrap.NodeName = tt.liveRecorded
 
 			cache := fake.NewClientBuilder().
 				WithScheme(scheme).
@@ -366,7 +381,7 @@ func TestMetalmanCSRApproverUsesLiveNodeName(t *testing.T) {
 			r, err := NewMetalmanCSRApprover(cache, live, kubefake.NewSimpleClientset())
 			require.NoError(t, err)
 
-			decision, err := r.Approver.Evaluate(context.Background(), metalmanKubeletCSR(t, user, "node-new", "JTI=a"))
+			decision, err := r.Approver.Evaluate(context.Background(), metalmanKubeletCSR(t, user, tt.csrNode, "JTI=a"))
 			require.NoError(t, err)
 			require.False(t, decision.Ignore)
 			require.Equal(t, tt.approve, decision.Approve, decision.Message)

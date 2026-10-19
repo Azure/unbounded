@@ -294,6 +294,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	issuedAt := metav1.Now()
 	node.Status.Bootstrap = &v1alpha3.BootstrapStatus{
 		CredentialID: credentialID,
+		NodeName:     node.NodeName(),
 		IssuedAt:     &issuedAt,
 	}
 

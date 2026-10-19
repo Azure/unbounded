@@ -753,6 +753,7 @@ func TestAttestRecordsCredentialIDWithEKInOneUpdate(t *testing.T) {
 	require.NotEmpty(t, m.Status.TPM.EKPublicKey)
 	require.NotNil(t, m.Status.Bootstrap)
 	require.Equal(t, "JTI=jti-1", m.Status.Bootstrap.CredentialID)
+	require.Equal(t, "bind-01", m.Status.Bootstrap.NodeName)
 	require.NotNil(t, m.Status.Bootstrap.IssuedAt)
 	require.True(t, m.Status.Bootstrap.IssuedAt.After(before))
 }
@@ -927,4 +928,31 @@ func TestAttestIgnoresForwardedHeaders(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("spoofed forwarded headers: expected 404, got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+func TestAttestRecordsLookupNodeName(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+	handler := testHandler(t, newPXEMachine("bind-ref", "aa:bb:cc:dd:ee:1f", "10.0.2.31"))
+	c := handler.StatusUpdater.(*testStatusUpdater).client
+
+	// The lookup may pin a node name (for example the name a virtual-media
+	// replacement captured) that differs from the live nodeRef.
+	handler.LookupMachine = func(r *http.Request) (*v1alpha3.Machine, error) {
+		var m v1alpha3.Machine
+		if err := c.Get(r.Context(), client.ObjectKey{Name: "bind-ref"}, &m); err != nil {
+			return nil, err
+		}
+
+		m.Spec.Kubernetes = &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{Name: "node-captured"}}
+
+		return &m, nil
+	}
+
+	doAttest(t, handler, "10.0.2.31", ekPub, srkPub)
+
+	var m v1alpha3.Machine
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-ref"}, &m))
+	require.Equal(t, "node-captured", m.Status.Bootstrap.NodeName)
+	require.Nil(t, m.Spec.Kubernetes)
 }

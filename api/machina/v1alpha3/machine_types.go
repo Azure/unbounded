@@ -802,9 +802,16 @@ type BootstrapStatus struct {
 	// token issued for this Machine, in the form the API server reports in
 	// the authentication.kubernetes.io/credential-id user extra
 	// (for example "JTI=<uuid>"). Kubelet client certificate requests made
-	// with the token are approved only for this Machine's node name.
+	// with the token are approved only for NodeName.
 	// +optional
 	CredentialID string `json:"credentialID,omitempty"`
+
+	// NodeName is the Kubernetes Node name the credential was issued for.
+	// It is the name written into the agent config served to the host, so
+	// later spec.kubernetes.nodeRef edits do not change which node the
+	// credential may claim.
+	// +optional
+	NodeName string `json:"nodeName,omitempty"`
 
 	// IssuedAt is when the credential was issued.
 	// +optional

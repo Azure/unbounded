@@ -4,14 +4,17 @@
 package netboot
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 func TestMediaAttestationFrozenLease(t *testing.T) {
@@ -133,5 +136,55 @@ func TestMediaAttestationLegacyLookup(t *testing.T) {
 				require.Equal(t, m.Spec, node.Spec)
 			})
 		}
+	}
+}
+
+// A nodeRef edit after the replacement captured its boot media must not change
+// the node name used for first boot: the agent config and the attestation view
+// keep the captured name, which is the Node replacement completion waits for.
+func TestMediaFirstBootPinsCapturedNodeName(t *testing.T) {
+	for name, tc := range map[string]struct {
+		captured, liveRef, want string
+	}{
+		"nodeRef edited mid-replacement":  {captured: "node-old", liveRef: "node-new", want: "node-old"},
+		"nodeRef added mid-replacement":   {captured: "host", liveRef: "node-new", want: "host"},
+		"nodeRef cleared mid-replacement": {captured: "node-old", want: "node-old"},
+		"empty capture uses live name":    {liveRef: "node-new", want: "node-new"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, m, op := firstBootFixture(t)
+			require.NoError(t, populateOCICache(h.Media.CacheDir, strings.Repeat("a", 64), map[string][]byte{
+				"cloud-init/vendor-data.tmpl": []byte(`{{ .AgentConfigJSON }}`),
+			}))
+
+			op.Status.Targets[0].BootMedia.NodeName = tc.captured
+			require.NoError(t, h.Media.Client.Status().Update(t.Context(), op))
+
+			m.Spec.Kubernetes = nil
+			if tc.liveRef != "" {
+				m.Spec.Kubernetes = &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{Name: tc.liveRef}}
+			}
+
+			require.NoError(t, h.Media.Client.Update(t.Context(), m))
+
+			w := firstBootRequest(h, "/cloud-init/vendor-data", "192.0.2.20", "")
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			var cfg provision.UnboundedAgentConfig
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &cfg))
+			require.Equal(t, tc.want, cfg.NodeName)
+			require.Equal(t, "host", cfg.MachineName)
+
+			r := httptest.NewRequest(http.MethodPost, "/attest", nil)
+			r.RemoteAddr = "192.0.2.20:4321"
+			node, err := h.Media.LookupAttestationMachine(r)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, node.NodeName())
+
+			// The live Machine spec is not rewritten.
+			var live v1alpha3.Machine
+			require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(m), &live))
+			require.Equal(t, m.Spec.Kubernetes, live.Spec.Kubernetes)
+		})
 	}
 }

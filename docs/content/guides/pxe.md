@@ -213,7 +213,7 @@ Metalman also sets the agent's node name to the Machine's node name (`spec.kuber
 
 The `metalman-bootstrap` ServiceAccount token is limited:
 
-- Kubelet client CSRs from this ServiceAccount are not auto-approved by kube-controller-manager. The machina controller approves a CSR only when its `authentication.kubernetes.io/credential-id` extra matches the `status.bootstrap.credentialID` of exactly one Machine, and the CN is `system:node:<node name of that Machine>`. Otherwise it denies the CSR.
+- Kubelet client CSRs from this ServiceAccount are not auto-approved by kube-controller-manager. The machina controller approves a CSR only when its `authentication.kubernetes.io/credential-id` extra matches the `status.bootstrap.credentialID` of exactly one Machine, and the CN is `system:node:<status.bootstrap.nodeName of that Machine>`, the node name recorded when the token was issued. Otherwise it denies the CSR.
 - A ValidatingAdmissionPolicy lets the ServiceAccount update only the status of its own Machine (matched by credential ID), and never `status.tpm` or `status.bootstrap`. It cannot create Machines.
 
 Metalman identifies clients only by the TCP peer address. It ignores `X-Forwarded-For`, `X-Real-IP`, and `Forwarded` headers. Running metalman behind an HTTP proxy is not supported.
