@@ -1665,7 +1665,7 @@ impl WorkerApplication {
     }
 
     /// Commit cache-tier disk index changes about once per second while there
-    /// are any. Storage-tier writes commit before they are acknowledged, so a
+    /// are any, including freed space that only later commits release. Storage-tier writes commit before they are acknowledged, so a
     /// crash loses at most the cache pages of the last interval.
     fn poll_disk_commit(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if let Some(Err(error)) = poll_task(&mut self.commit_task, cx)

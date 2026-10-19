@@ -494,7 +494,8 @@ impl Index {
         })
     }
 
-    /// Whether the volume has index changes that are not durable yet.
+    /// Whether the volume has commit work: index changes that are not durable
+    /// yet, or freed space that only later commits release.
     pub fn is_dirty(&self) -> bool {
         self.volume().is_some_and(|volume| volume.is_dirty())
     }

@@ -282,7 +282,8 @@ fn hold_acknowledgment_commits_extension_left_by_failed_commit() {
         f.store.writer.reserve_hold(&id.version, 1, first, &scope()),
     )
     .unwrap();
-    assert!(!index.is_dirty());
+    // Space freed by the retried commit drains with follow-up commits.
+    settle(&f);
 
     // The acknowledged deadline survives a crash.
     let f = f.restart_with(|| simulation.disk().crash().unwrap());
@@ -714,7 +715,9 @@ fn corrupt_held_storage_record_is_removed_and_rewritten_to_storage_tier() {
         // The removal is committed through the normal path.
         assert!(index.is_dirty());
         drive(&f.reactor, f.store.writer.commit(&scope())).unwrap();
-        assert!(!index.is_dirty());
+        // The freed record stays charged until later commits release it, and
+        // the index reports commit work until then, with no other writes.
+        settle(&f);
         // The one reserved hold page is free again, so a new fill rewrites
         // the page to the storage tier with the hold deadline.
         drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
@@ -723,7 +726,7 @@ fn corrupt_held_storage_record_is_removed_and_rewritten_to_storage_tier() {
         assert_ne!(repaired.generation, first.generation);
         assert_eq!(repaired.retain_until, first.retain_until);
         assert_eq!(index.held_page_expiry(&id), Some(until));
-        assert!(!index.is_dirty());
+        settle(&f);
         let read = drive(&f.reactor, f.store.reader.read(&id, &scope()))
             .unwrap()
             .unwrap();
@@ -1208,6 +1211,19 @@ impl Fixture {
         Self::in_directory(_directory)
     }
 }
+/// Commit until the index has no commit work, which includes freed space
+/// waiting for later commits. Fails if that takes more than a few commits.
+fn settle(f: &Fixture) {
+    let index = f.store.writer.index();
+    for _ in 0..4 {
+        if !index.is_dirty() {
+            return;
+        }
+        drive(&f.reactor, f.store.writer.commit(&scope())).unwrap();
+    }
+    assert!(!index.is_dirty(), "freed space never drained");
+}
+
 fn scope() -> RequestScope {
     RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(10)).unwrap()
 }
