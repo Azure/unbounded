@@ -933,6 +933,24 @@ spec:
                       nspawn machine.
                     type: string
                 type: object
+              bootstrap:
+                description: |-
+                  Bootstrap records the bootstrap credential most recently issued to
+                  this Machine by TPM attestation.
+                properties:
+                  credentialID:
+                    description: |-
+                      CredentialID is the ID of the most recent bootstrap ServiceAccount
+                      token issued for this Machine, in the form the API server reports in
+                      the authentication.kubernetes.io/credential-id user extra
+                      (for example "JTI=<uuid>"). Kubelet client certificate requests made
+                      with the token are approved only for this Machine's node name.
+                    type: string
+                  issuedAt:
+                    description: IssuedAt is when the credential was issued.
+                    format: date-time
+                    type: string
+                type: object
               conditions:
                 description: |-
                   Conditions represent the latest available observations of the

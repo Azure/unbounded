@@ -720,6 +720,11 @@ type MachineStatus struct {
 	// +optional
 	TPM *TPMStatus `json:"tpm,omitempty"`
 
+	// Bootstrap records the bootstrap credential most recently issued to
+	// this Machine by TPM attestation.
+	// +optional
+	Bootstrap *BootstrapStatus `json:"bootstrap,omitempty"`
+
 	// Agent holds the applied agent settings.
 	// +optional
 	Agent *AgentStatus `json:"agent,omitempty"`
@@ -779,6 +784,21 @@ type TPMStatus struct {
 	// EKPublicKey is the TPM endorsement key public key, written
 	// when the PXE boot image requests a bootstrap token.
 	EKPublicKey string `json:"ekPublicKey,omitempty"`
+}
+
+// BootstrapStatus identifies the bootstrap credential issued to a Machine.
+type BootstrapStatus struct {
+	// CredentialID is the ID of the most recent bootstrap ServiceAccount
+	// token issued for this Machine, in the form the API server reports in
+	// the authentication.kubernetes.io/credential-id user extra
+	// (for example "JTI=<uuid>"). Kubelet client certificate requests made
+	// with the token are approved only for this Machine's node name.
+	// +optional
+	CredentialID string `json:"credentialID,omitempty"`
+
+	// IssuedAt is when the credential was issued.
+	// +optional
+	IssuedAt *metav1.Time `json:"issuedAt,omitempty"`
 }
 
 // AgentStatus holds the applied agent settings for the machine.
