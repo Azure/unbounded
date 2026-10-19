@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -4058,4 +4059,46 @@ func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
 	}
 
 	t.Fatalf("timed out waiting for %s", url)
+}
+
+func TestResolveFile_AgentConfigPinsNodeName(t *testing.T) {
+	cases := []struct {
+		name       string
+		kubernetes *v1alpha3.KubernetesSpec
+		want       string
+	}{
+		{name: "defaults to machine name", want: "node-pin"},
+		{name: "empty nodeRef falls back", kubernetes: &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{}}, want: "node-pin"},
+		{name: "nodeRef override", kubernetes: &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{Name: "k8s-node-7"}}, want: "k8s-node-7"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := setupOCICache(t, "ghcr.io/test/image:v1", "pin123", map[string][]byte{
+				"agent.json.tmpl": []byte(`{{ .AgentConfigJSON }}`),
+			})
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-pin"},
+				Spec: v1alpha3.MachineSpec{
+					Kubernetes: tc.kubernetes,
+					PXE: &v1alpha3.PXESpec{
+						Image:      "ghcr.io/test/image:v1",
+						DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f9", IPv4: "10.0.1.19", SubnetMask: "255.255.255.0"}},
+					},
+				},
+			}
+			f := &FileResolver{
+				Cache:   cache,
+				Cluster: &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			}
+
+			resolved, err := f.ResolveFileByPath(t.Context(), "agent.json", node, "ghcr.io/test/image:v1")
+			require.NoError(t, err)
+
+			var cfg provision.UnboundedAgentConfig
+			require.NoError(t, json.Unmarshal(resolved.Data, &cfg))
+			require.Equal(t, tc.want, cfg.NodeName)
+			require.Equal(t, "node-pin", cfg.MachineName)
+		})
+	}
 }
