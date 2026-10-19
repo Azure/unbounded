@@ -464,12 +464,17 @@ impl WorkerDirectory {
                 scope,
                 None,
             )?;
+            // Record the worker before awaiting: a hold whose commit fails is
+            // still reserved in memory, and a failed admission must release
+            // its unused capacity. Releasing keeps published pages and refuses
+            // while a fill is active, so a worker that reserved nothing is
+            // unaffected.
+            fresh.push(mailbox.worker);
             match std::future::poll_fn(|cx| receipt.poll_completion(cx))
                 .await?
                 .value?
             {
                 Value::Held(_created, expiry) => {
-                    fresh.push(mailbox.worker);
                     accepted = accepted.max(expiry);
                 }
                 _ => return Err(Error::StaleFlight),

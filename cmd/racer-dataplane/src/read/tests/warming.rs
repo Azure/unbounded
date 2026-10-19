@@ -1002,3 +1002,137 @@ fn warm_follower_cancellation_waits_for_existing_foreground_supplier() {
     assert!(done);
     assert_eq!(f.origin.calls.get(), 1);
 }
+
+#[test]
+fn warm_hold_commit_failure_releases_reserved_capacity() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _simulation = simulation.enter();
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(1);
+    let mut f = fixture_with(7 * PAGE_BYTES, None);
+    f.reactor.init().unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            vec![Member {
+                node: node(0),
+                shares: NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:8200".into(),
+                rails: vec![],
+                site: String::new(),
+            }],
+        )
+        .unwrap(),
+    );
+    let (local, mut endpoint, _) = coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let owners = f.fill.dependencies.metadata_owner.clone();
+    owners
+        .warm
+        .configure(crate::read::warm::Config {
+            window: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let index = f.fill.dependencies.writer.index();
+    let request = || ClientRequest {
+        retain: Some(Duration::from_secs(60)),
+        kind: ReadKind::HeadPinned {
+            etag: f.page.version.etag.clone(),
+        },
+        origin: OriginContext {
+            object: f.context.object.clone(),
+            metadata: None,
+            authorization: None,
+        },
+    };
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    macro_rules! settle {
+        () => {
+            for _ in 0..8192 {
+                pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+                if owners.warm.snapshot().0 == 0 && !index.is_dirty() {
+                    break;
+                }
+                f.reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        };
+    }
+    // Publish page 0 under a hold, then fail the rest so the hold is trimmed
+    // to the published page.
+    f.origin.blocked_pages.borrow_mut().insert(1);
+    let mut head = local.read(request(), &f.scope);
+    let mut accepted = None;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = head.as_mut().poll(&mut cx) {
+            accepted = Some(result.unwrap());
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(accepted.unwrap().retain_until.is_some());
+    drop(head);
+    for _ in 0..8192 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        if f.origin.started_pages.borrow().contains(&1) {
+            break;
+        }
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    f.origin.version_unavailable.set(true);
+    f.origin.blocked_pages.borrow_mut().clear();
+    settle!();
+    assert_eq!(owners.warm.snapshot().0, 0);
+    assert!(index.held_page_expiry(&f.page).is_some());
+    assert!(!index.is_dirty());
+
+    // Raise the published page's deadline in memory so the next hold must
+    // commit, then fail that commit. The HEAD has reserved all seven pages.
+    index
+        .reserve_hold(
+            &f.page.version,
+            1,
+            uring_runtime::environment::wall_now() + Duration::from_secs(600),
+        )
+        .unwrap();
+    assert!(index.is_dirty());
+    simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
+    let mut refused = local.read(request(), &f.scope);
+    let mut response = None;
+    for _ in 0..8192 {
+        if let Poll::Ready(result) = refused.as_mut().poll(&mut cx) {
+            response = Some(result);
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    drop(refused);
+    assert!(
+        response
+            .unwrap()
+            .map_or(true, |response| response.retain_until.is_none()),
+        "a failed hold commit refuses retention"
+    );
+    settle!();
+    assert_eq!(owners.warm.snapshot().0, 0);
+    assert!(
+        index.held_page_expiry(&f.page).is_some(),
+        "release keeps the published page"
+    );
+    // The six unused pages are free for another version.
+    let mut other = f.page.version.clone();
+    other.etag = crate::model::StrongEtag::test_value("other-hold");
+    index
+        .reserve_hold(
+            &other,
+            7,
+            uring_runtime::environment::wall_now() + Duration::from_secs(30),
+        )
+        .expect("failed commit released its reserved capacity");
+    index.release_hold(&other).unwrap();
+    endpoint.uninstall().unwrap();
+}
