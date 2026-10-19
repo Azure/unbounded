@@ -4,9 +4,12 @@
 package metalman
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -15,6 +18,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -300,5 +304,94 @@ func TestMissingLiveRestrictionWithholdsGrantDespiteStaleCache(t *testing.T) {
 				t.Fatalf("grant after pass = %v, want NotFound", err)
 			}
 		})
+	}
+}
+
+// TestVerificationFailureFailsResultAndRecovers verifies that a failed live
+// read of the restriction keeps the grant withheld and reports a failed
+// result from every planner, so the pass is retried with backoff even when
+// the grant is already absent and the pass writes nothing that fires a watch.
+// Once the read succeeds, the grant is applied.
+func TestVerificationFailureFailsResultAndRecovers(t *testing.T) {
+	policy, binding := livePolicy(t), liveBinding(t)
+	withDefaults(policy, binding)
+
+	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: BootstrapServiceAccountName, Namespace: component.DefaultNamespace}}
+	applied, deletes := map[string]int{}, map[string]int{}
+	cached := bootstrapClient(t, "", applied, deletes, policy, binding, sa)
+
+	readErr := errors.New("apiserver unavailable")
+	failing := true
+	apiReader := interceptor.NewClient(
+		fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(policy.DeepCopy(), binding.DeepCopy(), sa.DeepCopy()).Build(),
+		interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*admissionv1.ValidatingAdmissionPolicyBinding); ok && failing {
+					return readErr
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		},
+	)
+	env := &component.Env{Client: cached, APIReader: apiReader, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	results := map[string]func() (*component.Plan, component.Result, error){
+		"Plan": func() (*component.Plan, component.Result, error) {
+			return Component{}.Plan(t.Context(), env, enabledSite())
+		},
+		"CleanupPlan": func() (*component.Plan, component.Result, error) {
+			return Component{}.CleanupPlan(t.Context(), env, disabledSite("rack-b"))
+		},
+		"Bootstrap": func() (*component.Plan, component.Result, error) {
+			return BootstrapComponent{}.Plan(t.Context(), env, nil)
+		},
+	}
+
+	for path, planFn := range results {
+		plan, res, err := planFn()
+		if err != nil {
+			t.Fatalf("%s: planning error %v, want the plan kept and a failed result", path, err)
+		}
+
+		if res.Ready || res.Reason != component.ReasonReconcileError || !errors.Is(res.Err, readErr) {
+			t.Errorf("%s: result = %+v, want failed with the read error", path, res)
+		}
+
+		if opsOf(plan, component.OpApply)[crbRef] > 0 || opsOf(plan, component.OpDelete)[crbRef] != 1 {
+			t.Errorf("%s: failed verification does not revoke the grant:\n%s", path, plan.Summary())
+		}
+	}
+
+	// The executed pass succeeds, but the combined result still fails, so the
+	// reconciler requeues with backoff.
+	if res := reconcile(t, env, enabledSite()); !errors.Is(res.Err, readErr) {
+		t.Fatalf("failed pass result = %+v, want the read error", res)
+	}
+
+	if applied[crbRef] != 0 {
+		t.Fatalf("grant applied %d times while verification failed, want 0", applied[crbRef])
+	}
+
+	// The retry reads the restriction and restores the grant.
+	failing = false
+
+	for path, planFn := range results {
+		plan, res, err := planFn()
+		if err != nil || res.Err != nil {
+			t.Fatalf("%s: recovered plan = %+v, %v, want success", path, res, err)
+		}
+
+		if opsOf(plan, component.OpDelete)[crbRef] > 0 || opsOf(plan, component.OpApply)[crbRef] != 1 {
+			t.Errorf("%s: recovered verification does not apply the grant:\n%s", path, plan.Summary())
+		}
+	}
+
+	if res := reconcile(t, env, enabledSite()); res.Err != nil || !res.Ready {
+		t.Fatalf("recovered pass result = %+v, want ready", res)
+	}
+
+	if applied[crbRef] != 1 {
+		t.Fatalf("grant applied %d times after recovery, want 1", applied[crbRef])
 	}
 }

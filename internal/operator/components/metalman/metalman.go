@@ -6,6 +6,8 @@ package metalman
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -13,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -59,7 +62,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, site *unbounded
 
 	plan := component.NewPlan()
 
-	restriction := addSupportOps(ctx, env, plan, support, c.Name(), site.Name)
+	restriction, verifyErr := addSupportOps(ctx, env, plan, support, c.Name(), site.Name)
 
 	plan.Add(component.Operation{
 		Kind:        component.OpApply,
@@ -69,6 +72,10 @@ func (c Component) Plan(ctx context.Context, env *component.Env, site *unbounded
 		Overridable: true,
 		DependsOn:   restriction,
 	})
+
+	if verifyErr != nil {
+		return plan, component.Failed(verifyErr), nil
+	}
 
 	return plan, component.Reconciled(), nil
 }
@@ -91,13 +98,20 @@ const BootstrapMachineBindingName = "metalman:bootstrap-machine"
 // the bootstrap grant is deleted rather than applied, and drifted specs are
 // replaced in full. The grant returns on a later pass once
 // the live restriction matches.
-func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan, support []*unstructured.Unstructured, componentName, site string) []component.ObjectRef {
+//
+// A verification that could not complete, such as a failed live read, is
+// returned as an error after the fail-closed operations are added. Callers
+// return the plan with a failed Result rather than a planning error: a
+// planning error discards the plan, which would drop the revocation, and a
+// successful Result would leave no retry when the pass writes nothing that
+// fires a watch.
+func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan, support []*unstructured.Unstructured, componentName, site string) ([]component.ObjectRef, error) {
 	// The executor ranks RBAC and Deployments ahead of admission policies, so
 	// without an explicit dependency the bootstrap grant and the token-minting
 	// Deployment would go live before the policy that restricts them, and stay
 	// live if the policy failed to apply.
 	restriction := admissionRefs(support)
-	repairs, verified := verifyRestriction(ctx, env, support)
+	repairs, verified, verifyErr := verifyRestriction(ctx, env, support)
 
 	for _, obj := range support {
 		if repair, ok := repairs[component.RefOf(obj)]; ok {
@@ -139,7 +153,7 @@ func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan
 		plan.Add(op)
 	}
 
-	return restriction
+	return restriction, verifyErr
 }
 
 // verifyRestriction compares the live admission policy and binding with the
@@ -151,13 +165,19 @@ func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan
 // still holds a deleted object the create is skipped as already applied and
 // the grant would go live without its restriction. The create event of each
 // admission object re-runs the plan, which grants once both read back live.
-func verifyRestriction(ctx context.Context, env *component.Env, support []*unstructured.Unstructured) (map[component.ObjectRef]component.Operation, bool) {
+//
+// Missing, terminating, and drifted objects are expected states that the
+// admission object watches re-trigger on. A verification that could not run
+// at all is also returned as an error, because nothing else retries it.
+func verifyRestriction(ctx context.Context, env *component.Env, support []*unstructured.Unstructured) (map[component.ObjectRef]component.Operation, bool, error) {
 	repairs := map[component.ObjectRef]component.Operation{}
 	verified := true
 
+	var errs []error
+
 	reader := env.LiveReader()
 	if reader == nil {
-		return repairs, false
+		return repairs, false, errors.New("verifying metalman bootstrap restriction: no reader configured")
 	}
 
 	for _, obj := range support {
@@ -174,12 +194,19 @@ func verifyRestriction(ctx context.Context, env *component.Env, support []*unstr
 
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, expected); err != nil {
 			verified = false
+
+			errs = append(errs, fmt.Errorf("verifying metalman bootstrap restriction: decode %s %s: %w", obj.GetKind(), obj.GetName(), err))
+
 			continue
 		}
 
 		err := reader.Get(ctx, client.ObjectKeyFromObject(expected), current)
 
 		switch {
+		case err != nil && !apierrors.IsNotFound(err):
+			verified = false
+
+			errs = append(errs, fmt.Errorf("verifying metalman bootstrap restriction: get %s %s: %w", obj.GetKind(), obj.GetName(), err))
 		case err != nil, current.GetDeletionTimestamp() != nil:
 			verified = false
 		case !equality.Semantic.DeepEqual(component.EffectiveAdmissionSpec(expected), component.EffectiveAdmissionSpec(current)):
@@ -194,7 +221,7 @@ func verifyRestriction(ctx context.Context, env *component.Env, support []*unstr
 		}
 	}
 
-	return repairs, verified
+	return repairs, verified, errors.Join(errs...)
 }
 
 // admissionRefs returns the refs of the admission policy objects in support.
@@ -235,7 +262,10 @@ func (c Component) CleanupPlan(ctx context.Context, env *component.Env, site *un
 	}, c.Name(), site.Name)
 	remove.FailureDomain = deploymentFailureDomain
 	plan.Add(remove)
-	addSupportOps(ctx, env, plan, support, c.Name(), site.Name)
+
+	if _, verifyErr := addSupportOps(ctx, env, plan, support, c.Name(), site.Name); verifyErr != nil {
+		return plan, component.Failed(verifyErr), nil
+	}
 
 	return plan, component.Disabled("component disabled"), nil
 }

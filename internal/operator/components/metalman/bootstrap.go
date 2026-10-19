@@ -136,7 +136,9 @@ func (c BootstrapComponent) Plan(ctx context.Context, env *component.Env, sites 
 		return nil, component.Result{}, err
 	}
 
-	addSupportOps(ctx, env, plan, support, c.Name(), "")
+	if _, verifyErr := addSupportOps(ctx, env, plan, support, c.Name(), ""); verifyErr != nil {
+		return plan, component.Failed(verifyErr), nil
+	}
 
 	return plan, component.NoSites("metalman bootstrap access restricted while no Sites exist"), nil
 }
