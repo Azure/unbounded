@@ -199,8 +199,8 @@ impl State {
     }
 
     /// Evict one data slot and remove its entries from the tree.
-    fn evict(&mut self, now: u64) -> Option<Vec<(Key, Value)>> {
-        let eviction = self.slots.evict_candidate(now)?;
+    fn evict(&mut self, now: u64, tier: Option<Tier>) -> Option<Vec<(Key, Value)>> {
+        let eviction = self.slots.evict_candidate_in(now, tier)?;
         let mut removed = Vec::with_capacity(eviction.keys.len());
         for key in eviction.keys {
             if self
@@ -944,7 +944,10 @@ impl<C: Charge> Volume<C> {
     }
 
     /// [`Volume::allocate`], evicting up to `max_evictions` slots while it
-    /// returns `Busy`. Returns the reservation and the entries removed by
+    /// returns `Busy`. When the storage slot quota is what blocks a storage
+    /// allocation, only expired storage slots are evicted (cache slots do not
+    /// count toward the quota), and it stops with `Busy` when there are none.
+    /// Returns the reservation and the entries removed by
     /// eviction (also when allocation still fails, they are gone).
     pub fn allocate_evicting(
         &self,
@@ -959,7 +962,14 @@ impl<C: Charge> Volume<C> {
             match self.allocate(tier, length) {
                 Err(Error::Busy) if evictions < max_evictions => {
                     evictions += 1;
-                    match self.evict_one(now) {
+                    let mut state = self.shared.state();
+                    let only = state
+                        .slots
+                        .storage_quota_blocks(tier, length)
+                        .then_some(Tier::Storage);
+                    let removed = state.evict(now, only);
+                    drop(state);
+                    match removed {
                         Some(removed) => evicted.extend(removed),
                         None => return (Err(Error::Busy), evicted),
                     }
@@ -979,7 +989,7 @@ impl<C: Charge> Volume<C> {
     /// storage: an older on-disk tree that still points into it is caught by
     /// the record header check.
     pub fn evict_one(&self, now: u64) -> Option<Vec<(Key, Value)>> {
-        self.shared.state().evict(now)
+        self.shared.state().evict(now, None)
     }
 
     /// A unique, nonzero write id, larger than any id handed out or committed
@@ -1324,7 +1334,7 @@ impl<C: Charge> Volume<C> {
                         evictions += 1;
                         state.release_freed();
                         // `now = 0` never evicts protected storage.
-                        if state.evict(0).is_none() {
+                        if state.evict(0, None).is_none() {
                             drop(state);
                             return attempt.fail(Error::Busy.into());
                         }

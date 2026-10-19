@@ -669,6 +669,21 @@ impl Slots {
         })
     }
 
+    /// Whether [`Slots::allocate`] for `tier` and `length` would fail only
+    /// because the storage slot quota is reached: no open or partly filled
+    /// slot of the class can take the record and storage slots are at the
+    /// quota. Evicting cache slots cannot help then.
+    pub fn storage_quota_blocks(&self, tier: Tier, length: u64) -> bool {
+        let Some(class) = super::format::class_for(length) else {
+            return false;
+        };
+        let index = tier_class(tier, class);
+        tier == Tier::Storage
+            && self.open[index] == NONE
+            && self.partial[index].is_empty()
+            && self.storage_slots >= self.limits.storage_slots
+    }
+
     /// Record that the reserved unit now holds an index entry for `key`, and
     /// raise the slot's `retain_until`. Call after the tree insert.
     pub fn commit_record(
@@ -785,6 +800,12 @@ impl Slots {
     /// chosen slot is not used for allocation until it is finished or
     /// canceled.
     pub fn evict_candidate(&mut self, now: u64) -> Option<Eviction> {
+        self.evict_candidate_in(now, None)
+    }
+
+    /// [`Slots::evict_candidate`] limited to slots of `tier` when it is set.
+    /// Slots of other tiers are skipped without clearing their reference bit.
+    pub fn evict_candidate_in(&mut self, now: u64, tier: Option<Tier>) -> Option<Eviction> {
         let count = self.slots.len() as u32;
         for _ in 0..2 * count {
             let slot = self.hand;
@@ -794,7 +815,10 @@ impl Slots {
                 self.hand + 1
             };
             let entry = &mut self.slots[slot as usize];
-            if entry.kind != KIND_DATA || entry.flags & (OPEN | EVICTING) != 0 {
+            if entry.kind != KIND_DATA
+                || entry.flags & (OPEN | EVICTING) != 0
+                || tier.is_some_and(|tier| entry.tier() != tier)
+            {
                 continue;
             }
             if entry.flags & REFERENCED != 0 {

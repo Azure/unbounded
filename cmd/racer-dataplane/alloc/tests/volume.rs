@@ -315,6 +315,50 @@ mod simulation {
     }
 
     #[test]
+    fn storage_quota_evicts_only_expired_storage() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let limits = Limits {
+            storage_slots: 1,
+            small_bytes: u64::MAX,
+        };
+        // Meta slot plus three data slots: one storage, two cache.
+        let (volume, slab, _) = mount(&reactor, 4, limits).unwrap();
+        let whole = SLOT_BYTES - 100;
+        put(
+            &reactor,
+            &volume,
+            &slab,
+            Tier::Storage,
+            key(1, 0),
+            whole,
+            1000,
+        )
+        .unwrap();
+        for n in 1..3 {
+            put(&reactor, &volume, &slab, Tier::Cache, key(1, n), whole, 0).unwrap();
+        }
+        // Quota reached and the storage slot is retained: no cache slot is
+        // evicted for a storage allocation.
+        let (reservation, evicted) = volume.allocate_evicting(Tier::Storage, whole, 50, 64);
+        assert_eq!(reservation.err(), Some(Error::Busy));
+        assert!(evicted.is_empty());
+        for n in 0..3 {
+            assert!(volume.get(&key(1, n)).is_some());
+        }
+        // Once the storage slot expires, it is evicted and reused.
+        let (reservation, evicted) = volume.allocate_evicting(Tier::Storage, whole, 2000, 64);
+        assert!(reservation.is_ok());
+        assert_eq!(
+            evicted.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [key(1, 0)]
+        );
+        for n in 1..3 {
+            assert!(volume.get(&key(1, n)).is_some());
+        }
+    }
+
+    #[test]
     fn quotas_return_busy() {
         let (_sim, _env) = setup();
         let reactor = TestReactor::new(64, ());
