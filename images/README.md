@@ -18,8 +18,8 @@ produces `ghcr.io/<owner>/agent-ubuntu2404`.
 ## Building Images
 
 Images are built automatically by the **Build Container Images** GitHub Actions workflow
-(`.github/workflows/images.yaml`). All builds produce multi-arch images for `linux/amd64` and
-`linux/arm64`.
+(`.github/workflows/images.yaml`). Builds default to multi-arch images for `linux/amd64` and
+`linux/arm64`, except for the ARM64-only GB200 Ubuntu host disk described below.
 
 ### Metalman Netboot Image
 
@@ -55,6 +55,15 @@ tagged with the full git commit SHA:
 ```
 ghcr.io/<owner>/agent-ubuntu2404:<commit-sha>
 ```
+
+### GB200 Ubuntu Host Disk
+
+`host-ubuntu2404-gb200` is ARM64-only and uses a native ARM64 builder.
+Unlike ordinary image publication, its disk must pass an offline driver
+contract and an ARM64 UEFI boot check before it is pushed. See
+[`host-ubuntu2404-gb200/README.md`](host-ubuntu2404-gb200/README.md) for the
+pinned Ubuntu/NVIDIA/MANA tuple and the limits of this qualification.
+Building it does not deploy or repave any machine.
 
 ## Adding a New Image
 
