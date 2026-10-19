@@ -294,7 +294,15 @@ mod directory {
         use std::process::Command;
         let root = Root::new();
         let directory = open_directory(&root.0).unwrap();
-        let fd = directory.as_raw_fd();
+        // Move the source to fd >= 4 so the normal case never self-dups.
+        // SAFETY: F_DUPFD_CLOEXEC returns a new fd that OwnedFd then owns.
+        use std::os::fd::FromRawFd;
+        let high = unsafe {
+            let raw = libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4);
+            assert!(raw >= 4, "{}", std::io::Error::last_os_error());
+            std::os::fd::OwnedFd::from_raw_fd(raw)
+        };
+        let fd = high.as_raw_fd();
         for self_dup in [false, true] {
             let mut command = Command::new("/bin/sh");
             command.args(["-c", "test -d /proc/self/fd/3"]);
@@ -306,7 +314,7 @@ mod directory {
                     if !self_dup {
                         return inherit_as_fd3(fd);
                     }
-                    if fd != 3 && libc::dup3(fd, 3, libc::O_CLOEXEC) < 0 {
+                    if libc::dup3(fd, 3, libc::O_CLOEXEC) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     if libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
