@@ -17,7 +17,9 @@
 //! 5. [`Volume::commit`] makes the entry durable. Storage writes must wait for
 //!    it before they are acknowledged. Cache writes are committed lazily, for
 //!    example by a timer that calls `commit` every second when
-//!    [`Volume::is_dirty`].
+//!    [`Volume::is_dirty`]. Freed storage records and nodes also make the
+//!    volume dirty until later commits release them, so such a timer keeps
+//!    committing until the space is reusable.
 //!
 //! # Reuse of space
 //!
@@ -844,11 +846,15 @@ impl<C: Charge> Volume<C> {
     }
 
     /// Whether a commit has work to do: index changes that are not durable
-    /// yet, or (after a mount that did not format) the generation skip, which
-    /// the first commit persists.
+    /// yet, (after a mount that did not format) the generation skip, which
+    /// the first commit persists, or freed space that only later successful
+    /// commits release. Freed space drains within two successful commits
+    /// after the last free, so a lazy committer stops once it is released.
     pub fn is_dirty(&self) -> bool {
         let state = self.shared.state();
-        state.tree.is_dirty() || state.mutations > self.commit.borrow().durable_mutations
+        state.tree.is_dirty()
+            || state.slots.has_pending()
+            || state.mutations > self.commit.borrow().durable_mutations
     }
 
     /// Value of `key`.
@@ -1203,12 +1209,33 @@ impl<C: Charge> Volume<C> {
         S::Error: From<Error>,
     {
         let target = self.shared.state().mutations;
-        let finished_at_call = self.commit.borrow().finished;
+        // Freed space is released only by later successful commits. When
+        // some is pending, this call runs (or joins) at least one attempt
+        // that starts after it, even with no new changes. One such attempt
+        // is enough, so repeated calls drain the space without looping.
+        let reclaim = self.shared.state().slots.has_pending();
+        let (finished_at_call, attempts_at_call) = {
+            let commit = self.commit.borrow();
+            (commit.finished, commit.attempts)
+        };
         Box::pin(async move {
             loop {
                 let wait_for = {
                     let commit = self.commit.borrow();
-                    if commit.durable_mutations >= target {
+                    if commit.durable_mutations >= target
+                        && (!reclaim || commit.finished > attempts_at_call)
+                    {
+                        if let Some(failure) = &commit.failure
+                            && reclaim
+                            && failure.attempt == commit.finished
+                            && failure.attempt > attempts_at_call
+                        {
+                            return Err(failure
+                                .error
+                                .downcast_ref::<S::Error>()
+                                .copied()
+                                .unwrap_or_else(|| uring_runtime::Error::Io.into()));
+                        }
                         return Ok(());
                     }
                     if let Some(failure) = &commit.failure

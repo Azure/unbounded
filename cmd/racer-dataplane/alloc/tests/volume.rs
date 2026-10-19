@@ -219,6 +219,11 @@ mod simulation {
         // Failed attempts leak nothing beyond pending nodes.
         assert_eq!(volume.usage().records, before.records);
         drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        // Freed space drains with two more commits.
+        assert!(volume.is_dirty());
+        for _ in 0..2 {
+            drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        }
         assert!(!volume.is_dirty());
         crash(&sim, volume, slab);
         let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
@@ -480,6 +485,43 @@ mod simulation {
         drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
         let next = put(&reactor, &volume, &slab, Tier::Storage, key(1, 3), 4096, 0).unwrap();
         assert_eq!((next.slot, next.unit), (first.slot, first.unit));
+    }
+
+    /// Pending storage space at the quota is released by commits with no new
+    /// changes, and the volume reports commit work until it drains.
+    #[test]
+    fn pending_space_drains_without_new_changes() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let limits = Limits {
+            storage_slots: 1,
+            small_bytes: u64::MAX,
+        };
+        let (volume, slab, _) = mount(&reactor, SLOTS, limits).unwrap();
+        let whole = SLOT_BYTES;
+        put(&reactor, &volume, &slab, Tier::Storage, key(1, 0), whole, 0).unwrap();
+        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        volume.remove(&key(1, 0));
+        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        // The removed record is still charged.
+        assert_eq!(
+            volume.allocate(Tier::Storage, whole).err(),
+            Some(Error::Busy)
+        );
+        assert!(volume.is_dirty());
+        let mut commits = 0;
+        while volume.is_dirty() {
+            assert!(commits < 4, "pending space never drained");
+            drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+            commits += 1;
+        }
+        assert!(commits >= 1);
+        assert!(volume.allocate(Tier::Storage, whole).is_ok());
+        // Once drained, a commit has nothing to do.
+        let attempts = volume.commit_stats().attempts;
+        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        assert_eq!(volume.commit_stats().attempts, attempts);
+        assert!(!volume.is_dirty());
     }
 
     /// A corrupt leaf loses only its range, which is salvaged from the older

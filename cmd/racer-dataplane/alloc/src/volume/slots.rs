@@ -561,6 +561,12 @@ impl Slots {
         self.last_success = self.last_success.max(epoch);
     }
 
+    /// Whether freed space is still waiting for later successful commits.
+    /// Two successful commits after the last free release all of it.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// A commit attempt failed. Nothing is released.
     pub fn commit_failed(&mut self, _epoch: u64) {}
 

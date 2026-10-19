@@ -200,12 +200,17 @@ epoch at the time it was freed. When a commit succeeds, the volume releases
 every address tagged at or before the previous successful commit. Both
 superblocks then only reference live space.
 
+While freed space is pending, the volume counts as dirty, and a commit runs
+an attempt even when the tree has no changes. Such an attempt only writes a
+new superblock for the same root. Two successful commits after the last free
+release everything, so the lazy committer stops after that.
+
 This rule covers tree nodes and storage data. Cache data is reused at once,
 because a stale cache entry fails its generation check and becomes a miss.
 
 ### Tiers
 
-- Cache inserts are committed lazily, by default every second when the tree is
+- Cache inserts are committed lazily, by default every second when the volume is
   dirty. A crash loses only cache inserts made after the last commit.
 - Storage inserts wait for a commit before they are acknowledged. Concurrent
   writers share one commit.
