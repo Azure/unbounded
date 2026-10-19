@@ -182,7 +182,6 @@ pub struct CandidatePolicy {
 #[derive(Default)]
 struct OwnershipRefresh {
     cursor: Option<page_alloc::volume::Key>,
-    visited: usize,
     active: Option<crate::model::PageId>,
 }
 #[derive(Clone, Copy)]
@@ -606,18 +605,14 @@ impl CandidatePolicy {
         let snapshot = self.published.current()?.ok_or(Error::Unavailable)?;
         let mut work = self.ownership_refresh.borrow_mut();
         if work.active.is_none() {
-            // Continuous appends must not keep a pass chasing the moving tail
-            // forever while earlier residents retain missing topology hints.
-            if work.visited >= index.page_capacity() {
-                work.cursor = None;
-                work.visited = 0;
-                return Ok(crate::topology::Maintenance::Idle);
-            }
+            // The cursor only moves forward in key order, so every resident
+            // present at pass start is visited before the pass ends. Pages
+            // appended behind the cursor wait for the next pass; the pass is
+            // not bounded by `page_capacity`, which bounds versions, not pages.
             let (cursor, mut pages) = index.resident_pages_after(work.cursor.as_ref(), 1);
             let exhausted = cursor.is_none();
             work.cursor = cursor;
             work.active = pages.pop();
-            work.visited += usize::from(work.active.is_some());
             if work.active.is_none() && !exhausted {
                 // An entry of an unknown version: skip it, bounded per turn.
                 return Ok(crate::topology::Maintenance::Progress);
@@ -625,7 +620,6 @@ impl CandidatePolicy {
         }
         let Some(page) = &work.active else {
             work.cursor = None;
-            work.visited = 0;
             return Ok(crate::topology::Maintenance::Idle);
         };
         if self
@@ -2816,6 +2810,66 @@ pub(super) mod tests {
         .unwrap();
         assert!(!policy.owns_current(&page));
         assert!(peers.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn ownership_refresh_visits_more_pages_than_version_capacity() {
+        use crate::model::{PageId, VersionMetadata, WorkerId};
+        use crate::store::catalog::Index;
+        let members = crate::topology::tests::fixtures::membership(1000);
+        let version = ObjectVersion {
+            object: object(),
+            etag: StrongEtag::test_value("many"),
+        };
+        let pages: Vec<_> = (0..4)
+            .map(|n| PageId {
+                version: version.clone(),
+                number: PageNumber(n),
+            })
+            .collect();
+        let peers = Rc::new(RecordedPeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let node = members.members()[0].node.clone();
+        let mut policy = policy(node, peers);
+        let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
+        index.set_page_capacity(1).unwrap();
+        let disk = crate::store::test_disk::TestDisk::mount(&index, 8);
+        for page in &pages {
+            disk.put(
+                &index,
+                page,
+                &VersionMetadata {
+                    content_type: None,
+                    version: version.clone(),
+                    length: 1 << 40,
+                },
+                crate::model::key_id_from_generation(1, 1).unwrap(),
+                page_alloc::volume::Tier::Cache,
+            );
+        }
+        assert_eq!(index.resident_pages_after(None, 8).1.len(), pages.len());
+        policy.published = crate::test_support::published_membership(members.clone());
+        let mut idle = 0;
+        for _ in 0..200 {
+            if policy.refresh_ownership(&index).unwrap() == crate::topology::Maintenance::Idle {
+                idle += 1;
+                if idle == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(idle, 2);
+        for page in &pages {
+            assert!(
+                policy
+                    .placement
+                    .cached(members.clone(), &page.version.object, page.number,)
+                    .is_some(),
+                "page {page:?} was not refreshed"
+            );
+        }
     }
 
     #[test]
