@@ -268,6 +268,9 @@ impl<C: Charge> Slab<C> {
     fn bind(&self, segments: &Segments) -> Result<()> {
         let mut opened = self.opened.borrow_mut();
         let slab = opened.as_mut().ok_or(Error::Unavailable)?;
+        if slab.volume.is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         let geometry = slab.geometry;
         let identity = segments.table_identity();
         if let Some(bound) = slab.table.as_ref()
@@ -360,6 +363,7 @@ impl<C: Charge> Slab<C> {
                     backing: OpenBacking::Devices(opened),
                     geometry: *geometry,
                     table: None,
+                    volume: None,
                 });
                 *placements.borrow_mut() = Vec::new();
                 return Ok(geometry.alignment());
@@ -464,6 +468,7 @@ impl<C: Charge> Slab<C> {
             backing: OpenBacking::File(Rc::new(file)),
             geometry,
             table: None,
+            volume: None,
         });
     }
 
@@ -617,6 +622,164 @@ impl<C: Charge> Slab<C> {
         })
     }
 
+    /// Blocking startup helper that binds the slab for extent volume use, with
+    /// no segment table. Slots are segments; `slot_count` may be at most
+    /// `volume::MAX_SLOTS` and at most the physical segment count. The volume
+    /// uses `volume::SLOT_BYTES` segments. Read and write go through
+    /// [`Slab::read_at`] and [`Slab::write_at`]. A slab bound to a segment table
+    /// cannot be bound for volume use, and the reverse.
+    pub fn open_volume(&self, slot_count: u64) -> Result<Alignment> {
+        if slot_count == 0 || slot_count > crate::volume::MAX_SLOTS {
+            return Err(Error::InvalidConfiguration);
+        }
+        let alignment = self.open_file()?;
+        let mut opened = self.opened.borrow_mut();
+        let slab = opened.as_mut().ok_or(Error::Unavailable)?;
+        if slab.table.is_some()
+            || slab.volume.is_some_and(|count| count != slot_count)
+            || slot_count > slab.geometry.segment_count()
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        slab.volume = Some(slot_count);
+        Ok(alignment)
+    }
+
+    /// Map an absolute slab offset to a backing descriptor and physical extent.
+    fn volume_submission(
+        &self,
+        offset: u64,
+        buffer: &AlignedBuffer<C>,
+    ) -> Result<(Rc<Descriptor>, Extent)> {
+        let opened = self.opened.borrow();
+        let slab = opened.as_ref().ok_or(Error::Unavailable)?;
+        let count = slab.volume.ok_or(Error::Unavailable)?;
+        let extent = Extent::new(offset, buffer.len())?;
+        slab.geometry.alignment().check(extent, buffer)?;
+        let segment = offset / self.segment_bytes;
+        let start = segment * self.segment_bytes;
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or(Error::Corrupt)?;
+        if segment >= count || end > start + self.segment_bytes {
+            return Err(Error::Corrupt);
+        }
+        match &slab.backing {
+            OpenBacking::File(file) => Ok((file.clone(), extent)),
+            OpenBacking::Devices(placements) => {
+                let position = usize::try_from(segment).map_err(|_| Error::Corrupt)?;
+                let placement = placements.get(position).ok_or(Error::Corrupt)?;
+                let physical = Extent::new(
+                    placement
+                        .offset
+                        .checked_add(offset - start)
+                        .ok_or(Error::Corrupt)?,
+                    buffer.len(),
+                )?;
+                slab.geometry.alignment().check(physical, buffer)?;
+                Ok((placement.file.clone(), physical))
+            }
+        }
+    }
+
+    /// Check a volume request and bundle it with its guard.
+    fn prepare_at<G: 'static>(
+        &self,
+        offset: u64,
+        buffer: AlignedBuffer<C>,
+        guard: G,
+    ) -> Result<Submission<C, G>> {
+        let (file, extent) = self.volume_submission(offset, &buffer)?;
+        Ok(Submission {
+            file,
+            extent,
+            buffer,
+            lease: guard,
+        })
+    }
+
+    /// Read `buffer.len()` bytes at an absolute slab offset of a volume-bound
+    /// slab. `guard` (for example a slot lease) is held until completion. The
+    /// transfer must be aligned and stay inside one segment, or it fails with
+    /// `InvalidConfiguration` (alignment) or `Corrupt` (range). Returns
+    /// `Unavailable` unless [`Slab::open_volume`] succeeded.
+    pub fn read_at<'a, S: Scope, B: Budget, G: 'static>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        offset: u64,
+        buffer: AlignedBuffer<C>,
+        guard: G,
+        scope: &'a S,
+    ) -> Operation<'a, AlignedBuffer<C>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            self.prepare_at(offset, buffer, guard)?
+                .read(reactor, scope)
+                .await
+        })
+    }
+
+    /// Write `buffer.len()` bytes at an absolute slab offset of a volume-bound
+    /// slab, with the same checks as [`Slab::read_at`]. The write counts toward
+    /// [`Slab::fence_writes`]. It is not durable until [`Slab::sync`].
+    pub fn write_at<'a, S: Scope, B: Budget, G: 'static>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        offset: u64,
+        buffer: AlignedBuffer<C>,
+        guard: G,
+        scope: &'a S,
+    ) -> Operation<'a, AlignedBuffer<C>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let submission = self.prepare_at(offset, buffer, guard)?;
+            let fence = self.writes.acquire()?;
+            submission.write(reactor, scope, fence).await
+        })
+    }
+
+    /// Fsync every distinct backing descriptor, making completed writes
+    /// durable. Writes still in flight are not covered; wait for them first.
+    /// Returns `Unavailable` before startup.
+    pub fn sync<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let files = self.descriptors()?;
+            for file in files {
+                reactor.file_sync(file, scope).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Distinct backing descriptors, in first-use order.
+    fn descriptors(&self) -> Result<Vec<Rc<Descriptor>>> {
+        let opened = self.opened.borrow();
+        let slab = opened.as_ref().ok_or(Error::Unavailable)?;
+        Ok(match &slab.backing {
+            OpenBacking::File(file) => vec![file.clone()],
+            OpenBacking::Devices(placements) => {
+                let mut files: Vec<Rc<Descriptor>> = Vec::new();
+                for placement in placements {
+                    if !files.iter().any(|f| Rc::ptr_eq(f, &placement.file)) {
+                        files.push(placement.file.clone());
+                    }
+                }
+                files
+            }
+        })
+    }
+
     /// Reuse charged capacity in the same size class without discarding mismatches.
     pub fn allocate(&self, length: usize, charge: C) -> Result<AlignedBuffer<C>> {
         let alignment = self.alignment()?;
@@ -677,6 +840,9 @@ struct OpenSlab {
     geometry: SegmentGeometry,
 
     table: Option<TableIdentity>,
+
+    // Slot count when bound for volume use instead of a segment table.
+    volume: Option<u64>,
 }
 
 /// Runtime owners shared by all submissions to a backing file.
@@ -693,17 +859,17 @@ struct OpenPlacement {
 
 /// A validated transfer owns every resource needed to keep kernel access safe.
 /// Only Slab::prepare constructs this capability, and submission consumes it.
-struct Submission<C: Charge> {
+struct Submission<C: Charge, G: 'static = SegmentLease> {
     file: Rc<Descriptor>,
 
     extent: Extent,
 
     buffer: AlignedBuffer<C>,
 
-    lease: SegmentLease,
+    lease: G,
 }
 
-impl<C: Charge> Submission<C> {
+impl<C: Charge, G: 'static> Submission<C, G> {
     /// Move the complete read capability into the reactor's completion ownership.
     async fn read<S: Scope, B: Budget>(
         self,
