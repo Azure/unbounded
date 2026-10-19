@@ -857,6 +857,29 @@ mod tests {
     }
 
     #[test]
+    fn restored_pages_count_indexed_payload_bytes() {
+        let index = index(8);
+        let disk = TestDisk::mount(&index, 8);
+        let metadata = descriptor("kept", 17);
+        disk.put(
+            &index,
+            &page(&metadata, 0),
+            &metadata,
+            key_id(),
+            Tier::Cache,
+        );
+        disk.commit(&index);
+        let snapshot = index.snapshot().unwrap();
+        let fresh = Index::new(WorkerId(0), 8, crate::test_support::availability());
+        let _disk = disk.crash(&fresh);
+        assert_eq!(fresh.retention().snapshot().indexed_payload_bytes, 0);
+        fresh.restore(snapshot).unwrap();
+        assert_eq!(fresh.retention().snapshot().indexed_payload_bytes, 17);
+        fresh.remove_cache(&metadata.version.object.cache);
+        assert_eq!(fresh.retention().snapshot().indexed_payload_bytes, 0);
+    }
+
+    #[test]
     fn hold_extension_is_durable_only_after_commit() {
         let index = index(8);
         let disk = TestDisk::mount(&index, 16);

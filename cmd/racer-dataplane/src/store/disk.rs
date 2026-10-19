@@ -106,6 +106,43 @@ impl Index {
                 let _ = versions.insert(entry);
             }
         }
+        drop(versions);
+        self.restore_residents(&volume);
+    }
+
+    /// Track retention residency and indexed payload bytes of mounted pages
+    /// whose version is known, as publication does for new pages.
+    fn restore_residents(&self, volume: &DiskVolume) {
+        let versions = self.versions.borrow();
+        let mut residents = self.residents.borrow_mut();
+        let retention = self.retention();
+        let mut cursor: Option<Key> = None;
+        loop {
+            let batch = volume.next_after(cursor.as_ref(), SCAN_BATCH);
+            let Some((last, _)) = batch.last() else {
+                break;
+            };
+            cursor = Some(*last);
+            for (key, _) in batch {
+                let Some(entry) = versions.get(&key_version(&key)) else {
+                    continue;
+                };
+                let page = PageId {
+                    version: entry.version.clone(),
+                    number: PageNumber(u64::from(key.page())),
+                };
+                let Ok(payload) = entry.metadata.page_length(&page) else {
+                    continue;
+                };
+                if let std::collections::hash_map::Entry::Vacant(slot) = residents.entry(key)
+                    && let Ok(mut resident) = self.track(&page)
+                {
+                    let payload = u64::from(payload);
+                    resident.payload = Some(retention.payload(payload, true));
+                    slot.insert((resident, payload));
+                }
+            }
+        }
     }
 
     pub(crate) fn volume(&self) -> Option<Rc<DiskVolume>> {
