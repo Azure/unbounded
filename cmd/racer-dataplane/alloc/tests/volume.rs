@@ -4,13 +4,13 @@ mod common;
 
 use common::*;
 use page_alloc::Error;
-use page_alloc::volume::{Limits, SLOT_BYTES, SlotKind, Tier, UNIT_BYTES};
-use std::ops::Bound;
+use page_alloc::volume::{Limits, SLOT_BYTES, Tier};
 
 #[cfg(feature = "simulation")]
 mod simulation {
     use super::*;
-    use page_alloc::volume::{Key, RETAIN_FOREVER, WHOLE_SLOT_CLASS};
+    use page_alloc::volume::{Key, RETAIN_FOREVER, SlotKind, UNIT_BYTES, WHOLE_SLOT_CLASS};
+    use std::ops::Bound;
     use std::rc::Rc;
     use uring_runtime::reactor::simulation::{Fault, Simulation, disk::DiskState};
 
@@ -95,6 +95,10 @@ mod simulation {
         let (volume, _slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         assert_eq!(report.seq, 3);
         assert_eq!(report.entries, 301);
+        // Nodes only the older tree references stay reserved.
+        assert!(report.pending_nodes > 0);
+        assert!(volume.usage().pending_units >= report.pending_nodes);
+        assert!(volume.is_dirty());
         assert!(volume.get(&key(2, 1)).is_some());
     }
 
@@ -622,8 +626,6 @@ fn io_uring_volume_round_trip() {
         assert_eq!(volume.get(&key), Some(*value));
         assert!(check(&reactor, &volume, &slab, &key, value).unwrap());
     }
-    let _ = Bound::<u8>::Unbounded;
-    let _ = SlotKind::Free;
     assert_eq!(reactor.in_flight(), 0);
 }
 

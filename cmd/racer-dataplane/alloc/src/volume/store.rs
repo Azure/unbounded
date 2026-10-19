@@ -766,7 +766,9 @@ impl<C: Charge> Volume<C> {
         state.tree = tree;
         state.slots = slots;
         state.next_generation = next_generation;
-        state.mutations = u64::from(report.dirty);
+        // Always dirty: the first commit persists the generation skip, so a
+        // second crash before it cannot hand out the same ids again.
+        state.mutations = 1;
         let commit = self.commit.get_mut();
         commit.seq = highest_seq;
         commit.durable_unit = unit;
@@ -841,7 +843,9 @@ impl<C: Charge> Volume<C> {
         self.len() == 0
     }
 
-    /// Whether the index has changes that are not durable yet.
+    /// Whether a commit has work to do: index changes that are not durable
+    /// yet, or (after a mount that did not format) the generation skip, which
+    /// the first commit persists.
     pub fn is_dirty(&self) -> bool {
         let state = self.shared.state();
         state.tree.is_dirty() || state.mutations > self.commit.borrow().durable_mutations
@@ -973,8 +977,10 @@ impl<C: Charge> Volume<C> {
     }
 
     /// A unique, nonzero write id, larger than any id handed out or committed
-    /// before on this volume (mount skips `GENERATION_SKIP` ids past the
-    /// committed high-water mark).
+    /// before on this volume. Mount skips `GENERATION_SKIP` ids past the
+    /// committed high-water mark; the skip is durable after the first commit
+    /// following the mount. Until then, a second crash may hand out ids that
+    /// were handed out (but never committed) before it.
     pub fn next_generation(&self) -> u64 {
         let mut state = self.shared.state();
         let generation = state.next_generation;

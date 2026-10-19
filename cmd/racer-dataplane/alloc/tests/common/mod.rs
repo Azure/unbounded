@@ -124,12 +124,11 @@ pub fn options(limits: Limits) -> VolumeOptions<()> {
     }
 }
 
+/// A mounted volume, its slab, and the mount report.
+pub type Mounted = (Rc<Volume<()>>, Rc<Slab<()>>, MountReport);
+
 /// Mount a volume on a new slab.
-pub fn mount(
-    reactor: &TestReactor,
-    slots: u64,
-    limits: Limits,
-) -> Result<(Rc<Volume<()>>, Rc<Slab<()>>, MountReport), TestError> {
+pub fn mount(reactor: &TestReactor, slots: u64, limits: Limits) -> Result<Mounted, TestError> {
     let slab = slab(slots);
     let (volume, report) = drive(
         reactor,
