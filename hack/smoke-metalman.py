@@ -626,6 +626,24 @@ METALMAN_BOOTSTRAP_USER = "system:serviceaccount:unbounded-system:metalman-boots
 KUBELET_CLIENT_SIGNER = "kubernetes.io/kube-apiserver-client-kubelet"
 
 
+def parse_csr_subject(output: str) -> dict[str, list[str]]:
+    """Parse `openssl req -noout -subject` output into attribute values.
+
+    Accepts both RFC 2253 output (`subject=CN=a,O=b`) and the default
+    one-line format (`subject=CN = a, O = b`).
+    """
+    text = output.strip()
+    if text.startswith("subject="):
+        text = text[len("subject="):]
+    attrs: dict[str, list[str]] = {}
+    for part in text.split(","):
+        key, sep, value = part.partition("=")
+        if not sep:
+            continue
+        attrs.setdefault(key.strip(), []).append(value.strip())
+    return attrs
+
+
 def approve_metalman_kubelet_csrs(name: str) -> None:
     """Approve pending kubelet client CSRs for *name* from metalman tokens.
 
@@ -647,7 +665,10 @@ def approve_metalman_kubelet_csrs(name: str) -> None:
             input=base64.b64decode(spec.get("request", "")).decode(),
             capture_output=True, text=True,
         )
-        if subject.returncode != 0 or f"CN=system:node:{name}" not in subject.stdout.split(","):
+        if subject.returncode != 0:
+            continue
+        attrs = parse_csr_subject(subject.stdout)
+        if attrs.get("CN") != [f"system:node:{name}"] or attrs.get("O") != ["system:nodes"]:
             continue
         csr_name = csr["metadata"]["name"]
         log(f"  Approving metalman kubelet client CSR {csr_name} for node '{name}'")
