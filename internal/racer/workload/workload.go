@@ -15,6 +15,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -326,6 +327,7 @@ func dataplaneContainer(c Config) corev1.Container {
 		},
 		// Readiness may wait on enrollment/recovery indefinitely without probe
 		// restarts. Membership must continue to include unready Pods.
+		Resources: dataplaneResources(),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/readyz", Port: intstr.FromString("diagnostics"), Scheme: corev1.URISchemeHTTP,
@@ -450,4 +452,21 @@ func DesiredDaemonSets(c Config) ([]*appsv1.DaemonSet, error) {
 	}
 
 	return []*appsv1.DaemonSet{host, pod}, nil
+}
+
+// DataplaneMemoryRequest is the default memory request for the dataplane
+// container. It covers the fixed overhead (a checkpoint working set of up to
+// 64 MiB by default, metadata, and runtime) plus the admission floors of a
+// handful of I/O workers (roughly 115 MiB of byte budgets per worker), so the
+// scheduler reserves a realistic baseline on every node.
+const DataplaneMemoryRequest = "1Gi"
+
+// dataplaneResources requests memory but sets no limit. Admission budgets
+// scale with the node's I/O worker count, so any fixed limit would be too
+// small on large nodes and risk OOM kills. Operators can add a limit with a
+// DaemonSet override.
+func dataplaneResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(DataplaneMemoryRequest)},
+	}
 }
