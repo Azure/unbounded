@@ -7,11 +7,14 @@ import (
 	"context"
 	"fmt"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
@@ -21,6 +24,10 @@ import (
 // BootstrapServiceAccountName is the ServiceAccount whose tokens metalman hands
 // to booting machines.
 const BootstrapServiceAccountName = "metalman-bootstrap"
+
+// BootstrapRestrictionPolicyName names both the ValidatingAdmissionPolicy that
+// restricts metalman bootstrap tokens and its binding.
+const BootstrapRestrictionPolicyName = "metalman-bootstrap-machine-restriction"
 
 // BootstrapComponent keeps the shared metalman bootstrap security posture
 // reconciled when no Site is left to do it.
@@ -42,6 +49,55 @@ func (BootstrapComponent) Name() string { return "metalman-bootstrap" }
 
 // ConditionType implements component.ClusterComponent.
 func (BootstrapComponent) ConditionType() string { return "MetalmanBootstrapReady" }
+
+// bootstrapWatch is one watch SetupWatches registers. It is separated from the
+// builder so tests can check the wiring without a running manager.
+type bootstrapWatch struct {
+	object    client.Object
+	predicate predicate.Predicate
+}
+
+// bootstrapWatches lists the objects whose events must re-run the zero-Site
+// plan. With no Sites there is no Site event to trigger a reconcile, so the
+// bootstrap ServiceAccount and bindings (including their initial create events
+// when the cache syncs) and admission policy deletion or drift must each
+// enqueue the singleton request themselves.
+func bootstrapWatches(env *component.Env) []bootstrapWatch {
+	named := func(namespace string, names ...string) predicate.Predicate {
+		return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			if obj.GetNamespace() != namespace {
+				return false
+			}
+
+			for _, name := range names {
+				if obj.GetName() == name {
+					return true
+				}
+			}
+
+			return false
+		})
+	}
+
+	policy := named("", BootstrapRestrictionPolicyName)
+	// The policy objects carry a generation, so ignore status-only updates.
+	policyDrift := predicate.And(policy, predicate.Predicate(predicate.GenerationChangedPredicate{}))
+
+	return []bootstrapWatch{
+		{&corev1.ServiceAccount{}, named(env.Namespace, BootstrapServiceAccountName)},
+		{&rbacv1.ClusterRoleBinding{}, named("", BootstrapMachineBindingName, StaleAutoApproveBindingName)},
+		{&admissionregistrationv1.ValidatingAdmissionPolicy{}, policyDrift},
+		{&admissionregistrationv1.ValidatingAdmissionPolicyBinding{}, policyDrift},
+	}
+}
+
+// SetupWatches implements component.WatchProvider. Only object metadata is
+// cached, since every event just re-runs Plan, which reads live state.
+func (BootstrapComponent) SetupWatches(b *builder.Builder, env *component.Env) {
+	for _, w := range bootstrapWatches(env) {
+		b.Watches(w.object, env.RequestSingleton(), builder.WithPredicates(w.predicate), builder.OnlyMetadata)
+	}
+}
 
 // Plan plans the shared support set only on the zero-Site pass and only when
 // metalman bootstrap resources are already live.
