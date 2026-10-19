@@ -329,6 +329,52 @@ func TestMetalmanCSRApproverConfirmsLiveMachine(t *testing.T) {
 	}
 }
 
+func TestMetalmanCSRApproverUsesLiveNodeName(t *testing.T) {
+	user := metalmanBootstrapUsername()
+
+	tests := map[string]struct {
+		cachedRef, liveRef string
+		approve            bool
+		contains           string
+	}{
+		"approves stale cached name with matching live name": {
+			cachedRef: "node-old",
+			liveRef:   "node-new",
+			approve:   true,
+		},
+		"denies matching cached name with changed live name": {
+			cachedRef: "node-new",
+			liveRef:   "node-other",
+			contains:  `issued to Machine "m1"`,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cachedM := attestedMachine("m1", tt.cachedRef, "JTI=a")
+			cachedM.UID = "uid-1"
+			liveM := attestedMachine("m1", tt.liveRef, "JTI=a")
+			liveM.UID = "uid-1"
+
+			cache := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(cachedM).
+				WithIndex(&unboundedv1alpha3.Machine{}, machineBootstrapCredentialIDField, machineBootstrapCredentialID).
+				Build()
+			live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveM).Build()
+
+			r, err := NewMetalmanCSRApprover(cache, live, kubefake.NewSimpleClientset())
+			require.NoError(t, err)
+
+			decision, err := r.Approver.Evaluate(context.Background(), metalmanKubeletCSR(t, user, "node-new", "JTI=a"))
+			require.NoError(t, err)
+			require.False(t, decision.Ignore)
+			require.Equal(t, tt.approve, decision.Approve, decision.Message)
+			require.Contains(t, decision.Message, tt.contains)
+		})
+	}
+}
+
 func TestMetalmanCSRApproverLiveReadErrorRetries(t *testing.T) {
 	cache := fake.NewClientBuilder().
 		WithScheme(scheme).

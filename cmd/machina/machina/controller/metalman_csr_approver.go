@@ -112,12 +112,9 @@ func (c *metalmanCSRClaimChecker) credentialMayClaimNode(
 		return false, fmt.Sprintf("credential is recorded on %d Machines", len(machines.Items)), nil
 	}
 
-	machine := &machines.Items[0]
-	if machine.NodeName() != nodeName {
-		return false, fmt.Sprintf("credential was issued to Machine %q", machine.Name), nil
-	}
-
-	return c.confirmLiveBinding(ctx, machine, nodeName, credentialID)
+	// The cached Machine only locates the candidate. Its node name may lag a
+	// spec.kubernetes.nodeRef change, so the live Machine decides the match.
+	return c.confirmLiveBinding(ctx, &machines.Items[0], nodeName, credentialID)
 }
 
 // confirmLiveBinding re-reads the cached candidate Machine from the API server
