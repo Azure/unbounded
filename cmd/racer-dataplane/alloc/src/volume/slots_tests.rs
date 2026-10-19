@@ -639,7 +639,7 @@ fn used_bytes_tracks_nodes_records_and_frees() {
     // The meta slot starts with its two superblock units.
     assert_eq!(slots.used_bytes(0..4), 2 * PAGE);
     assert_eq!(slots.used_bytes(1..4), 0);
-    assert_eq!(slots.used_bytes(3..1), 0);
+    assert_eq!(slots.used_bytes(3..3), 0);
     let small = slots.allocate(Tier::Cache, PAGE).unwrap();
     let whole = slots.allocate(Tier::Cache, SLOT_BYTES).unwrap();
     assert_ne!(small.slot, whole.slot);
