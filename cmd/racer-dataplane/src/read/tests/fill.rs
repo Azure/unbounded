@@ -4426,6 +4426,85 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
     }
 }
 
+/// AEAD/CRC failure on a held storage-tier page removes the bad entry, and the
+/// origin fill that follows writes the page back to the storage tier with the
+/// hold's deadline.
+#[test]
+fn corrupt_held_storage_page_is_repaired_to_storage_tier_by_fill() {
+    use page_alloc::volume::Tier;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for corrupt_tag in [false, true] {
+        let mut f = fixture();
+        f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
+        f.reactor.init().unwrap();
+        let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
+        let index = f.fill.dependencies.writer.index().clone();
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        index.reserve_hold(&f.page.version, 1, until).unwrap();
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        drop(acquire(&mut f, &mut budget).unwrap());
+        assert_eq!(
+            drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap(),
+            1
+        );
+        let first = index.lookup(&f.page).unwrap().unwrap();
+        assert_eq!(first.tier, Tier::Storage);
+        assert_eq!(index.held_page_expiry(&f.page), Some(until));
+        f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        f.origin.calls.set(0);
+        drive_disk(
+            &f,
+            f.fill
+                .dependencies
+                .writer
+                .rewrite_record(&f.page, &f.scope, |bytes| {
+                    let extent = page_alloc::Extent::new(0, bytes.len()).unwrap();
+                    let parsed = crate::store::parse_bytes(bytes, extent).unwrap();
+                    let offset = if corrupt_tag {
+                        parsed.ciphertext.end - 1
+                    } else {
+                        parsed.ciphertext.start
+                    };
+                    bytes[offset] ^= 1;
+                }),
+        )
+        .unwrap();
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        drop(
+            drive_io(
+                f.fill.acquire(
+                    f.page.clone(),
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut budget,
+                ),
+                &f.reactor,
+                &mut f.engine,
+                &f.crypto,
+            )
+            .unwrap(),
+        );
+        assert_eq!(f.fill.metrics.count(Event::CorruptMiss), 1);
+        assert_eq!(f.origin.calls.get(), 1);
+        // The hold survives; only the damaged publication was dropped.
+        assert_eq!(index.hold_expiry(&f.page.version), Some(until));
+        assert!(
+            index
+                .lookup(&f.page)
+                .unwrap()
+                .is_none_or(|value| value.generation != first.generation)
+        );
+        drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
+        let repaired = index.lookup(&f.page).unwrap().unwrap();
+        assert_eq!(repaired.tier, Tier::Storage);
+        assert_ne!(repaired.generation, first.generation);
+        assert_eq!(repaired.retain_until, first.retain_until);
+        assert_eq!(index.held_page_expiry(&f.page), Some(until));
+    }
+}
+
 #[test]
 fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
