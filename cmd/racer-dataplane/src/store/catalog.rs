@@ -392,7 +392,12 @@ impl Index {
         }
         let batch = versions
             .iter_after(after, limit)
-            .map(|(_, entry)| entry.clone())
+            .map(|(_, entry)| {
+                // Defensive: never let one oversized descriptor fail the image.
+                let mut entry = entry.clone();
+                entry.truncate_key_ids();
+                entry
+            })
             .collect();
         Ok((cursor, batch))
     }

@@ -376,10 +376,11 @@ const MAGIC: &[u8; 8] = b"RACERCP\0";
 const HEADER_BYTES: usize = 32;
 pub(super) const DIGEST_BYTES: usize = 32;
 const MAX_SHARDS: usize = 4096;
-const MAX_ITEMS: usize = 1_000_000;
+/// Matches the configuration bound on disk page and metadata entries, so a
+/// fully populated shard always fits in one image.
+const MAX_ITEMS: usize = 1_048_576;
 const MAX_STRING_BYTES: usize = 8192;
-/// Most distinct page keys recorded for one version.
-pub(super) const MAX_VERSION_KEYS: usize = 256;
+pub(super) use super::versions::MAX_VERSION_KEYS;
 
 // Shared with decode_with_budget/recovery_memory input.count calls.
 pub(super) const SHARD_BYTES: usize = 42; // worker + digest + two u32 counts.

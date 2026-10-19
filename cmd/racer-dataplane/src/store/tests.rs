@@ -3960,3 +3960,58 @@ mod checkpoint {
         );
     }
 }
+
+#[test]
+fn checkpoint_survives_version_with_many_key_ids() {
+    use super::checkpoint::{
+        CHECKPOINT_VERSION, CheckpointImage, MAX_VERSION_KEYS, decode, encode,
+    };
+    let f = Fixture::new();
+    let _ = f.open().unwrap();
+    f.enqueue(f.copy(1, 113)).unwrap();
+    f.enqueue(f.copy(2, 113)).unwrap();
+    drive(&f.reactor, f.store.writer.progress(8, &scope())).unwrap();
+    let index = f.store.writer.index();
+    let before = index.snapshot().unwrap().versions;
+    assert!(!before.is_empty());
+    let target = super::key::version_key(&before[0].version);
+    {
+        let mut versions = index.versions.borrow_mut();
+        let entry = versions.get_mut(&target).unwrap();
+        for n in 0..(MAX_VERSION_KEYS as u32 + 50) {
+            let mut k = [0xA5; 16];
+            k[..4].copy_from_slice(&n.to_le_bytes());
+            entry.add_key_id(racer_control_wire::KeyId(k));
+        }
+        assert_eq!(entry.key_ids.len(), MAX_VERSION_KEYS);
+        // Bypass the bound to exercise the snapshot-time truncation.
+        for n in 0..10u32 {
+            let mut k = [0x5A; 16];
+            k[..4].copy_from_slice(&n.to_le_bytes());
+            entry.key_ids.push(racer_control_wire::KeyId(k));
+        }
+    }
+    let shard = drive(
+        &f.reactor,
+        f.store.checkpoint.snapshot_incremental(4 * 1024 * 1024),
+    )
+    .unwrap();
+    assert_eq!(shard.index.versions.len(), before.len());
+    for entry in &shard.index.versions {
+        assert!(entry.key_ids.len() <= MAX_VERSION_KEYS);
+    }
+    let bytes = encode(&CheckpointImage {
+        version: CHECKPOINT_VERSION,
+        sequence: 1,
+        shards: vec![shard],
+    })
+    .unwrap();
+    let image = decode(&bytes).unwrap();
+    let versions = &image.shards[0].index.versions;
+    assert_eq!(versions.len(), before.len());
+    for old in &before[1..] {
+        let got = versions.iter().find(|e| e.version == old.version).unwrap();
+        assert_eq!(got.key_ids.len(), old.key_ids.len());
+    }
+    f.store.checkpoint.finish_snapshot();
+}

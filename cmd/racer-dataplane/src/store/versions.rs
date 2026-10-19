@@ -14,6 +14,10 @@ use crate::runtime::HashMap;
 use racer_control_wire::KeyId;
 use std::collections::BTreeMap;
 
+/// Most distinct page keys recorded for one version. Shared with the
+/// checkpoint format, which rejects descriptors carrying more.
+pub const MAX_VERSION_KEYS: usize = 256;
+
 /// Full identity and metadata of one disk-resident version.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionEntry {
@@ -33,10 +37,23 @@ impl VersionEntry {
         }
     }
 
-    /// Record a page key, ignoring duplicates.
+    /// Record a page key as the newest. Re-adding a known key moves it to the
+    /// newest position. At most [`MAX_VERSION_KEYS`] keys are kept; the oldest
+    /// is dropped when full so one long-lived version cannot break checkpoints.
     pub fn add_key_id(&mut self, key_id: KeyId) {
-        if !self.key_ids.contains(&key_id) {
-            self.key_ids.push(key_id);
+        if let Some(i) = self.key_ids.iter().position(|key| *key == key_id) {
+            self.key_ids.remove(i);
+        } else if self.key_ids.len() >= MAX_VERSION_KEYS {
+            self.key_ids.remove(0);
+        }
+        self.key_ids.push(key_id);
+    }
+
+    /// Keep only the newest [`MAX_VERSION_KEYS`] keys.
+    pub(crate) fn truncate_key_ids(&mut self) {
+        if self.key_ids.len() > MAX_VERSION_KEYS {
+            let excess = self.key_ids.len() - MAX_VERSION_KEYS;
+            self.key_ids.drain(..excess);
         }
     }
 }
@@ -331,5 +348,34 @@ mod tests {
         assert_eq!(table.get(&key).unwrap().key_ids.len(), 2);
         table.clear();
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn key_ids_keep_newest_bounded() {
+        let mut e = entry("c", "a");
+        let key = |n: u32| {
+            let mut k = [0; 16];
+            k[..4].copy_from_slice(&n.to_le_bytes());
+            KeyId(k)
+        };
+        for n in 0..(MAX_VERSION_KEYS as u32 + 10) {
+            e.add_key_id(key(n));
+        }
+        assert_eq!(e.key_ids.len(), MAX_VERSION_KEYS);
+        assert_eq!(e.key_ids[0], key(10));
+        assert_eq!(*e.key_ids.last().unwrap(), key(MAX_VERSION_KEYS as u32 + 9));
+        // Re-adding an existing key moves it to newest without evicting.
+        e.add_key_id(key(10));
+        assert_eq!(e.key_ids.len(), MAX_VERSION_KEYS);
+        assert_eq!(e.key_ids[0], key(11));
+        assert_eq!(*e.key_ids.last().unwrap(), key(10));
+        // Defensive truncation keeps the newest keys.
+        for n in 0..20 {
+            e.key_ids.push(key(1000 + n));
+        }
+        e.truncate_key_ids();
+        assert_eq!(e.key_ids.len(), MAX_VERSION_KEYS);
+        assert_eq!(*e.key_ids.last().unwrap(), key(1019));
+        assert_eq!(e.key_ids[0], key(31));
     }
 }
