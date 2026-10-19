@@ -13,7 +13,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -96,7 +95,9 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 			readErr = errors.Join(readErr, err)
 		case current.GetDeletionTimestamp() != nil:
 			unhealthy, terminating = true, true
-		case !equality.Semantic.DeepEqual(effectiveGuardSpec(expected), effectiveGuardSpec(current)):
+		// Compare only specs with API defaults normalized, so persisted defaults do
+		// not cause repeated revocation. Manifest decoding also retargets CEL identity.
+		case !equality.Semantic.DeepEqual(component.EffectiveAdmissionSpec(expected), component.EffectiveAdmissionSpec(current)):
 			unhealthy = true
 
 			if err := validateRuntimeOwner(current, marker.UID); err != nil {
@@ -183,55 +184,4 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 	// Only a later live read proving both grants absent permits normal planning.
 	// Retained installations do not regrant until caches activate them again.
 	return nil, false, nil
-}
-
-// Compare only specs, normalizing API defaults on copies so persisted defaults
-// do not cause repeated revocation. Manifest decoding also retargets CEL identity.
-func effectiveGuardSpec(obj client.Object) any {
-	switch obj := obj.(type) {
-	case *admissionv1.ValidatingAdmissionPolicy:
-		spec := obj.Spec.DeepCopy()
-		if spec.FailurePolicy == nil {
-			spec.FailurePolicy = ptr.To(admissionv1.Fail)
-		}
-
-		spec.MatchConstraints = effectiveGuardMatch(spec.MatchConstraints)
-
-		return spec
-	case *admissionv1.ValidatingAdmissionPolicyBinding:
-		spec := obj.Spec.DeepCopy()
-		spec.MatchResources = effectiveGuardMatch(spec.MatchResources)
-
-		return spec
-	default:
-		return nil
-	}
-}
-
-func effectiveGuardMatch(match *admissionv1.MatchResources) *admissionv1.MatchResources {
-	if match == nil {
-		match = &admissionv1.MatchResources{}
-	}
-
-	if match.MatchPolicy == nil {
-		match.MatchPolicy = ptr.To(admissionv1.Equivalent)
-	}
-
-	if match.NamespaceSelector == nil {
-		match.NamespaceSelector = &metav1.LabelSelector{}
-	}
-
-	if match.ObjectSelector == nil {
-		match.ObjectSelector = &metav1.LabelSelector{}
-	}
-
-	for _, rules := range [][]admissionv1.NamedRuleWithOperations{match.ResourceRules, match.ExcludeResourceRules} {
-		for i := range rules {
-			if rules[i].Scope == nil {
-				rules[i].Scope = ptr.To(admissionv1.AllScopes)
-			}
-		}
-	}
-
-	return match
 }

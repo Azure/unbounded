@@ -8,13 +8,18 @@ import (
 	"context"
 	"strings"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
@@ -47,7 +52,7 @@ func (Component) Enabled(site *unboundedv1alpha3.Site) bool {
 // The support RBAC ships in the machina manifest set and is identical for every
 // Site, so it carries a shared key and the executor writes it once per pass
 // rather than once per Site.
-func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+func (c Component) Plan(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
 	if err != nil {
 		return nil, component.Result{}, err
@@ -55,7 +60,7 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 
 	plan := component.NewPlan()
 
-	restriction := addSupportOps(plan, support, c.Name(), site.Name)
+	restriction := addSupportOps(ctx, env, plan, support, c.Name(), site.Name)
 
 	plan.Add(component.Operation{
 		Kind:        component.OpApply,
@@ -78,14 +83,30 @@ const BootstrapMachineBindingName = "metalman:bootstrap-machine"
 // the stale RBAC deletes to plan, and returns the admission refs that anything
 // relying on the restriction must depend on. Plan and CleanupPlan emit the same
 // operations, so the shared keys dedupe whether a Site is enabled or not.
-func addSupportOps(plan *component.Plan, support []*unstructured.Unstructured, componentName, site string) []component.ObjectRef {
+//
+// The live restriction is verified first. An apply cannot remove fields that
+// another field manager added, and the executor skips applies whose desired
+// fields already match, so a live policy or binding with extra matching
+// constraints would otherwise be reported as applied. When the restriction
+// cannot be verified, the bootstrap grant is deleted rather than applied, and
+// drifted specs are replaced in full. The grant returns on a later pass once
+// the live restriction matches.
+func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan, support []*unstructured.Unstructured, componentName, site string) []component.ObjectRef {
 	// The executor ranks RBAC and Deployments ahead of admission policies, so
 	// without an explicit dependency the bootstrap grant and the token-minting
 	// Deployment would go live before the policy that restricts them, and stay
 	// live if the policy failed to apply.
 	restriction := admissionRefs(support)
+	repairs, verified := verifyRestriction(ctx, env, support)
 
 	for _, obj := range support {
+		if repair, ok := repairs[component.RefOf(obj)]; ok {
+			repair.Component, repair.Site, repair.SharedKey = componentName, site, sharedSupportKey(obj)
+			plan.Add(repair)
+
+			continue
+		}
+
 		op := component.Operation{
 			Kind:      component.OpApply,
 			Object:    obj,
@@ -94,6 +115,14 @@ func addSupportOps(plan *component.Plan, support []*unstructured.Unstructured, c
 			SharedKey: sharedSupportKey(obj),
 		}
 		if obj.GetKind() == "ClusterRoleBinding" && obj.GetName() == BootstrapMachineBindingName {
+			if !verified {
+				op = component.DeleteOperation(obj.DeepCopy(), componentName, site)
+				op.SharedKey = sharedSupportKey(obj)
+				plan.Add(op)
+
+				continue
+			}
+
 			// An earlier release may already have installed the grant, so
 			// skipping the apply is not enough: revoke it until the
 			// restriction is back.
@@ -111,6 +140,59 @@ func addSupportOps(plan *component.Plan, support []*unstructured.Unstructured, c
 	}
 
 	return restriction
+}
+
+// verifyRestriction compares the live admission policy and binding with the
+// desired support objects. It returns merge patch repairs, keyed by object,
+// that replace a drifted spec in full, and whether the grant may be applied in
+// this pass. A missing object is safe to grant alongside, because its apply
+// creates it exactly as desired and the grant depends on that apply. Drift, a
+// terminating object, or a failed read withholds the grant.
+func verifyRestriction(ctx context.Context, env *component.Env, support []*unstructured.Unstructured) (map[component.ObjectRef]component.Operation, bool) {
+	repairs := map[component.ObjectRef]component.Operation{}
+	verified := true
+
+	reader := env.LiveReader()
+	if reader == nil {
+		return repairs, false
+	}
+
+	for _, obj := range support {
+		var expected, current client.Object
+
+		switch obj.GetKind() {
+		case "ValidatingAdmissionPolicy":
+			expected, current = &admissionv1.ValidatingAdmissionPolicy{}, &admissionv1.ValidatingAdmissionPolicy{}
+		case "ValidatingAdmissionPolicyBinding":
+			expected, current = &admissionv1.ValidatingAdmissionPolicyBinding{}, &admissionv1.ValidatingAdmissionPolicyBinding{}
+		default:
+			continue
+		}
+
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, expected); err != nil {
+			verified = false
+			continue
+		}
+
+		err := reader.Get(ctx, client.ObjectKeyFromObject(expected), current)
+
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil, current.GetDeletionTimestamp() != nil:
+			verified = false
+		case !equality.Semantic.DeepEqual(component.EffectiveAdmissionSpec(expected), component.EffectiveAdmissionSpec(current)):
+			verified = false
+			base := component.ToUnstructured(current)
+			base.SetGroupVersionKind(obj.GroupVersionKind())
+			desired := base.DeepCopy()
+			// The merge patch is computed against the live object, so fields
+			// absent from the desired spec are sent as null and removed.
+			desired.Object["spec"] = obj.DeepCopy().Object["spec"]
+			repairs[component.RefOf(obj)] = component.Operation{Kind: component.OpMergePatch, Base: base, Object: desired}
+		}
+	}
+
+	return repairs, verified
 }
 
 // admissionRefs returns the refs of the admission policy objects in support.
@@ -133,7 +215,7 @@ func admissionRefs(support []*unstructured.Unstructured) []component.ObjectRef {
 // therefore planned exactly as in Plan: the admission restriction is applied,
 // the retained bootstrap grant is revoked if the restriction fails, and RBAC
 // that is no longer shipped is removed.
-func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+func (c Component) CleanupPlan(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
 	if err != nil {
 		return nil, component.Result{}, err
@@ -151,7 +233,7 @@ func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unbo
 	}, c.Name(), site.Name)
 	remove.FailureDomain = deploymentFailureDomain
 	plan.Add(remove)
-	addSupportOps(plan, support, c.Name(), site.Name)
+	addSupportOps(ctx, env, plan, support, c.Name(), site.Name)
 
 	return plan, component.Disabled("component disabled"), nil
 }
