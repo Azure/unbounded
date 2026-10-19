@@ -5,6 +5,7 @@
 mod format;
 mod node;
 mod slots;
+mod superblock;
 mod tree;
 
 pub use format::{
@@ -18,4 +19,5 @@ pub use node::{
     NODE_VERSION, NodeBody, decode as decode_node, encode_inner, encode_leaf,
 };
 pub use slots::{Allocation, Eviction, Limits, SlotKind, SlotLease, SlotState, Slots, Usage};
+pub use superblock::{SUPERBLOCK_MAGIC, SUPERBLOCK_VERSION, Superblock};
 pub use tree::{CommitPlan, LoadReport, Loader, Range, Tree};
