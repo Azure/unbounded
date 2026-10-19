@@ -683,8 +683,8 @@ def approve_metalman_kubelet_csrs(name: str) -> None:
         try:
             subprocess.run([KUBECTL, "certificate", "approve", csr_name],
                            capture_output=True, text=True, timeout=30)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            log(f"  Failed to approve CSR {csr_name} (will retry next pass): {exc}")
 
 
 def start_metalman_csr_approver(name: str, interval: float = 2.0) -> threading.Event:
