@@ -183,6 +183,9 @@ pub struct CandidatePolicy {
 struct OwnershipRefresh {
     cursor: Option<page_alloc::volume::Key>,
     active: Option<crate::model::PageId>,
+    /// Index entries the current pass may still step over. `None` between
+    /// passes. Captured at pass start so new inserts cannot extend a pass.
+    budget: Option<u64>,
 }
 #[derive(Clone, Copy)]
 enum RequestMode {
@@ -605,22 +608,36 @@ impl CandidatePolicy {
         let snapshot = self.published.current()?.ok_or(Error::Unavailable)?;
         let mut work = self.ownership_refresh.borrow_mut();
         if work.active.is_none() {
-            // The cursor only moves forward in key order, so every resident
-            // present at pass start is visited before the pass ends. Pages
-            // appended behind the cursor wait for the next pass; the pass is
-            // not bounded by `page_capacity`, which bounds versions, not pages.
+            // A pass steps over at most the entries present at its start.
+            // The cursor moves forward in key order, so pages inserted ahead
+            // cannot extend the pass. Pages inserted behind the cursor wait
+            // for the next pass. The budget counts index entries, not
+            // versions, so `page_capacity` does not bound it.
+            let budget = *work
+                .budget
+                .get_or_insert_with(|| index.resident_page_count());
+            if budget == 0 {
+                work.cursor = None;
+                work.budget = None;
+                return Ok(crate::topology::Maintenance::Idle);
+            }
+            work.budget = Some(budget - 1);
             let (cursor, mut pages) = index.resident_pages_after(work.cursor.as_ref(), 1);
             let exhausted = cursor.is_none();
             work.cursor = cursor;
             work.active = pages.pop();
-            if work.active.is_none() && !exhausted {
+            if exhausted {
+                work.cursor = None;
+                work.budget = None;
+                return Ok(crate::topology::Maintenance::Idle);
+            }
+            if work.active.is_none() {
                 // An entry of an unknown version: skip it, bounded per turn.
                 return Ok(crate::topology::Maintenance::Progress);
             }
         }
         let Some(page) = &work.active else {
-            work.cursor = None;
-            return Ok(crate::topology::Maintenance::Idle);
+            return Ok(crate::topology::Maintenance::Progress);
         };
         if self
             .placement
@@ -2810,6 +2827,80 @@ pub(super) mod tests {
         .unwrap();
         assert!(!policy.owns_current(&page));
         assert!(peers.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn ownership_refresh_pass_is_bounded_by_entries_at_pass_start() {
+        use crate::model::{PageId, VersionMetadata, WorkerId};
+        use crate::store::catalog::Index;
+        let members = crate::topology::tests::fixtures::membership(1000);
+        let version = ObjectVersion {
+            object: object(),
+            etag: StrongEtag::test_value("bounded"),
+        };
+        let page = |n| PageId {
+            version: version.clone(),
+            number: PageNumber(n),
+        };
+        let peers = Rc::new(RecordedPeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let node = members.members()[0].node.clone();
+        let mut policy = policy(node, peers);
+        let index = Index::new(WorkerId(0), 64, crate::test_support::availability());
+        let disk = crate::store::test_disk::TestDisk::mount(&index, 64);
+        let put = |p: &PageId| {
+            disk.put(
+                &index,
+                p,
+                &VersionMetadata {
+                    content_type: None,
+                    version: version.clone(),
+                    length: 1 << 40,
+                },
+                crate::model::key_id_from_generation(1, 1).unwrap(),
+                page_alloc::volume::Tier::Cache,
+            );
+        };
+        for n in [10, 11, 12] {
+            put(&page(n));
+        }
+        assert_eq!(index.resident_page_count(), 3);
+        policy.published = crate::test_support::published_membership(members.clone());
+        let cached = |n| {
+            policy
+                .placement
+                .cached(members.clone(), &version.object, PageNumber(n))
+                .is_some()
+        };
+        let idle = crate::topology::Maintenance::Idle;
+        // Visit page 10, then insert one page behind and many ahead.
+        let mut turns = 0;
+        while !cached(10) {
+            assert_ne!(policy.refresh_ownership(&index).unwrap(), idle);
+            turns += 1;
+            assert!(turns < 50);
+        }
+        put(&page(0));
+        for n in 20..40 {
+            put(&page(n));
+        }
+        let mut turns = 0;
+        while policy.refresh_ownership(&index).unwrap() != idle {
+            turns += 1;
+            assert!(turns < 50, "pass did not end within its budget");
+        }
+        assert!(cached(11) && cached(12));
+        assert!(!cached(0), "page behind the cursor joined the pass");
+        assert!((20..40).filter(|n| cached(*n)).count() < 20);
+        // The next pass starts at the lowest key, so it visits page 0 first.
+        let mut turns = 0;
+        while !cached(0) {
+            assert_ne!(policy.refresh_ownership(&index).unwrap(), idle);
+            turns += 1;
+            assert!(turns < 50);
+        }
     }
 
     #[test]

@@ -541,6 +541,11 @@ impl Index {
         pages
     }
 
+    /// Index entries on the disk volume, including unknown versions.
+    pub fn resident_page_count(&self) -> u64 {
+        self.volume().map_or(0, |volume| volume.len())
+    }
+
     /// Walk disk pages in key order: up to `limit` index entries after
     /// `after`. Returns the last visited key (`None` once the index is
     /// exhausted) and the pages among them whose version is known.
