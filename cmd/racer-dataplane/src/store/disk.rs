@@ -2,17 +2,17 @@
 //! over its storage tier, and the version table that maps key hashes back to
 //! full versions.
 //!
-//! The volume is mounted once at startup ([`Index::install_volume`]). Before
-//! that the disk is empty: lookups miss and allocations fail with
-//! `Unavailable`, so storage fixtures that never open a slab still work.
+//! The index exists before `Store::open` mounts the volume
+//! ([`Index::install_volume`]): it is wired into readers, writers, and recovery
+//! at construction. Until the mount the disk is empty, so lookups miss and
+//! allocations fail with `Unavailable`.
 
 use super::catalog::DiskPage;
 use super::catalog::HeldSnapshot;
 use super::catalog::Index;
-use super::catalog::Resident;
 use super::holds::{Hold, HoldGuard, HoldTicket, Holds, MAX_HOLD_TTL};
 use super::key::{CACHE_HASH_BYTES, VersionKey, cache_hash, version_key, volume_key};
-use super::versions::{VersionEntry, VersionTable};
+use super::versions::VersionEntry;
 use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
@@ -31,7 +31,6 @@ use page_alloc::volume::{
 };
 use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
-use std::cell::RefCell;
 use std::ops::Bound;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,43 +50,6 @@ const SCAN_BATCH: usize = 4096;
 /// Slots kept out of the hold quota: the meta slot and one cache slot, so cache
 /// writes and commits can always make progress.
 const RESERVED_SLOTS: u64 = 2;
-
-pub(super) struct Disk {
-    pub(super) volume: RefCell<Option<Rc<DiskVolume>>>,
-    pub(super) holds: RefCell<Holds>,
-    pub(super) versions: RefCell<VersionTable>,
-    /// Retention owners of published pages, by volume key, with payload bytes.
-    residents: RefCell<HashMap<Key, (Resident, u64)>>,
-}
-
-impl Disk {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self {
-            volume: RefCell::new(None),
-            holds: RefCell::new(Holds::default()),
-            versions: RefCell::new(VersionTable::new(capacity).expect("nonzero version capacity")),
-            residents: RefCell::new(HashMap::default()),
-        }
-    }
-
-    /// Keep recovered descriptors only for versions with pages on the volume.
-    pub(super) fn restore_versions(&self, entries: Vec<VersionEntry>) -> Result<()> {
-        let volume = self.volume.borrow().clone();
-        let mut versions = self.versions.borrow_mut();
-        versions.clear();
-        let Some(volume) = volume else {
-            return Ok(());
-        };
-        for entry in entries {
-            let key = version_key(&entry.version);
-            if !volume.range(low(&key), high(&key), 1).is_empty() {
-                // A hash collision keeps the first entry; reads verify identity.
-                let _ = versions.insert(entry);
-            }
-        }
-        Ok(())
-    }
-}
 
 /// Seconds since the Unix epoch, now.
 fn now_unix() -> u64 {
@@ -132,13 +94,30 @@ fn key_version(key: &Key) -> VersionKey {
 }
 
 impl Index {
+    /// Keep recovered descriptors only for versions with pages on the volume.
+    pub(super) fn restore_versions(&self, entries: Vec<VersionEntry>) {
+        let volume = self.volume();
+        let mut versions = self.versions.borrow_mut();
+        versions.clear();
+        let Some(volume) = volume else {
+            return;
+        };
+        for entry in entries {
+            let key = version_key(&entry.version);
+            if !volume.range(low(&key), high(&key), 1).is_empty() {
+                // A hash collision keeps the first entry; reads verify identity.
+                let _ = versions.insert(entry);
+            }
+        }
+    }
+
     pub(crate) fn volume(&self) -> Option<Rc<DiskVolume>> {
-        self.disk.volume.borrow().clone()
+        self.volume.borrow().clone()
     }
 
     /// Whether the extent volume is mounted.
     pub fn is_mounted(&self) -> bool {
-        self.disk.volume.borrow().is_some()
+        self.volume.borrow().is_some()
     }
 
     /// Allocation limits for a volume of `slot_count` slots under the current
@@ -151,7 +130,7 @@ impl Index {
     }
 
     fn hold_slot_limit(&self, slot_count: u64) -> usize {
-        let percent = self.disk.holds.borrow().percent;
+        let percent = self.holds.borrow().percent;
         let slots = usize::try_from(slot_count).unwrap_or(usize::MAX);
         (slots.saturating_mul(percent) / 100)
             .min(slots.saturating_sub(RESERVED_SLOTS as usize))
@@ -240,8 +219,8 @@ impl Index {
             );
         }
         let pages: usize = entries.values().map(|hold| hold.pages).sum();
-        self.disk.holds.borrow_mut().entries = entries;
-        *self.disk.volume.borrow_mut() = Some(volume);
+        self.holds.borrow_mut().entries = entries;
+        *self.volume.borrow_mut() = Some(volume);
         let limit = self.hold_limit();
         if pages > limit {
             eprintln!(
@@ -263,7 +242,7 @@ impl Index {
     /// versions only require the cache to be available; reads check the header.
     fn version_available(&self, version: &ObjectVersion) -> bool {
         let cache = &version.object.cache;
-        match self.disk.versions.borrow().get_version(version) {
+        match self.versions.borrow().get_version(version) {
             Some(entry) => entry
                 .key_ids
                 .iter()
@@ -308,8 +287,8 @@ impl Index {
             return;
         }
         let retention = self.retention();
-        let mut residents = self.disk.residents.borrow_mut();
-        let mut holds = self.disk.holds.borrow_mut();
+        let mut residents = self.residents.borrow_mut();
+        let mut holds = self.holds.borrow_mut();
         for (key, _) in entries {
             if let Some((resident, bytes)) = residents.remove(key)
                 && evicted
@@ -343,8 +322,7 @@ impl Index {
         let volume = self.volume().ok_or(Error::Unavailable)?;
         let version = version_key(&page.version);
         let retain_until = if reservation.tier() == Tier::Storage {
-            self.disk
-                .holds
+            self.holds
                 .borrow()
                 .entries
                 .get(&version)
@@ -355,24 +333,12 @@ impl Index {
         };
         volume.publish(key, reservation, length, generation, retain_until)?;
         if retain_until != 0
-            && let Some(hold) = self.disk.holds.borrow_mut().entries.get_mut(&version)
+            && let Some(hold) = self.holds.borrow_mut().entries.get_mut(&version)
         {
             hold.published.insert(key.page());
         }
-        {
-            let mut versions = self.disk.versions.borrow_mut();
-            match versions.get_mut(&version) {
-                Some(entry) if entry.version == page.version => entry.add_key_id(key_id),
-                Some(_) => {}
-                None => {
-                    let mut entry = VersionEntry::new(metadata.clone());
-                    entry.add_key_id(key_id);
-                    // A hash collision keeps the first version; reads verify identity.
-                    let _ = versions.insert(entry);
-                }
-            }
-        }
-        let mut residents = self.disk.residents.borrow_mut();
+        self.learn_version(metadata, key_id);
+        let mut residents = self.residents.borrow_mut();
         if let std::collections::hash_map::Entry::Vacant(slot) = residents.entry(key) {
             // Residency is best effort: heat tracking is bounded separately.
             if let Ok(mut resident) = self.track(page) {
@@ -383,17 +349,19 @@ impl Index {
         Ok(true)
     }
 
-    /// Record a version seen in a valid record header, for reads of pages whose
-    /// version descriptor was not recovered.
+    /// Record `key_id` for a version, adding its descriptor when unknown. Used
+    /// on publication and for record headers read back from disk whose version
+    /// descriptor was not recovered.
     pub(super) fn learn_version(&self, metadata: &VersionMetadata, key_id: KeyId) {
         let version = version_key(&metadata.version);
-        let mut versions = self.disk.versions.borrow_mut();
+        let mut versions = self.versions.borrow_mut();
         match versions.get_mut(&version) {
             Some(entry) if entry.version == metadata.version => entry.add_key_id(key_id),
             Some(_) => {}
             None => {
                 let mut entry = VersionEntry::new(metadata.clone());
                 entry.add_key_id(key_id);
+                // A hash collision keeps the first version; reads verify identity.
                 let _ = versions.insert(entry);
             }
         }
@@ -415,12 +383,11 @@ impl Index {
     /// Remove every disk page, hold, and version descriptor of one cache.
     pub(super) fn remove_disk_cache(&self, cache: &CacheId) {
         let hash = cache_hash(cache);
-        self.disk
-            .holds
+        self.holds
             .borrow_mut()
             .entries
             .retain(|version, _| version[..CACHE_HASH_BYTES] != hash[..]);
-        self.disk.versions.borrow_mut().remove_cache(&hash);
+        self.versions.borrow_mut().remove_cache(&hash);
         if let Some(volume) = self.volume() {
             let removed = volume.remove_range(
                 Bound::Included(Key::new(hash, [0; 12], 0)),
@@ -436,13 +403,12 @@ impl Index {
     /// count of removed entries.
     pub fn retain_caches(&self, caches: &[CacheId]) -> usize {
         let allowed: HashSet<[u8; CACHE_HASH_BYTES]> = caches.iter().map(cache_hash).collect();
-        self.disk
-            .holds
+        self.holds
             .borrow_mut()
             .entries
             .retain(|version, _| allowed.contains(&split(version).0));
         {
-            let mut versions = self.disk.versions.borrow_mut();
+            let mut versions = self.versions.borrow_mut();
             let removed: Vec<_> = versions
                 .iter()
                 .filter(|(key, _)| !allowed.contains(&split(key).0))
@@ -517,7 +483,7 @@ impl Index {
         let Some(volume) = self.volume() else {
             return Vec::new();
         };
-        let versions = self.disk.versions.borrow();
+        let versions = self.versions.borrow();
         let mut pages = Vec::new();
         let mut cursor: Option<Key> = None;
         loop {
@@ -560,7 +526,7 @@ impl Index {
         };
         let batch = volume.next_after(after, limit);
         let cursor = batch.last().map(|(key, _)| *key);
-        let versions = self.disk.versions.borrow();
+        let versions = self.versions.borrow();
         let pages = batch
             .into_iter()
             .filter_map(|(key, _)| {
@@ -610,7 +576,7 @@ impl Index {
         if percent > 100 {
             return Err(Error::InvalidConfiguration);
         }
-        self.disk.holds.borrow_mut().percent = percent;
+        self.holds.borrow_mut().percent = percent;
         self.update_volume_limits();
         Ok(())
     }
@@ -638,7 +604,7 @@ impl Index {
                 .filter(|(_, value)| value.tier == Tier::Storage)
                 .collect()
         });
-        let mut holds = self.disk.holds.borrow_mut();
+        let mut holds = self.holds.borrow_mut();
         holds.expire();
         let old = holds.entries.get(&key);
         let mut published: HashSet<u32> = existing.iter().map(|(key, _)| key.page()).collect();
@@ -699,8 +665,7 @@ impl Index {
 
     /// Active reservation deadline, not proof that every requested page is on disk.
     pub fn hold_expiry(&self, version: &ObjectVersion) -> Option<SystemTime> {
-        self.disk
-            .holds
+        self.holds
             .borrow()
             .entries
             .get(&version_key(version))
@@ -714,8 +679,8 @@ impl Index {
         let Some(volume) = self.volume() else {
             return HeldSnapshot::default();
         };
-        let holds = self.disk.holds.borrow();
-        let versions = self.disk.versions.borrow();
+        let holds = self.holds.borrow();
+        let versions = self.versions.borrow();
         let mut snapshot = HeldSnapshot::default();
         let mut slots = HashSet::default();
         for (version, hold) in holds.entries.iter().filter(|(_, hold)| hold.live()) {
@@ -750,7 +715,6 @@ impl Index {
     /// Extend an existing reservation without adding page capacity.
     pub fn extend_hold(&self, version: &ObjectVersion, until: SystemTime) -> Result<()> {
         let pages = self
-            .disk
             .holds
             .borrow()
             .entries
@@ -766,7 +730,7 @@ impl Index {
     /// pending writes have finished.
     pub fn release_hold(&self, version: &ObjectVersion) -> Result<()> {
         let key = version_key(version);
-        let mut holds = self.disk.holds.borrow_mut();
+        let mut holds = self.holds.borrow_mut();
         if let Some(hold) = holds.entries.get_mut(&key) {
             if hold.inflight.get() != 0 || hold.active.get() != 0 {
                 return Err(Error::Overloaded);
@@ -784,7 +748,7 @@ impl Index {
     }
 
     pub(super) fn protect_hold(&self, version: &ObjectVersion) -> Result<HoldGuard> {
-        let holds = self.disk.holds.borrow();
+        let holds = self.holds.borrow();
         let hold = holds
             .entries
             .get(&version_key(version))
@@ -798,8 +762,7 @@ impl Index {
     /// Deadline of a published held page. A HEAD reservation alone returns None.
     pub fn held_page_expiry(&self, page: &PageId) -> Option<SystemTime> {
         let number = u32::try_from(page.number.0).ok()?;
-        self.disk
-            .holds
+        self.holds
             .borrow()
             .entries
             .get(&version_key(&page.version))
@@ -811,7 +774,7 @@ impl Index {
     /// or `None` when the page must be written to the cache tier.
     pub(super) fn hold_ticket(&self, page: &PageId) -> Option<HoldTicket> {
         let number = u32::try_from(page.number.0).ok()?;
-        let holds = self.disk.holds.borrow();
+        let holds = self.holds.borrow();
         let hold = holds
             .entries
             .get(&version_key(&page.version))
@@ -820,21 +783,5 @@ impl Index {
             })?;
         hold.inflight.set(hold.inflight.get() + 1);
         Some(HoldTicket(hold.inflight.clone()))
-    }
-
-    /// Remove a page only while its entry is still `value`, for tests that model
-    /// an invalidation.
-    #[cfg(test)]
-    pub(crate) fn remove_if_matches(&self, page: &PageId, value: &Value) {
-        if let Some(key) = volume_key(page) {
-            self.remove_if_generation(&key, value.generation);
-        }
-    }
-
-    /// Byte offset and length of a page's record, for corruption tests.
-    #[cfg(test)]
-    pub(crate) fn record_extent(&self, page: &PageId) -> Option<(u64, u64)> {
-        self.disk_entry(page)
-            .map(|(_, value)| (value.offset(), u64::from(value.length)))
     }
 }

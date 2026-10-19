@@ -56,7 +56,15 @@ pub struct Index {
 
     pub(super) residency: Rc<Residency>,
 
-    pub(super) disk: super::disk::Disk,
+    /// The mounted extent volume; `None` until `Store::open`.
+    pub(super) volume: RefCell<Option<Rc<super::disk::DiskVolume>>>,
+
+    pub(super) holds: RefCell<super::holds::Holds>,
+
+    pub(super) versions: RefCell<super::versions::VersionTable>,
+
+    /// Retention owners of published pages, by volume key, with payload bytes.
+    pub(super) residents: RefCell<HashMap<page_alloc::volume::Key, (Resident, u64)>>,
 }
 
 #[derive(Default)]
@@ -137,7 +145,13 @@ impl Index {
                 )),
                 counts: RefCell::new(HashMap::default()),
             }),
-            disk: super::disk::Disk::new(page_capacity),
+            volume: RefCell::new(None),
+            holds: RefCell::new(super::holds::Holds::default()),
+            versions: RefCell::new(
+                super::versions::VersionTable::new(page_capacity)
+                    .expect("nonzero version capacity"),
+            ),
+            residents: RefCell::new(HashMap::default()),
         }
     }
     pub(super) fn available(&self, cache: &racer_control_wire::CacheId) -> bool {
@@ -160,7 +174,7 @@ impl Index {
         if capacity == 0 {
             return Err(Error::InvalidConfiguration);
         }
-        self.disk.versions.borrow_mut().set_capacity(capacity)?;
+        self.versions.borrow_mut().set_capacity(capacity)?;
         self.page_capacity.set(capacity);
         self.update_volume_limits();
         Ok(())
@@ -202,8 +216,7 @@ impl Index {
             .get(version)
             .cloned()
             .or_else(|| {
-                self.disk
-                    .versions
+                self.versions
                     .borrow()
                     .get_version(version)
                     .map(|entry| entry.metadata.clone())
@@ -284,7 +297,6 @@ impl Index {
         Ok(IndexSnapshot {
             metadata: s.metadata.values().cloned().collect(),
             versions: self
-                .disk
                 .versions
                 .borrow()
                 .iter()
@@ -299,7 +311,7 @@ impl Index {
     /// Reject an already oversized cut without pausing writes or cloning state.
     pub(super) fn preflight_snapshot(&self, remaining: &mut usize) -> Result<()> {
         let state = self.state.borrow();
-        let versions = self.disk.versions.borrow();
+        let versions = self.versions.borrow();
         for bytes in state
             .metadata
             .values()
@@ -337,7 +349,7 @@ impl Index {
         limit: usize,
         remaining: &mut usize,
     ) -> Result<(Option<u64>, Vec<super::versions::VersionEntry>)> {
-        let versions = self.disk.versions.borrow();
+        let versions = self.versions.borrow();
         let mut cursor = after;
         for (age, entry) in versions.iter_after(after, limit) {
             *remaining = remaining
@@ -366,7 +378,7 @@ impl Index {
             replacement.publish_version(m)?;
         }
         let replacement = std::mem::take(&mut *replacement.state.get_mut());
-        self.disk.restore_versions(snapshot.versions)?;
+        self.restore_versions(snapshot.versions);
         let mut state = self.state.borrow_mut();
         state.metadata = replacement.metadata;
         state.order = replacement.order;
@@ -393,7 +405,6 @@ impl Index {
             .get(&m.version)
             .is_some_and(|v| !v.compatible(m))
             || self
-                .disk
                 .versions
                 .borrow()
                 .get_version(&m.version)
@@ -632,14 +643,13 @@ mod tests {
         );
         let key = version_key(&first.version);
         {
-            let mut holds = index.disk.holds.borrow_mut();
+            let mut holds = index.holds.borrow_mut();
             let hold = holds.entries.get_mut(&key).unwrap();
             hold.until = std::time::UNIX_EPOCH;
             assert!(hold.live(), "monotonic deadline still protects pages");
         }
         assert_eq!(index.held_snapshot().pages, 1);
         index
-            .disk
             .holds
             .borrow_mut()
             .entries
@@ -727,7 +737,6 @@ mod tests {
             .unwrap();
         let key = version_key(&version);
         index
-            .disk
             .holds
             .borrow_mut()
             .entries
@@ -736,7 +745,6 @@ mod tests {
             .until = now - Duration::from_secs(1);
         assert!(index.hold_expiry(&version).is_some());
         index
-            .disk
             .holds
             .borrow_mut()
             .entries

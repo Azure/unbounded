@@ -89,7 +89,7 @@ impl TestDisk {
     /// Drop the volume and slab, lose every write that was not synced, and
     /// mount again into `index`.
     pub(crate) fn crash(mut self, index: &Index) -> Self {
-        index.disk.volume.borrow_mut().take();
+        index.volume.borrow_mut().take();
         let capacity = self.slab.capacity_bytes();
         self.slab = Rc::new(Slab::new(
             "/test-disk/slab".into(),
@@ -203,5 +203,21 @@ impl TestDisk {
     pub(crate) fn commit(&self, index: &Index) {
         let scope = scope();
         self.drive(index.commit(&self.reactor, &scope)).unwrap();
+    }
+}
+
+impl Index {
+    /// Remove a page only while its entry is still `value`, for tests that model
+    /// an invalidation.
+    pub(crate) fn remove_if_matches(&self, page: &PageId, value: &Value) {
+        if let Some(key) = super::key::volume_key(page) {
+            self.remove_if_generation(&key, value.generation);
+        }
+    }
+
+    /// Byte offset and length of a page's record, for corruption tests.
+    pub(crate) fn record_extent(&self, page: &PageId) -> Option<(u64, u64)> {
+        self.disk_entry(page)
+            .map(|(_, value)| (value.offset(), u64::from(value.length)))
     }
 }
