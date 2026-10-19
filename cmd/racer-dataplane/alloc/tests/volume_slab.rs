@@ -68,7 +68,7 @@ fn drive<T>(
 #[cfg(feature = "simulation")]
 mod simulation {
     use super::*;
-    use page_alloc::{Segments, volume::MAX_SLOTS};
+    use page_alloc::volume::MAX_SLOTS;
     use std::rc::Rc;
     use uring_runtime::reactor::simulation::{Fault, Simulation, disk::DiskState};
 
@@ -204,10 +204,6 @@ mod simulation {
         assert!(slab.open_volume(3).is_ok());
         assert!(slab.open_volume(3).is_ok());
         assert_eq!(slab.open_volume(4), Err(Error::InvalidConfiguration));
-        assert_eq!(
-            slab.open_configured(&Segments::new(SEGMENT)),
-            Err(Error::InvalidConfiguration)
-        );
         for (offset, length, expected) in [
             (SEGMENT + 512, 4096, Error::InvalidConfiguration),
             (SEGMENT - 4096, 8192, Error::Corrupt),
@@ -238,11 +234,6 @@ mod simulation {
         assert_eq!(Rc::strong_count(&guard), 2);
         let _ = drive(&reactor, op).unwrap();
         assert_eq!(Rc::strong_count(&guard), 1);
-
-        // A slab bound to a segment table cannot be bound as a volume.
-        let other = Slab::<()>::new("/volume/other".into(), 4 * SEGMENT, SEGMENT, 4096);
-        let _ = other.open_configured(&Segments::new(SEGMENT)).unwrap();
-        assert_eq!(other.open_volume(4), Err(Error::InvalidConfiguration));
     }
 }
 

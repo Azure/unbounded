@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-description = "Worker-local aligned buffers and lease-fenced sparse slab storage"
+description = "Worker-local aligned buffers, direct-I/O slab storage, and an extent volume"
 
 [features]
 default = []

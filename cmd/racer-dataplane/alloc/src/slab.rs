@@ -5,11 +5,7 @@
 //! still fail with ENOSPC. Recycling never truncates or erases disk bytes.
 //! Parent directories must be trusted against hostile rename and unlink, even
 //! though descriptor-relative traversal rejects symlinks and parent components.
-use crate::segments::TableIdentity;
-use crate::{
-    AlignedBuffer, Alignment, Charge, Error, Extent, Result, SegmentGeometry, SegmentLease,
-    Segments,
-};
+use crate::{AlignedBuffer, Alignment, Charge, Error, Extent, Result};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -47,13 +43,13 @@ enum Backing {
     File(PathBuf),
     Devices {
         placements: RefCell<Vec<DevicePlacement>>,
-        geometry: SegmentGeometry,
+        alignment: Alignment,
     },
 }
 
 /// Direct-I/O cache storage, not a durable storage transaction.
-/// `open_configured` binds submissions to one segment table; read/write require
-/// a successful binding, not merely an open file.
+/// [`Slab::open_volume`] binds it for extent volume use; offset I/O requires
+/// that binding, not merely an open file.
 #[repr(align(64))]
 pub struct Slab<C: Charge> {
     backing: Backing,
@@ -97,7 +93,7 @@ impl<C: Charge> Slab<C> {
     /// Overlap checks only compare the same inode or device identity in this slab.
     /// Whole-disk, partition, and device-mapper aliases are not detected. The caller
     /// must guarantee disjoint physical storage across aliases and different slabs.
-    /// Files stay owned until `open_configured` creates worker-local descriptors.
+    /// Files stay owned until `open_volume` creates worker-local descriptors.
     pub fn from_devices(
         placements: Vec<DevicePlacement>,
         segment_bytes: u64,
@@ -137,7 +133,7 @@ impl<C: Charge> Slab<C> {
             segment_bytes,
             max_record_bytes,
         );
-        let geometry = slab.validate_layout(alignment, capacity_bytes)?;
+        slab.validate_layout(alignment, capacity_bytes)?;
         let mut files = HashMap::new();
         let mut ranges = Vec::with_capacity(placements.len());
         for placement in &placements {
@@ -197,7 +193,7 @@ impl<C: Charge> Slab<C> {
         }
         slab.backing = Backing::Devices {
             placements: RefCell::new(placements),
-            geometry,
+            alignment,
         };
         Ok(slab)
     }
@@ -243,79 +239,12 @@ impl<C: Charge> Slab<C> {
         self.opened
             .borrow()
             .as_ref()
-            .map(|o| o.geometry.alignment())
+            .map(|o| o.alignment)
             .ok_or(Error::Unavailable)
     }
 
-    /// Physical slab geometry, including the full segment capacity. A bound
-    /// table may deliberately expose fewer segments than this physical count.
-    pub fn geometry(&self) -> Result<SegmentGeometry> {
-        self.opened
-            .borrow()
-            .as_ref()
-            .map(|o| o.geometry)
-            .ok_or(Error::Unavailable)
-    }
-
-    /// Configure an empty table, or validate an already configured partial table,
-    /// and permanently bind this slab to that table's identity.
-    #[cfg(any(test, feature = "simulation"))]
-    pub fn configure_segments(&self, segments: &Segments) -> Result<()> {
-        self.bind(segments)
-    }
-
-    /// Attach the table identity to this backing only after all dimensions agree.
-    fn bind(&self, segments: &Segments) -> Result<()> {
-        let mut opened = self.opened.borrow_mut();
-        let slab = opened.as_mut().ok_or(Error::Unavailable)?;
-        if slab.volume.is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        let geometry = slab.geometry;
-        let identity = segments.table_identity();
-        if let Some(bound) = slab.table.as_ref()
-            && !bound.matches(&identity)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-        if segments.segment_bytes() != geometry.segment_bytes() {
-            return Err(Error::InvalidConfiguration);
-        }
-        if !segments.is_configured() {
-            let count = usize::try_from(geometry.segment_count())
-                .map_err(|_| Error::InvalidConfiguration)?;
-            segments.configure_table(geometry.slab_bytes(), count, geometry.alignment())?;
-        }
-        let configured = segments.geometry().ok_or(Error::InvalidConfiguration)?;
-        if configured.slab_bytes() != geometry.slab_bytes()
-            || configured.segment_bytes() != geometry.segment_bytes()
-            || configured.alignment() != geometry.alignment()
-            || configured.segment_count() > geometry.segment_count()
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-        slab.table = Some(identity);
-        Ok(())
-    }
-
-    /// Blocking startup helper. Do not invoke on a latency-sensitive worker.
-    pub fn open_configured(&self, segments: &Segments) -> Result<Alignment> {
-        // Automatic tables need one slot per physical segment; partial tables do not.
-        if !segments.is_configured()
-            && self
-                .capacity_bytes
-                .checked_div(self.segment_bytes)
-                .is_none_or(|count| count > crate::MAX_SEGMENTS)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-        let alignment = self.open_file()?;
-        self.bind(segments)?;
-        Ok(alignment)
-    }
-
-    /// Blocking startup I/O for geometry probing and buffer allocation. Read/write
-    /// return `Unavailable` until `configure_segments` succeeds.
+    /// Blocking startup I/O for geometry probing and buffer allocation. Offset
+    /// I/O returns `Unavailable` until [`Slab::open_volume`] succeeds.
     /// Parent directories must be trusted against
     /// rename/unlink by other users. Linux traversal rejects symlinks and `..`;
     /// newly created directories are private. Existing files must be owned by the
@@ -339,7 +268,7 @@ impl<C: Charge> Slab<C> {
             Backing::File(path) => path,
             Backing::Devices {
                 placements,
-                geometry,
+                alignment,
             } => {
                 let mut files = HashMap::new();
                 let mut opened = Vec::with_capacity(placements.borrow().len());
@@ -359,14 +288,15 @@ impl<C: Charge> Slab<C> {
                         offset: placement.offset,
                     });
                 }
+                let segment_count = opened.len() as u64;
                 *self.opened.borrow_mut() = Some(OpenSlab {
                     backing: OpenBacking::Devices(opened),
-                    geometry: *geometry,
-                    table: None,
+                    alignment: *alignment,
+                    segment_count,
                     volume: None,
                 });
                 *placements.borrow_mut() = Vec::new();
-                return Ok(geometry.alignment());
+                return Ok(*alignment);
             }
         };
         if self.segment_bytes == 0
@@ -400,7 +330,7 @@ impl<C: Charge> Slab<C> {
             // The virtual filesystem has a fixed root owner, independent of host uid.
             validate_file(stat.stx_mode as u32, stat.stx_uid, 0, stat.stx_nlink as u64)?;
             let a = alignment_from_stat(&stat)?;
-            let geometry = self.validate_layout(a, stat.stx_size)?;
+            let segment_count = self.validate_layout(a, stat.stx_size)?;
             if stat.stx_size == 0 {
                 handle
                     .set_len(self.capacity_bytes)
@@ -414,7 +344,7 @@ impl<C: Charge> Slab<C> {
                         .map_err(|e| system_error("fsync-directory", e))?;
                 }
             }
-            self.publish(file, geometry);
+            self.publish(file, a, segment_count);
             return Ok(a);
         }
         let file = open_private_file(path)?;
@@ -461,7 +391,7 @@ impl<C: Charge> Slab<C> {
             ));
         }
         let a = probe(&file)?;
-        let geometry = self.validate_layout(a, size)?;
+        let segment_count = self.validate_layout(a, size)?;
         if size == 0 {
             file.set_len(self.capacity_bytes)
                 .map_err(|e| system_error("ftruncate", e))?;
@@ -474,176 +404,42 @@ impl<C: Charge> Slab<C> {
                     .map_err(|e| system_error("fsync-directory", e))?;
             }
         }
-        self.publish(file.into(), geometry);
+        self.publish(file.into(), a, segment_count);
         Ok(a)
     }
 
     /// Publish geometry with its owning file, initially without I/O authority.
-    fn publish(&self, file: Descriptor, geometry: SegmentGeometry) {
+    fn publish(&self, file: Descriptor, alignment: Alignment, segment_count: u64) {
         *self.opened.borrow_mut() = Some(OpenSlab {
             backing: OpenBacking::File(Rc::new(file)),
-            geometry,
-            table: None,
+            alignment,
+            segment_count,
             volume: None,
         });
     }
 
-    /// Check physical dimensions and padded record size without changing the file.
-    fn validate_layout(&self, a: Alignment, size: u64) -> Result<SegmentGeometry> {
-        if a.extent(0, self.max_record_bytes)?.length() as u64 > self.segment_bytes
+    /// Check physical dimensions and padded record size without changing the
+    /// file, returning the physical segment count. Segment boundaries must be
+    /// multiples of both direct-I/O units.
+    fn validate_layout(&self, a: Alignment, size: u64) -> Result<u64> {
+        if self.segment_bytes == 0
+            || self.capacity_bytes == 0
+            || !self.capacity_bytes.is_multiple_of(self.segment_bytes)
+            || a.extent(0, self.max_record_bytes)?.length() as u64 > self.segment_bytes
             || !self.segment_bytes.is_multiple_of(a.offset())
             || !self.segment_bytes.is_multiple_of(a.length() as u64)
             || (size != 0 && size != self.capacity_bytes)
         {
             return Err(Error::InvalidConfiguration);
         }
-        SegmentGeometry::new(
-            self.capacity_bytes,
-            self.segment_bytes,
-            self.capacity_bytes / self.segment_bytes,
-            a,
-        )
-        .map_err(|_| Error::InvalidConfiguration)
+        Ok(self.capacity_bytes / self.segment_bytes)
     }
 
-    /// Borrow-check a request before moving its resources into a submission.
-    fn submission(
-        &self,
-        extent: Extent,
-        buffer: &AlignedBuffer<C>,
-        lease: &SegmentLease,
-    ) -> Result<(Rc<Descriptor>, Extent)> {
-        let opened = self.opened.borrow();
-        let slab = opened.as_ref().ok_or(Error::Unavailable)?;
-        let table = slab.table.as_ref().ok_or(Error::Unavailable)?;
-        slab.geometry.alignment().check(extent, buffer)?;
-        if !table.matches(&lease.table_identity()) {
-            return Err(Error::Stale);
-        }
-        let geometry = lease.geometry();
-        if geometry.slab_bytes() != slab.geometry.slab_bytes()
-            || geometry.segment_bytes() != slab.geometry.segment_bytes()
-            || geometry.alignment() != slab.geometry.alignment()
-        {
-            return Err(Error::Corrupt);
-        }
-        lease.validate_extent(&extent)?;
-        let start = lease
-            .id()
-            .0
-            .checked_mul(self.segment_bytes)
-            .ok_or(Error::Corrupt)?;
-        let end = extent
-            .offset()
-            .checked_add(extent.length() as u64)
-            .ok_or(Error::Corrupt)?;
-        if extent.offset() < start
-            || end
-                > start
-                    .checked_add(self.segment_bytes)
-                    .ok_or(Error::Corrupt)?
-            || end > self.capacity_bytes
-        {
-            return Err(Error::Corrupt);
-        }
-        match &slab.backing {
-            OpenBacking::File(file) => Ok((file.clone(), extent)),
-            OpenBacking::Devices(placements) => {
-                let position = usize::try_from(lease.id().0).map_err(|_| Error::Corrupt)?;
-                let placement = placements.get(position).ok_or(Error::Corrupt)?;
-                let offset = placement
-                    .offset
-                    .checked_add(extent.offset() - start)
-                    .ok_or(Error::Corrupt)?;
-                let physical = Extent::new(offset, extent.length())?;
-                let end = offset
-                    .checked_add(extent.length() as u64)
-                    .ok_or(Error::Corrupt)?;
-                if end
-                    > placement
-                        .offset
-                        .checked_add(self.segment_bytes)
-                        .ok_or(Error::Corrupt)?
-                    || end > i64::MAX as u64
-                {
-                    return Err(Error::Corrupt);
-                }
-                slab.geometry.alignment().check(physical, buffer)?;
-                Ok((placement.file.clone(), physical))
-            }
-        }
-    }
-
-    /// Consume a checked request so its descriptor, buffer, and lease travel together.
-    fn prepare(
-        &self,
-        extent: Extent,
-        buffer: AlignedBuffer<C>,
-        lease: SegmentLease,
-    ) -> Result<Submission<C>> {
-        let (file, extent) = self.submission(extent, &buffer, &lease)?;
-        Ok(Submission {
-            file,
-            extent,
-            buffer,
-            lease,
-        })
-    }
-
-    /// Read exactly one checked extent, retaining its buffer and lease until completion.
-    /// Dropping the waiting future does not release kernel-owned resources.
-    /// Neither a lease nor a successful read proves initialization in this
-    /// generation. Append only reserves space; recycled bytes may come from an
-    /// earlier generation or a different cache. Before exposing a valid record,
-    /// the caller must check its integrity, authentication, and cache identity.
-    pub fn read<'a, S: Scope, B: Budget>(
-        &'a self,
-        reactor: &'a Reactor<S, B>,
-        extent: Extent,
-        buffer: AlignedBuffer<C>,
-        lease: SegmentLease,
-        scope: &'a S,
-    ) -> Operation<'a, AlignedBuffer<C>, S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        Box::pin(async move {
-            self.prepare(extent, buffer, lease)?
-                .read(reactor, scope)
-                .await
-        })
-    }
-
-    /// Write exactly one checked extent with completion-owned accounting and lease.
-    /// Failed writes do not roll back the space reserved by append.
-    /// Any lease permits writes within its captured prefix, including a lease from
-    /// [`Segments::lease`]; it does not grant exclusive record ownership. The trusted
-    /// caller must write only reserved extents it owns, never overwrite published or
-    /// readable records, and publish a mapping only after the write succeeds.
-    pub fn write<'a, S: Scope, B: Budget>(
-        &'a self,
-        reactor: &'a Reactor<S, B>,
-        extent: Extent,
-        buffer: AlignedBuffer<C>,
-        lease: SegmentLease,
-        scope: &'a S,
-    ) -> Operation<'a, AlignedBuffer<C>, S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        Box::pin(async move {
-            let submission = self.prepare(extent, buffer, lease)?;
-            let fence = self.writes.acquire()?;
-            submission.write(reactor, scope, fence).await
-        })
-    }
-
-    /// Blocking startup helper that binds the slab for extent volume use, with
-    /// no segment table. Slots are segments; `slot_count` may be at most
-    /// `volume::MAX_SLOTS` and at most the physical segment count. The volume
-    /// uses `volume::SLOT_BYTES` segments. Read and write go through
-    /// [`Slab::read_at`] and [`Slab::write_at`]. A slab bound to a segment table
-    /// cannot be bound for volume use, and the reverse.
+    /// Blocking startup helper that binds the slab for extent volume use.
+    /// Slots are segments; `slot_count` may be at most `volume::MAX_SLOTS` and
+    /// at most the physical segment count. The volume uses `volume::SLOT_BYTES`
+    /// segments. Read and write go through [`Slab::read_at`] and
+    /// [`Slab::write_at`]. Rebinding with a different slot count is rejected.
     pub fn open_volume(&self, slot_count: u64) -> Result<Alignment> {
         if slot_count == 0 || slot_count > crate::volume::MAX_SLOTS {
             return Err(Error::InvalidConfiguration);
@@ -651,10 +447,7 @@ impl<C: Charge> Slab<C> {
         let alignment = self.open_file()?;
         let mut opened = self.opened.borrow_mut();
         let slab = opened.as_mut().ok_or(Error::Unavailable)?;
-        if slab.table.is_some()
-            || slab.volume.is_some_and(|count| count != slot_count)
-            || slot_count > slab.geometry.segment_count()
-        {
+        if slab.volume.is_some_and(|count| count != slot_count) || slot_count > slab.segment_count {
             return Err(Error::InvalidConfiguration);
         }
         slab.volume = Some(slot_count);
@@ -671,7 +464,7 @@ impl<C: Charge> Slab<C> {
         let slab = opened.as_ref().ok_or(Error::Unavailable)?;
         let count = slab.volume.ok_or(Error::Unavailable)?;
         let extent = Extent::new(offset, buffer.len())?;
-        slab.geometry.alignment().check(extent, buffer)?;
+        slab.alignment.check(extent, buffer)?;
         let segment = offset / self.segment_bytes;
         let start = segment * self.segment_bytes;
         let end = offset
@@ -692,7 +485,7 @@ impl<C: Charge> Slab<C> {
                         .ok_or(Error::Corrupt)?,
                     buffer.len(),
                 )?;
-                slab.geometry.alignment().check(physical, buffer)?;
+                slab.alignment.check(physical, buffer)?;
                 Ok((placement.file.clone(), physical))
             }
         }
@@ -853,11 +646,12 @@ impl<C: Charge> Slab<C> {
 struct OpenSlab {
     backing: OpenBacking,
 
-    geometry: SegmentGeometry,
+    alignment: Alignment,
 
-    table: Option<TableIdentity>,
+    // Physical segment count, possibly more than the bound slot count.
+    segment_count: u64,
 
-    // Slot count when bound for volume use instead of a segment table.
+    // Slot count once bound for volume use.
     volume: Option<u64>,
 }
 
@@ -874,8 +668,8 @@ struct OpenPlacement {
 }
 
 /// A validated transfer owns every resource needed to keep kernel access safe.
-/// Only Slab::prepare constructs this capability, and submission consumes it.
-struct Submission<C: Charge, G: 'static = SegmentLease> {
+/// Only Slab::prepare_at constructs this capability, and submission consumes it.
+struct Submission<C: Charge, G: 'static> {
     file: Rc<Descriptor>,
 
     extent: Extent,
@@ -1203,7 +997,6 @@ fn open_private_file(path: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Generation, SegmentId};
 
     /// Counts retained bytes independently of buffer pooling.
     struct CountingCharge {
@@ -1539,13 +1332,9 @@ mod tests {
             ));
             let slab = build(&[2 * segment_bytes, segment_bytes], segment_bytes, unit).unwrap();
             assert_eq!(slab.capacity_bytes(), 2 * segment_bytes);
-            assert_eq!(
-                slab.open_configured(&Segments::new(2 * segment_bytes)),
-                Err(Error::InvalidConfiguration)
-            );
-            let segments = Segments::new(segment_bytes);
-            assert_eq!(slab.open_configured(&segments), Ok(a));
-            assert_eq!(slab.open_configured(&segments), Ok(a));
+            assert_eq!(slab.open_volume(3), Err(Error::InvalidConfiguration));
+            assert_eq!(slab.open_volume(2), Ok(a));
+            assert_eq!(slab.open_volume(2), Ok(a));
             assert_eq!(file.metadata().unwrap().len(), file_bytes);
             let independent = File::open(directory.0.join("device")).unwrap();
             // SAFETY: this live independent descriptor tests that startup took no flock.
@@ -1565,9 +1354,9 @@ mod tests {
         }
     }
 
-    /// Translation preserves logical authority and rechecks physical bounds and alignment.
+    /// Translation maps logical offsets to placements and rechecks physical bounds.
     #[test]
-    fn device_submission_checks_logical_and_physical_extents() {
+    fn device_volume_submission_checks_logical_and_physical_extents() {
         let directory = Directory::new();
         let file = device_file(&directory.0.join("device"));
         let Some(a) = real_alignment(probe(&file)) else {
@@ -1586,49 +1375,34 @@ mod tests {
             a,
         )
         .unwrap();
-        let segments = Segments::new(4096);
-        let _ = slab.open_configured(&segments).unwrap();
-        drop(segments.append(4096).unwrap());
-        let (lease, extent) = segments.append(4096).unwrap();
+        let _ = slab.open_volume(2).unwrap();
         let buffer = slab.allocate(4096, ()).unwrap();
-        let (_, physical) = slab.submission(extent, &buffer, &lease).unwrap();
+        let (_, physical) = slab.volume_submission(4096, &buffer).unwrap();
         assert_eq!(physical, Extent::new(0, 4096).unwrap());
-        assert!(matches!(
-            slab.submission(Extent::new(0, 4096).unwrap(), &buffer, &lease),
-            Err(Error::Corrupt)
-        ));
-        assert!(matches!(
-            slab.submission(Extent::new(8192, 4096).unwrap(), &buffer, &lease),
-            Err(Error::Corrupt)
-        ));
-        assert!(matches!(
-            slab.submission(Extent::new(6144, 4096).unwrap(), &buffer, &lease),
-            Err(Error::Corrupt)
-        ));
-        assert!(matches!(
-            slab.submission(Extent::new(4097, 4096).unwrap(), &buffer, &lease),
-            Err(Error::InvalidConfiguration)
-        ));
-        let other = Segments::from_geometry(slab.geometry().unwrap()).unwrap();
-        let (foreign, extent) = other.append(4096).unwrap();
-        assert!(matches!(
-            slab.submission(extent, &buffer, &foreign),
-            Err(Error::Stale)
-        ));
-        let extent = Extent::new(4096, 4096).unwrap();
+        let (_, physical) = slab.volume_submission(0, &buffer).unwrap();
+        assert_eq!(physical, Extent::new(8192, 4096).unwrap());
         for (offset, expected) in [
+            (8192, Error::Corrupt),
+            (6144, Error::Corrupt),
+            (4097, Error::InvalidConfiguration),
+        ] {
+            assert!(
+                matches!(slab.volume_submission(offset, &buffer), Err(error) if error == expected),
+                "{offset}"
+            );
+        }
+        for (placement, expected) in [
             (1, Error::InvalidConfiguration),
             (u64::MAX - 511, Error::Corrupt),
-            (i64::MAX as u64 - 511, Error::Corrupt),
         ] {
             let mut opened = slab.opened.borrow_mut();
             let OpenBacking::Devices(placements) = &mut opened.as_mut().unwrap().backing else {
                 unreachable!()
             };
-            placements[1].offset = offset;
+            placements[1].offset = placement;
             drop(opened);
             assert!(
-                matches!(slab.submission(extent, &buffer, &lease), Err(error) if error == expected)
+                matches!(slab.volume_submission(4096, &buffer), Err(error) if error == expected)
             );
         }
     }
@@ -1670,10 +1444,7 @@ mod tests {
         let slab =
             Slab::<()>::from_devices(vec![DevicePlacement { file, offset: 4096 }], 4096, 4096, a)
                 .unwrap();
-        let segments = Segments::new(4096);
-        let _ = slab.open_configured(&segments).unwrap();
-        let (lease, extent) = segments.append(4096).unwrap();
-        drop(lease);
+        let _ = slab.open_volume(1).unwrap();
         let sim = Simulation::new();
         let _environment = sim.enter();
         let descriptor = sim
@@ -1701,12 +1472,12 @@ mod tests {
             ] {
                 sim.inject(if write { "write" } else { "read" }, fault)
                     .unwrap();
-                let lease = segments.lease(SegmentId(0), Generation(1)).unwrap();
+                let guard = Rc::new(());
                 let buffer = slab.allocate(4096, ()).unwrap();
                 let mut operation = if write {
-                    slab.write(&reactor, extent, buffer, lease, &TestScope)
+                    slab.write_at(&reactor, 0, buffer, guard.clone(), &TestScope)
                 } else {
-                    slab.read(&reactor, extent, buffer, lease, &TestScope)
+                    slab.read_at(&reactor, 0, buffer, guard.clone(), &TestScope)
                 };
                 let mut completed = false;
                 for _ in 0..100 {
@@ -1724,10 +1495,9 @@ mod tests {
                 drop(operation);
                 assert_eq!(slab.writes_in_flight(), 0);
                 assert_eq!(reactor.in_flight(), 0);
+                assert_eq!(Rc::strong_count(&guard), 1);
             }
         }
-        segments.begin_evict(SegmentId(0)).unwrap();
-        segments.recycle(SegmentId(0)).unwrap();
     }
 
     /// The live descriptor is direct, sparse, exclusively locked, and aligned.
@@ -1796,73 +1566,9 @@ mod tests {
         assert_eq!(conflicting.open_now(), Err(Error::Unavailable));
     }
 
-    /// An oversized automatic table must fail before creating or sizing its backing.
-    #[test]
-    fn open_configured_rejects_oversized_table_without_file_side_effects() {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let directory = Directory::new();
-        let existing = directory.0.join("existing");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&existing)
-            .unwrap();
-        let paths = [
-            directory.0.join("new"),
-            directory.0.join("missing/data"),
-            existing.clone(),
-        ];
-        for path in &paths {
-            let segments = Segments::new(4096);
-            let slab = Slab::<()>::new(path.clone(), 4096 * (crate::MAX_SEGMENTS + 1), 4096, 512);
-            assert_eq!(
-                slab.open_configured(&segments),
-                Err(Error::InvalidConfiguration)
-            );
-            assert!(!segments.is_configured());
-            assert_eq!(segments.count(), 0);
-            assert_eq!(file.metadata().unwrap().len(), 0);
-            if path != &existing {
-                assert!(!path.exists());
-            }
-            assert!(!directory.0.join("missing").exists());
-            assert_eq!(slab.geometry(), Err(Error::Unavailable));
-        }
-
-        let Some(alignment) = real_alignment(probe(&file)) else {
-            return;
-        };
-        let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
-        let capacity = segment_bytes.checked_mul(crate::MAX_SEGMENTS + 1).unwrap();
-        let retry_capacity = segment_bytes.checked_mul(2).unwrap();
-        for path in &paths {
-            let segments = Segments::new(segment_bytes);
-            let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
-            assert_eq!(
-                slab.open_configured(&segments),
-                Err(Error::InvalidConfiguration)
-            );
-            assert!(!segments.is_configured());
-            assert_eq!(slab.geometry(), Err(Error::Unavailable));
-            let retry = Slab::<()>::new(path.clone(), retry_capacity, segment_bytes, 512);
-            if real_alignment(retry.open_configured(&segments)).is_none() {
-                return;
-            }
-            assert_eq!(segments.count(), 2);
-            assert_eq!(std::fs::metadata(path).unwrap().len(), retry_capacity);
-            drop(retry);
-            std::fs::remove_file(path).unwrap();
-            if path.parent() != Some(directory.0.as_path()) {
-                std::fs::remove_dir(path.parent().unwrap()).unwrap();
-            }
-        }
-    }
-
     /// Invalid arithmetic inputs fail without creating a directory or a file.
     #[test]
-    fn open_configured_rejects_invalid_geometry_before_open() {
+    fn open_volume_rejects_invalid_geometry_before_open() {
         let directory = Directory::new();
         for (capacity, segment, record) in [
             (0, 0, 512),
@@ -1876,50 +1582,11 @@ mod tests {
         ] {
             let path = directory.0.join("missing/data");
             let slab = Slab::<()>::new(path.clone(), capacity, segment, record);
-            let segments = Segments::new(segment);
-            assert_eq!(
-                slab.open_configured(&segments),
-                Err(Error::InvalidConfiguration)
-            );
-            assert!(!segments.is_configured());
-            assert_eq!(slab.geometry(), Err(Error::Unavailable));
+            assert_eq!(slab.open_volume(1), Err(Error::InvalidConfiguration));
+            assert_eq!(slab.alignment(), Err(Error::Unavailable));
             assert!(!path.exists());
             assert!(!path.parent().unwrap().exists());
         }
-    }
-
-    /// The slot limit does not cap physical backing for an already configured table.
-    #[test]
-    fn open_configured_accepts_partial_table_above_physical_segment_limit() {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let directory = Directory::new();
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(directory.0.join("probe"))
-            .unwrap();
-        let Some(alignment) = real_alignment(probe(&file)) else {
-            return;
-        };
-        let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
-        let capacity = segment_bytes.checked_mul(crate::MAX_SEGMENTS + 1).unwrap();
-        let segments = Segments::new(segment_bytes);
-        segments.configure(capacity, 2, alignment).unwrap();
-        let path = directory.0.join("partial");
-        let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
-        let Some(opened_alignment) = real_alignment(slab.open_configured(&segments)) else {
-            return;
-        };
-        assert_eq!(opened_alignment, alignment);
-        assert_eq!(segments.count(), 2);
-        assert_eq!(segments.capacity_bytes(), capacity);
-        assert_eq!(
-            slab.geometry().unwrap().segment_count(),
-            crate::MAX_SEGMENTS + 1
-        );
-        assert_eq!(std::fs::metadata(path).unwrap().len(), capacity);
     }
 
     /// Invalid startup dimensions never truncate a preexisting nonempty file.
@@ -1955,37 +1622,23 @@ mod tests {
 
     /// Private validation rejects wrong ranges before any runtime admission.
     #[test]
-    fn submission_checks_alignment_segment_and_capacity() {
+    fn volume_submission_checks_alignment_segment_and_capacity() {
         let directory = Directory::new();
         let slab = Slab::<()>::new(directory.0.join("data"), 8192, 4096, 512);
-        let segments = Segments::new(4096);
-        let Some(a) = real_alignment(slab.open_configured(&segments)) else {
+        if real_alignment(slab.open_volume(2)).is_none() {
             return;
-        };
-        let (lease, extent) = segments.append(4096).unwrap();
+        }
         let buffer = slab.allocate(4096, ()).unwrap();
-        assert!(slab.submission(extent, &buffer, &lease).is_ok());
+        assert!(slab.volume_submission(0, &buffer).is_ok());
+        assert!(slab.volume_submission(4096, &buffer).is_ok());
         assert!(matches!(
-            slab.submission(Extent::new(4096, 4096).unwrap(), &buffer, &lease),
+            slab.volume_submission(8192, &buffer),
             Err(Error::Corrupt)
         ));
         assert!(matches!(
-            slab.submission(Extent::new(1, 4096).unwrap(), &buffer, &lease),
+            slab.volume_submission(1, &buffer),
             Err(Error::InvalidConfiguration)
         ));
-        let outside_table = Segments::new(4096);
-        outside_table.configure(12288, 3, a).unwrap();
-        drop(outside_table.append(4096).unwrap());
-        drop(outside_table.append(4096).unwrap());
-        let (outside, extent) = outside_table.append(4096).unwrap();
-        assert!(matches!(
-            slab.submission(extent, &buffer, &outside),
-            Err(Error::Stale)
-        ));
-        assert_eq!(
-            outside_table.validate(SegmentId(2), Generation(1), &extent),
-            Ok(())
-        );
     }
 
     /// Waiters sleep, replace wakers, unregister on cancellation, and register again.
@@ -2069,38 +1722,35 @@ mod tests {
         assert_eq!(state.count.get(), 0);
     }
 
-    /// Validation consumes rejected resources and successful preparation retains its lease.
+    /// Validation consumes rejected resources and successful preparation retains its guard.
     #[test]
     fn prepared_submission_owns_resources_and_failed_binding_is_recoverable() {
         let directory = Directory::new();
         let slab = Slab::<CountingCharge>::new(directory.0.join("prepared"), 8192, 4096, 512);
-        let Some(alignment) = real_alignment(slab.open_now()) else {
+        if real_alignment(slab.open_now()).is_none() {
             return;
-        };
-        let table = Segments::new(4096);
-        table.configure(8192, 2, alignment).unwrap();
-        let (lease, extent) = table.append(4096).unwrap();
+        }
         let used = Rc::new(Cell::new(0));
+        let guard = Rc::new(());
         let buffer = slab
             .allocate(4096, CountingCharge::new(&used, 4096))
             .unwrap();
         assert!(matches!(
-            slab.prepare(extent, buffer, lease),
+            slab.prepare_at(0, buffer, guard.clone()),
             Err(Error::Unavailable)
         ));
+        assert_eq!(Rc::strong_count(&guard), 1);
         assert_eq!(slab.reclaim_idle(), 4096);
         assert_eq!(used.get(), 0);
         assert_eq!(slab.writes_in_flight(), 0);
-        slab.configure_segments(&table).unwrap();
-        let lease = table.lease(SegmentId(0), Generation(1)).unwrap();
+        let _ = slab.open_volume(2).unwrap();
         let buffer = slab
             .allocate(4096, CountingCharge::new(&used, 4096))
             .unwrap();
-        let submission = slab.prepare(extent, buffer, lease).unwrap();
-        table.begin_evict(SegmentId(0)).unwrap();
-        assert_eq!(table.recycle(SegmentId(0)), Err(Error::Busy));
+        let submission = slab.prepare_at(0, buffer, guard.clone()).unwrap();
+        assert_eq!(Rc::strong_count(&guard), 2);
         drop(submission);
-        table.recycle(SegmentId(0)).unwrap();
+        assert_eq!(Rc::strong_count(&guard), 1);
         assert_eq!(used.get(), 4096);
         slab.reclaim_idle();
         assert_eq!(used.get(), 0);
@@ -2325,69 +1975,6 @@ mod tests {
                 & 0o777,
             0o700
         );
-    }
-
-    /// Binding is permanent and validates dimensions as well as captured used extents.
-    #[test]
-    fn binding_validates_geometry_identity_and_used_extents() {
-        let directory = Directory::new();
-        let slab = Slab::<()>::new(directory.0.join("data"), 8192, 4096, 512);
-        let table = Segments::new(4096);
-        let Some(a) = real_alignment(slab.open_configured(&table)) else {
-            return;
-        };
-        assert_eq!(table.geometry(), Some(slab.geometry().unwrap()));
-        slab.configure_segments(&table).unwrap();
-        let other = Segments::new(4096);
-        other.configure(8192, 2, a).unwrap();
-        assert_eq!(
-            slab.configure_segments(&other),
-            Err(Error::InvalidConfiguration)
-        );
-        let length = a.extent(0, 512).unwrap().length();
-        let (foreign, extent) = other.append(length).unwrap();
-        let buffer = slab.allocate(length, ()).unwrap();
-        assert!(matches!(
-            slab.submission(extent, &buffer, &foreign),
-            Err(Error::Stale)
-        ));
-        let (lease, extent) = table.append(length).unwrap();
-        assert!(slab.submission(extent, &buffer, &lease).is_ok());
-        assert!(matches!(
-            slab.submission(Extent::new(length as u64, length).unwrap(), &buffer, &lease),
-            Err(Error::Corrupt)
-        ));
-        let wrong = Slab::<()>::new(directory.0.join("wrong"), 8192, 4096, 512);
-        let _ = wrong.open_now().unwrap();
-        assert_eq!(
-            wrong.configure_segments(&Segments::new(8192)),
-            Err(Error::InvalidConfiguration)
-        );
-        let wrong_capacity = Segments::new(4096);
-        wrong_capacity.configure(4096, 1, a).unwrap();
-        assert_eq!(
-            wrong.configure_segments(&wrong_capacity),
-            Err(Error::InvalidConfiguration)
-        );
-        let wrong_alignment = Segments::new(4096);
-        let incompatible = Alignment::new(a.memory() * 2, a.offset(), a.length()).unwrap();
-        wrong_alignment.configure(8192, 2, incompatible).unwrap();
-        assert_eq!(
-            wrong.configure_segments(&wrong_alignment),
-            Err(Error::InvalidConfiguration)
-        );
-        let partial = Segments::new(4096);
-        partial.configure(8192, 1, a).unwrap();
-        wrong.configure_segments(&partial).unwrap();
-        assert_eq!(partial.count(), 1);
-        if length < 4096 {
-            drop(table.append(4096 - length).unwrap());
-        }
-        table.begin_evict(SegmentId(0)).unwrap();
-        assert!(slab.submission(extent, &buffer, &lease).is_ok());
-        assert_eq!(table.recycle(SegmentId(0)), Err(Error::Busy));
-        drop(lease);
-        table.recycle(SegmentId(0)).unwrap();
     }
 
     /// Invalid replacement preserves idle accounting until explicit reclamation.
