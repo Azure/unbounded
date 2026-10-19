@@ -25,7 +25,6 @@ use racer_control_wire::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
-use std::cell::RefCell;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -49,8 +48,6 @@ pub struct Checkpointer {
     layout: Cell<Option<CheckpointLayout>>,
     /// A successful snapshot has not been finished yet.
     taken: Cell<bool>,
-    writer: RefCell<std::rc::Weak<super::StoreWriter>>,
-    paused: RefCell<Option<super::WriterPause>>,
 }
 
 impl Checkpointer {
@@ -61,20 +58,6 @@ impl Checkpointer {
             index,
             layout: Cell::new(None),
             taken: Cell::new(false),
-            writer: RefCell::new(std::rc::Weak::new()),
-            paused: RefCell::new(None),
-        }
-    }
-
-    pub(super) fn bind_writer(&self, writer: &Rc<super::StoreWriter>) {
-        *self.writer.borrow_mut() = Rc::downgrade(writer);
-    }
-
-    async fn pause_writer(&self) -> Result<Option<super::WriterPause>> {
-        let writer = self.writer.borrow().upgrade();
-        match writer {
-            Some(writer) => writer.pause_for_checkpoint().await.map(Some),
-            None => Ok(None),
         }
     }
 
@@ -118,7 +101,6 @@ impl Checkpointer {
             if self.taken.get() {
                 return Err(Error::Overloaded);
             }
-            let paused = self.pause_writer().await?;
             let shard = ShardImage {
                 worker: self.index.worker(),
                 layout,
@@ -126,7 +108,6 @@ impl Checkpointer {
             };
             shard.validate()?;
             self.taken.set(true);
-            *self.paused.borrow_mut() = paused;
             Ok(shard)
         })
     }
@@ -141,13 +122,11 @@ impl Checkpointer {
                 return Err(Error::Overloaded);
             }
             let mut remaining = budget.checked_sub(SHARD_BYTES).ok_or(Error::Overloaded)?;
-            // Inspect borrowed index state before draining writes.
+            // Reject an oversized cut before cloning anything.
             owner.index.preflight_snapshot(&mut remaining)?;
             remaining = budget - SHARD_BYTES;
-            // Keep ownership in the future until success so cancellation resumes.
-            let paused = owner.pause_writer().await?;
             let result = async {
-                // Recheck while copying: draining writes can publish versions.
+                // Recheck while copying: writes between batches can publish versions.
                 let metadata = owner.index.snapshot_metadata_budgeted(&mut remaining)?;
                 let mut versions = Vec::new();
                 let mut cursor = None;
@@ -174,7 +153,6 @@ impl Checkpointer {
             .await;
             if result.is_ok() {
                 owner.taken.set(true);
-                *owner.paused.borrow_mut() = paused;
             }
             result
         })
@@ -184,8 +162,6 @@ impl Checkpointer {
     /// Images are Send values, deliberately containing no worker-local lease/Rc.
     pub fn finish_snapshot(&self) {
         self.taken.set(false);
-        let paused = self.paused.borrow_mut().take();
-        drop(paused);
     }
 
     /// Whether a successful snapshot still awaits [`Checkpointer::finish_snapshot`].
@@ -951,7 +927,6 @@ mod budget_tests {
             Err(Error::Overloaded)
         ));
         assert!(!checkpoint.is_snapshot_taken());
-        assert!(checkpoint.paused.borrow().is_none());
         let shard =
             futures::executor::block_on(checkpoint.snapshot_incremental(SHARD_BYTES)).unwrap();
         assert!(shard.index.versions.is_empty());
