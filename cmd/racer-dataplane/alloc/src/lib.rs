@@ -164,19 +164,20 @@ mod segments;
 
 mod slab;
 
-use racer_platform::reactor::IoBuffer;
-pub use segments::{
-    FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
-    SegmentSnapshot, SegmentState, Segments,
-};
 pub use demand::{
     DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
     DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
+pub use segments::{
+    FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
+    SegmentSnapshot, SegmentState, Segments,
+};
 pub use slab::{DevicePlacement, Slab};
+use racer_platform::reactor::IoBuffer;
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     cell::RefCell,
+    collections::VecDeque,
     fmt,
     ptr::NonNull,
     rc::{Rc, Weak},
@@ -704,18 +705,20 @@ pub struct AlignedBuffer<C: Charge> {
     length: usize,
 }
 
-/// Small bounded free lists, grouped in 64 KiB size classes without locks.
+/// Small demand-sized free lists, grouped in 64 KiB size classes without locks.
+///
+/// Entries are kept oldest first so maintenance trims the longest-idle storage.
 pub(crate) struct BufferPool<C: Charge> {
-    entries: Vec<AlignedBuffer<C>>,
-    depth: usize,
+    entries: VecDeque<AlignedBuffer<C>>,
+    demand: PoolDemand,
     budget: usize,
 }
 
 impl<C: Charge> Default for BufferPool<C> {
     fn default() -> Self {
         Self {
-            entries: Vec::new(),
-            depth: 8,
+            entries: VecDeque::new(),
+            demand: PoolDemand::new(),
             budget: 128 * 1024 * 1024,
         }
     }
@@ -735,8 +738,31 @@ impl<C: Charge> BufferPool<C> {
             .sum()
     }
 
-    fn accepts(&self, capacity: usize) -> bool {
-        self.entries.len() < self.depth && capacity <= self.budget.saturating_sub(self.bytes())
+    fn accepts(&mut self, capacity: usize) -> bool {
+        let bytes = self.bytes();
+        self.demand
+            .admit(self.entries.len(), bytes, capacity, self.budget)
+    }
+
+    /// Remove the entries chosen by demand maintenance, oldest first.
+    pub(crate) fn maintain(&mut self, now: std::time::Instant) -> Vec<AlignedBuffer<C>> {
+        let release = self.demand.tick(now, self.entries.len());
+        self.entries.drain(..release).collect()
+    }
+
+    /// Remove every idle entry and count it as trimmed.
+    pub(crate) fn take_all(&mut self) -> VecDeque<AlignedBuffer<C>> {
+        let idle = std::mem::take(&mut self.entries);
+        self.demand.record_trim(idle.len(), 0);
+        idle
+    }
+
+    pub(crate) fn set_constrained(&mut self, constrained: bool) {
+        self.demand.set_constrained(constrained);
+    }
+
+    pub(crate) fn stats(&self) -> PoolStats {
+        self.demand.stats(self.entries.len(), self.bytes())
     }
 
     fn take_for(&mut self, length: usize, charge: &C) -> Option<AlignedBuffer<C>> {
@@ -746,8 +772,14 @@ impl<C: Charge> BufferPool<C> {
             buffer_capacity(capacity) == Some(class)
                 && capacity >= length
                 && charge.covers(capacity)
-        })?;
-        Some(self.entries.swap_remove(index))
+        });
+        let Some(index) = index else {
+            self.demand.record_miss();
+            return None;
+        };
+        let buffer = self.entries.remove(index);
+        self.demand.record_hit(self.entries.len());
+        buffer
     }
 }
 
@@ -864,7 +896,7 @@ impl<C: Charge> Drop for AlignedBuffer<C> {
                 && idle.accepts(self.allocation().layout.size())
             {
                 self.allocation_mut().prepare_pool();
-                idle.entries.push(Self {
+                idle.entries.push_back(Self {
                     allocation: self.allocation.take(),
                     pool: Weak::new(),
                     length: self.length,
@@ -1033,6 +1065,7 @@ mod buffer_tests {
             let live = Rc::new(Cell::new(0));
             let pool = Rc::new(RefCell::new(BufferPool {
                 budget,
+                demand: PoolDemand::new().with_target(8),
                 ..BufferPool::default()
             }));
             for length in (1..=32).map(|n| n * 8192) {
@@ -1176,12 +1209,12 @@ mod buffer_tests {
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         drop(buffer);
         assert_eq!(wipes.get(), 0);
-        buffer = pool.borrow_mut().entries.pop().unwrap().pooled(&pool);
+        buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
         buffer.as_mut_slice().fill(0xa5);
         assert!(!buffer.allocation().clean);
         drop(buffer);
         assert_eq!(wipes.get(), 1);
-        buffer = pool.borrow_mut().entries.pop().unwrap().pooled(&pool);
+        buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         assert!(buffer.allocation().clean);
         drop(buffer);
@@ -1206,7 +1239,7 @@ mod buffer_tests {
             assert_eq!(buffer.as_slice()[127], 0x5a);
             drop(buffer);
             assert_eq!(wipes.get(), expected);
-            buffer = pool.borrow_mut().entries.pop().unwrap().pooled(&pool);
+            buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
             assert_eq!(IoBuffer::bytes(&buffer).unwrap(), &[0; 128]);
         }
         // Even an unused mutable borrow must conservatively require a wipe.
@@ -1386,7 +1419,7 @@ mod buffer_tests {
         drop(buffer);
         assert_eq!(live.get(), 15);
         assert!(weak.upgrade().is_none());
-        let mut reused = pool.borrow_mut().entries.pop().unwrap();
+        let mut reused = pool.borrow_mut().entries.pop_back().unwrap();
         assert_eq!(reused.as_slice().as_ptr(), pointer);
         assert_eq!(reused.as_slice(), &[0; 15]);
         reused.rebind(TrackedCharge::new(&live, 20)).unwrap();
@@ -1403,7 +1436,7 @@ mod buffer_tests {
         for scenario in 0..4 {
             let live = Rc::new(Cell::new(0));
             let pool = Rc::new(RefCell::new(BufferPool {
-                depth: 1,
+                demand: PoolDemand::new().with_bounds(0, 1).with_target(1),
                 ..BufferPool::default()
             }));
             let mut buffer = alignment
@@ -1433,7 +1466,7 @@ mod buffer_tests {
                 _ => {
                     let idle = alignment.allocate(8, TrackedCharge::new(&live, 8)).unwrap();
                     let pointer = idle.as_slice().as_ptr();
-                    pool.borrow_mut().entries.push(idle);
+                    pool.borrow_mut().entries.push_back(idle);
                     drop(buffer);
                     assert_eq!(live.get(), 8);
                     assert_eq!(pool.borrow().entries[0].as_slice().as_ptr(), pointer);

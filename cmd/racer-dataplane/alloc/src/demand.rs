@@ -208,7 +208,9 @@ impl PoolDemand {
             return 0;
         }
         if self.misses > 0 && self.rejects_full > 0 {
-            let step = usize::try_from(self.misses / 2).unwrap_or(usize::MAX).max(1);
+            let step = usize::try_from(self.misses / 2)
+                .unwrap_or(usize::MAX)
+                .max(1);
             self.target = self.target.saturating_add(step).min(self.max_depth);
             self.idle_windows = 0;
         } else if self.misses == 0 {

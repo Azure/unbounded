@@ -224,8 +224,29 @@ impl<C: Charge> Slab<C> {
 
     /// Release only idle memory, returning its size without touching live I/O.
     pub fn reclaim_idle(&self) -> usize {
-        let idle = std::mem::take(&mut self.idle_buffer.borrow_mut().entries);
+        let idle = self.idle_buffer.borrow_mut().take_all();
         idle.iter().map(|b| b.allocation().layout.size()).sum()
+    }
+
+    /// Run demand maintenance at `now`, freeing idle entries the controller
+    /// releases oldest first. Returns released bytes; O(1) between windows.
+    pub fn maintain_idle(&self, now: std::time::Instant) -> usize {
+        let Ok(mut pool) = self.idle_buffer.try_borrow_mut() else {
+            return 0;
+        };
+        let released = pool.maintain(now);
+        drop(pool);
+        released.iter().map(|b| b.allocation().layout.size()).sum()
+    }
+
+    /// Hold the idle pool at its minimum depth and refuse returns while constrained.
+    pub fn constrain_idle(&self, constrained: bool) {
+        self.idle_buffer.borrow_mut().set_constrained(constrained);
+    }
+
+    /// Current idle pool size, target, and cumulative counters.
+    pub fn idle_pool_stats(&self) -> crate::PoolStats {
+        self.idle_buffer.borrow().stats()
     }
 
     /// Wait for accepted writes to release their runtime completion fences.
