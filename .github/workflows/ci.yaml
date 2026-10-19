@@ -158,9 +158,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/Cargo.lock', 'crates/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/Cargo.lock', 'crates/**/Cargo.toml') }}-
+            racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-
 
       - name: Check Rust formatting
         run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check
@@ -214,9 +214,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/Cargo.lock', 'crates/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/Cargo.lock', 'crates/**/Cargo.toml') }}-
+            racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-
 
       - name: Check
         run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-targets $FEATURES
@@ -254,9 +254,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/Cargo.lock', 'crates/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/Cargo.lock', 'crates/**/Cargo.toml') }}-
+            racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml', 'crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-
 
       - name: Runtime production real I/O (no simulation)
         env:
@@ -377,7 +377,13 @@ jobs:
 
   # ---------- Shared Rust library crates (crates/) ----------
   crates-lint:
-    name: Rust Crates Lint
+    name: Rust Crates Lint (${{ matrix.crate }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each directory under crates/ is a standalone package with its own
+        # Cargo.lock; add new crates here.
+        crate: [uring-runtime, uring-runtime-sim]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -396,23 +402,29 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/crates-cargo
-          key: crates-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/Cargo.lock', 'crates/**/Cargo.toml') }}-${{ github.sha }}
+          key: crates-lint-${{ matrix.crate }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            crates-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/Cargo.lock', 'crates/**/Cargo.toml') }}-
+            crates-lint-${{ matrix.crate }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-
 
       - name: Check Rust formatting
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path crates/Cargo.toml --all --check
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path crates/${{ matrix.crate }}/Cargo.toml --check
 
       - name: Strict Clippy
-        run: timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path crates/Cargo.toml --workspace --all-targets -- -D warnings
+        run: timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml --all-targets -- -D warnings
 
       - name: Strict rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
-        run: timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 doc --locked --manifest-path crates/Cargo.toml --workspace --no-deps
+        run: timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 doc --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-deps
 
   crates-test:
-    name: Rust Crates Test
+    name: Rust Crates Test (${{ matrix.crate }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each directory under crates/ is a standalone package with its own
+        # Cargo.lock; add new crates here.
+        crate: [uring-runtime, uring-runtime-sim]
     # Real io_uring needs a VM rather than a seccomp-restricted container.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -436,21 +448,27 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/crates-cargo
-          key: crates-test-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/Cargo.lock', 'crates/**/Cargo.toml') }}-${{ github.sha }}
+          key: crates-test-${{ matrix.crate }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            crates-test-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/Cargo.lock', 'crates/**/Cargo.toml') }}-
+            crates-test-${{ matrix.crate }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-
 
       - name: Build tests
-        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 test --locked --manifest-path crates/Cargo.toml --workspace --no-run
+        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 test --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-run
 
       # io_uring tests fail instead of skipping when the kernel rejects setup.
       - name: Test
         env:
           URING_RUNTIME_REQUIRE_KERNEL: "1"
-        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path crates/Cargo.toml --workspace
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml
 
   crates-msrv:
-    name: Rust Crates MSRV
+    name: Rust Crates MSRV (${{ matrix.crate }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each directory under crates/ is a standalone package with its own
+        # Cargo.lock; add new crates here.
+        crate: [uring-runtime, uring-runtime-sim]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -459,7 +477,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Keep in sync with workspace.package.rust-version in crates/Cargo.toml.
+      # Keep in sync with package.rust-version in each crates/*/Cargo.toml.
       - name: Set up MSRV Rust
         run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.88.0 --profile minimal
 
@@ -470,15 +488,21 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/crates-msrv-cargo
-          key: crates-msrv-${{ runner.os }}-${{ runner.arch }}-1.88.0-${{ hashFiles('crates/Cargo.lock', 'crates/**/Cargo.toml') }}-${{ github.sha }}
+          key: crates-msrv-${{ matrix.crate }}-${{ runner.os }}-${{ runner.arch }}-1.88.0-${{ hashFiles('crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            crates-msrv-${{ runner.os }}-${{ runner.arch }}-1.88.0-${{ hashFiles('crates/Cargo.lock', 'crates/**/Cargo.toml') }}-
+            crates-msrv-${{ matrix.crate }}-${{ runner.os }}-${{ runner.arch }}-1.88.0-${{ hashFiles('crates/*/Cargo.lock', 'crates/*/Cargo.toml') }}-
 
       - name: Check
-        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.88.0 check --locked --manifest-path crates/Cargo.toml --workspace --all-targets
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.88.0 check --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml --all-targets
 
   crates-miri:
-    name: Rust Crates Miri
+    name: Rust Crates Miri (${{ matrix.crate }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each directory under crates/ is a standalone package with its own
+        # Cargo.lock; add new crates here.
+        crate: [uring-runtime, uring-runtime-sim]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -496,7 +520,7 @@ jobs:
       - name: Miri library tests
         env:
           MIRIFLAGS: ""
-        run: timeout --signal=TERM --kill-after=10s 1200s cargo +nightly-2025-11-21 miri test --locked --manifest-path crates/Cargo.toml --workspace --lib
+        run: timeout --signal=TERM --kill-after=10s 1200s cargo +nightly-2025-11-21 miri test --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml --lib
 
   racer-envtest:
     name: Racer API Server Integration Tests
