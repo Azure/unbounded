@@ -1002,6 +1002,7 @@ func TestRevokeOnDependencyFailureDeletesExistingObject(t *testing.T) {
 		deleteErr  error
 		wantExists bool
 		wantSkip   bool
+		wantFail   bool
 		wantInErr  string
 	}{
 		{name: "dependency fails", broken: "restriction", revoke: true, wantSkip: true},
@@ -1010,7 +1011,7 @@ func TestRevokeOnDependencyFailureDeletesExistingObject(t *testing.T) {
 		{name: "unrelated tier failure", broken: "other", revoke: true, wantExists: true, wantSkip: true},
 		{
 			name: "revoke fails", broken: "restriction", revoke: true, deleteErr: errors.New("delete refused"),
-			wantExists: true, wantSkip: true, wantInErr: "delete refused",
+			wantExists: true, wantFail: true, wantInErr: "delete refused",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1048,8 +1049,33 @@ func TestRevokeOnDependencyFailureDeletesExistingObject(t *testing.T) {
 				t.Fatalf("granted skipped = %v, want %v", skipped, tc.wantSkip)
 			}
 
-			if tc.wantInErr != "" && !strings.Contains(skipped[0].Err.Error(), tc.wantInErr) {
-				t.Fatalf("skip error = %v, want it to mention %q", skipped[0].Err, tc.wantInErr)
+			var failed []OperationResult
+
+			for _, r := range result.Results {
+				if r.Ref.Name == "granted" && r.Status == OpFailed {
+					failed = append(failed, r)
+				}
+			}
+
+			if (len(failed) == 1) != tc.wantFail {
+				t.Fatalf("granted failed = %v, want %v", failed, tc.wantFail)
+			}
+
+			if !tc.wantFail {
+				return
+			}
+
+			if !strings.Contains(failed[0].Err.Error(), tc.wantInErr) {
+				t.Fatalf("failure = %v, want it to mention %q", failed[0].Err, tc.wantInErr)
+			}
+
+			if err := result.Err(); err == nil || !strings.Contains(err.Error(), tc.wantInErr) {
+				t.Fatalf("ExecutionResult.Err() = %v, want it to mention %q", err, tc.wantInErr)
+			}
+
+			combined := CombineResult("c", "", Reconciled(), result)
+			if combined.Err == nil || !strings.Contains(combined.Err.Error(), tc.wantInErr) {
+				t.Fatalf("CombineResult error = %v, want it to mention %q", combined.Err, tc.wantInErr)
 			}
 		})
 	}

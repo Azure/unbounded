@@ -337,12 +337,15 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 
 	for _, op := range ordered {
 		if reason, blocked := blockedBy(op, brokenRef, brokenNS, brokenSub); blocked {
-			err := errors.New(reason)
+			// A revocation that fails leaves the object installed, so it is
+			// reported as a failure rather than a skip.
 			if revokeErr := e.revoke(ctx, op, brokenRef); revokeErr != nil {
-				err = fmt.Errorf("%s; revoking it failed: %w", reason, revokeErr)
+				fail(op, OpFailed, fmt.Errorf("%s; revoking it failed: %w", reason, revokeErr))
+
+				continue
 			}
 
-			fail(op, OpSkipped, err)
+			fail(op, OpSkipped, errors.New(reason))
 
 			continue
 		}
