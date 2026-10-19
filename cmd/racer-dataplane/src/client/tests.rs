@@ -350,6 +350,19 @@ mod directory {
             .unwrap();
         assert_eq!(prepare_client_directory(&directory), Err(Error::Io));
         assert_eq!(directory.metadata().unwrap().mode() & 0o7777, 0o777);
+        // A secure 0700 directory passes restrict_directory without chmod, so
+        // this reaches the fchmod in the search grant.
+        let secure = root.0.join("secure");
+        fs::create_dir(&secure).unwrap();
+        fs::set_permissions(&secure, fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&secure)
+            .unwrap();
+        let before = pinned.metadata().unwrap();
+        assert_eq!(prepare_client_directory(&pinned), Err(Error::Io));
+        assert_identity(&before, &pinned.metadata().unwrap(), 0o700);
         let link = root.0.join("link");
         std::os::unix::fs::symlink(&root.0, &link).unwrap();
         let link = OpenOptions::new()

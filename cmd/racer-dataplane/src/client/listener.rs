@@ -1269,8 +1269,9 @@ fn origin_owner() -> super::origin_directory::Owner {
     }
 }
 
-/// Search bits that let SDK clients running as any user reach the client
-/// socket. Read and write bits are not added.
+/// Search bits that let SDK clients running as users other than the
+/// directory owner reach the client socket. The owner bits and read and
+/// write bits are not changed.
 const CLIENT_DIRECTORY_SEARCH: u32 = 0o011;
 
 /// Make the client directory safe and reachable. Group and other write bits
