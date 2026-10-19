@@ -1231,6 +1231,82 @@ fn assembled_worker_exports_live_quota_gauges() {
 }
 
 #[test]
+fn lazy_disk_commit_waits_for_interval_and_pending_changes() {
+    let now = Instant::now();
+    assert!(!lazy_commit_due(None, now, false, false));
+    assert!(lazy_commit_due(None, now, true, false));
+    assert!(!lazy_commit_due(None, now, true, true));
+    assert!(!lazy_commit_due(
+        Some(now),
+        now + DISK_COMMIT_INTERVAL - Duration::from_millis(1),
+        true,
+        false
+    ));
+    assert!(lazy_commit_due(
+        Some(now),
+        now + DISK_COMMIT_INTERVAL,
+        true,
+        false
+    ));
+    assert!(!lazy_commit_due(
+        Some(now),
+        now + DISK_COMMIT_INTERVAL,
+        false,
+        false
+    ));
+}
+
+#[test]
+fn worker_lazily_commits_cache_index_changes() {
+    use page_alloc::volume::{Key, Tier};
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let mut worker = wake_test_worker();
+    worker.runtime.reactor.init().unwrap();
+    let startup = scope(Duration::from_secs(5)).unwrap();
+    drive_peer(&worker.runtime.reactor, worker.prepare_storage(&startup)).unwrap();
+    let index = worker.store.writer.index().clone();
+    let volume = index.volume().unwrap();
+    assert!(!index.is_dirty(), "a fresh format has nothing to commit");
+    // Publish one cache-tier entry directly; it stays uncommitted.
+    let reservation = volume.allocate(Tier::Cache, 4096).unwrap();
+    let charge = worker
+        .runtime
+        .admission
+        .reserve(None, ResourceClass::Ciphertext, 4096)
+        .unwrap();
+    let buffer = worker.store.writer.slabs().allocate(4096, charge).unwrap();
+    let _ = drive_peer(
+        &worker.runtime.reactor,
+        volume.write(&*worker.runtime.reactor, &reservation, buffer, &startup),
+    )
+    .unwrap();
+    let generation = volume.next_generation();
+    volume
+        .publish(
+            Key::new([1; 8], [2; 12], 0),
+            reservation,
+            4096,
+            generation,
+            0,
+        )
+        .unwrap();
+    assert!(index.is_dirty());
+    let before = volume.commit_stats().succeeded;
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while index.is_dirty() || worker.commit_task.is_some() {
+        worker.poll_writer(&mut cx).unwrap();
+        worker.runtime.reactor.poll_budgeted(64).unwrap();
+        assert!(Instant::now() < deadline, "lazy commit did not finish");
+    }
+    assert_eq!(volume.commit_stats().succeeded, before + 1);
+    // Nothing is pending, so polling starts no further commit.
+    worker.poll_writer(&mut cx).unwrap();
+    assert!(worker.commit_task.is_none());
+}
+
+#[test]
 fn disk_usage_worker_samples_recovery_and_reset() {
     let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();

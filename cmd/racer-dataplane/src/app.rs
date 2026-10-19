@@ -328,6 +328,22 @@ fn payload_capacity(
     ))
 }
 
+/// Interval between lazy commits of cache-tier disk index changes.
+const DISK_COMMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether to start a lazy disk commit: changes are pending, none is running,
+/// and the interval passed since the last one started.
+fn lazy_commit_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    dirty: bool,
+    running: bool,
+) -> bool {
+    dirty
+        && !running
+        && last.is_none_or(|last| now.saturating_duration_since(last) >= DISK_COMMIT_INTERVAL)
+}
+
 fn scope(timeout: Duration) -> Result<RequestScope> {
     RequestScope::new(
         RequestId([0; 16]),
@@ -617,6 +633,12 @@ pub struct WorkerApplication {
     peer_task: Option<Operation<'static, ()>>,
 
     writer_task: Option<Operation<'static, ()>>,
+
+    /// Lazy commit of cache-tier disk index changes.
+    commit_task: Option<Operation<'static, ()>>,
+
+    /// Start of the last lazy commit.
+    last_commit: Option<std::time::Instant>,
 
     /// Successful I/O returns its reserved slot instead of toggling shared state blindly.
     checkpoint_task: Option<Operation<'static, recovery::Publication>>,
@@ -1093,6 +1115,8 @@ impl WorkerApplication {
             keyring_scope: None,
             peer_task: None,
             writer_task: None,
+            commit_task: None,
+            last_commit: None,
             checkpoint_task: None,
             checkpoint_snapshot: None,
             checkpoint_generation: 0,
@@ -1636,6 +1660,38 @@ impl WorkerApplication {
                 writer.progress(8, &write_scope).await.map(|_| ())
             }));
         }
+        self.poll_disk_commit(cx)
+    }
+
+    /// Commit cache-tier disk index changes about once per second while there
+    /// are any. Storage-tier writes commit before they are acknowledged, so a
+    /// crash loses at most the cache pages of the last interval.
+    fn poll_disk_commit(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        if let Some(result) = poll_task(&mut self.commit_task, cx)
+            && !matches!(
+                result,
+                Err(Error::Io
+                    | Error::Os(_)
+                    | Error::Unavailable
+                    | Error::Overloaded
+                    | Error::Cancelled
+                    | Error::DeadlineExceeded)
+            )
+        {
+            result?;
+        }
+        let now = uring_runtime::environment::now();
+        if lazy_commit_due(
+            self.last_commit,
+            now,
+            self.store.writer.index().is_dirty(),
+            self.commit_task.is_some(),
+        ) {
+            self.last_commit = Some(now);
+            let writer = self.store.writer.clone();
+            let commit_scope = scope(self.timeout)?;
+            self.commit_task = Some(Box::pin(async move { writer.commit(&commit_scope).await }));
+        }
         Ok(())
     }
 
@@ -1926,6 +1982,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                     && self.peer_task.is_none()
                     && self.ingress_peers.is_empty()
                     && self.writer_task.is_none()
+                    && self.commit_task.is_none()
                     && self.checkpoint_task.is_none()
                     && self.checkpoint_snapshot.is_none()
                     && self.checkpoint_generation == 0
@@ -1938,6 +1995,22 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 }
             })
             .await;
+            // Make the last cache inserts durable on a clean shutdown. A cache
+            // commit failure only loses those pages.
+            match self.store.writer.commit(&deadline).await {
+                Ok(())
+                | Err(
+                    Error::Io
+                    | Error::Os(_)
+                    | Error::Unavailable
+                    | Error::Overloaded
+                    | Error::Cancelled
+                    | Error::DeadlineExceeded,
+                ) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
             if let Some(rdma) = &self.rdma {
                 rdma.drain().await?;
             }
