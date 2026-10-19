@@ -2636,7 +2636,7 @@ const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 15] = {
     ]
 };
 
-/// Per-worker idle pool series: name suffix, Prometheus kind, and value.
+/// Node-wide idle pool series: name suffix, Prometheus kind, and value.
 fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str, u64); 7] {
     [
         ("entries", "gauge", stats.entries as u64),
@@ -2649,21 +2649,36 @@ fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str,
     ]
 }
 
-/// Write `{prefix}_{suffix}{worker="N"}` for each pool sample, metric-major.
+/// Write node-wide sums as `racer_{family}_*` and only retained bytes per
+/// worker as `racer_worker_{family}_bytes{worker="N"}`. Per-worker breakdowns of
+/// every series would not fit the bounded diagnostic response on large nodes.
 fn write_pools(
     out: &mut impl Write,
-    prefix: &str,
+    family: &str,
     samples: &[(WorkerId, flow_control::PoolStats)],
 ) -> std::fmt::Result {
     if samples.is_empty() {
         return Ok(());
     }
-    for (index, (suffix, kind, _)) in pool_series(&Default::default()).into_iter().enumerate() {
-        writeln!(out, "# TYPE {prefix}_{suffix} {kind}")?;
-        for (worker, stats) in samples {
-            let value = pool_series(stats)[index].2;
-            writeln!(out, "{prefix}_{suffix}{{worker=\"{}\"}} {value}", worker.0)?;
+    let mut totals = [0u64; 7];
+    for (_, stats) in samples {
+        for (total, (_, _, value)) in totals.iter_mut().zip(pool_series(stats)) {
+            *total = total.saturating_add(value);
         }
+    }
+    for ((suffix, kind, _), total) in pool_series(&Default::default()).into_iter().zip(totals) {
+        writeln!(
+            out,
+            "# TYPE racer_{family}_{suffix} {kind}\nracer_{family}_{suffix} {total}"
+        )?;
+    }
+    writeln!(out, "# TYPE racer_worker_{family}_bytes gauge")?;
+    for (worker, stats) in samples {
+        writeln!(
+            out,
+            "racer_worker_{family}_bytes{{worker=\"{}\"}} {}",
+            worker.0, stats.bytes
+        )?;
     }
     Ok(())
 }
@@ -3046,7 +3061,7 @@ impl Metrics {
         Ok(())
     }
 
-    /// Write every admission class per worker, plus recycler and staging pools.
+    /// Write node-wide admission for every class, plus recycler and staging pools.
     fn write_worker_pools(&self, out: &mut impl Write) -> std::fmt::Result {
         let installed: Vec<_> = self
             .admission
@@ -3055,23 +3070,20 @@ impl Metrics {
             .collect();
         if !installed.is_empty() {
             for (name, used) in [
-                ("racer_worker_admission_used", true),
-                ("racer_worker_admission_limit", false),
+                ("racer_admission_used", true),
+                ("racer_admission_limit", false),
             ] {
                 writeln!(out, "# TYPE {name} gauge")?;
-                for (worker, usage) in &installed {
-                    for (class, label) in ADMISSION_CLASSES {
+                for (class, label) in ADMISSION_CLASSES {
+                    let total = installed.iter().fold(0u64, |total, (_, usage)| {
                         let value = if used {
                             usage.used(class)
                         } else {
                             usage.limit(class)
                         };
-                        writeln!(
-                            out,
-                            "{name}{{worker=\"{}\",class=\"{label}\"}} {value}",
-                            worker.0
-                        )?;
-                    }
+                        total.saturating_add(value as u64)
+                    });
+                    writeln!(out, "{name}{{class=\"{label}\"}} {total}")?;
                 }
             }
         }
@@ -3079,9 +3091,9 @@ impl Metrics {
             .iter()
             .map(|(worker, usage)| (*worker, usage.buffer_pool_stats()))
             .collect();
-        write_pools(out, "racer_worker_recycler", &recycler)?;
+        write_pools(out, "recycler", &recycler)?;
         let staging: Vec<_> = self.memory.staging.snapshots().flatten().collect();
-        write_pools(out, "racer_worker_staging_pool", &staging)
+        write_pools(out, "staging_pool", &staging)
     }
 
     /// Install once during worker assembly, not on the admission hot path.
@@ -4040,6 +4052,20 @@ pub(crate) mod tests {
                     metrics
                         .observe_admission(WorkerId(u16::MAX - index as u16), admission.shared())
                         .unwrap();
+                    metrics.observe_staging_pool(
+                        WorkerId(u16::MAX - index as u16),
+                        flow_control::PoolStats {
+                            entries: usize::MAX,
+                            bytes: usize::MAX,
+                            target: usize::MAX,
+                            max_depth: usize::MAX,
+                            hits: u64::MAX,
+                            misses: u64::MAX,
+                            rejects: u64::MAX,
+                            trimmed: u64::MAX,
+                            constrained: true,
+                        },
+                    );
                     metrics.observe_retention(crate::retention::Snapshot {
                         observations: u64::MAX,
                         qualified: u64::MAX,
@@ -4088,7 +4114,21 @@ pub(crate) mod tests {
             for event in crate::telemetry::EVENTS {
                 telemetry.metrics.record(event, u64::MAX);
             }
+            telemetry.metrics.observe_memory(ProcessMemory {
+                resident: Some(u64::MAX),
+                cgroup_current: Some(u64::MAX),
+                cgroup_limit: Some(u64::MAX),
+                pressure_some_avg10: Some(100.0),
+            });
             let text = diagnostic_text(&telemetry, "/metrics");
+            for name in [
+                "racer_admission_used{class=\"ordinary_outbound_connection\"}",
+                "racer_staging_pool_trimmed_total ",
+                "racer_worker_staging_pool_bytes{worker=\"65535\"}",
+                "racer_cgroup_memory_pressure_some_avg10 100\n",
+            ] {
+                assert!(text.contains(name), "{name}");
+            }
             assert!(text.len() < MAX_RESPONSE_BYTES);
             for (name, kind) in crate::telemetry::RETENTION_METRICS
                 .into_iter()
@@ -4129,7 +4169,7 @@ pub(crate) mod tests {
                 text.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                4 * 64
+                6 * 64
             );
             struct Small(usize);
             impl std::fmt::Write for Small {
@@ -5069,7 +5109,7 @@ pub(crate) mod tests {
             // quota charges must still match the idle scrape.
             let quotas = |text: &str| {
                 text.lines()
-                    .filter(|line| !line.contains("racer_worker_recycler_"))
+                    .filter(|line| !line.contains("recycler_"))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -5085,12 +5125,12 @@ pub(crate) mod tests {
                     .count(),
                 8
             );
-            // Per-class admission (15 classes x used/limit) and 7 recycler series per worker.
+            // Four compatibility series and retained recycler bytes per worker.
             assert_eq!(
                 idle.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                2 * (4 + 2 * 15 + 7)
+                2 * (4 + 1)
             );
             assert!(!idle.contains("request="));
         }
@@ -5130,90 +5170,103 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn worker_admission_and_pool_series_are_labeled_per_worker() {
+        fn admission_and_pool_series_sum_workers_and_label_retained_bytes() {
             let metrics = Metrics::for_workers(2).unwrap();
             let mut output = String::new();
             metrics[0].write_prometheus(&mut output).unwrap();
-            // Nothing installed: no per-worker pool or admission series at all.
+            // Nothing installed: no admission, pool, or process memory series.
             for absent in [
-                "racer_worker_admission_used",
-                "racer_worker_recycler_entries",
-                "racer_worker_staging_pool_entries",
+                "racer_admission_used",
+                "racer_recycler_entries",
+                "racer_staging_pool_entries",
                 "racer_process_resident_bytes",
             ] {
                 assert!(!output.contains(absent), "{absent}");
             }
-            let admission = flow_control::Quotas::new(AdmissionPolicy::new(
-                crate::test_support::cluster::config(false).limits,
-            ));
-            metrics[1]
-                .observe_admission(WorkerId(3), admission.shared())
-                .unwrap();
-            let mut reservation = admission
+            let quotas: Vec<_> = (0..2)
+                .map(|_| {
+                    flow_control::Quotas::new(AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ))
+                })
+                .collect();
+            for (index, (metrics, admission)) in metrics.iter().zip(&quotas).enumerate() {
+                metrics
+                    .observe_admission(WorkerId(3 + index as u16), admission.shared())
+                    .unwrap();
+            }
+            let mut reservation = quotas[0]
                 .reserve(None, ResourceClass::Ciphertext, 1 << 20)
                 .unwrap();
             let bytes = reservation.buffer(1 << 20).unwrap();
             reservation.recycle(bytes);
             drop(reservation);
-            let recycler = admission.buffer_pool_stats();
-            metrics[1].observe_staging_pool(
-                WorkerId(3),
-                flow_control::PoolStats {
-                    entries: 2,
-                    bytes: 4096,
-                    target: 3,
-                    max_depth: 8,
-                    hits: 5,
-                    misses: 6,
-                    rejects: 7,
-                    trimmed: 8,
-                    constrained: false,
-                },
-            );
+            let _relay = quotas[1].reserve(None, ResourceClass::Relay, 1).unwrap();
+            let recycler = quotas[0].buffer_pool_stats();
+            assert!(recycler.bytes >= 1 << 20, "recycled buffer is retained");
+            let staging = |entries, bytes, counter| flow_control::PoolStats {
+                entries,
+                bytes,
+                target: 3,
+                max_depth: 8,
+                hits: counter,
+                misses: counter + 1,
+                rejects: counter + 2,
+                trimmed: counter + 3,
+                constrained: false,
+            };
+            metrics[0].observe_staging_pool(WorkerId(3), staging(2, 4096, 5));
+            metrics[1].observe_staging_pool(WorkerId(4), staging(1, 1024, 10));
             output.clear();
-            metrics[0].write_prometheus(&mut output).unwrap();
-            let relay_limit = admission.limit(ResourceClass::Relay);
+            metrics[1].write_prometheus(&mut output).unwrap();
+            let sum = |class| quotas.iter().map(|q| q.limit(class)).sum::<usize>();
+            let ciphertext_used = quotas[0].used(ResourceClass::Ciphertext);
             for expected in [
-                "# TYPE racer_worker_admission_used gauge\n".to_string(),
-                "# TYPE racer_worker_admission_limit gauge\n".to_string(),
+                "# TYPE racer_admission_used gauge\n".to_string(),
+                "# TYPE racer_admission_limit gauge\n".to_string(),
+                format!("racer_admission_used{{class=\"ciphertext\"}} {ciphertext_used}\n"),
+                "racer_admission_used{class=\"relay\"} 1\n".to_string(),
+                "racer_admission_used{class=\"plaintext\"} 0\n".to_string(),
                 format!(
-                    "racer_worker_admission_used{{worker=\"3\",class=\"ciphertext\"}} {}\n",
-                    admission.used(ResourceClass::Ciphertext)
-                ),
-                "racer_worker_admission_used{worker=\"3\",class=\"plaintext\"} 0\n".to_string(),
-                format!(
-                    "racer_worker_admission_limit{{worker=\"3\",class=\"relay\"}} {relay_limit}\n"
+                    "racer_admission_limit{{class=\"relay\"}} {}\n",
+                    sum(ResourceClass::Relay)
                 ),
                 format!(
-                    "racer_worker_recycler_entries{{worker=\"3\"}} {}\n",
-                    recycler.entries
+                    "racer_admission_limit{{class=\"plaintext\"}} {}\n",
+                    sum(ResourceClass::Plaintext)
                 ),
+                format!("racer_recycler_entries {}\n", recycler.entries),
+                format!("racer_recycler_bytes {}\n", recycler.bytes),
+                "# TYPE racer_recycler_hits_total counter\n".to_string(),
                 format!(
                     "racer_worker_recycler_bytes{{worker=\"3\"}} {}\n",
                     recycler.bytes
                 ),
-                "# TYPE racer_worker_recycler_hits_total counter\n".to_string(),
+                "racer_worker_recycler_bytes{worker=\"4\"} 0\n".to_string(),
+                "# TYPE racer_staging_pool_entries gauge\nracer_staging_pool_entries 3\n"
+                    .to_string(),
+                "racer_staging_pool_bytes 5120\n".to_string(),
+                "racer_staging_pool_target 6\n".to_string(),
+                "# TYPE racer_staging_pool_hits_total counter\nracer_staging_pool_hits_total 15\n"
+                    .to_string(),
+                "racer_staging_pool_misses_total 17\n".to_string(),
+                "racer_staging_pool_rejects_total 19\n".to_string(),
+                "racer_staging_pool_trimmed_total 21\n".to_string(),
                 "# TYPE racer_worker_staging_pool_bytes gauge\n".to_string(),
-                "racer_worker_staging_pool_entries{worker=\"3\"} 2\n".to_string(),
                 "racer_worker_staging_pool_bytes{worker=\"3\"} 4096\n".to_string(),
-                "racer_worker_staging_pool_target{worker=\"3\"} 3\n".to_string(),
-                "racer_worker_staging_pool_hits_total{worker=\"3\"} 5\n".to_string(),
-                "racer_worker_staging_pool_misses_total{worker=\"3\"} 6\n".to_string(),
-                "racer_worker_staging_pool_rejects_total{worker=\"3\"} 7\n".to_string(),
-                "racer_worker_staging_pool_trimmed_total{worker=\"3\"} 8\n".to_string(),
-                // Compatibility series remain.
-                "racer_worker_relay_used{worker=\"3\"} 0\n".to_string(),
+                "racer_worker_staging_pool_bytes{worker=\"4\"} 1024\n".to_string(),
+                // Compatibility series remain per worker.
+                "racer_worker_relay_used{worker=\"4\"} 1\n".to_string(),
             ] {
                 assert!(
                     output.contains(&expected),
                     "missing {expected:?} in {output}"
                 );
             }
-            assert!(recycler.bytes >= 1 << 20, "recycled buffer is retained");
             assert_eq!(
                 output
                     .lines()
-                    .filter(|l| l.starts_with("racer_worker_admission_used{"))
+                    .filter(|l| l.starts_with("racer_admission_used{"))
                     .count(),
                 <ResourceClass as flow_control::Class>::COUNT
             );
