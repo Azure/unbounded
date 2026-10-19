@@ -1269,8 +1269,46 @@ fn origin_owner() -> super::origin_directory::Owner {
     }
 }
 
+/// Search bits that let SDK clients running as any user reach the client
+/// socket. Read and write bits are not added.
+const CLIENT_DIRECTORY_SEARCH: u32 = 0o011;
+
+/// Make the client directory safe and reachable. Group and other write bits
+/// are removed, and group and other search bits are added, so an existing
+/// 0700 or 0750 directory becomes 0711 or 0751. Ownership is not changed.
 pub(super) fn prepare_client_directory(directory: &File) -> Result<()> {
-    uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)
+    uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)?;
+    grant_client_search(directory)
+}
+
+/// Add [`CLIENT_DIRECTORY_SEARCH`] through the pinned descriptor, then check
+/// that the same directory, owner, and expected mode remain.
+fn grant_client_search(directory: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let before = directory.metadata().map_err(directory_error)?;
+    // restrict_directory already required an effective-user-owned directory.
+    let mode = before.mode() & 0o7777;
+    let wanted = mode | CLIENT_DIRECTORY_SEARCH;
+    if mode == wanted {
+        return Ok(());
+    }
+    // SAFETY: directory retains its descriptor throughout fchmod.
+    if unsafe { libc::fchmod(directory.as_raw_fd(), wanted) } != 0 {
+        return Err(directory_error(std::io::Error::last_os_error()));
+    }
+    let after = directory.metadata().map_err(directory_error)?;
+    let actual = after.mode() & 0o7777;
+    // Linux may clear setgid when the caller is not in the group.
+    if !after.is_dir()
+        || (after.uid(), after.gid()) != (before.uid(), before.gid())
+        || !uds_endpoint::same_inode(&before, &after)
+        || (actual != wanted && actual != wanted & !0o2000)
+    {
+        return Err(directory_error(std::io::Error::other(
+            "client directory changed while granting search",
+        )));
+    }
+    Ok(())
 }
 
 fn bind(

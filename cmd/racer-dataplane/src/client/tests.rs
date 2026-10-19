@@ -169,7 +169,11 @@ mod directory {
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
             let before = fs::metadata(&path).unwrap();
             fixture.reconcile(&[definition()]).unwrap();
-            assert_identity(&before, &fs::metadata(&path).unwrap(), mode & !0o022);
+            assert_identity(
+                &before,
+                &fs::metadata(&path).unwrap(),
+                (mode & !0o022) | 0o011,
+            );
             for ancestor in [&fixture.root.0, cache] {
                 assert_eq!(fs::metadata(ancestor).unwrap().mode() & 0o7777, 0o777);
             }
@@ -194,7 +198,7 @@ mod directory {
     fn secure_client_directory_permissions_are_unchanged() {
         // Generic mode combinations live in uds-endpoint. Keep adapter coverage
         // for read-only/sticky modes and no metadata mutation on the first call.
-        for mode in [0o755, 0o500, 0o1700] {
+        for mode in [0o755, 0o711, 0o751, 0o511, 0o1711] {
             let root = Root::new();
             let directory = open_directory(&root.0).unwrap();
             directory
@@ -213,6 +217,98 @@ mod directory {
                 .set_permissions(fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
+    }
+    #[test]
+    fn client_directory_preparation_grants_search_only() {
+        // Root origins used to leave 0700 or 0750 client directories, which
+        // nonroot SDK clients cannot traverse to reach the 0666 socket.
+        for (mode, wanted) in [
+            (0o700, 0o711),
+            (0o750, 0o751),
+            (0o500, 0o511),
+            (0o1700, 0o1711),
+            (0o2750, 0o2751),
+            (0o770, 0o751),
+            (0o707, 0o715),
+            (0o000, 0o011),
+        ] {
+            let root = Root::new();
+            let parent = open_directory(&root.0).unwrap();
+            let directory = child_directory(&parent, b"client").unwrap();
+            directory
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .unwrap();
+            let before = directory.metadata().unwrap();
+            prepare_client_directory(&directory).unwrap();
+            let first = directory.metadata().unwrap();
+            assert_identity(&before, &first, wanted);
+            // Idempotent: the second call changes no metadata.
+            prepare_client_directory(&directory).unwrap();
+            let second = directory.metadata().unwrap();
+            assert_identity(&first, &second, wanted);
+            assert_eq!(
+                (second.ctime(), second.ctime_nsec()),
+                (first.ctime(), first.ctime_nsec())
+            );
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+    }
+    #[test]
+    fn client_directory_search_grant_keeps_pinned_inode() {
+        let root = Root::new();
+        let parent = open_directory(&root.0).unwrap();
+        let directory = child_directory(&parent, b"client").unwrap();
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let path = root.0.join("client");
+        let moved = root.0.join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_client_directory(&directory).unwrap();
+        assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o711);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o700);
+    }
+    #[test]
+    fn nonroot_client_can_traverse_migrated_client_directory_when_root() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let root = Root::new();
+        let parent = open_directory(&root.0).unwrap();
+        let directory = child_directory(&parent, b"client").unwrap();
+        fs::write(root.0.join("client").join("probe"), b"").unwrap();
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
+        // Reach the directory through an inherited descriptor so ancestors of
+        // the test root do not affect the result.
+        let probe = |directory: &File| {
+            let fd = directory.as_raw_fd();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "test -e /proc/self/fd/3/probe"]);
+            // SAFETY: dup2 is async-signal-safe. Command drops supplementary
+            // groups itself when uid is set.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(fd, 3) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.uid(65532).gid(65532).status().unwrap().success()
+        };
+        assert!(!probe(&directory));
+        prepare_client_directory(&directory).unwrap();
+        assert!(probe(&directory));
+        let after = directory.metadata().unwrap();
+        assert_eq!((after.uid(), after.mode() & 0o7777), (0, 0o711));
     }
     #[test]
     fn client_directory_preparation_pins_inode_across_path_replacement() {
