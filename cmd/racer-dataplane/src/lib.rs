@@ -36,8 +36,6 @@ mod subscription_interop;
 #[doc(hidden)]
 pub use subscription_interop::go_sdk_subscription_server as run_subscription_interop_fixture;
 
-// Integrated into the worker loop in a later change.
-#[allow(dead_code)]
 pub(crate) mod pressure;
 
 #[cfg(test)]
