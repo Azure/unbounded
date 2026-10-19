@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	containerddigest "github.com/opencontainers/go-digest"
@@ -130,7 +131,7 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 
 	var (
 		firstRequest atomic.Bool
-		originBytes  atomic.Int64
+		originWrites = make(chan int64, 2)
 	)
 
 	originServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +141,7 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 			w.WriteHeader(http.StatusOK)
 
 			written, _ := io.CopyN(w, &generatedLayerReader{remaining: prefix}, prefix)
-			originBytes.Add(written)
+			originWrites <- written
 
 			return
 		}
@@ -158,7 +159,7 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 		w.WriteHeader(http.StatusPartialContent)
 
 		written, _ := io.CopyN(w, &generatedLayerReader{remaining: remaining}, remaining)
-		originBytes.Add(written)
+		originWrites <- written
 	}))
 	defer originServer.Close()
 
@@ -174,7 +175,18 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 
 	fetchGeneratedLayer(t, []docker.RegistryHost{containerdRegistryHost(t, gantryServer)}, d, layerSize)
 
-	if got := originBytes.Load(); got != layerSize {
+	var originBytes int64
+
+	for range 2 {
+		select {
+		case written := <-originWrites:
+			originBytes += written
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for origin response handlers to finish")
+		}
+	}
+
+	if got := originBytes; got != layerSize {
 		t.Fatalf("origin bytes = %d; want %d without prefix replay", got, layerSize)
 	}
 }
