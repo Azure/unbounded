@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -168,7 +169,8 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 		return plan, pending(), nil
 	}
 
-	if err := runtimePlan(ctx, env, plan, marker, secret); err != nil {
+	invalid, err := runtimePlan(ctx, env, plan, marker, secret)
+	if err != nil {
 		return nil, component.Result{}, err
 	}
 
@@ -181,6 +183,10 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 		return bootstrap, pending(), nil
 	}
 
+	if len(invalid) != 0 {
+		return plan, component.NotReadyAfter("OriginInvalid", "Racer origins not reconciled for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
+	}
+
 	return plan, component.ReconciledAfter("Racer controller installation reconciled", time.Hour), nil
 }
 
@@ -188,10 +194,10 @@ func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, e
 	return env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml", "mutating-webhook.yaml"}, nil)
 }
 
-func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) error {
+func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) ([]string, error) {
 	objects, err := decodeRuntimeManifests(env)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var (
@@ -219,20 +225,20 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			}
 			for key, value := range values {
 				if err := unstructured.SetNestedField(obj.Object, value, "data", key); err != nil {
-					return err
+					return nil, err
 				}
 			}
 
 			cm := &corev1.ConfigMap{}
 			if err := env.Scheme.Convert(obj, cm, nil); err != nil {
-				return err
+				return nil, err
 			}
 
 			bindRuntime(cm, marker.UID)
 
 			cm, err = preservedConfig(ctx, env, plan, cm, values)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			configHash = component.ConfigMapPayloadHash(cm)
@@ -248,7 +254,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 				return value, ok
 			})
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			prerequisites = append(prerequisites, component.RefOf(component.ToUnstructured(cm)))
@@ -258,15 +264,15 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			// Publish the same roots as the bootstrap trust so CA rotation and
 			// cross-signing also reach the API server's webhook client.
 			if err := setWebhookCABundle(obj, servingRoots(secret)); err != nil {
-				return err
+				return nil, err
 			}
 		case "Deployment":
 			if err := component.SetNamedContainerImage(obj, "controller", env.Config.Image(controllerName)); err != nil {
-				return err
+				return nil, err
 			}
 
 			if err := unstructured.SetNestedStringMap(obj.Object, map[string]string{"unbounded-cloud.io/racer-config-hash": configHash}, "spec", "template", "metadata", "annotations"); err != nil {
-				return err
+				return nil, err
 			}
 		}
 
@@ -287,7 +293,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 		op, err = ownedRuntimeOperation(ctx, env, op, marker.UID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		plan.Add(op)
@@ -301,16 +307,20 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	op, err := ownedRuntimeOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(trust), Component: name}, marker.UID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	plan.Add(op)
 
 	if runtimeConfig == nil {
-		return fmt.Errorf("racer runtime manifests contain no %s", configName)
+		return nil, fmt.Errorf("racer runtime manifests contain no %s", configName)
 	}
 
-	return planDataplane(ctx, env, plan, marker, runtimeConfig)
+	if err := planDataplane(ctx, env, plan, marker, runtimeConfig); err != nil {
+		return nil, err
+	}
+
+	return planOrigins(ctx, env, plan, marker)
 }
 
 func setWebhookCABundle(obj *unstructured.Unstructured, roots []byte) error {
@@ -347,10 +357,17 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&admissionv1.MutatingWebhookConfiguration{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == webhookName })))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
-	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName))))
-	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(dataplaneName))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(runtimeWorkload(env))))
+	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(runtimeWorkload(env))))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))
+}
+
+// runtimeWorkload matches the dataplane and every origin workload or account.
+func runtimeWorkload(env *component.Env) func(client.Object) bool {
+	dataplane, origin := env.InNamespaceNamed(dataplaneName), env.InNamespaceWithPrefix(originPrefix)
+
+	return func(obj client.Object) bool { return dataplane(obj) || origin(obj) }
 }
 
 func startupConfigPredicate(env *component.Env) predicate.Predicate {
