@@ -290,8 +290,17 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     let larger = slab.allocate(size * 2, charge(size * 2)).unwrap();
     assert_eq!(larger.len(), size * 2);
     assert_eq!(live.get(), size * 4);
+    // The initial demand target holds two entries, so a third return is freed.
     drop(larger);
-    assert_eq!(slab.reclaim_idle(), size * 4);
+    assert_eq!(slab.idle_bytes(), size * 2);
+    assert_eq!(live.get(), size * 2);
+    let stats = slab.idle_pool_stats();
+    assert_eq!(
+        (stats.entries, stats.target),
+        (2, page_alloc::DEFAULT_INITIAL_TARGET)
+    );
+    assert!(stats.entries <= page_alloc::DEFAULT_MAX_DEPTH);
+    assert_eq!(slab.reclaim_idle(), size * 2);
     assert_eq!(slab.reclaim_idle(), 0);
     assert_eq!(live.get(), 0);
 
@@ -304,6 +313,62 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     assert!(outstanding.as_slice().iter().all(|b| *b == 0));
     drop(outstanding);
     assert_eq!(live.get(), 0);
+}
+
+/// Demand maintenance grows under miss pressure, trims idle storage oldest
+/// first, releases its accounting, and holds a constrained pool empty.
+#[cfg(feature = "simulation")]
+#[test]
+fn idle_pool_adapts_to_demand_and_constraint() {
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let slab = Slab::new("/alloc-workflows/demand".into(), 8192, 4096, 1024);
+    let segments = Segments::new(slab.segment_bytes());
+    let alignment = slab.open_configured(&segments).unwrap();
+    let size = alignment.extent(0, 31).unwrap().length();
+    let live = Rc::new(Cell::new(0));
+    let charge = |bytes| CountingCharge::new(&live, bytes);
+    let window = page_alloc::DEFAULT_WINDOW;
+    let mut now = std::time::Instant::now();
+    assert_eq!(slab.maintain_idle(now), 0);
+
+    // Four concurrent buffers miss; only the initial target of two is retained.
+    let burst = |slab: &Slab<CountingCharge>| {
+        let held: Vec<_> = (0..4)
+            .map(|_| slab.allocate(size, charge(size)).unwrap())
+            .collect();
+        drop(held);
+    };
+    burst(&slab);
+    let stats = slab.idle_pool_stats();
+    assert_eq!((stats.entries, stats.misses), (2, 4));
+    assert_eq!(stats.rejects, 2);
+    now += window;
+    assert_eq!(slab.maintain_idle(now), 0);
+    assert_eq!(slab.idle_pool_stats().target, 4);
+    burst(&slab);
+    assert_eq!(slab.idle_pool_stats().entries, 4);
+    assert!(slab.idle_pool_stats().target <= page_alloc::DEFAULT_MAX_DEPTH);
+
+    // Untouched windows halve the idle surplus and release its accounting.
+    now += window;
+    slab.maintain_idle(now);
+    now += window;
+    assert_eq!(slab.maintain_idle(now), size * 2);
+    assert_eq!(slab.idle_pool_stats().entries, 2);
+    assert_eq!(live.get(), size * 2);
+    assert_eq!(slab.maintain_idle(now), 0);
+
+    slab.constrain_idle(true);
+    assert_eq!(slab.maintain_idle(now), size * 2);
+    assert_eq!(live.get(), 0);
+    drop(slab.allocate(size, charge(size)).unwrap());
+    assert_eq!(slab.idle_bytes(), 0);
+    assert!(slab.idle_pool_stats().constrained);
+    slab.constrain_idle(false);
+    drop(slab.allocate(size, charge(size)).unwrap());
+    assert_eq!(slab.idle_bytes(), size);
+    assert!(slab.idle_pool_stats().trimmed >= 4);
 }
 
 /// Bound submissions reject foreign identity and bytes beyond the captured prefix.
