@@ -853,6 +853,60 @@ mod tests {
     }
 
     #[test]
+    fn retain_caches_purges_pages_holds_and_versions_of_removed_caches() {
+        use racer_crypto::identity::KeyPurpose;
+        let kept = CacheId(crate::test_support::security::CACHE.into());
+        let removed = CacheId("44444444-4444-4444-8444-444444444444".into());
+        let keys = Rc::new(crate::test_support::security::keys_for(&[
+            kept.clone(),
+            removed.clone(),
+        ]));
+        let availability =
+            crate::control::for_caches(keys.clone(), vec![kept.clone(), removed.clone()]);
+        let index = Index::new(WorkerId(0), 8, availability);
+        let disk = TestDisk::mount(&index, 16);
+        let until = until();
+        let mut pages = Vec::new();
+        for cache in [&kept, &removed] {
+            let key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();
+            let mut metadata = descriptor("purge", 2 * crate::model::PAGE_BYTES);
+            metadata.version.object.cache = cache.clone();
+            index.reserve_hold(&metadata.version, 1, until).unwrap();
+            let held = page(&metadata, 0);
+            let ticket = index.hold_ticket(&held).unwrap();
+            disk.put(&index, &held, &metadata, key_id, Tier::Storage);
+            drop(ticket);
+            let cached = page(&metadata, 1);
+            disk.put(&index, &cached, &metadata, key_id, Tier::Cache);
+            pages.push((held, cached));
+        }
+        assert_eq!(index.disk_len(), 4);
+        assert_eq!(index.retain_caches(std::slice::from_ref(&kept)), 2);
+        assert_eq!(index.disk_len(), 2);
+        let (kept_held, kept_cached) = &pages[0];
+        assert!(index.is_held(kept_held));
+        assert!(index.lookup(kept_cached).unwrap().is_some());
+        assert!(index.version(&kept_held.version).unwrap().is_some());
+        let (removed_held, removed_cached) = &pages[1];
+        assert!(!index.is_held(removed_held));
+        assert!(index.disk_entry(removed_held).is_none());
+        assert!(index.disk_entry(removed_cached).is_none());
+        assert!(
+            index
+                .snapshot()
+                .unwrap()
+                .versions
+                .iter()
+                .all(|entry| entry.version.object.cache == kept)
+        );
+        // Purging is idempotent, and no accepted cache removes everything.
+        assert_eq!(index.retain_caches(std::slice::from_ref(&kept)), 0);
+        assert_eq!(index.retain_caches(&[]), 2);
+        assert_eq!(index.disk_len(), 0);
+        assert!(!index.is_held(kept_held));
+    }
+
+    #[test]
     fn content_type_is_immutable_including_absence() {
         let untyped = descriptor("v1", 3);
         let mut typed = untyped.clone();

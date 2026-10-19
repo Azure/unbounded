@@ -514,6 +514,22 @@ impl WorkerApplication {
             }
         })
         .await?;
+        // Cache removals are committed lazily, so a crash can bring back pages
+        // of a removed cache. Drop them before any request is admitted.
+        let accepted: Vec<_> = self
+            .snapshots
+            .current()?
+            .caches
+            .iter()
+            .map(|cache| cache.id.clone())
+            .collect();
+        let purged = self.store.writer.index().retain_caches(&accepted);
+        if purged != 0 {
+            eprintln!(
+                "racer: worker {} removed {purged} disk pages of removed caches",
+                self.worker.0
+            );
+        }
         Ok(())
     }
 }
@@ -1172,6 +1188,40 @@ mod tests {
             let startup = scope(Duration::from_secs(5)).unwrap();
             let _ = crate::app::tests::drive_peer(&app.runtime.reactor, app.store.open(&startup))
                 .unwrap();
+            // A page of a cache missing from the accepted publication, as a
+            // crash after a lazily committed removal could leave behind.
+            let index = app.store.writer.index();
+            let volume = index.volume().unwrap();
+            let reservation = volume
+                .allocate(page_alloc::volume::Tier::Cache, 4096)
+                .unwrap();
+            let charge = app
+                .runtime
+                .admission
+                .reserve(None, crate::admission::ResourceClass::Ciphertext, 4096)
+                .unwrap();
+            let buffer = app.store.writer.slabs().allocate(4096, charge).unwrap();
+            let _ = crate::app::tests::drive_peer(
+                &app.runtime.reactor,
+                volume.write(&*app.runtime.reactor, &reservation, buffer, &startup),
+            )
+            .unwrap();
+            let generation = volume.next_generation();
+            let removed = racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+            volume
+                .publish(
+                    page_alloc::volume::Key::new(
+                        crate::store::key::cache_hash(&removed),
+                        [3; 12],
+                        0,
+                    ),
+                    reservation,
+                    4096,
+                    generation,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(index.disk_len(), 1);
             let shard = futures::executor::block_on(app.store.checkpoint.snapshot_shard()).unwrap();
             let geometry = shard.layout;
             app.store.checkpoint.finish_snapshot();
@@ -1186,6 +1236,8 @@ mod tests {
                 app.recover_node(geometry, &scope(Duration::from_secs(5)).unwrap()),
             )
             .unwrap();
+            // The accepted publication has no caches, so recovery purges the page.
+            assert_eq!(app.store.writer.index().disk_len(), 0);
             let cut = node.recovery.lock().unwrap();
             assert!(cut.selected && cut.installed.contains(&WorkerId(0)));
             assert!(cut.failure.is_none());

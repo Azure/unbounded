@@ -430,6 +430,54 @@ impl Index {
         }
     }
 
+    /// Remove every disk page, hold, and version descriptor of caches outside
+    /// `caches`. Run at startup after recovery selects the accepted cache set,
+    /// since lazily committed removals may come back after a crash. Returns the
+    /// count of removed entries.
+    pub fn retain_caches(&self, caches: &[CacheId]) -> usize {
+        let allowed: HashSet<[u8; CACHE_HASH_BYTES]> = caches.iter().map(cache_hash).collect();
+        self.disk
+            .holds
+            .borrow_mut()
+            .entries
+            .retain(|version, _| allowed.contains(&split(version).0));
+        {
+            let mut versions = self.disk.versions.borrow_mut();
+            let removed: Vec<_> = versions
+                .iter()
+                .filter(|(key, _)| !allowed.contains(&split(key).0))
+                .map(|(key, _)| *key)
+                .collect();
+            for key in removed {
+                versions.remove(&key);
+            }
+        }
+        let Some(volume) = self.volume() else {
+            return 0;
+        };
+        let mut removed = 0;
+        let mut cursor: Option<Key> = None;
+        loop {
+            let batch = volume.next_after(cursor.as_ref(), SCAN_BATCH);
+            let Some((last, _)) = batch.last() else {
+                break;
+            };
+            cursor = Some(*last);
+            let mut doomed = Vec::new();
+            for (key, value) in batch {
+                if !allowed.contains(&key.cache()) {
+                    doomed.push((key, value));
+                }
+            }
+            for (key, value) in &doomed {
+                volume.remove_if(key, value);
+            }
+            removed += doomed.len();
+            self.forget_pages(&doomed, false);
+        }
+        removed
+    }
+
     /// Make every disk index change so far durable. A no-op before mount.
     pub fn commit<'a>(
         &'a self,

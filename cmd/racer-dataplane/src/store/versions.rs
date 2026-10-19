@@ -134,7 +134,6 @@ impl VersionTable {
             .filter(|entry| entry.version == *version)
     }
 
-    #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &VersionKey) -> Option<VersionEntry> {
         let (age, entry) = self.entries.remove(key)?;
         self.order.remove(&age);
