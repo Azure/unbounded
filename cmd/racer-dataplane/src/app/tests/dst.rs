@@ -2344,8 +2344,7 @@ impl Harness {
         config.peer_listen = format!("127.0.0.1:{}", 20000 + id).parse().unwrap();
         config.diagnostics_listen = format!("127.0.0.1:{}", 30000 + id).parse().unwrap();
         config.slab_directory = format!("/dst/node-{id}/slabs").into();
-        config.slab_bytes = 256 * 1024 * 1024;
-        config.free_segment_reserve = 1;
+        config.slab_bytes = 16 * page_alloc::volume::SLOT_BYTES;
         config.limits.queue_entries = NonZeroUsize::new(64).unwrap();
         config.limits.client_connections = NonZeroUsize::new(64).unwrap();
         config.limits.connections_per_neighbor = NonZeroUsize::new(2).unwrap();

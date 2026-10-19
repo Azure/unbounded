@@ -1168,7 +1168,10 @@ mod tests {
             app.snapshots
                 .apply(publication(&config, 1, vec![]))
                 .unwrap();
-            let _ = futures::executor::block_on(app.store.open()).unwrap();
+            app.runtime.reactor.init().unwrap();
+            let startup = scope(Duration::from_secs(5)).unwrap();
+            let _ = crate::app::tests::drive_peer(&app.runtime.reactor, app.store.open(&startup))
+                .unwrap();
             let shard = futures::executor::block_on(app.store.checkpoint.snapshot_shard()).unwrap();
             let geometry = shard.layout;
             app.store.checkpoint.finish_snapshot();

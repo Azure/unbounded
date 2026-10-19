@@ -185,12 +185,10 @@ fn disposable_loop_devices_read_only_bind_restart() {
     fs::create_dir_all(root.join("dev/disk/by-id")).unwrap();
     fs::create_dir(root.join("mounted")).unwrap();
     let mut config = crate::test_support::cluster::config(false);
-    config.segment_bytes = 32 * 1024 * 1024;
-    config.free_segment_reserve = 1;
     config.device_directory = root.join("mounted");
     config.slab_directory = root.join("checkpoints");
     assert!(!config.slab_directory.exists());
-    let segment = config.segment_bytes;
+    let segment = page_alloc::volume::SLOT_BYTES;
     let first = new_loop(root, "cache-a", 5 * segment + 2 * GUARD_BYTES);
     let second = new_loop(root, "cache-b", 6 * segment + 2 * GUARD_BYTES);
     command(
@@ -255,8 +253,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
         worker.alignment,
     )
     .unwrap();
-    let segments = Rc::new(page_alloc::Segments::new(segment));
-    let _ = slab.open_configured(&segments).unwrap();
+    let _ = slab.open_volume(6).unwrap();
     assert_eq!(slab.capacity_bytes(), 6 * segment);
     let admission = Rc::new(flow_control::Quotas::new(
         crate::admission::AdmissionPolicy::new(config.limits.clone()),
@@ -267,20 +264,17 @@ fn disposable_loop_devices_read_only_bind_restart() {
         Instant::now() + Duration::from_secs(30),
     )
     .unwrap();
-    // One full extent per segment reaches both physical devices in worker zero.
-    for index in 0..6 {
-        let (lease, extent) = segments.append(segment as usize).unwrap();
+    // One full slot per placement reaches both physical devices in worker zero.
+    for index in 0..6u64 {
+        let offset = index * segment;
         let mut buffer = slab.allocate(segment as usize, ()).unwrap();
         buffer.as_mut_slice().fill(index as u8 + 1);
         drop(drive(
             &reactor,
-            slab.write(&reactor, extent, buffer, lease, &scope),
+            slab.write_at(&reactor, offset, buffer, (), &scope),
         ));
-        let lease = segments
-            .lease(page_alloc::SegmentId(index), page_alloc::Generation(1))
-            .unwrap();
         let buffer = slab.allocate(segment as usize, ()).unwrap();
-        let buffer = drive(&reactor, slab.read(&reactor, extent, buffer, lease, &scope));
+        let buffer = drive(&reactor, slab.read_at(&reactor, offset, buffer, (), &scope));
         assert!(buffer.as_slice().iter().all(|b| *b == index as u8 + 1));
     }
     let other = &plan.workers[1];
@@ -298,27 +292,20 @@ fn disposable_loop_devices_read_only_bind_restart() {
         other.alignment,
     )
     .unwrap();
-    let other_segments = Rc::new(page_alloc::Segments::new(segment));
-    let _ = other_slab.open_configured(&other_segments).unwrap();
+    let _ = other_slab.open_volume(5).unwrap();
     assert_eq!(other.placements.len(), 5);
     for index in 0..other.placements.len() {
-        let (lease, extent) = other_segments.append(segment as usize).unwrap();
+        let offset = index as u64 * segment;
         let mut buffer = other_slab.allocate(segment as usize, ()).unwrap();
         buffer.as_mut_slice().fill(index as u8 + 32);
         drop(drive(
             &reactor,
-            other_slab.write(&reactor, extent, buffer, lease, &scope),
+            other_slab.write_at(&reactor, offset, buffer, (), &scope),
         ));
-        let lease = other_segments
-            .lease(
-                page_alloc::SegmentId(index as u64),
-                page_alloc::Generation(1),
-            )
-            .unwrap();
         let buffer = other_slab.allocate(segment as usize, ()).unwrap();
         let buffer = drive(
             &reactor,
-            other_slab.read(&reactor, extent, buffer, lease, &scope),
+            other_slab.read_at(&reactor, offset, buffer, (), &scope),
         );
         assert!(buffer.as_slice().iter().all(|b| *b == index as u8 + 32));
     }

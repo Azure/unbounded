@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use page_alloc::Alignment;
+use page_alloc::volume::{MIN_SLOTS, SLOT_BYTES, UNIT_BYTES};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -76,7 +77,7 @@ pub fn discover(config: &Config, selector: Option<&str>, workers: usize) -> Opti
                 if fs::metadata(path).is_ok_and(|m| seen.contains(&m.rdev())) {
                     return Ok(());
                 }
-                let device = open_device(&root, path, id, config.segment_bytes)?;
+                let device = open_device(&root, path, id, SLOT_BYTES)?;
                 match device.file.metadata() {
                     Ok(metadata) => {
                         if seen.insert(metadata.rdev()) {
@@ -377,30 +378,26 @@ fn device_alignment(file: &File) -> io::Result<Alignment> {
 }
 
 fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Plan> {
-    if workers == 0 || devices.is_empty() || config.segment_bytes == 0 {
+    if workers == 0 || devices.is_empty() {
         return Err(Error::InvalidConfiguration);
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     let total = devices.iter().try_fold(0u64, |n, d| {
-        n.checked_add(guarded_capacity(
-            d.bytes,
-            config.segment_bytes,
-            d.alignment,
-        )?)
-        .ok_or(Error::InvalidConfiguration)
+        n.checked_add(guarded_capacity(d.bytes, SLOT_BYTES, d.alignment)?)
+            .ok_or(Error::InvalidConfiguration)
     })?;
-    let worker_limit = MAX_SEGMENTS.min(i64::MAX as u64 / config.segment_bytes);
+    let worker_limit = MAX_SEGMENTS.min(i64::MAX as u64 / SLOT_BYTES);
     let usable = total.min(
         worker_limit
             .checked_mul(workers as u64)
             .ok_or(Error::InvalidConfiguration)?,
     );
-    if usable / workers as u64 <= config.free_segment_reserve as u64 {
+    if usable / (workers as u64) < MIN_SLOTS {
         return Err(Error::InvalidConfiguration);
     }
     if usable != total {
         eprintln!(
-            "racer-dataplane: segment limit discards {} whole device segments",
+            "racer-dataplane: slot limit discards {} whole device slots",
             total - usable
         );
     }
@@ -416,8 +413,15 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
             .map_err(|_| Error::InvalidConfiguration)?,
         )?;
     }
+    // The extent volume transfers whole 4096 byte units.
+    if alignment.memory() > UNIT_BYTES
+        || !(UNIT_BYTES as u64).is_multiple_of(alignment.offset())
+        || !UNIT_BYTES.is_multiple_of(alignment.length())
+    {
+        return Err(Error::InvalidConfiguration);
+    }
     for device in &devices {
-        guarded_capacity(device.bytes, config.segment_bytes, alignment)?;
+        guarded_capacity(device.bytes, SLOT_BYTES, alignment)?;
     }
     let record = alignment
         .extent(
@@ -425,7 +429,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
             crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
         )?
         .length() as u64;
-    if record > config.segment_bytes {
+    if record > SLOT_BYTES {
         return Err(Error::InvalidConfiguration);
     }
     let mut device_index = 0;
@@ -434,8 +438,8 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
     let mut max_snapshot = 0usize;
     for worker in 0..workers {
         let count = usable / workers as u64 + u64::from((worker as u64) < usable % workers as u64);
-        let capacity = (count - config.free_segment_reserve as u64)
-            .saturating_mul(config.segment_bytes / record);
+        // The meta slot holds no pages.
+        let capacity = (count - 1).saturating_mul(SLOT_BYTES / record);
         let requested = capacity.max((config.disk_page_entries.get() / workers).max(1) as u64);
         let pages = requested.min(MAX_PAGES) as usize;
         if requested > MAX_PAGES {
@@ -444,7 +448,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
             );
         }
         let mut hash = Sha256::new();
-        hash.update(b"racer-raw-layout-v1\0");
+        hash.update(b"racer-raw-layout-v2\0");
         hash.update(GUARD_BYTES.to_le_bytes());
         hash.update(GUARD_BYTES.to_le_bytes());
         let mut placements = Vec::with_capacity(count as usize);
@@ -452,7 +456,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
         let mut last_device = None;
         for _ in 0..count {
             while offset
-                .checked_add(config.segment_bytes)
+                .checked_add(SLOT_BYTES)
                 .ok_or(Error::InvalidConfiguration)?
                 > devices[device_index].bytes - GUARD_BYTES
             {
@@ -475,7 +479,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
                 offset,
             });
             offset = offset
-                .checked_add(config.segment_bytes)
+                .checked_add(SLOT_BYTES)
                 .ok_or(Error::InvalidConfiguration)?;
         }
         // Snapshot charges include each descriptor's largest accepted strings.
@@ -503,9 +507,8 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
         );
     }
     eprintln!(
-        "racer-dataplane: raw-device storage devices={} workers={workers} segments={usable} segment_bytes={}",
-        devices.len(),
-        config.segment_bytes
+        "racer-dataplane: raw-device storage devices={} workers={workers} slots={usable} slot_bytes={SLOT_BYTES}",
+        devices.len()
     );
     Ok(Plan {
         workers: plans,
@@ -524,7 +527,7 @@ fn lcm(a: u64, b: u64) -> Result<u64> {
 #[cfg(test)]
 pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::CheckpointLayout> {
     let c = crate::test_support::cluster::config(false);
-    let bytes = 6 * c.segment_bytes + 2 * GUARD_BYTES;
+    let bytes = 6 * SLOT_BYTES + 2 * GUARD_BYTES;
     let devices: Vec<_> = ["cache-a", "cache-b"]
         .into_iter()
         .map(|id| Device {
@@ -698,29 +701,29 @@ mod tests {
     #[test]
     fn split_sorted_devices_preserves_remainders_and_shared_claims() {
         let c = config();
-        let s = c.segment_bytes;
-        let p = plan(vec![device("z", 6, s), device("a", 5, s)], &c, 3).unwrap();
+        let s = SLOT_BYTES;
+        let p = plan(vec![device("z", 9, s), device("a", 7, s)], &c, 3).unwrap();
         assert_eq!(
             p.workers
                 .iter()
                 .map(|w| w.placements.len())
                 .collect::<Vec<_>>(),
-            [4, 4, 3]
+            [6, 5, 5]
         );
-        assert_eq!(p.workers[1].placements[0].offset, GUARD_BYTES + 4 * s);
+        assert_eq!(p.workers[1].placements[0].offset, GUARD_BYTES + 6 * s);
         assert_eq!(p.workers[1].placements[1].offset, GUARD_BYTES);
-        assert_eq!(p.workers[0].disk_groups, vec![(Arc::from("device:a"), 4)]);
+        assert_eq!(p.workers[0].disk_groups, vec![(Arc::from("device:a"), 6)]);
         assert_eq!(
             p.workers[1].disk_groups,
-            vec![(Arc::from("device:a"), 1), (Arc::from("device:z"), 3)]
+            vec![(Arc::from("device:a"), 1), (Arc::from("device:z"), 4)]
         );
-        assert_eq!(p.workers[2].disk_groups, vec![(Arc::from("device:z"), 3)]);
+        assert_eq!(p.workers[2].disk_groups, vec![(Arc::from("device:z"), 5)]);
         assert!(Arc::ptr_eq(
             &p.workers[0].placements[0].file,
             &p.workers[1].placements[0].file
         ));
         assert_ne!(p.workers[0].digest, p.workers[1].digest);
-        let q = plan(vec![device("a", 5, s), device("z", 6, s)], &c, 3).unwrap();
+        let q = plan(vec![device("a", 7, s), device("z", 9, s)], &c, 3).unwrap();
         assert_eq!(p.workers[0].digest, q.workers[0].digest);
     }
 
@@ -742,7 +745,7 @@ mod tests {
             c.validate().unwrap();
             plan(
                 (0..5)
-                    .map(|i| device(&format!("disk-{i}"), 100, c.segment_bytes))
+                    .map(|i| device(&format!("disk-{i}"), 100, SLOT_BYTES))
                     .collect(),
                 &c,
                 c.io_workers.unwrap(),
@@ -766,59 +769,50 @@ mod tests {
     }
 
     #[test]
-    fn disk_usage_shared_device_plan_exports_each_assigned_segment_once() {
+    fn disk_usage_shared_device_plan_exports_each_assigned_slot_once() {
         let c = config();
-        let s = c.segment_bytes;
-        let p = plan(vec![device("z", 6, s), device("a", 5, s)], &c, 3).unwrap();
+        let s = SLOT_BYTES;
+        let p = plan(vec![device("z", 9, s), device("a", 7, s)], &c, 3).unwrap();
         let metrics = crate::telemetry::Metrics::for_workers(3).unwrap();
-        for (worker, metric) in p.workers.iter().zip(&metrics) {
-            let segments = page_alloc::Segments::new(s);
-            segments
-                .configure(
-                    worker.placements.len() as u64 * s,
-                    worker.placements.len(),
-                    worker.alignment,
-                )
-                .unwrap();
-            segments
-                .configure_usage_groups(
-                    &worker
-                        .disk_groups
-                        .iter()
-                        .map(|(_, count)| *count)
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap();
-            drop(segments.append(4096).unwrap());
-            metric.observe_disks(
-                worker
-                    .disk_groups
-                    .iter()
-                    .zip(segments.usage())
-                    .map(|((disk, _), (size, used))| crate::telemetry::DiskUsage {
-                        disk: disk.clone(),
-                        size,
-                        used,
-                    })
-                    .collect(),
-            );
-        }
+        // Worker 1 spans both devices: one slot of `a` (the meta slot) and four of `z`.
+        let worker = &p.workers[1];
+        let index = crate::store::catalog::Index::new(
+            crate::model::WorkerId(1),
+            16,
+            crate::test_support::availability(),
+        );
+        let disk = crate::store::test_disk::TestDisk::mount(&index, worker.placements.len() as u64);
+        let counts: Vec<usize> = worker.disk_groups.iter().map(|(_, count)| *count).collect();
+        let usage = index.disk_usage(&counts);
+        drop(disk);
+        metrics[1].observe_disks(
+            worker
+                .disk_groups
+                .iter()
+                .zip(usage)
+                .map(|((disk, _), (size, used))| crate::telemetry::DiskUsage {
+                    disk: disk.clone(),
+                    size,
+                    used,
+                })
+                .collect(),
+        );
         let mut output = String::new();
-        metrics[0].write_prometheus(&mut output).unwrap();
-        for (disk, size, used) in [("a", 5 * s, 8192), ("z", 6 * s, 4096)] {
+        metrics[1].write_prometheus(&mut output).unwrap();
+        for (disk, size) in [("a", s), ("z", 4 * s)] {
             assert!(output.contains(&format!(
                 "racer_disk_size_bytes{{disk=\"device:{disk}\"}} {size}\n"
             )));
-            assert!(output.contains(&format!(
-                "racer_disk_used_bytes{{disk=\"device:{disk}\"}} {used}\n"
-            )));
         }
+        // Only the meta slot's superblock units are in use after format.
+        assert!(!output.contains("racer_disk_used_bytes{disk=\"device:a\"} 0\n"));
+        assert!(output.contains("racer_disk_used_bytes{disk=\"device:z\"} 0\n"));
     }
 
     #[test]
     fn layout_binds_stable_id_size_and_offset_not_fd() {
         let c = config();
-        let s = c.segment_bytes;
+        let s = SLOT_BYTES;
         let digest = |id, count| plan(vec![device(id, count, s)], &c, 1).unwrap().workers[0].digest;
         assert_eq!(digest("a", 8), digest("a", 8));
         assert_ne!(digest("a", 8), digest("b", 8));
@@ -830,12 +824,6 @@ mod tests {
         assert_ne!(
             original,
             plan(vec![resized], &c, 1).unwrap().workers[0].digest
-        );
-        let mut changed = config();
-        changed.segment_bytes /= 2;
-        assert_ne!(
-            original,
-            plan(vec![device("a", 8, s)], &changed, 1).unwrap().workers[0].digest
         );
     }
 
@@ -869,8 +857,8 @@ mod tests {
         }
         assert!(guarded_capacity(2 * GUARD_BYTES + s + 1, s, a).is_err());
         let c = config();
-        assert!(plan(vec![device("a", 8, c.segment_bytes)], &c, usize::MAX).is_err());
-        assert!(plan(vec![device("a", 8, c.segment_bytes)], &c, 0).is_err());
+        assert!(plan(vec![device("a", 8, SLOT_BYTES)], &c, usize::MAX).is_err());
+        assert!(plan(vec![device("a", 8, SLOT_BYTES)], &c, 0).is_err());
         assert_eq!(lcm(6, 8).unwrap(), 24);
         assert!(lcm(u64::MAX, 2).is_err());
     }
@@ -878,8 +866,8 @@ mod tests {
     #[test]
     fn every_worker_stays_inside_each_devices_guards_and_digest() {
         let c = config();
-        let s = c.segment_bytes;
-        let devices = vec![device("a", 5, s), device("b", 6, s)];
+        let s = SLOT_BYTES;
+        let devices = vec![device("a", 7, s), device("b", 8, s)];
         let files: Vec<_> = devices
             .iter()
             .map(|d| (d.file.clone(), d.bytes, d.id.clone()))
@@ -888,7 +876,7 @@ mod tests {
         let mut used = HashSet::new();
         for worker in &p.workers {
             let mut digest = Sha256::new();
-            digest.update(b"racer-raw-layout-v1\0");
+            digest.update(b"racer-raw-layout-v2\0");
             digest.update(GUARD_BYTES.to_le_bytes());
             digest.update(GUARD_BYTES.to_le_bytes());
             for placement in &worker.placements {
@@ -907,29 +895,29 @@ mod tests {
             }
             assert_eq!(worker.digest, <[u8; 32]>::from(digest.finalize()));
         }
-        assert_eq!(used.len(), 11);
+        assert_eq!(used.len(), 15);
     }
 
     #[test]
     fn combined_alignment_applies_to_all_workers_and_devices() {
         let c = config();
-        let s = c.segment_bytes;
-        let a = device("a", 5, s);
-        let mut b = device("b", 6, s);
-        b.alignment = Alignment::new(8192, 8192, 8192).unwrap();
-        b.bytes += 4096;
-        assert!(plan(vec![a, b], &c, 3).is_err());
-        let mut a = device("a", 5, s);
+        let s = SLOT_BYTES;
+        // The volume transfers 4096 byte units, so coarser alignment is rejected.
+        let mut a = device("a", 7, s);
         a.bytes += 4096;
-        let mut b = device("b", 6, s);
+        let mut b = device("b", 8, s);
         b.bytes += 4096;
         b.alignment = Alignment::new(8192, 8192, 8192).unwrap();
+        assert!(plan(vec![a, b], &c, 3).is_err());
+        let a = device("a", 7, s);
+        let mut b = device("b", 8, s);
+        b.alignment = Alignment::new(512, 512, 512).unwrap();
         let p = plan(vec![a, b], &c, 3).unwrap();
         for worker in &p.workers {
-            assert_eq!(worker.alignment.memory(), 8192);
-            assert_eq!(worker.alignment.offset(), 8192);
-            assert_eq!(worker.alignment.length(), 8192);
-            assert!(worker.placements.iter().all(|p| p.offset % 8192 == 0));
+            assert_eq!(worker.alignment.memory(), 4096);
+            assert_eq!(worker.alignment.offset(), 4096);
+            assert_eq!(worker.alignment.length(), 4096);
+            assert!(worker.placements.iter().all(|p| p.offset % 4096 == 0));
         }
     }
 
@@ -1007,7 +995,7 @@ mod tests {
     #[test]
     fn empty_too_small_invalid_and_missing_selectors_fall_back() {
         let mut c = config();
-        let s = c.segment_bytes;
+        let s = SLOT_BYTES;
         assert!(plan(Vec::new(), &c, 1).is_err());
         assert!(plan(vec![device("a", 2, s)], &c, 1).is_err());
         assert!(plan(vec![device("a", 5, s)], &c, 2).is_err());
@@ -1031,7 +1019,7 @@ mod tests {
     fn sizing_uses_capacity_or_configured_share_and_caps_checkpoint_memory() {
         let mut c = config();
         c.disk_page_entries = std::num::NonZeroUsize::new(1).unwrap();
-        let s = c.segment_bytes;
+        let s = SLOT_BYTES;
         let p = plan(vec![device("a", 9, s)], &c, 2).unwrap();
         let record = p.workers[0]
             .alignment
@@ -1041,10 +1029,7 @@ mod tests {
             )
             .unwrap()
             .length() as u64;
-        assert_eq!(
-            p.workers[0].page_entries as u64,
-            (5 - c.free_segment_reserve as u64) * (s / record)
-        );
+        assert_eq!(p.workers[0].page_entries as u64, (5 - 1) * (s / record));
         c.disk_page_entries = std::num::NonZeroUsize::new(100_000).unwrap();
         let p = plan(vec![device("a", 9, s)], &c, 2).unwrap();
         assert_eq!(p.workers[0].page_entries, 50_000);

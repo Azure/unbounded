@@ -112,15 +112,15 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_WARM_FILL_TIMEOUT_SECS` | `600` | Independent background fill deadline; 1..86,400 seconds |
 | `RACER_WARM_MAX_JOBS` | `16` | Node-wide tracked warm versions, including completed jobs until expiry; 1..1024 |
 | `RACER_WARM_WINDOW_PAGES` | `2` | Maximum in-flight pages per warm job; 1..64 |
-| `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker hard-hold cap as a percentage of segment count and page-index capacity; 1..100; free-segment reserve still applies |
+| `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker hard-hold cap as a percentage of disk slots and page-index capacity; 1..100; two slots per worker are never held |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
 | `RACER_PLACEMENT_CACHE_BYTES` | `16777216` (16 MiB) | Node-wide placement capacity estimate, divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
 | `RACER_CACHED_PATHS` | `128` | Node-wide retained path-query entry budget, divided among I/O workers; 1..1,048,576 |
 | `RACER_PATH_CACHE_BYTES` | `8388608` (8 MiB) | Node-wide accounted path-cache allocation budget, divided among I/O workers; 1 byte..512 MiB, independent of entry count |
 | `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
-| `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
-| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
-| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments |
+| `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab size, rounded down to whole 16,809,984-byte slots; at least 4 slots; does not limit device-mode capacity |
+| `RACER_SEGMENT_BYTES` | ignored | Accepted for compatibility and ignored with a warning; disk space is allocated in fixed slots |
+| `RACER_FREE_SEGMENT_RESERVE` | ignored | Accepted for compatibility and ignored with a warning |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
@@ -163,7 +163,7 @@ use `^` and `$` to avoid unintended substring and partition matches.
 Discovery runs once after startup enrollment. Changing or removing the annotation
 does not change a running layout or trigger a rollout; restart the affected
 dataplane to apply it. An absent/empty selector, Rust compile failure, discovery
-failure, no usable matches, or too few segments for all workers' reserves falls
+failure, no usable matches, or fewer than 4 slots for some worker falls
 back to file-backed slabs. Rejected candidates are skipped with diagnostics;
 remaining usable devices can still be selected. Aliases for one device are
 deduplicated.
@@ -195,37 +195,43 @@ This protects directory entries, **not device contents**: raw writes are
 intentional. `RACER_SLAB_DIRECTORY` still holds `checkpoint.0` and `checkpoint.1`
 and must remain writable and available.
 
-Device mode uses `floor((device_bytes - 2 MiB) / segment_bytes)` segments per
-device, at offsets `1 MiB + k * segment_bytes`. These are split among
-the final I/O workers with remainder segments assigned to workers. Each device's
-subsegment tail is unusable. `RACER_SLAB_BYTES` is ignored for device capacity,
-but still must pass configuration validation for fallback. The normal per-worker
-free-segment reserve, record headers, AEAD tags, alignment padding, and record
-packing reduce payload capacity. Hard limits can reduce it further:
+Device mode uses `floor((device_bytes - 2 MiB) / slot_bytes)` slots per
+device, where `slot_bytes` is 16,809,984 (4104 units of 4096 bytes), at offsets
+`1 MiB + k * slot_bytes`. These are split among the final I/O workers with
+remainder slots assigned to workers. Each device's tail smaller than a slot is
+unusable. Device alignment must divide 4096. `RACER_SLAB_BYTES` is ignored for
+device capacity, but still must pass configuration validation for fallback. Each
+worker's first slot holds the disk index. Record headers, AEAD tags, alignment
+padding, and record packing reduce payload capacity. Hard limits can reduce it
+further:
 
-- At most 1,000,000 segments per worker, also bounded by signed 64-bit byte offsets.
+- At most 1,000,000 slots per worker, also bounded by signed 64-bit byte offsets.
 - Each worker's page index grows to the larger of its estimated full-page capacity
   after reserves and its configured share of `RACER_DISK_PAGE_ENTRIES`, capped at
   1,000,000 entries. The estimate includes the largest record header, AEAD tag,
   and direct-I/O alignment. Small objects can exhaust the index before disk bytes.
 - Checkpoint working memory grows from a conservative estimate of page entries,
-  metadata entries, and segments, never below `RACER_CHECKPOINT_BYTES`, and is
+  metadata entries, and slots, never below `RACER_CHECKPOINT_BYTES`, and is
   capped at 512 MiB node-wide. Encoded checkpoint files still have a 64 MiB cap.
   Oversized snapshots are skipped; recovery rejects snapshots over its budget.
 
-Plan memory for the larger index, resident heat tracking, segment tables, and
+Plan memory for the larger index, resident heat tracking, slot tables, and
 checkpoint scratch, not just the configured admission budgets. The automatic
 checkpoint budget is not an RSS limit or a guarantee that a full cache can be
 checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
 
-Checkpoints store completed-page hold deadlines and bind each worker to
-file mode or its raw-device IDs, sizes, and segment offsets. The raw-layout
-digest also includes both guard sizes. Each checkpoint candidate is
-validated for the whole node: one mismatched worker rejects the entire candidate.
-A changed device layout, storage mode, worker count, or incompatible
-geometry rejects recovery and starts cold when no compatible checkpoint remains.
-Racer does not scan payloads to rebuild the index or migrate cached data. Preserve
-cluster and node identity state; it is separate from disposable cache checkpoints.
+Each worker's disk keeps its own page index and hold deadlines, so disk pages
+survive a restart without a checkpoint. Cache pages written in the last second
+before a crash can be lost; held pages are acknowledged only after they are durable.
+A slab with no valid disk index, including one from an older release, is
+reformatted and its old pages are discarded. Checkpoints only store object
+metadata and bind each worker to file mode or its raw-device IDs, sizes, and slot
+offsets. The raw-layout digest also includes both guard sizes. Each checkpoint
+candidate is validated for the whole node: one mismatched worker rejects the
+entire candidate. A changed device layout, storage mode, or worker count rejects
+the checkpoint and starts with cold metadata. Checkpoints from older releases are
+ignored. Preserve cluster and node identity state; it is separate from disposable
+cache checkpoints.
 
 ### Warm and hard retention
 
@@ -265,16 +271,15 @@ Retention is separate from freshness. An unpinned request still refreshes expire
 current-version metadata. Pin `Get` to the returned ETag to read the warmed version;
 retention does not force later unpinned reads to select it.
 
-Hard holds bypass second-sight and veto both page-index eviction and reclamation
-of a segment containing a held record. Admission charges **one whole segment per
-page**, including short pages and existing local copies. This is conservative
-capacity accounting, not a dedicated warm tail or one-page physical layout.
-Existing local copies stay where they are and are not rewritten. The charge
-leaves room for the eviction veto even when records are fragmented across segments.
-It can reject a request well before the disk's payload-byte capacity is full.
-Each worker must fit its pages within the retained percentage of both segments
-and index entries, while preserving the free-segment reserve and unused index
-reservations. Worker imbalance can also cause refusal.
+Hard holds bypass second-sight. Held pages are written as durable records that
+disk eviction skips until the hold deadline passes. Admission charges **one whole
+slot per page**, including short pages and existing local copies. This is
+conservative capacity accounting, not a one-page physical layout. Existing local
+copies that are already durable stay where they are; other local copies are
+rewritten as durable records. The charge can reject a request well before the
+disk's payload-byte capacity is full. Each worker must fit its pages within the
+retained percentage of both slots and index entries, leaving two slots free.
+Worker imbalance can also cause refusal.
 
 Progress means verified ciphertext has been published on disk, not merely queued
 for writing. If a later page fails, completed disk pages keep their admitted
@@ -302,7 +307,7 @@ storage or request state.
 | `racer_warm_waiters` | Registered GET page waits for warm progress; excludes HEAD admissions and unregistered reads |
 | `racer_warm_held_pages` | Published indexed pages under live hard holds; excludes unused reservations and pending writes |
 | `racer_warm_held_payload_bytes` | Logical payload bytes of those pages, excluding tags, headers, and padding |
-| `racer_warm_held_segments` | Distinct segments containing those pages, summed across storage workers |
+| `racer_warm_held_segments` | Distinct disk slots containing those pages, summed across storage workers |
 
 Held gauges use each storage worker's latest health snapshot. Expired holds are
 excluded after both wall and monotonic deadlines pass. Recovered holds count even
@@ -378,14 +383,14 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 
 | Metric | Meaning |
 | --- | --- |
-| `racer_disk_size_bytes{disk}` | Gauge of segment capacity assigned to Racer on this backing disk, including reserve segments |
-| `racer_disk_used_bytes{disk}` | Gauge of reserved record bytes on this backing disk, including headers, tags, and alignment padding, until segment recycling |
+| `racer_disk_size_bytes{disk}` | Gauge of slot capacity assigned to Racer on this backing disk, including the index slot |
+| `racer_disk_used_bytes{disk}` | Gauge of record and index bytes in use on this backing disk, including headers, tags, and alignment padding |
 | `racer_disk_class_publications_total{classification}` | Completed writer publications; excludes checkpoint restoration and deduplicated enqueue |
 | `racer_disk_class_published_payload_bytes_total{classification}` | Logical page payload bytes in those publications |
 | `racer_disk_class_index_evicted_pages_total{classification}` | Victim mappings removed to reserve page-index capacity |
 | `racer_disk_class_index_evicted_payload_bytes_total{classification}` | Logical payload bytes of those index victims |
-| `racer_disk_class_segment_evicted_pages_total{classification}` | Victim mappings removed by bounded segment reclamation, including index-only segment reclamation |
-| `racer_disk_class_segment_evicted_payload_bytes_total{classification}` | Logical payload bytes of those segment victims, not physical reclaimed disk space |
+| `racer_disk_class_segment_evicted_pages_total{classification}` | Pages removed by disk slot eviction |
+| `racer_disk_class_segment_evicted_payload_bytes_total{classification}` | Logical payload bytes of those pages, not physical reclaimed disk space |
 | `racer_disk_class_read_payload_bytes_total{classification}` | Logical page payload bytes returned successfully by StoreReader after framing and mapping checks |
 | `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |
 | `racer_disk_indexed_payload_bytes` | Total logical payload bytes in retained index mappings, including restored mappings |
@@ -398,12 +403,11 @@ For per-disk utilization as a percentage, use:
 
 The `disk` label is `device:<by-id basename>` for raw devices and
 `file:worker-<id>-slab-0.dat` for file-backed slabs. Workers sharing a device
-contribute only their assigned segments. Size excludes device guards, unused
-tails outside assigned segments, and unassigned capacity. Used bytes include
-failed-write reservations and records whose index mappings were removed, until
-their segments are recycled. These gauges measure Racer's reserved record space,
-not filesystem allocation or whole-device fullness. Sealed segment tails and
-free-segment reserves can require reclamation before utilization reaches 100%.
+contribute only their assigned slots. Size excludes device guards, unused
+tails outside assigned slots, and unassigned capacity. Used bytes count records
+and index nodes in use, including held records waiting to be reusable. These
+gauges measure Racer's record space, not filesystem allocation or whole-device
+fullness. Partly filled slots can require eviction before utilization reaches 100%.
 They are sampled after recovery and on each worker's health tick.
 
 All payload byte metrics exclude AEAD tags, record headers, and alignment padding.

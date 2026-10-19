@@ -66,11 +66,15 @@ impl Drop for Payload {
 pub(crate) type Ownership = Rc<dyn Fn(&PageId) -> bool>;
 pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 
+/// Scores with one ownership pass. Disk eviction is now the volume's CLOCK, so
+/// only tests rank pages this way.
+#[cfg(test)]
 pub(crate) struct Scoring<'a> {
     retention: &'a Retention,
     ownership: Ownership,
     now: Instant,
 }
+#[cfg(test)]
 impl Scoring<'_> {
     pub(crate) fn score(&self, page: &PageId) -> u8 {
         self.retention
@@ -136,6 +140,7 @@ impl Retention {
     pub(crate) fn set_ownership_pass(&self, prepare: OwnershipPass) {
         *self.ownership_pass.borrow_mut() = Some(prepare);
     }
+    #[cfg(test)]
     pub(crate) fn scoring_at(&self, now: Instant) -> Scoring<'_> {
         let ownership = match self.ownership_pass.borrow().as_ref() {
             Some(prepare) => prepare(),

@@ -1235,8 +1235,10 @@ fn disk_usage_worker_samples_recovery_and_reset() {
     let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let worker = wake_test_worker();
-    futures::executor::block_on(worker.prepare_storage()).unwrap();
-    let slab_bytes = worker.store.writer.slabs().geometry().unwrap().slab_bytes();
+    worker.runtime.reactor.init().unwrap();
+    let startup = scope(Duration::from_secs(5)).unwrap();
+    drive_peer(&worker.runtime.reactor, worker.prepare_storage(&startup)).unwrap();
+    let slab_bytes = worker.store.writer.slabs().capacity_bytes();
     let image = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
     worker.store.checkpoint.finish_snapshot();
     futures::executor::block_on(worker.store.recovery.install_shard(Some(image))).unwrap();
@@ -1254,11 +1256,15 @@ fn disk_usage_worker_samples_recovery_and_reset() {
     assert!(output.contains(&format!(
         "racer_disk_size_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {slab_bytes}\n"
     )));
-    assert!(output.contains("racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} 0\n"));
+    // A freshly formatted volume uses only its superblock units.
+    let used = "racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} ";
+    assert!(output.contains(used));
+    assert!(!output.contains(&format!("{used}0\n")));
     futures::executor::block_on(worker.store.recovery.install_shard(None)).unwrap();
     assert_eq!(scrape(), output, "samples change only on observation");
+    // Metadata recovery never touches disk pages.
     worker.observe_health().unwrap();
-    assert!(scrape().contains("racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} 0\n"));
+    assert_eq!(scrape(), output);
 }
 
 #[test]
@@ -1734,7 +1740,9 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
         .attach_io(rt0.reactor.clone(), rt0.admission.clone())
         .unwrap();
     for app in [&mut first, &mut second] {
-        let _ = futures::executor::block_on(app.store.writer.open()).unwrap();
+        app.runtime.reactor.init().unwrap();
+        let startup = scope(Duration::from_secs(5)).unwrap();
+        let _ = drive_peer(&app.runtime.reactor, app.store.writer.open(&startup)).unwrap();
         app.caches = vec![definition()];
     }
     first
@@ -3896,7 +3904,7 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
 }
 
-fn drive_peer<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
+pub(super) fn drive_peer<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let watchdog = Instant::now() + Duration::from_secs(30);

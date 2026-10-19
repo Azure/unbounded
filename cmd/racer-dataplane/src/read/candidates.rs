@@ -181,7 +181,7 @@ pub struct CandidatePolicy {
 }
 #[derive(Default)]
 struct OwnershipRefresh {
-    cursor: u64,
+    cursor: Option<page_alloc::volume::Key>,
     visited: usize,
     active: Option<crate::model::PageId>,
 }
@@ -609,17 +609,22 @@ impl CandidatePolicy {
             // Continuous appends must not keep a pass chasing the moving tail
             // forever while earlier residents retain missing topology hints.
             if work.visited >= index.page_capacity() {
-                work.cursor = 0;
+                work.cursor = None;
                 work.visited = 0;
                 return Ok(crate::topology::Maintenance::Idle);
             }
-            let (cursor, mut pages) = index.snapshot_pages(work.cursor, 1);
+            let (cursor, mut pages) = index.resident_pages_after(work.cursor.as_ref(), 1);
+            let exhausted = cursor.is_none();
             work.cursor = cursor;
-            work.active = pages.pop().map(|(page, _)| page);
+            work.active = pages.pop();
             work.visited += usize::from(work.active.is_some());
+            if work.active.is_none() && !exhausted {
+                // An entry of an unknown version: skip it, bounded per turn.
+                return Ok(crate::topology::Maintenance::Progress);
+            }
         }
         let Some(page) = &work.active else {
-            work.cursor = 0;
+            work.cursor = None;
             work.visited = 0;
             return Ok(crate::topology::Maintenance::Idle);
         };
@@ -2733,7 +2738,7 @@ pub(super) mod tests {
     #[test]
     fn ownership_refresh_recovers_idle_pages_and_rejects_obsolete_results() {
         use crate::model::{PageId, VersionMetadata, WorkerId};
-        use crate::store::catalog::{Index, IndexedPage, RecordLocation};
+        use crate::store::catalog::Index;
         use crate::topology::tests::fixtures;
         let members = fixtures::membership(1000);
         let page = PageId {
@@ -2754,25 +2759,19 @@ pub(super) mod tests {
         let mut policy = policy(owner.clone(), peers.clone());
         let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
         index.set_page_capacity(1).unwrap();
-        index
-            .publish(
-                page.clone(),
-                IndexedPage {
-                    location: RecordLocation {
-                        segment: page_alloc::SegmentId(0),
-                        generation: page_alloc::Generation(1),
-                        extent: page_alloc::Extent::new(0, 512).unwrap(),
-                    },
-                    metadata: VersionMetadata {
-                        content_type: None,
-                        version: page.version.clone(),
-                        length: 1,
-                    },
-                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                },
-            )
-            .unwrap();
-        assert_eq!(index.snapshot_pages(0, 1).1.len(), 1);
+        let disk = crate::store::test_disk::TestDisk::mount(&index, 8);
+        disk.put(
+            &index,
+            &page,
+            &VersionMetadata {
+                content_type: None,
+                version: page.version.clone(),
+                length: 1,
+            },
+            crate::model::key_id_from_generation(1, 1).unwrap(),
+            page_alloc::volume::Tier::Cache,
+        );
+        assert_eq!(index.resident_pages_after(None, 1).1, vec![page.clone()]);
         assert!(!policy.owns_current(&page));
         assert_eq!(policy.refresh_ownership(&index), Err(Error::Unavailable));
         policy.published = crate::test_support::published_membership(members.clone());
@@ -2899,12 +2898,11 @@ pub(super) mod tests {
             ));
             let writer = Rc::new(crate::store::StoreWriter::new(
                 index,
-                Rc::new(page_alloc::Segments::new(config.segment_bytes)),
                 Rc::new(page_alloc::Slab::new(
                     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("target/ownership-unopened-slab"),
                     config.slab_bytes,
-                    config.segment_bytes,
+                    page_alloc::volume::SLOT_BYTES,
                     crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
                 )),
                 admission.clone(),

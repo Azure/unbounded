@@ -62,7 +62,6 @@ use racer_dataplane::security::PageCryptoEngine;
 use racer_dataplane::store::StoreReader;
 use racer_dataplane::store::StoreWriter;
 use racer_dataplane::store::catalog::Index;
-use racer_dataplane::store::catalog::SegmentClock;
 use racer_dataplane::topology::LinkHealth;
 
 use racer_crypto::identity::Certificates;
@@ -810,18 +809,18 @@ fn open_fixture_storage(
     availability: Rc<racer_dataplane::control::Availability>,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
     let index = Rc::new(Index::new(worker, entries, availability.clone()));
-    let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
+    // The extent volume uses whole slots; a remainder is left unused.
+    let slot = page_alloc::volume::SLOT_BYTES;
+    let slab_bytes = slab_bytes / slot * slot;
+    assert!(slab_bytes >= page_alloc::volume::MIN_SLOTS * slot);
     let slabs = Rc::new(page_alloc::Slab::new(
         path.join(format!("worker-{}-slab-0.dat", worker.0)),
         slab_bytes,
-        64 * 1024 * 1024,
+        slot,
         racer_dataplane::model::PAGE_BYTES as usize + racer_dataplane::store::MAX_HEADER_BYTES + 16,
     ));
-    let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let disk = Rc::new(StoreReader::new(
-        eviction.clone(),
         index.clone(),
-        segments.clone(),
         slabs.clone(),
         admission.clone(),
         reactor.clone(),
@@ -829,16 +828,25 @@ fn open_fixture_storage(
     ));
     let writer = Rc::new(StoreWriter::new(
         index.clone(),
-        segments,
         slabs,
         admission.clone(),
         reactor.clone(),
         availability,
     ));
-    writer
-        .configure(admission.clone(), eviction, 64, entries)
-        .unwrap();
-    let _ = futures::executor::block_on(writer.open()).expect("real O_DIRECT slab must open");
+    writer.configure(admission.clone(), 64, entries).unwrap();
+    reactor.init().expect("fixture storage requires io_uring");
+    let scope = RequestScope::new(RequestId([3; 16]), Instant::now() + TIMEOUT).unwrap();
+    let mut open = writer.open(&scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    loop {
+        reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = open.as_mut().poll(&mut cx) {
+            let _ = result.expect("real O_DIRECT slab must mount");
+            break;
+        }
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    drop(open);
     (index, disk, writer)
 }
 

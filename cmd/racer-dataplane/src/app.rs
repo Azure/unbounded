@@ -67,7 +67,6 @@ use crate::store::Store;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::store::catalog::Index;
-use crate::store::catalog::SegmentClock;
 use crate::store::checkpoint::CheckpointLayout;
 use crate::store::checkpoint::Checkpointer;
 use crate::store::checkpoint::Recovery;
@@ -306,25 +305,26 @@ impl Application {
 }
 
 /// Create a bounded scope for application-owned lifecycle operations.
-/// Full-page capacity at actual direct-I/O alignment, conservatively allowing
-/// the largest supported record header. Short records can use tail space.
+/// Full-page capacity of a volume at actual direct-I/O alignment, conservatively
+/// allowing the largest supported record header, and the slot tail space left
+/// by full-page records. The meta slot holds no pages.
 fn payload_capacity(
-    geometry: page_alloc::SegmentGeometry,
-    reserve: usize,
+    slot_count: u64,
+    alignment: page_alloc::Alignment,
     page_entries: usize,
 ) -> Result<(u64, u64)> {
-    let record = geometry
-        .alignment()
+    use page_alloc::volume::SLOT_BYTES;
+    let record = alignment
         .extent(
             0,
             crate::model::PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES,
         )?
         .length() as u64;
-    let pages = geometry.segment_bytes() / record;
-    let usable = geometry.segment_count().saturating_sub(reserve as u64);
+    let pages = SLOT_BYTES / record;
+    let usable = slot_count.saturating_sub(1);
     Ok((
         (usable * pages).min(page_entries as u64) * crate::model::PAGE_BYTES,
-        usable * (geometry.segment_bytes() - pages * record),
+        usable * (SLOT_BYTES - pages * record),
     ))
 }
 
@@ -1256,17 +1256,16 @@ impl WorkerApplication {
             limits.metadata_entries.get(),
             availability.clone(),
         ));
-        let segments = Rc::new(page_alloc::Segments::new(config.segment_bytes));
-        let eviction = Rc::new(SegmentClock::with_budget(
-            index.clone(),
-            segments.clone(),
-            config.free_segment_reserve,
-            crate::store::catalog::FOREGROUND_RECLAIM_BUDGET,
-        ));
         let devices = node
             .devices
             .as_ref()
             .map(|plan| &plan.workers[worker.0 as usize]);
+        // File mode uses whole volume slots; a remainder is left unused.
+        let slab_bytes =
+            config.slab_bytes / page_alloc::volume::SLOT_BYTES * page_alloc::volume::SLOT_BYTES;
+        let slab_file = config
+            .slab_directory
+            .join(format!("worker-{}-slab-0.dat", worker.0));
         let slabs = Rc::new(if let Some(devices) = devices {
             page_alloc::Slab::from_devices(
                 devices
@@ -1277,25 +1276,21 @@ impl WorkerApplication {
                         offset: placement.offset,
                     })
                     .collect(),
-                config.segment_bytes,
+                page_alloc::volume::SLOT_BYTES,
                 crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
                 devices.alignment,
             )?
         } else {
             page_alloc::Slab::new(
-                config
-                    .slab_directory
-                    .join(format!("worker-{}-slab-0.dat", worker.0)),
-                config.slab_bytes,
-                config.segment_bytes,
+                slab_file.clone(),
+                slab_bytes,
+                page_alloc::volume::SLOT_BYTES,
                 crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
             )
         });
         let reader = Rc::new(
             StoreReader::new(
-                eviction.clone(),
                 index.clone(),
-                segments.clone(),
                 slabs.clone(),
                 runtime.admission.clone(),
                 runtime.reactor.clone(),
@@ -1303,33 +1298,34 @@ impl WorkerApplication {
             )
             .with_metrics(metrics.clone()),
         );
-        let writer = Rc::new(
-            StoreWriter::new(
-                index.clone(),
-                segments.clone(),
-                slabs,
-                runtime.admission.clone(),
-                runtime.reactor.clone(),
-                availability,
-            )
-            .with_metrics(metrics.clone())
-            .with_disk_groups(devices.map_or_else(
-                || {
-                    vec![(
-                        format!("file:worker-{}-slab-0.dat", worker.0).into(),
-                        (config.slab_bytes / config.segment_bytes) as usize,
-                    )]
-                },
-                |devices| devices.disk_groups.clone(),
-            )),
-        );
+        let writer = StoreWriter::new(
+            index.clone(),
+            slabs,
+            runtime.admission.clone(),
+            runtime.reactor.clone(),
+            availability,
+        )
+        .with_metrics(metrics.clone())
+        .with_disk_groups(devices.map_or_else(
+            || {
+                vec![(
+                    format!("file:worker-{}-slab-0.dat", worker.0).into(),
+                    (slab_bytes / page_alloc::volume::SLOT_BYTES) as usize,
+                )]
+            },
+            |devices| devices.disk_groups.clone(),
+        ));
+        let writer = Rc::new(if devices.is_none() {
+            writer.with_slab_file(slab_file)
+        } else {
+            writer
+        });
         let disk_page_entries = devices
             .map_or((config.disk_page_entries.get() / node.count).max(1), |d| {
                 d.page_entries
             });
         writer.configure(
             runtime.admission.clone(),
-            eviction.clone(),
             limits.queue_entries.get(),
             disk_page_entries,
         )?;
@@ -1353,7 +1349,6 @@ impl WorkerApplication {
                 ),
             ),
             recovery: Recovery::new(config.slab_directory.clone(), index),
-            eviction,
         })
     }
 
@@ -2278,7 +2273,7 @@ impl WorkerApplication {
             self.worker,
             Resources {
                 workers_usable: self.started && !self.stopping,
-                storage_usable: self.store.writer.slabs().alignment().is_ok(),
+                storage_usable: self.store.writer.index().is_mounted(),
                 listeners_usable: self.started
                     && (self.control.is_none()
                         || self.peer_task.is_some() && self.diagnostic_task.is_some()),
@@ -2309,7 +2304,7 @@ impl WorkerApplication {
                 .checkpoint
                 .prepare_directory(&self.runtime.reactor, startup)
                 .await?;
-            let geometry = self.prepare_storage().await?;
+            let geometry = self.prepare_storage(startup).await?;
             self.endpoint = Some(
                 self.directory
                     .install(self.worker, self.coordinator.clone())?,
@@ -2330,14 +2325,17 @@ impl WorkerApplication {
     }
 
     /// Open storage and publish the effective disk capacity metrics.
-    async fn prepare_storage(&self) -> Result<CheckpointLayout> {
-        let _ = self.store.open().await?;
+    async fn prepare_storage(&self, startup: &RequestScope) -> Result<CheckpointLayout> {
+        let alignment = self.store.open(startup).await?;
         let layout = self.store.checkpoint.layout()?;
-        let (payload, tail) = payload_capacity(
-            self.store.writer.slabs().geometry()?,
-            self.store.eviction.reserve(),
-            self.store.writer.index().page_capacity(),
-        )?;
+        let slots = self
+            .store
+            .writer
+            .index()
+            .volume()
+            .map_or(0, |volume| volume.slot_count());
+        let (payload, tail) =
+            payload_capacity(slots, alignment, self.store.writer.index().page_capacity())?;
         self.telemetry
             .metrics
             .add_gauge(Gauge::EffectivePayloadBytes, payload);

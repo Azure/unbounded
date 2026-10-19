@@ -2,9 +2,6 @@
 //! Versioned little-endian records protect framing with header SHA-256. The stored
 //! CRC is checked before AEAD at the fill boundary; padding is never returned.
 use self::catalog::Index;
-use self::catalog::IndexedPage;
-use self::catalog::RecordLocation;
-use self::catalog::SegmentClock;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::error::Error;
@@ -27,10 +24,12 @@ use crate::runtime::RequestScope;
 use page_alloc::AlignedBuffer;
 use page_alloc::Alignment;
 use page_alloc::Extent;
-use page_alloc::Generation;
-use page_alloc::SegmentLease;
-use page_alloc::Segments;
 use page_alloc::Slab;
+use page_alloc::volume::Key;
+use page_alloc::volume::SLOT_BYTES;
+use page_alloc::volume::Tier;
+use page_alloc::volume::Volume;
+use page_alloc::volume::VolumeOptions;
 use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
 use sha2::Digest;
@@ -42,19 +41,22 @@ use std::rc::Rc;
 
 pub mod catalog;
 pub mod checkpoint;
+pub mod disk;
 pub mod holds;
-// Unused until the store switches to the extent volume.
-#[allow(dead_code)]
 pub(crate) mod key;
-#[allow(dead_code)]
+#[cfg(test)]
+pub(crate) mod test_disk;
 pub mod versions;
+
+/// Write id stored in a record header; equals the volume entry's generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Generation(pub u64);
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
     pub writer: Rc<StoreWriter>,
     pub checkpoint: Rc<checkpoint::Checkpointer>,
     pub recovery: checkpoint::Recovery,
-    pub eviction: Rc<catalog::SegmentClock>,
 }
 
 impl Store {
@@ -66,19 +68,16 @@ impl Store {
         page_entries: usize,
     ) -> Result<()> {
         self.checkpoint.bind_writer(&self.writer);
-        self.writer.configure(
-            admission,
-            self.eviction.clone(),
-            queue_entries,
-            page_entries,
-        )
+        self.writer
+            .configure(admission, queue_entries, page_entries)
     }
 
-    /// Open slabs and configure the checkpoint layout.
-    pub fn open(&self) -> Operation<'_, Alignment> {
+    /// Open the slab, mount (or format) its extent volume, and configure the
+    /// checkpoint layout. Drive the worker reactor while this runs.
+    pub fn open<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Alignment> {
         Box::pin(async move {
             self.checkpoint.bind_writer(&self.writer);
-            let alignment = self.writer.open().await?;
+            let alignment = self.writer.open(scope).await?;
             let layout = self.checkpoint.configure_layout()?;
             self.recovery.configure_layout(layout);
             Ok(alignment)
@@ -86,13 +85,11 @@ impl Store {
     }
 }
 
-/// Lease mappings before awaiting I/O and return validated ciphertext framing.
+/// Read records through the volume and return validated ciphertext framing.
 /// AEAD validation remains owned by fill.
 pub struct StoreReader {
     metrics: crate::telemetry::Metrics,
-    clock: Rc<catalog::SegmentClock>,
     index: Rc<Index>,
-    segments: Rc<Segments>,
     slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
@@ -101,8 +98,8 @@ pub struct StoreReader {
 #[derive(Clone)]
 /// Permits conditional invalidation without removing a replacement mapping.
 pub struct ReadToken {
-    page: PageId,
-    location: RecordLocation,
+    key: Key,
+    generation: u64,
 }
 impl StoreReader {
     pub fn metadata(
@@ -112,9 +109,7 @@ impl StoreReader {
         self.index.version(version)
     }
     pub fn new(
-        clock: Rc<catalog::SegmentClock>,
         index: Rc<Index>,
-        segments: Rc<Segments>,
         slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
@@ -122,9 +117,7 @@ impl StoreReader {
     ) -> Self {
         Self {
             metrics: crate::telemetry::Metrics::default(),
-            clock,
             index,
-            segments,
             slabs,
             admission,
             reactor,
@@ -139,7 +132,8 @@ impl StoreReader {
         self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
-        self.index.remove_if_matches(&token.page, &token.location);
+        self.index
+            .remove_if_generation(&token.key, token.generation);
         Ok(())
     }
     pub fn read_with_token<'a>(
@@ -166,41 +160,25 @@ impl StoreReader {
     ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
         Box::pin(async move {
             scope.check()?;
-            let entry = match self.metrics.lookup(
+            // Pages beyond the key's page range are never stored.
+            let Some(key) = key::volume_key(page) else {
+                return Ok(None);
+            };
+            let value = match self.metrics.lookup(
                 crate::telemetry::LookupTier::DiskIndex,
                 self.index.lookup(page),
             )? {
-                Some(e) => e,
+                Some(value) => value,
                 None => return Ok(None),
             };
-            let token = ReadToken {
-                page: page.clone(),
-                location: entry.location.clone(),
-            };
-            // Both checks happen without yielding, so eviction cannot interleave.
-            if self
-                .segments
-                .validate(
-                    entry.location.segment,
-                    entry.location.generation,
-                    &entry.location.extent,
-                )
-                .is_err()
-            {
-                self.invalidate(&token)?;
+            let Some(volume) = self.index.volume() else {
                 return Ok(None);
-            }
-            let lease = match self
-                .segments
-                .lease(entry.location.segment, entry.location.generation)
-            {
-                Ok(l) => l,
-                Err(_) => {
-                    self.invalidate(&token)?;
-                    return Ok(None);
-                }
             };
-            let length = entry.location.extent.length();
+            let token = ReadToken {
+                key,
+                generation: value.generation,
+            };
+            let length = value.length as usize;
             let amount = staging_capacity(length)?;
             let mut reserved = reserve(amount);
             if matches!(reserved, Err(Error::Overloaded)) {
@@ -215,11 +193,9 @@ impl StoreReader {
                 return Err(Error::InvalidConfiguration);
             }
             let buffer = self.slabs.allocate(length, reservation)?;
-            let buffer = match self
-                .slabs
-                .read(&self.reactor, entry.location.extent, buffer, lease, scope)
-                .await
-            {
+            // The volume leases the slot for the read, so eviction cannot reuse
+            // it mid-transfer; the header check below catches earlier reuse.
+            let buffer = match volume.read(&*self.reactor, &value, buffer, scope).await {
                 Ok(b) => b,
                 Err(error @ (Error::Io | Error::Os(_) | Error::CorruptRecord)) => {
                     if error == Error::CorruptRecord {
@@ -228,6 +204,7 @@ impl StoreReader {
                     self.invalidate(&token)?;
                     return Ok(None);
                 }
+                Err(Error::Unavailable) => return Ok(None),
                 Err(e) => return Err(e),
             };
             // A record with this magic but a different format version (for
@@ -242,7 +219,8 @@ impl StoreReader {
                 self.invalidate(&token)?;
                 return Ok(None);
             }
-            let decoded = match parse(&buffer, entry.location.extent) {
+            let extent = Extent::new(0, length)?;
+            let decoded = match parse(&buffer, extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();
@@ -250,34 +228,53 @@ impl StoreReader {
                     return Ok(None);
                 }
             };
-            if decoded.header.envelope.page != *page
-                || decoded.header.generation != entry.location.generation
-                || decoded.header.metadata != entry.metadata
-                || decoded.header.envelope.key_id != entry.key_id
+            if decoded.header.generation.0 != value.generation
+                || decoded.header.envelope.page != *page
+            {
+                // Another record now occupies the slot: a stale entry, not
+                // corruption. Remove it only if the index still points here.
+                self.invalidate(&token)?;
+                return Ok(None);
+            }
+            let key_id = decoded.header.envelope.key_id;
+            if !self
+                .index
+                .page_available(&page.version.object.cache, key_id)
+            {
+                self.invalidate(&token)?;
+                return Ok(None);
+            }
+            if self
+                .index
+                .version(&page.version)?
+                .is_some_and(|known| !known.compatible(&decoded.header.metadata))
             {
                 self.corrupt_miss();
                 self.invalidate(&token)?;
                 return Ok(None);
             }
             // A concurrent retirement/removal must not resurrect a completed copy.
-            if self.index.lookup(page)?.is_none_or(|current| {
-                current.location != entry.location || current.key_id != entry.key_id
-            }) {
+            if self
+                .index
+                .lookup(page)?
+                .is_none_or(|current| current != value)
+            {
                 return Ok(None);
             }
+            self.index.learn_version(&decoded.header.metadata, key_id);
+            let metadata = decoded.header.metadata.clone();
             let ciphertext = self.buffers.slab_ciphertext(
                 buffer,
                 decoded.header.envelope,
                 decoded.ciphertext,
             )?;
             ciphertext.expected_checksum(decoded.checksum)?;
-            self.clock.mark_read(entry.location.segment)?;
             self.index
                 .retention()
-                .disk_read(page, u64::from(entry.metadata.page_length(page)?));
+                .disk_read(page, u64::from(metadata.page_length(page)?));
             Ok(Some((
                 CiphertextCopy {
-                    metadata: entry.metadata.for_pin(),
+                    metadata: metadata.for_pin(),
                     ciphertext,
                 },
                 token,
@@ -340,12 +337,13 @@ fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
 pub struct StoreWriter {
     metrics: crate::telemetry::Metrics,
     disk_groups: Vec<(std::sync::Arc<str>, usize)>,
+    /// File-mode slab path, resized at open when an older layout left a file
+    /// of another size.
+    slab_file: Option<std::path::PathBuf>,
     index: Rc<Index>,
-    segments: Rc<Segments>,
     slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
-    clock: RefCell<Option<Rc<SegmentClock>>>,
     pending: RefCell<HashMap<PageId, Dirty>>,
     queue: RefCell<VecDeque<PageId>>,
     next: Cell<u64>,
@@ -369,7 +367,6 @@ impl StoreWriter {
     }
     pub fn new(
         index: Rc<Index>,
-        segments: Rc<Segments>,
         slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
@@ -378,12 +375,11 @@ impl StoreWriter {
         Self {
             metrics: crate::telemetry::Metrics::default(),
             disk_groups: Vec::new(),
+            slab_file: None,
             index,
-            segments,
             slabs,
             admission,
             reactor,
-            clock: RefCell::new(None),
             pending: RefCell::new(HashMap::default()),
             queue: RefCell::new(VecDeque::new()),
             next: Cell::new(1),
@@ -405,7 +401,6 @@ impl StoreWriter {
     pub fn configure(
         &self,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-        clock: Rc<SegmentClock>,
         queue_entries: usize,
         page_entries: usize,
     ) -> Result<()> {
@@ -416,35 +411,68 @@ impl StoreWriter {
             return Err(Error::InvalidConfiguration);
         }
         self.index.set_page_capacity(page_entries)?;
-        *self.clock.borrow_mut() = Some(clock);
         self.capacity.set(queue_entries);
         Ok(())
     }
-    pub fn open(&self) -> Operation<'_, Alignment> {
+    /// Mount the extent volume on the slab, formatting it when no valid
+    /// superblock is found (for example a slab of an older release, whose data
+    /// is discarded). Drive the worker reactor while this runs.
+    pub fn open<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Alignment> {
         Box::pin(async move {
-            // Slab discovery is blocking startup work, not asynchronous request I/O.
-            let alignment = self.slabs.open_configured(&self.segments)?;
-            if !self.disk_groups.is_empty() {
-                self.segments.configure_usage_groups(
-                    &self
-                        .disk_groups
-                        .iter()
-                        .map(|(_, count)| *count)
-                        .collect::<Vec<_>>(),
-                )?;
+            if let Some(volume) = self.index.volume() {
+                return Ok(volume.alignment());
             }
+            let slots = self.slabs.capacity_bytes() / SLOT_BYTES;
+            if let Some(path) = &self.slab_file {
+                resize_legacy_slab(path, self.slabs.capacity_bytes())?;
+            }
+            if !self.disk_groups.is_empty()
+                && self
+                    .disk_groups
+                    .iter()
+                    .map(|(_, count)| *count as u64)
+                    .sum::<u64>()
+                    != slots
+            {
+                return Err(Error::InvalidConfiguration);
+            }
+            let mut volume_id = [0; 16];
+            getrandom::getrandom(&mut volume_id).map_err(|_| Error::Unavailable)?;
+            let admission = self.admission.clone();
+            let options = VolumeOptions {
+                limits: self.index.volume_limits(slots),
+                volume_id,
+                format: true,
+                charge: Rc::new(move |length| {
+                    admission
+                        .reserve_completion(None, ResourceClass::Ciphertext, length)
+                        .map_err(|_| page_alloc::Error::Busy)
+                }),
+            };
+            let (volume, report) =
+                Volume::mount(&*self.reactor, self.slabs.clone(), options, scope).await?;
+            let alignment = volume.alignment();
+            self.index.install_volume(volume, &report);
+            // Mount buffers return to the slab's idle pool still charged.
+            self.slabs.reclaim_idle();
             Ok(alignment)
         })
+    }
+    /// Remember the file-mode slab path for legacy size repair at open.
+    pub(crate) fn with_slab_file(mut self, path: std::path::PathBuf) -> Self {
+        self.slab_file = Some(path);
+        self
     }
     pub(crate) fn with_disk_groups(mut self, groups: Vec<(std::sync::Arc<str>, usize)>) -> Self {
         self.disk_groups = groups;
         self
     }
     pub(crate) fn observe_disks(&self) {
+        let counts: Vec<usize> = self.disk_groups.iter().map(|(_, count)| *count).collect();
         let samples = self
             .disk_groups
             .iter()
-            .zip(self.segments.usage())
+            .zip(self.index.disk_usage(&counts))
             .map(|((disk, _), (size, used))| crate::telemetry::DiskUsage {
                 disk: disk.clone(),
                 size,
@@ -458,11 +486,6 @@ impl StoreWriter {
     }
     pub fn index(&self) -> &Rc<Index> {
         &self.index
-    }
-    pub fn lease(&self, location: &RecordLocation) -> Result<SegmentLease> {
-        self.segments
-            .validate(location.segment, location.generation, &location.extent)?;
-        Ok(self.segments.lease(location.segment, location.generation)?)
     }
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
@@ -479,8 +502,9 @@ impl StoreWriter {
     }
 
     /// Force an encrypted copy to disk, regardless of ownership or second sight.
-    /// Reserve the version first. Success means a completed, published disk write,
-    /// not queue acceptance or fsync durability. Poll with the worker reactor.
+    /// Reserve the version first. Success means a published storage-tier write
+    /// made durable by a volume commit, not queue acceptance. Poll with the
+    /// worker reactor.
     /// Cancellation waits for accepted disk work to finish. Keep polling this
     /// future and the background writer until completion, even after canceling.
     pub fn persist_held<'a>(
@@ -496,19 +520,21 @@ impl StoreWriter {
             if !self.index.is_held(&id) {
                 return Err(Error::Unavailable);
             }
-            if let Some(entry) = self.index.lookup(&id)? {
-                if self.index.held_page_expiry(&id).is_none() {
-                    return Err(Error::Unavailable);
-                }
-                if !entry.metadata.compatible(&page.metadata.immutable()) {
+            if self
+                .index
+                .lookup(&id)?
+                .is_some_and(|value| value.tier == Tier::Storage)
+                && self.index.held_page_expiry(&id).is_some()
+            {
+                if self
+                    .index
+                    .version(&id.version)?
+                    .is_some_and(|known| !known.compatible(&page.metadata.immutable()))
+                {
                     return Err(Error::CorruptRecord);
                 }
-                self.segments.validate(
-                    entry.location.segment,
-                    entry.location.generation,
-                    &entry.location.extent,
-                )?;
-                return Ok(());
+                // An earlier publication may not be committed yet.
+                return self.commit(scope).await;
             }
             let waiter = WriterWaiter::new(self)?;
             let dirty = self.admission.reserve_completion(
@@ -541,16 +567,11 @@ impl StoreWriter {
             }
             self.slabs.fence_writes().await?;
             scope.check()?;
-            let entry = self.index.lookup(&id)?.ok_or(Error::Io)?;
-            self.segments.validate(
-                entry.location.segment,
-                entry.location.generation,
-                &entry.location.extent,
-            )?;
-            if self.index.held_page_expiry(&id).is_none() {
+            let value = self.index.lookup(&id)?.ok_or(Error::Io)?;
+            if value.tier != Tier::Storage || self.index.held_page_expiry(&id).is_none() {
                 return Err(Error::Unavailable);
             }
-            Ok(())
+            self.commit(scope).await
         })
     }
 
@@ -607,12 +628,6 @@ impl StoreWriter {
         if self.closed.get() {
             return Err(Error::Unavailable);
         }
-        // Configured writers can turn over the index in serialized progress.
-        // Queue/staging bounds still apply; enqueue itself never evicts mappings.
-        if self.clock.borrow().is_none() {
-            self.index
-                .preflight_capacity(&page.ciphertext.envelope().page)?;
-        }
         let logical = logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
             || !self.admission.owns(&dirty)
@@ -636,8 +651,9 @@ impl StoreWriter {
         {
             return Err(Error::CorruptRecord);
         }
-        // Zero denotes already durable: no pending ticket or second append.
-        if self.index.lookup(&id)?.is_some() {
+        // Zero denotes already on disk: no pending ticket or second write. A
+        // held page in the cache tier is rewritten to the storage tier.
+        if self.index.already_on_disk(&id)? {
             return Ok(0);
         }
         let mut pending = self.pending.borrow_mut();
@@ -951,9 +967,6 @@ impl StoreWriter {
             let mut failure = None;
             while let Some(result) = writes.next().await {
                 completed += 1;
-                if let Some(clock) = self.clock.borrow().as_ref() {
-                    let _ = clock.reclaim_now();
-                }
                 // Quota/space pressure and cache I/O failures never fail the node.
                 if let Err(error) = result {
                     if !matches!(
@@ -982,14 +995,14 @@ impl StoreWriter {
         page: &CiphertextCopy,
         scope: &RequestScope,
     ) -> Result<()> {
-        // Recovery or another publisher may have installed the mapping since enqueue.
-        if self.index.lookup(id)?.is_some() {
+        // Pages beyond the key's page range are never stored.
+        if key::volume_key(id).is_none() {
             return Ok(());
         }
-        // Capacity is owned across the await, including invalidation/replacement.
-        let index_ticket = self
-            .index
-            .reserve_page_for(id, self.clock.borrow().is_some())?;
+        // Recovery or another publisher may have written the page since enqueue.
+        if self.index.already_on_disk(id)? {
+            return Ok(());
+        }
         let alignment = self.slabs.alignment()?;
         let disk_bytes = alignment.extent(0, logical_length(page)?)?.length();
         let (staging, dirty, ticket) = {
@@ -1006,33 +1019,19 @@ impl StoreWriter {
         }
         let mut buffer = self.slabs.allocate(disk_bytes, staging)?;
         buffer.retain(dirty);
-        let (segment, extent) = match self.segments.append(disk_bytes).map_err(Error::from) {
-            Ok(append) => append,
-            Err(Error::Overloaded) => {
-                if let Some(clock) = self.clock.borrow().clone() {
-                    clock.reclaim_now()?;
-                }
-                self.segments.append(disk_bytes)?
-            }
-            Err(error) => return Err(error),
+        // A page of a live hold with unused capacity goes to the storage tier.
+        let hold = self.index.hold_ticket(id);
+        let tier = if hold.is_some() {
+            Tier::Storage
+        } else {
+            Tier::Cache
         };
-        let location = RecordLocation {
-            segment: segment.id(),
-            generation: segment.generation(),
-            extent,
-        };
-        let _publication_guard = self.index.publishing(location.segment);
-        let _publication_lease = self.segments.lease(location.segment, location.generation)?;
-        let encoded = encode_at(
-            page,
-            location.generation,
-            alignment,
-            location.extent.offset(),
-            buffer,
-        )?;
-        let _ = self
-            .slabs
-            .write(&self.reactor, extent, encoded.buffer, segment, scope)
+        let reservation = self.index.allocate(tier, disk_bytes as u64)?;
+        let generation = self.index.next_generation()?;
+        let encoded = encode_at(page, Generation(generation), alignment, 0, buffer)?;
+        let volume = self.index.volume().ok_or(Error::Unavailable)?;
+        let _ = volume
+            .write(&*self.reactor, &reservation, encoded.buffer, scope)
             .await?;
         if self.allowed(page)
             && self
@@ -1040,19 +1039,16 @@ impl StoreWriter {
                 .borrow()
                 .get(id)
                 .is_some_and(|d| d.ticket == ticket)
-            && self
-                .segments
-                .validate(location.segment, location.generation, &location.extent)
-                .is_ok()
+            && self.index.publish_page(
+                id,
+                reservation,
+                u32::try_from(disk_bytes).map_err(|_| Error::InvalidConfiguration)?,
+                generation,
+                &page.metadata.immutable(),
+                page.ciphertext.envelope().key_id,
+            )?
         {
-            index_ticket.publish(
-                id.clone(),
-                IndexedPage {
-                    location,
-                    metadata: page.metadata.immutable(),
-                    key_id: page.ciphertext.envelope().key_id,
-                },
-            )?;
+            drop(hold);
             self.metrics
                 .record(crate::telemetry::Event::DiskPublication, 1);
             self.retention()
@@ -1088,8 +1084,30 @@ impl StoreWriter {
                 self.progress(8, scope).await?;
             }
             self.slabs.fence_writes().await?;
+            // Make cache writes durable on a clean shutdown. Cache I/O failures
+            // are not fatal; the next mount simply finds fewer pages.
+            match self.commit(scope).await {
+                Ok(())
+                | Err(
+                    Error::Io
+                    | Error::Os(_)
+                    | Error::Unavailable
+                    | Error::Overloaded
+                    | Error::InvalidConfiguration,
+                ) => {}
+                Err(error) => return Err(error),
+            }
             self.slabs.reclaim_idle();
             Ok(())
+        })
+    }
+    /// Make every disk index change so far durable, then release the commit's
+    /// node buffers, which return to the slab's idle pool still charged.
+    pub fn commit<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(async move {
+            let result = self.index.commit(&self.reactor, scope).await;
+            self.slabs.reclaim_idle();
+            result
         })
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
@@ -1109,6 +1127,34 @@ impl StoreWriter {
     /// Idle, zeroized staging remains charged until reuse, pressure, or drain.
     pub fn retained_staging_bytes(&self) -> usize {
         self.slabs.idle_bytes()
+    }
+    /// Read a page's record from the slab, edit its bytes, and write it back
+    /// in place, bypassing the volume, to simulate media corruption.
+    #[cfg(test)]
+    pub(crate) fn rewrite_record<'a>(
+        &'a self,
+        page: &'a PageId,
+        scope: &'a RequestScope,
+        edit: impl FnOnce(&mut [u8]) + 'a,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            let (offset, length) = self.index.record_extent(page).ok_or(Error::Unavailable)?;
+            let length = length as usize;
+            let charge = self
+                .admission
+                .reserve(None, ResourceClass::Ciphertext, length)?;
+            let buffer = self.slabs.allocate(length, charge)?;
+            let mut buffer = self
+                .slabs
+                .read_at(&*self.reactor, offset, buffer, (), scope)
+                .await?;
+            edit(buffer.bytes_mut()?);
+            let _ = self
+                .slabs
+                .write_at(&*self.reactor, offset, buffer, (), scope)
+                .await?;
+            Ok(())
+        })
     }
     #[cfg(test)]
     fn reclaim_idle_buffer(&self) -> usize {
@@ -1522,3 +1568,28 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests;
+
+/// Give a file-mode slab of another size (left by an older layout) the
+/// configured size, so the volume mount formats it fresh. A missing or empty
+/// file is created by the slab itself.
+fn resize_legacy_slab(path: &std::path::Path, capacity: u64) -> Result<()> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() == capacity {
+        return Ok(());
+    }
+    eprintln!(
+        "racer: resizing slab {} from {} to {capacity} bytes for the extent volume; its pages are discarded",
+        path.display(),
+        metadata.len()
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_len(capacity))
+        .map_err(|error| {
+            eprintln!("racer: cannot resize slab {}: {error}", path.display());
+            Error::Io
+        })
+}

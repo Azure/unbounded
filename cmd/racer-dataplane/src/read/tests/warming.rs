@@ -40,6 +40,7 @@ fn completed_extension(refuse: bool) {
     let mut endpoints = Vec::new();
     for f in &fixtures {
         f.reactor.init().unwrap();
+        let _ = drive_disk(f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
         let (local, endpoint, _) = coordinator(f, &signers[0], &membership, NoPeer::requester());
         locals.push(local);
         endpoints.push(endpoint);
@@ -155,7 +156,7 @@ fn completed_extension(refuse: bool) {
     clock.advance(Duration::from_secs(3));
     let entry = delayed_index.lookup(&page).unwrap().unwrap();
     assert!(delayed_index.held_page_expiry(&page).is_none());
-    delayed_index.remove_if_matches(&page, &entry.location);
+    delayed_index.remove_if_matches(&page, &entry);
     assert!(delayed_index.lookup(&page).unwrap().is_none());
     let mut pressure = metadata.version.clone();
     pressure.etag = crate::model::StrongEtag::test_value("pressure");
@@ -344,6 +345,7 @@ fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
     }
     let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     let membership = Arc::new(
         Membership::validate(
             racer_control_wire::MembershipVersion(1),
@@ -546,6 +548,7 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
     let signers = network(1);
     let mut f = fixture_with(PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     let membership = Arc::new(
         Membership::validate(
             racer_control_wire::MembershipVersion(1),
@@ -609,11 +612,13 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
     );
     f.origin.version_unavailable.set(true);
     f.origin.blocked_pages.borrow_mut().clear();
-    for _ in 0..1024 {
+    // Durable hold writes wait for a commit's fsync, so allow real time.
+    for _ in 0..8192 {
         pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
         if owners.warm.snapshot().0 == 0 {
             break;
         }
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
     }
     assert_eq!(owners.warm.snapshot(), (0, 0));
     pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
@@ -639,11 +644,13 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
     }
     assert!(admitted);
     drop(failed_retry);
-    for _ in 0..1024 {
+    // Durable hold writes wait for a commit's fsync, so allow real time.
+    for _ in 0..8192 {
         pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
         if owners.warm.snapshot().0 == 0 {
             break;
         }
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
     }
     pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
     assert_eq!(owners.warm.snapshot().0, 0);
@@ -762,6 +769,7 @@ fn warm_drain_cancels_detached_job_and_refused_head_keeps_metadata_success() {
     for length in [3, 9 * PAGE_BYTES] {
         let mut f = fixture_with(length, None);
         f.reactor.init().unwrap();
+        let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
         let membership = Arc::new(
             Membership::validate(
                 racer_control_wire::MembershipVersion(1),
@@ -835,6 +843,7 @@ fn warm_cancel_keeps_get_gate_until_detached_origin_driver_fences() {
     let signers = network(1);
     let mut f = fixture();
     f.reactor.init().unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     let membership = Arc::new(
         Membership::validate(
             racer_control_wire::MembershipVersion(1),

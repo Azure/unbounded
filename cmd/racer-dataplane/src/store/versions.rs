@@ -64,6 +64,7 @@ impl VersionTable {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -81,10 +82,12 @@ impl VersionTable {
         Ok(evicted)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -131,6 +134,7 @@ impl VersionTable {
             .filter(|entry| entry.version == *version)
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &VersionKey) -> Option<VersionEntry> {
         let (age, entry) = self.entries.remove(key)?;
         self.order.remove(&age);
@@ -156,6 +160,23 @@ impl VersionTable {
         self.order
             .values()
             .filter_map(|key| self.entries.get(key).map(|(_, entry)| (key, entry)))
+    }
+
+    /// Up to `limit` entries inserted after the entry of age `after` (from the
+    /// oldest if `None`), oldest first, with their ages as cursors.
+    pub(crate) fn iter_after(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> impl Iterator<Item = (u64, &VersionEntry)> {
+        let start = match after {
+            Some(age) => std::ops::Bound::Excluded(age),
+            None => std::ops::Bound::Unbounded,
+        };
+        self.order
+            .range((start, std::ops::Bound::Unbounded))
+            .filter_map(|(age, key)| self.entries.get(key).map(|(_, entry)| (*age, entry)))
+            .take(limit)
     }
 
     pub(crate) fn clear(&mut self) {
