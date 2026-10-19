@@ -1369,7 +1369,7 @@ impl WorkerApplication {
                     devices.map_or(crate::store::checkpoint::FILE_LAYOUT_DIGEST, |d| d.digest),
                 ),
             ),
-            recovery: Recovery::new(config.slab_directory.clone(), index),
+            recovery: Recovery::new(index),
         })
     }
 

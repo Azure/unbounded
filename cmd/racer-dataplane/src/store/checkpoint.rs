@@ -302,39 +302,28 @@ fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
 /// Newest-valid checkpoint selection with cold-metadata fallback. Installation
 /// only restores metadata; page data and holds come from the mounted volume.
 pub struct Recovery {
-    #[cfg(test)]
-    directory: PathBuf,
     index: Rc<Index>,
     layout: Cell<Option<CheckpointLayout>>,
 }
 
 impl Recovery {
-    /// Filter disposable checkpoint state before installation. Standalone metadata
-    /// has no key ID, so it requires both a current cache UID and an active page
-    /// key. A version descriptor keeps only its available page keys and is
-    /// dropped when none remain.
+    /// Filter disposable checkpoint state before installation; see
+    /// [`IndexSnapshot::retain_available`]. Standalone metadata requires both a
+    /// current cache UID and an active page key.
     pub fn filter_available(
         image: &mut CheckpointImage,
         mut metadata_available: impl FnMut(&racer_control_wire::CacheId) -> bool,
         mut available: impl FnMut(&racer_control_wire::CacheId, KeyId) -> bool,
     ) {
         for shard in &mut image.shards {
-            shard.index.versions.retain_mut(|entry| {
-                let cache = &entry.version.object.cache;
-                entry.key_ids.retain(|key_id| available(cache, *key_id));
-                !entry.key_ids.is_empty()
-            });
             shard
                 .index
-                .metadata
-                .retain(|m| metadata_available(&m.version.object.cache));
+                .retain_available(&mut metadata_available, &mut available);
         }
     }
 
-    pub fn new(_directory: PathBuf, index: Rc<Index>) -> Self {
+    pub fn new(index: Rc<Index>) -> Self {
         Self {
-            #[cfg(test)]
-            directory: _directory,
             index,
             layout: Cell::new(None),
         }
@@ -805,14 +794,15 @@ impl<'a> Decoder<'a> {
 // filter, but do not create an application worker directory. This test-only
 // loader is not compiled into the dataplane.
 impl Recovery {
-    pub(crate) fn load(&self) -> Operation<'_, Option<CheckpointImage>> {
-        self.load_filtered(|_, _| true)
+    pub(crate) fn load<'a>(&'a self, directory: &Path) -> Operation<'a, Option<CheckpointImage>> {
+        self.load_filtered(directory, |_, _| true)
     }
-    pub(super) fn load_filtered(
-        &self,
+    pub(super) fn load_filtered<'a>(
+        &'a self,
+        directory: &Path,
         available: impl Fn(&CacheId, KeyId) -> bool,
-    ) -> Operation<'_, Option<CheckpointImage>> {
-        let result = candidates(&self.directory, MAX_CHECKPOINT_BYTES).map(|mut cuts| {
+    ) -> Operation<'a, Option<CheckpointImage>> {
+        let result = candidates(directory, MAX_CHECKPOINT_BYTES).map(|mut cuts| {
             cuts.find_map(|(_, mut image)| {
                 Recovery::filter_available(&mut image, |_| true, &available);
                 let valid = image

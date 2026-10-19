@@ -176,25 +176,19 @@ impl WorkerApplication {
                 return Err(error);
             }
         };
-        image.index.versions.retain_mut(|entry| {
-            let cache = &entry.version.object.cache;
-            if !self.caches.iter().any(|c| &c.id == cache) {
-                return false;
-            }
-            entry.key_ids.retain(|key_id| {
-                self.keys
-                    .lease(Some(cache), *key_id, KeyPurpose::Page)
-                    .is_ok()
-            });
-            !entry.key_ids.is_empty()
-        });
-        image.index.metadata.retain(|m| {
-            self.caches.iter().any(|c| c.id == m.version.object.cache)
-                && self
-                    .keys
-                    .active(&m.version.object.cache, KeyPurpose::Page)
-                    .is_ok()
-        });
+        image.index.retain_available(
+            |cache| {
+                self.caches.iter().any(|c| &c.id == cache)
+                    && self.keys.active(cache, KeyPurpose::Page).is_ok()
+            },
+            |cache, key_id| {
+                self.caches.iter().any(|c| &c.id == cache)
+                    && self
+                        .keys
+                        .lease(Some(cache), key_id, KeyPurpose::Page)
+                        .is_ok()
+            },
+        );
         {
             let mut cut = node.checkpoint.lock().map_err(|_| Error::Unavailable)?;
             if let Some(result) = cut.result() {
@@ -916,7 +910,7 @@ mod tests {
                 };
                 index.publish_version(metadata).unwrap();
                 assert!(!index.snapshot().unwrap().metadata.is_empty());
-                let recovery = Recovery::new(std::path::PathBuf::new(), index.clone());
+                let recovery = Recovery::new(index.clone());
                 recovery.configure_layout(shard.layout);
                 futures::executor::block_on(recovery.install_shard(if reset {
                     None
@@ -1115,7 +1109,7 @@ mod tests {
             16,
             crate::test_support::availability(),
         ));
-        let recovery = Recovery::new(std::path::PathBuf::new(), index.clone());
+        let recovery = Recovery::new(index.clone());
         recovery.configure_layout(g);
         futures::executor::block_on(recovery.install_shard(keyless.shards.into_iter().next()))
             .unwrap();

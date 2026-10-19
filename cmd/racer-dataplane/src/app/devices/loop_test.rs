@@ -372,7 +372,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let (_, mut recovered) = crate::store::checkpoint::read_candidates(&config.slab_directory)
         .unwrap()
         .remove(0);
-    let recovery = crate::store::checkpoint::Recovery::new(config.slab_directory.clone(), index);
+    let recovery = crate::store::checkpoint::Recovery::new(index);
     let mut geometry = checkpoint.layout().unwrap();
     geometry.layout_digest = restarted.workers[0].digest;
     recovery.configure_layout(geometry);

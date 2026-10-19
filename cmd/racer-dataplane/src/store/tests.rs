@@ -1028,7 +1028,7 @@ impl Fixture {
                 directory.0.clone(),
                 index.clone(),
             )),
-            recovery: super::checkpoint::Recovery::new(directory.0.clone(), index),
+            recovery: super::checkpoint::Recovery::new(index),
         };
         store.configure(admission.clone(), 2, 16).unwrap();
         let foreign = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -1923,7 +1923,9 @@ fn persistence_and_restart_preserve_committed_pages_and_metadata() {
                 result => panic!("slab did not reopen after owner teardown: {result:?}"),
             }
         }
-        let image = drive(&f.reactor, f.store.recovery.load()).unwrap().unwrap();
+        let image = drive(&f.reactor, f.store.recovery.load(&f._directory.0))
+            .unwrap()
+            .unwrap();
         drive(
             &f.reactor,
             f.store
@@ -1967,7 +1969,7 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
     let image = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
     futures::executor::block_on(f.store.checkpoint.publish(vec![image])).unwrap();
     f.store.checkpoint.finish_snapshot();
-    let loaded = futures::executor::block_on(f.store.recovery.load())
+    let loaded = futures::executor::block_on(f.store.recovery.load(&f._directory.0))
         .unwrap()
         .unwrap();
     futures::executor::block_on(
@@ -3194,7 +3196,6 @@ mod checkpoint {
     use sha2::Digest;
     use sha2::Sha256;
     use std::fs;
-    use std::path::PathBuf;
     use std::rc::Rc;
 
     #[test]
@@ -3487,7 +3488,7 @@ mod checkpoint {
         let mut decoded = checkpoint_format::decode(&encoded).unwrap();
         assert_eq!(decoded.shards[0].layout.layout_digest, [17; 32]);
         let index = index(8);
-        let recovery = Recovery::new(PathBuf::new(), index.clone());
+        let recovery = Recovery::new(index.clone());
         recovery.configure_layout(layout());
         assert_eq!(
             block_on(recovery.install_shard(Some(decoded.shards.remove(0)))),
@@ -3605,9 +3606,9 @@ mod checkpoint {
             fs::write(directory.0.join("checkpoint.0"), bytes).unwrap();
             let index = index(8);
             index.publish_version(descriptor("stale", 0)).unwrap();
-            let recovery = Recovery::new(directory.0.clone(), index.clone());
+            let recovery = Recovery::new(index.clone());
             recovery.configure_layout(layout());
-            assert!(block_on(recovery.load()).unwrap().is_none());
+            assert!(block_on(recovery.load(&directory.0)).unwrap().is_none());
             block_on(recovery.install_shard(None)).unwrap();
             assert!(index.snapshot().unwrap().metadata.is_empty());
         }
@@ -3653,9 +3654,9 @@ mod checkpoint {
             checkpoint_format::encode(&newer).unwrap(),
         )
         .unwrap();
-        let recovery = Recovery::new(directory.0.clone(), index(1));
+        let recovery = Recovery::new(index(1));
         recovery.configure_layout(layout());
-        let recovered = block_on(recovery.load_filtered(|_, _| false))
+        let recovered = block_on(recovery.load_filtered(&directory.0, |_, _| false))
             .unwrap()
             .unwrap();
         assert_eq!(recovered.sequence, 1);
@@ -3668,7 +3669,13 @@ mod checkpoint {
             checkpoint_format::encode(&newer).unwrap(),
         )
         .unwrap();
-        assert_eq!(block_on(recovery.load()).unwrap().unwrap().sequence, 1);
+        assert_eq!(
+            block_on(recovery.load(&directory.0))
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
     }
 
     #[test]
@@ -3687,8 +3694,8 @@ mod checkpoint {
             directory.0.join("checkpoint.1"),
         )
         .unwrap();
-        let recovery = Recovery::new(directory.0.clone(), index(8));
-        assert!(block_on(recovery.load()).unwrap().is_none());
+        let recovery = Recovery::new(index(8));
+        assert!(block_on(recovery.load(&directory.0)).unwrap().is_none());
     }
 
     #[test]
@@ -3742,12 +3749,12 @@ mod checkpoint {
         let directory = Directory::new();
         let index = index(8);
         let checkpointer = Checkpointer::new(directory.0.clone(), index.clone());
-        let recovery = Recovery::new(directory.0.clone(), index);
+        let recovery = Recovery::new(index);
         recovery.configure_layout(layout());
-        assert!(block_on(recovery.load()).unwrap().is_none());
+        assert!(block_on(recovery.load(&directory.0)).unwrap().is_none());
         block_on(checkpointer.publish(vec![shard()])).unwrap();
         block_on(checkpointer.publish(vec![shard()])).unwrap();
-        let load = || block_on(recovery.load()).unwrap().unwrap();
+        let load = || block_on(recovery.load(&directory.0)).unwrap().unwrap();
         assert_eq!(load().sequence, 2);
         fs::write(directory.0.join("checkpoint.1"), b"torn").unwrap();
         fs::write(
@@ -3765,12 +3772,11 @@ mod checkpoint {
         );
         fs::write(directory.0.join("checkpoint.0"), b"bad").unwrap();
         fs::write(directory.0.join("checkpoint.1"), b"bad").unwrap();
-        assert!(block_on(recovery.load()).unwrap().is_none());
+        assert!(block_on(recovery.load(&directory.0)).unwrap().is_none());
     }
 
     #[test]
     fn recovery_validates_before_mutation_and_filters_missing_keys() {
-        let directory = Directory::new();
         let index = index(8);
         let keep = descriptor("keep", 0);
         index
@@ -3784,7 +3790,7 @@ mod checkpoint {
             })
             .unwrap();
         assert!(index.current(&keep.version.object).unwrap().is_some());
-        let recovery = Recovery::new(directory.0.clone(), index.clone());
+        let recovery = Recovery::new(index.clone());
         recovery.configure_layout(layout());
         let mut bad = shard();
         bad.index.metadata.push(descriptor("v1", 18));
@@ -3814,10 +3820,9 @@ mod checkpoint {
 
     #[test]
     fn catalog_capacity_failure_preserves_all_live_state() {
-        let directory = Directory::new();
         let index = index(1);
         index.publish_version(descriptor("keep", 0)).unwrap();
-        let recovery = Recovery::new(directory.0.clone(), index.clone());
+        let recovery = Recovery::new(index.clone());
         recovery.configure_layout(layout());
         let mut recovered = shard();
         recovered.index.metadata = vec![descriptor("one", 0), descriptor("two", 0)];
@@ -3858,8 +3863,8 @@ mod checkpoint {
         // Force rename to fail while leaving the previously published slot readable.
         fs::create_dir(directory.0.join("checkpoint.1")).unwrap();
         assert!(block_on(checkpointer.publish(vec![shard()])).is_err());
-        let recovery = Recovery::new(directory.0.clone(), index);
-        let recovered = block_on(recovery.load()).unwrap().unwrap();
+        let recovery = Recovery::new(index);
+        let recovered = block_on(recovery.load(&directory.0)).unwrap().unwrap();
         assert_eq!(recovered.sequence, 1);
         assert!(fs::read_dir(&directory.0).unwrap().all(|entry| {
             !entry
@@ -3872,10 +3877,9 @@ mod checkpoint {
 
     #[test]
     fn wrong_worker_cannot_install() {
-        let directory = Directory::new();
         let index = index(8);
         index.publish_version(descriptor("keep", 0)).unwrap();
-        let recovery = Recovery::new(directory.0.clone(), index.clone());
+        let recovery = Recovery::new(index.clone());
         assert_eq!(
             block_on(recovery.install_shard(Some(shard()))),
             Err(Error::InvalidConfiguration)

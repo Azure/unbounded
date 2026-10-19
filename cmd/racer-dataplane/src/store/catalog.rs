@@ -116,6 +116,23 @@ pub struct IndexSnapshot {
     pub versions: Vec<super::versions::VersionEntry>,
 }
 impl IndexSnapshot {
+    /// Drop disposable state whose keys are gone. Standalone metadata has no
+    /// key ID, so `metadata_available` decides it per cache. A version
+    /// descriptor keeps only its available page keys and is dropped when none
+    /// remain.
+    pub fn retain_available(
+        &mut self,
+        mut metadata_available: impl FnMut(&racer_control_wire::CacheId) -> bool,
+        mut available: impl FnMut(&racer_control_wire::CacheId, KeyId) -> bool,
+    ) {
+        self.versions.retain_mut(|entry| {
+            let cache = &entry.version.object.cache;
+            entry.key_ids.retain(|key_id| available(cache, *key_id));
+            !entry.key_ids.is_empty()
+        });
+        self.metadata
+            .retain(|m| metadata_available(&m.version.object.cache));
+    }
     /// Structural checkpoint validation, in addition to checksum, ownership,
     /// capacity, and layout checks performed during recovery.
     pub fn validate_metadata(&self) -> Result<()> {
