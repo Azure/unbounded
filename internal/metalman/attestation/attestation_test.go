@@ -14,6 +14,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
@@ -179,10 +180,14 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 		},
 	}
 	clientset := fake.NewClientset(ns, sa)
+	var tokenCount int
+
 	clientset.PrependReactor("create", "serviceaccounts/token", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		tokenCount++
+
 		return true, &authenticationv1.TokenRequest{
 			Status: authenticationv1.TokenRequestStatus{
-				Token:               "fake-bootstrap-token-for-testing",
+				Token:               fakeJWT(t, map[string]any{"jti": fmt.Sprintf("jti-%d", tokenCount)}),
 				ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
 			},
 		}, nil
@@ -193,6 +198,20 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 		LookupNodeByIP: testLookupByIP(crClient),
 		StatusUpdater:  &testStatusUpdater{client: crClient},
 	}
+}
+
+// fakeJWT builds an unsigned JWT-shaped token with the given claims.
+func fakeJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enc := base64.RawURLEncoding
+
+	return enc.EncodeToString([]byte(`{"alg":"RS256"}`)) + "." + enc.EncodeToString(payload) + ".sig"
 }
 
 // doAttest performs an attest request from the given IP and returns the parsed response.
@@ -422,7 +441,7 @@ func TestAttestRetainedMediaAfterLeaseEdit(t *testing.T) {
 	require.NoError(t, err)
 	token, err := gcm.Open(nil, resp.GCMNonce, resp.EncryptedToken, nil)
 	require.NoError(t, err)
-	require.Equal(t, "fake-bootstrap-token-for-testing", string(token))
+	require.Equal(t, fakeJWT(t, map[string]any{"jti": "jti-1"}), string(token))
 	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(node), node))
 	require.NotEmpty(t, node.Status.TPM.EKPublicKey)
 	require.Equal(t, "192.0.2.99", node.Spec.Netboot().DHCPLeases[0].IPv4)
@@ -657,5 +676,223 @@ func TestCreateCredentialWrongKey(t *testing.T) {
 	_, decryptErr := rsa.DecryptOAEP(sha256.New(), rand.Reader, priv2, encSecret, label)
 	if decryptErr == nil {
 		t.Fatal("expected RSA-OAEP decrypt to fail with wrong key")
+	}
+}
+
+func newPXEMachine(name, mac, ip string) *v1alpha3.Machine {
+	return &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: mac, IPv4: ip, SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+}
+
+func rawAttest(handler *Handler, ip string, ekPub, srkPub []byte) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(AttestRequest{EKPub: ekPub, SRKPub: srkPub})
+	req := httptest.NewRequest(http.MethodPost, "/attest", bytes.NewReader(body))
+	req.RemoteAddr = ip + ":12345"
+	w := httptest.NewRecorder()
+	handler.Attest(w, req)
+
+	return w
+}
+
+// countingStatusUpdater wraps a StatusUpdater, counting calls and optionally failing.
+type countingStatusUpdater struct {
+	inner StatusUpdater
+	calls int
+	err   error
+	seen  []*v1alpha3.Machine
+}
+
+func (u *countingStatusUpdater) Update(ctx context.Context, node *v1alpha3.Machine) error {
+	u.calls++
+	u.seen = append(u.seen, node.DeepCopy())
+
+	if u.err != nil {
+		return u.err
+	}
+
+	return u.inner.Update(ctx, node)
+}
+
+func setTokenReactor(handler *Handler, token string, calls *int) {
+	handler.Clientset.(*fake.Clientset).PrependReactor("create", "serviceaccounts/token",
+		func(action clienttesting.Action) (bool, runtime.Object, error) {
+			*calls++
+
+			return true, &authenticationv1.TokenRequest{
+				Status: authenticationv1.TokenRequestStatus{Token: token},
+			}, nil
+		})
+}
+
+func TestAttestRecordsCredentialIDWithEKInOneUpdate(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+	handler := testHandler(t, newPXEMachine("bind-01", "aa:bb:cc:dd:ee:10", "10.0.2.10"))
+	inner := handler.StatusUpdater.(*testStatusUpdater)
+	counter := &countingStatusUpdater{inner: inner}
+	handler.StatusUpdater = counter
+
+	before := time.Now().Add(-time.Second)
+	doAttest(t, handler, "10.0.2.10", ekPub, srkPub)
+
+	require.Equal(t, 1, counter.calls)
+	require.NotNil(t, counter.seen[0].Status.TPM)
+	require.NotEmpty(t, counter.seen[0].Status.TPM.EKPublicKey)
+	require.NotNil(t, counter.seen[0].Status.Bootstrap)
+
+	var m v1alpha3.Machine
+	require.NoError(t, inner.client.Get(t.Context(), client.ObjectKey{Name: "bind-01"}, &m))
+	require.NotEmpty(t, m.Status.TPM.EKPublicKey)
+	require.NotNil(t, m.Status.Bootstrap)
+	require.Equal(t, "JTI=jti-1", m.Status.Bootstrap.CredentialID)
+	require.NotNil(t, m.Status.Bootstrap.IssuedAt)
+	require.True(t, m.Status.Bootstrap.IssuedAt.After(before))
+}
+
+func TestAttestReattestReplacesCredentialID(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+	handler := testHandler(t, newPXEMachine("bind-02", "aa:bb:cc:dd:ee:11", "10.0.2.11"))
+	c := handler.StatusUpdater.(*testStatusUpdater).client
+
+	doAttest(t, handler, "10.0.2.11", ekPub, srkPub)
+
+	var m v1alpha3.Machine
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-02"}, &m))
+	require.Equal(t, "JTI=jti-1", m.Status.Bootstrap.CredentialID)
+	firstEK := m.Status.TPM.EKPublicKey
+
+	doAttest(t, handler, "10.0.2.11", ekPub, srkPub)
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-02"}, &m))
+	require.Equal(t, "JTI=jti-2", m.Status.Bootstrap.CredentialID)
+	require.Equal(t, firstEK, m.Status.TPM.EKPublicKey)
+}
+
+func TestAttestMissingJTIFailsClosed(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+
+	for name, token := range map[string]string{
+		"no jti":     fakeJWT(t, map[string]any{"sub": "x"}),
+		"empty jti":  fakeJWT(t, map[string]any{"jti": ""}),
+		"opaque":     "not-a-jwt",
+		"bad base64": "a.!!!.c",
+	} {
+		t.Run(name, func(t *testing.T) {
+			handler := testHandler(t, newPXEMachine("bind-03", "aa:bb:cc:dd:ee:12", "10.0.2.12"))
+			c := handler.StatusUpdater.(*testStatusUpdater).client
+
+			var calls int
+			setTokenReactor(handler, token, &calls)
+
+			w := rawAttest(handler, "10.0.2.12", ekPub, srkPub)
+			require.Equal(t, http.StatusInternalServerError, w.Code)
+			require.Equal(t, 1, calls)
+			require.NotContains(t, w.Body.String(), token)
+			require.NotContains(t, w.Body.String(), "encryptedToken")
+
+			var m v1alpha3.Machine
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-03"}, &m))
+			require.Nil(t, m.Status.Bootstrap)
+			require.Nil(t, m.Status.TPM, "EK must not be pinned when attestation fails")
+		})
+	}
+}
+
+func TestAttestStatusUpdateFailureWithholdsToken(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+	handler := testHandler(t, newPXEMachine("bind-04", "aa:bb:cc:dd:ee:13", "10.0.2.13"))
+	handler.StatusUpdater = &countingStatusUpdater{
+		inner: handler.StatusUpdater,
+		err:   fmt.Errorf("conflict"),
+	}
+
+	w := rawAttest(handler, "10.0.2.13", ekPub, srkPub)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	require.NotContains(t, w.Body.String(), "encryptedToken")
+}
+
+func TestAttestStatusConflictWithholdsToken(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+	handler := testHandler(t, newPXEMachine("bind-05", "aa:bb:cc:dd:ee:14", "10.0.2.14"))
+	c := handler.StatusUpdater.(*testStatusUpdater).client
+	lookup := handler.LookupNodeByIP
+	// Return a stale copy, then bump the stored object so the update conflicts.
+	handler.LookupNodeByIP = func(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
+		m, err := lookup(ctx, ip)
+		if err != nil {
+			return nil, err
+		}
+
+		live := m.DeepCopy()
+		live.Labels = map[string]string{"bump": "1"}
+		require.NoError(t, c.Update(ctx, live))
+
+		return m, nil
+	}
+
+	w := rawAttest(handler, "10.0.2.14", ekPub, srkPub)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	require.NotContains(t, w.Body.String(), "encryptedToken")
+}
+
+func TestAttestEKMismatchMintsNoToken(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	_, otherEKPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+	handler := testHandler(t, newPXEMachine("bind-06", "aa:bb:cc:dd:ee:15", "10.0.2.15"))
+	doAttest(t, handler, "10.0.2.15", ekPub, srkPub)
+
+	var calls int
+	setTokenReactor(handler, fakeJWT(t, map[string]any{"jti": "should-not-mint"}), &calls)
+
+	w := rawAttest(handler, "10.0.2.15", otherEKPub, srkPub)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Equal(t, 0, calls)
+
+	var m v1alpha3.Machine
+	require.NoError(t, handler.StatusUpdater.(*testStatusUpdater).client.Get(t.Context(), client.ObjectKey{Name: "bind-06"}, &m))
+	require.Equal(t, "JTI=jti-1", m.Status.Bootstrap.CredentialID)
+}
+
+func TestCredentialIDFromToken(t *testing.T) {
+	enc := base64.RawURLEncoding
+	padded := base64.URLEncoding.EncodeToString([]byte(`{"jti":"abc-123"}`))
+
+	cases := []struct {
+		name    string
+		token   string
+		want    string
+		wantErr bool
+	}{
+		{name: "valid", token: fakeJWT(t, map[string]any{"jti": "abc-123", "sub": "s"}), want: "JTI=abc-123"},
+		{name: "padded payload", token: "h." + padded + ".s", want: "JTI=abc-123"},
+		{name: "missing jti", token: fakeJWT(t, map[string]any{"sub": "s"}), wantErr: true},
+		{name: "empty jti", token: fakeJWT(t, map[string]any{"jti": ""}), wantErr: true},
+		{name: "non-string jti", token: fakeJWT(t, map[string]any{"jti": 42}), wantErr: true},
+		{name: "two segments", token: "a.b", wantErr: true},
+		{name: "empty", token: "", wantErr: true},
+		{name: "bad base64", token: "a.***.c", wantErr: true},
+		{name: "bad json", token: "a." + enc.EncodeToString([]byte("nope")) + ".c", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := CredentialIDFromToken(tc.token)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
 	}
 }
