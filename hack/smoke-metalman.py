@@ -651,20 +651,28 @@ def approve_metalman_kubelet_csrs(name: str) -> None:
     is what approves these CSRs in a real deployment (after binding the token to
     its attested Machine). Stand in for it here, restricted to the smoke node.
     """
-    result = subprocess.run([KUBECTL, "get", "csr", "-o", "json"], capture_output=True, text=True)
-    if result.returncode != 0:
+    try:
+        result = subprocess.run([KUBECTL, "get", "csr", "-o", "json"],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return
+        items = json.loads(result.stdout).get("items", [])
+    except (subprocess.TimeoutExpired, OSError, ValueError):
         return
-    for csr in json.loads(result.stdout).get("items", []):
+    for csr in items:
         spec = csr.get("spec", {})
         if spec.get("signerName") != KUBELET_CLIENT_SIGNER or spec.get("username") != METALMAN_BOOTSTRAP_USER:
             continue
         if csr.get("status", {}).get("conditions"):
             continue
-        subject = subprocess.run(
-            ["openssl", "req", "-noout", "-subject", "-nameopt", "RFC2253"],
-            input=base64.b64decode(spec.get("request", "")).decode(),
-            capture_output=True, text=True,
-        )
+        try:
+            subject = subprocess.run(
+                ["openssl", "req", "-noout", "-subject", "-nameopt", "RFC2253"],
+                input=base64.b64decode(spec.get("request", "")).decode(),
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            continue
         if subject.returncode != 0:
             continue
         attrs = parse_csr_subject(subject.stdout)
@@ -672,7 +680,32 @@ def approve_metalman_kubelet_csrs(name: str) -> None:
             continue
         csr_name = csr["metadata"]["name"]
         log(f"  Approving metalman kubelet client CSR {csr_name} for node '{name}'")
-        run_quiet([KUBECTL, "certificate", "approve", csr_name])
+        try:
+            subprocess.run([KUBECTL, "certificate", "approve", csr_name],
+                           capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
+def start_metalman_csr_approver(name: str, interval: float = 2.0) -> threading.Event:
+    """Run approve_metalman_kubelet_csrs in a daemon thread until the event is set.
+
+    The agent blocks on kubelet TLS bootstrap before cloud-init finishes, so
+    approval must happen while the test waits for boot, not afterwards.
+    """
+    stop = threading.Event()
+
+    def loop() -> None:
+        while not stop.is_set():
+            try:
+                approve_metalman_kubelet_csrs(name)
+            except Exception as exc:  # noqa: BLE001 - keep approving on transient errors
+                log(f"  CSR approver error (will retry): {exc}")
+            stop.wait(interval)
+
+    threading.Thread(target=loop, name="metalman-csr-approver", daemon=True).start()
+    atexit.register(stop.set)
+    return stop
 
 
 def wait_k8s_node(name: str, timeout: int = 1800) -> None:
@@ -681,7 +714,6 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     net_diag_done = False
     for elapsed in range(timeout):
         check_procs()
-        approve_metalman_kubelet_csrs(name)
         result = subprocess.run(
             [KUBECTL, "get", "node", name, "-o", "json"],
             capture_output=True, text=True,
@@ -1324,6 +1356,8 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
+    csr_approver = start_metalman_csr_approver(NODE_NAME)
+
     log("Triggering HostReplace through kubectl-unbounded")
     operation_log = TMPDIR / "kubectl-host-replace.log"
     operation_proc = run_kubectl_unbounded_operation(
@@ -1347,6 +1381,7 @@ def main() -> None:
     assert_node_label(NODE_NAME, NODE_LABEL_KEY, NODE_LABEL_VALUE)
 
     run_operation_smoke_suite()
+    csr_approver.set()
 
     log("")
     log("Smoke test PASSED")
