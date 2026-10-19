@@ -292,6 +292,9 @@ An annotation that is present with an empty value is rejected. Values are checke
 with the same rules as the flags; see [Cache Identity](#cache-identity) for
 namespace and bucket limits.
 
+Choose a listener port that no other container in the pod uses. Set
+`object-listen` if the default port, `8080`, is already in use.
+
 Resource annotations take Kubernetes quantities, such as `100m` or `128Mi`. Each
 must be greater than zero, and a request must not exceed its limit. With none set,
 the sidecar has no requests or limits. If you set only a limit, Kubernetes sets the
@@ -309,8 +312,8 @@ The webhook makes these changes to the pod:
 - Adds the volume `racer-object-client`: hostPath `/run/racer/<cache>/client`,
   type `Directory`, mounted read-only in the sidecar only.
 - Sets the node selector `kubernetes.io/os: linux`, and adds a required node
-  affinity term `racer.unbounded-cloud.io/exclude DoesNotExist` to every node
-  selector term.
+  affinity requirement `racer.unbounded-cloud.io/exclude DoesNotExist` without
+  widening existing placement rules.
 - Adds the annotation `racer.unbounded-cloud.io/object-sidecar-injected` with the
   sidecar image.
 
@@ -327,7 +330,8 @@ When the webhook denies a pod, the reason appears in the error from
 Other denial causes:
 
 - The pod already has a volume named `racer-object-client`.
-- The pod has a `kubernetes.io/os` node selector other than `linux`.
+- The pod has `spec.os.name` or a `kubernetes.io/os` node selector other than
+  `linux`.
 
 If the pod is created without a sidecar, check that the label is on the pod (not
 only on the Deployment), that the pod is not in the racer-controller namespace,
@@ -555,6 +559,9 @@ delete a live socket to take over from another owner.
 
 Origins must cover every eligible Racer node. Application pods must run on nodes
 running Racer.
+
+Injection starts the sidecar process first, but does not wait for its HTTP
+listener to be ready. Applications must retry connection failures during startup.
 
 The example pods have no HTTP readiness probe, on purpose: Kubernetes probes target
 the pod IP, and the sidecar listens on pod loopback. Pod readiness therefore says
