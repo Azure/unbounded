@@ -140,14 +140,25 @@ func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unbo
 	}
 
 	plan := component.NewPlan()
-	plan.Add(component.DeleteOperation(&appsv1.Deployment{
+
+	// The Deployment delete gets its own failure domain. Removals of workloads
+	// rank ahead of RBAC removals and writes, so in the shared domain a failed
+	// Deployment delete would skip the stale auto-approval delete and the
+	// restriction applies below for as long as the failure persists.
+	remove := component.DeleteOperation(&appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace},
-	}, c.Name(), site.Name))
+	}, c.Name(), site.Name)
+	remove.FailureDomain = deploymentFailureDomain
+	plan.Add(remove)
 	addSupportOps(plan, support, c.Name(), site.Name)
 
 	return plan, component.Disabled("component disabled"), nil
 }
+
+// deploymentFailureDomain isolates the per-site Deployment delete so its
+// failure does not gate the shared support operations.
+const deploymentFailureDomain = "deployment"
 
 // StaleAutoApproveBindingName is the ClusterRoleBinding that earlier releases
 // installed to let kube-controller-manager auto-approve kubelet client

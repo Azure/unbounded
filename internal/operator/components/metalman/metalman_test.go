@@ -899,6 +899,59 @@ func TestCleanupRestrictionFailureRevokesBootstrapAccess(t *testing.T) {
 	}
 }
 
+// TestCleanupDeploymentFailureStillRemovesAutoApproval verifies that a failed
+// Deployment delete does not skip the stale auto-approval delete or the
+// restriction applies that CleanupPlan shares with Plan.
+func TestCleanupDeploymentFailureStillRemovesAutoApproval(t *testing.T) {
+	stale := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: StaleAutoApproveBindingName}}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name: DeploymentName("rack-a"), Namespace: component.DefaultNamespace,
+	}}
+	applied := map[string]int{}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(stale, dep).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				named := obj.(interface {
+					GetKind() string
+					GetName() string
+				})
+				applied[named.GetKind()+"/"+named.GetName()]++
+
+				return nil
+			},
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == DeploymentName("rack-a") {
+					return errors.New("delete Deployment failed")
+				}
+
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	if err := cleanup(t, env, disabledSite("rack-a")); err == nil {
+		t.Fatal("cleanup succeeded, want the Deployment failure reported")
+	}
+
+	err := cl.Get(t.Context(), client.ObjectKey{Name: StaleAutoApproveBindingName}, &rbacv1.ClusterRoleBinding{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("get auto-approval binding = %v, want NotFound", err)
+	}
+
+	for _, name := range []string{
+		"ValidatingAdmissionPolicy/metalman-bootstrap-machine-restriction",
+		"ValidatingAdmissionPolicyBinding/metalman-bootstrap-machine-restriction",
+	} {
+		if applied[name] != 1 {
+			t.Fatalf("%s applied %d times, want 1", name, applied[name])
+		}
+	}
+}
+
 // TestMixedSitesShareBootstrapRestriction verifies that enabled and disabled
 // Sites plan the shared support set identically, so one pass dedupes it,
 // keeps the enabled Site's Deployment and grant, and removes only the
