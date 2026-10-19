@@ -179,9 +179,21 @@ mod volume_pressure {
         assert!(index.lookup(&resident_id).unwrap().is_none());
         assert_eq!(retention.snapshot().disk[0].slot_evicted_pages, 1);
         assert!(index.lookup(&first).unwrap().is_some());
-        // A larger record needs another slot, but only open and leased slots
-        // remain: the write is discarded without failing progress.
-        let large = f.copy(2, 9000);
+        // A larger record needs another slot. The only unleased slot is the
+        // idle open one, which is closed and evicted under pressure.
+        let evicting = f.copy(4, 9000);
+        let evicting_id = evicting.ciphertext.envelope().page.clone();
+        f.enqueue(evicting).unwrap();
+        assert_eq!(
+            drive(&f.reactor, f.store.writer.progress(1, &scope())),
+            Ok(1)
+        );
+        assert!(index.lookup(&first).unwrap().is_none());
+        let evicting_slot = index.lookup(&evicting_id).unwrap().unwrap().slot;
+        let _pin = volume.lease(evicting_slot).unwrap();
+        // With every slot leased, a write in another class is discarded
+        // without failing progress.
+        let large = f.copy(2, 70000);
         let large_id = large.ciphertext.envelope().page.clone();
         f.enqueue(large).unwrap();
         assert_eq!(

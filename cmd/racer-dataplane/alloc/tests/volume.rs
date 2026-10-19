@@ -315,6 +315,59 @@ mod simulation {
     }
 
     #[test]
+    fn open_cache_slots_do_not_block_a_new_class() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        // Minimum volume: meta slot plus three data slots.
+        let (volume, slab, _) = mount(&reactor, 4, Limits::UNLIMITED).unwrap();
+        let page = UNIT_BYTES as u64;
+        // Three small records in different classes keep all data slots open.
+        let mut slots = Vec::new();
+        for (n, length) in [page, 2 * page, 4 * page].into_iter().enumerate() {
+            let value = put(
+                &reactor,
+                &volume,
+                &slab,
+                Tier::Cache,
+                key(1, n as u32),
+                length,
+                0,
+            )
+            .unwrap();
+            assert!(volume.slot_state(value.slot).unwrap().open);
+            slots.push(value.slot);
+        }
+        assert_eq!(
+            volume.allocate(Tier::Cache, page * 8).err(),
+            Some(Error::Busy)
+        );
+        // A reservation in flight pins its open slot; the others are taken.
+        let pinned = volume.allocate(Tier::Cache, page).unwrap();
+        assert_eq!(pinned.slot(), slots[0]);
+        let (reservation, evicted) = volume.allocate_evicting(Tier::Cache, page * 8, 0, 1);
+        let reservation = reservation.unwrap();
+        assert_eq!(evicted.len(), 1);
+        assert_ne!(evicted[0].1.slot, slots[0]);
+        assert!(volume.get(&key(1, 0)).is_some());
+        drop(reservation);
+        drop(pinned);
+        // With no leases or holds, a full page fits after one eviction.
+        put(
+            &reactor,
+            &volume,
+            &slab,
+            Tier::Cache,
+            key(2, 0),
+            page * 8,
+            0,
+        )
+        .unwrap();
+        let (reservation, evicted) = volume.allocate_evicting(Tier::Cache, SLOT_BYTES, 0, 4);
+        assert!(reservation.is_ok());
+        assert!(!evicted.is_empty());
+    }
+
+    #[test]
     fn storage_quota_evicts_only_expired_storage() {
         let (_sim, _env) = setup();
         let reactor = TestReactor::new(64, ());

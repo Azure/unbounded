@@ -337,13 +337,70 @@ fn clock_eviction() {
     for slot in 1..4 {
         let _ = slots.cancel_eviction(slot);
     }
+    let mut order = Vec::new();
     while let Some(e) = slots.evict_candidate(0) {
         seen.insert(e.slot);
+        order.push(e.slot);
         slots.finish_eviction(e.slot).unwrap();
         assert_eq!(slots.slot_state(e.slot).unwrap().kind, SlotKind::Free);
     }
-    assert_eq!(seen, HashSet::from([1, 2, 3]));
-    assert_eq!(slots.usage().cache_slots, 1);
+    // Closed slots go first. The idle open slot is taken last, under pressure.
+    assert_eq!(seen, HashSet::from([1, 2, 3, 4]));
+    assert_eq!(order.last(), Some(&4));
+    assert_eq!(slots.usage().cache_slots, 0);
+}
+
+#[test]
+fn idle_open_cache_slots_are_evicted_under_pressure() {
+    // Meta slot plus three data slots, each open for a different class.
+    let mut slots = table(4);
+    let mut open = Vec::new();
+    for (n, length) in [PAGE, 2 * PAGE, 4 * PAGE].into_iter().enumerate() {
+        let a = slots.allocate(Tier::Cache, length).unwrap();
+        open.push(a);
+        assert!(slots.slot_state(open[n].slot).unwrap().open);
+    }
+    assert_eq!(
+        slots.allocate(Tier::Cache, SLOT_BYTES).err(),
+        Some(Error::Busy)
+    );
+    // Leased (reserved, not yet indexed) open slots are not taken.
+    assert_eq!(slots.evict_candidate(0), None);
+    for (n, a) in open.iter().enumerate() {
+        slots
+            .commit_record(a.slot, a.unit, key(n as u32), 0)
+            .unwrap();
+    }
+    // Drop only the first lease. The other two stay pinned.
+    let first = open.remove(0);
+    let first_slot = first.slot;
+    drop(first);
+    // Storage-only sweeps never take open cache slots.
+    assert_eq!(slots.evict_candidate_in(0, Some(Tier::Storage)), None);
+    // A canceled eviction leaves the slot closed but reusable as partial.
+    let e = slots.evict_candidate(0).unwrap();
+    assert_eq!(e.slot, first_slot);
+    assert_eq!(e.keys, vec![key(0)]);
+    let state = slots.slot_state(e.slot).unwrap();
+    assert!(state.evicting && !state.open);
+    slots.cancel_eviction(e.slot).unwrap();
+    let again = slots.allocate(Tier::Cache, PAGE).unwrap();
+    assert_eq!(again.slot, first_slot);
+    assert!(slots.slot_state(first_slot).unwrap().open);
+    // A reservation in flight keeps the open slot ineligible.
+    assert_eq!(slots.evict_candidate(0), None);
+    slots.abort(again).unwrap();
+    let e = slots.evict_candidate(0).unwrap();
+    assert_eq!(e.slot, first_slot);
+    slots.finish_eviction(e.slot).unwrap();
+    assert_eq!(kind(&slots, first_slot), SlotKind::Free);
+    // The new class gets the freed slot. The next small record opens a new
+    // slot rather than reusing the evicted one.
+    let whole = slots.allocate(Tier::Cache, SLOT_BYTES).unwrap();
+    assert_eq!(whole.slot, first_slot);
+    assert_eq!(slots.allocate(Tier::Cache, PAGE).err(), Some(Error::Busy));
+    let usage = slots.usage();
+    assert_eq!(usage.small_bytes, 2 * PAGE + 4 * PAGE);
 }
 
 #[test]

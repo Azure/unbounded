@@ -795,7 +795,9 @@ impl Slots {
     ///
     /// A candidate is a data slot that is not open, not leased, not already
     /// being evicted, has a clear reference bit, and is either cache tier or
-    /// storage tier with `retain_until < now`. Reference bits are cleared as
+    /// storage tier with `retain_until < now`. When none is found, an open
+    /// cache slot with no lease and no unindexed record is closed and chosen,
+    /// so open slots of other classes cannot block allocation. Reference bits are cleared as
     /// the hand passes. The sweep visits at most two full rotations. The
     /// chosen slot is not used for allocation until it is finished or
     /// canceled.
@@ -838,7 +840,49 @@ impl Slots {
                 keys: self.keys(slot),
             });
         }
-        None
+        self.evict_open_cache(tier)
+    }
+
+    // Pressure fallback when the CLOCK finds no closed candidate: close and
+    // pick an idle open cache slot. Without it, open slots of other classes
+    // can hold every data slot and block a new class forever. A slot is idle
+    // when it is not leased (so no reservation is in flight) and every used
+    // record is indexed. Its reference bit is ignored. Open storage slots are
+    // never taken.
+    fn evict_open_cache(&mut self, tier: Option<Tier>) -> Option<Eviction> {
+        if tier == Some(Tier::Storage) {
+            return None;
+        }
+        let count = self.slots.len() as u32;
+        let slot = (1..count).find(|&slot| {
+            let entry = self.slots[slot as usize];
+            entry.kind == KIND_DATA
+                && entry.tier() == Tier::Cache
+                && entry.flags & OPEN != 0
+                && entry.flags & EVICTING == 0
+                && self.leases[slot as usize].get() == 0
+                && self.indexed_records(slot) == u32::from(entry.used)
+        })?;
+        let entry = self.slots[slot as usize];
+        let index = tier_class(entry.tier(), entry.class);
+        self.set_open(index, NONE);
+        self.partial[index].remove(&slot);
+        self.slots[slot as usize].flags |= EVICTING;
+        self.slots[slot as usize].flags &= !REFERENCED;
+        Some(Eviction {
+            slot,
+            keys: self.keys(slot),
+        })
+    }
+
+    // Number of records in a data slot that hold an index entry.
+    fn indexed_records(&self, slot: u32) -> u32 {
+        let entry = self.slots[slot as usize];
+        if entry.has_bitmap() {
+            self.records[entry.aux as usize].keys.len() as u32
+        } else {
+            u32::from(entry.flags & WHOLE_COMMITTED != 0)
+        }
     }
 
     /// Free a slot returned by [`Slots::evict_candidate`] after its keys were

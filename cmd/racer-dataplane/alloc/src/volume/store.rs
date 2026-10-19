@@ -985,7 +985,9 @@ impl<C: Charge> Volume<C> {
     ///
     /// A slot can be evicted when it is not open, not leased, its reference
     /// bit is clear, and it is a cache slot or a storage slot whose largest
-    /// `retain_until` is below `now`. The slot is free at once, even for
+    /// `retain_until` is below `now`. When no such slot exists, an open cache
+    /// slot with no lease and no unpublished record is closed and evicted, so
+    /// open slots of other classes cannot block allocation. The slot is free at once, even for
     /// storage: an older on-disk tree that still points into it is caught by
     /// the record header check.
     pub fn evict_one(&self, now: u64) -> Option<Vec<(Key, Value)>> {

@@ -249,6 +249,10 @@ entries.
   reference bit is clear, and it is a cache slot or every entry in it has an
   expired `retain_until`. Eviction removes all of the slot's entries from the
   tree and frees the slot at once.
+- When the CLOCK finds no such slot, eviction closes and evicts an open cache
+  slot that has no lease and no unpublished record. Otherwise partly filled
+  open slots of other classes could hold every data slot and block a new
+  class. Open storage slots are never evicted this way.
 - Deleting a storage entry frees its unit using the reuse rule above. A storage
   slot returns to the free pool when its last record is released.
 
