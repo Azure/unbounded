@@ -165,7 +165,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
 | `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
 | `RACER_REQUEST_CONTEXT_BYTES` | Unset: `33554432` (32 MiB) per final I/O worker | Request-context budget; an explicit value is node-wide |
-| `RACER_METADATA_ENTRIES` | `4096` | Node-wide catalog entries; at most 1,048,576 |
+| `RACER_METADATA_ENTRIES` | Unset: `4096` per final I/O worker; managed ConfigMap sets `4096` | Catalog entries; an explicit value (including the managed default) is node-wide and divided among I/O workers; at most 1,048,576 |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget in file mode; configured value at most 1,048,576; device mode can raise it as described below |
 | `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
 | `RACER_ADMISSION_HISTORY_BYTES` | `4194304` (4 MiB) | Node-wide Bloom history budget; 32 bytes..512 MiB, divided among final I/O workers, requiring at least 32 bytes per worker |
@@ -176,9 +176,9 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_WARM_WINDOW_PAGES` | `2` | Maximum in-flight pages per warm job; 1..64 |
 | `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker hard-hold cap as a percentage of segment count and page-index capacity; 1..100; free-segment reserve still applies |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
-| `RACER_PLACEMENT_CACHE_BYTES` | `16777216` (16 MiB) | Node-wide placement capacity estimate, divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
-| `RACER_CACHED_PATHS` | `128` | Node-wide retained path-query entry budget, divided among I/O workers; 1..1,048,576 |
-| `RACER_PATH_CACHE_BYTES` | `8388608` (8 MiB) | Node-wide accounted path-cache allocation budget, divided among I/O workers; 1 byte..512 MiB, independent of entry count |
+| `RACER_PLACEMENT_CACHE_BYTES` | Unset: `16777216` (16 MiB) per final I/O worker | Placement capacity estimate; an explicit value is node-wide and divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
+| `RACER_CACHED_PATHS` | Unset: `128` per final I/O worker | Retained path-query entry budget; an explicit value is node-wide and divided among I/O workers; 1..1,048,576 |
+| `RACER_PATH_CACHE_BYTES` | Unset: `8388608` (8 MiB) per final I/O worker | Accounted path-cache allocation budget; an explicit value is node-wide and divided among I/O workers; 1 byte..512 MiB, independent of entry count |
 | `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
 | `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
 | `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
@@ -186,7 +186,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
-| `RACER_CLIENT_CONNECTIONS` | `128` | Node-wide connection admission budget, partitioned among workers |
+| `RACER_CLIENT_CONNECTIONS` | Unset: `64` per final I/O worker | Connection admission budget; an explicit value is node-wide and partitioned among workers |
 | `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
 | `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
@@ -212,6 +212,33 @@ Node-wide budgets divide by final I/O worker count, not crypto thread count; tig
 can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
 divided among them. Admission budgets are not RSS limits:
 allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
+
+### Memory footprint
+
+Byte settings such as `RACER_PLAINTEXT_BYTES` are admission budgets. They cap how
+much memory requests may hold at once; they do not reserve memory and are not
+resident set size (RSS) limits. RSS grows toward the budgets under load, and
+catalog, page-index, checkpoint, allocator, and TLS memory come on top.
+
+Budgets that are unset default to a per-worker amount and are multiplied by the
+final I/O worker count, so a larger node gets a larger dataplane. A value set
+explicitly is a node-wide total and is divided among workers. Each worker needs
+roughly 115 MiB of plaintext, ciphertext, dirty, and request-context budget at
+minimum; startup fails rather than drop below half of the planned workers. To
+bound memory on a large node, cap threads with `RACER_MAX_THREADS`, fix the split
+with `RACER_IO_WORKERS` and `RACER_CRYPTO_HELPERS`, or set explicit node-wide budgets.
+
+The managed DaemonSet requests `1Gi` of memory for the `dataplane` container and
+sets no memory limit, because a fixed limit would be too small for nodes with many
+workers and could cause OOM kills. To add a limit or change the request, use a
+[workload override](#operator-managed-dataplane) that sets the container's
+`resources`. Size any limit from the worker count and budgets above.
+
+On glibc builds the dataplane sets the malloc mmap threshold to 1 MiB at startup,
+before workers start. Large buffers, such as 16 MiB pages, are then mapped
+individually and returned to the kernel when freed, instead of staying in heap
+arenas. To choose a different threshold, set `MALLOC_MMAP_THRESHOLD_` in the
+container environment; the dataplane then leaves glibc's value unchanged.
 
 ### Raw-device storage
 
