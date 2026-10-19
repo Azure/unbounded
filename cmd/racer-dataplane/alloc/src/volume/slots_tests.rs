@@ -810,3 +810,52 @@ fn randomized_model() {
         }
     }
 }
+
+#[test]
+fn pending_records_wait_for_the_reuse_rule() {
+    let small = class_for(PAGE).unwrap();
+    let (mut slots, dropped) = Slots::rebuild(
+        8,
+        Limits::UNLIMITED,
+        [],
+        [(key(1), value(2, 0, small, Tier::Storage, 5))],
+    )
+    .unwrap();
+    assert!(dropped.is_empty());
+    let epoch = slots.epoch();
+    let marked = slots.mark_pending_records(
+        [
+            // Same slot, free record: reserved.
+            value(2, 1, small, Tier::Storage, 9),
+            // Same record as the live entry: skipped.
+            value(2, 0, small, Tier::Storage, 9),
+            // Free slot, whole class: reserved.
+            value(3, 0, WHOLE_SLOT_CLASS, Tier::Storage, 1),
+            // Cache: skipped.
+            value(4, 0, small, Tier::Cache, 1),
+            // Slot used by another class: skipped.
+            value(2, 0, small + 1, Tier::Storage, 1),
+            // Out of range: skipped.
+            value(8, 0, small, Tier::Storage, 1),
+        ],
+        epoch,
+    );
+    assert_eq!(marked, 2);
+    let two = slots.slot_state(2).unwrap();
+    assert_eq!((two.used, two.indexed, two.retain_until), (2, 1, 9));
+    assert_eq!(slots.slot_state(3).unwrap().used, 1);
+    assert_eq!(kind(&slots, 4), SlotKind::Free);
+    assert_eq!(slots.usage().pending_units, 2);
+    // The reserved record is not handed out again.
+    let allocation = slots.allocate(Tier::Storage, PAGE).unwrap();
+    assert_eq!((allocation.slot, allocation.unit), (2, 2));
+    slots.abort(allocation).unwrap();
+    for round in 0..2 {
+        let epoch = slots.begin_commit();
+        slots.commit_succeeded(epoch);
+        let expected = if round == 0 { 2 } else { 0 };
+        assert_eq!(slots.usage().pending_units, expected);
+    }
+    assert_eq!(slots.slot_state(2).unwrap().used, 1);
+    assert_eq!(kind(&slots, 3), SlotKind::Free);
+}

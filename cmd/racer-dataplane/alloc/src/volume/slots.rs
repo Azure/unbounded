@@ -453,6 +453,64 @@ impl Slots {
         marked
     }
 
+    /// Reserve storage records referenced only by the older superblock's
+    /// tree, so they are not reused while that superblock may still be
+    /// mounted. They are released by the reuse rule with tag `epoch` and raise
+    /// their slot's `retain_until`. Cache values, malformed or out-of-range
+    /// values, and values that conflict with space already in use are
+    /// skipped. Call at mount, after [`Slots::rebuild`]. Returns how many were
+    /// reserved.
+    pub fn mark_pending_records(
+        &mut self,
+        values: impl IntoIterator<Item = Value>,
+        epoch: u64,
+    ) -> usize {
+        let mut marked = 0;
+        for value in values {
+            if value.tier != Tier::Storage
+                || !value.is_well_formed()
+                || u64::from(value.slot) >= self.slot_count()
+            {
+                continue;
+            }
+            let slot = value.slot;
+            let entry = self.slots[slot as usize];
+            match entry.kind {
+                KIND_FREE => {
+                    self.free_count -= 1;
+                    self.init_data(slot, value.tier, value.class);
+                }
+                KIND_DATA
+                    if entry.tier() == value.tier
+                        && entry.class == value.class
+                        && entry.flags & (OPEN | EVICTING) == 0 => {}
+                _ => continue,
+            }
+            let entry = self.slots[slot as usize];
+            let record = u32::from(value.unit) / class_units(value.class).expect("known class");
+            if entry.has_bitmap() {
+                if self.records[entry.aux as usize].get(record) {
+                    continue;
+                }
+                self.records[entry.aux as usize].set(record, true);
+            } else if entry.used != 0 {
+                continue;
+            }
+            let entry = &mut self.slots[slot as usize];
+            entry.used += 1;
+            entry.retain_until = entry.retain_until.max(value.retain_until);
+            self.small_bytes += record_bytes(value.class);
+            self.pending.push(PendingUnit {
+                epoch,
+                slot,
+                unit: value.unit,
+            });
+            self.refresh(slot);
+            marked += 1;
+        }
+        marked
+    }
+
     /// Slots in the volume.
     pub fn slot_count(&self) -> u64 {
         self.slots.len() as u64
