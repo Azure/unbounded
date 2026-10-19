@@ -104,13 +104,15 @@ EOF
 [Unit]
 Description=Enable NVIDIA persistence mode
 After=systemd-modules-load.service systemd-udev-trigger.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
-TimeoutStartSec=130
-ExecStart=/bin/sh -c 'i=0; while [ "$i" -lt 60 ]; do /usr/bin/nvidia-smi -pm 1 && exit 0; i=$((i + 1)); sleep 2; done; exit 1'
+ExecStartPre=-/usr/bin/nvidia-modprobe -u -c=0
+ExecStart=/usr/bin/nvidia-smi -pm 1
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

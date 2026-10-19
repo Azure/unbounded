@@ -38,9 +38,9 @@ class RootfsContractTest(unittest.TestCase):
         )
         self.put(
             "/etc/systemd/system/nvidia-persistence-mode.service",
-            "[Unit]\nAfter=systemd-modules-load.service\n"
-            "[Service]\nTimeoutStartSec=130\n"
-            "ExecStart=/bin/sh -c 'while true; do /usr/bin/nvidia-smi -pm 1 && exit 0; done'\n",
+            "[Unit]\nAfter=systemd-modules-load.service\nStartLimitIntervalSec=0\n"
+            "[Service]\nExecStart=/usr/bin/nvidia-smi -pm 1\n"
+            "Restart=on-failure\nRestartSec=5\n",
         )
         enabled = self.path(
             "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
