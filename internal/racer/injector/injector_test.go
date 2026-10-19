@@ -6,6 +6,7 @@ package injector
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -242,6 +243,67 @@ func TestMutatePodOS(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMutateHostNetwork(t *testing.T) {
+	for _, hostNetwork := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hostNetwork=%t", hostNetwork), func(t *testing.T) {
+			pod := newPod(nil)
+			pod.Spec.HostNetwork = hostNetwork
+			original := pod.DeepCopy()
+
+			err := Mutate(pod, testCfg)
+			if !hostNetwork {
+				if err != nil {
+					t.Fatalf("Mutate() error = %v", err)
+				}
+
+				if len(pod.Spec.InitContainers) != 1 || pod.Spec.InitContainers[0].Name != ContainerName {
+					t.Fatalf("sidecar not injected: %+v", pod.Spec.InitContainers)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), "spec.hostNetwork") {
+				t.Fatalf("err = %v, want mention of spec.hostNetwork", err)
+			}
+
+			if !reflect.DeepEqual(pod, original) {
+				t.Fatal("rejected pod was modified")
+			}
+		})
+	}
+
+	t.Run("not enabled is skipped", func(t *testing.T) {
+		pod := newPod(nil)
+		pod.Spec.HostNetwork = true
+		delete(pod.Labels, EnabledLabel)
+		original := pod.DeepCopy()
+
+		if err := Mutate(pod, testCfg); err != nil {
+			t.Fatalf("Mutate() error = %v", err)
+		}
+
+		if !reflect.DeepEqual(pod, original) {
+			t.Fatal("skipped pod was modified")
+		}
+	})
+
+	t.Run("already injected is skipped", func(t *testing.T) {
+		pod := newPod(nil)
+		pod.Spec.HostNetwork = true
+		pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: ContainerName})
+		original := pod.DeepCopy()
+
+		if err := Mutate(pod, testCfg); err != nil {
+			t.Fatalf("Mutate() error = %v", err)
+		}
+
+		if !reflect.DeepEqual(pod, original) {
+			t.Fatal("skipped pod was modified")
+		}
+	})
 }
 
 // kubeletExpand copies the rules kubelet uses to expand container args

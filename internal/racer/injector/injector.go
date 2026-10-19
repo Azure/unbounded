@@ -91,6 +91,13 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		}
 	}
 
+	// With host networking the loopback listener would be shared with every
+	// hostNetwork workload on the node, and the sidecar has no per-client
+	// authorization.
+	if pod.Spec.HostNetwork {
+		return errors.New("pod spec.hostNetwork is true, which the racer-object sidecar does not support because its loopback listener would be reachable from the node network namespace")
+	}
+
 	spec, err := parseAnnotations(pod.Annotations)
 	if err != nil {
 		return err

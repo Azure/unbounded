@@ -332,6 +332,8 @@ Other denial causes:
 - The pod already has a volume named `racer-object-client`.
 - The pod has `spec.os.name` or a `kubernetes.io/os` node selector other than
   `linux`.
+- The pod sets `spec.hostNetwork: true`. The sidecar's loopback listener would
+  be reachable by other host-network workloads on the node.
 
 If the pod is created without a sidecar, check that the label is on the pod (not
 only on the Deployment), that the pod is not in the racer-controller namespace,
