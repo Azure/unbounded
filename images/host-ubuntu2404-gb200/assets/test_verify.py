@@ -32,6 +32,21 @@ class RootfsContractTest(unittest.TestCase):
         self.put("/etc/machine-id", "")
         self.put(f"/boot/initrd.img-{self.kernel}", "initramfs fixture")
         self.put("/etc/initramfs-tools/update-initramfs.conf", "update_initramfs=yes\n")
+        self.put(
+            "/etc/modules-load.d/nvidia.conf",
+            "nvidia\nnvidia_modeset\nnvidia_uvm\nnvidia_drm\n",
+        )
+        self.put(
+            "/etc/systemd/system/nvidia-persistence-mode.service",
+            "[Unit]\nAfter=systemd-modules-load.service\n"
+            "ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*\n"
+            "[Service]\nExecStart=/usr/bin/nvidia-smi -pm 1\n",
+        )
+        enabled = self.path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
+        )
+        enabled.parent.mkdir(parents=True, exist_ok=True)
+        enabled.symlink_to("../nvidia-persistence-mode.service")
         self.put("/usr/share/unbounded/efi-packages.tsv", "shim-signed\t1\tarm64\n")
         self.put("/usr/share/unbounded/efi-packages.sha256", "test-package-hash\n")
         self.put("/var/lib/apt/lists/ubuntu_InRelease", "signed release fixture\n")
@@ -164,6 +179,20 @@ class RootfsContractTest(unittest.TestCase):
     def test_dkms_fallback_rejected(self):
         self.packages += "\nnvidia-dkms-580-server-open\t580\tarm64"
         self.rejected("unexpected DKMS")
+
+    def test_missing_nvidia_utilities_rejected(self):
+        self.packages = "linux-image\t7.0\tarm64"
+        self.rejected("missing pinned NVIDIA utilities")
+
+    def test_missing_nvidia_boot_module_configuration_rejected(self):
+        self.path("/etc/modules-load.d/nvidia.conf").unlink()
+        self.rejected("NVIDIA modules are not configured for boot")
+
+    def test_disabled_persistence_service_rejected(self):
+        self.path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
+        ).unlink()
+        self.rejected("NVIDIA persistence service is not enabled")
 
     def test_missing_apt_provenance_rejected(self):
         self.path("/var/lib/apt/lists/ubuntu_InRelease").unlink()

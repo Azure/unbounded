@@ -68,7 +68,7 @@ install_packages() {
 
 finish() {
     : "${SOURCE_COMMIT:?SOURCE_COMMIT is required}"
-    mkdir -p /etc/netplan /etc/initramfs-tools/conf.d \
+    mkdir -p /etc/netplan /etc/initramfs-tools/conf.d /etc/modules-load.d \
         /etc/systemd/system/systemd-networkd-wait-online.service.d
     printf 'MODULES=most\n' > /etc/initramfs-tools/conf.d/unbounded
     # MANA must be available before the cloud-init datasource can be reached.
@@ -93,6 +93,12 @@ EOF
 [Service]
 ExecStart=
 ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any --timeout=120
+EOF
+    cat > /etc/modules-load.d/nvidia.conf <<'EOF'
+nvidia
+nvidia_modeset
+nvidia_uvm
+nvidia_drm
 EOF
     cat > /etc/systemd/system/nvidia-persistence-mode.service <<'EOF'
 [Unit]

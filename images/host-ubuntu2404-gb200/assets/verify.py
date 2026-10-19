@@ -90,6 +90,36 @@ def verify():
         firmware[name] = sha256(path)
     packages = command("dpkg-query", "-W", "-f=${Package}\t${Version}\t${Architecture}\n")
     require("nvidia-dkms-" not in packages, "unexpected DKMS driver installation")
+    require(
+        re.search(
+            rf"^nvidia-utils-580-server\t{re.escape(driver)}(?:[-+~][^\t]*)?\tarm64$",
+            packages,
+            re.MULTILINE,
+        ),
+        "missing pinned NVIDIA utilities",
+    )
+    module_load_path = Path("/etc/modules-load.d/nvidia.conf")
+    require(
+        module_load_path.exists()
+        and module_load_path.read_text().splitlines()
+        == ["nvidia", "nvidia_modeset", "nvidia_uvm", "nvidia_drm"],
+        "NVIDIA modules are not configured for boot",
+    )
+    persistence_path = Path("/etc/systemd/system/nvidia-persistence-mode.service")
+    require(
+        persistence_path.exists()
+        and "After=systemd-modules-load.service" in persistence_path.read_text()
+        and "ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*"
+        in persistence_path.read_text()
+        and "ExecStart=/usr/bin/nvidia-smi -pm 1" in persistence_path.read_text(),
+        "invalid NVIDIA persistence service",
+    )
+    require(
+        Path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
+        ).is_symlink(),
+        "NVIDIA persistence service is not enabled",
+    )
     require(not Path("/etc/ssh/ssh_host_ed25519_key").exists(), "baked-in SSH key")
     require(Path("/etc/machine-id").read_bytes() == b"", "baked-in machine ID")
     result = {
