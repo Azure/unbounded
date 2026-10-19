@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -32,6 +31,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/peeraddr"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
@@ -69,22 +69,6 @@ type AttestResponse struct {
 	ClusterCA       string `json:"clusterCA,omitempty"` // PEM-encoded CA certificate
 }
 
-// clientIP extracts the client IP from an HTTP request, checking
-// X-Forwarded-For first, then falling back to RemoteAddr.
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.SplitN(fwd, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-
-	return host
-}
-
 // Attest handles the single-round-trip TPM attestation flow.
 // The node sends its EK and SRK public keys. The server wraps a random
 // AES-256 key via CreateCredential (bound to the EK and SRK), encrypts a
@@ -101,7 +85,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip := peeraddr.Host(r)
 
 	log := slog.With("remote", r.RemoteAddr, "ip", ip)
 	if len(req.EKPub) == 0 || len(req.SRKPub) == 0 {

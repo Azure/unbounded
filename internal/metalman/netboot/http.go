@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/peeraddr"
 )
 
 // cloudInitEvent represents a cloud-init webhook reporting event.
@@ -137,7 +138,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip := peeraddr.Host(r)
 	log := slog.With("proto", "http", "path", path, "ip", ip)
 	// The running installer keeps its original lease even if the Machine is
 	// edited. Resolve its artifacts from the operation snapshot, never live input.
@@ -185,15 +186,6 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 				}
 
 				return
-			}
-
-			if ip != remote {
-				if _, claimed, err := h.Media.artifactOwner(r.Context(), ip); claimed {
-					log.Warn("rejected forwarded boot media artifact request", "err", err)
-					http.NotFound(w, r)
-
-					return
-				}
 			}
 		}
 	}
@@ -337,7 +329,7 @@ func serveMissingShimRevocationsFile(w http.ResponseWriter, log *slog.Logger, no
 }
 
 func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip := peeraddr.Host(r)
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -406,7 +398,7 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip := peeraddr.Host(r)
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -444,8 +436,9 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 
 var errMediaFirstBootUnauthorized = errors.New("no authorized media first-boot owner")
 
-// Only the direct peer can claim a frozen lease. Live-IP fallback, including
-// forwarding headers, is allowed only for Machines and leases without media owners.
+// Only the direct peer can claim a frozen lease. Live-IP fallback, also keyed
+// by the direct peer, is allowed only for Machines and leases without media
+// owners. Forwarding headers are never trusted.
 func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *mediaOwner, error) {
 	if h.Media != nil {
 		remote, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -463,13 +456,13 @@ func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *medi
 		}
 	}
 
-	node, err := h.LookupNodeByIP(r.Context(), clientIP(r))
+	node, err := h.LookupNodeByIP(r.Context(), peeraddr.Host(r))
 	if node != nil && node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
 		return nil, nil, errMediaFirstBootUnauthorized
 	}
 
 	if h.Media != nil {
-		if mediaErr := h.Media.rejectFirstBootFallback(r.Context(), node, clientIP(r)); mediaErr != nil {
+		if mediaErr := h.Media.rejectFirstBootFallback(r.Context(), node, peeraddr.Host(r)); mediaErr != nil {
 			return nil, nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, mediaErr)
 		}
 	}
@@ -554,7 +547,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 }
 
 func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip := peeraddr.Host(r)
 	log := slog.With("handler", "pxe-disable", "ip", ip)
 
 	node, err := h.LookupNodeByIP(r.Context(), ip)
@@ -640,18 +633,4 @@ func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger
 	if err := h.StatusRecorder.RecordCloudInitDone(ctx, machineName); err != nil {
 		log.Error("recording cloud-init status", "node", machineName, "err", err)
 	}
-}
-
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.SplitN(fwd, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-
-	return host
 }

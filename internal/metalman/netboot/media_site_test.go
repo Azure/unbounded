@@ -56,7 +56,9 @@ func TestMediaSiteFirstBootFallback(t *testing.T) {
 						}
 
 						want := http.StatusOK
-						if sites.provider == sites.media {
+						if sites.provider == sites.media || source == "forwarded" {
+							// Forwarded headers are ignored, so a spoofed lease
+							// from a non-Machine peer never resolves the Machine.
 							want = http.StatusNotFound
 						}
 
@@ -73,8 +75,15 @@ func TestMediaSiteFirstBootFallback(t *testing.T) {
 							}
 						}
 
-						require.Equal(t, want, firstBootRequest(h, "/unbounded-agent/install-log", remote, "install output", forwarded).Code)
-						require.Equal(t, want, firstBootRequest(h, "/cloudinit/log", remote, `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`, forwarded).Code)
+						// Log reports from a non-Machine peer are acknowledged
+						// but never recorded.
+						wantLog := want
+						if source == "forwarded" {
+							wantLog = http.StatusOK
+						}
+
+						require.Equal(t, wantLog, firstBootRequest(h, "/unbounded-agent/install-log", remote, "install output", forwarded).Code)
+						require.Equal(t, wantLog, firstBootRequest(h, "/cloudinit/log", remote, `{"name":"modules-final","event_type":"finish","result":"SUCCESS"}`, forwarded).Code)
 						require.NoError(t, h.Media.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
 						require.Equal(t, before.Status, op.Status)
 

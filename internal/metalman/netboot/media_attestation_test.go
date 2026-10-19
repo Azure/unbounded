@@ -120,6 +120,14 @@ func TestMediaAttestationLegacyLookup(t *testing.T) {
 				}
 
 				node, err := h.Media.LookupAttestationMachine(r)
+				if forwarded {
+					// X-Forwarded-For is ignored; the direct peer is not a Machine.
+					require.Error(t, err)
+					require.Nil(t, node)
+
+					return
+				}
+
 				require.NoError(t, err)
 				require.Equal(t, client.ObjectKeyFromObject(m), client.ObjectKeyFromObject(node))
 				require.Equal(t, m.Spec, node.Spec)

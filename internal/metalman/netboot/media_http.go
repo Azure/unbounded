@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/peeraddr"
 )
 
 // firstBootOwner authorizes the installed OS after handoff, even when the ISO
@@ -104,12 +105,12 @@ func (p *MediaProvider) LookupAttestationMachine(r *http.Request) (*v1alpha3.Mac
 		return o.machine, nil
 	}
 
-	node, err := p.Resolver.LookupNodeByIP(r.Context(), clientIP(r))
+	node, err := p.Resolver.LookupNodeByIP(r.Context(), peeraddr.Host(r))
 	if node != nil && node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
 		return nil, errMediaFirstBootUnauthorized
 	}
 
-	if mediaErr := p.rejectFirstBootFallback(r.Context(), node, clientIP(r)); mediaErr != nil {
+	if mediaErr := p.rejectFirstBootFallback(r.Context(), node, peeraddr.Host(r)); mediaErr != nil {
 		return nil, fmt.Errorf("%w: %w", errMediaFirstBootUnauthorized, mediaErr)
 	}
 

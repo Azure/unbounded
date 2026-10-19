@@ -180,6 +180,7 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 		},
 	}
 	clientset := fake.NewClientset(ns, sa)
+
 	var tokenCount int
 
 	clientset.PrependReactor("create", "serviceaccounts/token", func(action clienttesting.Action) (bool, runtime.Object, error) {
@@ -739,6 +740,7 @@ func TestAttestRecordsCredentialIDWithEKInOneUpdate(t *testing.T) {
 	handler.StatusUpdater = counter
 
 	before := time.Now().Add(-time.Second)
+
 	doAttest(t, handler, "10.0.2.10", ekPub, srkPub)
 
 	require.Equal(t, 1, counter.calls)
@@ -894,5 +896,35 @@ func TestCredentialIDFromToken(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.want, got)
 		})
+	}
+}
+
+func TestAttestIgnoresForwardedHeaders(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.1.10", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	handler := testHandler(t, node)
+
+	body, _ := json.Marshal(AttestRequest{EKPub: ekPub, SRKPub: srkPub})
+	req := httptest.NewRequest(http.MethodPost, "/attest", bytes.NewReader(body))
+	req.RemoteAddr = "10.99.99.99:12345"
+	req.Header.Set("X-Forwarded-For", "10.0.1.10")
+	req.Header.Set("X-Real-IP", "10.0.1.10")
+	req.Header.Set("Forwarded", "for=10.0.1.10")
+
+	w := httptest.NewRecorder()
+	handler.Attest(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("spoofed forwarded headers: expected 404, got %d: %s", w.Code, w.Body.String())
 	}
 }
