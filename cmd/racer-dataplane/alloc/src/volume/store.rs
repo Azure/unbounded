@@ -1152,6 +1152,12 @@ impl<C: Charge> Volume<C> {
         self.shared.state().slots.slot_state(slot)
     }
 
+    /// Bytes in use by node units and records in slots `range`, for usage per
+    /// backing device. O(log slots).
+    pub fn used_bytes(&self, range: std::ops::Range<u32>) -> u64 {
+        self.shared.state().slots.used_bytes(range)
+    }
+
     /// Current allocation limits.
     pub fn limits(&self) -> Limits {
         self.shared.state().slots.limits()

@@ -25,10 +25,7 @@ use crate::runtime::HashMap;
 use crate::runtime::HashSet;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use page_alloc::volume::{
-    Key, Limits, MountReport, Reservation, SLOT_BYTES, SlotKind, Tier, UNIT_BYTES, Value, Volume,
-    class_units,
-};
+use page_alloc::volume::{Key, Limits, MountReport, Reservation, SLOT_BYTES, Tier, Value, Volume};
 use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
 use std::ops::Bound;
@@ -533,30 +530,18 @@ impl Index {
     }
 
     /// Bytes of each slot range, in order: `(size, used)` per group of
-    /// `counts[i]` consecutive slots.
+    /// `counts[i]` consecutive slots. O(groups * log slots).
     pub(crate) fn disk_usage(&self, counts: &[usize]) -> Vec<(u64, u64)> {
         let Some(volume) = self.volume() else {
             return Vec::new();
         };
-        let mut slot = 0u32;
+        let mut start = 0u32;
         counts
             .iter()
             .map(|count| {
-                let mut used = 0u64;
-                for _ in 0..*count {
-                    if let Some(state) = volume.slot_state(slot) {
-                        used += match state.kind {
-                            SlotKind::Free => 0,
-                            SlotKind::Node => u64::from(state.used) * UNIT_BYTES as u64,
-                            SlotKind::Data { class, .. } => {
-                                u64::from(state.used)
-                                    * u64::from(class_units(class).unwrap_or(0))
-                                    * UNIT_BYTES as u64
-                            }
-                        };
-                    }
-                    slot = slot.saturating_add(1);
-                }
+                let end = start.saturating_add(u32::try_from(*count).unwrap_or(u32::MAX));
+                let used = volume.used_bytes(start..end);
+                start = end;
                 (*count as u64 * SLOT_BYTES, used)
             })
             .collect()

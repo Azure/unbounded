@@ -781,6 +781,9 @@ mod tests {
         let disk = crate::store::test_disk::TestDisk::mount(&index, worker.placements.len() as u64);
         let counts: Vec<usize> = worker.disk_groups.iter().map(|(_, count)| *count).collect();
         let usage = index.disk_usage(&counts);
+        let meta =
+            index.volume().unwrap().usage().node_units * page_alloc::volume::UNIT_BYTES as u64;
+        assert!(meta > 0);
         drop(disk);
         metrics[1].observe_disks(
             worker
@@ -801,8 +804,11 @@ mod tests {
                 "racer_disk_size_bytes{{disk=\"device:{disk}\"}} {size}\n"
             )));
         }
-        // Only the meta slot's superblock units are in use after format.
-        assert!(!output.contains("racer_disk_used_bytes{disk=\"device:a\"} 0\n"));
+        // Only the meta slot's node units are in use after format, and they
+        // all belong to `a`.
+        assert!(output.contains(&format!(
+            "racer_disk_used_bytes{{disk=\"device:a\"}} {meta}\n"
+        )));
         assert!(output.contains("racer_disk_used_bytes{disk=\"device:z\"} 0\n"));
     }
 
@@ -815,6 +821,28 @@ mod tests {
         assert_ne!(digest("a", 8), digest("b", 8));
         assert_ne!(digest("a", 8), digest("a", 9));
         assert_ne!(digest("a", 8), crate::store::checkpoint::FILE_LAYOUT_DIGEST);
+        // The extent volume layout (v2) never matches a v1 segment layout of
+        // the same devices, so old checkpoints are rejected.
+        let tagged = |tag: &[u8]| {
+            let worker = plan(vec![device("a", 8, s)], &c, 1)
+                .unwrap()
+                .workers
+                .remove(0);
+            let device = device("a", 8, s);
+            let mut hash = Sha256::new();
+            hash.update(tag);
+            hash.update(GUARD_BYTES.to_le_bytes());
+            hash.update(GUARD_BYTES.to_le_bytes());
+            for placement in &worker.placements {
+                hash.update((device.id.len() as u64).to_le_bytes());
+                hash.update(device.id.as_bytes());
+                hash.update(device.bytes.to_le_bytes());
+                hash.update(placement.offset.to_le_bytes());
+            }
+            <[u8; 32]>::from(hash.finalize())
+        };
+        assert_eq!(tagged(b"racer-raw-layout-v2\0"), digest("a", 8));
+        assert_ne!(tagged(b"racer-raw-layout-v1\0"), digest("a", 8));
         let original = digest("a", 8);
         let mut resized = device("a", 8, s);
         resized.bytes += 4096;

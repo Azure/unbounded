@@ -335,6 +335,8 @@ pub struct Slots {
     cache_slots: u64,
     storage_slots: u64,
     small_bytes: u64,
+    // Fenwick tree of per-slot used bytes, for range queries in O(log n).
+    used: Vec<u64>,
 }
 
 fn tier_class(tier: Tier, class: u8) -> usize {
@@ -384,6 +386,7 @@ impl Slots {
             cache_slots: 0,
             storage_slots: 0,
             small_bytes: 0,
+            used: vec![0; count],
         };
         let aux = table.new_records(SLOT_UNITS);
         let meta = &mut table.slots[META_SLOT as usize];
@@ -393,6 +396,7 @@ impl Slots {
         for unit in 0..u32::from(META_FIRST_NODE_UNIT) {
             table.records[aux as usize].set(unit, true);
         }
+        table.sync_used(META_SLOT);
         Ok(table)
     }
 
@@ -499,6 +503,7 @@ impl Slots {
             let entry = &mut self.slots[slot as usize];
             entry.used += 1;
             entry.retain_until = entry.retain_until.max(value.retain_until);
+            self.sync_used(slot);
             self.small_bytes += record_bytes(value.class);
             self.pending.push(PendingUnit {
                 epoch,
@@ -582,6 +587,7 @@ impl Slots {
             .expect("node slot with free units has a clear bit");
         records.set(unit, true);
         self.slots[slot as usize].used += 1;
+        self.sync_used(slot);
         self.refresh(slot);
         Ok(NodeAddr::new(slot, unit as u16))
     }
@@ -645,6 +651,7 @@ impl Slots {
             0
         };
         self.slots[slot as usize].used += 1;
+        self.sync_used(slot);
         self.small_bytes += bytes;
         self.refresh(slot);
         let units = class_units(class).expect("known class");
@@ -946,6 +953,7 @@ impl Slots {
             self.small_bytes -= record_bytes(entry.class);
         }
         self.slots[slot as usize].used -= 1;
+        self.sync_used(slot);
         self.refresh(slot);
     }
 
@@ -971,6 +979,7 @@ impl Slots {
         }
         records.set(addr.unit().into(), true);
         self.slots[slot as usize].used += 1;
+        self.sync_used(slot);
         true
     }
 
@@ -1000,6 +1009,7 @@ impl Slots {
             return false;
         }
         self.slots[slot as usize].used += 1;
+        self.sync_used(slot);
         self.small_bytes += record_bytes(value.class);
         self.commit_record(slot, value.unit, key, value.retain_until)
             .expect("record was just reserved");
@@ -1145,6 +1155,52 @@ impl Slots {
             self.free.push(slot);
         }
         self.free_count += 1;
+        self.sync_used(slot);
+    }
+
+    // Bytes in use in one slot: node units, or records times their size.
+    fn slot_used_bytes(&self, slot: u32) -> u64 {
+        let entry = &self.slots[slot as usize];
+        let units = match entry.kind {
+            KIND_NODE => 1,
+            KIND_DATA => class_units(entry.class).unwrap_or(0),
+            _ => 0,
+        };
+        u64::from(entry.used) * u64::from(units) * UNIT_BYTES as u64
+    }
+
+    // Sum of the Fenwick tree over slots `0..end`.
+    fn used_prefix(&self, end: u32) -> u64 {
+        let mut index = (end as usize).min(self.used.len());
+        let mut sum = 0;
+        while index > 0 {
+            sum += self.used[index - 1];
+            index &= index - 1;
+        }
+        sum
+    }
+
+    // Bring the Fenwick tree's value of `slot` up to date after a change.
+    fn sync_used(&mut self, slot: u32) {
+        let new = self.slot_used_bytes(slot);
+        let old = self.used_prefix(slot + 1) - self.used_prefix(slot);
+        if new == old {
+            return;
+        }
+        let mut index = slot as usize + 1;
+        while index <= self.used.len() {
+            self.used[index - 1] = self.used[index - 1].wrapping_add(new.wrapping_sub(old));
+            index += index & index.wrapping_neg();
+        }
+    }
+
+    /// Bytes in use by node units and records in slots `range`, including
+    /// space of records that are pending reuse. O(log slots).
+    pub fn used_bytes(&self, range: std::ops::Range<u32>) -> u64 {
+        if range.start >= range.end {
+            return 0;
+        }
+        self.used_prefix(range.end) - self.used_prefix(range.start)
     }
 }
 

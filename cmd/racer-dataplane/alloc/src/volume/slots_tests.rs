@@ -601,14 +601,53 @@ fn check(slots: &Slots, model: &Model) {
     }
     used[0] += 2;
     let mut free = 0;
+    let mut bytes = Vec::new();
     for slot in 0..slots.slot_count() as u32 {
         let state = slots.slot_state(slot).unwrap();
         assert_eq!(state.used, used[slot as usize], "slot {slot}");
         if state.kind == SlotKind::Free {
             free += 1;
         }
+        bytes.push(state_bytes(&state));
     }
     assert_eq!(free, usage.free_slots);
+    // Range usage agrees with the per-slot states for every range.
+    let count = slots.slot_count() as u32;
+    for start in 0..=count {
+        let mut sum = 0;
+        for end in start..=count {
+            assert_eq!(slots.used_bytes(start..end), sum, "slots {start}..{end}");
+            if end < count {
+                sum += bytes[end as usize];
+            }
+        }
+    }
+}
+
+fn state_bytes(state: &SlotState) -> u64 {
+    let units = match state.kind {
+        SlotKind::Free => 0,
+        SlotKind::Node => 1,
+        SlotKind::Data { class, .. } => class_units(class).unwrap(),
+    };
+    u64::from(state.used) * u64::from(units) * PAGE
+}
+
+#[test]
+fn used_bytes_tracks_nodes_records_and_frees() {
+    let mut slots = table(4);
+    // The meta slot starts with its two superblock units.
+    assert_eq!(slots.used_bytes(0..4), 2 * PAGE);
+    assert_eq!(slots.used_bytes(1..4), 0);
+    assert_eq!(slots.used_bytes(3..1), 0);
+    let small = slots.allocate(Tier::Cache, PAGE).unwrap();
+    let whole = slots.allocate(Tier::Cache, SLOT_BYTES).unwrap();
+    assert_ne!(small.slot, whole.slot);
+    assert_eq!(slots.used_bytes(small.slot..small.slot + 1), PAGE);
+    assert_eq!(slots.used_bytes(whole.slot..whole.slot + 1), SLOT_BYTES);
+    assert_eq!(slots.used_bytes(0..4), 3 * PAGE + SLOT_BYTES);
+    slots.abort(small).unwrap();
+    assert_eq!(slots.used_bytes(0..4), 2 * PAGE + SLOT_BYTES);
 }
 
 fn release_pending(model: &mut Model, epoch: u64) {
