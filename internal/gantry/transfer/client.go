@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -25,7 +26,12 @@ import (
 // Reuse a single Client across all peers - the underlying http.Transport
 // pools per-host connections internally.
 type Client struct {
-	hc          *http.Client
+	hc *http.Client
+	// rangeHC carries FetchRangeFromPeer on its own transport, and therefore
+	// its own h2 connections. Sharing hc would put latency-critical range
+	// reads behind bulk layer streams on one connection, where they contend
+	// for the same flow-control window and share its idle-ping fate.
+	rangeHC     *http.Client
 	onBytesRead func(kind string, bytes int64)
 }
 
@@ -76,10 +82,24 @@ func NewClient(opts ...ClientOption) *Client {
 		fn(&o)
 	}
 
+	return &Client{
+		hc: &http.Client{
+			Transport: newPeerTransport(o),
+			Timeout:   o.requestTimeout,
+		},
+		rangeHC: &http.Client{
+			Transport: newPeerTransport(o),
+			Timeout:   o.requestTimeout,
+		},
+		onBytesRead: o.onBytesRead,
+	}
+}
+
+func newPeerTransport(o clientOptions) *http.Transport {
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
 
-	tr := &http.Transport{
+	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: o.dialTimeout}
 			return d.DialContext(ctx, network, addr)
@@ -89,14 +109,6 @@ func NewClient(opts ...ClientOption) *Client {
 			SendPingTimeout:  o.readIdleTimeout,
 			MaxReadFrameSize: peerMaxReadFrameSize,
 		},
-	}
-
-	return &Client{
-		hc: &http.Client{
-			Transport: tr,
-			Timeout:   o.requestTimeout,
-		},
-		onBytesRead: o.onBytesRead,
 	}
 }
 
@@ -194,6 +206,56 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+	default:
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
+	}
+}
+
+// FetchRangeFromPeer fetches one exact byte range from a peer holding a
+// complete, committed blob. Registry authorization is deliberately not
+// forwarded: digest and range are sufficient at the peer boundary.
+func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error) {
+	if _, err := httprange.New(requested.Start, requested.End); err != nil {
+		return nil, 0, "", err
+	}
+
+	url, err := buildPeerURL(peerAddr, ifaces.OriginRef{Digest: d, Kind: ifaces.KindBlob})
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req.Header.Set(MirroredHeader, "1")
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("Range", requested.HeaderValue())
+	req.URL.Scheme = "http"
+
+	resp, err := c.rangeHC.Do(req)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		size, err := httprange.ValidateResponse(requested, resp.Header.Get("Content-Range"), resp.ContentLength)
+		if err != nil {
+			_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+			return nil, 0, "", &ifaces.ErrPeerProtocol{PeerAddr: peerAddr, Err: err}
+		}
+
+		return c.responseBody(resp, ifaces.KindBlob), size, resp.Header.Get("Content-Type"), nil
+	case http.StatusNotFound:
+		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: d}
 	default:
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close

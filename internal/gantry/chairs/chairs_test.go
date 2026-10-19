@@ -212,6 +212,58 @@ func testHolder(peerID ifaces.NodeID) chairs.Holder {
 	}
 }
 
+func TestRankActiveExcludesExpiredHoldersWithoutChangingRegularRank(t *testing.T) {
+	now := time.Unix(2_000_000, 0)
+	snapshot := chairs.Snapshot{Epoch: 4, FetchedAt: now}
+
+	for index := range chairs.Count {
+		chair := chairs.Chair{
+			ID:              chairs.ID(index),
+			Holder:          testHolder(ifaces.NodeID(chairs.ID(index).Name())),
+			AssignmentEpoch: 4,
+			LeaseDuration:   time.Minute,
+			RenewTime:       now.Add(-10 * time.Second),
+		}
+
+		// Half the fleet stopped renewing hours ago.
+		if index%2 == 0 {
+			chair.RenewTime = now.Add(-6 * time.Hour)
+		}
+
+		snapshot.Chairs = append(snapshot.Chairs, chair)
+	}
+
+	if got := snapshot.SelectableCount(); got != chairs.Count {
+		t.Fatalf("SelectableCount = %d, want %d selectable holders", got, chairs.Count)
+	}
+
+	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	if got := len(chairs.Rank(snapshot, d, chairs.DefaultCount)); got != chairs.Count {
+		t.Fatalf("regular ranked chairs = %d, want %d", got, chairs.Count)
+	}
+
+	want := chairs.Count / 2
+
+	ranked := chairs.RankActive(snapshot, d, chairs.DefaultCount)
+	if len(ranked) != want {
+		t.Fatalf("active ranked chairs = %d, want %d", len(ranked), want)
+	}
+
+	for _, chair := range ranked {
+		if chair.Expired(now) {
+			t.Fatalf("expired chair %s was ranked", chair.ID.Name())
+		}
+	}
+
+	// A replayed snapshot from an API outage must not evict the whole fleet.
+	stale := snapshot
+	stale.Stale = true
+
+	if got := len(chairs.RankActive(stale, d, chairs.DefaultCount)); got != chairs.Count {
+		t.Fatalf("stale active ranked chairs = %d, want %d", got, chairs.Count)
+	}
+}
+
 func TestCurrentEpochUsesUnixOrigin(t *testing.T) {
 	period := 6 * time.Hour
 	now := time.Unix(0, 13*period.Nanoseconds()+period.Nanoseconds()/2)

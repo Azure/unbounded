@@ -26,8 +26,8 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: gantry
-      hostNetwork: false
-      dnsPolicy: ClusterFirst
+      hostNetwork: {{ .Values.gantry.artifactStreaming.enabled }}
+      dnsPolicy: {{ ternary "ClusterFirstWithHostNet" "ClusterFirst" .Values.gantry.artifactStreaming.enabled }}
       priorityClassName: gantry-low
       nodeSelector:
         {{- toYaml .Values.nodeSelector | nindent 8 }}
@@ -80,8 +80,10 @@ spec:
           ports:
             - name: mirror
               containerPort: 5000
+              {{- if not .Values.gantry.artifactStreaming.enabled }}
               hostPort: 5000
               hostIP: 127.0.0.1
+              {{- end }}
               protocol: TCP
             - name: transfer
               containerPort: 5001

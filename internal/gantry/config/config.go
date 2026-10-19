@@ -88,6 +88,15 @@ type Config struct {
 	// for the full opt-in checklist.
 	MirrorBindAllowNonLoopback bool `yaml:"mirror_bind_allow_non_loopback"`
 
+	// ArtifactStreamingEnabled enables the node-local OverlayBD range endpoint
+	// on /blobs/ under MirrorListen.
+	ArtifactStreamingEnabled bool `yaml:"artifact_streaming_enabled"`
+
+	// ArtifactStreamingAllowedHostSuffixes limits signed-origin requests to
+	// approved Azure data endpoints. A leading dot denotes a DNS suffix; values
+	// without a leading dot are exact hosts.
+	ArtifactStreamingAllowedHostSuffixes []string `yaml:"artifact_streaming_allowed_host_suffixes"`
+
 	// TransferListen is the peer-facing HTTP/2 endpoint (the design doc). The bind is
 	// typically 0.0.0.0; cluster-internal isolation comes from
 	// NetworkPolicy + the `Gantry-Mirrored: 1` request-header gate +
@@ -288,18 +297,32 @@ type Config struct {
 	// except by the number of eligible nodes.
 	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
 
-	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
-	// to a deterministic HRW-ranked subset of manifest consumers. Local
-	// self-selected pulls still run on every consumer. The default is 3.
+	// PrefetchCoordinatorReplicas limits Artifact Streaming convergence
+	// dispatch to a deterministic HRW-ranked subset of manifest consumers.
+	// The default is 3.
 	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
 
-	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
-	// per manifest. Group dispatch is best effort and target-side deduplicated.
+	// PrefetchMaxConcurrentGroups caps simultaneous outbound Artifact Streaming
+	// prefetch groups per manifest. Dispatch is best effort and target-side
+	// deduplicated.
 	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
 
-	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
-	// node derives a stable delay in [0, jitter) from itself and the manifest.
+	// PrefetchDispatchJitter spreads Artifact Streaming prefetch across
+	// requesters. Each node derives a stable delay in [0, jitter) from itself
+	// and the manifest.
 	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
+
+	// LayerSeedConcurrency caps simultaneous local layer downloads started by
+	// Artifact Streaming reconciliation.
+	LayerSeedConcurrency int `yaml:"layer_seed_concurrency"`
+
+	// LayerSeedPeerPatience is how long a seeding node waits for a peer to
+	// advertise a layer before falling back to origin. It exists so a large
+	// rollout does not convert into one origin pull per node.
+	LayerSeedPeerPatience time.Duration `yaml:"layer_seed_peer_patience"`
+
+	// LayerSeedBudget bounds total local seeding time for one manifest.
+	LayerSeedBudget time.Duration `yaml:"layer_seed_budget"`
 
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
 	// (HRW within the requester's zone) - the design doc / the design doc open question.
@@ -371,6 +394,53 @@ type Config struct {
 	// hosts.toml (mirror-only, no origin fall-through), where a shed request
 	// retries Gantry rather than falling through to origin.
 	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
+
+	// TransferMaxConcurrentRangeServes caps concurrent serves of small bounded
+	// ranges, admitted separately from full blob streams. Artifact Streaming
+	// reads OverlayBD indexes as a few KiB at a time; those reads are on the
+	// container-start critical path and cost almost no bandwidth, so they must
+	// not consume the scarce slots that TransferMaxConcurrentServes reserves
+	// for large-layer streams. Zero leaves ranges on the blob cap.
+	TransferMaxConcurrentRangeServes int `yaml:"transfer_max_concurrent_range_serves"`
+
+	// LayerSeedOriginFallback lets a seeding node pull a layer straight from
+	// origin when no peer has it. Leave this off at fleet scale: every node
+	// seeds every layer, so an origin fallback turns one cold image into
+	// nodes x layers concurrent origin pulls, which saturates the registry and
+	// starves the latency-critical range reads that gate container start.
+	// Bootstrap is the chair prefetch path's job.
+	LayerSeedOriginFallback bool `yaml:"layer_seed_origin_fallback"`
+
+	// RangeCacheDir holds Artifact Streaming ranges fetched from peers or origin.
+	// It defaults to a subdirectory of the libp2p hostPath because that is the
+	// only node-backed writable mount the agent already has; the container root
+	// is read-only and /tmp is an emptyDir subject to ephemeral-storage eviction.
+	// Empty disables range caching.
+	RangeCacheDir string `yaml:"range_cache_dir"`
+
+	// RangeCacheMaxBytes caps the on-disk range cache. Once reached the cache
+	// stops admitting new blobs rather than evicting, so a steady read pattern
+	// keeps its working set.
+	RangeCacheMaxBytes int64 `yaml:"range_cache_max_bytes"`
+
+	// MaxCachedRangeBytes is the largest single range worth caching. Index
+	// reads are a few KiB; anything large is bulk layer traffic that would
+	// evict the small reads that actually gate container start.
+	MaxCachedRangeBytes int64 `yaml:"max_cached_range_bytes"`
+
+	// IndexPrefetchHeadBytes and IndexPrefetchTailBytes bound the regions
+	// warmed when a manifest is served. OverlayBD reads a layer's head and its
+	// trailing index at mount time and nothing else, so these cover container
+	// start at a fraction of a percent of the image.
+	IndexPrefetchHeadBytes int64 `yaml:"index_prefetch_head_bytes"`
+	IndexPrefetchTailBytes int64 `yaml:"index_prefetch_tail_bytes"`
+
+	// IndexPrefetchConcurrency caps simultaneous layer warms per node.
+	IndexPrefetchConcurrency int `yaml:"index_prefetch_concurrency"`
+
+	// IndexPrefetchJitter spreads the fleet's first wave so a cold image does
+	// not put every node on origin in the same instant.
+	IndexPrefetchJitter time.Duration `yaml:"index_prefetch_jitter"`
 
 	// AdvertiseReconcileInterval is the cadence of the background
 	// advertiser's full inventory reconcile. Eager per-digest advertise on
@@ -489,15 +559,21 @@ func NewDefault() *Config {
 		RacerOriginConcurrentRequests: 64,
 		MirrorListen:                  "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback:    false,
-		TransferListen:                "0.0.0.0:5001",
-		MetricsListen:                 "0.0.0.0:9095",
-		PprofListen:                   "",
-		Libp2pListen:                  nil,
-		Libp2pIdentityPath:            "/var/lib/gantry/libp2p.key",
-		Libp2pConnManagerHigh:         900,
-		Libp2pConnManagerLow:          600,
-		Libp2pConnManagerGrace:        time.Minute,
-		ChairListen:                   "0.0.0.0:5002",
+		ArtifactStreamingEnabled:      false,
+		ArtifactStreamingAllowedHostSuffixes: []string{
+			".azurecr.io",
+			".data.mcr.microsoft.com",
+			".blob.core.windows.net",
+		},
+		TransferListen:         "0.0.0.0:5001",
+		MetricsListen:          "0.0.0.0:9095",
+		PprofListen:            "",
+		Libp2pListen:           nil,
+		Libp2pIdentityPath:     "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:  900,
+		Libp2pConnManagerLow:   600,
+		Libp2pConnManagerGrace: time.Minute,
+		ChairListen:            "0.0.0.0:5002",
 
 		NodeName:          "",
 		MembersKubeconfig: "",
@@ -532,8 +608,20 @@ func NewDefault() *Config {
 		PrefetchCoordinatorReplicas: 3,
 		PrefetchMaxConcurrentGroups: 64,
 		PrefetchDispatchJitter:      time.Second,
-		HRWTopologyScope:            "cluster",
-		ZoneLabelKey:                "topology.kubernetes.io/zone",
+		LayerSeedConcurrency:        8,
+		LayerSeedPeerPatience:       45 * time.Minute, // peer-only seeding keeps polling the swarm instead of giving up
+		LayerSeedBudget:             time.Hour,
+		RangeCacheDir:               "/var/lib/gantry/libp2p/rangecache",
+		RangeCacheMaxBytes:          4 << 30,
+		MaxCachedRangeBytes:         4 << 20,
+		IndexPrefetchHeadBytes:      256 << 10,
+		IndexPrefetchTailBytes:      2 << 20,
+		// Measured at 1000 nodes: concurrency 16 with 500ms spread moved p90
+		// from 15s to 42s. Warming harder makes the nodes fight each other.
+		IndexPrefetchConcurrency: 8,
+		IndexPrefetchJitter:      2 * time.Second,
+		HRWTopologyScope:         "cluster",
+		ZoneLabelKey:             "topology.kubernetes.io/zone",
 
 		CoordPeerAuthzEnforce:       false,
 		CoordRequireChairAssignment: false,
@@ -544,7 +632,10 @@ func NewDefault() *Config {
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
 		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
-		AdvertiseReconcileInterval:  time.Minute,
+		// Index reads are small and on the start path; the bound here exists
+		// only to keep goroutines and disk seeks finite, not to ration bandwidth.
+		TransferMaxConcurrentRangeServes: 512,
+		AdvertiseReconcileInterval:       time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
 		NF5JitterCap:                0, // no cap by default (original behavior)
@@ -657,6 +748,17 @@ func (c *Config) LoadEnv(env func(string) string) error {
 			*dst = n
 		}
 	}
+	setInt64 := func(key string, dst *int64) {
+		if v, ok := lookup(env, key); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
+				return
+			}
+
+			*dst = n
+		}
+	}
 	setDur := func(key string, dst *time.Duration) {
 		if v, ok := lookup(env, key); ok {
 			d, err := time.ParseDuration(v)
@@ -685,6 +787,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
+	setBool("ARTIFACT_STREAMING_ENABLED", &c.ArtifactStreamingEnabled)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("PPROF_LISTEN", &c.PprofListen)
@@ -757,6 +860,15 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("PEER_REDISCOVER_BUDGET", &c.PeerRediscoverBudget)
 	setDur("PEER_REDISCOVER_BACKOFF", &c.PeerRediscoverBackoff)
 	setInt("TRANSFER_MAX_CONCURRENT_SERVES", &c.TransferMaxConcurrentServes)
+	setInt("TRANSFER_MAX_CONCURRENT_RANGE_SERVES", &c.TransferMaxConcurrentRangeServes)
+	setBool("LAYER_SEED_ORIGIN_FALLBACK", &c.LayerSeedOriginFallback)
+	setStr("RANGE_CACHE_DIR", &c.RangeCacheDir)
+	setInt64("RANGE_CACHE_MAX_BYTES", &c.RangeCacheMaxBytes)
+	setInt64("MAX_CACHED_RANGE_BYTES", &c.MaxCachedRangeBytes)
+	setInt64("INDEX_PREFETCH_HEAD_BYTES", &c.IndexPrefetchHeadBytes)
+	setInt64("INDEX_PREFETCH_TAIL_BYTES", &c.IndexPrefetchTailBytes)
+	setInt("INDEX_PREFETCH_CONCURRENCY", &c.IndexPrefetchConcurrency)
+	setDur("INDEX_PREFETCH_JITTER", &c.IndexPrefetchJitter)
 	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
@@ -784,6 +896,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
+	fs.BoolVar(&c.ArtifactStreamingEnabled, "artifact-streaming-enabled", c.ArtifactStreamingEnabled, "enable the node-local OverlayBD /blobs/ range endpoint")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
 	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
@@ -851,9 +964,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "legacy no-op membership HRW size")
 	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "legacy no-op prefetch replica count")
 	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "legacy no-op prefetch fraction")
-	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "legacy no-op prefetch coordinator count")
-	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "legacy no-op prefetch concurrency")
-	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "legacy no-op prefetch dispatch jitter")
+	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "number of deterministic chair holders allowed to dispatch manifest prefetch")
+	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "maximum simultaneous outbound manifest prefetch groups")
+	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "maximum deterministic delay before manifest prefetch dispatch")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, "legacy no-op membership HRW scope")
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "legacy no-op zone label key")
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "unsupported in Lease-chair mode; validation requires false")
@@ -865,6 +978,8 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.PeerRediscoverBudget, "peer-rediscover-budget", c.PeerRediscoverBudget, "total wall-clock budget for the peer re-discovery loop (0 disables re-discovery, restoring the single-shot provider attempt)")
 	fs.DurationVar(&c.PeerRediscoverBackoff, "peer-rediscover-backoff", c.PeerRediscoverBackoff, "pause between peer re-discovery rounds (0 uses the built-in 1s default when re-discovery is enabled)")
 	fs.IntVar(&c.TransferMaxConcurrentServes, "transfer-max-concurrent-serves", c.TransferMaxConcurrentServes, "cap on concurrent peer blob-body serves (over the cap returns 429; 0 = unlimited)")
+	fs.IntVar(&c.TransferMaxConcurrentRangeServes, "transfer-max-concurrent-range-serves", c.TransferMaxConcurrentRangeServes, "cap on concurrent small bounded-range serves, admitted separately from blob streams (0 = use the blob cap)")
+	fs.BoolVar(&c.LayerSeedOriginFallback, "layer-seed-origin-fallback", c.LayerSeedOriginFallback, "allow layer seeding to pull from origin when no peer has the layer (unsafe at fleet scale)")
 	fs.DurationVar(&c.AdvertiseReconcileInterval, "advertise-reconcile-interval", c.AdvertiseReconcileInterval, "cadence of the background DHT advertiser inventory reconcile (backstop; eager advertise handles the fast path)")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
@@ -942,6 +1057,21 @@ func (c *Config) Validate() error {
 	}
 
 	mustAddr("metrics_listen", c.MetricsListen)
+
+	if !c.RacerEnabled {
+		if c.ArtifactStreamingEnabled && len(c.ArtifactStreamingAllowedHostSuffixes) == 0 {
+			errs = append(errs, errors.New("artifact_streaming_enabled requires artifact_streaming_allowed_host_suffixes"))
+		}
+
+		for _, allowed := range c.ArtifactStreamingAllowedHostSuffixes {
+			value := strings.TrimSpace(strings.TrimSuffix(allowed, "."))
+
+			base := strings.TrimPrefix(value, ".")
+			if !validArtifactStreamingHostRule(value, base) {
+				errs = append(errs, fmt.Errorf("artifact_streaming_allowed_host_suffixes contains invalid host %q", allowed))
+			}
+		}
+	}
 
 	if c.PprofListen != "" {
 		mustAddr("pprof_listen", c.PprofListen)
@@ -1225,6 +1355,10 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("transfer_max_concurrent_serves: must be >= 0, got %d", c.TransferMaxConcurrentServes))
 	}
 
+	if c.TransferMaxConcurrentRangeServes < 0 {
+		errs = append(errs, fmt.Errorf("transfer_max_concurrent_range_serves: must be >= 0, got %d", c.TransferMaxConcurrentRangeServes))
+	}
+
 	if c.AdvertiseReconcileInterval <= 0 {
 		errs = append(errs, fmt.Errorf("advertise_reconcile_interval: must be > 0, got %v", c.AdvertiseReconcileInterval))
 	}
@@ -1288,6 +1422,30 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+func validArtifactStreamingHostRule(value, base string) bool {
+	if value == "" || base == "" || net.ParseIP(base) != nil || strings.ContainsAny(base, "*/:?#@") || len(base) > 253 {
+		return false
+	}
+
+	for _, label := range strings.Split(base, ".") {
+		if len(label) == 0 || len(label) > 63 || !isDNSAlphaNumeric(label[0]) || !isDNSAlphaNumeric(label[len(label)-1]) {
+			return false
+		}
+
+		for index := 1; index < len(label)-1; index++ {
+			if !isDNSAlphaNumeric(label[index]) && label[index] != '-' {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func isDNSAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
 // ResolveUpstream returns the UpstreamRegistry whose Name (or NSAlias)
 // equals ns. Returns false if ns does not match any configured registry.
 func (c *Config) ResolveUpstream(ns string) (UpstreamRegistry, bool) {
@@ -1307,6 +1465,8 @@ func (c *Config) Redacted() *Config {
 	cp := *c
 
 	cp.UpstreamRegistries = append([]UpstreamRegistry(nil), c.UpstreamRegistries...)
+
+	cp.ArtifactStreamingAllowedHostSuffixes = append([]string(nil), c.ArtifactStreamingAllowedHostSuffixes...)
 	for i := range cp.UpstreamRegistries {
 		endpoint := cp.UpstreamRegistries[i].Endpoint
 		if endpoint == "" {

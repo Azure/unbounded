@@ -612,6 +612,57 @@ func TestPullerPumpQueuesAtCeilingThenDeclines(t *testing.T) {
 	}
 }
 
+func TestPullerPumpReportsCommittedContent(t *testing.T) {
+	body := []byte(`{"schemaVersion":2}`)
+	d := trackerDigestOf(body)
+	originPuller := &authorizationRecordingOriginPuller{body: body, seen: make(chan string, 1)}
+	cache := fakes.NewCache()
+	gate := newPullerPumpGate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	type committedContent struct {
+		registry   string
+		repository string
+		digest     digest.Digest
+		kind       ifaces.OriginRefKind
+	}
+
+	committed := make(chan committedContent, 1)
+	pump := newPullerPump(
+		inflight.New(inflight.DefaultStalls(), nil),
+		originPuller,
+		cache,
+		nil,
+		logger,
+		gate,
+		1,
+		0,
+		func(context.Context, digest.Digest) bool { return true },
+		nil,
+		nil,
+		leaseMetricHooks{},
+		pumpMetricHooks{OnContentReady: func(_ context.Context, registry, repository string, gotDigest digest.Digest, kind ifaces.OriginRefKind) {
+			committed <- committedContent{registry: registry, repository: repository, digest: gotDigest, kind: kind}
+		}},
+	)
+
+	result := pump(context.Background(), "app.azurecr.io", "team/app", d, ifaces.KindManifest)
+	if result.Status != coord.PumpStarted {
+		t.Fatalf("status = %v, want PumpStarted", result.Status)
+	}
+
+	gate.Wait()
+
+	select {
+	case got := <-committed:
+		if got.registry != "app.azurecr.io" || got.repository != "team/app" || got.digest != d || got.kind != ifaces.KindManifest {
+			t.Fatalf("committed content = %+v, want manifest %s from app.azurecr.io/team/app", got, d)
+		}
+	default:
+		t.Fatal("committed content hook was not called")
+	}
+}
+
 func TestPullerPumpRetainsDelegatedAuthorizationForBackgroundPull(t *testing.T) {
 	body := []byte("delegated background pull")
 	d := trackerDigestOf(body)

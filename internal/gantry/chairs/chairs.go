@@ -77,6 +77,13 @@ func (c Chair) Active(now time.Time) bool {
 	return c.Selectable() && !c.Expired(now)
 }
 
+// Abandoned reports whether the holder stopped renewing long enough ago to be
+// treated as gone. It uses the same threshold as reclamation so a chair leaves
+// the selection set exactly when a live node may take it over.
+func (c Chair) Abandoned(now time.Time) bool {
+	return c.Expired(now)
+}
+
 type Snapshot struct {
 	Epoch     int64
 	Chairs    []Chair
@@ -102,6 +109,21 @@ func (s Snapshot) OccupiedCountWithin(chairCount int) int {
 	}
 
 	return count
+}
+
+// usable reports whether a chair may be dialed for work. A stale snapshot is
+// replayed cache from an API outage, so its timestamps cannot condemn a holder
+// that may well still be renewing.
+func (s Snapshot) usable(chair Chair) bool {
+	if !chair.Selectable() {
+		return false
+	}
+
+	if s.Stale || s.FetchedAt.IsZero() {
+		return true
+	}
+
+	return !chair.Abandoned(s.FetchedAt)
 }
 
 func (s Snapshot) AvailableCount() int {
@@ -168,11 +190,22 @@ func (s Snapshot) HolderChair(peerID ifaces.NodeID) (Chair, bool) {
 }
 
 func Rank(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
+	return rank(snapshot, d, chairCount, false)
+}
+
+// RankActive ranks only chairs whose holder has not expired in a fresh
+// snapshot. Streaming convergence uses it to avoid dispatching durable work to
+// nodes that have left while regular pulls retain the historical ranking.
+func RankActive(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
+	return rank(snapshot, d, chairCount, true)
+}
+
+func rank(snapshot Snapshot, d digest.Digest, chairCount int, activeOnly bool) []Chair {
 	byName := make(map[string]Chair, len(snapshot.Chairs))
 	candidates := make([]ifaces.Node, 0, min(len(snapshot.Chairs), chairCount))
 
 	for _, chair := range snapshot.Chairs {
-		if chair.ID < 0 || int(chair.ID) >= chairCount || !chair.Selectable() {
+		if chair.ID < 0 || int(chair.ID) >= chairCount || !chair.Selectable() || activeOnly && !snapshot.usable(chair) {
 			continue
 		}
 
@@ -189,7 +222,11 @@ func Rank(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
 	ranked := make([]Chair, 0, len(candidates))
 
 	for _, candidate := range scored {
-		chair := byName[string(candidate.Node.ID)]
+		chair, ok := byName[string(candidate.Node.ID)]
+		if !ok {
+			continue
+		}
+
 		ranked = append(ranked, chair)
 	}
 

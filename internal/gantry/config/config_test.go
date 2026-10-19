@@ -14,6 +14,10 @@ import (
 
 func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	c := NewDefault()
+	if c.ArtifactStreamingEnabled {
+		t.Fatal("ArtifactStreamingEnabled = true, want disabled by default")
+	}
+
 	if c.OriginPullProgressTimeout != 5*time.Minute {
 		t.Fatalf("OriginPullProgressTimeout = %v, want 5m", c.OriginPullProgressTimeout)
 	}
@@ -73,6 +77,85 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestArtifactStreamingConfig(t *testing.T) {
+	t.Run("YAML", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadYAML(strings.NewReader(`
+artifact_streaming_enabled: true
+artifact_streaming_allowed_host_suffixes:
+  - .data.azurecr.io
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !c.ArtifactStreamingEnabled || len(c.ArtifactStreamingAllowedHostSuffixes) != 1 {
+			t.Fatalf("unexpected artifact streaming config: %+v", c)
+		}
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_ARTIFACT_STREAMING_ENABLED" {
+				return "true"
+			}
+
+			return ""
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !c.ArtifactStreamingEnabled {
+			t.Fatal("artifact streaming was not enabled from the environment")
+		}
+	})
+
+	t.Run("flags", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--artifact-streaming-enabled"}); err != nil {
+			t.Fatal(err)
+		}
+
+		if !c.ArtifactStreamingEnabled {
+			t.Fatal("artifact streaming was not enabled from flags")
+		}
+	})
+}
+
+func TestValidateArtifactStreaming(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		field  string
+	}{
+		{name: "empty hosts", mutate: func(c *Config) { c.ArtifactStreamingEnabled = true; c.ArtifactStreamingAllowedHostSuffixes = nil }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "invalid host", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"https://example.com"} }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "wildcard host", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"*.example.com"} }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "empty label", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"example..com"} }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "leading hyphen", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"-bad.example"} }, field: "artifact_streaming_allowed_host_suffixes"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			test.mutate(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("Validate error = %v, want %s", err, test.field)
+			}
+		})
 	}
 }
 

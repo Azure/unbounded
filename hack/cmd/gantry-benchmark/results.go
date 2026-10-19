@@ -147,7 +147,7 @@ func (b *benchmark) gantryRevision(ctx context.Context) (string, error) {
 		ctx,
 		nil,
 		"kubectl", "-n", b.config.GantryNamespace,
-		"get", "pods", "-l", "app.kubernetes.io/name="+b.config.GantryDaemonSet,
+		"get", "pods", "-l", b.config.gantryAgentSelector(),
 		"-o", "json",
 	)
 	if err != nil {
