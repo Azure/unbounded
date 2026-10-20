@@ -74,7 +74,11 @@ They check alignment and that the transfer stays inside one bound segment,
 then pass the buffer and guard to the reactor. The reactor holds both until the
 kernel reports completion, even if the caller drops the future. Short
 transfers are errors. `fence_writes` waits until no write is in flight; it
-does not flush. `sync` fsyncs every backing descriptor.
+does not flush. The distinct backing descriptors are found once at open.
+`sync` fsyncs all of them in parallel. `sync_dirty` fsyncs, in parallel, only
+the descriptors that completed a write since their last successful sync, and
+marks them dirty again if the fsync fails. `sync_at` fsyncs the one descriptor
+behind an offset.
 
 ## Simulation
 
