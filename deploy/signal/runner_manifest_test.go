@@ -15,7 +15,7 @@ import (
 func TestRunnerProvidesWorkflowDependencies(t *testing.T) {
 	t.Parallel()
 
-	content, err := os.ReadFile("../../images/project-signal-runner/Containerfile")
+	content, err := os.ReadFile("../../project-signal-certification-runner/Containerfile")
 	require.NoError(t, err)
 
 	containerfile := string(content)
@@ -23,14 +23,17 @@ func TestRunnerProvidesWorkflowDependencies(t *testing.T) {
 		"openmpi-bin",
 		"openssh-client",
 		"openssh-server",
-		"PasswordAuthentication no",
-		"PermitRootLogin prohibit-password",
+		"dependencies.lock.json",
+		"requirements.lock",
+		"ubuntu-InRelease.sha256",
+		"validate-image.py",
 	} {
 		assert.Contains(t, containerfile, dependency)
 	}
 
 	assert.Contains(t, containerfile, "nvidia/cuda:")
 	assert.Contains(t, containerfile, "@sha256:")
+	assert.Contains(t, containerfile, "--require-hashes")
 }
 
 func TestWorkflowConfiguresEphemeralMPIHostTrust(t *testing.T) {
@@ -53,6 +56,9 @@ func TestWorkflowConfiguresEphemeralMPIHostTrust(t *testing.T) {
 
 	assert.NotContains(t, manifest, "StrictHostKeyChecking=no")
 	assert.NotContains(t, manifest, "StrictModes=no")
+	assert.Contains(t, manifest, "mpi-payload-mode")
+	assert.Contains(t, manifest, "mpi-launcher")
+	assert.Contains(t, manifest, "mpi-worker")
 }
 
 func TestWorkflowPublishesRecoveryReceiptGate(t *testing.T) {

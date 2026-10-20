@@ -1,0 +1,75 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:4b9ed5fa8361736996499f64ecebf25d4ec37ff56e4d11323ccde10aa36e0c43
+
+ARG SOURCE_DATE_EPOCH=1792115941
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+COPY dependencies.lock.json requirements.lock script-contract.json ubuntu.sources ubuntu-InRelease.sha256 fetch-sources.py validate-image.py /opt/certification-image/
+
+RUN : > /etc/apt/sources.list \
+    && for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+        if [[ -f "${source}" ]]; then rm "${source}"; fi; \
+    done \
+    && install -m 0644 /opt/certification-image/ubuntu.sources /etc/apt/sources.list.d/certification.sources \
+    && printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod 0755 /usr/sbin/policy-rc.d \
+    && apt-get update \
+    && (cd /var/lib/apt/lists && sha256sum -c /opt/certification-image/ubuntu-InRelease.sha256) \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash binutils ca-certificates cmake coreutils curl findutils fio g++ gawk gcc \
+        git grep iproute2 libgomp1 libnuma-dev libopenmpi-dev make numactl \
+        openmpi-bin openssh-client openssh-server pkg-config procps python3 python3-venv \
+        sed systemd tar util-linux xz-utils \
+    && groupadd --gid 65532 certification \
+    && useradd --uid 65532 --gid 65532 --no-log-init --no-create-home \
+        --home-dir /home/certification --shell /bin/bash certification \
+    && install -d -o 65532 -g 65532 -m 0755 /home/certification \
+    && rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub \
+        /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub \
+        /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub \
+    && apt-get clean
+
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/python3 -m pip install --no-index --no-cache-dir \
+        --only-binary=:all: --require-hashes -r /opt/certification-image/requirements.lock \
+    && /opt/venv/bin/python3 -m pip check \
+    && /opt/venv/bin/python3 /opt/certification-image/fetch-sources.py \
+        /opt/certification-image/dependencies.lock.json /opt/build \
+    && chmod 0755 /opt/certification-image/validate-image.py \
+    && ln -s libnccl.so.2 /opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so \
+    && printf '%s\n' /opt/venv/lib/python3.12/site-packages/nvidia/*/lib \
+        /usr/local/cuda/targets/x86_64-linux/lib \
+        > /etc/ld.so.conf.d/00-project-signal-certification.conf \
+    && ldconfig
+
+RUN cmake -S /opt/build/nvbandwidth -B /opt/build/nvbandwidth-build \
+        -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CUDA_ARCHITECTURES=100-real;100-virtual' \
+        -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/targets/x86_64-linux/lib/stubs \
+        -DCMAKE_SKIP_RPATH=ON -DMULTINODE=OFF \
+        -DFETCHCONTENT_SOURCE_DIR_ARGPARSE=/opt/build/argparse \
+        -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+        -DARGPARSE_BUILD_TESTS=OFF -DARGPARSE_BUILD_SAMPLES=OFF -DARGPARSE_INSTALL=OFF \
+    && cmake --build /opt/build/nvbandwidth-build --parallel 2 \
+    && install -m 0755 /opt/build/nvbandwidth-build/nvbandwidth /usr/local/bin/nvbandwidth \
+    && make -C /opt/build/nccl-tests -j2 MPI=0 CUDA_HOME=/usr/local/cuda \
+        NCCL_HOME=/opt/venv/lib/python3.12/site-packages/nvidia/nccl \
+        'NVCC_GENCODE=-gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_100,code=compute_100' \
+    && install -m 0755 /opt/build/nccl-tests/build/all_reduce_perf /usr/local/bin/all_reduce_perf \
+    && make -C /opt/build/gpu-burn -j2 CUDAPATH=/usr/local/cuda IS_JETSON=false COMPUTE=100 \
+        'NVCCFLAGS=-O3 -code=sm_100,compute_100' \
+    && install -m 0755 /opt/build/gpu-burn/gpu_burn /usr/local/bin/gpu_burn \
+    && install -D -m 0644 /opt/build/gpu-burn/compare.fatbin /opt/gpu-burn/compare.fatbin
+
+ENV PATH="/opt/venv/bin:${PATH}" \
+    GPU_BURN_COMMIT=0d19c94dcb2e9b6858b7586a4c327674cd67113b \
+    PYTHONDONTWRITEBYTECODE=1
+WORKDIR /opt/gpu-burn
+
+RUN NVIDIA_VISIBLE_DEVICES=void CUDA_VISIBLE_DEVICES="" \
+    /opt/certification-image/validate-image.py \
+    && setpriv --reuid=65532 --regid=65532 --clear-groups \
+        --bounding-set=-all --no-new-privs \
+        /opt/venv/bin/python3 -c \
+        'import runpy; runpy.run_path("/opt/certification-image/validate-image.py")["runtime_identity_check"]()'
+
+ENTRYPOINT []
+CMD ["/bin/bash"]

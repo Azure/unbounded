@@ -145,6 +145,24 @@ func TestWorkflowForRunPrefersRecordedAttempt(t *testing.T) {
 	assert.Equal(t, types.UID("current-workflow"), got.GetUID())
 }
 
+func TestRetainedWorkflowOutputsSurviveArgoTTL(t *testing.T) {
+	t.Parallel()
+
+	run := &signalv1.CertificationRun{}
+	run.Status.Workflow.Outputs = map[string]string{
+		"verdict":      "Pass",
+		"measurements": "checked=14",
+	}
+
+	got := retainedWorkflowOutputs(run, nil)
+	assert.Equal(t, "Pass", got["verdict"])
+	assert.Equal(t, "checked=14", got["measurements"])
+
+	got["verdict"] = "mutated"
+
+	assert.Equal(t, "Pass", run.Status.Workflow.Outputs["verdict"])
+}
+
 func TestRunTriggerUsesControllerAnnotation(t *testing.T) {
 	t.Parallel()
 

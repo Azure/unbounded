@@ -1,0 +1,375 @@
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfileList
+items:
+  - metadata:
+      name: signal-hardware-preflight
+      annotations:
+        signal.unbounded-cloud.io/example: replace every REPLACE_WITH_EXPLICIT value before use
+    spec:
+      participants: &singleNode
+        count: 1
+        selector:
+          matchLabels:
+            signal.unbounded-cloud.io/certification-enabled: "true"
+        requiredResources:
+          nvidia.com/gpu: "1"
+      script: {name: project-signal-certification-scripts, key: hardware-preflight.sh}
+      workflow: &scriptWorkflow {name: project-signal-script-certification}
+      backend: &podBackend {apiVersion: v1, kind: Pod}
+      runnerImage: &runnerImage {{ default "example.invalid/project-signal-certification-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
+      purpose: Preflight
+      stagePlan:
+        - {id: hardware-preflight, displayName: Hardware preflight, category: health, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        expected-hardware-json: REPLACE_WITH_EXPLICIT_HARDWARE_POLICY_JSON
+        scratch-root: /scratch
+        duration-seconds: "0"
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        gpu-resource-count: "1"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/hardware-preflight
+      deadline: 15m
+      maxAttempts: 1
+
+  - metadata: {name: signal-gpu-health-monitor}
+    spec:
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: gpu-health-monitor.sh}
+      workflow: *scriptWorkflow
+      backend: *podBackend
+      runnerImage: *runnerImage
+      purpose: TargetedVerification
+      stagePlan:
+        - {id: gpu-health-monitor, displayName: GPU health monitor, category: health, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        gpu-devices: REPLACE_WITH_EXPLICIT_GPU_ORDINALS
+        health-mode: REPLACE_WITH_snapshot_OR_monitor
+        gpu-health-c2c-mode: REPLACE_WITH_required_OR_disabled
+        gpu-health-temperature-mode: REPLACE_WITH_enforce_OR_observe
+        health-limits-json: REPLACE_WITH_EXPLICIT_LIMIT_POLICY_JSON
+        health-links-json: REPLACE_WITH_EXPLICIT_LINK_POLICY_JSON
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        sample-interval-seconds: "REPLACE_WITH_EXPLICIT_SAMPLE_INTERVAL"
+        xid-lookback-seconds: "REPLACE_WITH_EXPLICIT_LOOKBACK"
+        max-kernel-log-age-seconds: "REPLACE_WITH_EXPLICIT_MAX_AGE"
+        scratch-root: /scratch
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "true"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/gpu-health-monitor
+      deadline: 30m
+      maxAttempts: 1
+
+  - metadata: {name: signal-gpu-full-node}
+    spec:
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: gpu-full-node.sh}
+      workflow: {name: project-signal-gpu-full-node-certification}
+      backend: &mpiBackend {apiVersion: kubeflow.org/v2beta1, kind: MPIJob}
+      runnerImage: *runnerImage
+      purpose: FullCertification
+      stagePlan:
+        - {id: preflight, displayName: Inventory preflight, category: health, required: true}
+        - {id: gpu-health, displayName: Full-node GPU workload, category: compute, required: true}
+        - {id: mpi-rank-access, displayName: MPI rank access, category: communication, required: true}
+        - {id: health-after, displayName: Final health, category: health, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        mpi-payload-mode: legacy-inline
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/gpu-full-node
+      deadline: 45m
+      maxAttempts: 1
+
+  - metadata: {name: signal-gpu-full-node-mpi}
+    spec:
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: gpu-full-node-mpi.sh}
+      workflow: {name: project-signal-gpu-full-node-certification}
+      backend: *mpiBackend
+      runnerImage: *runnerImage
+      purpose: FullCertification
+      stagePlan:
+        - {id: preflight, displayName: Inventory preflight, category: health, required: true}
+        - {id: gpu-health, displayName: Full-node GPU workload, category: compute, required: true}
+        - {id: mpi-rank-access, displayName: Script-backed MPI rank access, category: communication, required: true}
+        - {id: health-after, displayName: Final health, category: health, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        mpi-payload-mode: script
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/gpu-full-node-mpi
+      deadline: 45m
+      maxAttempts: 1
+
+  - metadata: {name: signal-gpu-identity-mpi}
+    spec:
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: gpu-identity-mpi.sh}
+      workflow: {name: project-signal-gpu-certification}
+      backend: *mpiBackend
+      runnerImage: *runnerImage
+      purpose: QuickCertification
+      stagePlan:
+        - {id: gpu-identity, displayName: GPU identity, category: health, required: true}
+        - {id: mpi-backend, displayName: Script-backed MPI execution, category: communication, required: true}
+      parameters:
+        expected-gpu-count: "1"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        mpi-payload-mode: script
+        gpu-resource-count: "1"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/gpu-identity-mpi
+      deadline: 15m
+      maxAttempts: 1
+
+  - metadata: {name: signal-gpu-burn-canary}
+    spec:
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: gpu-burn-canary.sh}
+      workflow: *scriptWorkflow
+      backend: *podBackend
+      runnerImage: *runnerImage
+      purpose: FullCertification
+      stagePlan:
+        - {id: gpu-burn-canary, displayName: GPU and host burn canary, category: stress, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        burn-duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        sample-interval-seconds: "REPLACE_WITH_EXPLICIT_SAMPLE_INTERVAL"
+        power-limit-tolerance-percent: "REPLACE_WITH_EXPLICIT_TOLERANCE"
+        power-limit-consecutive-samples: "REPLACE_WITH_EXPLICIT_SAMPLE_COUNT"
+        cpu-workers: "REPLACE_WITH_EXPLICIT_WORKER_COUNT"
+        memory-mib: "REPLACE_WITH_EXPLICIT_MEMORY_MIB"
+        storage-mib: "REPLACE_WITH_EXPLICIT_STORAGE_MIB"
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "true"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/gpu-burn-canary
+      deadline: 2h
+      maxAttempts: 1
+
+  - metadata: {name: signal-cpu-stream}
+    spec:
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: cpu-stream.sh}
+      workflow: *scriptWorkflow
+      backend: *podBackend
+      runnerImage: *runnerImage
+      purpose: FullCertification
+      stagePlan:
+        - {id: cpu-stream, displayName: CPU STREAM, category: compute, required: true}
+      parameters:
+        expected-gpu-count: "1"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        scratch-root: /scratch
+        c-compiler: /usr/bin/gcc
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        stream-iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        stream-elements: "REPLACE_WITH_EXPLICIT_ELEMENT_COUNT"
+        stream-threads: "REPLACE_WITH_EXPLICIT_THREAD_COUNT"
+        stream-alpha: "REPLACE_WITH_EXPLICIT_ALPHA"
+        stream-abs-tolerance: "REPLACE_WITH_EXPLICIT_ABSOLUTE_TOLERANCE"
+        stream-rel-tolerance: "REPLACE_WITH_EXPLICIT_RELATIVE_TOLERANCE"
+        stream-max-bytes: "REPLACE_WITH_EXPLICIT_MEMORY_BUDGET"
+        cpu-list: REPLACE_WITH_EXPLICIT_CPU_SET
+        numa-nodes: REPLACE_WITH_EXPLICIT_NUMA_SET
+        expected-online-cpu-count: "REPLACE_WITH_EXPLICIT_CPU_COUNT"
+        expected-numa-node-count: "REPLACE_WITH_EXPLICIT_NUMA_COUNT"
+        expected-cpu-model-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        stream-limits-json: "{}"
+        gpu-resource-count: "0"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/cpu-stream
+      deadline: 30m
+      maxAttempts: 1
+
+  - metadata: {name: signal-fio-storage}
+    spec:
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: fio-storage.sh}
+      workflow: *scriptWorkflow
+      backend: *podBackend
+      runnerImage: *runnerImage
+      purpose: FullCertification
+      stagePlan:
+        - {id: fio-storage, displayName: FIO storage, category: storage, required: true}
+      parameters:
+        expected-gpu-count: "1"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        scratch-root: /scratch
+        expected-mount-source: REPLACE_WITH_EXPLICIT_MOUNT_SOURCE
+        expected-filesystem-type: REPLACE_WITH_EXPLICIT_FILESYSTEM
+        fio-bin: /usr/bin/fio
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION_PER_CASE"
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        fio-bytes: "REPLACE_WITH_EXPLICIT_BYTES_PER_JOB"
+        fio-block-bytes: "REPLACE_WITH_EXPLICIT_BLOCK_BYTES"
+        fio-jobs: "REPLACE_WITH_EXPLICIT_JOB_COUNT"
+        fio-iodepth: "REPLACE_WITH_EXPLICIT_IO_DEPTH"
+        fio-ioengine: REPLACE_WITH_EXPLICIT_IO_ENGINE
+        fio-direct: "REPLACE_WITH_0_OR_1"
+        fio-random-seed: "REPLACE_WITH_EXPLICIT_SEED"
+        fio-limits-json: "{}"
+        gpu-resource-count: "0"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/fio-storage
+      deadline: 30m
+      maxAttempts: 1
+
+  - metadata: {name: signal-gpu-gemm-bf16}
+    spec: &gpuCompute
+      participants: *singleNode
+      script: {name: project-signal-certification-scripts, key: gpu-gemm-bf16.sh}
+      workflow: *scriptWorkflow
+      backend: *podBackend
+      runnerImage: *runnerImage
+      purpose: FullCertification
+      stagePlan:
+        - {id: gpu-gemm-bf16, displayName: BF16 GEMM, category: compute, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        gpu-devices: REPLACE_WITH_EXPLICIT_GPU_ORDINALS
+        scratch-root: /scratch
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        memory-budget-mib: "REPLACE_WITH_EXPLICIT_MEMORY_BUDGET"
+        workspace-mib: "REPLACE_WITH_EXPLICIT_WORKSPACE"
+        gemm-m: "REPLACE_WITH_EXPLICIT_M"
+        gemm-n: "REPLACE_WITH_EXPLICIT_N"
+        gemm-k: "REPLACE_WITH_EXPLICIT_K"
+        input-seed: "REPLACE_WITH_EXPLICIT_SEED"
+        abs-tolerance: "REPLACE_WITH_EXPLICIT_ABSOLUTE_TOLERANCE"
+        rel-tolerance: "REPLACE_WITH_EXPLICIT_RELATIVE_TOLERANCE"
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/gpu-gemm-bf16
+      deadline: 1h
+      maxAttempts: 1
+
+  - metadata: {name: signal-gpu-gemm-fp8}
+    spec:
+      <<: *gpuCompute
+      script: {name: project-signal-certification-scripts, key: gpu-gemm-fp8.sh}
+      stagePlan:
+        - {id: gpu-gemm-fp8, displayName: FP8 GEMM, category: compute, required: true}
+      evidencePath: project-signal/gpu-gemm-fp8
+
+  - metadata: {name: signal-softmax-determinism}
+    spec:
+      <<: *gpuCompute
+      script: {name: project-signal-certification-scripts, key: softmax-determinism.sh}
+      stagePlan:
+        - {id: softmax-determinism, displayName: Softmax determinism, category: compute, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        gpu-devices: REPLACE_WITH_EXPLICIT_GPU_ORDINALS
+        scratch-root: /scratch
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        memory-budget-mib: "REPLACE_WITH_EXPLICIT_MEMORY_BUDGET"
+        workspace-mib: "REPLACE_WITH_EXPLICIT_WORKSPACE"
+        input-seed: "REPLACE_WITH_EXPLICIT_SEED"
+        softmax-rows: "REPLACE_WITH_EXPLICIT_ROWS"
+        softmax-columns: "REPLACE_WITH_EXPLICIT_COLUMNS"
+        softmax-dtypes: REPLACE_WITH_EXPLICIT_DTYPE_CSV
+        abs-tolerance: "REPLACE_WITH_EXPLICIT_ABSOLUTE_TOLERANCE"
+        rel-tolerance: "REPLACE_WITH_EXPLICIT_RELATIVE_TOLERANCE"
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/softmax-determinism
+
+  - metadata: {name: signal-nvbandwidth}
+    spec:
+      <<: *gpuCompute
+      script: {name: project-signal-certification-scripts, key: nvbandwidth.sh}
+      stagePlan:
+        - {id: nvbandwidth, displayName: NVBandwidth, category: communication, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        gpu-devices: REPLACE_WITH_EXPLICIT_GPU_ORDINALS
+        scratch-root: /scratch
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        nvbandwidth-cases: REPLACE_WITH_EXPLICIT_CASE_CSV
+        nvbandwidth-buffer-mib: "REPLACE_WITH_EXPLICIT_BUFFER_MIB"
+        nvbandwidth-samples: "REPLACE_WITH_EXPLICIT_SAMPLE_COUNT"
+        nvbandwidth-limits-json: "{}"
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/nvbandwidth
+
+  - metadata: {name: signal-nccl-nvlink}
+    spec: &nccl
+      <<: *gpuCompute
+      script: {name: project-signal-certification-scripts, key: nccl-nvlink.sh}
+      stagePlan:
+        - {id: nccl-nvlink, displayName: NCCL NVLink, category: communication, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        gpu-devices: REPLACE_WITH_EXPLICIT_GPU_ORDINALS
+        scratch-root: /scratch
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        nccl-message-sizes-bytes: REPLACE_WITH_EXPLICIT_SIZE_CSV
+        nccl-test-iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        nccl-warmup-iterations: "REPLACE_WITH_EXPLICIT_WARMUP"
+        nccl-min-bus-bandwidth-gbps-json: "{}"
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/nccl-nvlink
+
+  - metadata: {name: signal-nccl-backend}
+    spec:
+      <<: *nccl
+      script: {name: project-signal-certification-scripts, key: nccl-backend.sh}
+      stagePlan:
+        - {id: nccl-backend, displayName: NCCL explicit backend, category: communication, required: true}
+      parameters:
+        expected-gpu-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        expected-gpu-product-regex: REPLACE_WITH_EXPLICIT_FULLMATCH_REGEX
+        gpu-devices: REPLACE_WITH_EXPLICIT_GPU_ORDINALS
+        scratch-root: /scratch
+        command-timeout-seconds: "REPLACE_WITH_EXPLICIT_TIMEOUT"
+        duration-seconds: "REPLACE_WITH_EXPLICIT_DURATION"
+        iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        nccl-backend: REPLACE_WITH_IB_OR_Socket
+        nccl-socket-interface: REPLACE_WITH_EXPLICIT_INTERFACE
+        nccl-ib-hcas: REPLACE_WITH_EXPLICIT_HCA_PORT_CSV
+        nccl-message-sizes-bytes: REPLACE_WITH_EXPLICIT_SIZE_CSV
+        nccl-test-iterations: "REPLACE_WITH_EXPLICIT_ITERATIONS"
+        nccl-warmup-iterations: "REPLACE_WITH_EXPLICIT_WARMUP"
+        nccl-min-bus-bandwidth-gbps-json: "{}"
+        gpu-resource-count: "REPLACE_WITH_EXPLICIT_GPU_COUNT"
+        privileged: "false"
+        require-recovery-gate: "true"
+      evidencePath: project-signal/nccl-backend

@@ -1,0 +1,614 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-gpu-full-node-certification
+  namespace: {{ default "project-signal" .Namespace }}
+spec:
+  serviceAccountName: project-signal-runner
+  entrypoint: certification
+  ttlStrategy:
+    secondsAfterCompletion: 21600
+    secondsAfterSuccess: 21600
+    secondsAfterFailure: 21600
+  podGC:
+    strategy: OnWorkflowCompletion
+    deleteDelayDuration: 2h
+  arguments:
+    parameters:
+      - name: run-name
+      - name: run-uid
+      - name: participants
+      - name: participant-plan
+        value: "[]"
+      - name: test-plan
+        value: "[]"
+      - name: script-configmap
+      - name: script-key
+      - name: script-digest
+      - name: backend-api-version
+      - name: backend-kind
+      - name: queue
+      - name: runner-image
+      - name: script-environment
+        value: "{}"
+      - name: mpi-payload-mode
+        value: legacy-inline
+      - name: tolerations
+        value: >-
+          [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
+      - name: expected-gpu-product-regex
+      - name: expected-gpu-count
+      - name: observed-gpu-capacity
+      - name: observed-gpu-allocatable
+      - name: gpu-resource-count
+        value: "0"
+      - name: privileged
+        value: "false"
+      - name: attempt
+  volumes:
+    - name: scripts
+      configMap:
+        name: "{{`{{workflow.parameters.script-configmap}}`}}"
+        defaultMode: 0555
+  templates:
+    - name: certification
+      steps:
+        - - name: legacy
+            when: "{{`{{=workflow.parameters['test-plan'] == '[]'}}`}}"
+            template: legacy-certification
+          - name: planned
+            when: "{{`{{=workflow.parameters['test-plan'] != '[]'}}`}}"
+            template: planned-certification
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`workflow.parameters['test-plan'] == '[]'
+                ? (steps.legacy.status == 'Succeeded' ? steps.legacy.outputs.parameters.verdict : 'Inconclusive')
+                : (steps.planned.status == 'Succeeded' ? steps.planned.outputs.parameters.verdict : 'Inconclusive')`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`workflow.parameters['test-plan'] == '[]'
+                ? (steps.legacy.status == 'Succeeded' ? steps.legacy.outputs.parameters.reason : 'RequiredTestCoverageMissing')
+                : (steps.planned.status == 'Succeeded' ? steps.planned.outputs.parameters.reason : 'RequiredTestCoverageMissing')`}}
+
+    - name: planned-certification
+      steps:
+        - - name: node
+            template: node-tests
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{workflow.parameters.participants}}`}}"
+                - name: node-uid
+                  value: "{{`{{=jsonpath(workflow.parameters['participant-plan'], '$[0].nodeUID')}}`}}"
+                - name: observed-gpu-capacity
+                  value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
+                - name: observed-gpu-allocatable
+                  value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{steps.node.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{steps.node.outputs.parameters.reason}}`}}"
+
+    - name: node-tests
+      inputs:
+        parameters:
+          - name: node-name
+          - name: node-uid
+          - name: observed-gpu-capacity
+          - name: observed-gpu-allocatable
+      dag:
+        failFast: false
+        tasks:
+          - name: node-health
+            template: full-node-stage
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{inputs.parameters.node-name}}`}}"
+                - name: node-uid
+                  value: "{{`{{inputs.parameters.node-uid}}`}}"
+                - name: observed-gpu-capacity
+                  value: "{{`{{inputs.parameters.observed-gpu-capacity}}`}}"
+                - name: observed-gpu-allocatable
+                  value: "{{`{{inputs.parameters.observed-gpu-allocatable}}`}}"
+                - name: test-id
+                  value: preflight
+                - name: stage-name
+                  value: preflight
+                - name: gpu-count
+                  value: "1"
+          - name: gpu-health
+            depends: node-health.Succeeded
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
+            template: full-node-stage
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{inputs.parameters.node-name}}`}}"
+                - name: node-uid
+                  value: "{{`{{inputs.parameters.node-uid}}`}}"
+                - name: observed-gpu-capacity
+                  value: "{{`{{inputs.parameters.observed-gpu-capacity}}`}}"
+                - name: observed-gpu-allocatable
+                  value: "{{`{{inputs.parameters.observed-gpu-allocatable}}`}}"
+                - name: test-id
+                  value: gpu-health
+                - name: stage-name
+                  value: workload
+                - name: gpu-count
+                  value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+          - name: workload-skipped
+            depends: node-health.Succeeded
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} != Pass"
+            template: skipped-workload
+          - name: mpi-backend
+            depends: gpu-health.Succeeded
+            when: "{{`{{tasks.gpu-health.outputs.parameters.verdict}}`}} == Pass"
+            template: full-node-mpi-backend
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{inputs.parameters.node-name}}`}}"
+                - name: node-uid
+                  value: "{{`{{inputs.parameters.node-uid}}`}}"
+                - name: device-inventory
+                  value: "{{`{{tasks.gpu-health.outputs.parameters.measurements}}`}}"
+                - name: gpu-count
+                  value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+            hooks:
+              exit:
+                template: cleanup-mpi
+                arguments:
+                  parameters:
+                    - name: node-name
+                      value: "{{`{{inputs.parameters.node-name}}`}}"
+          - name: health-after
+            depends: >-
+              (node-health.Succeeded || node-health.Failed || node-health.Errored) &&
+              (gpu-health.Succeeded || gpu-health.Failed || gpu-health.Errored || gpu-health.Skipped || gpu-health.Omitted) &&
+              (mpi-backend.Succeeded || mpi-backend.Failed || mpi-backend.Errored || mpi-backend.Skipped || mpi-backend.Omitted)
+            template: full-node-stage
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{inputs.parameters.node-name}}`}}"
+                - name: node-uid
+                  value: "{{`{{inputs.parameters.node-uid}}`}}"
+                - name: observed-gpu-capacity
+                  value: "{{`{{inputs.parameters.observed-gpu-capacity}}`}}"
+                - name: observed-gpu-allocatable
+                  value: "{{`{{inputs.parameters.observed-gpu-allocatable}}`}}"
+                - name: test-id
+                  value: health-after
+                - name: stage-name
+                  value: health-after
+                - name: gpu-count
+                  value: "1"
+
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`((tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail')
+                || (tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Fail')
+                || (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail')
+                || (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail'))
+                ? 'Fail'
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? 'Pass' : 'Inconclusive')`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail'
+                ? tasks['node-health'].outputs.parameters.reason
+                : (tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Fail'
+                ? tasks['gpu-health'].outputs.parameters.reason
+                : (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail'
+                ? tasks['mpi-backend'].outputs.parameters.reason
+                : (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail'
+                ? tasks['health-after'].outputs.parameters.reason
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['gpu-health'].status == 'Succeeded' && tasks['gpu-health'].outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? 'NodeTestsPassed' : 'RequiredTestCoverageMissing'))))`}}
+
+    - name: full-node-stage
+      inputs:
+        parameters:
+          - name: node-name
+          - name: node-uid
+          - name: observed-gpu-capacity
+          - name: observed-gpu-allocatable
+          - name: test-id
+          - name: stage-name
+          - name: gpu-count
+          - name: expected-gpu-product-regex
+            default: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+          - name: expected-gpu-count
+            default: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{inputs.parameters.node-name}}`}}"
+      podSpecPatch: >-
+        {"tolerations": {{`{{workflow.parameters.tolerations}}`}},
+        "containers":[{"name":"main","resources":{"limits":{"nvidia.com/gpu":"{{`{{inputs.parameters.gpu-count}}`}}"}}}]}
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
+        env:
+          - name: PROJECT_SIGNAL_STAGE_NAME
+            value: "{{`{{inputs.parameters.stage-name}}`}}"
+          - name: EXPECTED_GPU_PRODUCT_REGEX
+            value: "{{`{{inputs.parameters.expected-gpu-product-regex}}`}}"
+          - name: EXPECTED_GPU_COUNT
+            value: "{{`{{inputs.parameters.expected-gpu-count}}`}}"
+          - name: OBSERVED_GPU_CAPACITY
+            value: "{{`{{inputs.parameters.observed-gpu-capacity}}`}}"
+          - name: OBSERVED_GPU_ALLOCATABLE
+            value: "{{`{{inputs.parameters.observed-gpu-allocatable}}`}}"
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+          - name: results
+            mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}
+      outputs:
+        parameters:
+          - name: test-id
+            value: "{{`{{inputs.parameters.test-id}}`}}"
+          - name: run-uid
+            value: "{{`{{workflow.parameters.run-uid}}`}}"
+          - name: node-name
+            value: "{{`{{inputs.parameters.node-name}}`}}"
+          - name: node-uid
+            value: "{{`{{inputs.parameters.node-uid}}`}}"
+          - name: attempt
+            value: "{{`{{workflow.parameters.attempt}}`}}"
+          - name: script-digest
+            value: "{{`{{workflow.parameters.script-digest}}`}}"
+          - name: verdict
+            valueFrom:
+              path: /results/verdict
+              default: Inconclusive
+          - name: reason
+            valueFrom:
+              path: /results/reason
+              default: MissingTestResult
+          - name: measurements
+            valueFrom:
+              path: /results/measurements.txt
+              default: ""
+
+    - name: skipped-workload
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-lc"]
+        args:
+          - >-
+            printf 'PROJECT_SIGNAL_STAGE {"name":"workload","status":"skipped","at_epoch":%s,"reason":"PreflightFailed","message":"Full-node GPU allocation was not attempted because inventory preflight failed."}\n'
+            "$(date +%s)"
+
+    - name: full-node-mpi-backend
+      inputs:
+        parameters:
+          - name: node-name
+          - name: node-uid
+          - name: test-id
+            default: mpi-rank-access
+          - name: device-inventory
+          - name: gpu-count
+      resource:
+        action: create
+        setOwnerReference: true
+        successCondition: status.replicaStatuses.Launcher.succeeded == 1
+        failureCondition: status.replicaStatuses.Launcher.failed == 1
+        manifest: |
+          apiVersion: kubeflow.org/v2beta1
+          kind: MPIJob
+          metadata:
+            name: "{{`{{=sprig.trunc(40, workflow.name)}}`}}-{{`{{=sprig.trunc(12, sprig.sha256sum(inputs.parameters['node-name']))}}`}}"
+            labels:
+              signal.unbounded-cloud.io/run: "{{`{{workflow.parameters.run-name}}`}}"
+          spec:
+            launcherCreationPolicy: WaitForWorkersReady
+            mpiImplementation: OpenMPI
+            runLauncherAsWorker: false
+            runPolicy:
+              backoffLimit: 0
+              cleanPodPolicy: All
+              ttlSecondsAfterFinished: 3600
+            slotsPerWorker: {{`{{inputs.parameters.gpu-count}}`}}
+            mpiReplicaSpecs:
+              Launcher:
+                replicas: 1
+                template:
+                  spec:
+                    restartPolicy: Never
+                    volumes:
+                      - name: scripts
+                        configMap:
+                          name: "{{`{{workflow.parameters.script-configmap}}`}}"
+                          defaultMode: 0555
+                    containers:
+                      - name: launcher
+                        image: "{{`{{workflow.parameters.runner-image}}`}}"
+                        command: ["/bin/bash", "-lc"]
+                        args:
+                          - |
+                            case "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" in
+                              script)
+                                exec /bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" mpi-launcher "${PROJECT_SIGNAL_MPI_GPU_COUNT}"
+                                ;;
+                              legacy-inline|"")
+                                exec mpirun --allow-run-as-root \
+                                  -np "${PROJECT_SIGNAL_MPI_GPU_COUNT}" \
+                                  --bind-to none --map-by slot \
+                                  -mca plm_rsh_no_tree_spawn 1 \
+                                  -mca plm_rsh_args \
+                                  "-o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/project-signal-known-hosts" \
+                                  /bin/bash -lc \
+                                  'nvidia-smi -i "${OMPI_COMM_WORLD_LOCAL_RANK}" --query-gpu=index,uuid,name,pci.bus_id,pstate,temperature.gpu --format=csv,noheader,nounits'
+                                ;;
+                              *)
+                                printf 'UnsupportedMPIPayloadMode: %s\n' "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" >&2
+                                exit 64
+                                ;;
+                            esac
+                        env:
+                          - name: PROJECT_SIGNAL_MPI_PAYLOAD_MODE
+                            value: "{{`{{=workflow.parameters['test-plan'] == '[]' ? 'legacy-inline' : workflow.parameters['mpi-payload-mode']}}`}}"
+                          - name: PROJECT_SIGNAL_SCRIPT_KEY
+                            value: "{{`{{workflow.parameters.script-key}}`}}"
+                          - name: PROJECT_SIGNAL_MPI_GPU_COUNT
+                            value: "{{`{{inputs.parameters.gpu-count}}`}}"
+                        volumeMounts:
+                          - name: scripts
+                            mountPath: /scripts
+                            readOnly: true
+              Worker:
+                replicas: 1
+                template:
+                  spec:
+                    restartPolicy: Never
+                    nodeSelector:
+                      kubernetes.io/hostname: "{{`{{inputs.parameters.node-name}}`}}"
+                    tolerations: {{`{{workflow.parameters.tolerations}}`}}
+                    volumes:
+                      - name: scripts
+                        configMap:
+                          name: "{{`{{workflow.parameters.script-configmap}}`}}"
+                          defaultMode: 0555
+                    containers:
+                      - name: worker
+                        image: "{{`{{workflow.parameters.runner-image}}`}}"
+                        command: ["/bin/bash", "-lc"]
+                        args:
+                          - |
+                            case "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" in
+                              script)
+                                exec /bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" mpi-worker
+                                ;;
+                              legacy-inline|"")
+                                install -d -m 0700 /run/project-signal-ssh &&
+                                install -m 0600 /root/.ssh/authorized_keys /run/project-signal-ssh/authorized_keys &&
+                                mkdir -p /run/sshd &&
+                                ssh-keygen -A &&
+                                exec /usr/sbin/sshd -D -e \
+                                  -o AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys
+                                ;;
+                              *)
+                                printf 'UnsupportedMPIPayloadMode: %s\n' "${PROJECT_SIGNAL_MPI_PAYLOAD_MODE}" >&2
+                                exit 64
+                                ;;
+                            esac
+                        env:
+                          - name: PROJECT_SIGNAL_MPI_PAYLOAD_MODE
+                            value: "{{`{{=workflow.parameters['test-plan'] == '[]' ? 'legacy-inline' : workflow.parameters['mpi-payload-mode']}}`}}"
+                          - name: PROJECT_SIGNAL_SCRIPT_KEY
+                            value: "{{`{{workflow.parameters.script-key}}`}}"
+                        volumeMounts:
+                          - name: scripts
+                            mountPath: /scripts
+                            readOnly: true
+                        resources:
+                          limits:
+                            nvidia.com/gpu: "{{`{{inputs.parameters.gpu-count}}`}}"
+      outputs:
+        parameters:
+          - name: test-id
+            value: "{{`{{inputs.parameters.test-id}}`}}"
+          - name: run-uid
+            value: "{{`{{workflow.parameters.run-uid}}`}}"
+          - name: node-name
+            value: "{{`{{inputs.parameters.node-name}}`}}"
+          - name: node-uid
+            value: "{{`{{inputs.parameters.node-uid}}`}}"
+          - name: attempt
+            value: "{{`{{workflow.parameters.attempt}}`}}"
+          - name: script-digest
+            value: "{{`{{workflow.parameters.script-digest}}`}}"
+          - name: verdict
+            value: Pass
+          - name: reason
+            value: MPIRankAccessPassed
+          - name: measurements
+            valueFrom:
+              jsonPath: "{.status}"
+          - name: device-inventory
+            value: "{{`{{inputs.parameters.device-inventory}}`}}"
+
+    - name: cleanup-mpi
+      inputs:
+        parameters:
+          - name: node-name
+      resource:
+        action: delete
+        flags: ["--ignore-not-found=true", "--wait=true", "--cascade=foreground"]
+        manifest: |
+          apiVersion: kubeflow.org/v2beta1
+          kind: MPIJob
+          metadata:
+            name: "{{`{{=sprig.trunc(40, workflow.name)}}`}}-{{`{{=sprig.trunc(12, sprig.sha256sum(inputs.parameters['node-name']))}}`}}"
+
+    - name: legacy-certification
+      dag:
+        tasks:
+          - name: node-health
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: preflight
+                - name: gpu-count
+                  value: "1"
+          - name: workload
+            dependencies: [node-health]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: workload
+                - name: gpu-count
+                  value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+          - name: workload-skipped
+            dependencies: [node-health]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} != Pass"
+            template: skipped-workload
+          - name: mpi-backend
+            dependencies: [workload]
+            when: "{{`{{=tasks['node-health'].outputs.parameters.verdict == 'Pass' && tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Pass'}}`}}"
+            template: full-node-mpi-backend
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{`{{workflow.parameters.participants}}`}}"
+                - name: node-uid
+                  value: ""
+                - name: gpu-count
+                  value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+                - name: device-inventory
+                  value: ""
+            hooks:
+              exit:
+                template: cleanup-mpi
+                arguments:
+                  parameters:
+                    - name: node-name
+                      value: "{{`{{workflow.parameters.participants}}`}}"
+          - name: health-after
+            dependencies: [mpi-backend]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: health-after
+                - name: gpu-count
+                  value: "1"
+          - name: health-after-preflight-failure
+            dependencies: [workload-skipped]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} != Pass"
+            template: legacy-full-node-stage
+            arguments:
+              parameters:
+                - name: stage-name
+                  value: health-after
+                - name: gpu-count
+                  value: "1"
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              expression: >-
+                {{`((tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail')
+                || (tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Fail')
+                || (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail')
+                || (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail')
+                || (tasks['health-after-preflight-failure'].status == 'Succeeded'
+                && tasks['health-after-preflight-failure'].outputs.parameters.verdict == 'Fail'))
+                ? 'Fail'
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? 'Pass' : 'Inconclusive')`}}
+          - name: reason
+            valueFrom:
+              expression: >-
+                {{`tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Fail'
+                ? tasks['node-health'].outputs.parameters.reason
+                : (tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Fail'
+                ? tasks.workload.outputs.parameters.reason
+                : (tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Fail'
+                ? tasks['mpi-backend'].outputs.parameters.reason
+                : (tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Fail'
+                ? tasks['health-after'].outputs.parameters.reason
+                : (tasks['health-after-preflight-failure'].status == 'Succeeded'
+                && tasks['health-after-preflight-failure'].outputs.parameters.verdict == 'Fail'
+                ? tasks['health-after-preflight-failure'].outputs.parameters.reason
+                : (tasks['node-health'].status == 'Succeeded' && tasks['node-health'].outputs.parameters.verdict == 'Pass'
+                && tasks.workload.status == 'Succeeded' && tasks.workload.outputs.parameters.verdict == 'Pass'
+                && tasks['mpi-backend'].status == 'Succeeded' && tasks['mpi-backend'].outputs.parameters.verdict == 'Pass'
+                && tasks['health-after'].status == 'Succeeded' && tasks['health-after'].outputs.parameters.verdict == 'Pass'
+                ? tasks['node-health'].outputs.parameters.reason : 'RequiredTestCoverageMissing')))))`}}
+
+    - name: legacy-full-node-stage
+      inputs:
+        parameters:
+          - name: stage-name
+          - name: gpu-count
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+      podSpecPatch: >-
+        {"tolerations": {{`{{workflow.parameters.tolerations}}`}},
+        "containers":[{"name":"main","resources":{"limits":{"nvidia.com/gpu":"{{`{{inputs.parameters.gpu-count}}`}}"}}}]}
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
+        env:
+          - name: PROJECT_SIGNAL_STAGE_NAME
+            value: "{{`{{inputs.parameters.stage-name}}`}}"
+          - name: EXPECTED_GPU_PRODUCT_REGEX
+            value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+          - name: EXPECTED_GPU_COUNT
+            value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+          - name: OBSERVED_GPU_CAPACITY
+            value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
+          - name: OBSERVED_GPU_ALLOCATABLE
+            value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+          - name: results
+            mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /results/verdict
+          - name: reason
+            valueFrom:
+              path: /results/reason

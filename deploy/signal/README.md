@@ -11,10 +11,12 @@ from execution:
 - An execution backend performs coordinated work. The included example uses
   Kubeflow MPI Operator `MPIJob`.
 
-This directory is an educational example, not a production hardware
-qualification suite. The included script verifies only an expected GPU product
-and count. Replace it with an organization-reviewed diagnostic before using the
-controller to make workload placement decisions.
+The default smoke profile remains an educational example. The substantive
+suite is separate: it packages 14 exact upstream scripts, one immutable script
+snapshot per `CertificationRun`, explicit policy inputs, and digest-pinned
+runner execution. `gpu-identity-example.sh` remains in the upstream source
+contract for reproducibility but is intentionally excluded from the
+substantive ConfigMap and profiles.
 
 ## Architecture
 
@@ -51,10 +53,11 @@ Controller code never contains certification script bodies.
   WorkflowTemplate.
 - Controller and dashboard images built from `cmd/project-signal-controller`
   and `cmd/project-signal-dashboard`.
-- A reviewed runner image containing Bash, `nvidia-smi`, Open MPI, and the
-  MPI Operator's SSH requirements. `images/project-signal-runner/Containerfile`
-  provides a baseline CUDA runner; publish it by immutable digest and validate
-  it against the target cluster's driver and security policy before use.
+- A reviewed runner image built from the locked inputs in
+  `project-signal-certification-runner/`. The build is native linux/amd64 only
+  and pins its CUDA base, Ubuntu snapshot, Python wheels, and source archives.
+  Publish it by immutable digest and validate it against the target cluster's
+  driver and security policy before use.
 - Exact, verified Node selector values and an explicitly approved Node list.
 
 Recovery-gated Dapple certification additionally requires:
@@ -100,6 +103,43 @@ The GB200 sample enables this gate deliberately. Its generic identity script
 does not create a receipt, so the sample cannot certify a Node as production
 eligible until a reviewed Dapple workflow adds the verifier step and publishes
 the immutable receipt ConfigMap.
+
+## Substantive certification suite
+
+`project-signal-certification/scripts/` contains the exact packaged sources.
+`make signal-manifests` generates an immutable
+`project-signal-certification-scripts` ConfigMap containing these 14 scripts:
+
+| Execution model | Scripts |
+| --- | --- |
+| One Argo `script-check` task per run | `hardware-preflight.sh`, `gpu-health-monitor.sh`, `gpu-burn-canary.sh`, `cpu-stream.sh`, `fio-storage.sh`, `gpu-gemm-bf16.sh`, `gpu-gemm-fp8.sh`, `softmax-determinism.sh`, `nvbandwidth.sh`, `nccl-nvlink.sh`, `nccl-backend.sh` |
+| Typed full-node stages plus MPI backend | `gpu-full-node.sh`, `gpu-full-node-mpi.sh` |
+| GPU identity task plus script-backed MPI backend | `gpu-identity-mpi.sh` |
+
+The generic task does not relabel commands inside a script as independent Argo
+nodes. Argo tracks the exact script invocation as one task; scripts that have a
+real multi-stage execution contract use dedicated WorkflowTemplates instead.
+Each profile selects exactly one script key, so admission snapshots only that
+script and evidence remains attributable to one exact digest.
+
+Every substantive profile is a fail-closed template:
+
+- `runnerImage` must match `name@sha256:<64 lowercase hex characters>`; mutable
+  tags are rejected before Node reservation;
+- policy values use `REPLACE_WITH_EXPLICIT_*` markers instead of universal
+  performance, temperature, topology, duration, or bandwidth thresholds;
+- the controller maps profile parameters to uppercase script environment
+  variables and rejects names that cannot be represented safely;
+- observed GPU capacity and allocatable count are copied from the admitted
+  Node into the immutable Run rather than asserted by the profile;
+- `require-recovery-gate` is `true`, so scheduling and collecting typed results
+  is possible, but a `Pass` cannot become authoritative until the separately
+  trusted verifier publishes the signed immutable receipt.
+
+Do not apply the profile list unchanged. Replace every marker with an approved
+hardware-specific policy and use an actual runner digest. A missing or
+unsupported policy must remain `Inconclusive`; it must not be replaced with a
+permissive default merely to make a test pass.
 
 ### Dapple deployment acceptance
 
@@ -169,8 +209,14 @@ make signal-manifests \
   SIGNAL_RUNNER_IMAGE=<runner-image@sha256:digest>
 ```
 
-Generated output is written to `deploy/signal/rendered/` and is intentionally
-gitignored.
+`SIGNAL_RUNNER_IMAGE` is the digest-pinned runtime reference rendered into the
+manifests. Local build and push targets use the separate mutable
+`SIGNAL_RUNNER_BUILD_IMAGE` staging tag because container engines cannot tag a
+local build with an `image@sha256:` reference.
+
+Generated output is written to `deploy/signal/rendered/`. The script ConfigMap
+is generated directly from the packaged source files; do not edit rendered
+script bodies by hand.
 
 Before applying anything, edit or overlay the example profile values:
 

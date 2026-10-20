@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +48,34 @@ const (
 	SnapshotRunLabel     = "signal.unbounded-cloud.io/run"
 	DefaultMaxAttempts   = int32(1)
 )
+
+var runnerImageDigestPattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+
+var reservedScriptEnvironmentNames = map[string]struct{}{
+	"BASH_ENV":                       {},
+	"BASHOPTS":                       {},
+	"CDPATH":                         {},
+	"ENV":                            {},
+	"GLOBIGNORE":                     {},
+	"HOST_PROC_ROOT":                 {},
+	"HOST_SYSFS_ROOT":                {},
+	"IFS":                            {},
+	"LD_LIBRARY_PATH":                {},
+	"LD_PRELOAD":                     {},
+	"PATH":                           {},
+	"PROJECT_SIGNAL_PARAMETERS_JSON": {},
+	"PROJECT_SIGNAL_RESULTS_DIR":     {},
+	"PYTHONHOME":                     {},
+	"PYTHONPATH":                     {},
+	"SHELLOPTS":                      {},
+}
+
+var workflowOutputLimits = map[string]int{
+	"measurements":               16 * 1024,
+	"reason":                     4 * 1024,
+	"recovery-receipt-configmap": 253,
+	"verdict":                    32,
+}
 
 var workflowGVK = schema.GroupVersionKind{
 	Group:   "argoproj.io",
@@ -198,6 +227,14 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		return fmt.Errorf("profile %s stage plan: %w", profile.Name, err)
 	}
 
+	if !runnerImageDigestPattern.MatchString(profile.Spec.RunnerImage) {
+		return fmt.Errorf("profile %s runner image must use an immutable sha256 digest", profile.Name)
+	}
+
+	if _, err := scriptEnvironment(profile.Spec.Parameters); err != nil {
+		return fmt.Errorf("profile %s parameters: %w", profile.Name, err)
+	}
+
 	participants, err := r.selectParticipants(ctx, node, &profile)
 	if err != nil {
 		return err
@@ -216,6 +253,30 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 			}
 		}
 	}()
+
+	parameters := make(map[string]string, len(profile.Spec.Parameters)+2)
+	for key, value := range profile.Spec.Parameters {
+		parameters[key] = value
+	}
+
+	if len(participants) == 1 {
+		var participantNode corev1.Node
+
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+
+		if err := reader.Get(ctx, client.ObjectKey{Name: participants[0].NodeName}, &participantNode); err != nil {
+			return fmt.Errorf("read admitted participant inventory: %w", err)
+		}
+
+		gpuResource := corev1.ResourceName("nvidia.com/gpu")
+		gpuCapacity := participantNode.Status.Capacity[gpuResource]
+		gpuAllocatable := participantNode.Status.Allocatable[gpuResource]
+		parameters["observed-gpu-capacity"] = gpuCapacity.String()
+		parameters["observed-gpu-allocatable"] = gpuAllocatable.String()
+	}
 
 	snapshot, scriptDigest, err := r.createSnapshot(ctx, runName, &profile)
 	if err != nil {
@@ -254,7 +315,7 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 			RunnerImage:     profile.Spec.RunnerImage,
 			Purpose:         profile.Spec.Purpose,
 			StagePlan:       append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
-			Parameters:      profile.Spec.Parameters,
+			Parameters:      parameters,
 			EvidencePath:    strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
 			Deadline:        profile.Spec.Deadline,
 			MaxAttempts:     maxAttempts,
@@ -668,6 +729,16 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		return nil, fmt.Errorf("encode Workflow tolerations: %w", err)
 	}
 
+	scriptEnvironment, err := scriptEnvironment(run.Spec.Parameters)
+	if err != nil {
+		return nil, err
+	}
+
+	scriptEnvironmentJSON, err := json.Marshal(scriptEnvironment)
+	if err != nil {
+		return nil, fmt.Errorf("encode script environment: %w", err)
+	}
+
 	name := fmt.Sprintf("%s-a%d", run.Name, attempt)
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workflowGVK.GroupVersion().String(),
@@ -706,8 +777,14 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 					map[string]any{"name": "queue", "value": run.Spec.Backend.Queue},
 					map[string]any{"name": "runner-image", "value": run.Spec.RunnerImage},
 					map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
+					map[string]any{"name": "script-environment", "value": string(scriptEnvironmentJSON)},
+					map[string]any{"name": "mpi-payload-mode", "value": run.Spec.Parameters["mpi-payload-mode"]},
 					map[string]any{"name": "expected-gpu-product-regex", "value": run.Spec.Parameters["expected-gpu-product-regex"]},
 					map[string]any{"name": "expected-gpu-count", "value": run.Spec.Parameters["expected-gpu-count"]},
+					map[string]any{"name": "observed-gpu-capacity", "value": run.Spec.Parameters["observed-gpu-capacity"]},
+					map[string]any{"name": "observed-gpu-allocatable", "value": run.Spec.Parameters["observed-gpu-allocatable"]},
+					map[string]any{"name": "gpu-resource-count", "value": run.Spec.Parameters["gpu-resource-count"]},
+					map[string]any{"name": "privileged", "value": run.Spec.Parameters["privileged"]},
 					map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
 				},
 			},
@@ -718,6 +795,59 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 	})
 
 	return workflow, nil
+}
+
+func validEnvironmentName(value string) bool {
+	if value == "" || (value[0] != '_' && (value[0] < 'A' || value[0] > 'Z')) {
+		return false
+	}
+
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if (character < 'A' || character > 'Z') &&
+			(character < '0' || character > '9') &&
+			character != '_' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func scriptEnvironment(parameters map[string]string) (map[string]string, error) {
+	keys := make([]string, 0, len(parameters))
+	for key := range parameters {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	environment := make(map[string]string, len(parameters))
+	parameterByEnvironment := make(map[string]string, len(parameters))
+
+	for _, key := range keys {
+		environmentName := strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
+		if !validEnvironmentName(environmentName) {
+			return nil, fmt.Errorf("profile parameter %q cannot be mapped to a script environment variable", key)
+		}
+
+		if strings.HasPrefix(environmentName, "PROJECT_SIGNAL_") {
+			return nil, fmt.Errorf("profile parameter %q maps to reserved environment variable %s", key, environmentName)
+		}
+
+		if _, reserved := reservedScriptEnvironmentNames[environmentName]; reserved {
+			return nil, fmt.Errorf("profile parameter %q maps to reserved environment variable %s", key, environmentName)
+		}
+
+		if previous, exists := parameterByEnvironment[environmentName]; exists {
+			return nil, fmt.Errorf("profile parameters %q and %q both map to %s", previous, key, environmentName)
+		}
+
+		parameterByEnvironment[environmentName] = key
+		environment[environmentName] = parameters[key]
+	}
+
+	return environment, nil
 }
 
 func (r *RunReconciler) retryOrFinish(
@@ -756,8 +886,19 @@ func (r *RunReconciler) finish(
 		before := run.DeepCopy()
 		run.Status.ExecutionState = executionState
 		run.Status.Verdict = verdict
+		finalReason := reason
 
-		run.Status.Reason = reason
+		if workflow != nil {
+			outputs, err := workflowParameters(workflow)
+			if err != nil {
+				run.Status.Verdict = "Inconclusive"
+				finalReason = "workflow outputs rejected: " + err.Error()
+			} else {
+				run.Status.Workflow.Outputs = outputs
+			}
+		}
+
+		run.Status.Reason = finalReason
 		if executionState == "Completed" {
 			run.Status.Workflow.Phase = "Succeeded"
 		} else {
@@ -848,27 +989,71 @@ func (r *RunReconciler) evidenceDocument(
 	}
 
 	doc := map[string]any{
-		"apiVersion":     "signal.unbounded-cloud.io/evidence/v1alpha1",
-		"runID":          string(run.UID),
-		"runName":        run.Name,
-		"profile":        run.Spec.Profile,
-		"participants":   run.Spec.Participants,
-		"workflow":       run.Status.Workflow,
-		"backend":        run.Spec.Backend,
-		"runnerImage":    run.Spec.RunnerImage,
-		"purpose":        run.Spec.Purpose,
-		"stagePlan":      run.Spec.StagePlan,
-		"parameters":     run.Spec.Parameters,
-		"scriptSnapshot": run.Spec.Script,
-		"scriptContent":  snapshot.Data[run.Spec.Script.Key],
-		"executionState": executionState,
-		"verdict":        verdict,
-		"reason":         reason,
-		"startedAt":      run.Status.StartedAt,
-		"finishedAt":     run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
+		"apiVersion":      "signal.unbounded-cloud.io/evidence/v1alpha1",
+		"runID":           string(run.UID),
+		"runName":         run.Name,
+		"profile":         run.Spec.Profile,
+		"participants":    run.Spec.Participants,
+		"workflow":        run.Status.Workflow,
+		"workflowOutputs": run.Status.Workflow.Outputs,
+		"backend":         run.Spec.Backend,
+		"runnerImage":     run.Spec.RunnerImage,
+		"purpose":         run.Spec.Purpose,
+		"stagePlan":       run.Spec.StagePlan,
+		"parameters":      run.Spec.Parameters,
+		"scriptSnapshot":  run.Spec.Script,
+		"scriptContent":   snapshot.Data[run.Spec.Script.Key],
+		"executionState":  executionState,
+		"verdict":         verdict,
+		"reason":          reason,
+		"startedAt":       run.Status.StartedAt,
+		"finishedAt":      run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
+}
+
+func workflowParameters(workflow *unstructured.Unstructured) (map[string]string, error) {
+	parameters, found, err := unstructured.NestedSlice(workflow.Object, "status", "outputs", "parameters")
+	if err != nil {
+		return nil, fmt.Errorf("read parameters: %w", err)
+	}
+
+	if !found {
+		return nil, nil
+	}
+
+	outputs := make(map[string]string, len(parameters))
+	for _, raw := range parameters {
+		parameter, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("parameter entry is not an object")
+		}
+
+		name, nameOK := parameter["name"].(string)
+		value, valueOK := parameter["value"].(string)
+
+		if !nameOK || !valueOK {
+			return nil, fmt.Errorf("parameter name and value must be strings")
+		}
+
+		limit, allowed := workflowOutputLimits[name]
+		if !allowed {
+			return nil, fmt.Errorf("unexpected parameter %q", name)
+		}
+
+		if len(value) > limit {
+			return nil, fmt.Errorf("parameter %q exceeds %d bytes", name, limit)
+		}
+
+		if _, duplicate := outputs[name]; duplicate {
+			return nil, fmt.Errorf("duplicate parameter %q", name)
+		}
+
+		outputs[name] = value
+	}
+
+	return outputs, nil
 }
 
 func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {

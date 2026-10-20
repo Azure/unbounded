@@ -80,10 +80,11 @@ type CertificationRunSpec struct {
 }
 
 type WorkflowStatus struct {
-	Name    string `json:"name,omitempty"`
-	UID     string `json:"uid,omitempty"`
-	Attempt int32  `json:"attempt,omitempty"`
-	Phase   string `json:"phase,omitempty"`
+	Name    string            `json:"name,omitempty"`
+	UID     string            `json:"uid,omitempty"`
+	Attempt int32             `json:"attempt,omitempty"`
+	Phase   string            `json:"phase,omitempty"`
+	Outputs map[string]string `json:"outputs,omitempty"`
 }
 
 type EvidenceStatus struct {

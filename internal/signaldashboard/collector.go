@@ -499,7 +499,7 @@ func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.Certificat
 		Script:        scriptStatus(run, pod),
 		ArgoTask:      argoTask,
 		WorkflowNodes: workflowNodes,
-		Outputs:       workflowOutputs(workflow),
+		Outputs:       retainedWorkflowOutputs(run, workflow),
 		MPIJob:        extractMPIJobStatus(mpiJob),
 		Participants:  participants,
 		Cleanup: CleanupStatus{
@@ -514,6 +514,24 @@ func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.Certificat
 		Partial: len(snapshot.errors) > 0,
 		Errors:  snapshot.errors,
 	}
+}
+
+func retainedWorkflowOutputs(run *signalv1.CertificationRun, workflow *unstructured.Unstructured) map[string]string {
+	outputs := workflowOutputs(workflow)
+	if len(outputs) > 0 {
+		return outputs
+	}
+
+	if len(run.Status.Workflow.Outputs) == 0 {
+		return nil
+	}
+
+	retained := make(map[string]string, len(run.Status.Workflow.Outputs))
+	for name, value := range run.Status.Workflow.Outputs {
+		retained[name] = value
+	}
+
+	return retained
 }
 
 func workflowForRun(run *signalv1.CertificationRun, workflows []unstructured.Unstructured) *unstructured.Unstructured {

@@ -25,6 +25,10 @@ spec:
       - name: backend-kind
       - name: queue
       - name: runner-image
+      - name: script-environment
+        value: "{}"
+      - name: mpi-payload-mode
+        value: legacy-inline
       - name: tolerations
         value: >-
           [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
@@ -32,6 +36,14 @@ spec:
         value: "^$"
       - name: expected-gpu-count
         value: "0"
+      - name: observed-gpu-capacity
+        value: "0"
+      - name: observed-gpu-allocatable
+        value: "0"
+      - name: gpu-resource-count
+        value: "0"
+      - name: privileged
+        value: "false"
       - name: attempt
   volumes:
     - name: scripts
@@ -134,12 +146,24 @@ spec:
                         image: "{{`{{workflow.parameters.runner-image}}`}}"
                         command: ["/bin/bash", "-lc"]
                         args:
-                          - >-
-                            mpirun --allow-run-as-root -np 1 --bind-to none
-                            --map-by slot -mca plm_rsh_no_tree_spawn 1
-                            -mca plm_rsh_args
-                            "-o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/project-signal-known-hosts"
-                            /bin/true
+                          - |
+                            if [[ "{{`{{workflow.parameters.mpi-payload-mode}}`}}" == script ]]; then
+                              exec /bin/bash "/scripts/{{`{{workflow.parameters.script-key}}`}}" mpi-launcher 1
+                            fi
+                            exec mpirun --allow-run-as-root -np 1 --bind-to none \
+                              --map-by slot -mca plm_rsh_no_tree_spawn 1 \
+                              -mca plm_rsh_args \
+                              "-o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/project-signal-known-hosts" \
+                              /bin/true
+                        volumeMounts:
+                          - name: scripts
+                            mountPath: /scripts
+                            readOnly: true
+                    volumes:
+                      - name: scripts
+                        configMap:
+                          name: "{{`{{workflow.parameters.script-configmap}}`}}"
+                          defaultMode: 0555
               Worker:
                 replicas: 1
                 template:
@@ -154,13 +178,25 @@ spec:
                         command:
                           - /bin/bash
                           - -lc
-                          - >-
+                          - |
+                            if [[ "{{`{{workflow.parameters.mpi-payload-mode}}`}}" == script ]]; then
+                              exec /bin/bash "/scripts/{{`{{workflow.parameters.script-key}}`}}" mpi-worker
+                            fi
                             install -d -m 0700 /run/project-signal-ssh &&
                             install -m 0600 /root/.ssh/authorized_keys /run/project-signal-ssh/authorized_keys &&
                             mkdir -p /run/sshd &&
                             ssh-keygen -A &&
-                            exec /usr/sbin/sshd -D -e
-                            -o AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys
+                            exec /usr/sbin/sshd -D -e \
+                              -o AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys
+                        volumeMounts:
+                          - name: scripts
+                            mountPath: /scripts
+                            readOnly: true
                         resources:
                           limits:
                             nvidia.com/gpu: "1"
+                    volumes:
+                      - name: scripts
+                        configMap:
+                          name: "{{`{{workflow.parameters.script-configmap}}`}}"
+                          defaultMode: 0555

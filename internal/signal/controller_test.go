@@ -75,6 +75,11 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 		t.Fatalf("purpose = %q, want %q", run.Spec.Purpose, signalv1.PurposeQuickCertification)
 	}
 
+	if run.Spec.Parameters["observed-gpu-capacity"] != "8" ||
+		run.Spec.Parameters["observed-gpu-allocatable"] != "8" {
+		t.Fatalf("observed GPU inventory = %#v", run.Spec.Parameters)
+	}
+
 	if run.Annotations[RunTriggerAnnotation] != "manual" {
 		t.Fatalf("trigger = %q, want manual", run.Annotations[RunTriggerAnnotation])
 	}
@@ -99,6 +104,39 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 
 	if locked.Annotations[ReservationLabel] != run.Name {
 		t.Fatalf("reservation = %q, want %q", locked.Annotations[ReservationLabel], run.Name)
+	}
+}
+
+func TestAdmissionRejectsMutableRunnerImageBeforeReservation(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	node := readyNode("gpu-0", "example-gpu")
+	node.Labels[RequestLabel] = "gpu-smoke"
+	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.RunnerImage = "registry.example/runner:latest"
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
+		Data:       map[string]string{"payload.txt": "test payload\n"},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, profile, source).Build()
+	reconciler := &AdmissionReconciler{Client: kube, Namespace: "signal", ScriptNamespace: "signal"}
+
+	_, err := reconciler.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: node.Name}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "immutable sha256 digest") {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+
+	var got corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Annotations[ReservationLabel] != "" {
+		t.Fatalf("node was reserved after rejected profile: %#v", got.Annotations)
 	}
 }
 
@@ -361,6 +399,11 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	run := testRun("run-1")
 	run.UID = types.UID("run-uid")
+	run.Spec.Parameters = map[string]string{
+		"expected-gpu-count": "8",
+		"health-mode":        "snapshot",
+		"mpi-payload-mode":   "script",
+	}
 	run.Spec.Tolerations = []corev1.Toleration{{
 		Key:      "nvidia.com/gpu",
 		Operator: corev1.TolerationOpExists,
@@ -412,6 +455,17 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		t.Fatalf("workflow tolerations = %q", values["tolerations"])
 	}
 
+	var environment map[string]string
+	if err := json.Unmarshal([]byte(values["script-environment"]), &environment); err != nil {
+		t.Fatalf("decode script environment: %v", err)
+	}
+
+	if environment["EXPECTED_GPU_COUNT"] != "8" ||
+		environment["HEALTH_MODE"] != "snapshot" ||
+		values["mpi-payload-mode"] != "script" {
+		t.Fatalf("workflow script policy = %#v, parameters = %#v", environment, values)
+	}
+
 	var tolerations []corev1.Toleration
 	if err := json.Unmarshal([]byte(values["tolerations"]), &tolerations); err != nil {
 		t.Fatalf("decode workflow tolerations: %v", err)
@@ -419,6 +473,77 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	if len(tolerations) != 1 {
 		t.Fatalf("workflow tolerations = %#v, want one deduplicated GPU toleration", tolerations)
+	}
+}
+
+func TestBuildWorkflowRejectsParameterThatCannotBecomeEnvironmentVariable(t *testing.T) {
+	t.Parallel()
+
+	run := testRun("run-invalid-parameter")
+	run.Spec.Parameters = map[string]string{"invalid.parameter": "value"}
+
+	if _, err := buildWorkflow(run, 1); err == nil ||
+		!strings.Contains(err.Error(), "cannot be mapped to a script environment variable") {
+		t.Fatalf("buildWorkflow error = %v", err)
+	}
+}
+
+func TestScriptEnvironmentRejectsCollidingParameterNames(t *testing.T) {
+	t.Parallel()
+
+	_, err := scriptEnvironment(map[string]string{
+		"gpu-devices": "0,1",
+		"gpu_devices": "2,3",
+	})
+	if err == nil || !strings.Contains(err.Error(), "both map to GPU_DEVICES") {
+		t.Fatalf("scriptEnvironment error = %v", err)
+	}
+}
+
+func TestScriptEnvironmentRejectsReservedNames(t *testing.T) {
+	t.Parallel()
+
+	for _, parameter := range []string{"path", "bash-env", "project-signal-run-uid"} {
+		_, err := scriptEnvironment(map[string]string{parameter: "value"})
+		if err == nil || !strings.Contains(err.Error(), "reserved environment variable") {
+			t.Fatalf("scriptEnvironment(%q) error = %v", parameter, err)
+		}
+	}
+}
+
+func TestWorkflowParametersRejectMalformedEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string][]any{
+		"duplicate": {
+			map[string]any{"name": "verdict", "value": "Pass"},
+			map[string]any{"name": "verdict", "value": "Fail"},
+		},
+		"unexpected": {
+			map[string]any{"name": "unbounded", "value": "value"},
+		},
+		"oversized": {
+			map[string]any{"name": "measurements", "value": strings.Repeat("x", 16*1024+1)},
+		},
+		"wrong type": {
+			map[string]any{"name": "verdict", "value": true},
+		},
+	}
+
+	for name, parameters := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			workflow := &unstructured.Unstructured{Object: map[string]any{
+				"status": map[string]any{
+					"outputs": map[string]any{"parameters": parameters},
+				},
+			}}
+
+			if _, err := workflowParameters(workflow); err == nil {
+				t.Fatal("workflowParameters succeeded")
+			}
+		})
 	}
 }
 
@@ -537,6 +662,10 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 		t.Fatalf("status = %#v", got.Status)
 	}
 
+	if got.Status.Workflow.Outputs["measurements"] != "checked=14" {
+		t.Fatalf("retained workflow outputs = %#v", got.Status.Workflow.Outputs)
+	}
+
 	if got.Status.Evidence.URI == "" || len(store.data) == 0 {
 		t.Fatal("evidence was not persisted")
 	}
@@ -548,8 +677,9 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 		t.Fatalf("decode evidence: %v", err)
 	}
 
-	if evidence.Workflow.Phase != "Succeeded" {
-		t.Fatalf("evidence workflow phase = %q, want Succeeded", evidence.Workflow.Phase)
+	if evidence.Workflow.Phase != "Succeeded" ||
+		evidence.Workflow.Outputs["measurements"] != "checked=14" {
+		t.Fatalf("evidence workflow = %#v", evidence.Workflow)
 	}
 
 	if !got.Status.Cleanup.ReservationsReleased || !got.Status.Cleanup.SnapshotDeleted {
@@ -926,6 +1056,7 @@ func readyNode(name, sku string) *corev1.Node {
 			},
 		},
 		Status: corev1.NodeStatus{
+			Capacity:    corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("8")},
 			Allocatable: corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("8")},
 			Conditions:  []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
 		},
@@ -946,7 +1077,7 @@ func testProfile(name, sku string) *signalv1.CertificationProfile {
 			Script:       signalv1.ScriptReference{Name: "scripts", Key: "payload.txt"},
 			Workflow:     signalv1.WorkflowReference{Name: "gpu-cert"},
 			Backend:      signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
-			RunnerImage:  "runner@sha256:abc",
+			RunnerImage:  "runner@sha256:" + strings.Repeat("a", 64),
 			Purpose:      signalv1.PurposeQuickCertification,
 			StagePlan:    []signalv1.CertificationStage{{ID: "workload", DisplayName: "Workload", Category: "compute", Required: true}},
 			EvidencePath: "signal/" + sku,
@@ -970,7 +1101,7 @@ func testRun(name string) *signalv1.CertificationRun {
 			Script:          signalv1.ScriptSnapshot{ConfigMapName: name + "-scripts", Key: "payload.txt", Digest: digestString("test payload\n")},
 			Workflow:        signalv1.WorkflowReference{Name: "gpu-cert"},
 			Backend:         signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
-			RunnerImage:     "runner@sha256:abc",
+			RunnerImage:     "runner@sha256:" + strings.Repeat("a", 64),
 			EvidencePath:    "signal/" + name + ".json",
 			Deadline:        metav1.Duration{Duration: 10 * time.Minute},
 			MaxAttempts:     2,
@@ -1007,6 +1138,7 @@ func workflowObject(run *signalv1.CertificationRun, phase, verdict, reason strin
 			"outputs": map[string]any{"parameters": []any{
 				map[string]any{"name": "verdict", "value": verdict},
 				map[string]any{"name": "reason", "value": reason},
+				map[string]any{"name": "measurements", "value": "checked=14"},
 			}},
 		},
 	}}

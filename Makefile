@@ -101,7 +101,8 @@ SIGNAL_DASHBOARD_IMAGE ?= example.invalid/project-signal-dashboard:replace-me
 SIGNAL_NAMESPACE ?= project-signal
 SIGNAL_RECOVERY_IMAGE ?= example.invalid/project-signal-recovery:replace-me
 SIGNAL_RECOVERY_VERIFIER_SECRET ?=
-SIGNAL_RUNNER_IMAGE ?= example.invalid/gpu-runner:replace-me
+SIGNAL_RUNNER_IMAGE ?= example.invalid/project-signal-certification-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
+SIGNAL_RUNNER_BUILD_IMAGE ?= example.invalid/project-signal-certification-runner:replace-me
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
 
@@ -1137,16 +1138,14 @@ image-project-signal-recovery-local: ## Build Project Signal recovery verifier i
 	$(call trivy-maybe,$(SIGNAL_RECOVERY_IMAGE))
 
 image-project-signal-runner-local: ## Build Project Signal GPU runner image locally
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t project-signal-runner:$(VERSION_TAG) -t $(SIGNAL_RUNNER_IMAGE) \
-		-f ./images/project-signal-runner/Containerfile .
-	$(call trivy-maybe,$(SIGNAL_RUNNER_IMAGE))
+	$(CONTAINER_ENGINE) build --platform linux/amd64 \
+		-t project-signal-runner:$(VERSION_TAG) -t $(SIGNAL_RUNNER_BUILD_IMAGE) \
+		-f ./project-signal-certification-runner/Containerfile \
+		./project-signal-certification-runner
+	$(call trivy-maybe,$(SIGNAL_RUNNER_BUILD_IMAGE))
 
 project-signal-runner-oci-push: image-project-signal-runner-local ## Build and push the Project Signal GPU runner image
-	$(CONTAINER_ENGINE) push $(SIGNAL_RUNNER_IMAGE)
+	$(CONTAINER_ENGINE) push $(SIGNAL_RUNNER_BUILD_IMAGE)
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
@@ -1231,6 +1230,9 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set DashboardImage=$(SIGNAL_DASHBOARD_IMAGE) \
 		--set RecoveryVerifierSecret=$(SIGNAL_RECOVERY_VERIFIER_SECRET) \
 		--set RunnerImage=$(SIGNAL_RUNNER_IMAGE)
+	$(GOCMD) run ./hack/cmd/render-signal-scripts \
+		--namespace $(SIGNAL_NAMESPACE) \
+		--output $(SIGNAL_MANIFEST_RENDERED_DIR)/03-certification-scripts.yaml
 	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
 	@cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (image: $(SIGNAL_CONTROLLER_IMAGE))"

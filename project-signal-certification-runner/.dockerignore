@@ -1,0 +1,10 @@
+**
+!.dockerignore
+!Containerfile
+!dependencies.lock.json
+!fetch-sources.py
+!requirements.lock
+!script-contract.json
+!ubuntu-InRelease.sha256
+!ubuntu.sources
+!validate-image.py

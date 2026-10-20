@@ -1,0 +1,212 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-script-certification
+  namespace: {{ default "project-signal" .Namespace }}
+spec:
+  serviceAccountName: project-signal-runner
+  entrypoint: certification
+  ttlStrategy:
+    secondsAfterCompletion: 21600
+    secondsAfterSuccess: 21600
+    secondsAfterFailure: 21600
+  podGC:
+    strategy: OnWorkflowCompletion
+    deleteDelayDuration: 2h
+  arguments:
+    parameters:
+      - name: run-name
+      - name: run-uid
+      - name: participants
+      - name: script-configmap
+      - name: script-key
+      - name: script-digest
+      - name: backend-api-version
+      - name: backend-kind
+      - name: queue
+      - name: runner-image
+      - name: script-environment
+        value: "{}"
+      - name: tolerations
+        value: >-
+          [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
+      - name: expected-gpu-product-regex
+        value: "^$"
+      - name: expected-gpu-count
+        value: "0"
+      - name: observed-gpu-capacity
+        value: "0"
+      - name: observed-gpu-allocatable
+        value: "0"
+      - name: gpu-resource-count
+        value: "0"
+      - name: privileged
+        value: "false"
+      - name: mpi-payload-mode
+        value: legacy-inline
+      - name: attempt
+  volumes:
+    - name: scripts
+      configMap:
+        name: "{{`{{workflow.parameters.script-configmap}}`}}"
+        defaultMode: 0555
+  templates:
+    - name: certification
+      dag:
+        tasks:
+          - name: script-check
+            template: script-check
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{tasks.script-check.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{tasks.script-check.outputs.parameters.reason}}`}}"
+          - name: measurements
+            valueFrom:
+              parameter: "{{`{{tasks.script-check.outputs.parameters.measurements}}`}}"
+          - name: recovery-receipt-configmap
+            valueFrom:
+              parameter: "{{`{{tasks.script-check.outputs.parameters.recovery-receipt-configmap}}`}}"
+
+    - name: script-check
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+      podSpecPatch: >-
+        {"hostNetwork":true,
+        "tolerations": {{`{{workflow.parameters.tolerations}}`}},
+        "containers":[{"name":"main",
+        "securityContext":{"privileged":{{`{{workflow.parameters.privileged}}`}}},
+        "resources":{"limits":{"nvidia.com/gpu":"{{`{{workflow.parameters.gpu-resource-count}}`}}"}}}]}
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -u
+            install -d -m 0755 /results
+            printf '%s' Inconclusive > /results/verdict
+            printf '%s' ScriptDidNotProduceReason > /results/reason
+            : > /results/measurements.txt
+            : > /results/recovery-receipt-configmap
+            set +e
+            python3 - "{{`{{workflow.parameters.script-environment}}`}}" \
+              "/scripts/{{`{{workflow.parameters.script-key}}`}}" <<'PY'
+            import json
+            import os
+            import re
+            import sys
+
+            values = json.loads(sys.argv[1])
+            if not isinstance(values, dict):
+                raise SystemExit("script environment must be an object")
+            for name, value in values.items():
+                if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) or not isinstance(value, str):
+                    raise SystemExit("script environment contains an invalid entry")
+                reserved = {
+                    "BASH_ENV", "BASHOPTS", "CDPATH", "ENV", "GLOBIGNORE",
+                    "HOST_PROC_ROOT", "HOST_SYSFS_ROOT", "IFS", "LD_LIBRARY_PATH",
+                    "LD_PRELOAD", "PATH", "PYTHONHOME", "PYTHONPATH", "SHELLOPTS",
+                }
+                if name.startswith("PROJECT_SIGNAL_") or name in reserved:
+                    raise SystemExit("script environment attempts to override a reserved variable")
+                os.environ[name] = value
+            os.environ["PROJECT_SIGNAL_RESULTS_DIR"] = "/results"
+            os.execvpe("/bin/bash", ["/bin/bash", sys.argv[2]], os.environ)
+            PY
+            status=$?
+            set -e
+            if [[ $status -ne 0 ]]; then
+              [[ -s /results/verdict ]] || printf '%s' Inconclusive > /results/verdict
+              [[ -s /results/reason ]] || printf 'ScriptExit%d' "$status" > /results/reason
+              printf '\nscript_exit_code=%d\n' "$status" >> /results/measurements.txt
+            fi
+        env:
+          - name: PROJECT_SIGNAL_RUN_NAME
+            value: "{{`{{workflow.parameters.run-name}}`}}"
+          - name: PROJECT_SIGNAL_RUN_UID
+            value: "{{`{{workflow.parameters.run-uid}}`}}"
+          - name: PROJECT_SIGNAL_SCRIPT_DIGEST
+            value: "{{`{{workflow.parameters.script-digest}}`}}"
+          - name: PROJECT_SIGNAL_ATTEMPT
+            value: "{{`{{workflow.parameters.attempt}}`}}"
+          - name: HOST_PROC_ROOT
+            value: /host-proc
+          - name: HOST_SYSFS_ROOT
+            value: /host-sys
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+          - name: results
+            mountPath: /results
+          - name: scratch
+            mountPath: /scratch
+          - name: work
+            mountPath: /work
+          - name: host-proc
+            mountPath: /host-proc
+            readOnly: true
+          - name: host-sys
+            mountPath: /host-sys
+            readOnly: true
+          - name: host-dev
+            mountPath: /host-dev
+            readOnly: true
+          - name: host-var-log
+            mountPath: /var/log
+            readOnly: true
+          - name: host-run-log
+            mountPath: /run/log
+            readOnly: true
+          - name: host-machine-id
+            mountPath: /etc/machine-id
+            readOnly: true
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: scratch
+          emptyDir: {}
+        - name: work
+          emptyDir: {}
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-var-log
+          hostPath:
+            path: /var/log
+            type: Directory
+        - name: host-run-log
+          hostPath:
+            path: /run/log
+            type: Directory
+        - name: host-machine-id
+          hostPath:
+            path: /etc/machine-id
+            type: File
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /results/verdict
+          - name: reason
+            valueFrom:
+              path: /results/reason
+          - name: measurements
+            valueFrom:
+              path: /results/measurements.txt
+          - name: recovery-receipt-configmap
+            valueFrom:
+              path: /results/recovery-receipt-configmap

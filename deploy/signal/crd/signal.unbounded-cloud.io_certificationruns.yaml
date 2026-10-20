@@ -347,6 +347,10 @@ spec:
                     type: integer
                   name:
                     type: string
+                  outputs:
+                    additionalProperties:
+                      type: string
+                    type: object
                   phase:
                     type: string
                   uid:
