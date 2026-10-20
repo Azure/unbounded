@@ -1574,6 +1574,43 @@ mod socket {
         assert!(drive(&reactor, watch).is_err());
     }
 
+    #[test]
+    /// A pending local wake makes wait return without sleeping, so the
+    /// cancellation scan is left to the next poll_budgeted turn.
+    fn local_wake_skips_wait_cancellation_scan() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let wake = reactor.waker().unwrap();
+        let request = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = Rc::new(Descriptor::from(socket));
+
+        let mut watch = reactor.readiness(fd, libc::POLLHUP as u32, &request);
+        assert!(poll(&mut watch).is_pending());
+        reactor.wait(Duration::ZERO).unwrap();
+        request.cancel().unwrap();
+        wake.wake().unwrap();
+
+        reactor.wait(MAX_WAIT).unwrap();
+        {
+            let state = reactor.state.borrow();
+            assert_eq!(state.wait_attempts, 0, "local wake must skip the sleep");
+            assert!(
+                !wake.fd.as_ref().unwrap().local.load(Ordering::Acquire),
+                "wait must still consume the local wake"
+            );
+            let entry = state.entries.first_key_value().unwrap().1;
+            assert!(
+                entry.completion.needs_cancel(),
+                "wait must not scan cancellations while a local wake is pending"
+            );
+        }
+        assert!(drive(&reactor, watch).is_err());
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
     #[cfg(feature = "simulation")]
     #[test]
     /// Nonzero waits check scope deadlines in the reactor's captured clock, not

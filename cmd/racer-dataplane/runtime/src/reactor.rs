@@ -1783,8 +1783,16 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     pub fn wait(&self, duration: Duration) -> Result<()> {
         // A scope cancelled during the service turn wakes nothing, and its
         // fenced operation completes only after ASYNC_CANCEL. Queue those
-        // cancels now so their CQEs end the sleep instead of the timeout.
-        if !duration.is_zero() {
+        // cancels now so their CQEs end the sleep instead of the timeout. A
+        // pending local wake skips the sleep, so the next poll_budgeted scans.
+        let local_pending = || {
+            self.state
+                .borrow()
+                .wake
+                .as_ref()
+                .is_some_and(|wake| wake.local.load(Ordering::Acquire))
+        };
+        if !duration.is_zero() && !local_pending() {
             // Scope checks read the ambient clock, so scan in the reactor's
             // captured environment exactly as poll_budgeted does.
             let _environment = self.environment.enter();
