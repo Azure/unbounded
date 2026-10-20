@@ -64,7 +64,13 @@ var componentImages = map[string][]string{
 	"gantry":          {"gantry"},
 	"metalman":        {"metalman"},
 	"token-refresher": {"token-refresher"},
-	"racer":           {"racer-controller", "racer-dataplane"},
+	"racer":           {"racer-controller", "racer-dataplane", "racer-object"},
+}
+
+// imagelessComponents are registered components that apply no workloads, only
+// RBAC or admission policy, so they have no image to cover.
+var imagelessComponents = map[string]struct{}{
+	"metalman-bootstrap": {},
 }
 
 // releaseBOMSource is the tool whose hardcoded image list feeds the signed
@@ -332,6 +338,10 @@ func TestComponentImagesCoversRegistry(t *testing.T) {
 	}
 
 	for name := range registered {
+		if _, ok := imagelessComponents[name]; ok {
+			continue
+		}
+
 		repositories, ok := componentImages[name]
 		if !ok {
 			t.Errorf(

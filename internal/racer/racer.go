@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -48,10 +49,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/authority"
+	"github.com/Azure/unbounded/internal/racer/injector"
 	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/server"
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -64,6 +67,8 @@ type Application struct {
 	Server      *server.Server
 	Lifecycle   *server.Lifecycle
 	Replication *Replication
+	// ObjectImage is the racer-object sidecar image injected by the webhook.
+	ObjectImage string
 }
 
 // Assemble performs no Kubernetes calls, I/O, cryptography, or goroutine startup.
@@ -82,6 +87,7 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 		Server:      server.New(cfg.serverConfig(), c, a, lifecycle, replication),
 		Lifecycle:   lifecycle,
 		Replication: replication,
+		ObjectImage: cfg.ObjectImage,
 	}
 }
 
@@ -112,8 +118,17 @@ func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("register HTTPS server: %w", err)
 	}
 
+	// The webhook server does not require leader election, so every replica
+	// serves sidecar injection independently of Racer leadership.
+	hooks := mgr.GetWebhookServer()
+	hooks.Register(injector.Path, &webhook.Admission{Handler: injector.NewHandler(injector.Config{Image: a.ObjectImage})})
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return fmt.Errorf("register liveness: %w", err)
+	}
+
+	if err := mgr.AddReadyzCheck("webhook", hooks.StartedChecker()); err != nil {
+		return fmt.Errorf("register webhook readiness: %w", err)
 	}
 
 	return mgr.AddReadyzCheck("racer", a.Server.Ready)
@@ -186,7 +201,21 @@ func (a *Application) Recover(ctx context.Context, writer client.Writer) error {
 }
 
 func managerOptions(cfg Config, scheme *runtime.Scheme) ctrl.Options {
+	// Validate rejects malformed addresses before the manager is built; an
+	// invalid address here yields port 0 and fails at listen time.
+	host, port, err := splitAddress(cfg.WebhookAddress)
+	if err != nil {
+		host, port = "", 0
+	}
+
 	return ctrl.Options{
+		WebhookServer: webhook.NewServer(webhook.Options{
+			Host:     host,
+			Port:     port,
+			CertDir:  filepath.Dir(cfg.TLSCertificateFile),
+			CertName: filepath.Base(cfg.TLSCertificateFile),
+			KeyName:  filepath.Base(cfg.TLSPrivateKeyFile),
+		}),
 		Scheme:                        scheme,
 		LeaderElection:                true,
 		LeaderElectionReleaseOnCancel: false,
@@ -209,6 +238,8 @@ type Config struct {
 	ControlAddress            string
 	MetricsAddress            string
 	ProbeAddress              string
+	WebhookAddress            string
+	ObjectImage               string
 	TLSCertificateFile        string
 	TLSPrivateKeyFile         string
 	PeerPort                  uint16
@@ -257,6 +288,8 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		ControlAddress:            env("RACER_CONTROL_ADDRESS", ":8443"),
 		MetricsAddress:            env("RACER_METRICS_ADDRESS", ":8080"),
 		ProbeAddress:              env("RACER_PROBE_ADDRESS", ":8081"),
+		WebhookAddress:            env("RACER_WEBHOOK_ADDRESS", ":9443"),
+		ObjectImage:               env("RACER_OBJECT_IMAGE", ""),
 		TLSCertificateFile:        env("RACER_TLS_CERTIFICATE_FILE", "/etc/racer/tls/tls.crt"),
 		TLSPrivateKeyFile:         env("RACER_TLS_PRIVATE_KEY_FILE", "/etc/racer/tls/tls.key"),
 		PeerPort:                  uint16(port),
@@ -359,6 +392,18 @@ func (c Config) Validate() error {
 		if len(validation.IsDNS1123Subdomain(name)) != 0 {
 			return fmt.Errorf("%s must be a DNS subdomain", field)
 		}
+	}
+
+	if _, _, err := splitAddress(c.WebhookAddress); err != nil {
+		return fmt.Errorf("WebhookAddress: %v", err)
+	}
+
+	if err := (injector.Config{Image: c.ObjectImage}).Validate(); err != nil {
+		return fmt.Errorf("ObjectImage: %v", err)
+	}
+
+	if filepath.Dir(c.TLSCertificateFile) != filepath.Dir(c.TLSPrivateKeyFile) {
+		return fmt.Errorf("TLS certificate and private key files must share a directory")
 	}
 
 	if c.VersionConfigMapName == c.InstallationConfigMapName {
@@ -1047,4 +1092,19 @@ func (r *Replication) PollInterval() time.Duration { return r.interval() }
 func (r *Replication) AuthenticateReplica(ctx context.Context, request *http.Request) (string, time.Time, error) {
 	identity, err := r.authority.AuthenticateReplica(ctx, request)
 	return identity.UID(), identity.Expires(), err
+}
+
+// splitAddress parses host:port with a required nonzero port.
+func splitAddress(address string) (string, int, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", 0, err
+	}
+
+	value, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || value == 0 {
+		return "", 0, fmt.Errorf("port must be an integer from 1 to 65535")
+	}
+
+	return host, int(value), nil
 }

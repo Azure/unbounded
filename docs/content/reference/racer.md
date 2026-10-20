@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [racer-object guid
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Kubernetes metadata only; no `spec` or `status` |
+| Fields | Optional `spec.origin` for an operator-managed Azure origin; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -32,8 +32,9 @@ metadata:
 
 Any ClusterCache triggers installation by the Unbounded operator, not a Site
 component flag. This resource is not a Kubernetes PersistentVolume or
-PersistentVolumeClaim (PVC), does not configure an origin or capacity, and makes
-no durability promise. Cached data is disposable. A cache's Kubernetes UID is its
+PersistentVolumeClaim (PVC), does not configure capacity, and makes no durability
+promise. It configures an origin only when `spec.origin` is set (see
+[Managed Azure origin](#managed-azure-origin)). Cached data is disposable. A cache's Kubernetes UID is its
 wire cache identity (`CacheID`).
 
 | Path on the node | Owner and purpose |
@@ -43,6 +44,61 @@ wire cache identity (`CacheID`).
 
 Pod mounts grant access: expose only the needed cache/role. Origins need existing trusted
 parent directories. Clients do not automatically bypass Racer to connect directly to origins.
+
+### Managed Azure origin
+
+Set `spec.origin` to have the operator run a `racer-object origin` DaemonSet for
+the cache. Leave it unset to deploy your own origin, as described in the
+[racer-object reference](racer-object.md#deploying-the-origin). Do not do both
+for one cache. Removing `spec.origin` removes the managed origin.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: artifacts
+spec:
+  origin:
+    buckets: [models]
+    azure:
+      accountURL: https://account.blob.core.windows.net
+      credential:
+        workloadIdentity:
+          clientID: 00000000-0000-0000-0000-000000000000
+```
+
+| Field | Meaning |
+|-------|---------|
+| `buckets` | Required. 1 to 64 blob container names the origin may read |
+| `metadataTTL` | Optional. How long object metadata is reused; not negative |
+| `requestTimeout` | Optional. Limit for each upstream request; positive |
+| `maxConcurrentRequests` | Optional. Upstream requests per origin pod, 1 to 65536 |
+| `azure.accountURL` | Required. Blob account URL; `http` or `https`, no credentials, query, or fragment |
+| `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
+| `azure.credential.default` | `DefaultAzureCredential`. Optional `clientID` for a user-assigned managed identity, or `secretRef` to a Secret in the operator namespace whose keys become environment variables |
+| `azure.credential.workloadIdentity` | Microsoft Entra Workload ID. Requires `clientID`, optional `tenantID`. The cluster must run the Azure Workload Identity webhook, and the identity must trust the origin ServiceAccount |
+
+Unset optional fields use the `racer-object` defaults.
+
+The operator names the DaemonSet and its ServiceAccount `racer-origin-<cache>`
+in the Racer namespace. It copies node affinity, node selector, tolerations, and
+image pull secrets from the `racer-dataplane` DaemonSet, and waits until that
+DaemonSet exists. The origin runs as UID and GID 65532 and serves
+`/run/racer/<cache>/origin/socket`, which the dataplane creates.
+
+The origin's cache namespace is the account URL with a lowercase scheme and host,
+no default port, and no trailing slash, for example
+`https://account.blob.core.windows.net`. Sidecars must use the same values:
+
+| Sidecar annotation | Value |
+|--------------------|-------|
+| `racer.unbounded-cloud.io/object-namespace` | The normalized account URL |
+| `racer.unbounded-cloud.io/object-cache` | The ClusterCache name |
+| `racer.unbounded-cloud.io/object-buckets` | A subset of `spec.origin.buckets` |
+
+If the spec is not valid, the operator skips that origin and reports
+`OriginInvalid`. It reports `OriginPending` while the dataplane DaemonSet is
+missing.
 
 ## Node requirements
 
@@ -60,8 +116,15 @@ runs a privileged UID 0 container with these host paths:
 Do not turn off cluster-wide admission protections. Authorize these workloads
 narrowly. RDMA is optional; see [RDMA](#rdma).
 
-Racer origins run as UID/GID 0 to match the root dataplane's `0600` socket. They
-do not need privileged mode. Run exactly one origin owner per cache on every
+Racer origins run as the non-root UID/GID 65532 and do not need privileged mode.
+For each cache, the dataplane creates `/run/racer/<name>/origin` owned by
+UID/GID 65532 with mode `0700`, and repairs its owner and mode on every cache
+setup. Origins do not create this directory: mount it with hostPath type
+`Directory`, so origin pods wait until the dataplane has created it. The origin
+creates its socket with mode `0600`; the privileged dataplane can still connect.
+When the dataplane takes over a directory left by an older root origin, it
+re-owns that origin's leftover lock, socket, and staging entries to UID/GID 65532
+instead of deleting them, so the new origin can recover them. Run exactly one origin owner per cache on every
 eligible node that can supply origin reads, not only on nodes that read. A
 DaemonSet with the same placement and tolerations as Racer does this. Every
 origin must return the same bytes for the same key and version. Never delete a
@@ -709,7 +772,7 @@ for server limits, partial failures, and restart behavior.
 | Socket | Path |
 |--------|------|
 | Client | `/run/racer/<name>/client/socket` |
-| Origin | `/run/racer/<name>/origin/socket`, mode `0600` |
+| Origin | `/run/racer/<name>/origin/socket`, mode `0600`, in a dataplane-created directory owned by UID/GID 65532 with mode `0700` |
 
 For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
 noncaching fake Racer. It does not test distributed or RDMA behavior.

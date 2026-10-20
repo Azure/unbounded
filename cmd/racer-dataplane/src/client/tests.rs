@@ -155,7 +155,7 @@ mod directory {
         assert_eq!(after.mode() & 0o7777, mode);
     }
     #[test]
-    fn startup_hardens_existing_client_directory_without_changing_ancestors() {
+    fn startup_hardens_existing_client_directory_and_origin_without_changing_ancestors() {
         for mode in [0o777, 0o775, 0o757, 0o770, 0o722, 0o2775, 0o1777] {
             let fixture = Fixture::new();
             let path = fixture.socket().parent().unwrap().to_owned();
@@ -169,10 +169,16 @@ mod directory {
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
             let before = fs::metadata(&path).unwrap();
             fixture.reconcile(&[definition()]).unwrap();
-            assert_identity(&before, &fs::metadata(&path).unwrap(), mode & !0o022);
-            for ancestor in [&fixture.root.0, cache, &origin] {
+            assert_identity(
+                &before,
+                &fs::metadata(&path).unwrap(),
+                (mode & !0o022) | 0o011,
+            );
+            for ancestor in [&fixture.root.0, cache] {
                 assert_eq!(fs::metadata(ancestor).unwrap().mode() & 0o7777, 0o777);
             }
+            // The dataplane owns the origin directory layout and makes it private.
+            assert_eq!(fs::metadata(&origin).unwrap().mode() & 0o7777, 0o700);
             assert_eq!(
                 fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
                 0o666
@@ -192,7 +198,7 @@ mod directory {
     fn secure_client_directory_permissions_are_unchanged() {
         // Generic mode combinations live in uds-endpoint. Keep adapter coverage
         // for read-only/sticky modes and no metadata mutation on the first call.
-        for mode in [0o755, 0o500, 0o1700] {
+        for mode in [0o755, 0o711, 0o751, 0o511, 0o1711] {
             let root = Root::new();
             let directory = open_directory(&root.0).unwrap();
             directory
@@ -211,6 +217,147 @@ mod directory {
                 .set_permissions(fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
+    }
+    #[test]
+    fn client_directory_preparation_grants_search_only() {
+        // Root origins used to leave 0700 or 0750 client directories, which
+        // nonroot SDK clients cannot traverse to reach the 0666 socket.
+        for (mode, wanted) in [
+            (0o700, 0o711),
+            (0o750, 0o751),
+            (0o500, 0o511),
+            (0o1700, 0o1711),
+            (0o2750, 0o2751),
+            (0o770, 0o751),
+            (0o707, 0o715),
+            (0o000, 0o011),
+        ] {
+            let root = Root::new();
+            let parent = open_directory(&root.0).unwrap();
+            let directory = child_directory(&parent, b"client").unwrap();
+            directory
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .unwrap();
+            let before = directory.metadata().unwrap();
+            prepare_client_directory(&directory).unwrap();
+            let first = directory.metadata().unwrap();
+            assert_identity(&before, &first, wanted);
+            // Idempotent: the second call changes no metadata.
+            prepare_client_directory(&directory).unwrap();
+            let second = directory.metadata().unwrap();
+            assert_identity(&first, &second, wanted);
+            assert_eq!(
+                (second.ctime(), second.ctime_nsec()),
+                (first.ctime(), first.ctime_nsec())
+            );
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+    }
+    #[test]
+    fn client_directory_search_grant_keeps_pinned_inode() {
+        let root = Root::new();
+        let parent = open_directory(&root.0).unwrap();
+        let directory = child_directory(&parent, b"client").unwrap();
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let path = root.0.join("client");
+        let moved = root.0.join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_client_directory(&directory).unwrap();
+        assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o711);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o700);
+    }
+    /// Installs `fd` as descriptor 3 without close-on-exec. `dup2(3, 3)` is a
+    /// no-op that keeps FD_CLOEXEC, so the flag is cleared explicitly.
+    /// Must only call async-signal-safe functions; it runs in `pre_exec`.
+    fn inherit_as_fd3(fd: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: dup2 and fcntl are async-signal-safe and touch only fds.
+        unsafe {
+            if libc::dup2(fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(3, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn inherit_as_fd3_survives_exec_for_self_and_other_descriptors() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        let root = Root::new();
+        let directory = open_directory(&root.0).unwrap();
+        // Move the source to fd >= 4 so the normal case never self-dups.
+        // SAFETY: F_DUPFD_CLOEXEC returns a new fd that OwnedFd then owns.
+        use std::os::fd::FromRawFd;
+        let high = unsafe {
+            let raw = libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4);
+            assert!(raw >= 4, "{}", std::io::Error::last_os_error());
+            std::os::fd::OwnedFd::from_raw_fd(raw)
+        };
+        let fd = high.as_raw_fd();
+        for self_dup in [false, true] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "test -d /proc/self/fd/3"]);
+            // SAFETY: dup3 and inherit_as_fd3 only call async-signal-safe
+            // syscalls. The self-dup case first places a close-on-exec copy at
+            // fd 3 so inherit_as_fd3 deterministically sees dup2(3, 3).
+            unsafe {
+                command.pre_exec(move || {
+                    if !self_dup {
+                        return inherit_as_fd3(fd);
+                    }
+                    if libc::dup3(fd, 3, libc::O_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    inherit_as_fd3(3)
+                });
+            }
+            assert!(command.status().unwrap().success(), "self_dup={self_dup}");
+        }
+    }
+    #[test]
+    fn nonroot_client_can_traverse_migrated_client_directory_when_root() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let root = Root::new();
+        let parent = open_directory(&root.0).unwrap();
+        let directory = child_directory(&parent, b"client").unwrap();
+        fs::write(root.0.join("client").join("probe"), b"").unwrap();
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
+        // Reach the directory through an inherited descriptor so ancestors of
+        // the test root do not affect the result.
+        let probe = |directory: &File| {
+            let fd = directory.as_raw_fd();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "test -e /proc/self/fd/3/probe"]);
+            // SAFETY: inherit_as_fd3 only calls async-signal-safe syscalls.
+            // Command drops supplementary groups itself when uid is set.
+            unsafe {
+                command.pre_exec(move || inherit_as_fd3(fd));
+            }
+            command.uid(65532).gid(65532).status().unwrap().success()
+        };
+        assert!(!probe(&directory));
+        prepare_client_directory(&directory).unwrap();
+        assert!(probe(&directory));
+        let after = directory.metadata().unwrap();
+        assert_eq!((after.uid(), after.mode() & 0o7777), (0, 0o711));
     }
     #[test]
     fn client_directory_preparation_pins_inode_across_path_replacement() {
@@ -252,6 +399,19 @@ mod directory {
             .unwrap();
         assert_eq!(prepare_client_directory(&directory), Err(Error::Io));
         assert_eq!(directory.metadata().unwrap().mode() & 0o7777, 0o777);
+        // A secure 0700 directory passes restrict_directory without chmod, so
+        // this reaches the fchmod in the search grant.
+        let secure = root.0.join("secure");
+        fs::create_dir(&secure).unwrap();
+        fs::set_permissions(&secure, fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&secure)
+            .unwrap();
+        let before = pinned.metadata().unwrap();
+        assert_eq!(prepare_client_directory(&pinned), Err(Error::Io));
+        assert_identity(&before, &pinned.metadata().unwrap(), 0o700);
         let link = root.0.join("link");
         std::os::unix::fs::symlink(&root.0, &link).unwrap();
         let link = OpenOptions::new()
@@ -2947,8 +3107,9 @@ fn prepared_rename_failure_restores_already_exchanged_paths() {
 fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
     let fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();
+    // The dataplane created the origin directory; the adapter owns its socket.
     let origin = fixture.root.0.join("example/origin");
-    fs::create_dir(&origin).unwrap();
+    assert!(fs::symlink_metadata(&origin).unwrap().is_dir());
     fs::write(origin.join("socket"), b"origin").unwrap();
     let mut replacement = definition();
     replacement.id = CacheId("00000000-0000-4000-8000-000000000002".into());

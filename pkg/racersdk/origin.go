@@ -150,12 +150,13 @@ func (c OriginConfig) limits() (originLimits, error) {
 // created. A process that exits without returning leaves the socket behind;
 // see [OriginConfig.RecoverStaleSocket].
 //
-// ServeOrigin does not need root. It needs write and search permission on
-// the socket directory, where it creates the socket with mode 0600, owned by
-// its effective user. Only a process with that user, or one allowed to
-// bypass file permissions such as root with CAP_DAC_OVERRIDE, can connect to
-// it, so the Racer dataplane must run as the same user as the origin or with
-// that capability.
+// ServeOrigin does not need root and does not create directories. The
+// socket directory /run/racer/<cache>/origin must already exist, be owned by
+// the effective user, and not be group or other writable. The Racer
+// dataplane creates it owned by UID/GID 65532 with mode 0700, so origins must
+// run as that user. ServeOrigin creates the socket there with mode 0600,
+// owned by its effective user. The privileged dataplane connects to it
+// through CAP_DAC_OVERRIDE.
 func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error {
 	name, err := cacheName(config.Cache)
 	if err != nil {

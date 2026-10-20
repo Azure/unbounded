@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -127,7 +128,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	})
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	// Test healthz
@@ -149,7 +150,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 
 	// Test serving cached file (with source IP identification)
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+	req.Header.Set(testPeerHeader, "10.0.1.50")
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -169,7 +170,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 
 	// Test 404 for unknown file
 	req, _ = http.NewRequest("GET", ts.URL+"/nonexistent/foo", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+	req.Header.Set(testPeerHeader, "10.0.1.50")
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -281,11 +282,11 @@ func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /", srv.handleFile)
 
-			ts := httptest.NewServer(mux)
+			ts := newTestPeerServer(mux)
 			defer ts.Close()
 
 			req, _ := http.NewRequest("GET", ts.URL+"/"+tt.path, nil)
-			req.Header.Set("X-Forwarded-For", "10.0.1.60")
+			req.Header.Set(testPeerHeader, "10.0.1.60")
 
 			resp, err := http.DefaultClient.Do(req)
 			require.NoError(t, err)
@@ -337,7 +338,7 @@ func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	tests := []struct {
@@ -355,7 +356,7 @@ func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
 			req, _ := http.NewRequest("GET", ts.URL+"/"+tt.path, nil)
-			req.Header.Set("X-Forwarded-For", "10.0.1.61")
+			req.Header.Set(testPeerHeader, "10.0.1.61")
 
 			resp, err := http.DefaultClient.Do(req)
 			require.NoError(t, err)
@@ -405,11 +406,11 @@ func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/revocations.efi", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.62")
+	req.Header.Set(testPeerHeader, "10.0.1.62")
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -458,11 +459,11 @@ menuentry "Install" {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/grub/grub.cfg", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.10")
+	req.Header.Set(testPeerHeader, "10.0.1.10")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -522,11 +523,11 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/network-config", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.51")
+	req.Header.Set(testPeerHeader, "10.0.1.51")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -580,11 +581,11 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/network-config", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.52")
+	req.Header.Set(testPeerHeader, "10.0.1.52")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -624,12 +625,12 @@ func TestHTTPServer_UnknownSourceIP(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	// No node registered -- requests from any IP should get 404
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.99.99.99")
+	req.Header.Set(testPeerHeader, "10.99.99.99")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -733,11 +734,11 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+	req.Header.Set(testPeerHeader, "10.0.1.50")
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -746,7 +747,7 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 	require.Empty(t, recorder.bootImageWrittenEvents())
 
 	req, _ = http.NewRequest("GET", ts.URL+"/disk.img.gz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+	req.Header.Set(testPeerHeader, "10.0.1.50")
 
 	resp, err = http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -758,7 +759,7 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 	require.Empty(t, recorder.bootImageWrittenEvents())
 
 	req, _ = http.NewRequest("GET", ts.URL+"/missing", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+	req.Header.Set(testPeerHeader, "10.0.1.50")
 
 	resp, err = http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -800,11 +801,11 @@ func TestHTTPServer_UsesMachineImageForBootFilesWhenNetbootImageUnset(t *testing
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+	req.Header.Set(testPeerHeader, "10.0.1.50")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1162,12 +1163,12 @@ func TestHTTPServer_NetworkConfigOmitsGatewayAndInvalidDNS(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", server.handleFile)
 
-	httpServer := httptest.NewServer(mux)
+	httpServer := newTestPeerServer(mux)
 	defer httpServer.Close()
 
 	request, err := http.NewRequest(http.MethodGet, httpServer.URL+"/cloud-init/network-config", nil)
 	require.NoError(t, err)
-	request.Header.Set("X-Forwarded-For", "10.0.1.20")
+	request.Header.Set(testPeerHeader, "10.0.1.20")
 	response, err := http.DefaultClient.Do(request)
 	require.NoError(t, err)
 
@@ -1936,11 +1937,11 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.9.11")
+	req.Header.Set(testPeerHeader, "10.0.9.11")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2013,11 +2014,11 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.9.10")
+	req.Header.Set(testPeerHeader, "10.0.9.10")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2331,9 +2332,12 @@ func TestClientIP(t *testing.T) {
 		remote   string
 		expected string
 	}{
-		{"forwarded", "10.0.1.10", "192.168.1.1:1234", "10.0.1.10"},
-		{"forwarded multiple", "10.0.1.10, 192.168.1.1", "192.168.1.1:1234", "10.0.1.10"},
+		{"forwarded ignored", "10.0.1.10", "192.168.1.1:1234", "192.168.1.1"},
+		{"forwarded multiple ignored", "10.0.1.10, 192.168.1.1", "192.168.1.2:1234", "192.168.1.2"},
 		{"remote only", "", "10.0.1.10:1234", "10.0.1.10"},
+		{"ipv6", "", "[2001:db8::1]:1234", "2001:db8::1"},
+		{"missing port", "", "10.0.1.10", "10.0.1.10"},
+		{"empty", "", "", ""},
 	}
 
 	for _, tt := range tests {
@@ -2344,6 +2348,8 @@ func TestClientIP(t *testing.T) {
 			}
 			if tt.fwdFor != "" {
 				r.Header.Set("X-Forwarded-For", tt.fwdFor)
+				r.Header.Set("X-Real-IP", tt.fwdFor)
+				r.Header.Set("Forwarded", "for="+tt.fwdFor)
 			}
 
 			got := clientIP(r)
@@ -2403,12 +2409,12 @@ menuentry "Install {{ .Machine.Name }}" {
 	})
 	mux.HandleFunc("GET /", httpSrv.handleFile)
 
-	httpTS := httptest.NewServer(mux)
+	httpTS := newTestPeerServer(mux)
 	defer httpTS.Close()
 
 	// Test vmlinuz via HTTP
 	req, _ := http.NewRequest("GET", httpTS.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.3.10")
+	req.Header.Set(testPeerHeader, "10.0.3.10")
 	resp, _ := http.DefaultClient.Do(req)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -2419,7 +2425,7 @@ menuentry "Install {{ .Machine.Name }}" {
 
 	// Test boot config (template rendered)
 	req, _ = http.NewRequest("GET", httpTS.URL+"/grub/grub.cfg", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.3.10")
+	req.Header.Set(testPeerHeader, "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -2430,7 +2436,7 @@ menuentry "Install {{ .Machine.Name }}" {
 
 	// Test default user-data (no ConfigMap configured, so metalman returns built-in default)
 	req, _ = http.NewRequest("GET", httpTS.URL+"/cloud-init/user-data", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.3.10")
+	req.Header.Set(testPeerHeader, "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -2441,7 +2447,7 @@ menuentry "Install {{ .Machine.Name }}" {
 
 	// Test 404 for file not in this image
 	req, _ = http.NewRequest("GET", httpTS.URL+"/nonexistent/foo", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.3.10")
+	req.Header.Set(testPeerHeader, "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	resp.Body.Close()
 
@@ -2490,7 +2496,7 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	for _, tt := range []struct {
@@ -2501,7 +2507,7 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 		{path: "/vmlinuz", want: netbootData},
 	} {
 		req, _ := http.NewRequest("GET", ts.URL+tt.path, nil)
-		req.Header.Set("X-Forwarded-For", "10.0.30.10")
+		req.Header.Set(testPeerHeader, "10.0.30.10")
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -2572,12 +2578,12 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	// Alpha node can access its own image's files
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.10.1")
+	req.Header.Set(testPeerHeader, "10.0.10.1")
 	resp, _ := http.DefaultClient.Do(req)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -2592,7 +2598,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 
 	// Beta node can access its own image's files
 	req, _ = http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.10.2")
+	req.Header.Set(testPeerHeader, "10.0.10.2")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -2662,7 +2668,7 @@ func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	for _, tt := range []struct {
@@ -2673,7 +2679,7 @@ func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
 		{ip: "10.0.20.2", want: "arm64-vmlinuz"},
 	} {
 		req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-		req.Header.Set("X-Forwarded-For", tt.ip)
+		req.Header.Set(testPeerHeader, tt.ip)
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -2721,12 +2727,12 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	// File not yet pulled -- should get 503
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.5.10")
+	req.Header.Set(testPeerHeader, "10.0.5.10")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2794,12 +2800,12 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 	mux.HandleFunc("POST /pxe/disable", srv.handleDisablePXE)
 	mux.HandleFunc("GET /pxe/disable", srv.handleDisablePXE)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	// Disable PXE via GET (matches busybox wget behavior in initrd)
 	req, _ := http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.6.10")
+	req.Header.Set(testPeerHeader, "10.0.6.10")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2818,7 +2824,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 
 	// Second call should be idempotent (still 200)
 	req, _ = http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.6.10")
+	req.Header.Set(testPeerHeader, "10.0.6.10")
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -2861,11 +2867,11 @@ func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /pxe/disable", srv.handleDisablePXE)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.6.11")
+	req.Header.Set(testPeerHeader, "10.0.6.11")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2896,11 +2902,11 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 	mux.HandleFunc("POST /pxe/disable", srv.handleDisablePXE)
 	mux.HandleFunc("GET /pxe/disable", srv.handleDisablePXE)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
-	req.Header.Set("X-Forwarded-For", "10.99.99.99")
+	req.Header.Set(testPeerHeader, "10.99.99.99")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3194,13 +3200,13 @@ func TestHandleCloudInitLog(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(tt.body))
-			req.Header.Set("X-Forwarded-For", "10.0.1.50")
+			req.Header.Set(testPeerHeader, "10.0.1.50")
 
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -3409,13 +3415,13 @@ func TestInstallLogEndpointAcceptsPlainTextWithoutRecordingCondition(t *testing.
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /unbounded-agent/install-log", srv.handleInstallLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := "unbounded-agent install exited with status 42\n\nlast 120 lines of /var/log/unbounded-agent-install.log:\nfailed to download agent"
 	req, _ := http.NewRequest("POST", ts.URL+"/unbounded-agent/install-log", strings.NewReader(body))
 	req.Header.Set("Content-Type", "text/plain")
-	req.Header.Set("X-Forwarded-For", "10.0.20.18")
+	req.Header.Set(testPeerHeader, "10.0.20.18")
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -3453,12 +3459,12 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := `{"name":"init-local","description":"starting init-local","event_type":"start","origin":"cloudinit","timestamp":1775657336.0}`
 	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-	req.Header.Set("X-Forwarded-For", "10.0.20.10")
+	req.Header.Set(testPeerHeader, "10.0.20.10")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3515,12 +3521,12 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := `{"name":"modules-final","description":"modules-final ran successfully and took 1.23 seconds","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
 	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-	req.Header.Set("X-Forwarded-For", "10.0.20.11")
+	req.Header.Set(testPeerHeader, "10.0.20.11")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3581,12 +3587,12 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := `{"name":"modules-config","description":"running modules-config","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"FAIL: command [apt-get install -y badpkg] failed with exit code 100"}`
 	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-	req.Header.Set("X-Forwarded-For", "10.0.20.12")
+	req.Header.Set(testPeerHeader, "10.0.20.12")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3629,12 +3635,12 @@ func TestCloudInitCondition_NoClientSkipsUpdate(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
 	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-	req.Header.Set("X-Forwarded-For", "10.0.20.99")
+	req.Header.Set(testPeerHeader, "10.0.20.99")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3668,12 +3674,12 @@ func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
 	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-	req.Header.Set("X-Forwarded-For", "10.99.99.99")
+	req.Header.Set(testPeerHeader, "10.99.99.99")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3721,12 +3727,12 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
 	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-	req.Header.Set("X-Forwarded-For", "10.0.20.15")
+	req.Header.Set(testPeerHeader, "10.0.20.15")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3772,14 +3778,14 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	postEvent := func(body string) {
 		t.Helper()
 
 		req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-		req.Header.Set("X-Forwarded-For", "10.0.20.13")
+		req.Header.Set(testPeerHeader, "10.0.20.13")
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -3869,14 +3875,14 @@ func TestHTTPServerRecordsCloudInitDoneOnlyOnFinalSuccess(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	postEvent := func(body string) {
 		t.Helper()
 
 		req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-		req.Header.Set("X-Forwarded-For", "10.0.20.16")
+		req.Header.Set(testPeerHeader, "10.0.20.16")
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -3928,12 +3934,12 @@ func TestHTTPServerDoesNotRecordCloudInitDoneOnFailure(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
 
-	ts := httptest.NewServer(mux)
+	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
 	body := `{"name":"modules-final","description":"running modules-final","event_type":"finish","origin":"cloudinit","timestamp":1.0,"result":"FAIL: command [apt-get install -y badpkg] failed with exit code 100"}`
 	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
-	req.Header.Set("X-Forwarded-For", "10.0.20.17")
+	req.Header.Set(testPeerHeader, "10.0.20.17")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -4058,4 +4064,46 @@ func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
 	}
 
 	t.Fatalf("timed out waiting for %s", url)
+}
+
+func TestResolveFile_AgentConfigPinsNodeName(t *testing.T) {
+	cases := []struct {
+		name       string
+		kubernetes *v1alpha3.KubernetesSpec
+		want       string
+	}{
+		{name: "defaults to machine name", want: "node-pin"},
+		{name: "empty nodeRef falls back", kubernetes: &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{}}, want: "node-pin"},
+		{name: "nodeRef override", kubernetes: &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{Name: "k8s-node-7"}}, want: "k8s-node-7"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := setupOCICache(t, "ghcr.io/test/image:v1", "pin123", map[string][]byte{
+				"agent.json.tmpl": []byte(`{{ .AgentConfigJSON }}`),
+			})
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-pin"},
+				Spec: v1alpha3.MachineSpec{
+					Kubernetes: tc.kubernetes,
+					PXE: &v1alpha3.PXESpec{
+						Image:      "ghcr.io/test/image:v1",
+						DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f9", IPv4: "10.0.1.19", SubnetMask: "255.255.255.0"}},
+					},
+				},
+			}
+			f := &FileResolver{
+				Cache:   cache,
+				Cluster: &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			}
+
+			resolved, err := f.ResolveFileByPath(t.Context(), "agent.json", node, "ghcr.io/test/image:v1")
+			require.NoError(t, err)
+
+			var cfg provision.UnboundedAgentConfig
+			require.NoError(t, json.Unmarshal(resolved.Data, &cfg))
+			require.Equal(t, tc.want, cfg.NodeName)
+			require.Equal(t, "node-pin", cfg.MachineName)
+		})
+	}
 }

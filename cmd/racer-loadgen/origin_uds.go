@@ -142,23 +142,39 @@ func (b *originBlobBody) Close() error {
 	return nil
 }
 
-// Provision only missing directories. Refuse symlinks and untrusted writable
-// ancestors, and leave ownership/modes of existing directories untouched. The
-// SDK additionally checks final directory ownership before acquiring its lock.
-func prepareOriginDirectory(cache string) error {
-	path := "/"
-	for _, part := range []string{"run", "racer", cache, "origin"} {
+// originUID is the UID/GID the loadgen origin runs as. The racer-dataplane
+// creates /run/racer/<cache>/origin owned by this user with mode 0700
+// (ORIGIN_UID in cmd/racer-dataplane/src/client/origin_directory.rs).
+const originUID = 65532
+
+// checkOriginDirectory creates nothing and changes nothing. It refuses
+// symlinks, non-directories, and group/other-writable or foreign-owned
+// ancestors under root, and requires the dataplane-created origin leaf to be
+// owned by the effective user. The SDK repeats the final ownership check
+// before acquiring its lock.
+func checkOriginDirectory(root, cache string) error {
+	parts := []string{"run", "racer", cache, "origin"}
+
+	path := root
+	for i, part := range parts {
 		path = filepath.Join(path, part)
-		if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
-		}
 
 		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("origin directory %s does not exist: racer-dataplane creates it owned by UID/GID %d "+
+				"with mode 0700; run the origin as UID %d and mount that directory", path, originUID, originUID)
+		}
+
 		if err != nil {
 			return err
 		}
 
 		stat, ok := info.Sys().(*syscall.Stat_t)
+		if ok && i == len(parts)-1 && stat.Uid != uint32(os.Geteuid()) {
+			return fmt.Errorf("origin directory %s is owned by UID %d, not effective UID %d; run the origin as UID %d",
+				path, stat.Uid, os.Geteuid(), originUID)
+		}
+
 		if !ok || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || (stat.Uid != 0 && stat.Uid != uint32(os.Geteuid())) {
 			return fmt.Errorf("unsafe origin directory %s", path)
 		}
@@ -172,7 +188,7 @@ func prepareOriginDirectory(cache string) error {
 // Merely finding a socket (possibly a competing owner) is not readiness. stop
 // cancels and joins ServeOrigin so its owned-socket cleanup finishes before exit.
 func startUDSOrigin(ctx, startup context.Context, config racersdk.OriginConfig, origin racersdk.Origin, probe racersdk.Key, failed func(error)) (func(), error) {
-	if err := prepareOriginDirectory(config.Cache); err != nil {
+	if err := checkOriginDirectory("/", config.Cache); err != nil {
 		return nil, err
 	}
 

@@ -138,6 +138,18 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # Kubelet client CSRs from metalman-bootstrap tokens, approved only for the
+  # node name recorded with the token's credential on its attested Machine
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["update"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["signers"]
+    resourceNames: ["kubernetes.io/kube-apiserver-client-kubelet"]
+    verbs: ["approve"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -170,25 +182,13 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Auto-approve kubelet client certificate requests from the bootstrap SA.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: metalman:node-autoapprove-bootstrap
-subjects:
-  - kind: ServiceAccount
-    name: metalman-bootstrap
-    namespace: {{ default "unbounded-system" .Namespace }}
-roleRef:
-  kind: ClusterRole
-  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
-  apiGroup: rbac.authorization.k8s.io
-
----
-# Allow the metalman-bootstrap SA to get and create Machine CRs and publish
-# initial agent bootstrap status.
-# The agent's register-machine phase uses this SA token to check whether a
-# Machine CR already exists and, if not, to create one during bootstrap.
+# Allow the metalman-bootstrap SA to read Machine CRs and publish initial agent
+# bootstrap status. Metalman only issues these tokens to attested, pre-existing
+# Machines, so the agent's register-machine phase never needs to create one.
+#
+# Kubelet client certificates requested with these tokens are NOT
+# auto-approved. Metalman approves them only for the node name of the single
+# Machine whose status.bootstrap.credentialID matches the requesting token.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -196,7 +196,7 @@ metadata:
 rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
-    verbs: ["get", "create"]
+    verbs: ["get"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines/status"]
     verbs: ["get", "update", "patch"]
@@ -214,3 +214,64 @@ roleRef:
   kind: ClusterRole
   name: metalman-bootstrap
   apiGroup: rbac.authorization.k8s.io
+
+---
+# Restrict tokens minted for the metalman-bootstrap SA to their own Machine.
+# RBAC cannot scope machines/status by name, so without this policy one
+# attested node's token could rewrite any Machine's status, including the TPM
+# endorsement key pinned on first attestation. Metalman records the token's
+# credential ID (KEP-4193, "JTI=<jti>") in status.bootstrap.credentialID of
+# the Machine it attested; only a request carrying that credential ID may
+# update that Machine's status, and it may not change status.tpm or
+# status.bootstrap. Writes to the main machines resource are denied outright.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: metalman-bootstrap-machine-restriction
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["unbounded-cloud.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["machines", "machines/status"]
+  matchConditions:
+    - name: is-metalman-bootstrap-sa
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:metalman-bootstrap'"
+  validations:
+    - expression: "request.subResource == 'status'"
+      message: "metalman-bootstrap tokens may not create, update, or delete Machines"
+      reason: Forbidden
+    - expression: >-
+        request.subResource != 'status' ||
+        (has(oldObject.status) && has(oldObject.status.bootstrap) &&
+        has(oldObject.status.bootstrap.credentialID) &&
+        oldObject.status.bootstrap.credentialID != '' &&
+        'authentication.kubernetes.io/credential-id' in request.userInfo.extra &&
+        oldObject.status.bootstrap.credentialID in request.userInfo.extra['authentication.kubernetes.io/credential-id'])
+      message: "metalman-bootstrap tokens may only update the status of the Machine they were issued for"
+      reason: Forbidden
+    - expression: >-
+        request.subResource != 'status' ||
+        ((has(oldObject.status) && has(oldObject.status.tpm)) ?
+        (has(object.status) && has(object.status.tpm) && object.status.tpm == oldObject.status.tpm) :
+        !(has(object.status) && has(object.status.tpm)))
+      message: "metalman-bootstrap tokens may not modify status.tpm"
+      reason: Forbidden
+    - expression: >-
+        request.subResource != 'status' ||
+        ((has(oldObject.status) && has(oldObject.status.bootstrap)) ?
+        (has(object.status) && has(object.status.bootstrap) && object.status.bootstrap == oldObject.status.bootstrap) :
+        !(has(object.status) && has(object.status.bootstrap)))
+      message: "metalman-bootstrap tokens may not modify status.bootstrap"
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: metalman-bootstrap-machine-restriction
+spec:
+  policyName: metalman-bootstrap-machine-restriction
+  validationActions: ["Deny"]

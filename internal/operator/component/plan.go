@@ -145,6 +145,14 @@ type Operation struct {
 	// skips dependents when a dependency fails, so a failure does not leave a
 	// workload pointing at a ConfigMap that was never written.
 	DependsOn []ObjectRef
+
+	// RevokeOnDependencyFailure makes an OpApply fail closed: when a declared
+	// DependsOn fails and the apply is skipped, the executor deletes the
+	// object instead of leaving a copy from an earlier pass in place. Use it
+	// for grants that are only safe while their dependencies hold, such as RBAC
+	// that an admission policy restricts. In the steady state the dependencies
+	// succeed and the object is applied as usual, so it is never churned.
+	RevokeOnDependencyFailure bool
 }
 
 // Ref returns the ObjectRef identifying this operation's object.
@@ -263,6 +271,10 @@ func (p *Plan) Summary() string {
 			}
 
 			b.WriteString("]")
+		}
+
+		if op.RevokeOnDependencyFailure {
+			b.WriteString(" [revoke on dependency failure]")
 		}
 
 		b.WriteString("\n")

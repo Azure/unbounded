@@ -266,6 +266,8 @@ jobs:
   #   - netboot                       : PXE artifact referenced by metalman
   #   - gantry                        : cluster-wide gantry DaemonSet
   #   - orca                          : deployed separately by deploy-orca
+  #   - racer-object                  : injected sidecars and per-ClusterCache
+  #                                     origin DaemonSets from the racer component
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
@@ -295,6 +297,8 @@ jobs:
             file: images/racer-controller/Containerfile
           - name: racer-dataplane
             file: images/racer-dataplane/Containerfile
+          - name: racer-object
+            file: images/racer-object/Containerfile
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator

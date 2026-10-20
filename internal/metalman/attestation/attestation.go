@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
@@ -68,14 +69,10 @@ type AttestResponse struct {
 	ClusterCA       string `json:"clusterCA,omitempty"` // PEM-encoded CA certificate
 }
 
-// clientIP extracts the client IP from an HTTP request, checking
-// X-Forwarded-For first, then falling back to RemoteAddr.
+// clientIP returns the host part of r.RemoteAddr, the address of the direct
+// TCP peer. Forwarding headers are never trusted. If RemoteAddr has no port,
+// it is returned unchanged.
 func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.SplitN(fwd, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
-
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -161,7 +158,11 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TOFU: store or verify the EK public key.
+	// TOFU: record or verify the EK public key. On first use the pin is
+	// only staged on the in-memory object here; it is persisted together
+	// with the bootstrap credential ID in a single status update after the
+	// token is minted (see below). A mismatched EK is rejected before any
+	// token is minted.
 	if node.Status.TPM == nil || node.Status.TPM.EKPublicKey == "" {
 		der, err := x509.MarshalPKIXPublicKey(ekKey)
 		if err != nil {
@@ -178,14 +179,8 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		node.Status.TPM.EKPublicKey = ekPubPEM
-		if err := h.StatusUpdater.Update(ctx, node); err != nil {
-			log.Error("attest: storing EK public key", "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
 
-			return
-		}
-
-		log.Info("TOFU: stored EK public key")
+		log.Info("TOFU: staging EK public key")
 	} else {
 		block, _ := pem.Decode([]byte(node.Status.TPM.EKPublicKey))
 		if block == nil {
@@ -291,6 +286,40 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bind the token to this Machine. The machina CSR approver only approves
+	// kubelet client CSRs from the bootstrap ServiceAccount whose
+	// credential-id matches a Machine's status.bootstrap.credentialID, so the
+	// credential ID must be persisted before the token is handed out. Fail
+	// closed if it cannot be determined or stored.
+	credentialID, err := CredentialIDFromToken(tokenResp.Status.Token)
+	if err != nil {
+		log.Error("attest: bootstrap token has no usable jti claim; the API server must issue "+
+			"ServiceAccount tokens with a jti (Kubernetes 1.30+, ServiceAccountTokenJTI)", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+
+		return
+	}
+
+	// Re-attestation overwrites any previous credential ID, so tokens issued
+	// by earlier attestations can no longer get kubelet client certificates
+	// approved for this Machine.
+	issuedAt := metav1.Now()
+	node.Status.Bootstrap = &v1alpha3.BootstrapStatus{
+		CredentialID: credentialID,
+		NodeName:     node.NodeName(),
+		IssuedAt:     &issuedAt,
+	}
+
+	// Single status update: persists the TOFU EK pin (if staged above) and
+	// the bootstrap credential ID together. A conflict or any other error
+	// aborts without returning the token.
+	if err := h.StatusUpdater.Update(ctx, node); err != nil {
+		log.Error("attest: recording bootstrap credential on Machine status", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+
+		return
+	}
+
 	// Encrypt the bootstrap token with the credential-wrapped AES key.
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {
@@ -334,6 +363,36 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Error("attest: writing response", "err", err)
 	}
+}
+
+// CredentialIDFromToken extracts the jti claim from a ServiceAccount JWT and
+// returns it in the form kube-apiserver reports in the
+// "authentication.kubernetes.io/credential-id" user extra ("JTI=<jti>").
+// The signature is not verified; the token was just minted by the API server.
+func CredentialIDFromToken(token string) (string, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("token is not a JWT: expected 3 segments, got %d", len(parts))
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return "", fmt.Errorf("decoding JWT payload: %w", err)
+	}
+
+	var claims struct {
+		JTI any `json:"jti"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return "", fmt.Errorf("parsing JWT claims: %w", err)
+	}
+
+	jti, ok := claims.JTI.(string)
+	if !ok || jti == "" {
+		return "", fmt.Errorf("JWT has no string jti claim")
+	}
+
+	return "JTI=" + jti, nil
 }
 
 // publicKeysEqual compares two crypto.PublicKey values structurally.

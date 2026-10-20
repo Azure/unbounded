@@ -431,7 +431,7 @@ func TestGuardContainmentSpecTampering(t *testing.T) {
 					persist(t, env, planPass(t, env))
 					assertControllerBindings(t, env, true)
 					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, guard))
-					require.Equal(t, effectiveGuardSpec(original), effectiveGuardSpec(guard))
+					require.Equal(t, component.EffectiveAdmissionSpec(original), component.EffectiveAdmissionSpec(guard))
 					_, stop, err := planGuardContainment(t.Context(), env)
 					require.NoError(t, err)
 					require.False(t, stop)
