@@ -1203,6 +1203,30 @@ mod simulation {
         assert!(stats.writes * 16 < stats.pages_written, "{stats:?}");
     }
 
+    /// A small commit lands its pages in one contiguous run: one request for
+    /// the pages, one for the open node slot's bitmap, one for the
+    /// superblock. Releases of other node slots are carried, not written.
+    #[test]
+    fn small_commits_write_one_run() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        let mut writes = Vec::new();
+        for n in 0..4000u32 {
+            // Spread keys so commits touch several leaves.
+            let k = key(1, n.wrapping_mul(2_654_435_761));
+            put(&reactor, &volume, &slab, Tier::Storage, k, 100, 0).unwrap();
+            if n % 8 == 7 {
+                commit(&reactor, &volume).unwrap();
+                if n > 2000 {
+                    writes.push(volume.commit_stats().writes);
+                }
+            }
+        }
+        let average = writes.iter().sum::<u64>() as f64 / writes.len() as f64;
+        assert!(average < 3.5, "{average} {writes:?}");
+    }
+
     /// Allocate, write one unit, and publish a record of `length` bytes.
     /// Writing only the first unit keeps large records cheap in the
     /// simulated disk.

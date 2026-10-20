@@ -283,7 +283,8 @@ changes.
    "Metadata space"), so the leaves, inner copies, slot table pages, and
    retired log of a small commit form one run. Write the bitmap of every node
    slot that changed to the copy that is not durable, with the units this
-   commit releases already clear.
+   commit releases already clear. A small commit usually writes three
+   requests: its run, the cursor slot's bitmap, and the superblock.
 6. Barrier 1: `fsync` the backing descriptors that completed a write since
    their last sync (`Slab::sync_dirty`), in parallel. This also makes every
    published record durable, because a record is published only after its
@@ -303,10 +304,22 @@ superblock may be durable.
 A durable superblock references only its own root set, and the older
 superblock references the one before. A page or storage record that commit N
 stops referencing is still referenced by superblock N-1. Commit N lists it in
-its retired log, which superblock N references. Commit N+1 releases everything
-in log N: its persisted state (bitmaps, record map, slot table) already shows
-it free, and the memory state frees it when N+1 is durable, at which point
-superblock N-1 is gone. A failed attempt releases nothing.
+its retired log, which superblock N references. Commit N+1 releases what
+it takes from log N: its persisted state (bitmaps, record map, slot table)
+already shows it free, and the memory state frees it when N+1 is durable, at
+which point superblock N-1 is gone. A failed attempt releases nothing.
+
+Releasing a metadata page means writing its node slot's bitmap, which costs
+a request unless the commit writes that bitmap anyway. So a commit with
+changes releases the retired pages of node slots it already writes (the
+cursor slot) and carries the others into its own retired log, until more
+than half a log page (126 pages) would be carried; then it releases whole
+slots, most pages first, until the carried pages fit. Carrying is safe:
+keeping a page in use longer never exposes it to reuse, and the page stays
+listed in a durable log, so a later commit (or the first commit after mount)
+releases it. A commit with no changes releases everything, so draining still
+empties the log. Carried pages do not make the volume dirty: they wait for
+the next commit with changes and count as pending units meanwhile.
 
 `is_dirty` stays true while a retired log holds anything other than the
 previous log's own pages and leftovers, so a lazy committer drains freed

@@ -27,6 +27,38 @@ use super::superblock::Superblock;
 use super::table::{Ident, RUN_PAGES, SlotOp};
 use crate::{AlignedBuffer, Charge, Error};
 
+/// Retired metadata pages a commit may carry over instead of releasing:
+/// enough to fill most of one retired log page.
+const DEFER_PAGES: usize = LOG_CAPACITY / 2;
+
+/// Split retired pages into those to release now and those to carry. Pages
+/// of slots whose bitmap is written anyway (`dirty`) are released. Of the
+/// rest, whole slots are released, most pages first, until at most
+/// [`DEFER_PAGES`] remain.
+fn split_releases(
+    retired: Vec<NodeAddr>,
+    dirty: impl Fn(u32) -> bool,
+) -> (Vec<NodeAddr>, Vec<NodeAddr>) {
+    let (mut release, rest): (Vec<_>, Vec<_>) = retired.into_iter().partition(|a| dirty(a.slot()));
+    let mut by_slot: BTreeMap<u32, Vec<NodeAddr>> = BTreeMap::new();
+    for addr in rest {
+        by_slot.entry(addr.slot()).or_default().push(addr);
+    }
+    let mut groups: Vec<Vec<NodeAddr>> = by_slot.into_values().collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    let mut carried: usize = groups.iter().map(Vec::len).sum();
+    let mut defer = Vec::new();
+    for group in groups {
+        if carried > DEFER_PAGES {
+            carried -= group.len();
+            release.extend(group);
+        } else {
+            defer.extend(group);
+        }
+    }
+    (release, defer)
+}
+
 fn other_unit(unit: u16) -> u16 {
     if unit == SUPERBLOCK_A_UNIT {
         SUPERBLOCK_B_UNIT
@@ -774,12 +806,24 @@ impl<C: Charge> Volume<C> {
             .allocated
             .retain(|a| self.shared.state().slots.page_used(*a));
 
-        // Metadata pages the new root set stops referencing.
-        let released_pages: Vec<NodeAddr> = log_prev
-            .iter()
-            .filter(|r| !r.record)
-            .map(|r| r.addr)
-            .collect();
+        // Metadata pages the previous commit retired. Releasing a page means
+        // writing its node slot's bitmap, so pages of slots this commit does
+        // not write anyway stay retired (carried in the new log) until the
+        // carried set outgrows DEFER_PAGES. A commit with no changes releases
+        // everything, so draining still empties the log.
+        let (released_pages, deferred) = {
+            let retired: Vec<NodeAddr> = log_prev
+                .iter()
+                .filter(|r| !r.record)
+                .map(|r| r.addr)
+                .collect();
+            if frozen.index.is_empty() && frozen.records.is_empty() {
+                (retired, Vec::new())
+            } else {
+                let state = self.shared.state();
+                split_releases(retired, |slot| state.slots.dirty_nodes().contains(&slot))
+            }
+        };
         let mut base_freed: Vec<Retired> = index
             .freed
             .iter()
@@ -802,6 +846,12 @@ impl<C: Charge> Volume<C> {
                 }),
         );
         base_freed.extend(retired_records.iter().copied());
+        base_freed.extend(deferred.iter().map(|addr| Retired {
+            addr: *addr,
+            incarnation: 0,
+            record: false,
+        }));
+
         // Slot table and the allocation fixpoint: placing pages may claim
         // node slots, which changes the slot table, which may need pages.
         let released_slots: BTreeSet<u32> = released_pages.iter().map(|a| a.slot()).collect();
@@ -1067,5 +1117,37 @@ impl<C: Charge> Volume<C> {
             .write_at(reactor, unit_offset(0, unit), buffer, guard, scope)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(slot: u32, unit: u16) -> NodeAddr {
+        NodeAddr::new(slot, unit)
+    }
+
+    #[test]
+    fn releases_of_written_slots_are_never_carried() {
+        let retired = vec![addr(5, 2), addr(6, 2), addr(5, 3)];
+        let (release, carry) = split_releases(retired, |slot| slot == 5);
+        assert_eq!(release, vec![addr(5, 2), addr(5, 3)]);
+        assert_eq!(carry, vec![addr(6, 2)]);
+    }
+
+    #[test]
+    fn carried_releases_are_bounded_by_releasing_the_largest_slots() {
+        let mut retired: Vec<NodeAddr> = (0..DEFER_PAGES as u16).map(|u| addr(7, u + 2)).collect();
+        retired.extend((0..10).map(|u| addr(8, u + 2)));
+        retired.push(addr(9, 2));
+        let (release, carry) = split_releases(retired, |_| false);
+        assert!(release.iter().all(|a| a.slot() == 7));
+        assert_eq!(release.len(), DEFER_PAGES);
+        assert_eq!(carry.len(), 11);
+        // Nothing to carry over the limit: everything stays carried.
+        let (release, carry) = split_releases(vec![addr(8, 2)], |_| false);
+        assert!(release.is_empty());
+        assert_eq!(carry, vec![addr(8, 2)]);
     }
 }
