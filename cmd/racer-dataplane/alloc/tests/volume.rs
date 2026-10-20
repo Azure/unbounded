@@ -1021,6 +1021,82 @@ mod simulation {
         assert!(volume.free_slots() >= SLOTS - 2);
     }
 
+    /// Poll `evict_one` until it has removed `key(1, 0)` but not finished.
+    fn evict_part_way<'a>(
+        reactor: &'a TestReactor,
+        volume: &'a page_alloc::volume::Volume<()>,
+        now: u64,
+    ) -> Task<'a, Result<Option<Vec<(Key, Value)>>, TestError>> {
+        let mut eviction: Task<'a, _> = volume.evict_one(reactor, now, &SCOPE);
+        for _ in 0..100_000 {
+            let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(eviction.as_mut().poll(cx).is_pending(), "finished early");
+            if volume.try_get(&key(1, 0)) == Some(None) {
+                return eviction;
+            }
+            reactor.poll_budgeted(64).unwrap();
+        }
+        panic!("eviction made no progress");
+    }
+
+    /// Storage records filling more than one eviction batch in one slot,
+    /// remounted so the slot is closed and evictable.
+    fn many_storage(
+        sim: &Simulation,
+        reactor: &TestReactor,
+    ) -> (Rc<page_alloc::volume::Volume<()>>, Rc<page_alloc::Slab<()>>) {
+        let (volume, slab, _) = mount(reactor, 4, Limits::UNLIMITED).unwrap();
+        for n in 0..3000 {
+            put(reactor, &volume, &slab, Tier::Storage, key(1, n), 100, 10).unwrap();
+        }
+        commit(reactor, &volume).unwrap();
+        crash(sim, volume, slab);
+        let (volume, slab, _) = mount(reactor, 4, Limits::UNLIMITED).unwrap();
+        (volume, slab)
+    }
+
+    #[test]
+    fn eviction_keeps_entries_retained_while_it_runs() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab) = many_storage(&sim, &reactor);
+        let slot = get(&reactor, &volume, &key(1, 2999)).unwrap().slot;
+        let free = volume.free_slots();
+        let eviction = evict_part_way(&reactor, &volume, 50);
+        assert!(
+            drive(
+                &reactor,
+                volume.set_retain(&reactor, &key(1, 2999), 100, &SCOPE)
+            )
+            .unwrap()
+        );
+        let evicted = drive(&reactor, eviction).unwrap().unwrap();
+        assert_eq!(evicted.len(), 2999);
+        assert!(evicted.iter().all(|(k, _)| *k != key(1, 2999)));
+        let kept = get(&reactor, &volume, &key(1, 2999)).unwrap();
+        assert_eq!((kept.slot, kept.retain_until), (slot, 100));
+        // The slot was kept, not freed.
+        assert_eq!(volume.free_slots(), free);
+        commit(&reactor, &volume).unwrap();
+        commit(&reactor, &volume).unwrap();
+        assert!(check(&reactor, &volume, &slab, &key(1, 2999), &kept).unwrap());
+        assert_eq!(evict_one(&reactor, &volume, 50), None);
+    }
+
+    #[test]
+    fn dropped_eviction_gives_back_the_slot_and_its_removals() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, _slab) = many_storage(&sim, &reactor);
+        drop(evict_part_way(&reactor, &volume, 50));
+        let partial = volume.take_evicted();
+        assert!(!partial.is_empty() && partial.len() < 3000);
+        assert!(volume.take_evicted().is_empty());
+        let rest = evict_one(&reactor, &volume, 50).expect("slot evictable again");
+        assert_eq!(partial.len() + rest.len(), 3000);
+        assert!(entries(&reactor, &volume).is_empty());
+    }
+
     /// Uncommitted changes are bounded: allocation pushes back until a
     /// commit drains them.
     #[test]

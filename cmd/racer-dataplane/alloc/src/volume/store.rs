@@ -710,6 +710,8 @@ pub struct Volume<C: Charge> {
     /// Commit run buffers kept between writes so small commits do not
     /// allocate, zero, and free a full run each time. Each keeps its charge.
     pub(super) run_buffers: RefCell<Vec<AlignedBuffer<C>>>,
+    // Index entries removed by eviction and not yet handed to a caller.
+    pub(super) evicted: RefCell<Vec<(Key, Value)>>,
 }
 
 /// Page source for tree code: the pager plus the I/O context of one call.
@@ -827,6 +829,7 @@ impl<C: Charge> Volume<C> {
             pager: Pager::new(options.metadata_cache_bytes),
             dirty_limit,
             run_buffers: RefCell::new(Vec::new()),
+            evicted: RefCell::new(Vec::new()),
         })
     }
 

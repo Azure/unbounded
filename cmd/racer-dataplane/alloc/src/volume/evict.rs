@@ -4,6 +4,11 @@
 //! at a time, removes the index entries that still point at the slot,
 //! yields between batches, and only then frees the slot. It returns the
 //! removed entries so callers can drop their own bookkeeping.
+//!
+//! Removed entries are queued on the volume as they are deleted, so an
+//! eviction that fails or is dropped part way loses none of them: the next
+//! eviction call returns them, and [`Volume::take_evicted`] drains them on
+//! an error path.
 
 use std::ops::Bound;
 
@@ -16,6 +21,27 @@ use crate::{Charge, Error};
 
 /// A reservation (or why there is none) and the entries evicted for it.
 pub type Allocated = (crate::Result<Reservation>, Vec<(Key, Value)>);
+
+/// Gives back a slot whose eviction stopped early, by error or by the
+/// eviction future being dropped.
+struct EvictionGuard<'a> {
+    shared: &'a super::store::Shared,
+    slot: u32,
+    done: bool,
+}
+
+impl Drop for EvictionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.shared.state().slots.cancel_eviction(self.slot);
+        }
+    }
+}
+
+/// Whether eviction must keep an entry: storage retained at `now`.
+fn retained(value: &Value, now: u64) -> bool {
+    value.tier == Tier::Storage && value.retain_until >= now
+}
 
 /// Partly filled slots [`Volume::allocate_evicting`] may reopen per call.
 const REOPENS: usize = 2;
@@ -60,13 +86,21 @@ impl<C: Charge> Volume<C> {
         let Some((slot, incarnation)) = self.shared.state().slots.evict_candidate(now, tier) else {
             return Ok(None);
         };
-        match self.evict_slot(reactor, scope, slot, incarnation).await {
-            Ok(removed) => Ok(Some(removed)),
-            Err(error) => {
-                let _ = self.shared.state().slots.cancel_eviction(slot);
-                Err(error)
-            }
-        }
+        let mut guard = EvictionGuard {
+            shared: &self.shared,
+            slot,
+            done: false,
+        };
+        self.evict_slot(reactor, scope, slot, incarnation, now, &mut guard)
+            .await?;
+        Ok(Some(self.take_evicted()))
+    }
+
+    /// Entries removed by evictions and not yet returned, for example by one
+    /// that failed or was dropped part way. Callers that drop their own
+    /// bookkeeping on eviction call this after an eviction error.
+    pub fn take_evicted(&self) -> Vec<(Key, Value)> {
+        std::mem::take(&mut *self.evicted.borrow_mut())
     }
 
     async fn evict_slot<S: Scope, B: Budget>(
@@ -75,7 +109,9 @@ impl<C: Charge> Volume<C> {
         scope: &S,
         slot: u32,
         incarnation: u32,
-    ) -> std::result::Result<Vec<(Key, Value)>, S::Error>
+        now: u64,
+        guard: &mut EvictionGuard<'_>,
+    ) -> std::result::Result<(), S::Error>
     where
         S::Error: From<Error>,
     {
@@ -86,7 +122,9 @@ impl<C: Charge> Volume<C> {
         };
         self.prefetch_slot_records(reactor, scope, slot).await?;
         let mut cursor = Bound::Included(record_key(slot, 0));
-        let mut removed = Vec::new();
+        // Storage entries retained at `now` (raised by `set_retain` after the
+        // slot was chosen) are kept, and so is the slot.
+        let mut kept = false;
         loop {
             let batch = self
                 .scan_records(reactor, scope, cursor, high, EVICT_BATCH)
@@ -110,6 +148,7 @@ impl<C: Charge> Volume<C> {
                 let mut misses = Vec::new();
                 {
                     let mut state = self.shared.state();
+                    let mut removed = self.evicted.borrow_mut();
                     for ((key, unit, generation), cached) in pending.into_iter().zip(cached) {
                         match cached {
                             Some(Some(value))
@@ -117,6 +156,10 @@ impl<C: Charge> Volume<C> {
                                     && value.unit == unit
                                     && value.generation == generation =>
                             {
+                                if retained(&value, now) {
+                                    kept = true;
+                                    continue;
+                                }
                                 state.set(key, IndexOp::Delete, Some(Some(value)));
                                 removed.push((key, value));
                             }
@@ -140,10 +183,14 @@ impl<C: Charge> Volume<C> {
                     && value.unit == unit
                     && value.generation == generation
                 {
+                    if retained(&value, now) {
+                        kept = true;
+                        continue;
+                    }
                     self.shared
                         .state()
                         .set(key, IndexOp::Delete, Some(Some(value)));
-                    removed.push((key, value));
+                    self.evicted.borrow_mut().push((key, value));
                 }
             }
             cursor = Bound::Excluded(last);
@@ -162,7 +209,11 @@ impl<C: Charge> Volume<C> {
                     _ => true,
                 }
         });
-        if lost {
+        guard.done = true;
+        if kept {
+            // An entry of the slot is still retained: keep the slot.
+            state.slots.cancel_eviction(slot).map_err(S::Error::from)?;
+        } else if lost {
             // Some records of the slot are unaccounted for: an index entry may
             // still point into it. Never reuse it.
             state.slots.quarantine(slot);
@@ -170,7 +221,7 @@ impl<C: Charge> Volume<C> {
             state.slots.finish_eviction(slot).map_err(S::Error::from)?;
         }
         state.mutations += 1;
-        Ok(removed)
+        Ok(())
     }
 
     /// Load the occupancy of a closed, partly filled slot of `tier` and
