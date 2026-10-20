@@ -104,3 +104,50 @@ func TestStatCancellationDuringDeadlineSetup(t *testing.T) {
 		})
 	}
 }
+
+func TestStatLaneScalesWithMaxConnections(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		maxConnections int
+		want           int
+	}{
+		{"default", 0, defaultMaxConnections},
+		{"one", 1, 1},
+		{"wide", 128, 128},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := testClient(t, "unused", tt.maxConnections)
+
+			if got := cap(c.stat.slots); got != tt.want {
+				t.Fatalf("stat slots = %d, want %d", got, tt.want)
+			}
+
+			if got := cap(c.stat.queue); got != statQueue {
+				t.Fatalf("stat queue = %d, want %d", got, statQueue)
+			}
+
+			peers := make([]net.Conn, 0, tt.want+1)
+
+			t.Cleanup(func() {
+				for _, peer := range peers {
+					closeQuietly(peer)
+				}
+			})
+
+			for range tt.want + 1 {
+				local, peer := net.Pipe()
+				peers = append(peers, peer)
+				c.recycle(&clientConn{Conn: local, r: bufio.NewReader(local), expires: time.Now().Add(time.Minute)})
+			}
+
+			if got := len(c.idle); got != tt.want {
+				t.Fatalf("idle connections = %d, want %d", got, tt.want)
+			}
+
+			// The connection beyond the idle cap is closed rather than pooled.
+			if _, err := peers[tt.want].Read(make([]byte, 1)); err == nil {
+				t.Fatal("connection beyond the idle cap was not closed")
+			}
+		})
+	}
+}
