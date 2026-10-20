@@ -462,6 +462,45 @@ func TestOriginMirrorsDataplanePullSecrets(t *testing.T) {
 	}
 }
 
+func TestOriginPullSecretsFallBackToDataplaneServiceAccount(t *testing.T) {
+	env := testEnv(t, originCache("cache", nil))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	account := &corev1.ServiceAccount{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), account))
+	account.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "sa-registry"}}
+	require.NoError(t, env.Client.Update(t.Context(), account))
+	persist(t, env, planPass(t, env))
+
+	ds, _ := liveOrigin(t, env, "cache")
+	require.Equal(t, []corev1.LocalObjectReference{{Name: "sa-registry"}}, ds.Spec.Template.Spec.ImagePullSecrets)
+
+	// Explicit template secrets take precedence over the ServiceAccount.
+	dataplane := liveDataplane(t, env)
+	dataplane.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "template-registry"}}
+	require.NoError(t, env.Client.Update(t.Context(), dataplane))
+	persist(t, env, planPass(t, env))
+
+	ds, _ = liveOrigin(t, env, "cache")
+	require.Equal(t, []corev1.LocalObjectReference{{Name: "template-registry"}}, ds.Spec.Template.Spec.ImagePullSecrets)
+}
+
+func TestOriginPlacementMissingServiceAccount(t *testing.T) {
+	env := testEnv(t, originCache("cache", nil))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	dataplane := liveDataplane(t, env)
+	dataplane.Spec.Template.Spec.ServiceAccountName = "absent"
+	require.NoError(t, env.Client.Update(t.Context(), dataplane))
+
+	mirror, found, err := originPlacement(t.Context(), env)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Empty(t, mirror.pullSecrets)
+}
+
 func TestOriginLongDottedCacheName(t *testing.T) {
 	name := strings.Repeat("a.", 40) + "bc"
 	require.Len(t, name, 82)

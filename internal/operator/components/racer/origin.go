@@ -295,6 +295,29 @@ func originPlacement(ctx context.Context, env *component.Env) (mirror originMirr
 	mirror.tolerations = slices.Clone(pod.Tolerations)
 	mirror.pullSecrets = slices.Clone(pod.ImagePullSecrets)
 
+	// Kubernetes adds ServiceAccount imagePullSecrets to admitted Pods, not
+	// to the DaemonSet template, and origins run under their own
+	// ServiceAccount. Fall back to the dataplane ServiceAccount's secrets so
+	// origins can pull from the same registry. A missing ServiceAccount
+	// means there is nothing to copy.
+	if len(mirror.pullSecrets) == 0 {
+		accountName := pod.ServiceAccountName
+		if accountName == "" {
+			accountName = dataplaneName
+		}
+
+		account := &corev1.ServiceAccount{}
+
+		err = env.LiveReader().Get(ctx, objectKey(env, accountName), account)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return originMirror{}, false, err
+		}
+
+		if err == nil {
+			mirror.pullSecrets = slices.Clone(account.ImagePullSecrets)
+		}
+	}
+
 	return mirror, true, nil
 }
 
