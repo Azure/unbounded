@@ -322,6 +322,9 @@ pub(super) struct State {
     /// Lost ranges seen by lookups, per tree.
     pub(super) lost: Vec<(TreeKind, Key, Option<Key>)>,
     pub(super) invalid_copies: u64,
+    /// Correction of the durable index entry count found by a scrub (a lost
+    /// leaf's entries are gone without being counted).
+    pub(super) count_fix: i64,
 }
 
 impl State {
@@ -801,6 +804,7 @@ impl<C: Charge> Volume<C> {
                     carry: Vec::new(),
                     lost: Vec::new(),
                     invalid_copies: 0,
+                    count_fix: 0,
                 }),
                 aborts: RefCell::new(Vec::new()),
             }),
@@ -950,7 +954,8 @@ impl<C: Charge> Volume<C> {
     /// entry whose page was not cached counts as an insert until then.
     pub fn len(&self) -> u64 {
         let state = self.shared.state();
-        let delta = state.active.delta + state.frozen.as_ref().map_or(0, |f| f.delta);
+        let delta =
+            state.active.delta + state.frozen.as_ref().map_or(0, |f| f.delta) + state.count_fix;
         (state.durable.trees[TreeKind::Index.index()].count as i64 + delta).max(0) as u64
     }
 
@@ -1588,19 +1593,25 @@ impl<C: Charge> Volume<C> {
                     continue;
                 };
                 let mut max = 0;
+                let mut retired = false;
                 for (rk, desc) in self.slot_records(reactor, scope, slot).await? {
                     if desc.incarnation != incarnation {
                         continue;
                     }
                     let (_, unit) = record_key_parts(&rk);
-                    if let Some(value) = self.resolve(reactor, scope, &desc.key).await?
-                        && value.slot == slot
-                        && value.unit == unit
-                    {
-                        max = max.max(value.retain_until);
+                    match self.resolve(reactor, scope, &desc.key).await? {
+                        Some(value) if value.slot == slot && value.unit == unit => {
+                            max = max.max(value.retain_until);
+                        }
+                        // Removed but not released: an older durable tree
+                        // may still reference it with a bound we no longer
+                        // know. Keep the slot's bound until it is released.
+                        _ => retired = true,
                     }
                 }
-                // Retired records of the slot stay protected until released.
+                if retired {
+                    continue;
+                }
                 self.shared
                     .state()
                     .slots

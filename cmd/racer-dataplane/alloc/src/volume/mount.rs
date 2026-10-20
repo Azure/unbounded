@@ -5,7 +5,6 @@
 //! does not read the index or the record map: lookups fault their pages in
 //! on demand. See the "Mount" section of `designs/racer-extent-volume.md`.
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -38,7 +37,8 @@ struct Loaded {
     log: Vec<Retired>,
     log_pages: Vec<NodeAddr>,
     log_ok: bool,
-    bitmaps: Vec<(u32, Option<(Box<[u64; BITMAP_WORDS]>, u8, u64)>)>,
+    /// Per node slot: its bitmap if valid, and whether one was expected.
+    bitmaps: Vec<(u32, Option<(Box<[u64; BITMAP_WORDS]>, u8, u64)>, bool)>,
 }
 
 impl Loaded {
@@ -246,28 +246,28 @@ impl<C: Charge> Volume<C> {
             log_ok = false;
         }
         // Node bitmaps: the newest valid copy no newer than the superblock.
-        let mut nodes: BTreeSet<u32> = summaries
+        let mut nodes: std::collections::BTreeMap<u32, (u8, u64)> = summaries
             .iter()
             .filter(|(_, s)| s.kind == SLOT_NODE)
-            .map(|(slot, _)| *slot)
+            .map(|(slot, s)| (*slot, (s.copy, s.bitmap_seq)))
             .collect();
-        nodes.insert(META_SLOT);
+        nodes.entry(META_SLOT).or_insert((0, 0));
         let volume_id = superblock.volume_id;
         let results = bounded(
-            nodes.into_iter().map(|slot| {
+            nodes.into_iter().map(|(slot, (copy, expected))| {
                 Box::pin(async move {
-                    let mut best: Option<(Box<[u64; BITMAP_WORDS]>, u8, u64)> = None;
-                    for copy in 0..2u8 {
-                        let addr = NodeAddr::new(slot, bitmap_unit(slot, copy));
-                        let bytes = self.read_unit(reactor, addr.offset(), scope).await?;
-                        if let Some((words, found)) =
-                            decode_bitmap(&bytes[..], &volume_id, seq, addr, slot)
-                            && best.as_ref().is_none_or(|b| found > b.2)
-                        {
-                            best = Some((words, copy, found));
-                        }
+                    if expected == 0 {
+                        // Never written (a fresh format): rebuilt, not lost.
+                        return Ok((slot, None, false));
                     }
-                    Ok((slot, best))
+                    // Only the copy the slot table names, written by the
+                    // commit it names: an older valid copy may be stale.
+                    let addr = NodeAddr::new(slot, bitmap_unit(slot, copy));
+                    let bytes = self.read_unit(reactor, addr.offset(), scope).await?;
+                    let found = decode_bitmap(&bytes[..], &volume_id, seq, addr, slot)
+                        .filter(|(_, found)| *found == expected)
+                        .map(|(words, found)| (words, copy, found));
+                    Ok((slot, found, true))
                 })
                     as Pin<Box<dyn Future<Output = std::result::Result<_, S::Error>> + '_>>
             }),
@@ -320,10 +320,14 @@ impl<C: Charge> Volume<C> {
             superblock.next_incarnation,
         )?;
         let mut missing = Vec::new();
-        for (slot, bitmap) in bitmaps {
+        let mut damaged = 0;
+        for (slot, bitmap, expected) in bitmaps {
             match bitmap {
                 Some((words, copy, seq)) => slots.set_node_bitmap(slot, &words, copy, seq),
-                None => missing.push(slot),
+                None => {
+                    missing.push(slot);
+                    damaged += u64::from(expected);
+                }
             }
         }
         // Slots whose summary is unreadable are never reused.
@@ -370,7 +374,7 @@ impl<C: Charge> Volume<C> {
                         slots.mark_node_unit(addr, false);
                     }
                 }
-                report.rebuilt_bitmaps = missing.len() as u64;
+                report.rebuilt_bitmaps = damaged;
             }
         }
         let pending = log.len() as u64;
@@ -437,6 +441,8 @@ impl<C: Charge> Volume<C> {
         Box::pin(async move {
             let reads_before = self.pager.stats().reads;
             let copies_before = self.shared.state().invalid_copies;
+            let start = self.shared.state().durable;
+            let mut restarted = false;
             let mut report = ScrubReport::default();
             for kind in [TreeKind::Index, TreeKind::Records] {
                 let mut at = Key::MIN;
@@ -454,6 +460,7 @@ impl<C: Charge> Volume<C> {
                     .await?;
                     if self.shared.state().durable.seq != durable.seq {
                         // A commit published new roots; continue on them.
+                        restarted = true;
                         continue;
                     }
                     let high = match seek {
@@ -504,6 +511,15 @@ impl<C: Charge> Volume<C> {
                             state.slots.quarantine(slot);
                         }
                     }
+                }
+            }
+            {
+                // Entries of lost leaves were never subtracted from the
+                // durable count; correct it when the walk saw one root set.
+                let mut state = self.shared.state();
+                if !restarted && state.durable.seq == start.seq {
+                    let visited = report.entries as i64;
+                    state.count_fix = visited - start.trees[TreeKind::Index.index()].count as i64;
                 }
             }
             report.pages_read = self.pager.stats().reads - reads_before;

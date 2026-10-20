@@ -333,6 +333,7 @@ struct Outcome {
     bitmaps: Vec<(u32, u8)>,
     pages: u64,
     writes: u64,
+    count_fix: i64,
 }
 
 impl<C: Charge> Volume<C> {
@@ -468,6 +469,7 @@ impl<C: Charge> Volume<C> {
         {
             let mut state = self.shared.state();
             state.durable = outcome.durable;
+            state.count_fix -= outcome.count_fix;
             state.epoch += 1;
             state.frozen = None;
             for addr in outcome.released_pages {
@@ -522,7 +524,7 @@ impl<C: Charge> Volume<C> {
         scope.check()?;
 
         // Freeze.
-        let (frozen, base, log_prev, log_pages_prev) = {
+        let (frozen, base, log_prev, log_pages_prev, count_fix) = {
             let mut state = self.shared.state();
             let active = std::mem::take(&mut state.active);
             let frozen = match state.frozen.take() {
@@ -544,6 +546,7 @@ impl<C: Charge> Volume<C> {
                 state.durable,
                 state.log.clone(),
                 state.log_pages.clone(),
+                state.count_fix,
             )
         };
         let seq = {
@@ -746,6 +749,27 @@ impl<C: Charge> Volume<C> {
             for (slot, _) in deltas.keys() {
                 changes.entry(*slot).or_default();
             }
+            // Bitmaps this commit writes: the copy that is not durable.
+            let written: Vec<(u32, u8)> = {
+                let state = self.shared.state();
+                let mut dirty = state.slots.dirty_nodes().clone();
+                dirty.extend(released_slots.iter().copied());
+                dirty
+                    .into_iter()
+                    .filter_map(|slot| {
+                        state
+                            .slots
+                            .node_copy(slot)
+                            .map(|(copy, _, _)| (slot, 1 - copy))
+                    })
+                    .collect()
+            };
+            for (slot, copy) in &written {
+                changes.entry(*slot).or_default().merge(&SlotOp {
+                    bitmap: Some((*copy, seq)),
+                    ..SlotOp::default()
+                });
+            }
             let ops: Vec<(Key, (u32, SlotOp))> = changes
                 .into_iter()
                 .map(|(slot, op)| (slot_key(slot), (slot, op)))
@@ -803,7 +827,12 @@ impl<C: Charge> Volume<C> {
             }
             reserve.extend(more);
         };
-        let real = real || !slots_applied.freed.is_empty();
+        // Slot table pages freed only to record bitmap copies do not make
+        // the volume dirty; otherwise releasing them would never settle.
+        let user_slot_changes = attempt.slot_ops.as_ref().is_some_and(|ops| !ops.is_empty())
+            || !deltas.is_empty()
+            || !attempt.claimed.is_empty();
+        let real = real || (user_slot_changes && !slots_applied.freed.is_empty());
         let mut dirty = self.shared.state().slots.take_dirty_nodes();
         dirty.extend(released_slots.iter().copied());
         attempt.dirty = dirty.clone();
@@ -816,7 +845,7 @@ impl<C: Charge> Volume<C> {
         // Place and write the tree pages, children first.
         let mut roots = [TreeRoot::EMPTY; 3];
         let counts = [
-            (base.trees[0].count as i64 + index_delta).max(0) as u64,
+            (base.trees[0].count as i64 + index_delta + count_fix).max(0) as u64,
             (base.trees[1].count as i64 + record_delta).max(0) as u64,
             (base.trees[2].count as i64 + slots_delta).max(0) as u64,
         ];
@@ -941,6 +970,7 @@ impl<C: Charge> Volume<C> {
             bitmaps,
             pages: writer.pages,
             writes: writer.writes + 1,
+            count_fix,
         })
     }
 

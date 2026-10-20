@@ -205,6 +205,13 @@ pub struct SlotSummary {
 
     /// Data slot: upper bound of the records' `retain_until`.
     pub retain_until: u64,
+
+    /// Node slot: which bitmap copy (0 or 1) is current.
+    pub copy: u8,
+
+    /// Node slot: seq of the commit that wrote the current bitmap copy, 0
+    /// when none was written.
+    pub bitmap_seq: u64,
 }
 
 impl SlotSummary {
@@ -214,9 +221,11 @@ impl SlotSummary {
         raw[0] = self.kind;
         raw[1] = self.tier;
         raw[2] = self.class;
+        raw[3] = self.copy;
         raw[4..8].copy_from_slice(&self.incarnation.to_le_bytes());
         raw[8..12].copy_from_slice(&self.used.to_le_bytes());
         raw[16..24].copy_from_slice(&self.retain_until.to_le_bytes());
+        raw[24..32].copy_from_slice(&self.bitmap_seq.to_le_bytes());
         raw
     }
 
@@ -229,25 +238,25 @@ impl SlotSummary {
             incarnation: u32::from_le_bytes(raw[4..8].try_into().ok()?),
             used: u32::from_le_bytes(raw[8..12].try_into().ok()?),
             retain_until: u64::from_le_bytes(raw[16..24].try_into().ok()?),
+            copy: raw[3],
+            bitmap_seq: u64::from_le_bytes(raw[24..32].try_into().ok()?),
         };
-        if raw[3] != 0
-            || raw[12..16] != [0; 4]
-            || raw[24..].iter().any(|&b| b != 0)
-            || summary.incarnation == 0
-        {
+        if raw[12..16] != [0; 4] || summary.incarnation == 0 {
             return None;
         }
+        let empty = summary.tier == 0
+            && summary.class == 0
+            && summary.used == 0
+            && summary.retain_until == 0;
         let ok = match summary.kind {
-            SLOT_NODE | SLOT_QUARANTINED => {
-                summary.tier == 0
-                    && summary.class == 0
-                    && summary.used == 0
-                    && summary.retain_until == 0
-            }
+            SLOT_NODE => empty && summary.copy < 2,
+            SLOT_QUARANTINED => empty && summary.copy == 0 && summary.bitmap_seq == 0,
             SLOT_DATA => {
                 summary.tier < 2
                     && super::format::class_records(summary.class)
                         .is_some_and(|records| summary.used <= records)
+                    && summary.copy == 0
+                    && summary.bitmap_seq == 0
             }
             _ => false,
         };
@@ -834,11 +843,14 @@ mod tests {
             incarnation: 5,
             used: 10,
             retain_until: 99,
+            ..SlotSummary::default()
         };
         assert_eq!(SlotSummary::decode(&summary.encode()), Some(summary));
         let node = SlotSummary {
             kind: SLOT_NODE,
             incarnation: 2,
+            copy: 1,
+            bitmap_seq: 8,
             ..SlotSummary::default()
         };
         assert_eq!(SlotSummary::decode(&node.encode()), Some(node));
@@ -853,6 +865,11 @@ mod tests {
                 ..summary
             },
             SlotSummary { used: 2, ..node },
+            SlotSummary { copy: 2, ..node },
+            SlotSummary {
+                bitmap_seq: 3,
+                ..summary
+            },
         ] {
             assert_eq!(SlotSummary::decode(&bad.encode()), None, "{bad:?}");
         }

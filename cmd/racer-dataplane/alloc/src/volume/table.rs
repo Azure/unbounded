@@ -250,6 +250,9 @@ pub struct SlotOp {
     /// `retain_max`.
     pub retain_set: Option<u64>,
 
+    /// Node slot: the bitmap copy and seq a commit wrote.
+    pub bitmap: Option<(u8, u64)>,
+
     /// The first queued change took a slot that was free: freeing it again
     /// cancels the whole entry.
     pub fresh: bool,
@@ -263,6 +266,9 @@ impl SlotOp {
             *self = *later;
             self.fresh = fresh;
             return;
+        }
+        if later.bitmap.is_some() {
+            self.bitmap = later.bitmap;
         }
         if let Some(set) = later.retain_set {
             self.retain_set = Some(set);
@@ -305,6 +311,12 @@ impl SlotOp {
         }
         if let Some(max) = self.retain_max {
             summary.retain_until = summary.retain_until.max(max);
+        }
+        if let Some((copy, seq)) = self.bitmap
+            && summary.kind == SLOT_NODE
+        {
+            summary.copy = copy;
+            summary.bitmap_seq = seq;
         }
         Some(summary)
     }
@@ -512,7 +524,11 @@ impl Slots {
                     bitmap.words.fill(u64::MAX);
                     let tail = SLOT_UNITS % 64;
                     bitmap.words[BITMAP_WORDS - 1] = (1u64 << tail) - 1;
+                    bitmap.seq = summary.bitmap_seq;
                     table.slots[slot as usize].used = SLOT_UNITS as u16;
+                    if summary.copy == 1 {
+                        table.slots[slot as usize].flags |= COPY;
+                    }
                 }
                 SLOT_DATA => {
                     let tier = Tier::from_byte(summary.tier).unwrap_or(Tier::Cache);
@@ -716,6 +732,11 @@ impl Slots {
             return None;
         }
         self.bitmaps[entry.aux as usize].as_ref().map(|b| &*b.words)
+    }
+
+    /// Node slots whose bitmap changed and is not written yet.
+    pub fn dirty_nodes(&self) -> &BTreeSet<u32> {
+        &self.dirty_nodes
     }
 
     /// Node slots whose bitmap changed since the last [`Slots::take_dirty_nodes`].

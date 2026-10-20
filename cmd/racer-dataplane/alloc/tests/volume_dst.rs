@@ -4,17 +4,19 @@
 //! header holds its key and generation), reads, removes, changes retention,
 //! evicts, and commits (often several commits at once, interleaved with
 //! writes). It injects I/O errors and loses power at random points, including
-//! in the middle of commits. Some seeds also flip a bit in a node or
+//! in the middle of commits. Some seeds also flip a bit in a metadata page or
 //! superblock on the durable image before remounting.
 //!
 //! The runner mirrors the index in a model and logs every change. After each
 //! remount it checks:
 //!
-//! - The mounted index (plus entries the mount dropped) equals the model at
+//! - The mounted index (plus entries a scrub dropped) equals the model at
 //!   some point at or after the call of the last successful commit. Corruption
-//!   seeds accept one commit less, and inside lost ranges accept bounded loss
-//!   and only values that were once published.
-//! - Every storage entry reads back a record with its key and generation.
+//!   seeds accept one commit less, and inside lost ranges (found by a scrub)
+//!   accept bounded loss and only values that were once published.
+//! - Every storage entry reads back a record with its key and generation,
+//!   unless it was evicted or its retention had passed (expired storage slots
+//!   are reused at once on eviction).
 //!   Cache entries from before the crash may point at reused space; entries
 //!   published since the mount must match.
 //! - No two entries overlap, and each lies in a data slot of its tier and
@@ -30,8 +32,8 @@ mod common;
 
 use common::*;
 use page_alloc::volume::{
-    Key, Limits, MountReport, RETAIN_FOREVER, Reservation, SLOT_BYTES, SlotKind, Superblock, Tier,
-    UNIT_BYTES, Value, Volume, class_units,
+    Key, Limits, MountReport, RETAIN_FOREVER, Reservation, SLOT_BYTES, ScrubReport, SlotKind,
+    Superblock, Tier, UNIT_BYTES, Value, Volume, class_units,
 };
 use page_alloc::{Error, Slab};
 use std::{
@@ -77,6 +79,8 @@ struct Write<'r> {
     length: u64,
     retain_until: u64,
     task: Task<'r, (Reservation, Result<(), TestError>)>,
+    /// Output of a task that completed during [`Run::block`].
+    done: Option<(Reservation, Result<(), TestError>)>,
 }
 
 /// A commit in flight with the model at its call.
@@ -84,6 +88,8 @@ struct Commit<'r> {
     index: usize,
     snapshot: Index,
     task: Task<'r, Result<(), TestError>>,
+    /// Output of a task that completed during [`Run::block`].
+    done: Option<Result<(), TestError>>,
 }
 
 struct Run<'r> {
@@ -118,6 +124,8 @@ struct Run<'r> {
     /// `commit_stats().succeeded` last observed on this mount.
     succeeded_seen: u64,
     corruptions: u64,
+    /// A scrub found a lost range on some mount.
+    seen_lost: bool,
     crashes: u64,
     budget: usize,
 }
@@ -157,6 +165,7 @@ impl<'r> Run<'r> {
             successes_since_corruption: 0,
             succeeded_seen: 0,
             corruptions: 0,
+            seen_lost: false,
             crashes: 0,
             budget: 8,
         }
@@ -211,7 +220,19 @@ impl<'r> Run<'r> {
         let reservation = match self.volume.allocate(tier, length) {
             Ok(r) => r,
             Err(Error::Busy) => {
-                let (result, removed) = self.volume.allocate_evicting(tier, length, self.now, 4);
+                let now = self.now;
+                let (result, removed) = match self.run(|volume, reactor| {
+                    Box::pin(async move {
+                        volume
+                            .allocate_evicting(reactor, tier, length, now, 4, &SCOPE)
+                            .await
+                    })
+                }) {
+                    Ok(done) => done,
+                    // Injected read faults.
+                    Err(TestError::Runtime(_)) => return,
+                    Err(error) => panic!("allocate_evicting: {error:?}"),
+                };
                 self.evicted(removed);
                 match result {
                     Ok(r) => r,
@@ -246,6 +267,7 @@ impl<'r> Run<'r> {
             length,
             retain_until,
             task,
+            done: None,
         });
     }
 
@@ -256,6 +278,7 @@ impl<'r> Run<'r> {
             index: self.log.len(),
             snapshot: self.model.clone(),
             task: Box::pin(async move { volume.commit(reactor, &SCOPE).await }),
+            done: None,
         });
     }
 
@@ -263,11 +286,15 @@ impl<'r> Run<'r> {
     fn turn(&mut self) {
         let mut index = 0;
         while index < self.writes.len() {
-            if let Poll::Ready((reservation, result)) = poll(&mut self.writes[index].task) {
+            let write = &mut self.writes[index];
+            let output = match write.done.take() {
+                Some(output) => Poll::Ready(output),
+                None => poll(&mut write.task),
+            };
+            if let Poll::Ready((reservation, result)) = output {
                 let write = self.writes.swap_remove(index);
                 if result.is_ok() {
-                    let old = self
-                        .volume
+                    self.volume
                         .publish(
                             write.key,
                             reservation,
@@ -276,8 +303,8 @@ impl<'r> Run<'r> {
                             write.retain_until,
                         )
                         .unwrap();
-                    assert_eq!(old.as_ref(), self.model.get(&write.key));
-                    let value = self.volume.get(&write.key).unwrap();
+                    let value = self.volume.try_get(&write.key).unwrap().unwrap();
+                    assert_eq!(value.generation, write.generation);
                     self.published.insert((write.key, value.generation));
                     self.change(write.key, Some(value));
                 }
@@ -287,7 +314,12 @@ impl<'r> Run<'r> {
         }
         let mut index = 0;
         while index < self.commits.len() {
-            if let Poll::Ready(result) = poll(&mut self.commits[index].task) {
+            let commit = &mut self.commits[index];
+            let output = match commit.done.take() {
+                Some(output) => Poll::Ready(output),
+                None => poll(&mut commit.task),
+            };
+            if let Poll::Ready(result) = output {
                 let commit = self.commits.swap_remove(index);
                 if result.is_ok() {
                     let max = commit.snapshot.values().map(|v| v.generation).max();
@@ -311,14 +343,85 @@ impl<'r> Run<'r> {
         self.reactor.poll_budgeted(self.budget).unwrap();
     }
 
-    fn check_model(&self) {
-        let actual: Index = self
-            .volume
-            .range(Bound::Unbounded, Bound::Unbounded, usize::MAX)
-            .into_iter()
-            .collect();
+    /// Run `op` like an executor would: poll it, the in-flight writes and
+    /// commits, and the reactor until it completes. A page fault led by one
+    /// task may be awaited by another, so polling only `op` could stall.
+    ///
+    /// Tasks that complete meanwhile are not processed (published or
+    /// recorded) until the next [`Run::turn`], so the model sees the
+    /// operation's changes first, as the volume does.
+    fn block<T>(&mut self, mut op: Task<'r, T>) -> T {
+        for _ in 0..10_000_000 {
+            if let Poll::Ready(value) = poll(&mut op) {
+                return value;
+            }
+            for write in &mut self.writes {
+                if write.done.is_none()
+                    && let Poll::Ready(output) = poll(&mut write.task)
+                {
+                    write.done = Some(output);
+                }
+            }
+            for commit in &mut self.commits {
+                if commit.done.is_none()
+                    && let Poll::Ready(output) = poll(&mut commit.task)
+                {
+                    commit.done = Some(output);
+                }
+            }
+            self.reactor.poll_budgeted(self.budget).unwrap();
+        }
+        panic!("operation did not complete");
+    }
+
+    /// [`Run::block`] on an operation built from the volume and reactor.
+    fn run<T>(&mut self, build: impl FnOnce(Rc<Volume<()>>, &'r TestReactor) -> Task<'r, T>) -> T {
+        let op = build(self.volume.clone(), self.reactor);
+        self.block(op)
+    }
+
+    /// Every index entry. Retries injected read faults.
+    fn all(&mut self) -> Index {
+        loop {
+            match self.run(|volume, reactor| {
+                Box::pin(async move {
+                    volume
+                        .range(
+                            reactor,
+                            Bound::Unbounded,
+                            Bound::Unbounded,
+                            usize::MAX,
+                            &SCOPE,
+                        )
+                        .await
+                })
+            }) {
+                Ok(entries) => return entries.into_iter().collect(),
+                Err(TestError::Runtime(_)) => continue,
+                Err(error) => panic!("range: {error:?}"),
+            }
+        }
+    }
+
+    /// Current value of `key`, retrying injected read faults.
+    fn lookup(&mut self, key: &Key) -> Option<Value> {
+        loop {
+            let key = *key;
+            match self.run(|volume, reactor| {
+                Box::pin(async move { volume.get(reactor, &key, &SCOPE).await })
+            }) {
+                Ok(value) => return value,
+                Err(TestError::Runtime(_)) => continue,
+                Err(error) => panic!("get: {error:?}"),
+            }
+        }
+    }
+
+    fn check_model(&mut self) {
+        let actual = self.all();
         assert!(actual == self.model, "index diverged from the model");
-        assert_eq!(self.volume.len(), self.model.len() as u64);
+        // Exact unless a publish could not tell whether it replaced an entry.
+        assert!(self.volume.len() >= self.model.len() as u64);
     }
 
     fn read_check(&mut self, key: Key, value: Value) {
@@ -331,7 +434,13 @@ impl<'r> Run<'r> {
                 let ok = record_matches(buffer.as_slice(), &key, value.generation);
                 let allowed = match value.tier {
                     Tier::Cache => self.stale_cache.contains(&(key, value.generation)),
-                    Tier::Storage => self.evicted_storage.contains(&(key, value.generation)),
+                    // Expired storage is not protected: evicting its slot
+                    // (even after the entry was removed) reuses it at once,
+                    // and an older tree may still point at it.
+                    Tier::Storage => {
+                        self.evicted_storage.contains(&(key, value.generation))
+                            || value.retain_until < self.now
+                    }
                 };
                 assert!(ok || allowed, "{key:?} {value:?} reads another record");
             }
@@ -356,7 +465,11 @@ impl<'r> Run<'r> {
             }
             47..=51 => {
                 let key = self.random_key();
-                let old = self.volume.remove(&key);
+                let Ok(old) = self.run(|volume, reactor| {
+                    Box::pin(async move { volume.remove(reactor, &key, &SCOPE).await })
+                }) else {
+                    return;
+                };
                 assert_eq!(old.as_ref(), self.model.get(&key));
                 if old.is_some() {
                     self.change(key, None);
@@ -364,11 +477,19 @@ impl<'r> Run<'r> {
             }
             52..=54 => {
                 if let Some((key, mut value)) = self.pick() {
-                    if self.rng.chance(30) {
+                    let stale = self.rng.chance(30);
+                    if stale {
                         value.generation += 1;
-                        assert!(!self.volume.remove_if(&key, &value));
-                    } else {
-                        assert!(self.volume.remove_if(&key, &value));
+                    }
+                    let Ok(removed) = self.run(|volume, reactor| {
+                        Box::pin(
+                            async move { volume.remove_if(reactor, &key, &value, &SCOPE).await },
+                        )
+                    }) else {
+                        return;
+                    };
+                    assert_eq!(removed, !stale);
+                    if removed {
                         self.change(key, None);
                     }
                 }
@@ -377,9 +498,22 @@ impl<'r> Run<'r> {
                 let cache = self.rng.below(u64::from(CACHES)) as u8;
                 let low = Key::new([cache; 8], [0; 12], 0);
                 let high = Key::new([cache + 1; 8], [0; 12], 0);
-                let removed = self
-                    .volume
-                    .remove_range(Bound::Included(low), Bound::Excluded(high));
+                let Ok(removed) = self.run(|volume, reactor| {
+                    Box::pin(async move {
+                        volume
+                            .remove_range(
+                                reactor,
+                                Bound::Included(low),
+                                Bound::Excluded(high),
+                                &SCOPE,
+                            )
+                            .await
+                    })
+                }) else {
+                    // A read fault part way: the batches before it are removed.
+                    self.resync();
+                    return;
+                };
                 for (key, value) in removed {
                     assert_eq!(self.model.get(&key), Some(&value));
                     self.change(key, None);
@@ -388,15 +522,29 @@ impl<'r> Run<'r> {
             56..=61 => {
                 if let Some((key, _)) = self.pick() {
                     let until = self.retain();
-                    assert!(self.volume.set_retain(&key, until));
-                    let value = self.volume.get(&key).unwrap();
+                    let Ok(found) = self.run(|volume, reactor| {
+                        Box::pin(
+                            async move { volume.set_retain(reactor, &key, until, &SCOPE).await },
+                        )
+                    }) else {
+                        return;
+                    };
+                    assert!(found);
+                    let value = self.lookup(&key).unwrap();
                     assert_eq!(value.retain_until, until);
                     self.change(key, Some(value));
                 }
             }
             62..=65 => {
-                if let Some(removed) = self.volume.evict_one(self.now) {
-                    self.evicted(removed);
+                let now = self.now;
+                match self.run(|volume, reactor| {
+                    Box::pin(async move { volume.evict_one(reactor, now, &SCOPE).await })
+                }) {
+                    Ok(Some(removed)) => self.evicted(removed),
+                    Ok(None) => {}
+                    // A read fault stops the eviction; entries removed so
+                    // far stay removed.
+                    Err(_) => self.resync(),
                 }
             }
             66..=75 => {
@@ -421,6 +569,24 @@ impl<'r> Run<'r> {
             }
         }
         self.turn();
+    }
+
+    /// Take the volume's index as the model after an operation failed part
+    /// way. Its changes are all valid (removals of entries the model holds).
+    fn resync(&mut self) {
+        let actual = self.all();
+        for (key, value) in self.model.clone() {
+            if !actual.contains_key(&key) {
+                if value.tier == Tier::Storage {
+                    self.evicted_storage.insert((key, value.generation));
+                }
+                self.change(key, None);
+            }
+        }
+        assert!(
+            actual == self.model,
+            "a failed operation changed more than it removed"
+        );
     }
 
     fn pick(&mut self) -> Option<(Key, Value)> {
@@ -460,11 +626,20 @@ impl<'r> Run<'r> {
         self.succeeded_seen = 0;
         // The model knows both superblocks' states only after two commits.
         self.successes_since_corruption = 0;
-        self.verify(&report, corrupted_superblock);
+        let scrub = loop {
+            match self
+                .run(|volume, reactor| Box::pin(async move { volume.scrub(reactor, &SCOPE).await }))
+            {
+                Ok(scrub) => break scrub,
+                Err(TestError::Runtime(_)) => continue,
+                Err(error) => panic!("scrub: {error:?}"),
+            }
+        };
+        self.verify(&report, &scrub, corrupted_superblock);
     }
 
-    /// Flip one bit in a node or superblock unit of the meta slot. Returns
-    /// whether a superblock was hit.
+    /// Flip one bit in a metadata page or superblock unit of the meta slot.
+    /// Returns whether a superblock was hit.
     fn corrupt(&mut self) -> bool {
         let path = std::path::Path::new(PATH);
         let units = 2 + self.rng.below(400);
@@ -502,35 +677,49 @@ impl<'r> Run<'r> {
         unit < 2
     }
 
-    fn verify(&mut self, report: &MountReport, corrupted_superblock: bool) {
+    fn verify(&mut self, report: &MountReport, scrub: &ScrubReport, corrupted_superblock: bool) {
         assert!(!report.formatted, "volume was reformatted");
-        let mut mounted: Index = self
-            .volume
-            .range(Bound::Unbounded, Bound::Unbounded, usize::MAX)
-            .into_iter()
-            .collect();
-        assert_eq!(mounted.len() as u64, report.entries);
+        let mut mounted = self.all();
         let loose = self.corruption;
-        for (key, value) in &report.dropped {
+        // A lost leaf stays lost until a commit rewrites its range, so after
+        // one, later mounts may still see it.
+        let clean = !self.seen_lost;
+        self.seen_lost |= !scrub.lost.is_empty() || !scrub.lost_records.is_empty();
+        if !loose || (corrupted_superblock && clean) {
+            // Without page corruption, every page either root set references
+            // is intact: nothing was reused early. Node bitmaps may be
+            // rebuilt from the trees: an attempt that failed after writing
+            // its superblock leaves a superblock that may be durable, and
+            // the retry overwrites the bitmap copy it names.
             assert!(
-                loose || value.tier == Tier::Cache,
-                "dropped storage {key:?} {value:?}"
+                report.lost.is_empty()
+                    && !report.root_lost
+                    && report.invalid_copies == 0
+                    && scrub.lost.is_empty()
+                    && scrub.lost_records.is_empty()
+                    && scrub.invalid_copies == 0
+                    && scrub.dropped.is_empty(),
+                "{report:?} {scrub:?}"
             );
+            if !loose {
+                assert_eq!(mounted.len() as u64, report.entries);
+            }
+        }
+        if !loose {
+            assert_eq!(scrub.entries, report.entries);
+        }
+        assert_eq!(
+            self.volume.len(),
+            mounted.len() as u64 - scrub.dropped.len() as u64
+        );
+        for (key, value) in &scrub.dropped {
+            assert!(loose, "dropped {key:?} {value:?}");
             mounted.entry(*key).or_insert(*value);
         }
-        if !loose || corrupted_superblock {
-            // Without node corruption, every node either tree references is
-            // intact: nothing was reused early.
-            assert!(
-                report.lost.is_empty() && !report.root_lost && report.invalid_copies == 0,
-                "{report:?}"
-            );
-        }
         assert!(loose || !corrupted_superblock);
+        let lost = scrub.lost.clone();
         let in_lost = |key: &Key| {
-            report
-                .lost
-                .iter()
+            lost.iter()
                 .any(|(low, high)| key >= low && high.is_none_or(|h| *key < h))
         };
         let base = if loose { &self.previous } else { &self.durable };
@@ -570,17 +759,16 @@ impl<'r> Run<'r> {
         );
         // Records and placement.
         let mut extents = Vec::new();
-        for (key, value) in self
-            .volume
-            .range(Bound::Unbounded, Bound::Unbounded, usize::MAX)
-        {
+        for (key, value) in self.all() {
             let state = self.volume.slot_state(value.slot).unwrap();
-            assert_eq!(
-                state.kind,
-                SlotKind::Data {
-                    tier: value.tier,
-                    class: value.class
-                }
+            assert!(
+                state.kind
+                    == SlotKind::Data {
+                        tier: value.tier,
+                        class: value.class
+                    }
+                    || (loose && state.kind == SlotKind::Quarantined),
+                "{key:?} {value:?} in {state:?}"
             );
             let units = class_units(value.class).unwrap();
             extents.push((value.slot, u32::from(value.unit), units));
@@ -597,11 +785,7 @@ impl<'r> Run<'r> {
             );
         }
         // Continue from the mounted index.
-        self.model = self
-            .volume
-            .range(Bound::Unbounded, Bound::Unbounded, usize::MAX)
-            .into_iter()
-            .collect();
+        self.model = self.all();
         self.log.clear();
         self.durable = (0, self.model.clone());
         self.previous = (0, self.model.clone());

@@ -211,6 +211,7 @@ fn slot_ops_merge_and_apply() {
         ident: Some(data),
         retain_max: Some(5),
         retain_set: None,
+        bitmap: None,
         fresh: false,
     };
     op.merge(&SlotOp {
