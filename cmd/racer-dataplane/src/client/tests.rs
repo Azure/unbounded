@@ -1897,7 +1897,11 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     // Duplex completion frames and the next response head may be in flight
     // together, in addition to listener readiness. Keep reactor headroom
     // while proving that an exhausted relay pipe quota cannot block delivery.
-    let (mut fixture, pipes) = body_fixture(4, false);
+    // The ring must cover every connection's sends at once: the kernel reaps
+    // them asynchronously, so under CPU starvation all five connections can
+    // hold entries together, and a full ring closes a connection with
+    // Overloaded and no response. Pipe quota, not ring size, is under test.
+    let (mut fixture, pipes) = body_fixture(16, false);
     let failures = crate::telemetry::Failures::default();
     fixture.listeners.responses = Rc::new(
         Responses::new(
@@ -1912,9 +1916,11 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     let held = pipes.acquire().unwrap();
     // Hold the shared page fill so no waiter can complete before the
     // overflow request is queued. Without this, whether a head arrives during
-    // start_body depends on how fast the origin thread answers.
+    // start_body depends on how fast the origin thread answers. These requests
+    // carry If-Match, so the fill resolves metadata with a pinned HEAD and then
+    // fetches the page with a pinned GET; gate the GET, not InitialGet.
     let origin = &fixture.worker.as_ref().unwrap().origin;
-    origin.block(RequestKind::InitialGet);
+    origin.block(RequestKind::PinnedGet);
     let mut first = start_body(&fixture);
     let mut second = start_body(&fixture);
     let mut third = start_body(&fixture);
@@ -1924,9 +1930,9 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     assert_no_head(&mut third);
     assert_no_head(&mut fourth);
     let mut overflow = start_body(&fixture);
-    origin.release(RequestKind::InitialGet);
+    origin.release(RequestKind::PinnedGet);
     // Every request becomes ready when the fill lands. Drive one connection
-    // per pass so their response sends cannot together exhaust the 4-entry ring.
+    // per pass so their responses are written one at a time.
     let output = fixture.receive_budgeted(&mut overflow, true, 2);
     let mut diagnostics = String::new();
     failures.write(&mut diagnostics).unwrap();
