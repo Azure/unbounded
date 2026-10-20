@@ -1705,6 +1705,18 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         if let Some(error) = failure {
             return Err(error);
         }
+        self.queue_cancellations(budget);
+        let mut state = self.state.borrow_mut();
+        let submitted = state.submit_pending();
+        if submitted.is_err() {
+            state.stopped = true;
+        }
+        submitted.map(|()| completed)
+    }
+
+    /// Queue ASYNC_CANCEL for up to `budget` in-flight operations whose scope was
+    /// cancelled, resuming the round-robin scan where the previous call stopped.
+    fn queue_cancellations(&self, budget: usize) {
         let mut state = self.state.borrow_mut();
         let count = budget.min(state.entries.len());
         for _ in 0..count {
@@ -1764,16 +1776,18 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 }
             }
         }
-        let submitted = state.submit_pending();
-        if submitted.is_err() {
-            state.stopped = true;
-        }
-        submitted.map(|()| completed)
     }
 
     /// Sleep until a CQE/external wake, bounded by both duration and a 10ms timer
     /// fallback for producers that cannot yet attach the eventfd wake endpoint.
     pub fn wait(&self, duration: Duration) -> Result<()> {
+        // A scope cancelled during the service turn wakes nothing, and its
+        // fenced operation completes only after ASYNC_CANCEL. Queue those
+        // cancels now so their CQEs end the sleep instead of the timeout.
+        if !duration.is_zero() {
+            let pending = self.state.borrow().entries.len();
+            self.queue_cancellations(pending);
+        }
         let mut state = self.state.borrow_mut();
         // Service polling can queue SQEs after poll_budgeted. Submit once before
         // sleeping so that work can produce the CQEs we wait for. Transient errors
