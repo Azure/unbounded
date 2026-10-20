@@ -10,6 +10,7 @@ mod pager;
 mod slots;
 mod store;
 mod superblock;
+mod table;
 mod tree;
 
 pub use format::{
