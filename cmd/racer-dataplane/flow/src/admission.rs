@@ -748,12 +748,15 @@ mod handoff {
     use crate::{Error, Result};
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex, MutexGuard,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::Waker,
     };
 
     /// Bounds queued, delivered, and outstanding offered items with reservations.
-    /// Callbacks execute under the handoff lock and must not reenter it.
+    /// Callbacks execute under the target's lock and must not reenter that target.
     pub trait Admission {
         /// Ownership that retains capacity until final admitted work completes.
         type Reservation;
@@ -794,25 +797,16 @@ mod handoff {
         closed: bool,
     }
 
-    /// Stable target slots and the next round-robin scan position.
-    struct State<K, A: Admission, T> {
-        targets: Vec<(K, Target<A, T>)>,
-
-        cursor: usize,
-    }
-
-    impl<K: Eq, A: Admission, T> State<K, A, T> {
-        /// Find a stable target without changing its admission or closed state.
-        fn target(&mut self, key: &K) -> Option<&mut Target<A, T>> {
-            self.targets
-                .iter_mut()
-                .find(|(candidate, _)| candidate == key)
-                .map(|(_, target)| target)
-        }
-    }
-
     /// Shared handoff bounded by admission, not a separate queue-slot limit.
-    pub struct Handoff<K, A: Admission, T>(Mutex<State<K, A, T>>);
+    ///
+    /// Each target has its own lock. Every target polls its inbox on each turn,
+    /// so a single shared lock would serialize all of them with the producer.
+    pub struct Handoff<K, A: Admission, T> {
+        targets: Vec<(K, Mutex<Target<A, T>>)>,
+
+        // Fairness hint only; concurrent producers may race on it.
+        cursor: AtomicUsize,
+    }
 
     /// Capacity reserved on a selected target before constructing its payload.
     pub struct Offer<K, A: Admission, T> {
@@ -827,28 +821,46 @@ mod handoff {
         /// Create stable target slots; empty target lists simply reject offers.
         /// Repeated keys share one slot, in first-occurrence order.
         pub fn new(keys: &[K]) -> Self {
-            let mut targets = Vec::new();
+            let mut targets: Vec<(K, Mutex<Target<A, T>>)> = Vec::new();
             for key in keys {
                 if targets.iter().any(|(candidate, _)| candidate == key) {
                     continue;
                 }
                 targets.push((
                     key.clone(),
-                    Target {
+                    Mutex::new(Target {
                         admission: None,
                         queue: VecDeque::new(),
                         waker: None,
                         closed: false,
-                    },
+                    }),
                 ));
             }
-            Self(Mutex::new(State { targets, cursor: 0 }))
+            Self {
+                targets,
+                cursor: AtomicUsize::new(0),
+            }
+        }
+
+        /// Find a stable target slot without locking it.
+        fn slot(&self, key: &K) -> Option<&Mutex<Target<A, T>>> {
+            self.targets
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, target)| target)
+        }
+
+        /// Lock a known target without changing its admission or closed state.
+        fn target(&self, key: &K) -> Result<MutexGuard<'_, Target<A, T>>> {
+            self.slot(key)
+                .ok_or(Error::InvalidInput)?
+                .lock()
+                .map_err(|_| Error::Unavailable)
         }
 
         /// Install admission once on a known target that has not closed.
         pub fn install(&self, key: &K, admission: A) -> Result<()> {
-            let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-            let target = state.target(key).ok_or(Error::InvalidInput)?;
+            let mut target = self.target(key)?;
             if target.admission.is_some() || target.closed {
                 return Err(Error::InvalidInput);
             }
@@ -858,11 +870,15 @@ mod handoff {
 
         /// Scan open targets fairly and reserve before returning an offer.
         pub fn reserve(self: &Arc<Self>, waker: &Waker) -> Result<Offer<K, A, T>> {
-            let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
+            let count = self.targets.len();
+            let cursor = self.cursor.load(Ordering::Relaxed);
             let mut rejection = None;
-            for offset in 0..state.targets.len() {
-                let index = (state.cursor + offset) % state.targets.len();
-                let (_, target) = &state.targets[index];
+            for offset in 0..count {
+                let index = (cursor + offset) % count;
+                let target = self.targets[index]
+                    .1
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?;
                 if target.closed {
                     continue;
                 }
@@ -872,7 +888,8 @@ mod handoff {
                 admission.register(waker);
                 match admission.reserve() {
                     Ok(reservation) => {
-                        state.cursor = (index + 1) % state.targets.len();
+                        drop(target);
+                        self.cursor.store((index + 1) % count, Ordering::Relaxed);
                         return Ok(Offer {
                             handoff: self.clone(),
                             target: index,
@@ -897,32 +914,49 @@ mod handoff {
             waker: &Waker,
             budget: usize,
         ) -> Result<Batch<T, A::Reservation, N>> {
-            let waker = Arc::new(waker.clone());
-            let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-            let target = state.target(key).ok_or(Error::InvalidInput)?;
-            if target.closed {
-                return Err(Error::Unavailable);
-            }
-            let old = target.waker.replace(waker);
-            let batch = std::array::from_fn(|index| {
-                if index < budget {
-                    target.queue.pop_front()
+            let slot = self.slot(key).ok_or(Error::InvalidInput)?;
+            // Targets poll on every turn with the same waker. Comparing does not
+            // run waker callbacks, so skip the clone while it is still registered.
+            // Wakers released here drop only after the target unlocks.
+            let mut released = None;
+            let mut target = slot.lock().map_err(|_| Error::Unavailable)?;
+            if !target
+                .waker
+                .as_ref()
+                .is_some_and(|current| current.will_wake(waker))
+            {
+                drop(target);
+                let replacement = Arc::new(waker.clone());
+                target = slot.lock().map_err(|_| Error::Unavailable)?;
+                released = Some(if target.closed {
+                    Some(replacement)
                 } else {
-                    None
-                }
-            });
-            drop(state);
-            drop(old);
-            Ok(batch)
+                    target.waker.replace(replacement)
+                });
+            }
+            let result = if target.closed {
+                Err(Error::Unavailable)
+            } else {
+                Ok(std::array::from_fn(|index| {
+                    if index < budget {
+                        target.queue.pop_front()
+                    } else {
+                        None
+                    }
+                }))
+            };
+            drop(target);
+            drop(released);
+            result
         }
 
-        /// Close permanently, then drop ownership and wake outside the shared lock.
+        /// Close permanently, then drop ownership and wake outside the target lock.
         pub fn close(&self, key: &K) {
+            let Some(slot) = self.slot(key) else {
+                return;
+            };
             let (queued, admission, waker) = {
-                let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(target) = state.target(key) else {
-                    return;
-                };
+                let mut target = slot.lock().unwrap_or_else(|e| e.into_inner());
                 target.closed = true;
                 (
                     std::mem::take(&mut target.queue),
@@ -940,10 +974,12 @@ mod handoff {
 
     impl<K, A: Admission, T> Offer<K, A, T> {
         /// Build only on an open target; the envelope retains admission itself.
-        /// The closure executes under the handoff lock and must not reenter it.
+        /// The closure executes under the target lock and must not reenter it.
         pub fn deliver(self, item: impl FnOnce() -> T) -> Result<()> {
-            let mut state = self.handoff.0.lock().map_err(|_| Error::Unavailable)?;
-            let target = &mut state.targets[self.target].1;
+            let mut target = self.handoff.targets[self.target]
+                .1
+                .lock()
+                .map_err(|_| Error::Unavailable)?;
             if target.closed {
                 return Err(Error::Unavailable);
             }
@@ -952,7 +988,7 @@ mod handoff {
                 reservation: self.reservation,
             });
             let waker = target.waker.clone();
-            drop(state);
+            drop(target);
             if let Some(waker) = waker {
                 waker.wake_by_ref();
             }
@@ -984,7 +1020,7 @@ mod handoff {
                 let Some(handoff) = self.handoff.upgrade() else {
                     return;
                 };
-                if let Ok(state) = handoff.0.try_lock() {
+                if let Ok(state) = handoff.targets[0].1.try_lock() {
                     drop(state);
                     handoff.close(&2);
                 } else {
@@ -1070,7 +1106,7 @@ mod handoff {
                 Err(Error::InvalidInput)
             ));
             assert_eq!(state.blocked.load(Ordering::SeqCst), 0);
-            assert!(handoff.0.lock().unwrap().targets[0].1.waker.is_none());
+            assert!(handoff.target(&1).unwrap().waker.is_none());
         }
 
         #[test]
@@ -1093,6 +1129,49 @@ mod handoff {
             assert_eq!(items.map(|item| item.unwrap().into_parts().0), [7, 8]);
         }
 
+        #[test]
+        fn repeated_pop_with_registered_waker_skips_clone() {
+            let handoff = Arc::new(Handoff::new(&[1]));
+            let (state, waker) = TargetWake::new(&handoff);
+            handoff.pop_batch::<0>(&1, &waker, 0).unwrap();
+            let clones = state.clones.load(Ordering::SeqCst);
+            assert_eq!(clones, 1);
+            for _ in 0..3 {
+                handoff.pop_batch::<0>(&1, &waker, 0).unwrap();
+            }
+            assert_eq!(state.clones.load(Ordering::SeqCst), clones);
+            assert_eq!(state.drops.load(Ordering::SeqCst), 0);
+            handoff.pop_batch::<0>(&1, Waker::noop(), 0).unwrap();
+            assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+            assert!(
+                handoff
+                    .target(&1)
+                    .unwrap()
+                    .waker
+                    .as_ref()
+                    .unwrap()
+                    .will_wake(Waker::noop())
+            );
+        }
+
+        #[test]
+        fn targets_lock_independently() {
+            let handoff = Arc::new(Handoff::<_, Ready, u8>::new(&[1, 2]));
+            handoff.install(&1, Ready).unwrap();
+            handoff.install(&2, Ready).unwrap();
+            let held = handoff.target(&1).unwrap();
+            handoff.cursor.store(1, Ordering::Relaxed);
+            handoff
+                .reserve(Waker::noop())
+                .unwrap()
+                .deliver(|| 9)
+                .unwrap();
+            let [item] = handoff.pop_batch::<1>(&2, Waker::noop(), 1).unwrap();
+            assert_eq!(item.unwrap().into_parts().0, 9);
+            drop(held);
+            assert_eq!(handoff.cursor.load(Ordering::Relaxed), 0);
+        }
+
         type ClosingHandoff = Handoff<u8, CloseAdmission, CloseDrop>;
 
         #[derive(Clone)]
@@ -1104,14 +1183,14 @@ mod handoff {
         impl CloseDrop {
             fn reenter(&self) {
                 if let Some(handoff) = self.handoff.upgrade() {
-                    let state = handoff
-                        .0
+                    let state = handoff.targets[0]
+                        .1
                         .try_lock()
                         .expect("close must unlock before callbacks");
-                    assert!(state.targets[0].1.closed);
-                    assert!(state.targets[0].1.queue.is_empty());
-                    assert!(state.targets[0].1.admission.is_none());
-                    assert!(state.targets[0].1.waker.is_none());
+                    assert!(state.closed);
+                    assert!(state.queue.is_empty());
+                    assert!(state.admission.is_none());
+                    assert!(state.waker.is_none());
                     drop(state);
                     handoff.close(&1);
                     assert!(matches!(
@@ -1182,7 +1261,7 @@ mod handoff {
                 handoff.close(&1);
                 handoff.close(&2);
                 assert_eq!(drops.load(Ordering::SeqCst), 1 + 2 * queued);
-                assert!(handoff.0.lock().unwrap().targets[0].1.admission.is_none());
+                assert!(handoff.target(&1).unwrap().admission.is_none());
             }
         }
 
@@ -1207,7 +1286,7 @@ mod handoff {
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             handoff.close(&1);
             assert_eq!(wakes.load(Ordering::SeqCst), 1);
-            assert!(handoff.0.lock().unwrap().targets[0].1.waker.is_none());
+            assert!(handoff.target(&1).unwrap().waker.is_none());
         }
 
         #[test]
@@ -1225,16 +1304,7 @@ mod handoff {
                         handoff.pop_batch::<0>(&key, Waker::noop(), budget),
                         Err(Error::Unavailable)
                     ));
-                    assert!(
-                        handoff
-                            .0
-                            .lock()
-                            .unwrap()
-                            .target(&key)
-                            .unwrap()
-                            .waker
-                            .is_none()
-                    );
+                    assert!(handoff.target(&key).unwrap().waker.is_none());
                 }
                 assert_eq!(handoff.install(&key, Ready), Err(Error::InvalidInput));
             }
@@ -1268,9 +1338,6 @@ mod handoff {
                 let handoff = Arc::new(Handoff::<_, Ready, u8>::new(keys));
                 assert_eq!(
                     handoff
-                        .0
-                        .lock()
-                        .unwrap()
                         .targets
                         .iter()
                         .map(|(key, _)| *key)
