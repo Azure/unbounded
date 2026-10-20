@@ -35,6 +35,108 @@ func TestCSRApproverBootstrapAllowed(t *testing.T) {
 	require.True(t, decision.Approve)
 }
 
+func TestCSRApproverCredentialBootstrapAllowed(t *testing.T) {
+	approver := testCredentialCSRApprover(t, func(_ context.Context, _ *certificatesv1.CertificateSigningRequest, nodeName, credentialID string) (bool, error) {
+		return nodeName == "node-a" && credentialID == "JTI=credential-a", nil
+	})
+	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+		SignerName: DefaultControllerCertificateSignerName,
+		Username:   testCredentialBootstrapRequester,
+		Groups:     []string{"system:serviceaccounts", "system:authenticated"},
+		Extra: map[string]certificatesv1.ExtraValue{
+			CredentialIDExtraKey: {"JTI=credential-a"},
+		},
+		Usages: clientAuthUsages(),
+	}, csrSubject{
+		CommonName:   "system:node:node-a",
+		Organization: []string{SystemNodesGroup, testDaemonGroup},
+	})
+
+	decision, err := approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.True(t, decision.Approve)
+}
+
+func TestCSRApproverCredentialBootstrapPreservesLegacyBootstrap(t *testing.T) {
+	approver := testCredentialCSRApprover(t, func(context.Context, *certificatesv1.CertificateSigningRequest, string, string) (bool, error) {
+		t.Fatal("credential authorization callback must not be called")
+
+		return false, nil
+	})
+	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+		SignerName: DefaultControllerCertificateSignerName,
+		Username:   "system:bootstrap:abc123",
+		Groups:     []string{testBootstrapGroup},
+		Usages:     clientAuthUsages(),
+	}, csrSubject{
+		CommonName:   "system:node:node-a",
+		Organization: []string{SystemNodesGroup, testDaemonGroup},
+	})
+
+	decision, err := approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.True(t, decision.Approve)
+}
+
+func TestCSRApproverCredentialBootstrapRequiresSingleCredentialID(t *testing.T) {
+	for name, credentialIDs := range map[string][]string{
+		"missing":  nil,
+		"empty":    {""},
+		"multiple": {"JTI=a", "JTI=b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			approver := testCredentialCSRApprover(t, func(context.Context, *certificatesv1.CertificateSigningRequest, string, string) (bool, error) {
+				t.Fatal("authorization callback must not be called")
+
+				return false, nil
+			})
+			csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+				SignerName: DefaultControllerCertificateSignerName,
+				Username:   testCredentialBootstrapRequester,
+				Groups:     []string{"system:serviceaccounts", "system:authenticated"},
+				Extra: map[string]certificatesv1.ExtraValue{
+					CredentialIDExtraKey: credentialIDs,
+				},
+				Usages: clientAuthUsages(),
+			}, csrSubject{
+				CommonName:   "system:node:node-a",
+				Organization: []string{SystemNodesGroup, testDaemonGroup},
+			})
+
+			decision, err := approver.Evaluate(context.Background(), csr)
+			require.NoError(t, err)
+			require.False(t, decision.Approve)
+			require.Contains(t, decision.Message, "exactly one non-empty")
+		})
+	}
+}
+
+func TestCSRApproverCredentialBootstrapRejectsArbitraryServiceAccount(t *testing.T) {
+	approver := testCredentialCSRApprover(t, func(context.Context, *certificatesv1.CertificateSigningRequest, string, string) (bool, error) {
+		t.Fatal("authorization callback must not be called")
+
+		return false, nil
+	})
+	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+		SignerName: DefaultControllerCertificateSignerName,
+		Username:   "system:serviceaccount:default:metalman-bootstrap",
+		Groups:     []string{"system:serviceaccounts", "system:authenticated"},
+		Extra: map[string]certificatesv1.ExtraValue{
+			CredentialIDExtraKey: {"JTI=credential-a"},
+		},
+		Usages: clientAuthUsages(),
+	}, csrSubject{
+		CommonName:   "system:node:node-a",
+		Organization: []string{SystemNodesGroup, testDaemonGroup},
+	})
+
+	decision, err := approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.False(t, decision.Ignore)
+	require.False(t, decision.Approve)
+	require.Contains(t, decision.Message, "neither an authorized bootstrap token")
+}
+
 func TestCSRApproverIgnoresUnrelatedClientCSR(t *testing.T) {
 	approver := testCSRApprover(t, true, true)
 	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
@@ -301,7 +403,30 @@ func testCSRApprover(t *testing.T, bootstrapAllowed, renewalAllowed bool) *CSRAp
 	return approver
 }
 
-const testBootstrapGroup = "system:bootstrappers:unbounded-agent-daemons"
+func testCredentialCSRApprover(t *testing.T, authorize CredentialRequestAuthorizationFunc) *CSRApprover {
+	t.Helper()
+
+	approver, err := NewCSRApprover(CSRApproverOptions{
+		BootstrapGroup:               testBootstrapGroup,
+		DaemonGroup:                  testDaemonGroup,
+		CredentialBootstrapRequester: testCredentialBootstrapRequester,
+		AuthorizeBootstrap: func(context.Context, *certificatesv1.CertificateSigningRequest, string) (bool, error) {
+			return true, nil
+		},
+		AuthorizeCredentialBootstrap: authorize,
+		AuthorizeRenewal: func(context.Context, *certificatesv1.CertificateSigningRequest, string) (bool, error) {
+			return true, nil
+		},
+	})
+	require.NoError(t, err)
+
+	return approver
+}
+
+const (
+	testBootstrapGroup               = "system:bootstrappers:unbounded-agent-daemons"
+	testCredentialBootstrapRequester = "system:serviceaccount:unbounded-system:metalman-bootstrap"
+)
 
 func clientAuthUsages() []certificatesv1.KeyUsage {
 	return []certificatesv1.KeyUsage{
