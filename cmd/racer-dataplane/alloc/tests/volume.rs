@@ -130,7 +130,8 @@ mod simulation {
             expected.push((key(3, n), value));
             commit(&reactor, &volume).unwrap();
             let idle = volume.idle_run_buffers();
-            assert!((1..=4).contains(&idle), "idle {idle}");
+            assert!((1..=16).contains(&idle), "idle {idle}");
+            assert!(volume.idle_run_buffer_bytes() <= 1024 * 1024);
         }
         crash(&sim, volume, slab);
         let (volume, _slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();

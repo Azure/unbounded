@@ -107,20 +107,33 @@ where
         });
         if !extends {
             self.submit().await?;
-            let buffer = self.volume.take_run_buffer()?;
+            let buffer = self.volume.take_run_buffer(1)?;
             self.run = Some(Run {
                 start: addr,
                 filled: 0,
                 buffer,
             });
         }
+        // Runs start small and double, so a commit of a few scattered pages
+        // does not fill and write back full-run buffers.
+        let run = self.run.as_mut().expect("run");
+        if run.filled == run_capacity(&run.buffer) {
+            let pages = (run.filled * 2).clamp(1, RUN_PAGES);
+            let mut bigger = self.volume.take_run_buffer(pages)?;
+            let used = run.filled * UNIT_BYTES;
+            bigger.as_mut_slice()[..used].copy_from_slice(&run.buffer.as_slice()[..used]);
+            let old = std::mem::replace(&mut run.buffer, bigger);
+            self.volume.return_run_buffer(old);
+        }
         let run = self.run.as_mut().expect("run");
         let at = run.filled * UNIT_BYTES;
         let slice = &mut run.buffer.as_mut_slice()[at..at + UNIT_BYTES];
         encode(slice);
         if cache {
-            let mut bytes = Box::new([0u8; UNIT_BYTES]);
-            bytes.copy_from_slice(slice);
+            let mut bytes = Box::<[u8; UNIT_BYTES]>::new_uninit();
+            bytes.write(slice.try_into().expect("one unit"));
+            // SAFETY: `write` initialized every byte.
+            let bytes = unsafe { bytes.assume_init() };
             let priority = if bytes[11] == 0 {
                 Priority::Leaf
             } else {
@@ -334,32 +347,73 @@ struct Outcome {
     count_fix: i64,
 }
 
-/// Run buffers kept on the volume between commits.
-pub(super) const RUN_BUFFER_CACHE: usize = 4;
+/// Idle run buffers kept on the volume between commits, by count and bytes.
+pub(super) const RUN_BUFFER_CACHE: usize = 16;
+pub(super) const RUN_BUFFER_CACHE_BYTES: usize = 1024 * 1024;
+
+/// Whole pages a run buffer can hold.
+fn run_capacity<C: Charge>(buffer: &AlignedBuffer<C>) -> usize {
+    buffer.allocation().layout.size() / UNIT_BYTES
+}
 
 impl<C: Charge> Volume<C> {
-    /// A full-run buffer, reused when one is idle. Its bytes are stale, which
-    /// is fine: only filled pages are written and every encoder writes the
-    /// whole page.
-    fn take_run_buffer(&self) -> Result<AlignedBuffer<C>, Error> {
-        if let Some(mut buffer) = self.run_buffers.borrow_mut().pop() {
-            buffer.length = RUN_PAGES * UNIT_BYTES;
+    /// A run buffer for at least `pages` pages, reusing the smallest idle one
+    /// that fits. Its bytes are stale, which is fine: only filled pages are
+    /// written and every encoder writes the whole page.
+    fn take_run_buffer(&self, pages: usize) -> Result<AlignedBuffer<C>, Error> {
+        debug_assert!((1..=RUN_PAGES).contains(&pages));
+        let mut cache = self.run_buffers.borrow_mut();
+        let best = cache
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| run_capacity(b) >= pages)
+            .min_by_key(|(_, b)| run_capacity(b))
+            .map(|(i, _)| i);
+        if let Some(i) = best {
+            let mut buffer = cache.swap_remove(i);
+            buffer.length = run_capacity(&buffer) * UNIT_BYTES;
             return Ok(buffer);
         }
-        self.slab.allocate(
-            RUN_PAGES * UNIT_BYTES,
-            (self.charge)(RUN_PAGES * UNIT_BYTES)?,
-        )
+        drop(cache);
+        let bytes = pages.next_power_of_two().min(RUN_PAGES) * UNIT_BYTES;
+        let mut buffer = self.slab.allocate(bytes, (self.charge)(bytes)?)?;
+        // A pooled slab buffer may be larger; expose all of it.
+        buffer.length = run_capacity(&buffer) * UNIT_BYTES;
+        Ok(buffer)
     }
 
-    /// Keep a completed run buffer for the next run, up to
-    /// [`RUN_BUFFER_CACHE`]. A kept buffer stays charged and live, so a
+    /// Keep an idle run buffer for later runs, within [`RUN_BUFFER_CACHE`]
+    /// buffers and [`RUN_BUFFER_CACHE_BYTES`]. A smaller idle buffer makes
+    /// room for a larger one. A kept buffer stays charged and live, so a
     /// charge that requires wiping is still honored when it is finally dropped.
     fn return_run_buffer(&self, buffer: AlignedBuffer<C>) {
+        let size = buffer.allocation().layout.size();
+        if size > RUN_BUFFER_CACHE_BYTES {
+            return;
+        }
         let mut cache = self.run_buffers.borrow_mut();
-        if cache.len() < RUN_BUFFER_CACHE {
+        let mut held: usize = cache.iter().map(|b| b.allocation().layout.size()).sum();
+        let mut evicted = Vec::new();
+        while cache.len() >= RUN_BUFFER_CACHE || held + size > RUN_BUFFER_CACHE_BYTES {
+            let Some((i, smallest)) = cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, b)| b.allocation().layout.size())
+                .map(|(i, b)| (i, b.allocation().layout.size()))
+            else {
+                break;
+            };
+            if smallest > size {
+                break;
+            }
+            held -= smallest;
+            evicted.push(cache.swap_remove(i));
+        }
+        if cache.len() < RUN_BUFFER_CACHE && held + size <= RUN_BUFFER_CACHE_BYTES {
             cache.push(buffer);
         }
+        // Dropped buffers return to the slab pool outside this borrow.
+        drop(cache);
     }
 
     /// Bytes held, and still charged, by idle commit run buffers.
