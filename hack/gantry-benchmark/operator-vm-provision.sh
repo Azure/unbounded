@@ -230,7 +230,6 @@ test \"\$BENCHMARK_NODE_COUNT\" = '$BENCHMARK_NODE_COUNT'
 test \"\$BENCHMARK_IMAGE_SIZE_MIB\" = '$BENCHMARK_IMAGE_SIZE_MIB'
 test \"\$BENCHMARK_IMAGE_LAYERS\" = '$BENCHMARK_IMAGE_LAYERS'
 systemctl cat gantry-benchmark-operator.service >/dev/null
-systemctl cat gantry-benchmark-image-builder.service >/dev/null
 printf 'gantry-benchmark-bootstrap-ready\\n'" \
   --only-show-errors \
   --query 'value[0].message' \
