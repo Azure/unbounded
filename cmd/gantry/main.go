@@ -7,6 +7,7 @@
 //
 //	gantry version print build information and exit
 //	gantry agent run the full agent (mirror + transfer + libp2p + ...)
+//	gantry snapshotter run the ACR OverlayBD compatibility snapshotter
 package main
 
 import (
@@ -80,6 +81,8 @@ func run(args []string) error {
 		return nil
 	case "agent":
 		return runAgent(args[1:])
+	case "snapshotter":
+		return runSnapshotter(args[1:])
 	case "help", "-h", "-help", "--help":
 		return runHelp(args[1:])
 	default:
@@ -94,11 +97,24 @@ func printUsage(w *os.File) {
 
 Subcommands:
   agent      run the Gantry P2P agent
+	snapshotter run the ACR OverlayBD compatibility snapshotter
   version    print build information
-  help       print help for the agent subcommand`)
+	help       print help for a subcommand`)
 }
 
 func runHelp(args []string) error {
+	if len(args) == 1 && args[0] == "snapshotter" {
+		fs := buildSnapshotterFlagSet()
+		fs.SetOutput(os.Stdout)
+		_, _ = fmt.Fprintln(os.Stdout, "Usage: gantry snapshotter [flags]") //nolint:errcheck // best-effort write
+		_, _ = fmt.Fprintln(os.Stdout)                                      //nolint:errcheck // best-effort write
+		_, _ = fmt.Fprintln(os.Stdout, "Flags:")                            //nolint:errcheck // best-effort write
+
+		fs.PrintDefaults()
+
+		return nil
+	}
+
 	if len(args) == 0 || args[0] == "agent" {
 		fs, _ := buildAgentFlagSet(config.NewDefault())
 		fs.SetOutput(os.Stdout)

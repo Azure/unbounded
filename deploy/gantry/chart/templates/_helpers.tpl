@@ -36,6 +36,12 @@
 {{- if and .Values.overlaybdConfig.enabled (empty .Values.overlaybdConfig.nodeSelector) -}}
 {{- fail "overlaybdConfig.enabled requires an explicit overlaybdConfig.nodeSelector" -}}
 {{- end -}}
+{{- if not (hasPrefix "/" .Values.overlaybdConfig.address) -}}
+{{- fail "overlaybdConfig.address must be an absolute Unix socket path" -}}
+{{- end -}}
+{{- if not (hasPrefix "/" .Values.overlaybdConfig.snapshotterRoot) -}}
+{{- fail "overlaybdConfig.snapshotterRoot must be an absolute path" -}}
+{{- end -}}
 {{- end }}
 
 {{- define "gantry.managerLabel" -}}

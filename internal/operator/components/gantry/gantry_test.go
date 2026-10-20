@@ -315,6 +315,7 @@ func TestApplyMutatorEnablesArtifactStreaming(t *testing.T) {
 			"spec": map[string]any{
 				"nodeSelector": map[string]any{},
 				"containers": []any{
+					map[string]any{"name": overlayBDSnapshotterContainerName, "image": "placeholder"},
 					map[string]any{"name": overlayBDConfigContainerName, "image": "placeholder"},
 				},
 			},
@@ -350,6 +351,10 @@ func TestApplyMutatorEnablesArtifactStreaming(t *testing.T) {
 
 	if image := containerImage(t, overlay, "containers", overlayBDConfigContainerName); image != "gantry-node-config:test" {
 		t.Fatalf("configurator image = %q", image)
+	}
+
+	if image := containerImage(t, overlay, "containers", overlayBDSnapshotterContainerName); image != "gantry:test" {
+		t.Fatalf("snapshotter image = %q", image)
 	}
 
 	selector, _, err := unstructured.NestedStringMap(overlay.Object, "spec", "template", "spec", "nodeSelector")

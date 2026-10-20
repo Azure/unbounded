@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -156,16 +157,37 @@ func TestOverlayBDConfiguratorEnabled(t *testing.T) {
 
 	var daemonSet struct {
 		Spec struct {
+			Selector struct {
+				MatchLabels map[string]string `yaml:"matchLabels"`
+			} `yaml:"selector"`
 			Template struct {
+				Metadata struct {
+					Labels map[string]string `yaml:"labels"`
+				} `yaml:"metadata"`
 				Spec struct {
 					HostPID      bool              `yaml:"hostPID"`
 					NodeSelector map[string]string `yaml:"nodeSelector"`
 					Containers   []struct {
-						Image           string `yaml:"image"`
+						Name            string   `yaml:"name"`
+						Image           string   `yaml:"image"`
+						Args            []string `yaml:"args"`
 						SecurityContext struct {
 							Privileged bool `yaml:"privileged"`
 						} `yaml:"securityContext"`
+						VolumeMounts []struct {
+							Name             string `yaml:"name"`
+							MountPath        string `yaml:"mountPath"`
+							MountPropagation string `yaml:"mountPropagation"`
+							ReadOnly         bool   `yaml:"readOnly"`
+						} `yaml:"volumeMounts"`
 					} `yaml:"containers"`
+					Volumes []struct {
+						Name     string `yaml:"name"`
+						HostPath struct {
+							Path string `yaml:"path"`
+							Type string `yaml:"type"`
+						} `yaml:"hostPath"`
+					} `yaml:"volumes"`
 				} `yaml:"spec"`
 			} `yaml:"template"`
 		} `yaml:"spec"`
@@ -178,14 +200,64 @@ func TestOverlayBDConfiguratorEnabled(t *testing.T) {
 		t.Error("hostPID = false, want true")
 	}
 
+	for key, value := range daemonSet.Spec.Selector.MatchLabels {
+		if daemonSet.Spec.Template.Metadata.Labels[key] != value {
+			t.Errorf("selector label %s=%q does not match pod label %q", key, value, daemonSet.Spec.Template.Metadata.Labels[key])
+		}
+	}
+
 	if got := daemonSet.Spec.Template.Spec.NodeSelector["kubernetes.azure.com/host-os"]; got != "AzureLinux" {
 		t.Errorf("node selector = %q, want AzureLinux", got)
 	}
 
-	if len(daemonSet.Spec.Template.Spec.Containers) != 1 ||
-		daemonSet.Spec.Template.Spec.Containers[0].Image != "gantry-node-config:test" ||
-		!daemonSet.Spec.Template.Spec.Containers[0].SecurityContext.Privileged {
+	if len(daemonSet.Spec.Template.Spec.Containers) != 2 {
 		t.Fatalf("unexpected configurator container: %+v", daemonSet.Spec.Template.Spec.Containers)
+	}
+
+	containers := daemonSet.Spec.Template.Spec.Containers
+	if containers[0].Name != "snapshotter" || !containers[0].SecurityContext.Privileged {
+		t.Fatalf("unexpected snapshotter container: %+v", containers[0])
+	}
+
+	if !slices.Contains(containers[0].Args, "--fallback-snapshotter=overlayfs") {
+		t.Fatalf("snapshotter args = %v, want overlayfs fallback", containers[0].Args)
+	}
+
+	if containers[1].Name != "configure" || containers[1].Image != "gantry-node-config:test" || !containers[1].SecurityContext.Privileged {
+		t.Fatalf("unexpected configurator container: %+v", containers[1])
+	}
+
+	foundBidirectional := false
+	foundContainerdRuntimeMount := false
+
+	for _, volumeMount := range containers[0].VolumeMounts {
+		if volumeMount.Name == "snapshotter-state" && volumeMount.MountPropagation == "Bidirectional" {
+			foundBidirectional = true
+		}
+
+		if volumeMount.Name == "containerd-runtime" && volumeMount.MountPath == "/run/containerd" && volumeMount.ReadOnly {
+			foundContainerdRuntimeMount = true
+		}
+	}
+
+	if !foundBidirectional {
+		t.Fatal("snapshotter state mount is not bidirectionally propagated")
+	}
+
+	if !foundContainerdRuntimeMount {
+		t.Fatal("snapshotter does not have the read-only containerd runtime directory mount")
+	}
+
+	foundContainerdRuntimeVolume := false
+
+	for _, volume := range daemonSet.Spec.Template.Spec.Volumes {
+		if volume.Name == "containerd-runtime" && volume.HostPath.Path == "/run/containerd" && volume.HostPath.Type == "Directory" {
+			foundContainerdRuntimeVolume = true
+		}
+	}
+
+	if !foundContainerdRuntimeVolume {
+		t.Fatal("snapshotter does not use the containerd runtime directory hostPath")
 	}
 }
 

@@ -189,11 +189,10 @@ on its own; no restart needed.
 
 ## ACR Artifact Streaming
 
-This integration configures an existing AKS Artifact Streaming node pool. It
-does not install OverlayBD or register its snapshotter with containerd. Enable
-it only on nodes where AKS already provides
-`/opt/acr/tools/overlaybd/config.sh`, `overlaybd-tcmu`, and
-`overlaybd-snapshotter`.
+This integration consumes the existing ACR OverlayBD v0.1.0 artifact contract
+without running the OverlayBD daemon or snapshotter. Enable it on Linux nodes
+that support NBD, ext4, EROFS when required by the image, and shared mount
+propagation.
 
 For a standalone Helm installation, enable the Gantry range endpoint and its
 host configurator together. Point Gantry's OCI upstream at the node-local AKS
@@ -220,26 +219,39 @@ In this mode Gantry uses host networking so it can reach the loopback-only AKS
 mirror. Containerd resolves through Gantry on port 5000; Gantry forwards OCI
 requests to the AKS mirror on port 8578, preserving its `ns` query. The AKS
 mirror returns the OverlayBD manifest, which triggers Gantry's complete-layer
-chair pulls. OverlayBD sends range reads to the same Gantry listener under
-`/blobs/`, where the source order remains local, peer, then signed ACR origin.
+chair pulls. The Gantry snapshotter reads sealed LSMT layers through the same
+Gantry listener under `/blobs/`, where the source order remains local, peer,
+then signed ACR origin.
+
+AKS initially selects the `overlaybd` snapshotter on these nodes. Gantry keeps
+that native plugin registered, adds a distinct `gantry-overlaybd` proxy, and
+switches CRI image unpacking to the new proxy. The adapter delegates ordinary
+OCI layers to containerd's built-in `overlayfs` snapshotter; only layers with
+the complete ACR OverlayBD contract use NBD.
 
 The registry-specific containerd file lists the AKS mirror after Gantry. If
 Gantry is unavailable, containerd continues through port 8578 with Artifact
 Streaming but without Gantry peer reuse.
 
-The configurator waits for `/artifact-streaming/readyz`, snapshots the current
-host configuration under `/var/lib/gantry/overlaybd-config`, then uses the
-AKS-provided configuration tool to set OverlayBD's P2P address to
-`http://localhost:5000/blobs`. It restarts the OverlayBD services only when the
-effective configuration changes. A second writer is never overwritten: if the
-host file differs from Gantry's managed snapshot, apply or rollback preserves
-that file and reports the conflict.
+The adapter DaemonSet runs `gantry snapshotter` beside the host configurator.
+The snapshotter container mounts the host containerd runtime directory
+read-only for the ordinary-image fallback, so containerd can recreate its
+socket without leaving the adapter bound to the old inode.
+The configurator waits for `/artifact-streaming/readyz` and the host-visible
+snapshotter socket, loads the `nbd` module, and verifies device capacity. It
+then snapshots the current containerd configuration under
+`/var/lib/gantry/snapshotter-config`, enables `/etc/containerd/conf.d/*.toml`
+through structured TOML, and writes a last-wins drop-in that registers
+`proxy_plugins.gantry-overlaybd` and selects it for CRI image unpacking.
+Containerd restarts only when effective configuration changes. A second writer
+is never overwritten: if either managed file differs from the recorded bytes,
+apply or rollback preserves it and reports the conflict.
 
 For an operator-managed installation, opt in through every participating
 `Site` using the same selector. This path assumes `unbounded-agent` or another
 node manager already routes containerd through Gantry. Use the standalone Helm
 chart on stock AKS nodes so the registry-specific route is installed alongside
-the OverlayBD configuration.
+the snapshotter configuration.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -261,7 +273,7 @@ while disabling Gantry, or conflicting selectors across Sites.
 
 ### Artifact Streaming rollback
 
-Drain workloads using active OverlayBD devices before disabling the operator
+Drain workloads using active Gantry snapshotter devices before disabling the operator
 setting. The operator issues deletion of
 `DaemonSet/gantry-overlaybd-config` before applying the non-streaming Gantry
 DaemonSet, and the configurator's `preStop` restores the original host
@@ -348,30 +360,30 @@ queueing behind ACR rather than failing.
 
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
-| Pods on streaming nodes stall on first read | Gantry agent unavailable on that node | OverlayBD has no second path while `p2pConfig` targets Gantry. Cordon the node, drain streaming workloads, then set `overlaybdConfig.enabled=false` so new devices use ACR directly. |
+| Pods on streaming nodes stall on first read | Gantry agent or snapshotter unavailable on that node | Cordon the node, drain streaming workloads, then set `overlaybdConfig.enabled=false` to restore the previous containerd snapshotter. |
 | `GantryStreamingOriginFailing` while peers still serve | ACR data plane, or an expired SAS | Ranges backed by a complete peer keep working, so do not disable Gantry; it is the only thing still serving. Escalate to ACR. |
 | `GantryStreamingRejectingOriginURLs` | Allowlist does not cover the registry data endpoint | Add it to `gantry.artifactStreaming.allowedHostSuffixes` and roll the agent. |
 | Ranges return to `source="origin"` after a peer had served them | Provider record outlived the blob (containerd GC or eviction) | Expected. Gantry fails over within the same request and suppresses that provider for 3m. Investigate only if it persists, which points at containerd GC pressure. |
 | `/artifact-streaming/readyz` returns 503 | Agent still starting, or draining | The gate is sticky until startup completes. If it persists, check the containerd socket; containerd is Gantry's only content store. |
-| OverlayBD device errors while Gantry is healthy | OverlayBD daemon or TCMU backend | Outside Gantry. Restore direct origin with `overlaybdConfig.enabled=false` and engage AKS support. |
+| NBD device errors while Gantry is healthy | NBD capacity, kernel module, or mount propagation | Check the adapter DaemonSet and host `nbd` module state. Drain workloads before disabling `overlaybdConfig`. |
 
 ### Artifact Streaming compatibility
 
-Gantry configures an existing AKS Artifact Streaming installation. It does not
-install, version, or upgrade OverlayBD.
+Gantry consumes ACR's existing OverlayBD artifact format but owns the runtime
+reader and snapshotter.
 
 | Component | Requirement | Owner |
 | --- | --- | --- |
 | Node pool | Created with Artifact Streaming enabled | AKS |
 | Registry | Premium ACR serving streaming artifacts | ACR |
-| OverlayBD runtime | `overlaybd-tcmu` and `overlaybd-snapshotter` units present and active | AKS |
-| OverlayBD config tool | `/opt/acr/tools/overlaybd/config.sh` | AKS |
-| Kernel backend | TCMU, as provisioned by the node image | AKS |
+| Artifact contract | OverlayBD v0.1.0 annotations and sealed LSMT layers | ACR |
+| Kernel backend | `nbd`, ext4, and EROFS when selected by the image | Node image |
+| Snapshotter selection | CRI selects `gantry-overlaybd`; AKS's native `overlaybd` registration remains intact | Gantry |
 | containerd | Reads `/etc/containerd/certs.d`; Unbounded-managed nodes pin 2.1.8 | Unbounded / AKS |
-| Host config keys written | `p2pConfig.enable` and `p2pConfig.address` only | Gantry |
+| Host config written | import for `/etc/containerd/conf.d/*.toml`, `proxy_plugins.gantry-overlaybd`, and the CRI snapshotter selection | Gantry |
 
-Every other key in `/etc/overlaybd/overlaybd.json` is left exactly as the node
-image shipped it, and rollback restores the original file.
+Every other containerd setting is preserved, and rollback restores the original
+main config and any pre-existing drop-in exactly.
 
 ## What to verify after rollout
 

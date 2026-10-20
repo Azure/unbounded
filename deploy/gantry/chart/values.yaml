@@ -42,7 +42,14 @@ metricsService:
 
 overlaybdConfig:
   enabled: false
-  address: http://localhost:5000/blobs
+  address: /run/gantry-overlaybd/gantry-overlaybd.sock
+  gantryEndpoint: http://127.0.0.1:5000/blobs
+  snapshotterRoot: /var/lib/gantry/snapshotter
+  containerdAddress: /run/containerd/containerd.sock
+  fallbackSnapshotter: overlayfs
+  nbdDeviceGlob: /dev/nbd*
+  nbdMaxDevices: "1024"
+  nbdMinDevices: "64"
   image:
     reference: ""
     repository: ghcr.io/azure/gantry-node-config
@@ -85,6 +92,13 @@ resources:
     limits:
       cpu: 100m
       memory: 64Mi
+  overlaybdSnapshotter:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "4"
+      memory: 4Gi
 
 gantry:
   config: ""

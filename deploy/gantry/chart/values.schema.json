@@ -201,6 +201,13 @@
       "required": [
         "enabled",
         "address",
+        "gantryEndpoint",
+        "snapshotterRoot",
+        "containerdAddress",
+        "fallbackSnapshotter",
+        "nbdDeviceGlob",
+        "nbdMaxDevices",
+        "nbdMinDevices",
         "image",
         "nodeSelector",
         "tolerations"
@@ -211,7 +218,35 @@
         },
         "address": {
           "type": "string",
-          "pattern": "^http://localhost:[0-9]+/blobs$"
+          "pattern": "^/"
+        },
+        "gantryEndpoint": {
+          "type": "string",
+          "pattern": "^http://(127\\.0\\.0\\.1|localhost):[0-9]+/blobs$"
+        },
+        "snapshotterRoot": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "containerdAddress": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "fallbackSnapshotter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nbdDeviceGlob": {
+          "type": "string",
+          "pattern": "^/dev/nbd"
+        },
+        "nbdMaxDevices": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "nbdMinDevices": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
         },
         "image": {
           "type": "object",
@@ -282,7 +317,8 @@
         "agent",
         "init",
         "nodeConfig",
-        "overlaybdConfig"
+        "overlaybdConfig",
+        "overlaybdSnapshotter"
       ],
       "properties": {
         "agent": {
@@ -295,6 +331,9 @@
           "type": "object"
         },
         "overlaybdConfig": {
+          "type": "object"
+        },
+        "overlaybdSnapshotter": {
           "type": "object"
         }
       }

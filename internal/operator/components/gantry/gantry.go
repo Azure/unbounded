@@ -55,11 +55,12 @@ const (
 	// agentContainerName is the gantry agent's main container. Only this
 	// container carries the operator-managed image; the DaemonSet's busybox
 	// init container keeps its pinned public image.
-	agentContainerName             = "gantry"
-	overlayBDConfigDaemonSetName   = "gantry-overlaybd-config"
-	overlayBDConfigContainerName   = "configure"
-	overlayBDConfigImageRepository = "gantry-node-config"
-	artifactStreamingEnabledEnv    = "GANTRY_ARTIFACT_STREAMING_ENABLED"
+	agentContainerName                = "gantry"
+	overlayBDConfigDaemonSetName      = "gantry-overlaybd-config"
+	overlayBDConfigContainerName      = "configure"
+	overlayBDSnapshotterContainerName = "snapshotter"
+	overlayBDConfigImageRepository    = "gantry-node-config"
+	artifactStreamingEnabledEnv       = "GANTRY_ARTIFACT_STREAMING_ENABLED"
 
 	// legacyNodeConfigName and legacyNodeConfigDaemonSetName were installed by
 	// older operator versions. The unbounded agent owns this host configuration.
@@ -432,6 +433,10 @@ func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactS
 
 			if err := component.SetNamedContainerImage(obj, overlayBDConfigContainerName, overlayBDConfigImage); err != nil {
 				return fmt.Errorf("set gantry OverlayBD configurator image: %w", err)
+			}
+
+			if err := component.SetNamedContainerImage(obj, overlayBDSnapshotterContainerName, agentImage); err != nil {
+				return fmt.Errorf("set gantry OverlayBD snapshotter image: %w", err)
 			}
 
 			selector := make(map[string]any, len(artifactStreaming.NodeSelector))

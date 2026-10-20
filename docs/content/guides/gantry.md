@@ -250,9 +250,15 @@ registry.
 
 ### 4. Optional: Enable ACR Artifact Streaming
 
-ACR Artifact Streaming support requires an AKS node pool that already runs the
-OverlayBD daemon and snapshotter. Gantry configures that existing installation;
-it does not provision OverlayBD on other nodes.
+ACR Artifact Streaming support consumes the existing ACR OverlayBD v0.1.0
+artifact contract without running the OverlayBD daemon or snapshotter. Use a
+Linux node pool with NBD and the filesystem support required by the converted
+image. AKS initially selects the native `overlaybd` snapshotter; Gantry's
+managed drop-in switches CRI to the distinct `gantry-overlaybd` proxy while
+leaving that native plugin registered.
+Converted ACR layers use Gantry's NBD data path. Ordinary OCI layers delegate
+to containerd's built-in `overlayfs` snapshotter through a read-only mount of
+the host containerd runtime directory.
 
 For the standalone chart, set both feature gates and select only the AKS
 streaming node pool:
@@ -282,9 +288,9 @@ spec:
 ```
 
 Every Site that enables the cluster-wide feature must specify the same
-selector. The node configurator records the previous OverlayBD configuration,
-does not restart services on a no-op, and restores its previous value on
-graceful removal only when no other writer changed the file.
+selector. The node configurator records the previous containerd configuration,
+does not restart containerd on a no-op, and restores its previous value on
+graceful removal only when no other writer changed the managed files.
 
 To roll back, drain active streaming workloads first. Operator-managed installs
 then set `spec.components.gantry.artifactStreaming.enabled` to `false`; the

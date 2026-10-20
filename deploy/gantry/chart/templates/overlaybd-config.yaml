@@ -36,12 +36,53 @@ spec:
         {{- toYaml .Values.overlaybdConfig.tolerations | nindent 8 }}
       terminationGracePeriodSeconds: 60
       containers:
+        - name: snapshotter
+          image: {{ include "gantry.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - snapshotter
+            - --root={{ .Values.overlaybdConfig.snapshotterRoot }}
+            - --address={{ .Values.overlaybdConfig.address }}
+            - --gantry-endpoint={{ .Values.overlaybdConfig.gantryEndpoint }}
+            - --nbd-devices={{ .Values.overlaybdConfig.nbdDeviceGlob }}
+            - --containerd-address={{ .Values.overlaybdConfig.containerdAddress }}
+            - --fallback-snapshotter={{ .Values.overlaybdConfig.fallbackSnapshotter }}
+          resources:
+            {{- toYaml .Values.resources.overlaybdSnapshotter | nindent 12 }}
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            exec:
+              command: ["test", "-S", {{ .Values.overlaybdConfig.address | quote }}]
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          volumeMounts:
+            - name: snapshotter-state
+              mountPath: {{ .Values.overlaybdConfig.snapshotterRoot }}
+              mountPropagation: Bidirectional
+            - name: snapshotter-run
+              mountPath: /run/gantry-overlaybd
+            - name: host-dev
+              mountPath: /dev
+            - name: containerd-runtime
+              mountPath: {{ dir .Values.overlaybdConfig.containerdAddress }}
+              readOnly: true
         - name: configure
           image: {{ include "gantry.overlaybdConfigImage" . }}
           imagePullPolicy: {{ .Values.overlaybdConfig.image.pullPolicy }}
           env:
-            - name: OVERLAYBD_P2P_ADDRESS
+            - name: GANTRY_SNAPSHOTTER_ADDRESS
               value: {{ .Values.overlaybdConfig.address | quote }}
+            - name: GANTRY_NBD_MAX_DEVICES
+              value: {{ .Values.overlaybdConfig.nbdMaxDevices | quote }}
+            - name: GANTRY_NBD_MIN_DEVICES
+              value: {{ .Values.overlaybdConfig.nbdMinDevices | quote }}
           resources:
             {{- toYaml .Values.resources.overlaybdConfig | nindent 12 }}
           lifecycle:
@@ -64,13 +105,27 @@ spec:
           volumeMounts:
             - name: host-root
               mountPath: /host
-            - name: run
+            - name: snapshotter-run
               mountPath: /run/gantry-overlaybd
       volumes:
         - name: host-root
           hostPath:
             path: /
             type: Directory
-        - name: run
-          emptyDir: {}
+        - name: snapshotter-state
+          hostPath:
+            path: {{ .Values.overlaybdConfig.snapshotterRoot }}
+            type: DirectoryOrCreate
+        - name: snapshotter-run
+          hostPath:
+            path: /run/gantry-overlaybd
+            type: DirectoryOrCreate
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: containerd-runtime
+          hostPath:
+            path: {{ dir .Values.overlaybdConfig.containerdAddress }}
+            type: Directory
 {{- end }}

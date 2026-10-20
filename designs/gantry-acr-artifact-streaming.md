@@ -534,5 +534,3 @@ The run's post-pull metric-settlement gate timed out while 231 transfers were
 still active. It therefore did not persist final P95 startup or settled origin
 traffic measurements. The Pod counts and physical host-store measurements above
 are direct observations and do not depend on that missing phase artifact.
-
-

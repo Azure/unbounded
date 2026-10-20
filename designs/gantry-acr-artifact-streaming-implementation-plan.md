@@ -15,9 +15,10 @@ Two independent paths run after Gantry serves a streaming manifest:
 1. **Complete-layer seeding:** the existing manifest prefetch path sends
    layer-specific `please_pull` requests to Gantry chairs. Chairs download,
    verify, commit, and advertise complete layers.
-2. **Range reads:** OverlayBD sends `Range: bytes=N-M` to a node-local Gantry
-   endpoint. Gantry serves the range from a complete local layer, a complete
-   peer layer, or the signed Azure origin URL.
+2. **Range reads:** the Gantry snapshotter interprets the existing ACR
+  OverlayBD v0.1.0 contract and reads sealed LSMT layers through Gantry's
+  node-local exact-range endpoint. Gantry serves each range from a complete
+  local layer, a complete peer layer, or the signed Azure origin URL.
 
 The range path does not start, cancel, or own chair pulls. Manifest processing
 remains the only owner of proactive complete-layer seeding.
@@ -25,9 +26,9 @@ remains the only owner of proactive complete-layer seeding.
 ```text
 manifest -> existing Gantry prefetch -> chairs pull complete layers
 
-OverlayBD range -> local complete blob
-                -> complete peer provider
-                -> signed origin URL
+Gantry LSMT read -> local complete blob
+                 -> complete peer provider
+                 -> signed origin URL
 ```
 
 ## Baseline implementation decisions
@@ -39,16 +40,19 @@ contract:
 - Add `GET /blobs/<resolved-origin-url>` to the existing node-local Gantry
   listener on port 5000.
 - Accept one exact bounded range, `bytes=N-M`. Reject suffix, open-ended, and
-  multipart ranges at the OverlayBD endpoint.
+  multipart ranges at the OverlayBD-compatible endpoint.
 - Query only complete digest providers already advertised in the existing DHT.
 - Use a short, bounded provider lookup. Do not wait for an in-progress chair
   pull before using the signed origin URL.
 - Do not add range-keyed DHT records or range-specific chair RPCs.
 - Do not cache partial origin ranges in the first implementation.
-- Do not send signed URLs or OverlayBD registry authorization to peers.
+- Do not send signed URLs or registry authorization to peers.
 - Keep complete content in containerd; do not add another complete-object
   store.
-- Ship the feature disabled until the node's OverlayBD configuration is ready.
+- Keep the ACR conversion output unchanged. Gantry consumes the existing
+  OverlayBD descriptor annotations and sealed LSMT layer blobs.
+- Ship the feature disabled until the Gantry snapshotter and containerd proxy
+  configuration are ready.
 
 A transient range cache and cluster-wide range ownership remain possible later
 optimizations. Neither is required for the design's local/peer/origin source
@@ -62,6 +66,8 @@ transition.
 |---|---|
 | `internal/gantry/httprange` | Parse exact request ranges and validate `Content-Range` responses. |
 | `internal/gantry/streaming` | Handle OverlayBD requests, parse Azure data URLs, choose a source, and stream the response. |
+| `internal/gantry/overlaybd` | Validate the ACR contract, read and stack sealed LSMT layers, expose NBD devices, and implement containerd snapshots. |
+| `internal/gantry/containerdconfig` | Apply and restore the containerd proxy snapshotter drop-in transactionally. |
 
 `httprange` is shared by the streaming handler and peer transfer client. It
 must not import Gantry networking or storage packages.
@@ -79,9 +85,10 @@ mirror package or the chair coordinator.
 | `internal/gantry/transfer/transfer.go` | Keep the existing server wire contract; add conformance tests for exact ranges. |
 | `internal/gantry/config/config.go` | Add feature, origin-policy, lookup, and concurrency configuration. |
 | `internal/gantry/mirror/mirror.go` | Permit composition of the mirror handler with the streaming handler on one listener. Do not add streaming source logic here. |
-| `cmd/gantry/main.go` | Construct and wire the streaming server, shared listener, metrics, and shutdown. |
+| `cmd/gantry/main.go` | Construct and wire the streaming server and expose the `snapshotter` subcommand. |
+| `cmd/gantry-node-config` | Manage the host containerd import and proxy-plugin drop-in. |
 | `cmd/gantry/agent_metrics.go` | Register bounded streaming metrics. |
-| `deploy/gantry/chart` | Render configuration and optional OverlayBD node configuration. |
+| `deploy/gantry/chart` | Render the optional privileged snapshotter and host configurator workload. |
 
 ## Phase 0: Lock and test upstream contracts
 
@@ -108,14 +115,14 @@ Add tests proving:
 
 1. Containerd's remote snapshot annotations carry the original image
    reference and layer digest.
-2. The OverlayBD snapshotter writes the expected `repoBlobUrl`, digest, and
-   size without downloading the complete layer.
+2. Containerd passes the existing blob digest, size, filesystem type, version,
+  and image-reference labels without downloading the complete layer.
 3. Gantry's existing `manifest.TypedChildren` classifies the streaming config
    and layers correctly.
 4. `layerPrefetchAdapter.OnManifestServed` sends the streaming children through
    `PrefetchManifestChildren` with registry and repository intact.
-5. OverlayBD sends the post-redirect URL to `p2pConfig.address` with an exact
-   bounded range.
+5. The Gantry LSMT reader sends the canonical ACR blob URL to the node-local
+  endpoint with an exact bounded range.
 6. ACR Artifact Streaming uses redirect mode in supported environments. Direct
   registry `200` self mode is unsupported by this integration.
 
@@ -507,34 +514,39 @@ request always has a signed fallback capability.
 single manifest: first range from origin, complete chair commit, second range
 from peer.
 
-## Phase 7: AKS OverlayBD configuration
+## Phase 7: Gantry snapshotter and AKS node configuration
 
-AKS Artifact Streaming node pools already install the OverlayBD daemon and
-snapshotter. Gantry must configure the existing daemon to use the local endpoint:
+The ACR Artifact Streaming conversion contract remains unchanged. Gantry
+replaces the runtime OverlayBD dependency with a compatibility adapter that:
 
-```json
-{
-  "p2pConfig": {
-    "enable": true,
-    "address": "http://localhost:5000/blobs"
-  }
-}
-```
+1. validates the existing `containerd.io/snapshot/overlaybd/*` labels;
+2. reads sealed OverlayBD v0.1.0 LSMT layers through Gantry's range endpoint;
+3. merges layers bottom-to-top with top-layer precedence;
+4. exposes the read-only virtual disk through Linux NBD;
+5. mounts ext4 or EROFS from that device; and
+6. returns an overlayfs mount with a local writable upper directory; and
+7. delegates ordinary, non-converted OCI layers to containerd's built-in
+  overlayfs snapshotter.
 
 ### Helm/operator resources
 
-Add an explicitly enabled OverlayBD node-configuration workload modeled on the
-upstream Peerd configurator:
+Add an explicitly enabled two-container adapter DaemonSet:
 
-- privileged access only where required to enter the host namespaces;
+- a privileged `gantry snapshotter` container with `/dev`, a host-visible Unix
+  socket, the host containerd runtime directory mounted read-only, and
+  bidirectional mount propagation for snapshotter state;
+- a privileged node-config container that enters the host namespaces only for
+  NBD module setup and containerd restart;
 - no service-account token when Kubernetes API access is unnecessary;
 - node selector/affinity limiting it to Artifact Streaming node pools;
-- use the AKS-provided `/opt/acr/tools/overlaybd/config.sh` rather than editing
-  JSON with string replacement;
-- set only `p2pConfig` and leave every other OverlayBD setting exactly as the
-  host had it;
-- verify Gantry readiness before enabling the proxy;
-- record the previous values for rollback;
+- verify both Gantry range readiness and the snapshotter socket before changing
+  containerd;
+- load `nbd` with a bounded device count and verify the minimum capacity;
+- add `/etc/containerd/conf.d/*.toml` through a structured TOML parser and use
+  a last-wins drop-in to register `proxy_plugins.gantry-overlaybd` and select
+  it for CRI image unpacking without replacing AKS's native `overlaybd` plugin;
+- record exact original and managed bytes for rollback and concurrent-change
+  detection;
 - avoid repeated service restarts when the desired config is already present;
   and
 - report readiness only after the host config and running service agree.
@@ -546,6 +558,11 @@ gantry.artifactStreaming.enabled
 overlaybdConfig.enabled
 overlaybdConfig.nodeSelector
 overlaybdConfig.address
+overlaybdConfig.snapshotterRoot
+overlaybdConfig.containerdAddress
+overlaybdConfig.fallbackSnapshotter
+overlaybdConfig.nbdMaxDevices
+overlaybdConfig.nbdMinDevices
 ```
 
 The operator-managed profile renders the resource into its explicit manifest
@@ -558,21 +575,22 @@ silently deploy privileged host mutation merely because Gantry is enabled.
 ### Rollout order
 
 1. Deploy Gantry with the streaming endpoint enabled and ready.
-2. Configure OverlayBD node by node to call Gantry.
-3. Validate a new streaming device on each updated node.
-4. Roll back in reverse order: disable OverlayBD P2P first, then roll back
-   Gantry.
+2. Start the Gantry snapshotter and configure containerd node by node.
+3. Validate an ACR-converted image and active filesystem reads on each updated
+  node.
+4. Roll back in reverse order: restore the containerd proxy config first, then
+  roll back Gantry.
 
 **Phase exit:** a fresh AKS Artifact Streaming node can be configured and rolled
-back declaratively, and reapplying identical desired state does not restart
-OverlayBD services.
+back declaratively, reapplying identical desired state does not restart
+containerd, and no OverlayBD daemon or snapshotter process is required.
 
 ## Phase 8: End-to-end validation and operational release
 
 ### Kind contract tests
 
-Kind does not need a real OverlayBD block device to validate Gantry's HTTP and
-peer behavior. The `e2e/gantry` contract uses a strict range client, a
+Kind does not need a real NBD device to validate Gantry's HTTP, LSMT, snapshot
+metadata, and peer behavior. The `e2e/gantry` contract uses a strict range client, a
 cluster-local TLS origin, and a complete blob inserted on a peer node to prove:
 
 - raw signed URL preservation;
@@ -681,17 +699,17 @@ make gantry
 2. Verify existing OCI pulls, DHT, chairs, and transfer behavior are unchanged.
 3. Enable the Gantry streaming endpoint.
 4. Verify endpoint readiness on every target node.
-5. Enable OverlayBD `p2pConfig` node by node.
+5. Enable the Gantry snapshotter and containerd proxy drop-in node by node.
 6. Run a streaming smoke workload on each updated node group.
 7. Expand only after origin/peer metrics and active filesystem reads are healthy.
 
-Mixed Gantry versions are acceptable during step 1 because the existing peer
-server already supports exact ranges; only upgraded requesters expose the local
-OverlayBD endpoint.
+Mixed Gantry versions are acceptable during step 1 because the adapter remains
+disabled until both containers are present on a node.
 
 ### Rollback
 
-1. Disable OverlayBD P2P configuration so new devices use direct origin.
+1. Restore the original containerd proxy configuration so new snapshots use the
+  previous node runtime.
 2. Drain affected streaming workloads before removing the node-local endpoint.
 3. Disable the Gantry streaming endpoint.
 4. Roll back Gantry.
@@ -710,7 +728,9 @@ content and existing DHT records remain valid.
 | Range reads starve complete pulls | Separate concurrency pools and metrics for range origin traffic and chair origin traffic. |
 | Partial response is presented as valid | Strict `206`, `Content-Range`, length, and EOF validation. |
 | Snapshot annotations are absent on transfer-service pulls | Explicit containerd configuration plus contract/readiness tests. |
-| Host configuration disrupts active devices | Idempotent writes, controlled node rollout, no restart on no-op, exercised rollback. |
+| Host configuration disrupts active devices | Exact original/managed state, concurrent-change refusal, controlled rollout, no restart on no-op, exercised rollback. |
+| NBD capacity is exhausted | Configurable `nbds_max`, startup capacity check, one device per active mounted snapshot, and release on removal. |
+| LSMT interpretation differs from OverlayBD | Format-level tests for metadata, mappings, holes, zeroes, layer precedence, virtual size, and contiguous reads. |
 | Partial bytes are confused with complete providers | Never write partial ranges to containerd or advertise them in the complete-object DHT. |
 
 ## Acceptance criteria
@@ -756,6 +776,6 @@ content and existing DHT records remain valid.
 - Cluster-wide range ownership.
 - Persistent partial-range caching.
 - Changes to containerd's image pull algorithm.
-- Changes to OverlayBD or the OverlayBD snapshotter.
-- Provisioning OverlayBD on Unbounded-managed nodes.
+- Changes to ACR conversion or the existing OverlayBD v0.1.0 artifact contract.
+- Writable OverlayBD block layers, TurboOCI, or Racer integration.
 - Replacing complete-layer chairs with on-demand range owners.
