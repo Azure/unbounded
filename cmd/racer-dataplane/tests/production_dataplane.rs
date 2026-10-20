@@ -529,7 +529,6 @@ impl Rig {
         let transfers = Rc::new(Transfers::new(
             http.clone(),
             io.clone(),
-            None,
             admission.clone(),
             Rc::new(racer_dataplane::peer::protocol::SecurityCodec::new(
                 admission.clone(),

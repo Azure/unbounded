@@ -44,8 +44,7 @@ use crate::peer::forwarding::Forwarding;
 use crate::peer::protocol::Signatures;
 use crate::peer::server::PeerServer;
 use crate::peer::transport::Transfers;
-use crate::rdma::Devices;
-use crate::rdma::Sessions;
+use crate::rdma::Links;
 use crate::read::Coordinator;
 use crate::read::candidates::CandidatePolicy;
 use crate::read::dispatch::WorkerDirectory;
@@ -172,7 +171,7 @@ pub struct NodeState {
 
     observations: Observations,
 
-    native: native::NativePairs,
+    native: native::NativeNode,
 
     cache_rollout: controlplane::Rollout<WorkerId, Vec<CacheDefinition>>,
 
@@ -227,7 +226,7 @@ impl NodeState {
             periodic_checkpoint: Mutex::new(CheckpointCut::default()),
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
-            native: native::NativePairs::default(),
+            native: native::NativeNode::default(),
             pressure: Default::default(),
         })
     }
@@ -568,17 +567,13 @@ pub struct WorkerApplication {
     /// Same table as Fill; the worker drives abandoned work without user futures.
     flights: Rc<Flights>,
 
-    rdma: Option<Rc<Sessions>>,
-
-    devices: Option<Rc<Devices>>,
+    links: Option<Rc<Links>>,
 
     discovered_nics: Vec<racer_control_wire::RailMapping>,
 
     actual_rails: Vec<racer_control_wire::RailMapping>,
 
     inventory_generation: u64,
-
-    native_numa: Option<native::NativePlacement>,
 
     native_task: Option<Operation<'static, Vec<racer_control_wire::RailMapping>>>,
 
@@ -860,18 +855,18 @@ impl WorkerApplication {
         let disk = store.reader.clone();
         let writer = store.writer.clone();
 
-        let (sessions, rdma, devices) = if config.enable_rdma {
-            let devices = Rc::new(Devices::with_reactor(reactor.clone()));
-            if let Some(port) = node.native.io(worker)? {
-                devices.attach(port)?;
-            }
-            let sessions = Rc::new(Sessions::new(
-                devices.clone(),
-                config.limits.connections_per_neighbor.get(),
-            ));
-            (Some(sessions.clone()), Some(sessions), Some(devices))
+        let links = if config.enable_rdma {
+            node.native.client(worker)?.map(|client| {
+                Rc::new(Links::new(
+                    client,
+                    node.native.link_node(),
+                    config.node.clone(),
+                    limits.connections_per_neighbor.get(),
+                    Some(reactor.clone()),
+                ))
+            })
         } else {
-            (None, None, None)
+            None
         };
 
         let paths = Rc::new(
@@ -897,7 +892,6 @@ impl WorkerApplication {
         let transfers = Transfers::new(
             http.clone(),
             io.clone(),
-            rdma.clone(),
             admission.clone(),
             wire.clone(),
             signatures.clone(),
@@ -916,8 +910,8 @@ impl WorkerApplication {
             memory.clone(),
             writer.clone(),
         ));
-        let transfers = Rc::new(match &sessions {
-            Some(sessions) => transfers.with_native(sessions.clone()),
+        let transfers = Rc::new(match &links {
+            Some(links) => transfers.with_links(links.clone()),
             None => transfers,
         });
         let requester = Rc::new(
@@ -1062,12 +1056,10 @@ impl WorkerApplication {
             coordinator,
             metadata,
             flights,
-            rdma,
-            devices,
+            links,
             discovered_nics,
             actual_rails: Vec::new(),
             inventory_generation: 0,
-            native_numa: node.native.numa(worker)?,
             native_task: None,
             native_retry: racer_platform::environment::now(),
             telemetry: Rc::new(telemetry),
@@ -1382,9 +1374,7 @@ impl WorkerApplication {
             && self.native_task.is_some()
         {
             self.native_task.take();
-            if let Some(devices) = &self.devices {
-                devices.close();
-            }
+            self.close_native();
         }
         if !self.actual_rails.is_empty() {
             let compatible = self.native_publication().is_ok_and(|published_rails| {
@@ -1402,9 +1392,7 @@ impl WorkerApplication {
                     })
             });
             if !compatible {
-                if let Some(devices) = &self.devices {
-                    devices.close();
-                }
+                self.close_native();
                 self.actual_rails.clear();
             }
         }
@@ -1713,8 +1701,8 @@ impl WorkerApplication {
                     self.worker.0
                 );
             })?;
-        if let Some(rdma) = &self.rdma {
-            stage_result(self.worker, "rdma-progress", rdma.progress())?;
+        if let Some(links) = &self.links {
+            links.poll(cx);
         }
         if let Some(result) = poll_task(&mut self.peer_task, cx) {
             listener_completion(result, self.stopping, self.worker, "peer-listener")?;
@@ -2056,11 +2044,8 @@ impl racer_platform::group::Service<RequestScope> for WorkerApplication {
                 }
             })
             .await;
-            if let Some(rdma) = &self.rdma {
-                rdma.drain().await?;
-            }
-            if let Some(devices) = &self.devices {
-                devices.close();
+            if let Some(links) = &self.links {
+                links.drain().await?;
             }
             if let Some(scope) = &self.diagnostic_scope {
                 scope.cancel()?;
@@ -2586,10 +2571,8 @@ fn partition_limits_with_cause(
     ] {
         *value = NonZeroUsize::new(value.get() / workers).ok_or_else(|| invalid(dimension))?;
     }
-    if rdma {
-        limits.registered_bytes = NonZeroUsize::new(node.registered_bytes.get() / workers)
-            .ok_or_else(|| invalid("registered_bytes"))?;
-    }
+    // Registered memory is one node-wide pool owned by a single native thread;
+    // it is never divided per worker.
     let page = crate::model::PAGE_BYTES as usize;
     let window = limits.range_window_pages.get();
     for (dimension, insufficient) in [
@@ -2609,7 +2592,7 @@ fn partition_limits_with_cause(
         ),
         (
             "registered_bytes",
-            rdma && native::slot_count(&limits).map_err(|error| ("registered_bytes", error))? == 0,
+            rdma && native::buffer_count(&limits) < 2,
         ),
         (
             "request_context_bytes",

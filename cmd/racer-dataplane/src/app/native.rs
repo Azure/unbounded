@@ -1,19 +1,18 @@
-//! Native lifecycle endpoints remain per I/O shard, even with shared crypto threads.
+//! One RDMA owner per node, hosted beside crypto on the thread paired with the
+//! first I/O worker; every I/O worker gets a client (`designs/racer-rdma-sessions.md`,
+//! "Threading").
 
 use super::*;
-use crate::rdma::WithNative;
+use crate::rdma::WithOwner;
 use crate::runtime::HashMap;
-use rdma_verbs::IoPort;
-use rdma_verbs::NativePort;
 
 #[derive(Default)]
-pub(super) struct NativePairs {
-    ports: Mutex<HashMap<WorkerId, NativePair>>,
+pub(super) struct NativeNode {
+    clients: Mutex<HashMap<WorkerId, rdma_verbs::Client>>,
+    owner: Mutex<Option<(WorkerId, rdma_verbs::OwnerPort)>>,
+    owner_worker: Mutex<Option<WorkerId>>,
+    links: Arc<crate::rdma::LinkNode>,
     numa: Mutex<HashMap<WorkerId, NativePlacement>>,
-}
-struct NativePair {
-    io: Option<IoPort>,
-    crypto: Option<NativePort>,
 }
 
 /// NUMA locality of the crypto role that first-touches registered allocations.
@@ -22,14 +21,12 @@ pub(super) struct NativePlacement {
     pub(super) numa_node: Option<usize>,
 }
 
-pub(super) fn slot_count(limits: &Limits) -> Result<usize> {
-    let charge = crate::rdma::native_slot_charge(crate::rdma::MAX_CIPHERTEXT)?;
-    Ok((limits.registered_bytes.get() / charge)
-        .min(limits.queue_entries.get())
-        .min(256))
+/// Page buffers the node-wide registered budget funds.
+pub(super) fn buffer_count(limits: &Limits) -> usize {
+    crate::rdma::buffer_count(limits.registered_bytes.get())
 }
 
-impl NativePairs {
+impl NativeNode {
     pub(super) fn place(&self, plan: &AffinityPlan) -> Result<()> {
         let mut numa = self.numa.lock().map_err(|_| Error::Unavailable)?;
         for pair in &plan.pairs {
@@ -50,67 +47,82 @@ impl NativePairs {
             .get(&worker)
             .copied())
     }
+    /// Create the node owner and one client per worker. The first worker's
+    /// crypto thread hosts the owner.
     pub(super) fn prepare(
         &self,
         workers: impl Iterator<Item = WorkerId>,
         limits: &Limits,
     ) -> Result<()> {
-        let slots = slot_count(limits)?;
         // Insufficient optional native capacity uses HTTP without inventing quota.
-        if slots == 0 {
+        if buffer_count(limits) < 2 {
             return Ok(());
         }
-        let mut ports = self.ports.lock().map_err(|_| Error::Unavailable)?;
-        for worker in workers {
-            let (io, native) = rdma_verbs::pair(slots)?;
-            ports.insert(
-                worker,
-                NativePair {
-                    io: Some(io),
-                    crypto: Some(native),
-                },
-            );
-        }
+        let workers: Vec<_> = workers.collect();
+        let Some(&first) = workers.first() else {
+            return Ok(());
+        };
+        let (clients, port) = rdma_verbs::node(workers.len())?;
+        let mut map = self.clients.lock().map_err(|_| Error::Unavailable)?;
+        map.extend(workers.into_iter().zip(clients));
+        *self.owner.lock().map_err(|_| Error::Unavailable)? = Some((first, port));
+        *self.owner_worker.lock().map_err(|_| Error::Unavailable)? = Some(first);
         Ok(())
     }
-    pub(super) fn io(&self, worker: WorkerId) -> Result<Option<IoPort>> {
+    /// This worker's client, once.
+    pub(super) fn client(&self, worker: WorkerId) -> Result<Option<rdma_verbs::Client>> {
         Ok(self
-            .ports
+            .clients
             .lock()
             .map_err(|_| Error::Unavailable)?
-            .get_mut(&worker)
-            .and_then(|pair| pair.io.take()))
+            .remove(&worker))
+    }
+    /// The worker whose paired crypto thread hosts the owner.
+    pub(super) fn owner_worker(&self) -> Option<WorkerId> {
+        *self
+            .owner_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    pub(super) fn link_node(&self) -> Arc<crate::rdma::LinkNode> {
+        self.links.clone()
     }
     pub(super) fn crypto(
         &self,
         worker: WorkerId,
         engine: PageCryptoEngine,
     ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
-        let native = self
-            .ports
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .get_mut(&worker)
-            .and_then(|pair| pair.crypto.take());
-        Ok(match native {
-            Some(native) => Box::new(WithNative::new(engine, native)),
+        let mut owner = self.owner.lock().map_err(|_| Error::Unavailable)?;
+        Ok(match owner.take_if(|(hosted, _)| *hosted == worker) {
+            // Build the owner here, on the native thread that polls it.
+            Some((_, port)) => Box::new(WithOwner::with_host(engine, rdma_verbs::Owner::new(port))),
             None => Box::new(engine),
         })
     }
 }
 impl WorkerApplication {
+    fn native_owner(&self) -> bool {
+        self.links.is_some() && self.node.native.owner_worker() == Some(self.worker)
+    }
+    /// Close the node's links. Only the owner's worker closes: every worker sees
+    /// the same inventory and publication, and the owner reactivates.
+    pub(super) fn close_native(&mut self) {
+        if self.native_owner()
+            && let Some(links) = &self.links
+        {
+            links.close();
+        }
+    }
     /// Inventory withdrawal/GID changes invalidate in-progress activation before
-    /// it can publish readiness. Existing generations drain on their native owner.
+    /// it can publish readiness. Existing links drain on the owner.
     pub(super) fn refresh_inventory(&mut self) -> Result<()> {
-        if self.devices.is_none() || self.node.inventory.generation() == self.inventory_generation {
+        if self.links.is_none() || self.node.inventory.generation() == self.inventory_generation {
             return Ok(());
         }
         let snapshot = self.node.inventory.snapshot()?;
         if snapshot.generation != self.inventory_generation {
             self.native_task.take();
-            if let Some(devices) = &self.devices {
-                devices.close();
-            }
+            self.close_native();
             self.actual_rails.clear();
             self.discovered_nics = snapshot.nics;
             self.inventory_generation = snapshot.generation;
@@ -118,16 +130,21 @@ impl WorkerApplication {
         }
         Ok(())
     }
+    /// The node's rails: one device per published rail, chosen near the owner.
     pub(super) fn native_publication(&self) -> Result<Vec<racer_control_wire::RailMapping>> {
         let snapshot = self.snapshots.current()?;
         let member = snapshot.membership.member(self.keys.node())?;
-        let capacity = self.devices.as_ref().map_or(0, |d| d.capacity());
+        let owner = self.node.native.owner_worker();
+        let numa = match owner {
+            Some(owner) => self.node.native.numa(owner)?.and_then(|p| p.numa_node),
+            None => None,
+        };
         Ok(crate::rdma::select_worker(
             &member.rails,
             &self.discovered_nics,
-            usize::from(self.worker.0),
-            self.native_numa.and_then(|p| p.numa_node),
-            capacity,
+            0,
+            numa,
+            usize::from(self.links.is_some()),
         ))
     }
     pub(super) fn poll_native(&mut self, cx: &mut Context<'_>) -> Result<()> {
@@ -135,43 +152,37 @@ impl WorkerApplication {
             self.native_task.take();
             return Ok(());
         }
-        if self.devices.is_none() {
+        let Some(links) = self.links.clone() else {
             return Ok(());
-        }
+        };
         self.refresh_inventory()?;
         if let Some(task) = self.native_task.as_mut()
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
             self.native_task = None;
             self.native_retry = racer_platform::environment::now() + Duration::from_secs(1);
-            match result {
-                Ok(actual) => self.actual_rails = actual,
-                Err(_) => {
-                    if let Some(devices) = &self.devices {
-                        devices.close();
-                    }
-                }
+            if result.is_err() {
+                links.close();
             }
         }
-        if self.stopping
+        self.actual_rails = links.active();
+        if !self.native_owner()
             || self.native_task.is_some()
             || !self.actual_rails.is_empty()
             || racer_platform::environment::now() < self.native_retry
         {
             return Ok(());
         }
-        let Some(devices) = self.devices.clone() else {
-            return Ok(());
-        };
         let publication = self.native_publication()?;
         if publication.is_empty() {
             return Ok(());
         }
         let admission = self.runtime.admission.clone();
+        let registered = admission.limit(crate::admission::ResourceClass::Registered);
         let turn = scope(Duration::from_secs(5))?;
         self.native_task = Some(Box::pin(async move {
-            devices
-                .activate(publication, &admission, crate::rdma::MAX_CIPHERTEXT, &turn)
+            links
+                .activate(publication, &admission, registered, &turn)
                 .await
         }));
         cx.waker().wake_by_ref();
@@ -179,18 +190,26 @@ impl WorkerApplication {
     }
     pub(super) async fn activate_native(&mut self, startup: &RequestScope) -> Result<()> {
         self.refresh_inventory()?;
-        let Some(devices) = &self.devices else {
+        let Some(links) = self.links.clone() else {
             return Ok(());
         };
+        if !self.native_owner() {
+            // Rails are node-wide; other workers read the owner's activation
+            // when it settles (see `poll_native`) and never wait for it here.
+            self.actual_rails = links.active();
+            return Ok(());
+        }
         let publication = self.native_publication()?;
         if publication.is_empty() {
             return Ok(());
         }
-        match devices
+        match links
             .activate(
                 publication,
                 &self.runtime.admission,
-                crate::rdma::MAX_CIPHERTEXT,
+                self.runtime
+                    .admission
+                    .limit(crate::admission::ResourceClass::Registered),
                 startup,
             )
             .await
@@ -202,7 +221,7 @@ impl WorkerApplication {
                 startup.check()?;
             }
             Err(_) => {
-                devices.close();
+                links.close();
             }
         }
         Ok(())
@@ -269,11 +288,11 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(worker.actual_rails[0].device, "new");
-        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         // No membership change is needed for local discovery withdrawal to revoke.
         app.node.inventory.update(vec![]).unwrap();
         worker.refresh_inventory().unwrap();
-        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         service
             .poll(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
@@ -288,12 +307,12 @@ mod tests {
                 .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
                 .unwrap();
         }
-        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         let mut changed = fresh;
         changed.iter_mut().find(|n| n.device == "new").unwrap().gid = Some([3; 16]);
         app.node.inventory.update(changed).unwrap();
         worker.refresh_inventory().unwrap();
-        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         service
             .poll(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
@@ -663,17 +682,18 @@ mod tests {
     }
 
     #[test]
-    fn native_endpoints_remain_per_io_with_shared_crypto_placement() {
+    fn native_node_has_one_owner_and_one_client_per_worker() {
         let mut config = default_config(true);
         let mut plan = four_pair_plan(&config);
         config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers(&config.limits, &mut plan, true).unwrap();
         assert!(plan.crypto_groups().len() < plan.pairs.len());
-        let native = NativePairs::default();
+        let native = NativeNode::default();
         native.place(&plan).unwrap();
         native
             .prepare(plan.pairs.iter().map(|pair| pair.worker), &limits)
             .unwrap();
+        assert_eq!(native.owner_worker(), Some(plan.pairs[0].worker));
         for pair in &plan.pairs {
             assert_eq!(
                 native
@@ -682,8 +702,8 @@ mod tests {
                     .map(|placement| placement.numa_node),
                 Some(pair.crypto.numa_node)
             );
-            assert!(native.io(pair.worker).unwrap().is_some());
-            assert!(native.io(pair.worker).unwrap().is_none());
+            assert!(native.client(pair.worker).unwrap().is_some());
+            assert!(native.client(pair.worker).unwrap().is_none());
         }
     }
 
@@ -703,7 +723,6 @@ mod tests {
             (limits.plaintext_bytes, config.limits.plaintext_bytes),
             (limits.ciphertext_bytes, config.limits.ciphertext_bytes),
             (limits.dirty_bytes, config.limits.dirty_bytes),
-            (limits.registered_bytes, config.limits.registered_bytes),
             (
                 limits.request_context_bytes,
                 config.limits.request_context_bytes,
@@ -730,74 +749,53 @@ mod tests {
             config.limits.connections_per_neighbor
         );
 
-        let native = NativePairs::default();
+        // Registered memory is one node-wide pool, never divided per worker.
+        assert_eq!(limits.registered_bytes, config.limits.registered_bytes);
+        assert_eq!(
+            buffer_count(&limits),
+            5 * 96 * 1024 * 1024 / crate::rdma::BUFFER_LEN
+        );
+        let native = NativeNode::default();
         native
             .prepare(plan.pairs.iter().map(|p| p.worker), &limits)
             .unwrap();
-        let mut total = 0;
         for pair in &plan.pairs {
-            let port = native
-                .io(pair.worker)
-                .unwrap()
-                .expect("funded native worker");
-            assert_eq!(port.capacity(), 2);
-            let devices = Devices::new();
-            devices.attach(port).unwrap();
-            let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
-            let startup = scope(Duration::from_secs(10)).unwrap();
-            let mut activation =
-                devices.activate(vec![], &admission, crate::rdma::MAX_CIPHERTEXT, &startup);
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            assert!(activation.as_mut().poll(&mut cx).is_pending());
-            let used = admission.used(ResourceClass::Registered);
-            assert_eq!(used, 2 * (32 * 1024 * 1024 + 8192));
-            assert!(used <= limits.registered_bytes.get());
-            total += used;
+            assert!(native.client(pair.worker).unwrap().is_some());
         }
-        assert!(total <= config.limits.registered_bytes.get());
     }
 
     #[test]
-    fn native_worker_sizing_observes_exact_slot_boundaries() {
+    fn native_worker_sizing_requires_two_node_wide_buffers() {
         let mut config = default_config(true);
         config
             .scale_limits(four_pair_plan(&config).pairs.len())
             .unwrap();
-        let charge = 32 * 1024 * 1024 + 8192;
+        let buffer = crate::rdma::BUFFER_LEN;
         for (budget, expected) in [
             (1, 0),
             (16 * 1024 * 1024 + 16, 0),
-            (charge - 1, 0),
-            (charge, 1),
-            (charge + 1, 1),
-            (2 * charge - 1, 1),
-            (2 * charge, 2),
-            (3 * charge - 1, 2),
-            (3 * charge, 3),
-            (4 * charge - 1, 3),
-            (4 * charge, 4),
-            (4 * charge + 3, 4),
+            (buffer, 1),
+            (2 * buffer - 1, 1),
+            (2 * buffer, 2),
+            (3 * buffer + 3, 3),
         ] {
             config.limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
             let mut plan = four_pair_plan(&config);
             let result = size_workers(&config.limits, &mut plan, true);
-            if expected < 3 {
+            assert_eq!(plan.pairs.len(), 5, "budget={budget}");
+            if expected < 2 {
                 assert!(
                     matches!(result, Err(Error::InvalidConfiguration)),
                     "budget={budget}"
                 );
-                assert_eq!(plan.pairs.len(), 5);
-                if expected > 0 {
-                    let limits =
-                        super::super::partition_limits(&config.limits, expected, true).unwrap();
-                    assert_eq!(slot_count(&limits).unwrap(), 1);
-                    assert!(limits.registered_bytes.get() * expected <= budget);
-                }
+                assert_eq!(
+                    super::super::partition_limits_with_cause(&config.limits, 1, true).err(),
+                    Some(("registered_bytes", Error::InvalidConfiguration))
+                );
             } else {
                 let limits = result.unwrap();
-                assert_eq!(plan.pairs.len(), expected, "budget={budget}");
-                assert!(slot_count(&limits).unwrap() >= 1);
-                assert!(limits.registered_bytes.get() * expected <= budget);
+                assert_eq!(buffer_count(&limits), expected, "budget={budget}");
+                assert_eq!(limits.registered_bytes.get(), budget);
             }
         }
         let mut plan = four_pair_plan(&config);
@@ -844,55 +842,59 @@ mod tests {
     }
 
     #[test]
-    fn native_preparation_preserves_slot_caps_and_unfunded_fallback() {
+    fn native_preparation_funds_two_buffers_or_falls_back_to_http() {
         let mut limits = default_config(true).limits;
-        let charge = 32 * 1024 * 1024 + 8192;
-        for (budget, queue, expected) in [
-            (charge - 1, 256, 0),
-            (charge, 256, 1),
-            (2 * charge - 1, 256, 1),
-            (3 * charge, 2, 2),
-            (257 * charge, 512, 256),
-        ] {
+        let buffer = crate::rdma::BUFFER_LEN;
+        for (budget, funded) in [(buffer, false), (2 * buffer - 1, false), (2 * buffer, true)] {
             limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
-            limits.queue_entries = NonZeroUsize::new(queue).unwrap();
-            let native = NativePairs::default();
+            let native = NativeNode::default();
             native
-                .prepare(std::iter::once(WorkerId(0)), &limits)
+                .prepare([WorkerId(0), WorkerId(1)].into_iter(), &limits)
                 .unwrap();
-            let port = native.io(WorkerId(0)).unwrap();
-            assert_eq!(port.as_ref().map_or(0, IoPort::capacity), expected);
+            assert_eq!(native.client(WorkerId(1)).unwrap().is_some(), funded);
+            assert_eq!(native.owner_worker(), funded.then_some(WorkerId(0)));
         }
     }
 
     #[test]
     fn native_activation_exhaustion_fails_closed_and_rolls_back_partial_quota() {
         let mut limits = default_config(true).limits;
-        limits.registered_bytes = NonZeroUsize::new(2 * (32 * 1024 * 1024 + 8192)).unwrap();
-        let native = NativePairs::default();
+        limits.registered_bytes = NonZeroUsize::new(4 * crate::rdma::BUFFER_LEN).unwrap();
+        let native = NativeNode::default();
         native
             .prepare(std::iter::once(WorkerId(0)), &limits)
             .unwrap();
-        let port = native.io(WorkerId(0)).unwrap().unwrap();
-        assert_eq!(port.capacity(), 2);
-        let devices = Devices::new();
-        devices.attach(port).unwrap();
-        let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits));
+        let links = crate::rdma::Links::new(
+            native.client(WorkerId(0)).unwrap().unwrap(),
+            native.link_node(),
+            NodeId("node".into()),
+            2,
+            None,
+        );
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
         let held = admission
             .reserve(None, ResourceClass::Registered, 1)
             .unwrap();
         let startup = scope(Duration::from_secs(10)).unwrap();
+        let publication = vec![racer_control_wire::RailMapping {
+            device: "missing".into(),
+            port: 1,
+            gid: None,
+            rail: RailId(0),
+            numa_node: None,
+        }];
         assert!(matches!(
-            futures::executor::block_on(devices.activate(
-                vec![],
+            futures::executor::block_on(links.activate(
+                publication,
                 &admission,
-                crate::rdma::MAX_CIPHERTEXT,
+                limits.registered_bytes.get(),
                 &startup,
             )),
             Err(Error::Overloaded)
         ));
         assert_eq!(admission.used(ResourceClass::Registered), 1);
-        assert!(!devices.ready(RailId(0)));
+        assert!(!links.rail_ready(RailId(0)));
+        assert!(links.node().settled());
         drop(held);
         assert_eq!(admission.used(ResourceClass::Registered), 0);
     }
@@ -984,9 +986,6 @@ mod tests {
         let mut app = configured();
         app.discovered_nics[0].device = "test-device".into();
         let (mut worker, engine) = worker(&app, true, true);
-        worker.native_numa = Some(NativePlacement { numa_node: None });
-        assert_eq!(worker.native_publication().unwrap().len(), 1);
-        worker.native_numa = None;
         assert_eq!(worker.native_publication().unwrap().len(), 1);
         let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -996,10 +995,10 @@ mod tests {
                 .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
                 .unwrap();
         }
-        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         let charged = worker.runtime.admission.used(ResourceClass::Registered);
         assert!(charged > 0);
-        worker.devices.as_ref().unwrap().close();
+        worker.links.as_ref().unwrap().close();
         worker.actual_rails.clear();
         service
             .poll(
@@ -1015,7 +1014,7 @@ mod tests {
                 .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
                 .unwrap();
         }
-        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         assert_eq!(
             worker.runtime.admission.used(ResourceClass::Registered),
             charged
@@ -1041,7 +1040,7 @@ mod tests {
             .refresh_snapshot(&scope(Duration::from_secs(1)).unwrap())
             .unwrap();
         assert!(worker.actual_rails.is_empty());
-        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         service
             .poll(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
@@ -1079,7 +1078,7 @@ mod tests {
             )
             .unwrap();
             assert!(worker.actual_rails.is_empty());
-            assert!(!worker.rdma.as_ref().unwrap().ready(RailId(7)));
+            assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
             assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
         }
     }
@@ -1106,7 +1105,7 @@ mod tests {
             Err(Error::IncompatibleMembership)
         );
         assert!(worker.actual_rails.is_empty());
-        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
     }
 
@@ -1140,8 +1139,8 @@ mod tests {
         ));
         drop(activation);
         assert!(worker.actual_rails.is_empty());
-        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
-        assert!(!worker.rdma.as_ref().unwrap().ready(RailId(7)));
+        assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
+        assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         assert_eq!(admission.used(ResourceClass::Registered), 0);
     }
 

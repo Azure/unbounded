@@ -1198,7 +1198,6 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             let transfers = Rc::new(crate::peer::transport::Transfers::new(
                 Rc::new(crate::http::new_pool(reactor, admission.clone(), 4)),
                 io,
-                None,
                 admission,
                 codec,
                 signers[i].clone(),

@@ -523,3 +523,28 @@ Stage 5, cleanup (after 4):
 10. The old `racer-verbs.md` cited line ranges that no longer matched
     `verbs/src/lib.rs` (for example the slot pool range). The rewrite drops
     line citations for code that this plan replaces.
+
+## Deviations in the implementation
+
+Recorded while building stage 3; the code is authoritative.
+
+1. Link id. `Client::accept` connects the responder's QP and takes the link
+   id before the responder's endpoint exists, so the id cannot hash the
+   responder's full setup. The link id is the first 8 bytes of
+   `SHA-256("racer-rdma-session-v2\0" || initiator setup || responder nonce)`
+   (`LinkId::for_setup`, `src/rdma/link_setup.rs`). Both inputs are in the
+   signed exchange. `LinkId::derive` (symmetric) is kept but unused.
+2. No plain `Accept`. When the receiver cannot grant, it sends no payload
+   control at all and the page is ordinary HTTP. `Phase::Accept` always
+   carries `racer-rdma-grant`. `Complete` and the fallback `Finish` both name
+   the `Accept` digest as their previous head.
+3. Commit split. Stages 3a and 3b add `Links`, the setup handler, and the
+   background connect without switching the application; stage 3c switches
+   the application (node owner, per-worker clients, node-wide
+   `RACER_REGISTERED_BYTES`) together with the transport, so every commit
+   keeps native DST coverage green.
+4. Non-owner workers do not wait for activation at startup; they read the
+   node's active rails from the shared `LinkNode` when it settles.
+5. Owner maps are ordered (`BTreeMap`) so simulated runs replay exactly.
+6. The grant extension carries the rail; the transfer id is already bound by
+   the signed `Accept`. The grant length is `MAX_CIPHERTEXT`.

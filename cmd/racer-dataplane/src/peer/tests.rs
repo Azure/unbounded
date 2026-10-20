@@ -130,7 +130,6 @@ mod body_progress {
             let transfers = transport::Transfers::new(
                 pool.clone(),
                 io.clone(),
-                None,
                 admission.clone(),
                 Rc::new(codec(&admission)),
                 signers[0].clone(),
@@ -1136,7 +1135,6 @@ mod encrypted_http {
         let transfers = transport::Transfers::new(
             pool.clone(),
             ios[0].clone(),
-            None,
             admissions[0].clone(),
             Rc::new(codec(&admissions[0])),
             identities[0].signatures.clone(),
@@ -1483,7 +1481,6 @@ mod requester_safety {
             Rc::new(Transfers::new(
                 pool,
                 io,
-                None,
                 admission.clone(),
                 Rc::new(crate::peer::tests::codec(&admission)),
                 signers[0].clone(),
@@ -3152,7 +3149,6 @@ impl SocketFixture {
         Rc::new(transport::Transfers::new(
             self.pool.clone(),
             self.io.clone(),
-            None,
             self.admission.clone(),
             self.codec.clone(),
             signer,

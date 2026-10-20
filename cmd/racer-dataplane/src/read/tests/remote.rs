@@ -354,7 +354,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let transfers = Rc::new(Transfers::new(
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2)),
         io.clone(),
-        None,
         admission.clone(),
         codec.clone(),
         a.signatures.clone(),

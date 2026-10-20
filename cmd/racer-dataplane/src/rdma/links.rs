@@ -347,6 +347,11 @@ impl Links {
         current.len()
     }
 
+    /// Background setups still running on this worker.
+    pub fn setups(&self) -> usize {
+        self.tasks.borrow().len()
+    }
+
     /// Whether a background setup to `peer` on `rail` should start now: the rail
     /// is active, the link is idle, and no setup from this node is running.
     pub fn wants(&self, peer: &NodeId, rail: RailId) -> bool {
@@ -599,7 +604,7 @@ impl AsRef<[u8]> for PageSource {
     }
 }
 
-fn completion_value(link: u64, tag: u32, length: u32, transfer: TransferId) -> Vec<u8> {
+pub(crate) fn completion_value(link: u64, tag: u32, length: u32, transfer: TransferId) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(COMPLETE_LEN);
     bytes.extend_from_slice(COMPLETE_PREFIX);
     bytes.extend_from_slice(&link.to_be_bytes());
@@ -646,6 +651,15 @@ impl PendingReceive {
     /// Per-link tag.
     pub fn tag(&self) -> u32 {
         self.tag
+    }
+
+    /// Poll the arrival directly (tests of the fallback path).
+    #[cfg(test)]
+    pub(crate) fn poll_arrival(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<rdma_verbs::Result<Arrival>> {
+        self.arrival.poll(cx)
     }
 
     /// Requires the signed `COMPLETION_HEADER` to name this link, tag, transfer,

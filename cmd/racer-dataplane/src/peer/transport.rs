@@ -21,13 +21,12 @@ use crate::peer::protocol::Signatures;
 use crate::peer::protocol::SignedHead;
 use crate::peer::protocol::VerifiedHead;
 use crate::peer::protocol::signed_digest;
-use crate::rdma::AuthenticatedDescriptor;
+use crate::rdma::AuthenticatedGrant;
 use crate::rdma::COMPLETION_HEADER;
-use crate::rdma::DESCRIPTOR_HEADER;
+use crate::rdma::GRANT_HEADER;
+use crate::rdma::PendingReceive;
 use crate::rdma::SETUP_BINDING_HEADER;
 use crate::rdma::SETUP_HEADER;
-use crate::rdma::Sessions;
-use crate::rdma::SetupParameters;
 use crate::rdma::TransportPlan;
 use crate::runtime::RequestScope;
 use crate::telemetry::BodyProgress;
@@ -206,17 +205,6 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
 fn native_failure(error: Error, scope: &RequestScope) -> bool {
     scope.check().is_ok() && (recoverable(error) || error == Error::DeadlineExceeded)
 }
-async fn fence(session: &crate::rdma::SessionLease, scope: &RequestScope) -> Result<()> {
-    let cancellation = scope.cancellation.subscribe()?;
-    futures::future::poll_fn(|cx| {
-        cancellation.register(cx.waker());
-        session.abort()?;
-        scope.check()?;
-        session.qp.poll_stopped(cx).map_err(Into::into)
-    })
-    .await
-}
-
 impl Transfers {
     /// Bind the upgrade to the actual authenticated reverse hop, not a planned
     /// route or a peer's claimed Site. Run before either end prepares a native QP.
@@ -276,237 +264,94 @@ impl Transfers {
         )
     }
 
+    /// Sender side of one page: write into the receiver's signed grant with
+    /// immediate, then send one signed response head, `Complete`, or release
+    /// the grant and fall back to the HTTP body (`designs/racer-rdma-sessions.md`,
+    /// "Per-page protocol"). Every granted tag gets exactly one write or release
+    /// unless the link breaks, which fences everything.
     pub(super) async fn send_native(
         &self,
-        mut connection: ConnectionLease,
+        connection: ConnectionLease,
         response: &SignedResponse,
-        admitted: (Binding, VerifiedHead),
+        admitted: (Binding, VerifiedHead, AuthenticatedGrant),
         membership: &std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, bool)> {
-        let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let signatures = &self.signatures;
-        let Some(rdma) = &self.rdma else {
+        let (mut binding, accept, grant) = admitted;
+        let Some(links) = &self.links else {
             return Ok((connection, false));
         };
-        let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
-            &response.response
-        else {
-            return Ok((connection, false));
-        };
-        let (mut binding, accept) = admitted;
-        if binding.membership != membership.version.0 {
-            return Err(Error::IncompatibleMembership);
-        }
-        let mut bounded_scope = scope.clone();
-        bounded_scope.deadline.0 = bounded_scope
-            .deadline
-            .0
-            .min(crate::peer::protocol::decode_deadline(binding.deadline)?.0);
-        let scope = &bounded_scope;
-        scope.check()?;
         let peer = accept.peer.node();
-        if self.response_plan(
-            &connection,
-            &response.authentication,
-            membership,
-            &ciphertext.envelope().page,
-            peer,
-            true,
-        )? != (TransportPlan::Rdma { rail: binding.rail })
-            || !rdma.ready(binding.rail)
-        {
-            return Ok((connection, false));
-        }
-        let prepared = match sessions.prepare(&accept.peer, binding.rail, scope).await {
-            Ok(p) => p,
-            Err(e) if recoverable(e) => return Ok((connection, false)),
-            Err(e) => return Err(e),
-        };
-        binding.response = envelope_digest(&response.authentication)?;
-        let local_setup = prepared.setup().header_value();
-        let offer = binding.sign(
-            signatures,
-            peer,
-            Phase::Offer,
-            &signed_digest(&accept.signed)?,
-            0,
-            vec![extension(SETUP_HEADER, local_setup.clone())],
-        )?;
-        let mut previous = signed_digest(&offer)?;
-        let mut head = encode_envelope(&response.authentication, true, 0)?;
-        attach(&mut head, &offer)?;
-        connection = self.io.send_head(connection, head, scope).await?.connection;
-        connection.next_round()?;
-        let (conn, setup) = self.read_control(connection, false, scope).await?;
-        connection = conn;
-        let (setup, phase) = binding.verify(
-            signatures,
-            peer,
-            setup,
-            &[Phase::Setup, Phase::Fallback],
-            &previous,
-            0,
-            scope,
-        )?;
-        previous = signed_digest(&setup.signed)?;
-        if phase == Phase::Fallback {
-            drop(prepared);
-            return self
-                .send_fallback(connection, response, &binding, peer, previous, scope)
-                .await;
-        }
-        let remote = SetupParameters::from_verified(&setup, binding.rail)?;
-        let session = match prepared.finish(&setup, scope).await {
-            Ok(session) => session,
-            Err(error) if recoverable(error) => {
-                return self
-                    .failed_then_fallback(connection, response, &binding, peer, previous, scope)
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
-        let ready = binding.sign(
-            signatures,
-            peer,
-            Phase::Ready,
-            &previous,
-            0,
-            vec![
-                extension(SETUP_HEADER, local_setup),
-                extension(SETUP_BINDING_HEADER, remote.binding_header_value()),
-            ],
-        )?;
-        previous = signed_digest(&ready)?;
-        connection = self.write_control(connection, ready, scope).await?;
-        connection.next_round()?;
-        let (conn, grant) = self.read_control(connection, false, scope).await?;
-        connection = conn;
-        let (grant, phase) = binding.verify(
-            signatures,
-            peer,
-            grant,
-            &[Phase::Grant, Phase::Fallback],
-            &previous,
-            0,
-            scope,
-        )?;
-        previous = signed_digest(&grant.signed)?;
-        if phase == Phase::Fallback {
-            fence(&session, scope).await?;
-            return self
-                .send_fallback(connection, response, &binding, peer, previous, scope)
-                .await;
-        }
-        self.send_native_page(
-            connection, response, &binding, peer, &session, grant, previous, scope,
-        )
-        .await
-    }
-
-    /// The established session stays owned by the caller through completion or fencing.
-    #[allow(clippy::too_many_arguments)] // Keep session and transfer ownership visible across awaits.
-    async fn send_native_page(
-        &self,
-        mut connection: ConnectionLease,
-        response: &SignedResponse,
-        binding: &Binding,
-        peer: &NodeId,
-        session: &crate::rdma::SessionLease,
-        grant: VerifiedHead,
-        mut previous: [u8; 32],
-        scope: &RequestScope,
-    ) -> Result<(ConnectionLease, bool)> {
-        let signatures = &self.signatures;
-        let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
         let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
             &response.response
         else {
-            return Err(Error::InvalidRequest);
+            links.release(peer, &grant);
+            return Ok((connection, false));
         };
-        let descriptor = AuthenticatedDescriptor::from_verified(&grant, session, binding.transfer)?;
-        let native_deadline = native_scope(scope);
-        let complete = match rdma
-            .send_to(session, ciphertext.clone(), descriptor, &native_deadline)
-            .await
-        {
-            Ok(complete) => complete,
-            Err(error) if native_failure(error, scope) => {
-                fence(session, scope).await?;
+        let checked = (|| {
+            if binding.membership != membership.version.0 {
+                return Err(Error::IncompatibleMembership);
+            }
+            let mut bounded = scope.clone();
+            bounded.deadline.0 = bounded
+                .deadline
+                .0
+                .min(crate::peer::protocol::decode_deadline(binding.deadline)?.0);
+            bounded.check()?;
+            let plan = self.response_plan(
+                &connection,
+                &response.authentication,
+                membership,
+                &ciphertext.envelope().page,
+                peer,
+                true,
+            )?;
+            Ok((bounded, plan))
+        })();
+        let (bounded, plan) = match checked {
+            Ok(checked) => checked,
+            Err(error) => {
+                links.release(peer, &grant);
+                return Err(error);
+            }
+        };
+        let scope = &bounded;
+        if plan != (TransportPlan::Rdma { rail: binding.rail }) {
+            links.release(peer, &grant);
+            return Ok((connection, false));
+        }
+        binding.response = envelope_digest(&response.authentication)?;
+        let previous = signed_digest(&accept.signed)?;
+        // Stage 4 stages the ciphertext on the crypto thread (`Source::Staged`).
+        let sent = links
+            .send(peer, &grant, ciphertext, &native_scope(scope))
+            .await;
+        let sent = match sent {
+            Ok(sent) => sent,
+            Err(error) => {
+                links.release(peer, &grant);
+                if !native_failure(error, scope) {
+                    return Err(error);
+                }
                 return self
-                    .failed_then_fallback(connection, response, binding, peer, previous, scope)
+                    .send_fallback(connection, response, &binding, peer, previous, scope)
                     .await;
             }
-            Err(error) => return Err(error),
         };
         let complete = binding.sign(
-            signatures,
+            &self.signatures,
             peer,
             Phase::Complete,
             &previous,
             0,
-            vec![extension(COMPLETION_HEADER, complete.header_value())],
+            vec![extension(COMPLETION_HEADER, sent.header_value())],
         )?;
-        previous = signed_digest(&complete)?;
-        connection = self.write_control(connection, complete, scope).await?;
-        connection.next_round()?;
-        let (conn, done) = self.read_control(connection, false, scope).await?;
-        connection = conn;
-        let (done, phase) = binding.verify(
-            signatures,
-            peer,
-            done,
-            &[Phase::Done, Phase::Fallback],
-            &previous,
-            0,
-            scope,
-        )?;
-        previous = signed_digest(&done.signed)?;
-        if phase == Phase::Fallback {
-            fence(session, scope).await?;
-            return self
-                .send_fallback(connection, response, binding, peer, previous, scope)
-                .await;
-        }
-        let finish = binding.sign(signatures, peer, Phase::Finish, &previous, 0, vec![])?;
-        connection = self.write_control(connection, finish, scope).await?;
+        let mut head = encode_envelope(&response.authentication, true, 0)?;
+        attach(&mut head, &complete)?;
+        let connection = self.io.send_head(connection, head, scope).await?.connection;
         #[cfg(test)]
         self.native_completed.set(self.native_completed.get() + 1);
         Ok((connection, true))
-    }
-    async fn failed_then_fallback(
-        &self,
-        mut connection: ConnectionLease,
-        response: &SignedResponse,
-        binding: &Binding,
-        peer: &NodeId,
-        previous: [u8; 32],
-        scope: &RequestScope,
-    ) -> Result<(ConnectionLease, bool)> {
-        let signatures = &self.signatures;
-        let failed = binding.sign(signatures, peer, Phase::Failed, &previous, 0, vec![])?;
-        let previous = signed_digest(&failed)?;
-        connection = self.write_control(connection, failed, scope).await?;
-        connection.next_round()?;
-        let (connection, fallback) = self.read_control(connection, false, scope).await?;
-        let (fallback, _) = binding.verify(
-            signatures,
-            peer,
-            fallback,
-            &[Phase::Fallback],
-            &previous,
-            0,
-            scope,
-        )?;
-        self.send_fallback(
-            connection,
-            response,
-            binding,
-            peer,
-            signed_digest(&fallback.signed)?,
-            scope,
-        )
-        .await
     }
     async fn send_fallback(
         &self,
@@ -543,22 +388,21 @@ impl Transfers {
             .await?;
         Ok((written.lease, true))
     }
-    pub(super) fn accept_native(
+    /// Receiver: when the hop plan is RDMA and the link is ready, grant a page
+    /// window in-band and sign it into the request's `Accept` control. Any
+    /// recoverable failure means a plain HTTP request.
+    pub(super) async fn accept_native(
         &self,
         request: &SignedRequest,
         plan: TransportPlan,
         scope: &RequestScope,
-    ) -> Result<Option<(Binding, SignedHead, NodeId)>> {
+    ) -> Result<Option<(Binding, SignedHead, NodeId, PendingReceive)>> {
         let TransportPlan::Rdma { rail } = plan else {
             return Ok(None);
         };
-        let Some(sessions) = &self.native else {
+        let Some(links) = &self.links else {
             return Ok(None);
         };
-        let signatures = &self.signatures;
-        if !sessions.ready(rail) || !self.rdma.as_ref().is_some_and(|rdma| rdma.ready(rail)) {
-            return Ok(None);
-        }
         let peer = crate::peer::protocol::receiver(
             &request
                 .authentication
@@ -567,24 +411,43 @@ impl Transfers {
                 .unwrap_or(&request.authentication.original)
                 .head,
         )?;
+        if links.ready(&peer, rail).is_none() {
+            return Ok(None);
+        }
         let binding = Binding::request(
             &request.authentication,
             request.request.route.membership.0,
             scope,
             rail,
         )?;
-        let accept = binding.sign(signatures, &peer, Phase::Accept, &[0; 32], 0, vec![])?;
-        Ok(Some((binding, accept, peer)))
+        let pending = match links
+            .grant(&peer, rail, binding.transfer, &native_scope(scope))
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) if native_failure(error, scope) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let accept = binding.sign(
+            &self.signatures,
+            &peer,
+            Phase::Accept,
+            &[0; 32],
+            0,
+            vec![extension(GRANT_HEADER, pending.header_value())],
+        )?;
+        Ok(Some((binding, accept, peer, pending)))
     }
+    /// Sender: verify the requester's signed `Accept` and the grant it names.
     pub(super) fn admit_native(
         &self,
         request: &SignedRequest,
         control: SignedHead,
         scope: &RequestScope,
-    ) -> Result<Option<(Binding, VerifiedHead)>> {
-        let Some(_) = &self.native else {
+    ) -> Result<Option<(Binding, VerifiedHead, AuthenticatedGrant)>> {
+        if self.links.is_none() {
             return Ok(None);
-        };
+        }
         let signatures = &self.signatures;
         let binding = Binding::parse_accept(&control)?;
         if binding.request != envelope_digest(&request.authentication)?
@@ -613,28 +476,8 @@ impl Transfers {
             0,
             scope,
         )?;
-        Ok(Some((binding, verified)))
-    }
-    async fn write_control(
-        &self,
-        connection: ConnectionLease,
-        signed: SignedHead,
-        scope: &RequestScope,
-    ) -> Result<ConnectionLease> {
-        Ok(self
-            .io
-            .send_head(connection, frame(signed)?, scope)
-            .await?
-            .connection)
-    }
-    async fn read_control(
-        &self,
-        connection: ConnectionLease,
-        response: bool,
-        scope: &RequestScope,
-    ) -> Result<(ConnectionLease, SignedHead)> {
-        let received = self.io.receive_head(connection, scope).await?;
-        Ok((received.connection, unframe(received.value, response)?))
+        let grant = AuthenticatedGrant::from_verified(&verified, binding.rail, binding.transfer)?;
+        Ok(Some((binding, verified, grant)))
     }
     async fn read_ciphertext(
         &self,
@@ -647,31 +490,31 @@ impl Transfers {
         let read = self.io.read_body_exact(connection, buffer, scope).await?;
         Ok((read.lease, read.buffer))
     }
-    /// A completed control round always pairs one request and one response before
-    /// resetting HTTP framing. No pipelining or detached state map is required.
-    /// Receive a native transfer with authenticated metadata and fallback framing.
+    /// Receiver: read the sender's one signed outcome. `Complete` means the page
+    /// is in the granted window; anything after that is `Io`, because the HTTP
+    /// body was never sent. `Finish` carries the HTTP body.
     #[allow(clippy::too_many_arguments)] // Preserve explicit authenticated transfer inputs.
     pub(super) async fn receive_native(
         &self,
-        mut connection: ConnectionLease,
+        connection: ConnectionLease,
         authentication: ForwardedHead,
         mut binding: Binding,
         accept: SignedHead,
         peer: NodeId,
-        offer: SignedHead,
+        control: SignedHead,
+        pending: PendingReceive,
         membership: &std::sync::Arc<crate::topology::Membership>,
+        length: usize,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
-        let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let signatures = &self.signatures;
         binding.response = envelope_digest(&authentication)?;
-        let (offer, _) = binding.verify(
-            signatures,
+        let (verified, phase) = binding.verify(
+            &self.signatures,
             &peer,
-            offer,
-            &[Phase::Offer],
+            control,
+            &[Phase::Complete, Phase::Finish],
             &signed_digest(&accept)?,
-            0,
+            length,
             scope,
         )?;
         let (metadata, envelope) = super::protocol::page_descriptor(&authentication.original.head)?;
@@ -683,210 +526,27 @@ impl Transfers {
             &authentication,
             membership,
             &envelope.page,
-            offer.peer.node(),
+            verified.peer.node(),
             false,
         )? != (TransportPlan::Rdma { rail: binding.rail })
         {
             return Err(Error::Unauthorized);
         }
-        let remote = SetupParameters::from_verified(&offer, binding.rail)?;
-        let mut previous = signed_digest(&offer.signed)?;
-        connection.next_round()?;
-        let prepared = match sessions
-            .prepare_admitted(
-                &offer.peer,
-                binding.rail,
-                connection.state().exchange.admission.clone(),
-                connection.state().exchange.receive_permit.clone(),
-                scope,
-            )
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) if recoverable(error) => {
-                return self
-                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
-        let local_setup = prepared.setup().header_value();
-        let setup = binding.sign(
-            signatures,
-            &peer,
-            Phase::Setup,
-            &previous,
-            0,
-            vec![
-                extension(SETUP_HEADER, local_setup),
-                extension(SETUP_BINDING_HEADER, remote.binding_header_value()),
-            ],
-        )?;
-        previous = signed_digest(&setup)?;
-        connection = self.write_control(connection, setup, scope).await?;
-        let (conn, ready) = self.read_control(connection, true, scope).await?;
-        connection = conn;
-        let (ready, phase) = binding.verify(
-            signatures,
-            &peer,
-            ready,
-            &[Phase::Ready, Phase::Failed],
-            &previous,
-            0,
-            scope,
-        )?;
-        previous = signed_digest(&ready.signed)?;
-        connection.next_round()?;
-        if phase == Phase::Failed {
-            drop(prepared);
+        if phase == Phase::Finish {
+            // The owner keeps the tag until the sender's release arrives.
+            drop(pending);
             return self
-                .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                .receive_fallback(connection, authentication, length, scope)
                 .await;
         }
-        if SetupParameters::from_verified(&ready, binding.rail)?.encoded != remote.encoded {
-            return Err(Error::Unauthorized);
-        }
-        let session = match prepared.finish(&ready, scope).await {
-            Ok(session) => session,
-            Err(error) if recoverable(error) => {
-                return self
-                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
-        self.receive_native_page(
-            connection,
-            authentication,
-            &binding,
-            &peer,
-            &session,
-            metadata,
-            envelope,
-            previous,
-            scope,
-        )
-        .await
-    }
-
-    /// Grant, completion, and final acknowledgment share the established session owner.
-    /// Receive and fence one page using the caller's established session.
-    #[allow(clippy::too_many_arguments)] // Keep session and transfer ownership visible across awaits.
-    async fn receive_native_page(
-        &self,
-        mut connection: ConnectionLease,
-        authentication: ForwardedHead,
-        binding: &Binding,
-        peer: &NodeId,
-        session: &crate::rdma::SessionLease,
-        metadata: crate::model::ObjectMetadata,
-        envelope: crate::model::PageEnvelope,
-        mut previous: [u8; 32],
-        scope: &RequestScope,
-    ) -> Result<SignedResponse> {
-        let signatures = &self.signatures;
-        let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
         let (admission, _) = &self.wire;
-        let native_deadline = native_scope(scope);
-        if let Err(error) = session.wait_ready(&native_deadline).await {
-            fence(session, scope).await?;
-            if native_failure(error, scope) {
-                return self
-                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
-                    .await;
-            }
-            return Err(error);
-        }
-        let grant = match rdma
-            .prepare_receive(session, &envelope, binding.transfer, scope)
-            .await
-        {
-            Ok(grant) => grant,
-            Err(error) if recoverable(error) => {
-                fence(session, scope).await?;
-                return self
-                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = grant.wait_bound(&native_deadline).await {
-            fence(session, scope).await?;
-            drop(grant);
-            if native_failure(error, scope) {
-                return self
-                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
-                    .await;
-            }
-            return Err(error);
-        }
-        let request = binding.sign(
-            signatures,
-            peer,
-            Phase::Grant,
-            &previous,
-            0,
-            vec![extension(DESCRIPTOR_HEADER, grant.header_value()?)],
-        )?;
-        previous = signed_digest(&request)?;
-        connection = self.write_control(connection, request, scope).await?;
-        let (conn, completed) = self.read_control(connection, true, scope).await?;
-        connection = conn;
-        let (completed, phase) = binding.verify(
-            signatures,
-            peer,
-            completed,
-            &[Phase::Complete, Phase::Failed],
-            &previous,
-            0,
-            scope,
-        )?;
-        previous = signed_digest(&completed.signed)?;
-        connection.next_round()?;
-        if phase == Phase::Failed {
-            fence(session, scope).await?;
-            drop(grant);
-            return self
-                .receive_fallback(connection, authentication, binding, peer, previous, scope)
-                .await;
-        }
-        let native_deadline = native_scope(scope);
-        let page = match rdma
-            .finish_receive(
-                session,
-                grant,
-                &completed,
-                envelope,
-                admission,
-                &native_deadline,
-            )
-            .await
-        {
-            Ok(page) => page,
-            Err(error) if native_failure(error, scope) => {
-                fence(session, scope).await?;
-                return self
-                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
+        // Stage 4 keeps the arrival in registered memory instead of copying it.
+        let page = pending
+            .finish(&verified, envelope, admission, &native_scope(scope))
+            .await?;
         #[cfg(test)]
         self.native_completions
             .set(self.native_completions.get() + 1);
-        let done = binding.sign(signatures, peer, Phase::Done, &previous, 0, vec![])?;
-        previous = signed_digest(&done)?;
-        connection = self.write_control(connection, done, scope).await?;
-        let (mut conn, finish) = self.read_control(connection, true, scope).await?;
-        binding.verify(
-            signatures,
-            peer,
-            finish,
-            &[Phase::Finish],
-            &previous,
-            0,
-            scope,
-        )?;
         // The original envelope is verified by the requester/relay's outstanding
         // binding after this transport returns. No plaintext is published here.
         let response =
@@ -918,7 +578,8 @@ impl Transfers {
             &crate::peer::protocol::response_head(&response, &request_digest, &path)?,
             false,
         )?;
-        conn.finish_exchange()?;
+        let mut connection = connection;
+        connection.finish_exchange()?;
         Ok(SignedResponse {
             authentication,
             response,
@@ -928,37 +589,15 @@ impl Transfers {
         &self,
         connection: ConnectionLease,
         authentication: ForwardedHead,
-        binding: &Binding,
-        peer: &NodeId,
-        previous: [u8; 32],
+        length: usize,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
         scope.check()?;
-        let signatures = &self.signatures;
-        let fallback = binding.sign(signatures, peer, Phase::Fallback, &previous, 0, vec![])?;
-        let previous = signed_digest(&fallback)?;
-        let connection = self.write_control(connection, fallback, scope).await?;
-        let mut received = self.io.receive_head(connection, scope).await?;
-        let control = detach(&mut received.value)?.ok_or(Error::Unauthorized)?;
-        let (returned, length) = decode_envelope(received.value, true)?;
-        if envelope_digest(&returned)? != binding.response {
-            return Err(Error::Unauthorized);
-        }
-        binding.verify(
-            signatures,
-            peer,
-            control,
-            &[Phase::Finish],
-            &previous,
-            length,
-            scope,
-        )?;
-        let (mut connection, buffer) = self
-            .read_ciphertext(received.connection, length, scope)
-            .await?;
+        let (mut connection, buffer) = self.read_ciphertext(connection, length, scope).await?;
         let (bytes, _reservation) = buffer.into_parts();
         let (_, codec) = &self.wire;
         let response = codec.response(authentication, bytes, scope)?;
+        validate_body_length(&response.response, length)?;
         connection.finish_exchange()?;
         Ok(response)
     }
@@ -1257,9 +896,7 @@ pub struct Transfers {
     pub(super) native_fallbacks: std::cell::Cell<usize>,
     pub(super) http: Rc<HttpPool>,
     pub(super) io: Rc<HttpIo>,
-    pub(super) rdma: Option<Rc<Sessions>>,
     pub(super) wire: (Rc<flow_control::Quotas<AdmissionPolicy>>, Rc<SecurityCodec>),
-    pub(super) native: Option<Rc<crate::rdma::Sessions>>,
     pub(super) links: Option<Rc<crate::rdma::Links>>,
 }
 impl Transfers {
@@ -1275,7 +912,6 @@ impl Transfers {
     pub fn new(
         http: Rc<HttpPool>,
         io: Rc<HttpIo>,
-        rdma: Option<Rc<Sessions>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         codec: Rc<SecurityCodec>,
         signatures: Rc<crate::peer::protocol::Signatures>,
@@ -1292,19 +928,13 @@ impl Transfers {
             native_fallbacks: std::cell::Cell::new(0),
             http,
             io,
-            rdma,
             wire: (admission, codec),
-            native: None,
             links: None,
         }
     }
     /// Use persistent RDMA links for pages and link setup.
     pub fn with_links(mut self, links: Rc<crate::rdma::Links>) -> Self {
         self.links = Some(links);
-        self
-    }
-    pub fn with_native(mut self, sessions: Rc<crate::rdma::Sessions>) -> Self {
-        self.native = Some(sessions);
         self
     }
     pub(crate) fn with_receive_gate(mut self, gate: Arc<super::receive::Gate>) -> Self {
@@ -1433,7 +1063,7 @@ impl Transfers {
             }
             // Native response verification requires an authenticated membership lease.
             let native = if membership.is_some() {
-                self.accept_native(&request, plan, scope)?
+                self.accept_native(&request, plan, scope).await?
             } else {
                 None
             };
@@ -1447,7 +1077,7 @@ impl Transfers {
                 self.ensure_link(&endpoint, &peer, rail);
             }
             scope.candidate_progress()?;
-            if let Some((_, accept, _)) = &native {
+            if let Some((_, accept, _, _)) = &native {
                 attach(&mut head, accept)?;
             }
             if let Some(timing) = timing.as_deref_mut() {
@@ -1482,10 +1112,7 @@ impl Transfers {
             };
             let (authentication, length) = decode_envelope(received.value, true)?;
             if let Some(control) = control {
-                let (binding, accept, peer) = native.ok_or(Error::Unauthorized)?;
-                if length != 0 {
-                    return Err(Error::InvalidRequest);
-                }
+                let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
                 return self
                     .receive_native(
                         received.connection,
@@ -1494,7 +1121,9 @@ impl Transfers {
                         accept,
                         peer,
                         control,
+                        pending,
                         membership.as_ref().ok_or(Error::IncompatibleMembership)?,
+                        length,
                         scope,
                     )
                     .await
@@ -1776,8 +1405,6 @@ mod tests {
         use crate::model::*;
         use crate::peer::protocol as p;
         use crate::peer::protocol::Signatures;
-        use crate::rdma::Devices;
-        use crate::rdma::Sessions;
         use crate::runtime::Reactor;
         use racer_control_wire::KeyId;
         use std::os::unix::net::UnixStream;
@@ -1792,9 +1419,6 @@ mod tests {
             admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
             reactor: &Rc<Reactor>,
         ) -> Transfers {
-            let devices = Rc::new(Devices::new());
-            let sessions = Rc::new(Sessions::new(devices.clone(), 2));
-            let rdma = sessions.clone();
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(p::MAX_ENVELOPE_HEAD),
@@ -1804,7 +1428,6 @@ mod tests {
             Transfers::new(
                 Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2)),
                 io,
-                Some(rdma),
                 admission.clone(),
                 Rc::new(p::SecurityCodec::new(
                     admission.clone(),
@@ -1812,7 +1435,6 @@ mod tests {
                 )),
                 signatures.clone(),
             )
-            .with_native(sessions)
         }
         fn test_membership(
             signers: &[Rc<Signatures>],
@@ -2069,24 +1691,6 @@ mod tests {
         }
 
         #[test]
-        fn real_socket_signed_offer_falls_back_when_local_provider_is_unavailable() {
-            offer_fallback(false, None, false);
-        }
-        #[test]
-        fn real_socket_sender_failure_requires_signed_fallback_before_ciphertext() {
-            offer_fallback(true, None, false);
-        }
-        #[test]
-        fn signed_offer_rejects_cross_site_and_missing_site_before_session_preparation() {
-            for sites in [["site1", "site2"], ["", "site1"], ["site1", ""], ["", ""]] {
-                offer_fallback(false, Some(sites), false);
-            }
-        }
-        #[test]
-        fn signed_offer_cannot_substitute_the_actual_local_identity_in_response_path() {
-            offer_fallback(false, None, true);
-        }
-        #[test]
         fn native_subdeadline_preserves_parent_deadline_and_cancellation() {
             let scope =
                 RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
@@ -2109,423 +1713,87 @@ mod tests {
             assert!(!native_failure(Error::DeadlineExceeded, &scope));
             assert!(!native_failure(Error::Os(libc::ECONNRESET), &scope));
         }
-        fn offer_fallback(
-            sender_failure: bool,
-            rejected_sites: Option<[&str; 2]>,
-            wrong_path: bool,
-        ) {
-            let rejected = rejected_sites.is_some() || wrong_path;
-            let signers = crate::peer::tests::signers();
-            let membership = test_membership(
-                &signers,
-                &[0, 2],
-                &rejected_sites.unwrap_or(["site1", "site1"]),
-            );
-            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-                crate::test_support::cluster::config(false).limits,
-            )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
-            let receiver = transfers(signers[0].clone(), &admission, &reactor);
-            let sender = transfers(signers[2].clone(), &admission, &reactor);
-            let scope =
-                RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(10))
-                    .unwrap();
-            let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
-            let version = ObjectVersion {
-                object: ObjectId {
-                    cache: cache.clone(),
-                    key: CacheKey([3; 32]),
-                },
-                etag: StrongEtag::parse(b"\"v1\"").unwrap(),
-            };
-            let envelope = PageEnvelope {
-                cipher: crate::model::PageCipher::Xaes256Gcm,
-                page: PageId {
-                    version: version.clone(),
-                    number: PageNumber(0),
-                },
-                key_id: KeyId([1; 16]),
-                nonce: Nonce([2; 24]),
-                plaintext_length: 19,
-                ciphertext_length: 35,
-            };
-            let page = BufferPool::new(admission.clone())
-                .ciphertext(
-                    admission
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 35)
-                        .unwrap(),
-                    envelope,
-                    vec![77; 35],
-                )
-                .unwrap();
-            let response = PeerResponse::Page {
-                metadata: ObjectMetadata {
-                    content_type: None,
-                    version,
-                    length: 19,
-                    expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
-                },
-                ciphertext: page,
-            };
-            let mut head = p::response_head(
-                &response,
-                &[4; 32],
-                &[
-                    signers[usize::from(wrong_path)].node().clone(),
-                    signers[2].node().clone(),
-                ],
-            )
-            .unwrap();
-            p::push(&mut head, "racer-receiver", &signers[0].node().0);
-            let authentication = ForwardedHead {
-                original: Arc::new(signers[2].sign(head).unwrap()),
-                hops: vec![],
-            };
-            let mut binding = Binding {
-                request: [4; 32],
-                response: [0; 32],
-                transfer: TransferId([6; 16]),
-                membership: 1,
-                deadline: p::encode_deadline(scope.deadline).unwrap(),
-                rail: RailId(7),
-            };
-            let accept = binding
-                .sign(
-                    &signers[0],
-                    signers[2].node(),
-                    Phase::Accept,
-                    &[0; 32],
-                    0,
-                    vec![],
-                )
-                .unwrap();
-            binding.response = envelope_digest(&authentication).unwrap();
-            // A well-formed signed remote endpoint cannot manufacture a local provider.
-            let mut setup = b"racer-rdma-setup-v1\0".to_vec();
-            setup.extend_from_slice(&7u16.to_be_bytes());
-            setup.extend_from_slice(&[1; 16]);
-            setup.extend_from_slice(&[2; 16]);
-            for value in [1u32, 2, 3] {
-                setup.extend_from_slice(&value.to_be_bytes());
-            }
-            setup.extend_from_slice(&1u16.to_be_bytes());
-            setup.extend_from_slice(&[1, 1]);
-            let offer = binding
-                .sign(
-                    &signers[2],
-                    signers[0].node(),
-                    Phase::Offer,
-                    &signed_digest(&accept).unwrap(),
-                    0,
-                    vec![extension(SETUP_HEADER, p::binary(&setup).into_bytes())],
-                )
-                .unwrap();
-            let previous = signed_digest(&offer).unwrap();
-            let mut offered = encode_envelope(&authentication, true, 0).unwrap();
-            attach(&mut offered, &offer).unwrap();
-            let response = SignedResponse {
-                authentication,
-                response,
-            };
-            let (a, b) = UnixStream::pair().unwrap();
-            let a = crate::http::from_accepted(a.into(), &admission).unwrap();
-            let b = crate::http::from_accepted(b.into(), &admission).unwrap();
-            let receive = async {
-                let a = p::connect(
-                    &receiver.io,
-                    a,
-                    signers[0].clone(),
-                    signers[2].node(),
-                    &scope,
-                )
-                .await?;
-                let initial = MessageHead {
-                    start: StartLine::Request {
-                        method: "POST".into(),
-                        target: "/test".into(),
-                    },
-                    headers: vec![extension("content-length", b"0".to_vec())],
-                };
-                let sent = receiver.io.send_head(a, initial, &scope).await?;
-                let mut received = receiver.io.receive_head(sent.connection, &scope).await?;
-                let offer = detach(&mut received.value)?.unwrap();
-                let (auth, _) = decode_envelope(received.value, true)?;
-                let mut original = binding.clone();
-                original.response = [0; 32];
-                if sender_failure {
-                    let (verified, _) = binding.verify(
-                        &signers[0],
-                        signers[2].node(),
-                        offer,
-                        &[Phase::Offer],
-                        &signed_digest(&accept)?,
-                        0,
-                        &scope,
-                    )?;
-                    let mut connection = received.connection;
-                    connection.finish_exchange()?;
-                    let setup = binding.sign(
-                        &signers[0],
-                        signers[2].node(),
-                        Phase::Setup,
-                        &signed_digest(&verified.signed)?,
-                        0,
-                        vec![
-                            extension(SETUP_HEADER, p::binary(&[1; 32]).into_bytes()),
-                            extension(SETUP_BINDING_HEADER, p::binary(&[2; 32]).into_bytes()),
-                        ],
-                    )?;
-                    let setup_digest = signed_digest(&setup)?;
-                    connection = receiver.write_control(connection, setup, &scope).await?;
-                    let failed = receiver.read_control(connection, true, &scope).await?;
-                    let (mut connection, signed) = failed;
-                    let (failed, _) = binding.verify(
-                        &signers[0],
-                        signers[2].node(),
-                        signed,
-                        &[Phase::Failed],
-                        &setup_digest,
-                        0,
-                        &scope,
-                    )?;
-                    connection.finish_exchange()?;
-                    return receiver
-                        .receive_fallback(
-                            connection,
-                            auth,
-                            &binding,
-                            signers[2].node(),
-                            signed_digest(&failed.signed)?,
-                            &scope,
-                        )
-                        .await;
-                }
-                receiver
-                    .receive_native(
-                        received.connection,
-                        auth,
-                        original,
-                        accept,
-                        signers[2].node().clone(),
-                        offer,
-                        &membership,
-                        &scope,
-                    )
-                    .await
-            };
-            let send = async {
-                let b = p::accept(&sender.io, b, signers[2].clone(), &scope).await?;
-                let received = sender.io.receive_head(b, &scope).await?;
-                let sent = sender
-                    .io
-                    .send_head(received.connection, offered, &scope)
-                    .await?;
-                let mut connection = sent.connection;
-                connection.finish_exchange()?;
-                if rejected {
-                    // Keep the connection alive until the receiver returns its rejection.
-                    return std::future::pending::<Result<()>>().await;
-                }
-                if sender_failure {
-                    let (connection, setup) =
-                        sender.read_control(connection, false, &scope).await?;
-                    let (setup, _) = binding.verify(
-                        &signers[2],
-                        signers[0].node(),
-                        setup,
-                        &[Phase::Setup],
-                        &previous,
-                        0,
-                        &scope,
-                    )?;
-                    let (mut connection, _) = sender
-                        .failed_then_fallback(
-                            connection,
-                            &response,
-                            &binding,
-                            signers[0].node(),
-                            signed_digest(&setup.signed)?,
-                            &scope,
-                        )
-                        .await?;
-                    connection.finish_exchange()?;
-                    return Ok(());
-                }
-                let (connection, fallback) = sender.read_control(connection, false, &scope).await?;
-                let (verified, phase) = binding.verify(
-                    &signers[2],
-                    signers[0].node(),
-                    fallback,
-                    &[Phase::Fallback],
-                    &previous,
-                    0,
-                    &scope,
-                )?;
-                assert_eq!(phase, Phase::Fallback);
-                let (mut connection, sent) = sender
-                    .send_fallback(
-                        connection,
-                        &response,
-                        &binding,
-                        signers[0].node(),
-                        signed_digest(&verified.signed)?,
-                        &scope,
-                    )
-                    .await?;
-                assert!(sent);
-                connection.finish_exchange()?;
-                Ok::<(), Error>(())
-            };
-            let mut future = std::pin::pin!(async { futures::try_join!(receive, send) });
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            let result = loop {
-                if let Poll::Ready(result) = std::future::Future::poll(future.as_mut(), &mut cx) {
-                    break result;
-                }
-                reactor.poll_budgeted(128).unwrap();
-                reactor.wait(Duration::from_millis(1)).unwrap();
-            };
-            if rejected {
-                assert!(matches!(result, Err(Error::Unauthorized)));
-                assert_eq!(receiver.native.as_ref().unwrap().prepare_attempts.get(), 0);
-                return;
-            }
-            let (result, ()) = result.unwrap();
-            assert_eq!(
-                envelope_digest(&result.authentication).unwrap(),
-                binding.response
-            );
-            match result.response {
-                PeerResponse::Page { ciphertext, .. } => assert_eq!(ciphertext.bytes(), &[77; 35]),
-                _ => panic!("expected retained ciphertext"),
-            }
-            assert_eq!(admission.used(ResourceClass::Registered), 0);
-        }
-        #[cfg(feature = "rdma")]
-        #[test]
-        #[ignore = "requires real ABI v1 adapter and RACER_RDMA_TEST_DEVICE/PORT/GID for an active type-2B port"]
-        fn native_provider_signed_setup_grant_write_completion_roundtrip() {
-            native_roundtrip(false, false, None, false);
-        }
-        #[test]
-        fn simulated_native_mixed_site_hop_both_directions() {
-            for reverse in [false, true] {
-                for relayed in [false, true] {
-                    native_roundtrip(true, reverse, None, relayed);
-                }
-            }
-        }
-        #[test]
-        fn simulated_native_sender_rejects_cross_site_before_session_preparation() {
-            for site in ["site2", ""] {
-                native_roundtrip(true, false, Some(site), false);
-                native_roundtrip(true, true, Some(site), true);
-            }
-        }
-        fn native_roundtrip(
-            simulated: bool,
+        /// One page over a ready link, driven as the peer server and requester do.
+        #[derive(Clone, Copy, Default)]
+        struct PageCase {
             reverse: bool,
-            rejected_site: Option<&str>,
             relayed: bool,
-        ) {
+            /// The sender's membership puts the sender in this Site.
+            sender_site: Option<&'static str>,
+            /// The receiver's membership puts the sender in this Site.
+            receiver_site: Option<&'static str>,
+            /// The sender's link breaks before it writes.
+            sender_down: bool,
+        }
+
+        struct PageOutcome {
+            result: Result<SignedResponse>,
+            sent: Result<bool>,
+            completed: usize,
+            fallbacks: usize,
+            completions: usize,
+            released: bool,
+            free: (Option<usize>, Option<usize>),
+        }
+
+        fn page_membership(
+            signers: &[Rc<Signatures>],
+            sender_site: Option<&str>,
+        ) -> Arc<crate::topology::Membership> {
             use crate::topology::Member;
             use crate::topology::Membership;
-            use racer_control_wire::RailId;
-            use racer_control_wire::RailMapping;
-            use rdma_verbs::NativeService;
-            use rdma_verbs::pair;
-            let reject_sender = rejected_site.is_some();
-            let device = if simulated {
-                "sim-rnic".into()
-            } else {
-                std::env::var("RACER_RDMA_TEST_DEVICE").expect("select real device")
-            };
-            let port = if simulated {
-                1
-            } else {
-                std::env::var("RACER_RDMA_TEST_PORT")
-                    .expect("select port")
-                    .parse()
-                    .unwrap()
-            };
-            let text = if simulated {
-                "11".repeat(16)
-            } else {
-                std::env::var("RACER_RDMA_TEST_GID").expect("32 lowercase hex GID digits")
-            };
-            assert_eq!(text.len(), 32);
-            let mut gid = [0; 16];
-            for (i, b) in gid.iter_mut().enumerate() {
-                *b = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap();
-            }
-            let fabric = rdma_verbs::simulation::Simulation::new()
-                .with_devices(vec![rdma_verbs::simulation::Device::new(
-                    device.clone(),
-                    gid,
-                )])
-                .unwrap();
-            let _fabric = simulated.then(|| fabric.enter());
+            Arc::new(
+                Membership::validate(
+                    MembershipVersion(1),
+                    [0, 1, 2]
+                        .into_iter()
+                        .map(|i| Member {
+                            node: signers[i].node().clone(),
+                            shares: std::num::NonZeroU32::new(1).unwrap(),
+                            peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
+                            rails: vec![racer_control_wire::RailMapping {
+                                rail: RailId(7),
+                                device: "test-provider".into(),
+                                port: 1,
+                                gid: None,
+                                numa_node: None,
+                            }],
+                            site: match i {
+                                1 => "site2",
+                                2 => sender_site.unwrap_or("site1"),
+                                _ => "site1",
+                            }
+                            .into(),
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            )
+        }
+
+        fn page_roundtrip(case: PageCase) -> PageOutcome {
+            use crate::rdma::links::tests::link_up;
+            use crate::rdma::links::tests::world_for;
             let mut signers = crate::peer::tests::signers();
-            if reverse {
+            if case.reverse {
                 signers.swap(0, 2);
             }
+            let mut w = world_for(
+                [signers[0].node().clone(), signers[2].node().clone()],
+                false,
+            );
+            link_up(&mut w);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(true).limits,
             )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
-            let mappings = vec![RailMapping {
-                rail: RailId(7),
-                device,
-                port,
-                gid: Some(gid),
-                numa_node: None,
-            }];
+            let receiver =
+                transfers(signers[0].clone(), &admission, &reactor).with_links(w.a.links.clone());
+            let sender =
+                transfers(signers[2].clone(), &admission, &reactor).with_links(w.b.links.clone());
             let scope =
                 RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();
-            let make = |signatures: Rc<Signatures>| {
-                let (io, port) = pair(2).unwrap();
-                let devices = Rc::new(Devices::new());
-                devices.attach(io).unwrap();
-                let sessions = Rc::new(Sessions::new(devices.clone(), 2));
-                let rdma = sessions.clone();
-                let http = Rc::new(crate::http::new_io(
-                    reactor.clone(),
-                    Codec::new(p::MAX_ENVELOPE_HEAD),
-                    admission.clone(),
-                    crate::model::PAGE_BYTES + 16,
-                ));
-                let transfer = Transfers::new(
-                    Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2)),
-                    http,
-                    Some(rdma),
-                    admission.clone(),
-                    Rc::new(p::SecurityCodec::new(
-                        admission.clone(),
-                        BufferPool::new(admission.clone()),
-                    )),
-                    signatures.clone(),
-                )
-                .with_native(sessions);
-                (devices, NativeService::new(port), transfer)
-            };
-            let (receive_devices, mut receive_engine, receiver) = make(signers[0].clone());
-            let (send_devices, mut send_engine, sender) = make(signers[2].clone());
-            let mut activate = std::pin::pin!(async {
-                futures::try_join!(
-                    receive_devices.activate(mappings.clone(), &admission, 4096, &scope),
-                    send_devices.activate(mappings.clone(), &admission, 4096, &scope)
-                )
-            });
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            loop {
-                if let Poll::Ready(result) = std::future::Future::poll(activate.as_mut(), &mut cx) {
-                    result.expect("native provider activation must succeed");
-                    break;
-                }
-                receive_engine.poll_budgeted(8).unwrap();
-                send_engine.poll_budgeted(8).unwrap();
-            }
             let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
             let version = ObjectVersion {
                 object: ObjectId {
@@ -2563,7 +1831,7 @@ mod tests {
                 },
                 ciphertext: page,
             };
-            let path = if relayed {
+            let path = if case.relayed {
                 vec![
                     signers[0].node().clone(),
                     signers[2].node().clone(),
@@ -2578,9 +1846,13 @@ mod tests {
             };
             let mut head = p::response_head(&response, &[4; 32], &path).unwrap();
             p::push(&mut head, "racer-receiver", &path[1].0);
-            let original = Arc::new(signers[if relayed { 1 } else { 2 }].sign(head).unwrap());
+            let original = Arc::new(
+                signers[if case.relayed { 1 } else { 2 }]
+                    .sign(head)
+                    .unwrap(),
+            );
             let mut hops = vec![];
-            if relayed {
+            if case.relayed {
                 let mut hop = MessageHead {
                     start: StartLine::Request {
                         method: "POST".into(),
@@ -2618,6 +1890,20 @@ mod tests {
                 deadline: p::encode_deadline(scope.deadline).unwrap(),
                 rail: RailId(7),
             };
+            let sender_membership = page_membership(&signers, case.sender_site);
+            let receiver_membership = page_membership(&signers, case.receiver_site);
+            // The receiver grants in-band and names the grant in its signed Accept.
+            let pending = crate::rdma::links::tests::drive(
+                &mut w.a.owner,
+                &mut w.b.owner,
+                receiver.links.as_ref().unwrap().grant(
+                    signers[2].node(),
+                    RailId(7),
+                    binding.transfer,
+                    &scope,
+                ),
+            )
+            .unwrap();
             let accept = binding
                 .sign(
                     &signers[0],
@@ -2625,149 +1911,325 @@ mod tests {
                     Phase::Accept,
                     &[0; 32],
                     0,
-                    vec![],
+                    vec![extension(GRANT_HEADER, pending.header_value())],
                 )
                 .unwrap();
             let accept_wire = p::encode_signed(&accept).unwrap();
-            let membership = Arc::new(
-                Membership::validate(
-                    MembershipVersion(1),
-                    [0, 1, 2]
-                        .into_iter()
-                        .map(|i| Member {
-                            node: signers[i].node().clone(),
-                            shares: std::num::NonZeroU32::new(1).unwrap(),
-                            peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
-                            rails: mappings.clone(),
-                            site: if i == 1 {
-                                "site2"
-                            } else if i == 2 {
-                                rejected_site.unwrap_or("site1")
-                            } else {
-                                "site1"
-                            }
-                            .into(),
-                        })
-                        .collect(),
-                )
-                .unwrap(),
-            );
+            if case.sender_down {
+                let links = sender.links.as_ref().unwrap();
+                let (epoch, _) = links.ready(signers[0].node(), RailId(7)).unwrap();
+                links.abandon(signers[0].node(), RailId(7), epoch);
+                crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+            }
+            let released = std::cell::Cell::new(false);
             let (a, b) = UnixStream::pair().unwrap();
             let a = crate::http::from_accepted(a.into(), &admission).unwrap();
             let b = crate::http::from_accepted(b.into(), &admission).unwrap();
-            let receive = async {
-                let a = p::connect(
-                    &receiver.io,
-                    a,
-                    signers[0].clone(),
-                    signers[2].node(),
-                    &scope,
-                )
-                .await?;
-                let initial = MessageHead {
-                    start: StartLine::Request {
-                        method: "POST".into(),
-                        target: "/test".into(),
-                    },
-                    headers: vec![extension("content-length", b"0".to_vec())],
-                };
-                let sent = receiver.io.send_head(a, initial, &scope).await?;
-                let mut offered = receiver.io.receive_head(sent.connection, &scope).await?;
-                let control = detach(&mut offered.value)?;
-                let (auth, length) = decode_envelope(offered.value, true)?;
-                if reject_sender {
-                    assert!(control.is_none());
-                    let (_, body) = receiver
-                        .read_ciphertext(offered.connection, length, &scope)
-                        .await?;
-                    return receiver
-                        .wire
-                        .1
-                        .response(auth, body.bytes()?.to_vec(), &scope);
-                }
-                let control = control.ok_or(Error::Unavailable)?;
-                assert_eq!(length, 0, "provider test requires native offer");
-                receiver
-                    .receive_native(
-                        offered.connection,
-                        auth,
-                        binding.clone(),
-                        accept,
-                        signers[2].node().clone(),
-                        control,
-                        &membership,
-                        &scope,
-                    )
-                    .await
-            };
-            let send = async {
-                let b = p::accept(&sender.io, b, signers[2].clone(), &scope).await?;
-                let received = sender.io.receive_head(b, &scope).await?;
-                let (verified, _) = binding.verify(
-                    &signers[2],
-                    signers[0].node(),
-                    p::decode_signed(&accept_wire)?,
-                    &[Phase::Accept],
-                    &[0; 32],
-                    0,
-                    &scope,
-                )?;
-                let (mut conn, sent) = sender
-                    .send_native(
-                        received.connection,
-                        &response,
-                        (binding.clone(), verified),
-                        &membership,
+            let (result, sent) = {
+                let receive = async {
+                    let a = p::connect(
+                        &receiver.io,
+                        a,
+                        signers[0].clone(),
+                        signers[2].node(),
                         &scope,
                     )
                     .await?;
-                if reject_sender {
-                    assert!(!sent);
-                    assert_eq!(sender.native.as_ref().unwrap().prepare_attempts.get(), 0);
-                    let head = encode_envelope(&response.authentication, true, 144)?;
-                    conn = sender.io.send_head(conn, head, &scope).await?.connection;
-                    let PeerResponse::Page { ciphertext, .. } = &response.response else {
-                        unreachable!()
+                    let mut initial = MessageHead {
+                        start: StartLine::Request {
+                            method: "POST".into(),
+                            target: "/test".into(),
+                        },
+                        headers: vec![extension("content-length", b"0".to_vec())],
                     };
-                    conn = sender
-                        .io
-                        .write_body(conn, ciphertext.clone(), &scope)
-                        .await?
-                        .lease;
-                } else {
-                    assert!(sent);
+                    attach(&mut initial, &p::decode_signed(&accept_wire)?)?;
+                    let sent = receiver.io.send_head(a, initial, &scope).await?;
+                    let mut received = receiver.io.receive_head(sent.connection, &scope).await?;
+                    let control = detach(&mut received.value)?;
+                    let (auth, length) = decode_envelope(received.value, true)?;
+                    let Some(control) = control else {
+                        // Plain HTTP: the sender released the grant.
+                        let arrival = std::future::poll_fn(|cx| pending.poll_arrival(cx)).await;
+                        released.set(matches!(arrival, Ok(rdma_verbs::Arrival::Released)));
+                        let (mut connection, body) = receiver
+                            .read_ciphertext(received.connection, length, &scope)
+                            .await?;
+                        connection.finish_exchange()?;
+                        return receiver
+                            .wire
+                            .1
+                            .response(auth, body.bytes()?.to_vec(), &scope);
+                    };
+                    receiver
+                        .receive_native(
+                            received.connection,
+                            auth,
+                            binding.clone(),
+                            p::decode_signed(&accept_wire)?,
+                            signers[2].node().clone(),
+                            control,
+                            pending,
+                            &receiver_membership,
+                            length,
+                            &scope,
+                        )
+                        .await
+                };
+                let send = async {
+                    let b = p::accept(&sender.io, b, signers[2].clone(), &scope).await?;
+                    let mut received = sender.io.receive_head(b, &scope).await?;
+                    let control = detach(&mut received.value)?.ok_or(Error::Unauthorized)?;
+                    let (verified, _) = binding.verify(
+                        &signers[2],
+                        signers[0].node(),
+                        control,
+                        &[Phase::Accept],
+                        &[0; 32],
+                        0,
+                        &scope,
+                    )?;
+                    let grant = AuthenticatedGrant::from_verified(
+                        &verified,
+                        binding.rail,
+                        binding.transfer,
+                    )?;
+                    let (mut conn, sent) = sender
+                        .send_native(
+                            received.connection,
+                            &response,
+                            (binding.clone(), verified, grant),
+                            &sender_membership,
+                            &scope,
+                        )
+                        .await?;
+                    if !sent {
+                        let head = encode_envelope(&response.authentication, true, 144)?;
+                        conn = sender.io.send_head(conn, head, &scope).await?.connection;
+                        let PeerResponse::Page { ciphertext, .. } = &response.response else {
+                            unreachable!()
+                        };
+                        conn = sender
+                            .io
+                            .write_body(conn, ciphertext.clone(), &scope)
+                            .await?
+                            .lease;
+                    }
+                    assert_eq!(conn.send_remaining(), Some(0));
+                    conn.finish_exchange()?;
+                    Ok::<bool, Error>(sent)
+                };
+                let mut exchange = std::pin::pin!(async { futures::join!(receive, send) });
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                loop {
+                    if let Poll::Ready(result) =
+                        std::future::Future::poll(exchange.as_mut(), &mut cx)
+                    {
+                        break result;
+                    }
+                    w.a.owner.poll_budgeted(16).unwrap();
+                    w.b.owner.poll_budgeted(16).unwrap();
+                    reactor.poll_budgeted(128).unwrap();
+                    reactor.wait(Duration::from_millis(1)).unwrap();
                 }
-                assert_eq!(conn.send_remaining(), Some(0));
-                assert_eq!(conn.receive_remaining(), Some(0));
-                conn.finish_exchange()?;
-                Ok::<(), Error>(())
             };
-            let mut exchange = std::pin::pin!(async { futures::try_join!(receive, send) });
-            let (result, ()) = loop {
-                if let Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), &mut cx) {
-                    break result.expect("native provider roundtrip");
-                }
-                receive_engine.poll_budgeted(8).unwrap();
-                send_engine.poll_budgeted(8).unwrap();
-                reactor.poll_budgeted(128).unwrap();
-                reactor.wait(Duration::from_millis(1)).unwrap();
-            };
-            match result.response {
-                PeerResponse::Page { ciphertext, .. } => {
-                    assert_eq!(ciphertext.bytes(), &[0x5a; 144])
-                }
+            crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+            PageOutcome {
+                result,
+                sent,
+                completed: sender.native_completed.get(),
+                fallbacks: sender.native_fallbacks.get(),
+                completions: receiver.native_completions.get(),
+                released: released.get(),
+                free: (
+                    w.a.links.buffers(RailId(7), rdma_verbs::BufferState::Free),
+                    w.b.links.buffers(RailId(7), rdma_verbs::BufferState::Free),
+                ),
+            }
+        }
+
+        fn page_bytes(result: &Result<SignedResponse>) -> Vec<u8> {
+            match &result.as_ref().expect("page").response {
+                PeerResponse::Page { ciphertext, .. } => ciphertext.bytes().to_vec(),
                 _ => panic!("expected page"),
             }
+        }
+
+        #[test]
+        fn simulated_link_grant_in_request_and_complete_both_directions() {
+            for reverse in [false, true] {
+                for relayed in [false, true] {
+                    let outcome = page_roundtrip(PageCase {
+                        reverse,
+                        relayed,
+                        ..PageCase::default()
+                    });
+                    assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+                    assert_eq!(outcome.sent, Ok(true));
+                    assert_eq!(
+                        (outcome.completed, outcome.fallbacks, outcome.completions),
+                        (1, 0, 1),
+                        "HTTP fallback cannot pass a native success test"
+                    );
+                    assert_eq!(outcome.free, (Some(2), Some(2)));
+                }
+            }
+        }
+
+        #[test]
+        fn simulated_sender_rejects_cross_site_and_releases_the_grant() {
+            for site in ["site2", ""] {
+                for (reverse, relayed) in [(false, false), (true, true)] {
+                    let outcome = page_roundtrip(PageCase {
+                        reverse,
+                        relayed,
+                        sender_site: Some(site),
+                        ..PageCase::default()
+                    });
+                    assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+                    assert_eq!(outcome.sent, Ok(false));
+                    assert!(outcome.released, "the receiver's grant is released");
+                    assert_eq!(
+                        (outcome.completed, outcome.fallbacks, outcome.completions),
+                        (0, 0, 0)
+                    );
+                    assert_eq!(outcome.free, (Some(2), Some(2)));
+                }
+            }
+        }
+
+        #[test]
+        fn simulated_sender_link_down_falls_back_to_signed_http_body() {
+            let outcome = page_roundtrip(PageCase {
+                sender_down: true,
+                ..PageCase::default()
+            });
+            assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+            assert_eq!(outcome.sent, Ok(true));
             assert_eq!(
-                sender.native_completed.get(),
-                usize::from(!reject_sender),
-                "HTTP fallback cannot pass a native success test"
+                (outcome.completed, outcome.fallbacks, outcome.completions),
+                (0, 1, 0)
             );
-            assert_eq!(sender.native_fallbacks.get(), 0);
-            assert_eq!(
-                receiver.native_completions.get(),
-                usize::from(!reject_sender)
+        }
+
+        #[test]
+        fn simulated_receiver_rejects_complete_from_cross_site_hop() {
+            for site in ["site2", ""] {
+                let outcome = page_roundtrip(PageCase {
+                    receiver_site: Some(site),
+                    ..PageCase::default()
+                });
+                assert!(matches!(outcome.result, Err(Error::Unauthorized)));
+                assert_eq!(outcome.sent, Ok(true));
+                assert_eq!(outcome.completions, 0);
+                // The dropped arrival still returns its buffer.
+                assert_eq!(outcome.free, (Some(2), Some(2)));
+            }
+        }
+
+        #[test]
+        fn completion_must_name_the_grant_and_a_lost_arrival_is_io() {
+            use crate::rdma::links::tests::drive;
+            use crate::rdma::links::tests::link_up;
+            use crate::rdma::links::tests::page;
+            use crate::rdma::links::tests::world_for;
+            use base64::Engine;
+            let signers = crate::peer::tests::signers();
+            let (a, b) = (signers[0].node().clone(), signers[2].node().clone());
+            let mut w = world_for([a.clone(), b.clone()], false);
+            let scope =
+                RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(30))
+                    .unwrap();
+            // Before setup, the receiver cannot grant and the page uses HTTP.
+            let early = drive(
+                &mut w.a.owner,
+                &mut w.b.owner,
+                w.a.links.grant(&b, RailId(7), TransferId([6; 16]), &scope),
             );
+            assert!(matches!(early, Err(Error::Unavailable)));
+            assert!(native_failure(Error::Unavailable, &scope));
+            link_up(&mut w);
+            let binding = Binding {
+                request: [4; 32],
+                response: [5; 32],
+                transfer: TransferId([6; 16]),
+                membership: 1,
+                deadline: p::encode_deadline(scope.deadline).unwrap(),
+                rail: RailId(7),
+            };
+            let admission = w.a.admission.clone();
+            let envelope = page(&admission, 35, 1).envelope().clone();
+            for mutation in 0..5 {
+                let pending = drive(
+                    &mut w.a.owner,
+                    &mut w.b.owner,
+                    w.a.links.grant(&b, RailId(7), binding.transfer, &scope),
+                )
+                .unwrap();
+                let mut transfer = binding.transfer;
+                let (mut link, mut tag, mut length) = (pending.link(), pending.tag(), 35);
+                match mutation {
+                    0 => link ^= 1,
+                    1 => tag ^= 1,
+                    2 => length += 1,
+                    3 => transfer.0[0] ^= 1,
+                    _ => {}
+                }
+                let value = crate::rdma::links::completion_value(link, tag, length, transfer);
+                let complete = binding
+                    .sign(
+                        &signers[2],
+                        &a,
+                        Phase::Complete,
+                        &[9; 32],
+                        0,
+                        vec![extension(
+                            COMPLETION_HEADER,
+                            base64::engine::general_purpose::STANDARD
+                                .encode(value)
+                                .into_bytes(),
+                        )],
+                    )
+                    .unwrap();
+                let (verified, _) = binding
+                    .verify(
+                        &signers[0],
+                        &b,
+                        complete,
+                        &[Phase::Complete],
+                        &[9; 32],
+                        0,
+                        &scope,
+                    )
+                    .unwrap();
+                let grant = crate::rdma::AuthenticatedGrant {
+                    link: pending.link(),
+                    tag: pending.tag(),
+                    length: crate::rdma::MAX_CIPHERTEXT as u32,
+                    rail: RailId(7),
+                    transfer: binding.transfer,
+                };
+                if mutation < 4 {
+                    let result = drive(
+                        &mut w.a.owner,
+                        &mut w.b.owner,
+                        pending.finish(&verified, envelope.clone(), &admission, &scope),
+                    );
+                    assert!(matches!(result, Err(Error::Unauthorized)), "{mutation}");
+                    w.b.links.release(&a, &grant);
+                } else {
+                    // The link breaks after the sender's completion: the page is
+                    // lost and the request fails with `Io`, never a fallback.
+                    let (epoch, _) = w.a.links.ready(&b, RailId(7)).unwrap();
+                    w.a.links.abandon(&b, RailId(7), epoch);
+                    let result = drive(
+                        &mut w.a.owner,
+                        &mut w.b.owner,
+                        pending.finish(&verified, envelope.clone(), &admission, &scope),
+                    );
+                    assert!(matches!(result, Err(Error::Io)));
+                }
+            }
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
     }
     #[test]

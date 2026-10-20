@@ -483,8 +483,20 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
         .unwrap(),
         rail: racer_control_wire::RailId(1),
     };
+    let grant = || {
+        vec![Header::new(
+            "racer-rdma-grant",
+            binary(&[7; 38]).into_bytes(),
+        )]
+    };
+    assert!(
+        binding
+            .sign(&n[0], n[1].node(), Phase::Accept, &[0; 32], 0, vec![])
+            .is_err(),
+        "accept names a grant"
+    );
     let accept = binding
-        .sign(&n[0], n[1].node(), Phase::Accept, &[0; 32], 0, vec![])
+        .sign(&n[0], n[1].node(), Phase::Accept, &[0; 32], 0, grant())
         .unwrap();
     assert_eq!(Binding::parse_accept(&accept).unwrap(), binding);
     let previous = signed_digest(&accept).unwrap();
@@ -577,7 +589,7 @@ fn request_builders_supply_host_for_strict_http_codec() {
         deadline: 1,
         rail: racer_control_wire::RailId(1),
     };
-    for phase in [Phase::Accept, Phase::Fallback, Phase::Done, Phase::Finish] {
+    for phase in [Phase::Fallback, Phase::Done, Phase::Finish] {
         let head = binding.head(phase, &[0; 32], 0, vec![]).unwrap();
         assert_eq!(
             head.unique("host").unwrap(),

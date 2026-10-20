@@ -9,7 +9,7 @@
 //! Work request ids: bits 63..56 kind, 31..0 receive slot, send slot, or tag.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
@@ -356,15 +356,15 @@ pub(crate) struct Link {
 
     free_slots: Vec<u32>,
 
-    grants: HashMap<u32, GrantEntry>,
+    grants: BTreeMap<u32, GrantEntry>,
 
-    remote: HashMap<u32, RemoteGrant>,
+    remote: BTreeMap<u32, RemoteGrant>,
 
-    waiting: HashMap<u32, Waiting>,
+    waiting: BTreeMap<u32, Waiting>,
 
     outbox: VecDeque<Outgoing>,
 
-    inflight: HashMap<u64, InFlight>,
+    inflight: BTreeMap<u64, InFlight>,
 
     /// Buffers held until the QP is destroyed.
     quarantine: Vec<Buffer>,
@@ -438,11 +438,11 @@ impl Link {
             sq_used: 0,
             next_tag: 0,
             free_slots: (recv_depth..recv_depth + send_slots).rev().collect(),
-            grants: HashMap::new(),
-            remote: HashMap::new(),
-            waiting: HashMap::new(),
+            grants: BTreeMap::new(),
+            remote: BTreeMap::new(),
+            waiting: BTreeMap::new(),
             outbox: VecDeque::new(),
-            inflight: HashMap::new(),
+            inflight: BTreeMap::new(),
             quarantine: Vec::new(),
             created: now,
             ready_since: None,
@@ -1318,7 +1318,7 @@ impl Link {
     fn fail_all(&mut self, pool: &Pool) {
         let mut quarantine = Vec::new();
 
-        for (_, mut entry) in self.grants.drain() {
+        for (_, mut entry) in std::mem::take(&mut self.grants) {
             if let Some(buffer) = entry.buffer.take() {
                 quarantine.push(buffer);
             }
@@ -1332,7 +1332,7 @@ impl Link {
             }
         }
 
-        for (_, waiting) in self.waiting.drain() {
+        for (_, waiting) in std::mem::take(&mut self.waiting) {
             let (Waiting::Write { done, .. } | Waiting::Release { done }) = waiting;
             let _ = done.complete(Err(Error::Unavailable));
         }
@@ -1351,7 +1351,7 @@ impl Link {
             }
         }
 
-        for (_, inflight) in self.inflight.drain() {
+        for (_, inflight) in std::mem::take(&mut self.inflight) {
             match inflight {
                 InFlight::Write { buffer, done } => {
                     quarantine.push(buffer);

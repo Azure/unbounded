@@ -1444,11 +1444,16 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
             ..NodeState::default()
         };
         let node = Arc::new(state);
+        if enable_rdma {
+            node.native
+                .prepare(std::iter::once(WorkerId(0)), &config.limits)
+                .unwrap();
+        }
         let mut worker =
             WorkerApplication::assemble(&config, node.clone(), WorkerId(0), runtime, Vec::new())
                 .expect("valid side-effect-free worker composition");
         assert!(worker.control.is_some());
-        assert_eq!(worker.rdma.is_some(), enable_rdma);
+        assert_eq!(worker.links.is_some(), enable_rdma);
         assert_eq!(
             Rc::strong_count(&worker.flights),
             2,
@@ -3713,7 +3718,7 @@ fn disabled_rdma_turn_does_not_refresh_inventory() {
     node.inventory.update(vec![]).unwrap();
     node.inventory.restore(b"[]").unwrap();
     assert_ne!(generation, node.inventory.generation());
-    assert!(app.devices.is_none());
+    assert!(app.links.is_none());
     app.refresh_inventory().unwrap();
     app.poll_native(&mut Context::from_waker(futures::task::noop_waker_ref()))
         .unwrap();

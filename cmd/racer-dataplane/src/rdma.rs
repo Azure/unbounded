@@ -414,7 +414,7 @@ impl SessionLease {
 }
 
 pub const DESCRIPTOR_HEADER: &str = "racer-rdma-descriptor";
-pub const COMPLETION_HEADER: &str = "racer-rdma-completion";
+pub const COMPLETION_HEADER: &str = "racer-rdma-complete";
 /// Type-2B windows expose exactly one transfer buffer. Bind CQE precedes export;
 /// invalidation plus terminal QP destruction precedes any CPU access or reuse.
 pub struct Grant {

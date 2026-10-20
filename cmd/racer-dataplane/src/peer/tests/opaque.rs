@@ -1120,7 +1120,6 @@ impl RelayFixture {
         let transfers = Rc::new(transport::Transfers::new(
             pool.clone(),
             ios[1].clone(),
-            None,
             admissions[1].clone(),
             Rc::new(codec(&admissions[1])),
             signers[1].clone(),

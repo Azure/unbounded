@@ -28,7 +28,7 @@ pub struct Binding {
 /// Wire phase only; the caller chooses allowed transitions and executes transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// Request transport acceptance.
+    /// Request carrying the receiver's in-band grant.
     Accept,
     /// Offer transport setup.
     Offer,
@@ -77,10 +77,11 @@ impl Phase {
     /// Ordered extension fields required by this phase.
     pub fn fields(self) -> &'static [&'static str] {
         match self {
+            Self::Accept => &["racer-rdma-grant"],
             Self::Offer => &["racer-rdma-setup"],
             Self::Setup | Self::Ready => &["racer-rdma-setup", "racer-rdma-setup-binding"],
             Self::Grant => &["racer-rdma-descriptor"],
-            Self::Complete => &["racer-rdma-completion"],
+            Self::Complete => &["racer-rdma-complete"],
             _ => &[],
         }
     }

@@ -161,7 +161,6 @@ impl PeerServer {
                 1,
             )),
             io.clone(),
-            None,
             admission.clone(),
             wire.clone(),
             signatures.clone(),
@@ -328,6 +327,10 @@ impl PeerServer {
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
+    }
+    #[cfg(test)]
+    pub(crate) fn transfers(&self) -> &Rc<super::transport::Transfers> {
+        &self.transfers
     }
     #[cfg(test)]
     pub fn with_transfers(mut self, transfers: Rc<super::transport::Transfers>) -> Self {

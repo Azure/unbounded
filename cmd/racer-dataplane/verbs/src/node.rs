@@ -10,7 +10,7 @@
 //! Clients queue commands and get results through [`Op`]s.
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError, RwLock,
@@ -46,7 +46,7 @@ pub use link::SETUP_TIMEOUT;
 
 /// Opaque caller identity for a link. Racer uses `SHA-256(NodeId)` and the
 /// rail.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct LinkKey {
     /// Peer identity.
     pub peer: [u8; 32],
@@ -185,9 +185,9 @@ enum Command {
 
 /// State shared by the owner and every client.
 struct NodeShared {
-    links: RwLock<HashMap<LinkKey, LinkState>>,
+    links: RwLock<BTreeMap<LinkKey, LinkState>>,
 
-    pools: RwLock<HashMap<u16, Arc<PoolShared>>>,
+    pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
 
     /// Breaks that did not fit in a command queue.
     breaks: Mutex<Vec<(LinkKey, Epoch)>>,
@@ -210,8 +210,8 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
 
     let (handles, channel) = channel::channels(workers, COMMAND_QUEUE)?;
     let shared = Arc::new(NodeShared {
-        links: RwLock::new(HashMap::new()),
-        pools: RwLock::new(HashMap::new()),
+        links: RwLock::new(BTreeMap::new()),
+        pools: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
@@ -510,17 +510,17 @@ pub struct Owner {
     shared: Arc<NodeShared>,
 
     // Declared before `devices`: links drop before pools and devices.
-    links: HashMap<LinkKey, Link>,
+    links: BTreeMap<LinkKey, Link>,
 
     dying: Vec<Dying>,
 
-    devices: HashMap<u16, DeviceState>,
+    devices: BTreeMap<u16, DeviceState>,
 
     quota: Option<Arc<GuardOwner>>,
 
     settings: Option<Settings>,
 
-    backoff: HashMap<LinkKey, Backoff>,
+    backoff: BTreeMap<LinkKey, Backoff>,
 
     next_epoch: u64,
 
@@ -553,12 +553,12 @@ impl Owner {
             simulation: crate::simulation::current(),
             channel,
             shared,
-            links: HashMap::new(),
+            links: BTreeMap::new(),
             dying: Vec::new(),
-            devices: HashMap::new(),
+            devices: BTreeMap::new(),
             quota: None,
             settings: None,
-            backoff: HashMap::new(),
+            backoff: BTreeMap::new(),
             next_epoch: 1,
             closing: false,
             dirty: false,
@@ -786,7 +786,7 @@ impl Owner {
             Access::PAGES
         };
         let count = config.pool_bytes / config.buffer_len;
-        let mut built = HashMap::new();
+        let mut built = BTreeMap::new();
 
         for selection in &selected {
             let device = Rc::new(
