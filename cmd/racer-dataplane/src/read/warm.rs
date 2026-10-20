@@ -1260,11 +1260,8 @@ async fn warm_one(
         .first()
         .cloned()
         .ok_or(Error::IncompatibleMembership)?;
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        job.scope.check()?;
-        let result = remote(
+    retry_remote_fill(&job.scope, &job.metrics, || {
+        remote(
             directory,
             plan,
             &primary,
@@ -1274,19 +1271,49 @@ async fn warm_one(
             WarmAction::Fill { page: page.number },
             &job.scope,
         )
-        .await;
-        match result {
+    })
+    .await
+}
+
+/// Whether a remote fill error is transient and worth another bounded attempt.
+///
+/// Matches ordinary candidate acquisition, which treats socket failures
+/// (`Error::Os`) like `Unavailable` and `Io`.
+fn remote_fill_retryable(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Overloaded | Error::Unavailable | Error::Io | Error::Os(_)
+    )
+}
+
+/// Run `attempt` up to `REMOTE_FILL_ATTEMPTS` times while it fails transiently.
+async fn retry_remote_fill<T, F, Fut>(
+    scope: &RequestScope,
+    metrics: &Metrics,
+    mut attempt: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        scope.check()?;
+        match attempt().await {
             Ok(_) => {
-                job.metrics.warm_event(WarmEvent::RemoteFillCompleted);
+                metrics.warm_event(WarmEvent::RemoteFillCompleted);
                 return Ok(());
             }
-            Err(Error::Overloaded | Error::Unavailable | Error::Io)
-                if attempt < REMOTE_FILL_ATTEMPTS && job.scope.check().is_ok() =>
+            Err(error)
+                if remote_fill_retryable(&error)
+                    && attempts < REMOTE_FILL_ATTEMPTS
+                    && scope.check().is_ok() =>
             {
-                job.metrics.warm_event(WarmEvent::RemoteFillRetried);
+                metrics.warm_event(WarmEvent::RemoteFillRetried);
             }
             Err(error) => {
-                job.metrics.warm_event(WarmEvent::RemoteFillFailed);
+                metrics.warm_event(WarmEvent::RemoteFillFailed);
                 return Err(error);
             }
         }
@@ -1732,6 +1759,57 @@ mod tests {
                 "lease id is preserved"
             );
         }
+    }
+
+    #[test]
+    fn remote_fill_retries_socket_errors_then_succeeds() {
+        let metrics = Metrics::default();
+        let scope = scope();
+        let calls = std::cell::Cell::new(0);
+        let result = futures::executor::block_on(retry_remote_fill(&scope, &metrics, || {
+            calls.set(calls.get() + 1);
+            let outcome = if calls.get() == 1 {
+                Err(Error::Os(104)) // ECONNRESET
+            } else {
+                Ok(())
+            };
+            std::future::ready(outcome)
+        }));
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(metrics.count(Event::WarmRemoteFillRetried), 1);
+        assert_eq!(metrics.count(Event::WarmRemoteFillFailed), 0);
+    }
+
+    #[test]
+    fn remote_fill_fails_after_bounded_socket_errors() {
+        let metrics = Metrics::default();
+        let scope = scope();
+        let calls = std::cell::Cell::new(0);
+        let result = futures::executor::block_on(retry_remote_fill(&scope, &metrics, || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err::<(), _>(Error::Os(111))) // ECONNREFUSED
+        }));
+        assert_eq!(result, Err(Error::Os(111)));
+        assert_eq!(calls.get(), REMOTE_FILL_ATTEMPTS);
+        assert_eq!(
+            metrics.count(Event::WarmRemoteFillRetried),
+            (REMOTE_FILL_ATTEMPTS - 1) as u64
+        );
+        assert_eq!(metrics.count(Event::WarmRemoteFillFailed), 1);
+    }
+
+    #[test]
+    fn remote_fill_does_not_retry_permanent_errors() {
+        let metrics = Metrics::default();
+        let scope = scope();
+        let calls = std::cell::Cell::new(0);
+        let result = futures::executor::block_on(retry_remote_fill(&scope, &metrics, || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err::<(), _>(Error::VersionUnavailable))
+        }));
+        assert_eq!(result, Err(Error::VersionUnavailable));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
