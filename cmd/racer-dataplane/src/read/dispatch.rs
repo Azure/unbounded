@@ -766,7 +766,7 @@ impl WorkerDirectory {
                 // from the object's metadata worker to every local worker.
                 crate::peer::protocol::Operation::Warm {
                     version,
-                    action: crate::peer::protocol::WarmAction::Fill { page },
+                    action: crate::peer::protocol::WarmAction::Fill { page, .. },
                     ..
                 } => self.page_owner(&PageId {
                     version: version.clone(),

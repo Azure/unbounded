@@ -280,7 +280,13 @@ pub enum WarmAction {
     /// primary owner of, until the requester's wall-clock `until`.
     Hold { pages: u64, until: SystemTime },
     /// Fill one held page onto the owner's disk and acknowledge without payload.
-    Fill { page: PageNumber },
+    /// `length` and `content_type` are the requester's admitted immutable
+    /// metadata; the owner refuses to acknowledge a copy that disagrees.
+    Fill {
+        page: PageNumber,
+        length: u64,
+        content_type: Option<crate::model::ContentType>,
+    },
     /// Drop this lease. The owner frees unused capacity after its last lease.
     Release,
 }
@@ -538,11 +544,20 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
                     push(&mut head, "racer-warm-pages", *pages);
                     push(&mut head, "racer-warm-until", warm_until(*until)?);
                 }
-                WarmAction::Fill { page } => {
-                    if page.0 >= MAX_WARM_PAGES {
+                WarmAction::Fill {
+                    page,
+                    length,
+                    content_type,
+                } => {
+                    if !warm_fill_in_range(page.0, *length) {
                         return Err(Error::InvalidRequest);
                     }
                     push(&mut head, "racer-page", page.0);
+                    push(&mut head, "racer-length", *length);
+                    push(&mut head, "racer-metadata-version", 1);
+                    if let Some(content_type) = content_type {
+                        push(&mut head, "racer-content-type", content_type.as_str());
+                    }
                 }
                 WarmAction::Release => {}
             }
@@ -609,6 +624,14 @@ fn decode_warm_until(head: &MessageHead, name: &str) -> Result<SystemTime> {
     }
 }
 
+/// A warm fill names an existing page of a nonempty object within the hold limit.
+fn warm_fill_in_range(page: u64, length: u64) -> bool {
+    page < MAX_WARM_PAGES
+        && page
+            .checked_mul(PAGE_BYTES)
+            .is_some_and(|start| start < length)
+}
+
 fn warm_action(head: &MessageHead) -> Result<WarmAction> {
     Ok(match field(head, "racer-warm-action")?.as_str() {
         "hold" => {
@@ -623,11 +646,21 @@ fn warm_action(head: &MessageHead) -> Result<WarmAction> {
         }
         "fill" => {
             let page = number(head, "racer-page")?;
-            if page >= MAX_WARM_PAGES {
+            let length = number(head, "racer-length")?;
+            if !warm_fill_in_range(page, length) {
                 return Err(Error::InvalidRequest);
             }
+            let content_type = match head.unique("racer-metadata-version")? {
+                Some(b"1") => head
+                    .unique("racer-content-type")?
+                    .map(crate::model::ContentType::parse)
+                    .transpose()?,
+                _ => return Err(Error::InvalidRequest),
+            };
             WarmAction::Fill {
                 page: PageNumber(page),
+                length,
+                content_type,
             }
         }
         "release" => WarmAction::Release,

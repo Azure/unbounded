@@ -276,7 +276,10 @@ is the primary owner of. Admission works like this:
 The warm job then asks each owner to fill its pages, in ascending page order
 within a bounded pipeline. A remote owner fills the page through its own normal
 path, writes it to its own disk under the hold, and replies with an
-acknowledgement only. No page bytes go back to the requesting node. A busy or
+acknowledgement only. No page bytes go back to the requesting node. Each fill
+request carries the admitted version's length and content type, and an owner
+that fetches a copy with different metadata refuses to store or acknowledge it,
+which fails the job. A busy or
 unreachable owner is retried up to 3 times. If a page still fails, the job
 stops and sends a best-effort release to every owner. Owners that do not get the
 release keep their holds until expiry.

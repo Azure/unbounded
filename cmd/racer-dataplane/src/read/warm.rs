@@ -1302,7 +1302,11 @@ async fn warm_one(
             context,
             &page.version,
             job.lease,
-            WarmAction::Fill { page: page.number },
+            WarmAction::Fill {
+                page: page.number,
+                length: metadata.length,
+                content_type: metadata.content_type.clone(),
+            },
             &job.scope,
         )
     })
@@ -1504,7 +1508,16 @@ pub(crate) async fn serve(
                 }
             }
         }
-        WarmAction::Fill { page } => {
+        WarmAction::Fill {
+            page,
+            length,
+            content_type,
+        } => {
+            let expected = crate::model::VersionMetadata {
+                content_type,
+                version: version.clone(),
+                length,
+            };
             let page = PageId {
                 version,
                 number: page,
@@ -1525,6 +1538,12 @@ pub(crate) async fn serve(
                     .fill
                     .acquire_warm(page, membership, context, scope, budget)
                     .await?;
+                // Never publish or acknowledge a same-ETag copy whose immutable
+                // metadata disagrees with the requester's admitted HEAD; a later
+                // read would reject it, so the frontier must not advance.
+                if !expected.compatible(&acquired.metadata.immutable()) {
+                    return Err(Error::VersionUnavailable);
+                }
                 local
                     .fill
                     .dependencies

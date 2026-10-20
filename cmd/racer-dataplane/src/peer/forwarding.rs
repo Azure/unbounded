@@ -2041,6 +2041,10 @@ mod tests {
                 22,
                 WarmAction::Fill {
                     page: PageNumber(8),
+                    length: 8 * PAGE_BYTES + 1,
+                    content_type: Some(
+                        crate::model::ContentType::parse(b"application/octet-stream").unwrap(),
+                    ),
                 },
                 PeerResponse::Warmed,
                 PeerResponse::Released,
@@ -2145,6 +2149,18 @@ mod tests {
             },
             WarmAction::Fill {
                 page: PageNumber(MAX_WARM_PAGES),
+                length: u64::MAX,
+                content_type: None,
+            },
+            WarmAction::Fill {
+                page: PageNumber(2),
+                length: 2 * PAGE_BYTES,
+                content_type: None,
+            },
+            WarmAction::Fill {
+                page: PageNumber(0),
+                length: 0,
+                content_type: None,
             },
         ] {
             assert!(
@@ -2203,6 +2219,53 @@ mod tests {
                 decode(&|headers: &mut Vec<http1::Header>| headers.retain(|h| h.name != name))
                     .is_err(),
                 "accepted missing {name}"
+            );
+        }
+        let (signed, _) = sender
+            .sign_request_to(
+                warm_request(
+                    33,
+                    WarmAction::Fill {
+                        page: PageNumber(1),
+                        length: PAGE_BYTES + 1,
+                        content_type: Some(
+                            crate::model::ContentType::parse(b"text/plain").unwrap(),
+                        ),
+                    },
+                ),
+                &node(1),
+            )
+            .unwrap();
+        let decode_fill = |change: &dyn Fn(&mut Vec<http1::Header>)| {
+            let mut head = clone_head(&signed.authentication.original);
+            change(&mut head.head.headers);
+            codec.request(
+                ForwardedHead {
+                    original: Arc::new(head),
+                    hops: vec![],
+                },
+                &scope,
+            )
+        };
+        assert!(decode_fill(&|_| {}).is_ok());
+        for (name, value) in [
+            ("racer-length", b"0".as_slice()),
+            ("racer-length", b"4194304"),
+            ("racer-length", b"-1"),
+            ("racer-length", b"big"),
+            ("racer-metadata-version", b"2"),
+            ("racer-content-type", b"not a type"),
+        ] {
+            assert!(
+                decode_fill(&set(name, value)).is_err(),
+                "accepted fill {name}={value:?}"
+            );
+        }
+        for name in ["racer-length", "racer-metadata-version", "racer-page"] {
+            assert!(
+                decode_fill(&|headers: &mut Vec<http1::Header>| headers.retain(|h| h.name != name))
+                    .is_err(),
+                "accepted fill missing {name}"
             );
         }
     }

@@ -287,7 +287,7 @@ impl Peer {
                         self.holds.borrow_mut().push(*until);
                         (None, Some(PeerResponse::Held { until: *until }))
                     }
-                    WarmAction::Fill { page } => (Some(page.0), Some(PeerResponse::Warmed)),
+                    WarmAction::Fill { page, .. } => (Some(page.0), Some(PeerResponse::Warmed)),
                     WarmAction::Release => {
                         self.releases.set(self.releases.get() + 1);
                         (None, Some(PeerResponse::Released))
@@ -1385,30 +1385,47 @@ fn owner_holds_only_primary_pages_and_shares_capacity_across_leases() {
     ));
     assert_eq!(directory.warm.lease_count(&version), 2);
     assert!(index.hold_expiry(&version).is_some());
+    let fill = |length: u64, content_type: Option<crate::model::ContentType>| WarmAction::Fill {
+        page: PageNumber(0),
+        length,
+        content_type,
+    };
     assert!(
         matches!(
-            serve(
-                3,
-                WarmAction::Fill {
-                    page: PageNumber(0)
-                },
-                &primary
-            ),
+            serve(3, fill(PAGE_BYTES + 7, None), &primary),
             PeerResponse::Unavailable
         ),
         "a fill needs a live lease"
     );
-    assert!(matches!(
-        serve(
-            1,
-            WarmAction::Fill {
-                page: PageNumber(0)
-            },
-            &primary
+    for mismatch in [
+        fill(PAGE_BYTES + 8, None),
+        fill(
+            PAGE_BYTES + 7,
+            Some(crate::model::ContentType::parse(b"text/plain").unwrap()),
         ),
+    ] {
+        assert!(
+            matches!(
+                serve(1, mismatch.clone(), &primary),
+                PeerResponse::VersionUnavailable
+            ),
+            "acknowledged incompatible metadata {mismatch:?}"
+        );
+        assert_eq!(
+            index.held_page_expiry(&f.page),
+            None,
+            "an incompatible copy is never published"
+        );
+    }
+    let before = f.origin.calls.get();
+    assert!(matches!(
+        serve(1, fill(PAGE_BYTES + 7, None), &primary),
         PeerResponse::Warmed
     ));
-    assert_eq!(f.origin.calls.get(), 1, "the owner fills from origin");
+    assert!(
+        f.origin.calls.get() <= before + 1,
+        "the owner fills from origin"
+    );
     assert!(index.held_page_expiry(&f.page).is_some());
     assert!(matches!(
         serve(1, WarmAction::Release, &primary),

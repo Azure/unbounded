@@ -1665,7 +1665,7 @@ fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
         } => (
             &version.object,
             match action {
-                crate::peer::protocol::WarmAction::Fill { page } => *page,
+                crate::peer::protocol::WarmAction::Fill { page, .. } => *page,
                 _ => PageNumber(0),
             },
         ),
