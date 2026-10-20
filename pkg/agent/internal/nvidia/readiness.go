@@ -52,6 +52,10 @@ func checkReadiness(
 	}
 
 	if err != nil {
+		if message := strings.TrimSpace(string(out)); message != "" {
+			return fmt.Errorf("nvidia-smi GPU query failed: %w: %s", err, message)
+		}
+
 		return fmt.Errorf("nvidia-smi GPU query failed: %w", err)
 	}
 
