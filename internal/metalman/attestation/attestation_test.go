@@ -842,6 +842,7 @@ func TestAttestEKMismatchMintsNoToken(t *testing.T) {
 	doAttest(t, handler, "10.0.2.15", ekPub, srkPub)
 
 	var calls int
+
 	handler.ResolveBootstrapToken = func(context.Context, *v1alpha3.Machine) (string, error) {
 		calls++
 
