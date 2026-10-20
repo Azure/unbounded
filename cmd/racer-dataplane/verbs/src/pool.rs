@@ -190,13 +190,22 @@ impl PoolShared {
             return Some(Ok(buffer));
         }
 
-        {
+        // Clone before locking: the clone callback may reenter the pool.
+        // `will_wake` only compares pointers and runs no callback. An unused
+        // clone is returned and dropped after the lock is released, so the
+        // drop callback never runs under the lock either.
+        let clone = waker.clone();
+        let unused = {
             let mut waiters = lock(&self.waiters);
             // Repeated polls from one task register it once.
-            if !waiters.iter().any(|w| w.will_wake(waker)) {
-                waiters.push(waker.clone());
+            if waiters.iter().any(|w| w.will_wake(waker)) {
+                Some(clone)
+            } else {
+                waiters.push(clone);
+                None
             }
-        }
+        };
+        drop(unused);
 
         // A buffer may have returned between the first try and registering.
         self.stage(len).map(Ok)
@@ -521,7 +530,7 @@ impl Drop for SendBuffer {
 mod tests {
     use std::{
         sync::atomic::AtomicUsize,
-        task::{Wake, Waker},
+        task::{RawWaker, RawWakerVTable, Wake, Waker},
     };
 
     use super::*;
@@ -592,6 +601,87 @@ mod tests {
         assert_eq!(reenter.wakes.load(Ordering::SeqCst), 1);
         assert_eq!(shared.waiter_count(), 0);
         assert_eq!(shared.count_in(BufferState::Free), 1);
+    }
+
+    /// Counts calls into a raw waker vtable whose clone, wake, and drop
+    /// callbacks all reenter the pool by taking the waiter lock.
+    struct RawReenter {
+        shared: Arc<PoolShared>,
+        clones: AtomicUsize,
+        drops: AtomicUsize,
+        wakes: AtomicUsize,
+    }
+
+    static RAW_REENTER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        raw_reenter_clone,
+        raw_reenter_wake,
+        raw_reenter_wake_by_ref,
+        raw_reenter_drop,
+    );
+
+    unsafe fn raw_reenter_clone(data: *const ()) -> RawWaker {
+        // SAFETY: `data` came from `Arc::into_raw` and the waker holds a count.
+        let state = unsafe { &*data.cast::<RawReenter>() };
+        state.clones.fetch_add(1, Ordering::SeqCst);
+        let _ = state.shared.waiter_count();
+        // SAFETY: as above; the new waker owns the added count.
+        unsafe { Arc::increment_strong_count(data.cast::<RawReenter>()) };
+        RawWaker::new(data, &RAW_REENTER_VTABLE)
+    }
+
+    unsafe fn raw_reenter_wake(data: *const ()) {
+        // SAFETY: `data` is a live waker's pointer.
+        unsafe { raw_reenter_wake_by_ref(data) };
+        // SAFETY: `wake` consumes the waker.
+        unsafe { raw_reenter_drop(data) };
+    }
+
+    unsafe fn raw_reenter_wake_by_ref(data: *const ()) {
+        // SAFETY: `data` is a live waker's pointer.
+        let state = unsafe { &*data.cast::<RawReenter>() };
+        state.wakes.fetch_add(1, Ordering::SeqCst);
+        let _ = state.shared.waiter_count();
+    }
+
+    unsafe fn raw_reenter_drop(data: *const ()) {
+        // SAFETY: `data` came from `Arc::into_raw` and owns one count.
+        let state = unsafe { Arc::from_raw(data.cast::<RawReenter>()) };
+        state.drops.fetch_add(1, Ordering::SeqCst);
+        let _ = state.shared.waiter_count();
+    }
+
+    #[test]
+    /// Waker clone and drop callbacks that reenter the pool do not deadlock,
+    /// including the duplicate-registration path that drops an unused clone.
+    fn reentrant_clone_and_drop_do_not_deadlock() {
+        let sim = Simulation::new();
+        let (pool, _charge) = pool(&sim, 1);
+        let shared = pool.shared().clone();
+        let held = shared.stage(5).unwrap();
+        let state = Arc::new(RawReenter {
+            shared: shared.clone(),
+            clones: AtomicUsize::new(0),
+            drops: AtomicUsize::new(0),
+            wakes: AtomicUsize::new(0),
+        });
+        let data = Arc::into_raw(state.clone()).cast::<()>();
+        // SAFETY: the vtable upholds the `RawWaker` contract over an `Arc`.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(data, &RAW_REENTER_VTABLE)) };
+        assert!(shared.poll_stage(5, &waker).is_none());
+        assert!(shared.poll_stage(5, &waker).is_none());
+        assert_eq!(shared.waiter_count(), 1);
+        assert_eq!(state.clones.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.drops.load(Ordering::SeqCst),
+            1,
+            "unused clone dropped"
+        );
+        drop(held);
+        assert_eq!(state.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(state.drops.load(Ordering::SeqCst), 2);
+        drop(waker);
+        assert_eq!(state.drops.load(Ordering::SeqCst), 3);
+        assert_eq!(Arc::strong_count(&state), 1);
     }
 
     #[test]
