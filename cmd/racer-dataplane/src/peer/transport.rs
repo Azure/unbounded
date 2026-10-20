@@ -322,7 +322,7 @@ impl Transfers {
         }
         binding.response = envelope_digest(&response.authentication)?;
         let previous = signed_digest(&accept.signed)?;
-        // Stage 4 stages the ciphertext on the crypto thread (`Source::Staged`).
+        // `Links::send` stages the ciphertext on the crypto thread when it can.
         let sent = links
             .send(peer, &grant, ciphertext, &native_scope(scope))
             .await;

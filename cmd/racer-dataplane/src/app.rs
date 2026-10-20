@@ -857,13 +857,16 @@ impl WorkerApplication {
 
         let links = if config.enable_rdma {
             node.native.client(worker)?.map(|client| {
-                Rc::new(Links::new(
-                    client,
-                    node.native.link_node(),
-                    config.node.clone(),
-                    limits.connections_per_neighbor.get(),
-                    Some(reactor.clone()),
-                ))
+                Rc::new(
+                    Links::new(
+                        client,
+                        node.native.link_node(),
+                        config.node.clone(),
+                        limits.connections_per_neighbor.get(),
+                        Some(reactor.clone()),
+                    )
+                    .with_stager(runtime.crypto.clone()),
+                )
             })
         } else {
             None

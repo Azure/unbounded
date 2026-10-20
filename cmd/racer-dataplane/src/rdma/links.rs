@@ -134,6 +134,13 @@ pub struct Links {
     tasks: RefCell<Vec<Operation<'static, ()>>>,
 
     draining: Cell<bool>,
+
+    /// This worker's crypto thread, which stages send copies.
+    stager: Option<Rc<crate::security::CryptoClient>>,
+
+    /// Sends staged on the crypto thread and sends left to the owner.
+    #[cfg(test)]
+    pub(crate) staging: Cell<(usize, usize)>,
 }
 
 impl Links {
@@ -156,7 +163,18 @@ impl Links {
             retry: reactor.map_or_else(NativeRetry::unattached, NativeRetry::new),
             tasks: RefCell::new(Vec::new()),
             draining: Cell::new(false),
+            stager: None,
+            #[cfg(test)]
+            staging: Cell::new((0, 0)),
         }
+    }
+
+    /// Copy outgoing ciphertext into registered memory on `crypto`'s thread
+    /// instead of the shared owner thread (`designs/racer-rdma-sessions.md`,
+    /// "Zero-copy").
+    pub fn with_stager(mut self, crypto: Rc<crate::security::CryptoClient>) -> Self {
+        self.stager = Some(crypto);
+        self
     }
 
     /// The local node.
@@ -566,12 +584,16 @@ impl Links {
         if link != grant.link {
             return Err(Error::Unavailable);
         }
+        let source = match self.stage(grant.rail, page, scope).await? {
+            Some(buffer) => Source::Staged(buffer),
+            None => Source::Bytes(Arc::new(PageSource(page.clone()))),
+        };
         self.wait(
             self.client.write(
                 link_key(peer, grant.rail),
                 epoch,
                 grant.tag,
-                Source::Bytes(Arc::new(PageSource(page.clone()))),
+                source,
                 scope.deadline.0,
             ),
             scope,
@@ -580,6 +602,43 @@ impl Links {
         Ok(NativeSent {
             value: completion_value(grant.link, grant.tag, length as u32, grant.transfer),
         })
+    }
+
+    /// Copy `page` into a free send buffer of `rail` on the crypto thread.
+    /// `None` leaves the copy to the owner (`Source::Bytes`): no stager, no free
+    /// buffer right now, or a stager failure other than the request's own
+    /// cancellation. A failed copy drops the buffer, which returns it to the
+    /// pool.
+    async fn stage(
+        &self,
+        rail: RailId,
+        page: &CiphertextPage,
+        scope: &RequestScope,
+    ) -> Result<Option<rdma_verbs::SendBuffer>> {
+        let Some(crypto) = &self.stager else {
+            return Ok(None);
+        };
+        // Never wait for a buffer here: the owner queues `Source::Bytes`
+        // writes itself, and a parked waker would only cause a spurious wake.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let staged = match self.client.send_buffer(rail.0, page.bytes().len(), &mut cx) {
+            Poll::Ready(Ok(buffer)) => match crypto.stage(page.clone(), buffer, scope).await {
+                Ok(buffer) => Some(buffer),
+                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                Err(_) => None,
+            },
+            Poll::Ready(Err(_)) | Poll::Pending => None,
+        };
+        #[cfg(test)]
+        {
+            let (yes, no) = self.staging.get();
+            self.staging.set(if staged.is_some() {
+                (yes + 1, no)
+            } else {
+                (yes, no + 1)
+            });
+        }
+        Ok(staged)
     }
 
     /// Sender: decline the peer's grant if its link is still the granted one.
