@@ -83,7 +83,9 @@ profile-gantry: operator-vm-check
 		hack/gantry-benchmark/profile-gantry.sh
 
 operator-vm-check:
-	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-verify-streaming-layers-remote.sh operator-vm-watch.sh
+	@for script in deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-verify-streaming-layers-remote.sh operator-vm-watch.sh; do \
+		bash -n "$$script"; \
+	done
 	./deploy.sh plan deploy.env.example | grep -Fq 'Artifact Streaming:  false'
 	@stream_config=$$(mktemp); \
 	trap 'rm -f "$$stream_config"' EXIT; \
