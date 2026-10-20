@@ -1,0 +1,156 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-gpu-certification
+  namespace: {{ default "project-signal" .Namespace }}
+spec:
+  serviceAccountName: project-signal-runner
+  entrypoint: certification
+  ttlStrategy:
+    secondsAfterCompletion: 21600
+    secondsAfterSuccess: 21600
+    secondsAfterFailure: 21600
+  podGC:
+    strategy: OnWorkflowCompletion
+    deleteDelayDuration: 2h
+  arguments:
+    parameters:
+      - name: run-name
+      - name: run-uid
+      - name: participants
+      - name: script-configmap
+      - name: script-key
+      - name: script-digest
+      - name: backend-api-version
+      - name: backend-kind
+      - name: queue
+      - name: runner-image
+      - name: tolerations
+        value: >-
+          [{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
+      - name: expected-gpu-product-regex
+        value: "^$"
+      - name: expected-gpu-count
+        value: "0"
+      - name: attempt
+  volumes:
+    - name: scripts
+      configMap:
+        name: "{{`{{workflow.parameters.script-configmap}}`}}"
+        defaultMode: 0555
+  templates:
+    - name: certification
+      dag:
+        tasks:
+          - name: node-health
+            template: node-health
+          - name: mpi-backend
+            dependencies: [node-health]
+            template: mpi-backend
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{tasks.node-health.outputs.parameters.reason}}`}}"
+
+    - name: node-health
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+      podSpecPatch: >-
+        {"tolerations": {{`{{workflow.parameters.tolerations}}`}}}
+      container:
+        image: "{{`{{workflow.parameters.runner-image}}`}}"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
+        env:
+          - name: EXPECTED_GPU_PRODUCT_REGEX
+            value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+          - name: EXPECTED_GPU_COUNT
+            value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+          - name: results
+            mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /results/verdict
+          - name: reason
+            valueFrom:
+              path: /results/reason
+
+    - name: mpi-backend
+      resource:
+        action: create
+        setOwnerReference: true
+        successCondition: status.replicaStatuses.Launcher.succeeded == 1
+        failureCondition: status.replicaStatuses.Launcher.failed == 1
+        manifest: |
+          apiVersion: kubeflow.org/v2beta1
+          kind: MPIJob
+          metadata:
+            generateName: project-signal-mpi-
+            labels:
+              signal.unbounded-cloud.io/run: "{{`{{workflow.parameters.run-name}}`}}"
+          spec:
+            launcherCreationPolicy: WaitForWorkersReady
+            mpiImplementation: OpenMPI
+            runLauncherAsWorker: false
+            runPolicy:
+              backoffLimit: 0
+              cleanPodPolicy: All
+              ttlSecondsAfterFinished: 3600
+            slotsPerWorker: 1
+            mpiReplicaSpecs:
+              Launcher:
+                replicas: 1
+                template:
+                  spec:
+                    restartPolicy: Never
+                    containers:
+                      - name: launcher
+                        image: "{{`{{workflow.parameters.runner-image}}`}}"
+                        command: ["/bin/bash", "-lc"]
+                        args:
+                          - >-
+                            mpirun --allow-run-as-root -np 1 --bind-to none
+                            --map-by slot -mca plm_rsh_no_tree_spawn 1
+                            -mca plm_rsh_args
+                            "-o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/project-signal-known-hosts"
+                            /bin/true
+              Worker:
+                replicas: 1
+                template:
+                  spec:
+                    restartPolicy: Never
+                    nodeSelector:
+                      kubernetes.io/hostname: "{{`{{workflow.parameters.participants}}`}}"
+                    tolerations: {{`{{workflow.parameters.tolerations}}`}}
+                    containers:
+                      - name: worker
+                        image: "{{`{{workflow.parameters.runner-image}}`}}"
+                        command:
+                          - /bin/bash
+                          - -lc
+                          - >-
+                            install -d -m 0700 /run/project-signal-ssh &&
+                            install -m 0600 /root/.ssh/authorized_keys /run/project-signal-ssh/authorized_keys &&
+                            mkdir -p /run/sshd &&
+                            ssh-keygen -A &&
+                            exec /usr/sbin/sshd -D -e
+                            -o AuthorizedKeysFile=/run/project-signal-ssh/authorized_keys
+                        resources:
+                          limits:
+                            nvidia.com/gpu: "1"

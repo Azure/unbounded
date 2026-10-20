@@ -1,0 +1,62 @@
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: gpu-smoke-example
+  annotations:
+    signal.unbounded-cloud.io/example: "replace all REPLACE_WITH_VERIFIED values before use"
+spec:
+  participants:
+    count: 1
+    selector:
+      matchLabels:
+        node.kubernetes.io/instance-type: REPLACE_WITH_VERIFIED_INSTANCE_TYPE
+        nvidia.com/gpu.product: REPLACE_WITH_VERIFIED_GPU_PRODUCT_LABEL
+    requiredResources:
+      nvidia.com/gpu: "1"
+  script:
+    name: project-signal-scripts
+    key: gpu-identity-example.sh
+  workflow:
+    name: project-signal-gpu-certification
+  backend:
+    apiVersion: kubeflow.org/v2beta1
+    kind: MPIJob
+  runnerImage: {{ default "example.invalid/gpu-runner:replace-me" .RunnerImage }}
+  purpose: QuickCertification
+  stagePlan:
+    - id: preflight
+      displayName: Preflight health
+      category: health
+      description: Verify the approved hardware identity and baseline health.
+      required: true
+    - id: workload
+      displayName: Certification workload
+      category: compute
+      description: Run the profile-specific hardware workload.
+      expectedDuration: 5m
+      required: true
+    - id: health-after
+      displayName: Final health
+      category: health
+      description: Verify that the workload introduced no new hardware errors.
+      required: true
+  parameters:
+    expected-gpu-product-regex: ^REPLACE_WITH_VERIFIED_NVIDIA_SMI_PRODUCT$
+    expected-gpu-count: "REPLACE_WITH_VERIFIED_GPU_COUNT"
+  evidencePath: project-signal/example
+  deadline: 15m
+  maxAttempts: 2
+  recurring:
+    enabled: false
+    nodeNames:
+      - REPLACE_WITH_APPROVED_NODE
+    minIdleDuration: 15m
+    validFor: 1h
+    expiresAt: "1970-01-01T00:00:00Z"
+    evaluationInterval: 1m
+    failureBackoff: 30m
+    maxConsecutiveFailures: 2
+    maxConcurrent: 1
+    failureDomainLabel: topology.kubernetes.io/zone
+    maxConcurrentPerFailureDomain: 1
+    exclusiveProfiles: []
