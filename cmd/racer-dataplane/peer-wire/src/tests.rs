@@ -630,3 +630,153 @@ fn credential_policy_runs_after_profile_checks_before_signature_verification() {
     assert_eq!(policy.0.get(), 1);
     assert!(matches!(verifier.sign(head()), Err(Error::Unavailable)));
 }
+
+#[test]
+fn rdma_link_request_and_response_roundtrip_and_reject_substitution() {
+    use crate::link::{BINDING_FIELD, KIND, MAX_SETUP, RdmaLink, SETUP_FIELD, TARGET};
+    let n = network(3);
+    let request = RdmaLink {
+        setup: vec![7; 74],
+        binding: None,
+    };
+    let response = RdmaLink {
+        setup: vec![9; 74],
+        binding: Some([5; 32]),
+    };
+    let head = request.head().unwrap();
+    assert!(matches!(&head.start, StartLine::Request { method, target }
+        if method == "POST" && target == TARGET));
+    assert_eq!(field(&head, "racer-kind").unwrap(), KIND);
+    assert_eq!(field(&head, "content-length").unwrap(), "0");
+    assert!(head.unique(BINDING_FIELD).unwrap().is_none());
+    assert!(matches!(
+        response.head().unwrap().start,
+        StartLine::Response { status: 200 }
+    ));
+
+    // Success: both directions, with and without a known signer.
+    let signed = request.sign(&n[0], n[1].node()).unwrap();
+    let (verified, parsed) = RdmaLink::verify(
+        &n[1],
+        None,
+        request.sign(&n[0], n[1].node()).unwrap(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(parsed, request);
+    assert_eq!(verified.peer().node(), n[0].node());
+    let input = String::from_utf8(
+        signed
+            .head
+            .unique("signature-input")
+            .unwrap()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(input.contains(&format!("\"{SETUP_FIELD}\"")));
+    let signed = response.sign(&n[1], n[0].node()).unwrap();
+    let (_, parsed) = RdmaLink::verify(
+        &n[0],
+        Some(n[1].node()),
+        response.sign(&n[1], n[0].node()).unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(parsed, response);
+    let input = String::from_utf8(
+        signed
+            .head
+            .unique("signature-input")
+            .unwrap()
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(input.contains(&format!("\"{BINDING_FIELD}\"")));
+
+    // Failure: wrong direction, signer, receiver, or tampered setup.
+    assert!(
+        RdmaLink::verify(
+            &n[0],
+            None,
+            response.sign(&n[1], n[0].node()).unwrap(),
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        RdmaLink::verify(
+            &n[0],
+            Some(n[2].node()),
+            response.sign(&n[1], n[0].node()).unwrap(),
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        RdmaLink::verify(
+            &n[2],
+            None,
+            response.sign(&n[1], n[0].node()).unwrap(),
+            true
+        )
+        .is_err()
+    );
+    let mut tampered = response.sign(&n[1], n[0].node()).unwrap();
+    for h in &mut tampered.head.headers {
+        if h.name == SETUP_FIELD {
+            h.value = binary(&[8; 74]).into_bytes();
+        }
+    }
+    assert!(RdmaLink::verify(&n[0], None, tampered, true).is_err());
+
+    // Edge: setup bounds, malformed binding, wrong kind, extra fields.
+    for setup in [vec![], vec![1; MAX_SETUP + 1]] {
+        assert!(
+            RdmaLink {
+                setup,
+                binding: None
+            }
+            .head()
+            .is_err()
+        );
+    }
+    assert!(
+        RdmaLink {
+            setup: vec![1; MAX_SETUP],
+            binding: None
+        }
+        .head()
+        .is_ok()
+    );
+    let mut bad = response.head().unwrap();
+    for h in &mut bad.headers {
+        if h.name == BINDING_FIELD {
+            h.value = binary(&[5; 31]).into_bytes();
+        }
+    }
+    assert!(RdmaLink::parse(&bad).is_err());
+    let mut bad = response.head().unwrap();
+    bad.headers.retain(|h| h.name != BINDING_FIELD);
+    assert!(RdmaLink::parse(&bad).is_err());
+    let mut bad = request.head().unwrap();
+    for h in &mut bad.headers {
+        if h.name == "racer-kind" {
+            h.value = b"request".to_vec();
+        }
+    }
+    assert!(RdmaLink::parse(&bad).is_err());
+    let mut bad = request.head().unwrap();
+    for h in &mut bad.headers {
+        if h.name == SETUP_FIELD {
+            h.value = b"not base64!".to_vec();
+        }
+    }
+    assert!(RdmaLink::parse(&bad).is_err());
+    let mut extra = request.head().unwrap();
+    push(&mut extra, "racer-extra", "1");
+    push(&mut extra, "racer-receiver", &n[1].node().0);
+    let signed = n[0].sign(extra).unwrap();
+    assert!(RdmaLink::verify(&n[1], None, signed, false).is_err());
+}

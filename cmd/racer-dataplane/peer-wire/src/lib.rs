@@ -7,6 +7,7 @@
 
 pub mod control;
 pub mod forwarding;
+pub mod link;
 mod session;
 #[cfg(test)]
 mod tests;
