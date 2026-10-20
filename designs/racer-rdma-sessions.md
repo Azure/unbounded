@@ -3,8 +3,9 @@
 Status: approved direction, target design. The verbs crate side is in
 [racer-verbs.md](racer-verbs.md). This file covers threading, the link
 handshake, the per-page protocol, Racer types, zero-copy, configuration,
-deletions, tests, and the implementation plan. Stage 4a (receive-side
-zero-copy) is implemented; see "Deviations in the implementation".
+deletions, tests, and the implementation plan. Stages 4a (receive-side
+zero-copy) and 4b (staged sends on the crypto thread) are implemented; see
+"Deviations in the implementation".
 
 Paths are relative to `cmd/racer-dataplane/` unless noted.
 
@@ -321,6 +322,10 @@ Send (one copy, off the I/O thread):
   sending worker's paired crypto thread copies (and can verify the stored
   checksum on the way). `write` then takes `Source::Staged`. The owner thread
   then does no bulk copies.
+  Implemented in stage 4b: `Links::send` takes a free buffer without waiting
+  (`Client::send_buffer` with a no-op waker), copies on the crypto thread
+  (`CryptoInput::Stage { ciphertext, buffer }`, `PageCryptoEngine::stage` in
+  `src/security.rs`), and writes `Source::Staged`. See deviation 8.
 - Full zero-copy send would need cache slabs allocated from registered
   memory (`alloc` crate). Out of scope; noted as follow-up.
 
@@ -576,5 +581,23 @@ Recorded while building stage 4a (receive-side zero-copy, done):
 10. The cache keeps a copy, not the request's `Arc`, so
     `MemoryCache::invalidate_ciphertext` matches a registered argument by
     envelope and bytes as well as by pointer.
-11. Relays: send-side code is unchanged in 4a. A relayed registered page goes
-    through the existing `Source::Bytes` copy; stage 4b owns that path.
+11. Relays: send-side code is unchanged in 4a. With stage 4b, a relayed
+    registered page is copied once into a send buffer on the crypto thread
+    by `Links::stage` (it reads `CiphertextPage::bytes`, whatever the
+    storage); it is not sent from its receive buffer in place. Without a
+    stager or free send buffer it still takes the owner `Source::Bytes` copy.
+
+Recorded while building stage 4b (staged sends, done):
+
+12. Stage 4b staging (`Links::stage`, `src/rdma/links.rs`). The input field is
+    `buffer`, not `into`. The copy does not verify the stored checksum; the
+    ciphertext is AEAD-authenticated by the receiver anyway. When no buffer is
+    free at once, the stager fails for any reason other than the request's
+    own cancellation or deadline, or the worker has no stager, the send falls
+    back to `Source::Bytes` (owner copies, owner queues for a buffer) rather
+    than waiting or falling back to HTTP. A failed or cancelled stage job
+    drops the `SendBuffer`, which returns it to `Free`; on cancellation
+    `Links::send` returns the error and `send_native` releases the grant. The
+    stage job runs without a key lease and records no crypto metrics
+    (`checksum_only`). The owner still copies under pool exhaustion, so it is
+    not entirely free of bulk copies.
