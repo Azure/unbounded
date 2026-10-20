@@ -346,6 +346,13 @@ if [[ "$action" == destroy ]]; then
       aks_node_resource_group=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
         --query nodeResourceGroup -o tsv)
       if [[ -n "$aks_node_resource_group" ]] && [[ $(az group exists -n "$aks_node_resource_group") == true ]]; then
+        while IFS= read -r orphaned_vmss; do
+          [[ -n "$orphaned_vmss" ]] || continue
+          log "submitting deletion of orphaned AKS VM scale set $orphaned_vmss"
+          az vmss delete -g "$aks_node_resource_group" -n "$orphaned_vmss" \
+            --no-wait --only-show-errors
+        done < <(az vmss list -g "$aks_node_resource_group" --query '[].name' -o tsv)
+
         log "submitting deletion of orphaned AKS node resource group $aks_node_resource_group"
         az group delete -n "$aks_node_resource_group" --yes --no-wait --only-show-errors
       fi
