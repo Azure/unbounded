@@ -163,7 +163,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
-| `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
+| `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA page-buffer budget when enabled. One node-wide pool, never divided among workers, split evenly across selected RDMA devices; an explicit value is the node total |
 | `RACER_REQUEST_CONTEXT_BYTES` | Unset: `33554432` (32 MiB) per final I/O worker | Request-context budget; an explicit value is node-wide |
 | `RACER_METADATA_ENTRIES` | Unset: `4096` per final I/O worker; managed ConfigMap sets `4096` | Catalog entries; an explicit value (including the managed default) is node-wide and divided among I/O workers; at most 1,048,576 |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget in file mode; configured value at most 1,048,576; device mode can raise it as described below |
@@ -187,7 +187,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
 | `RACER_CLIENT_CONNECTIONS` | Unset: `64` per final I/O worker | Connection admission budget; an explicit value is node-wide and partitioned among workers |
-| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024. Also sets the in-flight RDMA page grants per link |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
 | `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
 | `RACER_REPLICA_SELECTION` | `spread` | Which page owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across all owners. `primary`: always the first-ranked owner |
@@ -937,6 +937,23 @@ change placement; in-flight snapshots mean label changes are not immediate revoc
 | `false` | Disable native RDMA |
 
 Release images include native verbs support; discovery/provider failures retain HTTP.
+
+Each node keeps one long-lived, two-way RC connection (link) per peer and rail. The
+first page to a peer sets the link up in the background with a signed
+`POST /racer/v1/rdma/link` over an authenticated peer HTTP connection. If both nodes
+start a setup at once, the lower NodeId wins. Pages use HTTP until the link is ready,
+and again if a link breaks. Idle links close after 120 seconds.
+
+Per page, the receiver grants one registered page buffer in its signed request. The
+sender writes the page with an RDMA write with immediate, then sends a signed
+completion in place of the HTTP body. If the sender cannot use the grant before
+writing, it releases it and sends the page over HTTP. Received pages stay in
+registered memory for the request; anything kept longer, such as cached pages, is
+copied out. Senders usually copy pages into registered memory on the worker's crypto thread.
+
+Page buffers are registered for local access only. Peers write through memory
+windows (type 2B) bound per grant and invalidated after use.
+
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json
