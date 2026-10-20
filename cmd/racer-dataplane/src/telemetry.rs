@@ -531,17 +531,50 @@ mod warm_metric_tests {
             (WarmEvent::WaitCompleted, "racer_warm_wait_completed_total"),
             (WarmEvent::WaitFallback, "racer_warm_wait_fallback_total"),
             (WarmEvent::WaitFailed, "racer_warm_wait_failed_total"),
-            (WarmEvent::RemoteHoldAccepted, "racer_warm_remote_hold_accepted_total"),
-            (WarmEvent::RemoteHoldRefused, "racer_warm_remote_hold_refused_total"),
-            (WarmEvent::RemoteFillCompleted, "racer_warm_remote_fill_completed_total"),
-            (WarmEvent::RemoteFillRetried, "racer_warm_remote_fill_retried_total"),
-            (WarmEvent::RemoteFillFailed, "racer_warm_remote_fill_failed_total"),
-            (WarmEvent::RemoteReleaseSent, "racer_warm_remote_release_sent_total"),
-            (WarmEvent::RemoteReleaseFailed, "racer_warm_remote_release_failed_total"),
-            (WarmEvent::OwnerHoldAccepted, "racer_warm_owner_hold_accepted_total"),
-            (WarmEvent::OwnerHoldRefused, "racer_warm_owner_hold_refused_total"),
-            (WarmEvent::OwnerFillCompleted, "racer_warm_owner_fill_completed_total"),
-            (WarmEvent::OwnerFillFailed, "racer_warm_owner_fill_failed_total"),
+            (
+                WarmEvent::RemoteHoldAccepted,
+                "racer_warm_remote_hold_accepted_total",
+            ),
+            (
+                WarmEvent::RemoteHoldRefused,
+                "racer_warm_remote_hold_refused_total",
+            ),
+            (
+                WarmEvent::RemoteFillCompleted,
+                "racer_warm_remote_fill_completed_total",
+            ),
+            (
+                WarmEvent::RemoteFillRetried,
+                "racer_warm_remote_fill_retried_total",
+            ),
+            (
+                WarmEvent::RemoteFillFailed,
+                "racer_warm_remote_fill_failed_total",
+            ),
+            (
+                WarmEvent::RemoteReleaseSent,
+                "racer_warm_remote_release_sent_total",
+            ),
+            (
+                WarmEvent::RemoteReleaseFailed,
+                "racer_warm_remote_release_failed_total",
+            ),
+            (
+                WarmEvent::OwnerHoldAccepted,
+                "racer_warm_owner_hold_accepted_total",
+            ),
+            (
+                WarmEvent::OwnerHoldRefused,
+                "racer_warm_owner_hold_refused_total",
+            ),
+            (
+                WarmEvent::OwnerFillCompleted,
+                "racer_warm_owner_fill_completed_total",
+            ),
+            (
+                WarmEvent::OwnerFillFailed,
+                "racer_warm_owner_fill_failed_total",
+            ),
             (WarmEvent::OwnerReleased, "racer_warm_owner_released_total"),
         ] {
             workers[0].warm_event(event);

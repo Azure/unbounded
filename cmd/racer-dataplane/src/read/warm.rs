@@ -1,11 +1,16 @@
 //! Node-wide warm jobs. Progress means disk publication, not writer queue admission.
 
 use super::dispatch::WorkerDirectory;
+use super::flight::AcquisitionBudget;
 use crate::error::{Error, Result};
 use crate::model::{ObjectMetadata, ObjectVersion, PAGE_BYTES, PageId, PageNumber, RequestId};
+use crate::peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse, WarmAction};
 use crate::runtime::RequestScope;
 use crate::security::ChargedOriginContext;
+use crate::security::OriginContext;
 use crate::telemetry::{Metrics, WarmEvent};
+use crate::topology::Membership;
+use racer_control_wire::NodeId;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -68,6 +73,30 @@ pub(crate) struct Job {
     scope: RequestScope,
     admission: futures::lock::Mutex<()>,
     progress: Mutex<Progress>,
+    plan: Mutex<Option<Arc<Plan>>>,
+}
+
+/// Primary-owner placement of one warm job, fixed at its first admission.
+/// Later membership changes are not re-homed; see the reference docs.
+pub(crate) struct Plan {
+    node: NodeId,
+    membership: Arc<Membership>,
+    local: Vec<u64>,
+    counts: BTreeMap<u16, usize>,
+    remote: Vec<NodeId>,
+}
+
+impl Plan {
+    fn is_local(&self, page: u64) -> bool {
+        usize::try_from(page / 64)
+            .ok()
+            .and_then(|word| self.local.get(word))
+            .is_none_or(|word| word >> (page % 64) & 1 == 1)
+    }
+
+    fn lease(&self, job: &Job) -> LeaseKey {
+        (self.node.clone(), job.scope.request.0)
+    }
 }
 
 pub struct WarmRegistry {
@@ -77,7 +106,12 @@ pub struct WarmRegistry {
     waiter_limit: usize,
     draining: std::sync::atomic::AtomicBool,
     releases: Mutex<BTreeMap<u16, ReleaseQueue>>,
+    /// Live hold leases per version. Local jobs and remote requesters both hold
+    /// leases; unused capacity is released only after the last lease is gone.
+    leases: Mutex<BTreeMap<ObjectVersion, BTreeMap<LeaseKey, SystemTime>>>,
 }
+/// A requester node and the warm job identifier it chose for one version.
+type LeaseKey = (NodeId, [u8; 16]);
 type ReleaseQueue = (Option<Waker>, std::collections::BTreeSet<ObjectVersion>);
 
 impl WarmRegistry {
@@ -89,7 +123,76 @@ impl WarmRegistry {
             waiter_limit,
             draining: std::sync::atomic::AtomicBool::new(false),
             releases: Mutex::new(BTreeMap::new()),
+            leases: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Record or extend a lease before reserving capacity for it, so a racing
+    /// release of another lease cannot trim this reservation.
+    pub(crate) fn grant_lease(&self, version: &ObjectVersion, key: &LeaseKey, until: SystemTime) {
+        let now = uring_runtime::environment::wall_now();
+        let mut leases = self.leases.lock().unwrap();
+        let entry = leases.entry(version.clone()).or_default();
+        entry.retain(|_, expiry| *expiry > now);
+        let expiry = entry.entry(key.clone()).or_insert(until);
+        *expiry = (*expiry).max(until);
+    }
+
+    pub(crate) fn has_lease(&self, version: &ObjectVersion, key: &LeaseKey) -> bool {
+        let now = uring_runtime::environment::wall_now();
+        self.leases
+            .lock()
+            .unwrap()
+            .get(version)
+            .and_then(|entry| entry.get(key))
+            .is_some_and(|expiry| *expiry > now)
+    }
+
+    /// Drop one lease. Unused hold capacity is released on every local worker
+    /// once no live lease remains. Returns whether a release was queued.
+    pub(crate) fn drop_lease(
+        &self,
+        version: &ObjectVersion,
+        key: &LeaseKey,
+        workers: &[crate::model::WorkerId],
+    ) -> bool {
+        let now = uring_runtime::environment::wall_now();
+        let last = {
+            let mut leases = self.leases.lock().unwrap();
+            match leases.get_mut(version) {
+                Some(entry) => {
+                    entry.remove(key);
+                    entry.retain(|_, expiry| *expiry > now);
+                    if entry.is_empty() {
+                        leases.remove(version);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => true,
+            }
+        };
+        if last {
+            self.release(version, workers);
+        }
+        last
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lease_count(&self, version: &ObjectVersion) -> usize {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(version)
+            .map_or(0, BTreeMap::len)
+    }
+
+    /// Pages a remote primary owner holds are not stored on this node.
+    pub(crate) fn is_local_page(&self, page: &PageId) -> bool {
+        let job = self.jobs.lock().unwrap().get(&page.version).cloned();
+        job.and_then(|job| job.plan.lock().unwrap().clone())
+            .is_none_or(|plan| plan.is_local(page.number.0))
     }
 
     pub fn configure(&self, config: Config) -> Result<()> {
@@ -275,6 +378,7 @@ impl WarmRegistry {
                 waiters: BTreeMap::new(),
                 sequence: 0,
             }),
+            plan: Mutex::new(None),
         });
         jobs.insert(version.clone(), job.clone());
         Ok((job, true))
@@ -323,6 +427,11 @@ impl WarmRegistry {
             !remove
         });
         drop(jobs);
+        // Expired leases need no release: their holds expire on their own.
+        self.leases.lock().unwrap().retain(|_, entry| {
+            entry.retain(|_, expiry| *expiry > wall);
+            !entry.is_empty()
+        });
         for job in cancel {
             let _ = job.scope.cancel();
         }
@@ -590,39 +699,68 @@ pub(crate) async fn admit(
                 uring_runtime::environment::now() + config.fill_timeout,
             )?
         };
-        let mut fresh_workers = Vec::new();
-        let admitted = directory
-            .reserve_warm(
+        let existing = job.plan.lock().unwrap().clone();
+        let plan = match existing {
+            Some(plan) => Ok(plan),
+            None => plan(
+                &directory,
                 &metadata.version,
                 pages,
-                target,
+                membership,
                 &reservation_scope,
-                &mut fresh_workers,
             )
             .await
-            .and_then(|accepted| {
-                job.scope.check()?;
-                if directory
-                    .warm
-                    .draining
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    Err(Error::Cancelled)
-                } else {
-                    Ok(accepted)
-                }
-            });
+            .map(|plan| {
+                let plan = Arc::new(plan);
+                *job.plan.lock().unwrap() = Some(plan.clone());
+                plan
+            }),
+        };
+        let mut fresh_workers = Vec::new();
+        let admitted = match &plan {
+            Ok(plan) => {
+                reserve(
+                    &directory,
+                    &job,
+                    plan,
+                    &context,
+                    &metadata.version,
+                    pages,
+                    target,
+                    &reservation_scope,
+                    &mut fresh_workers,
+                )
+                .await
+            }
+            Err(error) => Err(*error),
+        }
+        .and_then(|accepted| {
+            job.scope.check()?;
+            if directory
+                .warm
+                .draining
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                Err(Error::Cancelled)
+            } else {
+                Ok(accepted)
+            }
+        });
         let target = match admitted {
             Ok(target) => target,
             Err(error) => {
                 if fresh {
-                    directory.warm.release(&metadata.version, &fresh_workers);
+                    if let Ok(plan) = &plan {
+                        release_all(&directory, &job, plan, &context, &metadata.version, config)
+                            .await;
+                    }
                     job.stop();
                 }
                 let _ = send.send(Err(error));
                 return Ok::<(), Error>(());
             }
         };
+        let plan = plan?;
         job.update(|progress| progress.until = Some(target));
         let runners = std::mem::take(&mut job.progress.lock().unwrap().runners);
         for runner in runners.into_values() {
@@ -642,8 +780,8 @@ pub(crate) async fn admit(
         let result = run(
             &directory,
             &job,
+            &plan,
             &metadata,
-            membership,
             &context,
             config.window,
             revision,
@@ -651,7 +789,7 @@ pub(crate) async fn admit(
         .await;
         if result.is_err() {
             let _lock = job.admission.lock().await;
-            directory.warm.release(&metadata.version, &fresh_workers);
+            release_all(&directory, &job, &plan, &context, &metadata.version, config).await;
             job.stop();
         } else {
             guard.complete = true;
@@ -677,8 +815,8 @@ pub(crate) async fn admit(
 async fn run(
     directory: &Arc<WorkerDirectory>,
     job: &Arc<Job>,
+    plan: &Arc<Plan>,
     metadata: &ObjectMetadata,
-    membership: Arc<crate::topology::Membership>,
     context: &ChargedOriginContext,
     window: usize,
     mut revision: u64,
@@ -717,12 +855,13 @@ async fn run(
                 version: metadata.version.clone(),
                 number: PageNumber(next),
             };
-            pending.push_back(directory.warm_page(
+            pending.push_back(warm_one(
+                directory,
+                job,
+                plan,
                 page,
                 metadata.immutable(),
-                membership.clone(),
                 context,
-                &job.scope,
             ));
             next += 1;
         }
@@ -768,6 +907,433 @@ async fn run(
                 failure.get_or_insert(error);
             }
             _ => {}
+        }
+    }
+}
+
+/// Attempts per remote warm page before the job fails. Retries are immediate
+/// and stay inside the job's fill timeout; only transient refusals retry.
+const REMOTE_FILL_ATTEMPTS: usize = 3;
+
+/// Bound for best-effort remote releases after a job fails or is refused.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Map each page to its primary owner under the admission membership. Pages
+/// whose primary is this node (or that have no candidates) are held locally.
+async fn plan(
+    directory: &Arc<WorkerDirectory>,
+    version: &ObjectVersion,
+    pages: u64,
+    membership: Arc<Membership>,
+    scope: &RequestScope,
+) -> Result<Plan> {
+    if pages > directory.max_warm_pages() {
+        return Err(Error::Overloaded);
+    }
+    let local = directory.local()?;
+    let candidates = local.fill.dependencies.candidates.clone();
+    drop(local);
+    let node = candidates.node.clone();
+    let words = usize::try_from(pages.div_ceil(64)).map_err(|_| Error::Overloaded)?;
+    let mut plan = Plan {
+        node,
+        membership: membership.clone(),
+        local: vec![0; words],
+        counts: BTreeMap::new(),
+        remote: Vec::new(),
+    };
+    let mut remote = std::collections::BTreeSet::new();
+    for number in 0..pages {
+        scope.check()?;
+        let ranked = candidates
+            .candidates_scoped(
+                membership.clone(),
+                &version.object,
+                PageNumber(number),
+                scope,
+            )
+            .await?;
+        match ranked.ordered.first() {
+            Some(primary) if primary != &plan.node => {
+                remote.insert(primary.clone());
+            }
+            _ => {
+                plan.local[(number / 64) as usize] |= 1 << (number % 64);
+                let owner = directory.page_owner(&PageId {
+                    version: version.clone(),
+                    number: PageNumber(number),
+                })?;
+                *plan.counts.entry(owner.0).or_insert(0) += 1;
+            }
+        }
+        if number % 1024 == 1023 {
+            uring_runtime::drivers::yield_now().await;
+        }
+    }
+    plan.remote = remote.into_iter().collect();
+    Ok(plan)
+}
+
+/// All-or-nothing hold admission: local primaries reserve through the worker
+/// mailboxes and every remote primary owner must accept a `Hold`. The result is
+/// the earliest expiry any owner promised, so every page is held until then.
+#[allow(clippy::too_many_arguments)] // Explicit admission inputs, no parameter shim.
+async fn reserve(
+    directory: &Arc<WorkerDirectory>,
+    job: &Job,
+    plan: &Plan,
+    context: &OriginContext,
+    version: &ObjectVersion,
+    pages: u64,
+    target: SystemTime,
+    scope: &RequestScope,
+    fresh: &mut Vec<crate::model::WorkerId>,
+) -> Result<SystemTime> {
+    let lease = plan.lease(job);
+    directory.warm.grant_lease(version, &lease, target);
+    let mut accepted = directory
+        .reserve_warm(version, &plan.counts, target, scope, fresh)
+        .await?;
+    if pages == 0 || plan.remote.is_empty() {
+        return Ok(accepted);
+    }
+    let action = WarmAction::Hold {
+        pages,
+        until: target,
+    };
+    let replies = futures::future::join_all(plan.remote.iter().map(|owner| {
+        remote(
+            directory,
+            plan,
+            owner,
+            context,
+            version,
+            lease.1,
+            action.clone(),
+            scope,
+        )
+    }))
+    .await;
+    let mut failure = None;
+    for reply in replies {
+        match reply {
+            Ok(Some(until)) => {
+                job.metrics.warm_event(WarmEvent::RemoteHoldAccepted);
+                accepted = accepted.min(until);
+            }
+            Ok(None) => {
+                job.metrics.warm_event(WarmEvent::RemoteHoldRefused);
+                failure.get_or_insert(Error::CorruptRecord);
+            }
+            Err(error) => {
+                job.metrics.warm_event(WarmEvent::RemoteHoldRefused);
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(accepted),
+    }
+}
+
+/// Release the job's local lease and, best effort, every remote owner's lease.
+/// Unreachable owners keep their holds until expiry.
+async fn release_all(
+    directory: &Arc<WorkerDirectory>,
+    job: &Job,
+    plan: &Plan,
+    context: &OriginContext,
+    version: &ObjectVersion,
+    config: Config,
+) {
+    let lease = plan.lease(job);
+    directory
+        .warm
+        .drop_lease(version, &lease, &directory.workers());
+    if plan.remote.is_empty() {
+        return;
+    }
+    let Ok(scope) = RequestScope::new(
+        job.scope.request,
+        uring_runtime::environment::now() + RELEASE_TIMEOUT.min(config.fill_timeout),
+    ) else {
+        return;
+    };
+    let replies = futures::future::join_all(plan.remote.iter().map(|owner| {
+        remote(
+            directory,
+            plan,
+            owner,
+            context,
+            version,
+            lease.1,
+            WarmAction::Release,
+            &scope,
+        )
+    }))
+    .await;
+    for reply in replies {
+        job.metrics.warm_event(if reply.is_ok() {
+            WarmEvent::RemoteReleaseSent
+        } else {
+            WarmEvent::RemoteReleaseFailed
+        });
+    }
+}
+
+/// Warm one page: local primaries publish to this node's disk; remote
+/// primaries fill under their hold and acknowledge without a payload.
+async fn warm_one(
+    directory: &Arc<WorkerDirectory>,
+    job: &Job,
+    plan: &Plan,
+    page: PageId,
+    metadata: crate::model::VersionMetadata,
+    context: &ChargedOriginContext,
+) -> Result<()> {
+    if plan.is_local(page.number.0) {
+        return directory
+            .warm_page(page, metadata, plan.membership.clone(), context, &job.scope)
+            .await;
+    }
+    let candidates = directory.local()?.fill.dependencies.candidates.clone();
+    let primary = candidates
+        .candidates_scoped(
+            plan.membership.clone(),
+            &page.version.object,
+            page.number,
+            &job.scope,
+        )
+        .await?
+        .ordered
+        .first()
+        .cloned()
+        .ok_or(Error::IncompatibleMembership)?;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        job.scope.check()?;
+        let result = remote(
+            directory,
+            plan,
+            &primary,
+            context,
+            &page.version,
+            job.scope.request.0,
+            WarmAction::Fill { page: page.number },
+            &job.scope,
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                job.metrics.warm_event(WarmEvent::RemoteFillCompleted);
+                return Ok(());
+            }
+            Err(Error::Overloaded | Error::Unavailable | Error::Io)
+                if attempt < REMOTE_FILL_ATTEMPTS && job.scope.check().is_ok() =>
+            {
+                job.metrics.warm_event(WarmEvent::RemoteFillRetried);
+            }
+            Err(error) => {
+                job.metrics.warm_event(WarmEvent::RemoteFillFailed);
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Send one warm action directly to `owner` and map its acknowledgement.
+#[allow(clippy::too_many_arguments)] // Explicit route and lease inputs.
+async fn remote(
+    directory: &Arc<WorkerDirectory>,
+    plan: &Plan,
+    owner: &NodeId,
+    context: &OriginContext,
+    version: &ObjectVersion,
+    lease: [u8; 16],
+    action: WarmAction,
+    scope: &RequestScope,
+) -> Result<Option<SystemTime>> {
+    let candidates = directory.local()?.fill.dependencies.candidates.clone();
+    let mut budget = super::default_budget(scope);
+    let expected = action.clone();
+    let response = candidates
+        .request(
+            &plan.membership,
+            owner,
+            context,
+            &PeerOperation::Warm {
+                version: version.clone(),
+                lease,
+                action,
+            },
+            FetchMode::Acquire,
+            scope,
+            &mut budget,
+            1,
+        )
+        .await?;
+    match (response.response(), expected) {
+        (PeerResponse::Held { until }, WarmAction::Hold { .. }) => Ok(Some(*until)),
+        (PeerResponse::Warmed, WarmAction::Fill { .. })
+        | (PeerResponse::Released, WarmAction::Release) => Ok(None),
+        (PeerResponse::Overloaded, _) => Err(Error::Overloaded),
+        (PeerResponse::Unavailable | PeerResponse::Miss, _) => Err(Error::Unavailable),
+        (PeerResponse::StaleMembership, _) => Err(Error::IncompatibleMembership),
+        (PeerResponse::VersionUnavailable, _) => Err(Error::VersionUnavailable),
+        (PeerResponse::NotFound, _) => Err(Error::NotFound),
+        (PeerResponse::OriginRejected, _) => Err(Error::OriginRejected),
+        (PeerResponse::OriginForbidden, _) => Err(Error::OriginForbidden),
+        _ => Err(Error::CorruptRecord),
+    }
+}
+
+/// The authenticated requester's lease on one object version.
+pub(crate) struct Lease {
+    pub requester: NodeId,
+    pub version: ObjectVersion,
+    pub lease: [u8; 16],
+}
+
+/// Owner side of the warm protocol. Holds are accepted only for pages this
+/// node is the primary owner of under the request's membership.
+#[allow(clippy::too_many_arguments)] // Explicit peer inputs, no parameter shim.
+pub(crate) async fn serve(
+    local: &super::Coordinator,
+    lease: Lease,
+    action: WarmAction,
+    membership: Arc<Membership>,
+    context: &OriginContext,
+    scope: &RequestScope,
+    budget: &mut AcquisitionBudget,
+) -> Result<PeerResponse> {
+    let directory = local.streams.directory().clone();
+    let metrics = local.fill.metrics.clone();
+    if directory
+        .warm
+        .draining
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(Error::Unavailable);
+    }
+    let candidates = local.fill.dependencies.candidates.clone();
+    let node = candidates.node.clone();
+    let Lease {
+        requester,
+        version,
+        lease,
+    } = lease;
+    let key = (requester, lease);
+    match action {
+        WarmAction::Hold { pages, until } => {
+            let now = uring_runtime::environment::wall_now();
+            let until = until.min(
+                now.checked_add(directory.warm.config().max_ttl)
+                    .ok_or(Error::InvalidRequest)?,
+            );
+            // Report whole milliseconds, never later than the wire request.
+            let until = std::time::UNIX_EPOCH
+                + Duration::from_millis(crate::peer::protocol::millis(until)?);
+            if until <= now || pages > directory.max_warm_pages() {
+                metrics.warm_event(WarmEvent::OwnerHoldRefused);
+                return Err(Error::Overloaded);
+            }
+            let mut counts = BTreeMap::new();
+            for number in 0..pages {
+                scope.check()?;
+                let ranked = candidates
+                    .candidates_scoped(
+                        membership.clone(),
+                        &version.object,
+                        PageNumber(number),
+                        scope,
+                    )
+                    .await?;
+                if ranked.ordered.first() == Some(&node) {
+                    let owner = directory.page_owner(&PageId {
+                        version: version.clone(),
+                        number: PageNumber(number),
+                    })?;
+                    *counts.entry(owner.0).or_insert(0usize) += 1;
+                }
+                if number % 1024 == 1023 {
+                    uring_runtime::drivers::yield_now().await;
+                }
+            }
+            if counts.is_empty() {
+                metrics.warm_event(WarmEvent::OwnerHoldRefused);
+                return Ok(PeerResponse::StaleMembership);
+            }
+            let renewal = directory.warm.has_lease(&version, &key);
+            directory.warm.grant_lease(&version, &key, until);
+            let mut fresh = Vec::new();
+            match directory
+                .reserve_warm(&version, &counts, until, scope, &mut fresh)
+                .await
+            {
+                Ok(_) => {
+                    metrics.warm_event(WarmEvent::OwnerHoldAccepted);
+                    Ok(PeerResponse::Held { until })
+                }
+                Err(error) => {
+                    metrics.warm_event(WarmEvent::OwnerHoldRefused);
+                    // A failed renewal keeps the lease it already had.
+                    if !renewal {
+                        directory
+                            .warm
+                            .drop_lease(&version, &key, &directory.workers());
+                    }
+                    Err(error)
+                }
+            }
+        }
+        WarmAction::Fill { page } => {
+            let page = PageId {
+                version,
+                number: page,
+            };
+            if !directory.warm.has_lease(&page.version, &key) {
+                metrics.warm_event(WarmEvent::OwnerFillFailed);
+                return Ok(PeerResponse::Unavailable);
+            }
+            let ranked = candidates
+                .candidates_scoped(membership.clone(), &page.version.object, page.number, scope)
+                .await?;
+            if ranked.ordered.first() != Some(&node) {
+                metrics.warm_event(WarmEvent::OwnerFillFailed);
+                return Ok(PeerResponse::StaleMembership);
+            }
+            let result = async {
+                let acquired = local
+                    .fill
+                    .acquire_warm(page, membership, context, scope, budget)
+                    .await?;
+                local
+                    .fill
+                    .dependencies
+                    .writer
+                    .persist_held(acquired.copy(), scope)
+                    .await
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    metrics.warm_event(WarmEvent::OwnerFillCompleted);
+                    Ok(PeerResponse::Warmed)
+                }
+                Err(error) => {
+                    metrics.warm_event(WarmEvent::OwnerFillFailed);
+                    Err(error)
+                }
+            }
+        }
+        WarmAction::Release => {
+            directory
+                .warm
+                .drop_lease(&version, &key, &directory.workers());
+            metrics.warm_event(WarmEvent::OwnerReleased);
+            Ok(PeerResponse::Released)
         }
     }
 }

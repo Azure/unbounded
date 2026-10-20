@@ -4,6 +4,7 @@ use super::hot_reads::coordinator;
 use crate::client::{ClientRequest, ReadKind};
 use crate::peer::forwarding::{Forwarding, VerifiedResponse};
 use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::WarmAction;
 use crate::read::ReadPayload;
 use crate::test_support::security::{network, node};
 
@@ -249,7 +250,10 @@ struct Peer {
     pages: Vec<PageResult>,
     blocked: Cell<bool>,
     wake: RefCell<Option<std::task::Waker>>,
-    calls: RefCell<Vec<u64>>,
+    /// (warm fill, page) in request order.
+    calls: RefCell<Vec<(bool, u64)>>,
+    holds: RefCell<Vec<std::time::SystemTime>>,
+    releases: Cell<usize>,
 }
 impl Peer {
     fn available(&self, _: &Arc<Membership>, _: &racer_control_wire::NodeId) -> bool {
@@ -270,39 +274,58 @@ impl Peer {
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
-            let PeerOperation::Page { page, .. } = &request.operation else {
-                panic!("GET bypassed warm gate with provider selection");
+            // Remote warm holds and releases answer immediately; fills and page
+            // reads share the gate so tests can observe the warm frontier.
+            let (number, reply) = match &request.operation {
+                PeerOperation::Page { page, .. } => (Some(page.number.0), None),
+                PeerOperation::Warm { action, .. } => match action {
+                    WarmAction::Hold { until, .. } => {
+                        self.holds.borrow_mut().push(*until);
+                        (None, Some(PeerResponse::Held { until: *until }))
+                    }
+                    WarmAction::Fill { page } => (Some(page.0), Some(PeerResponse::Warmed)),
+                    WarmAction::Release => {
+                        self.releases.set(self.releases.get() + 1);
+                        (None, Some(PeerResponse::Released))
+                    }
+                },
+                _ => panic!("GET bypassed warm gate with provider selection"),
             };
-            let number = page.number.0;
-            self.calls.borrow_mut().push(number);
-            let cancellation = scope.cancellation.subscribe()?;
-            std::future::poll_fn(|cx| {
-                cancellation.register(cx.waker());
-                scope.check()?;
-                *self.wake.borrow_mut() = Some(cx.waker().clone());
-                if self.blocked.get() {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok::<(), Error>(()))
-                }
-            })
-            .await?;
+            if let Some(number) = number {
+                self.calls.borrow_mut().push((reply.is_some(), number));
+                let cancellation = scope.cancellation.subscribe()?;
+                std::future::poll_fn(|cx| {
+                    cancellation.register(cx.waker());
+                    scope.check()?;
+                    *self.wake.borrow_mut() = Some(cx.waker().clone());
+                    if self.blocked.get() {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok::<(), Error>(()))
+                    }
+                })
+                .await?;
+            }
             let (signed, binding) = self.sender.sign_request(request)?;
             let verified = self.receiver.verify_request(signed)?;
-            let page = &self.pages[number as usize];
-            let ciphertext = page.ciphertext.clone().rehome(self.admission.reserve(
-                Some(&page.metadata.version.object.cache),
-                crate::admission::ResourceClass::Ciphertext,
-                page.ciphertext.bytes().len(),
-            )?)?;
-            self.sender.verify_response(
-                self.receiver.sign_response(
-                    verified.binding(),
+            let response = match (reply, number) {
+                (Some(reply), _) => reply,
+                (None, Some(number)) => {
+                    let page = &self.pages[number as usize];
+                    let ciphertext = page.ciphertext.clone().rehome(self.admission.reserve(
+                        Some(&page.metadata.version.object.cache),
+                        crate::admission::ResourceClass::Ciphertext,
+                        page.ciphertext.bytes().len(),
+                    )?)?;
                     PeerResponse::Page {
                         metadata: page.metadata.clone(),
                         ciphertext,
-                    },
-                )?,
+                    }
+                }
+                (None, None) => unreachable!(),
+            };
+            self.sender.verify_response(
+                self.receiver.sign_response(verified.binding(), response)?,
                 &binding,
             )
         })
@@ -317,6 +340,8 @@ impl Peer {
 
 #[test]
 fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
+    // node(1) is the primary owner of every page: it holds and fills them, and
+    // the requester keeps none of them, yet GETs still wait on the frontier.
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(2);
@@ -367,6 +392,8 @@ fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
         blocked: Cell::new(true),
         wake: RefCell::new(None),
         calls: RefCell::new(Vec::new()),
+        holds: RefCell::new(Vec::new()),
+        releases: Cell::new(0),
     });
     let requester = Requester::scripted(peer.clone(), Peer::available, Peer::request, Peer::direct);
     let (local, mut endpoint, _publication) = coordinator(&f, &signers[0], &membership, requester);
@@ -469,9 +496,10 @@ fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
         }
         pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
     }
+    assert_eq!(peer.holds.borrow().len(), 2, "one remote hold per HEAD");
     assert_eq!(
         &*peer.calls.borrow(),
-        &[0],
+        &[(true, 0)],
         "neither GET requests its unstarted tail page"
     );
     peer.unblock();
@@ -505,33 +533,44 @@ fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
     );
     assert_eq!(
         &*peer.calls.borrow(),
-        &[0, 1, 2],
-        "one outbound acquisition per page across both GET modes"
+        &[
+            (true, 0),
+            (true, 1),
+            (true, 2),
+            (true, 0),
+            (true, 1),
+            (true, 2),
+            (false, 2)
+        ],
+        "the owner warms every page, the extending HEAD reverifies every page \
+         at the owner, and both GET modes share one page read"
     );
+    assert_eq!(peer.releases.get(), 0, "a completed warm keeps its holds");
     assert_eq!(
         f.origin.calls.get(),
         0,
         "normal topology uses peer, not direct origin"
     );
+    assert!(until <= *peer.holds.borrow().first().unwrap());
     for number in 0..3 {
         let page = PageId {
             version: f.page.version.clone(),
             number: PageNumber(number),
         };
-        assert!(
-            f.fill
-                .dependencies
-                .writer
-                .index()
-                .lookup(&page)
-                .unwrap()
-                .is_some()
-        );
         assert_eq!(
             f.fill.dependencies.writer.index().held_page_expiry(&page),
-            Some(until)
+            None,
+            "the requester holds none of the remote primary's pages"
         );
     }
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .hold_expiry(&f.page.version),
+        None
+    );
     drop(streams);
     for _ in 0..32 {
         pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);

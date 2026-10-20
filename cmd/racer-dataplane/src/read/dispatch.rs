@@ -395,7 +395,7 @@ impl WorkerDirectory {
             .find(|m| m.worker == worker)
             .ok_or(Error::InvalidConfiguration)
     }
-    fn local(&self) -> Result<Rc<Coordinator>> {
+    pub(super) fn local(&self) -> Result<Rc<Coordinator>> {
         LOCALS
             .with(|locals| {
                 locals
@@ -431,30 +431,29 @@ impl WorkerDirectory {
         self.map.owner(page)
     }
 
+    /// Largest object page count this node admits for warm planning or holds.
+    pub(super) fn max_warm_pages(&self) -> u64 {
+        1_048_576u64.saturating_mul(self.mailboxes.len() as u64)
+    }
+
+    pub(super) fn workers(&self) -> Vec<WorkerId> {
+        self.mailboxes
+            .iter()
+            .map(|mailbox| mailbox.worker)
+            .collect()
+    }
+
+    /// Reserve `counts[worker]` held pages on every local worker. Workers absent
+    /// from `counts` still renew holds over pages they already store.
     pub(super) async fn reserve_warm(
         &self,
         version: &ObjectVersion,
-        pages: u64,
+        counts: &std::collections::BTreeMap<u16, usize>,
         until: std::time::SystemTime,
         scope: &RequestScope,
         fresh: &mut Vec<WorkerId>,
     ) -> Result<std::time::SystemTime> {
-        if pages > 1_048_576u64.saturating_mul(self.mailboxes.len() as u64) {
-            return Err(Error::Overloaded);
-        }
-        let mut counts = std::collections::BTreeMap::new();
-        // Bound admission CPU by the configured storage capacity at each owner.
-        for number in 0..pages {
-            scope.check()?;
-            let owner = self.page_owner(&PageId {
-                version: version.clone(),
-                number: crate::model::PageNumber(number),
-            })?;
-            *counts.entry(owner.0).or_insert(0usize) += 1;
-            if number % 1024 == 1023 {
-                uring_runtime::drivers::yield_now().await;
-            }
-        }
+        scope.check()?;
         let mut accepted = until;
         for mailbox in &self.mailboxes {
             let count = counts.get(&mailbox.worker.0).copied().unwrap_or(0);
@@ -519,6 +518,11 @@ impl WorkerDirectory {
         scope: &RequestScope,
     ) -> Result<Option<PageResult>> {
         if !self.warm.wait(page, scope).await? {
+            return Ok(None);
+        }
+        // Pages held by a remote primary owner are read through normal Fill,
+        // which routes to that owner's held copy under the usual topology.
+        if !self.warm.is_local_page(page) {
             return Ok(None);
         }
         let owner = self.page_owner(page)?;
@@ -747,6 +751,16 @@ impl WorkerDirectory {
                 crate::peer::protocol::Operation::Metadata { object, .. } => {
                     self.metadata_owner(object)?
                 }
+                // Fill runs on the page's local worker; hold and release fan out
+                // from the object's metadata worker to every local worker.
+                crate::peer::protocol::Operation::Warm {
+                    version,
+                    action: crate::peer::protocol::WarmAction::Fill { page },
+                    ..
+                } => self.page_owner(&PageId {
+                    version: version.clone(),
+                    number: *page,
+                })?,
                 crate::peer::protocol::Operation::Warm { version, .. } => {
                     self.metadata_owner(&version.object)?
                 }
