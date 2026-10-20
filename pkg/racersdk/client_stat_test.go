@@ -133,13 +133,19 @@ func TestStatBurstLeavesIngressForGet(t *testing.T) {
 	)
 
 	// Hold every Stat response until the whole burst is in flight, so each
-	// Stat uses its own connection.
-	arrive := func() {
+	// Stat uses its own connection. Release on stop too, so cleanup does not
+	// hang when a regression keeps part of the burst from arriving.
+	arrive := func() bool {
 		if heads.Add(1) == burst {
 			close(all)
 		}
 
-		<-all
+		select {
+		case <-all:
+			return true
+		case <-stop:
+			return false
+		}
 	}
 
 	serve := func(conn net.Conn) {
@@ -156,7 +162,9 @@ func TestStatBurstLeavesIngressForGet(t *testing.T) {
 				return
 			}
 
-			arrive()
+			if !arrive() {
+				return
+			}
 
 			if _, err := io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\n"); err != nil {
 				return
