@@ -28,8 +28,8 @@ pub use page::{
 };
 pub use pager::{FRAME_BYTES, PagerStats};
 pub use store::{
-    ChargeFn, CommitStats, DEFAULT_METADATA_CACHE_BYTES, EVICT_BATCH, GENERATION_SKIP,
-    IO_CONCURRENCY, MountReport, Reservation, ScrubReport, Volume, VolumeOptions,
+    ChargeFn, CommitStats, DEFAULT_DIRTY_BYTES, DEFAULT_METADATA_CACHE_BYTES, EVICT_BATCH,
+    GENERATION_SKIP, IO_CONCURRENCY, MountReport, Reservation, ScrubReport, Volume, VolumeOptions,
 };
 pub use superblock::{SUPERBLOCK_MAGIC, SUPERBLOCK_VERSION, Superblock};
 pub use table::{Limits, RUN_PAGES, SlotKind, SlotLease, SlotState, Usage};

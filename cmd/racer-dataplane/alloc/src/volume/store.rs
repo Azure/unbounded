@@ -61,6 +61,9 @@ pub const GENERATION_SKIP: u64 = 1 << 40;
 /// Default byte budget of the metadata page cache.
 pub const DEFAULT_METADATA_CACHE_BYTES: usize = 64 << 20;
 
+/// Smallest default dirty limit (about 50k uncommitted changes).
+pub const DEFAULT_DIRTY_BYTES: usize = 8 << 20;
+
 /// Records an eviction step handles before yielding to other tasks.
 pub const EVICT_BATCH: usize = 256;
 
@@ -91,8 +94,8 @@ pub struct VolumeOptions<C: Charge> {
     pub metadata_cache_bytes: usize,
 
     /// Bytes of uncommitted index changes above which allocation returns
-    /// `Busy` until a commit. 0 picks a quarter of the cache budget (at
-    /// least 1 MiB).
+    /// `Busy` until a commit. 0 picks a quarter of the cache budget, at
+    /// least [`DEFAULT_DIRTY_BYTES`].
     pub dirty_bytes: usize,
 }
 
@@ -776,7 +779,7 @@ impl<C: Charge> Volume<C> {
         options: &VolumeOptions<C>,
     ) -> Result<Self> {
         let dirty_limit = if options.dirty_bytes == 0 {
-            (options.metadata_cache_bytes / 4).max(1 << 20)
+            (options.metadata_cache_bytes / 4).max(DEFAULT_DIRTY_BYTES)
         } else {
             options.dirty_bytes
         };

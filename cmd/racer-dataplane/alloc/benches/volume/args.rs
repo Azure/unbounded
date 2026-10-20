@@ -11,12 +11,14 @@ pub enum Scenario {
     Read,
     Commit,
     Cpu,
+    Lookup,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 5] = [
+    pub const ALL: [Scenario; 6] = [
         Scenario::Cpu,
         Scenario::Commit,
+        Scenario::Lookup,
         Scenario::Write,
         Scenario::Held,
         Scenario::Read,
@@ -29,6 +31,7 @@ impl Scenario {
             Scenario::Read => "read",
             Scenario::Commit => "commit",
             Scenario::Cpu => "cpu",
+            Scenario::Lookup => "lookup",
         }
     }
 
@@ -62,6 +65,8 @@ pub struct Args {
     pub retain_secs: u64,
     pub pages_per_version: u32,
     pub cpu_entries: u64,
+    pub lookup_entries: u64,
+    pub metadata_cache: u64,
     pub spin: u32,
     pub ring_entries: usize,
     pub verify: bool,
@@ -85,7 +90,7 @@ LAYOUT:
   --slots-per-worker N    use only the first N slots of each worker's slice
 
 RUN:
-  --scenario LIST         comma list or repeat: write,held,read,commit,cpu,all (default all)
+  --scenario LIST         comma list or repeat: write,held,read,commit,cpu,lookup,all (default all)
   --duration SECS         per timed scenario (default 10, fractional ok)
   --qd N                  in-flight lanes per worker (default 16)
   --page-bytes LIST       page sizes for write/held/read (default 16M,1M,64K,4K)
@@ -96,7 +101,9 @@ RUN:
   --hold-percent N        storage slot limit as % of slots for held (default 100)
   --retain-secs N         held retain_until = now + N seconds (default 0)
   --pages-per-version N   keys share a version prefix for N pages (default 16)
-  --cpu-entries N         entries for the cpu scenario (default 1000000)
+  --cpu-entries N         entries for the cpu scenario (default 1000000, capped by capacity)
+  --lookup-entries N      4 KiB entries the lookup scenario fills per worker (default 1000000)
+  --metadata-cache SIZE   metadata page cache budget per volume (default 64M)
   --spin N                idle executor turns before blocking in wait (default 0)
   --ring-entries N        io_uring queue entries per worker (default 1024)
   --no-verify             skip record header checks on reads
@@ -177,6 +184,8 @@ impl Args {
             retain_secs: 0,
             pages_per_version: 16,
             cpu_entries: 1_000_000,
+            lookup_entries: 1_000_000,
+            metadata_cache: 64 << 20,
             spin: 0,
             ring_entries: 1024,
             verify: true,
@@ -233,6 +242,8 @@ impl Args {
                     args.pages_per_version = number(value()?)?.clamp(1, u32::MAX.into()) as u32
                 }
                 "--cpu-entries" => args.cpu_entries = number(value()?)?,
+                "--lookup-entries" => args.lookup_entries = number(value()?)?,
+                "--metadata-cache" => args.metadata_cache = number(value()?)?,
                 "--spin" => args.spin = number(value()?)? as u32,
                 "--ring-entries" => args.ring_entries = number(value()?)? as usize,
                 "--no-verify" => args.verify = false,

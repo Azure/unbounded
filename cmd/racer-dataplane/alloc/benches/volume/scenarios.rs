@@ -6,8 +6,7 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use page_alloc::volume::{
-    Key, Limits, NodeAddr, SLOT_BYTES, SLOT_UNITS, Slots, Tier, Tree, UNIT_BYTES, Value, Volume,
-    VolumeOptions,
+    Key, Limits, MountReport, SLOT_BYTES, SLOT_UNITS, Tier, UNIT_BYTES, Volume, VolumeOptions,
 };
 use page_alloc::{AlignedBuffer, Charge, Error, Slab};
 
@@ -266,7 +265,6 @@ struct PutConfig {
 struct PutSink<'b> {
     next_key: &'b dyn Fn() -> Key,
     keys: Option<&'b RefCell<Vec<Key>>>,
-    shadow: Option<&'b RefCell<Tree>>,
     /// Operations left; `u64::MAX` for unbounded.
     budget: &'b Cell<u64>,
     /// Lanes still running.
@@ -310,27 +308,6 @@ fn ns(d: Duration) -> u64 {
     d.as_nanos() as u64
 }
 
-/// Encode the shadow tree's dirty nodes like a commit would. Returns the
-/// prepare time and node count.
-fn shadow_commit(tree: &RefCell<Tree>, seq: u64) -> Result<(Duration, u64)> {
-    let mut tree = tree.borrow_mut();
-    let mut next = 0u64;
-    let mut alloc = || {
-        next += 1;
-        Ok(NodeAddr::new(
-            1 + (next / u64::from(SLOT_UNITS)) as u32,
-            (next % u64::from(SLOT_UNITS)) as u16,
-        ))
-    };
-    let start = Instant::now();
-    let plan = tree.prepare_commit(seq, &mut alloc)?;
-    let elapsed = start.elapsed();
-    let nodes = plan.writes.len() as u64;
-    tree.commit_succeeded(plan);
-    drop(tree.take_freed());
-    Ok((elapsed, nodes))
-}
-
 impl<'a> Worker<'a> {
     pub fn new(index: usize, args: &'a Args, plan: &'a WorkerPlan) -> Result<Self> {
         let reactor = BenchReactor::new(args.ring_entries, ());
@@ -353,6 +330,40 @@ impl<'a> Worker<'a> {
 
     fn slot_count(&self) -> u64 {
         self.plan.placements.len() as u64
+    }
+
+    /// Mount options with this run's charge and metadata cache budget.
+    fn options(
+        &self,
+        limits: Limits,
+        volume_id: [u8; 16],
+        format: bool,
+    ) -> VolumeOptions<BenchCharge> {
+        let charge = self.charge();
+        let mut options =
+            VolumeOptions::new(limits, volume_id, format, Rc::new(move |_| Ok(charge)));
+        options.metadata_cache_bytes = self.args.metadata_cache as usize;
+        options
+    }
+
+    /// Mount the volume already on `slab`. Returns it, its report, and the
+    /// mount time.
+    fn remount(
+        &self,
+        slab: &Rc<Slab<BenchCharge>>,
+    ) -> Result<(Rc<Volume<BenchCharge>>, MountReport, Duration)> {
+        let start = Instant::now();
+        let (volume, report) = block_on(
+            &self.reactor,
+            &self.timers,
+            Volume::mount(
+                &self.reactor,
+                slab.clone(),
+                self.options(Limits::UNLIMITED, [0; 16], false),
+                &SCOPE,
+            ),
+        )?;
+        Ok((volume, report, start.elapsed()))
     }
 
     /// Format a fresh volume: wipe both superblocks, then mount with format.
@@ -388,15 +399,7 @@ impl<'a> Worker<'a> {
             Volume::mount(
                 &self.reactor,
                 slab.clone(),
-                VolumeOptions {
-                    limits,
-                    volume_id,
-                    format: true,
-                    charge: {
-                        let charge = self.charge();
-                        Rc::new(move |_| Ok(charge))
-                    },
-                },
+                self.options(limits, volume_id, true),
                 &SCOPE,
             ),
         )?;
@@ -427,6 +430,7 @@ impl<'a> Worker<'a> {
             Scenario::Read => self.read(job.page_bytes, phase, &mut report)?,
             Scenario::Commit => self.commit(phase, &mut report)?,
             Scenario::Cpu => self.cpu(phase, &mut report)?,
+            Scenario::Lookup => self.lookup(phase, &mut report)?,
         }
         Ok(report)
     }
@@ -453,7 +457,24 @@ impl<'a> Worker<'a> {
             sink.budget.set(sink.budget.get().saturating_sub(1));
             let start = Instant::now();
             let (result, evicted) = if config.evict {
-                volume.allocate_evicting(config.tier, config.length, now_unix(), EVICTION_BUDGET)
+                match volume
+                    .allocate_evicting(
+                        &self.reactor,
+                        config.tier,
+                        config.length,
+                        now_unix(),
+                        EVICTION_BUDGET,
+                        &SCOPE,
+                    )
+                    .await
+                {
+                    Ok(done) => done,
+                    Err(error) => {
+                        hot.borrow_mut().error("allocate_evicting", error);
+                        self.timers.sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                }
             } else {
                 (volume.allocate(config.tier, config.length), Vec::new())
             };
@@ -525,11 +546,6 @@ impl<'a> Worker<'a> {
             if let Some(keys) = sink.keys {
                 keys.borrow_mut().push(key);
             }
-            if let Some(shadow) = sink.shadow
-                && let Some(value) = volume.get(&key)
-            {
-                shadow.borrow_mut().insert(key, value);
-            }
             if config.commit_each {
                 let commit_start = Instant::now();
                 let result = volume.commit(&self.reactor, &SCOPE).await;
@@ -567,7 +583,9 @@ impl<'a> Worker<'a> {
             if deadline.is_some_and(|d| now >= d) || active.get() == 0 {
                 break;
             }
-            if now.saturating_duration_since(last) < interval {
+            // Commit early when uncommitted changes reach the dirty limit:
+            // allocation returns Busy until they drain.
+            if now.saturating_duration_since(last) < interval && !volume.needs_commit() {
                 continue;
             }
             if !volume.is_dirty() {
@@ -668,7 +686,6 @@ impl<'a> Worker<'a> {
         let sink = PutSink {
             next_key: &next_key,
             keys: None,
-            shadow: None,
             budget: &budget,
             active: &active,
         };
@@ -720,7 +737,6 @@ impl<'a> Worker<'a> {
         let sink = PutSink {
             next_key: &next_key,
             keys: None,
-            shadow: None,
             budget: &budget,
             active: &active,
         };
@@ -772,7 +788,6 @@ impl<'a> Worker<'a> {
         let sink = PutSink {
             next_key: &next_key,
             keys: Some(&keys),
-            shadow: None,
             budget: &budget,
             active: &active,
         };
@@ -847,7 +862,13 @@ impl<'a> Worker<'a> {
         while Instant::now() < deadline {
             let key = keys[rng.below(keys.len())];
             let start = Instant::now();
-            let value = volume.get(&key);
+            let value = match volume.get(&self.reactor, &key, &SCOPE).await {
+                Ok(value) => value,
+                Err(error) => {
+                    hot.borrow_mut().error("get", error);
+                    continue;
+                }
+            };
             let looked = Instant::now();
             hot.borrow_mut().get.record_duration(looked - start);
             let Some(value) = value else {
@@ -885,7 +906,6 @@ impl<'a> Worker<'a> {
         for &target in &self.args.entries {
             let label = format!("e{target}");
             let mounted = self.fresh(Limits::UNLIMITED)?;
-            let shadow = RefCell::new(Tree::new(mounted.volume.volume_id()));
             let keys = RefCell::new(Vec::new());
             let hot = RefCell::new(Hot::default());
             let budget = Cell::new(target);
@@ -910,7 +930,6 @@ impl<'a> Worker<'a> {
                 &PutSink {
                     next_key: &next_key,
                     keys: Some(&keys),
-                    shadow: Some(&shadow),
                     budget: &budget,
                     active: &active,
                 },
@@ -925,12 +944,11 @@ impl<'a> Worker<'a> {
                 ));
             }
             hot.borrow().report(report, &format!("{label}_fill_"));
-            let mut seq = 1;
-            let (prepare, nodes) = shadow_commit(&shadow, seq)?;
             let elapsed = self.commit_now(&mounted.volume)?;
+            let commit = mounted.volume.commit_stats();
             report.sample(format!("{label}_full_commit_ns"), ns(elapsed));
-            report.sample(format!("{label}_full_prepare_ns"), ns(prepare));
-            report.add(format!("{label}_full_nodes"), nodes);
+            report.add(format!("{label}_full_pages"), commit.pages_written);
+            report.add(format!("{label}_full_writes"), commit.writes);
             let keys = keys.into_inner();
             let mut rng = Rng(mix(self.index as u64 ^ target));
             for &mutations in &self.args.mutations {
@@ -958,18 +976,16 @@ impl<'a> Worker<'a> {
                     &PutSink {
                         next_key: &next_key,
                         keys: None,
-                        shadow: Some(&shadow),
                         budget: &budget,
                         active: &active,
                     },
                     &mut stats,
                 )?;
-                seq += 1;
-                let (prepare, nodes) = shadow_commit(&shadow, seq)?;
                 let elapsed = self.commit_now(&mounted.volume)?;
+                let commit = mounted.volume.commit_stats();
                 report.sample(format!("{label}_m{mutations}_commit_ns"), ns(elapsed));
-                report.sample(format!("{label}_m{mutations}_prepare_ns"), ns(prepare));
-                report.add(format!("{label}_m{mutations}_nodes"), nodes);
+                report.add(format!("{label}_m{mutations}_pages"), commit.pages_written);
+                report.add(format!("{label}_m{mutations}_writes"), commit.writes);
             }
             // No-op commit and bare fsync: the floor under every commit.
             let elapsed = self.commit_now(&mounted.volume)?;
@@ -983,46 +999,24 @@ impl<'a> Worker<'a> {
                 )?;
                 report.sample("fsync_ns", ns(start.elapsed()));
             }
-            {
-                let shadow = shadow.borrow();
-                report.max(
-                    format!("{label}_tree_height_max"),
-                    u64::from(shadow.height()),
-                );
-                report.add(format!("{label}_tree_nodes"), shadow.node_count() as u64);
-            }
+            report.add(
+                format!("{label}_cache_bytes"),
+                mounted.volume.pager_stats().bytes,
+            );
             self.usage(&mounted.volume, report, &format!("{label}_end_"));
             // Remount: drop the volume, then mount the same slab.
             let Mounted { slab, volume, .. } = mounted;
             drop(volume);
-            let start = Instant::now();
-            let (volume, mount) = block_on(
-                &self.reactor,
-                &self.timers,
-                Volume::mount(
-                    &self.reactor,
-                    slab.clone(),
-                    VolumeOptions {
-                        limits: Limits::UNLIMITED,
-                        volume_id: [0; 16],
-                        format: false,
-                        charge: {
-                            let charge = self.charge();
-                            Rc::new(move |_| Ok(charge))
-                        },
-                    },
-                    &SCOPE,
-                ),
-            )?;
-            let elapsed = start.elapsed();
+            let (volume, mount, elapsed) = self.remount(&slab)?;
             report.sample(format!("{label}_mount_ns"), ns(elapsed));
             report.add(format!("{label}_mount_entries"), mount.entries);
+            report.add(format!("{label}_mount_pages_read"), mount.pages_read);
             report.add(
                 format!("{label}_mount_invalid_copies"),
                 mount.invalid_copies,
             );
             report.add(format!("{label}_mount_pending_nodes"), mount.pending_nodes);
-            if mount.entries != entries || mount.formatted || mount.dirty {
+            if mount.entries != entries || mount.formatted || mount.dirty || mount.fell_back {
                 report.note(format!(
                     "{label}: remount found {} entries (expected {entries}), formatted={}, dirty={}",
                     mount.entries, mount.formatted, mount.dirty
@@ -1035,161 +1029,118 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    /// CPU cost of index operations, apart from device I/O.
+    /// CPU cost of index operations, apart from device I/O. The index lives
+    /// on disk behind the page cache; with the default cache every page used
+    /// here stays cached, so the synchronous calls (`allocate`, `publish`,
+    /// `try_get`) and the cached async ones (`get`, `remove`, `evict_one`)
+    /// do no metadata I/O. `--cpu-entries` is capped by the volume capacity.
     fn cpu(&self, phase: &mut Phase<'_>, report: &mut Report) -> Result<()> {
         phase.start();
-        let n = self.args.cpu_entries.max(1);
         let mut rng = Rng(mix(self.index as u64 ^ 0xc0));
-        let keys: Vec<Key> = (0..n).map(|i| self.keys.key(1 << 40 | i)).collect();
-        let value = |i: u64, generation: u64| Value {
-            slot: 1 + (i / u64::from(SLOT_UNITS)) as u32,
-            unit: (i % u64::from(SLOT_UNITS)) as u16,
-            class: 0,
-            tier: Tier::Cache,
-            length: UNIT_BYTES as u32,
-            flags: 0,
-            generation,
-            retain_until: 0,
-        };
-        let mut timed = |name: &str, ops: u64, f: &mut dyn FnMut()| {
-            let start = Instant::now();
-            f();
-            report.add(format!("{name}_ns"), ns(start.elapsed()));
-            report.add(format!("{name}_ops"), ops);
-        };
-
-        // Part A: the in-memory B+tree alone.
-        let tree = RefCell::new(Tree::new([1; 16]));
-        timed("tree_insert", n, &mut || {
-            let mut tree = tree.borrow_mut();
-            for (i, key) in keys.iter().enumerate() {
-                tree.insert(*key, value(i as u64, i as u64 + 1));
-            }
-        });
-        let order: Vec<usize> = (0..n).map(|_| rng.below(n as usize)).collect();
-        let mut found = 0u64;
-        timed("tree_get", n, &mut || {
-            let tree = tree.borrow();
-            for &i in &order {
-                found += u64::from(tree.get(&keys[i]).is_some());
-            }
-        });
-        let (prepare, nodes) = shadow_commit(&tree, 1)?;
-        let mut samples: Vec<(String, u64)> = vec![
-            ("tree_full_prepare_ns".into(), ns(prepare)),
-            ("tree_full_nodes".into(), nodes),
-        ];
-        let mut seq = 1;
-        for &mutations in &self.args.mutations {
-            let picks: Vec<usize> = (0..mutations).map(|_| rng.below(n as usize)).collect();
-            let start = Instant::now();
-            {
-                let mut tree = tree.borrow_mut();
-                for &i in &picks {
-                    tree.insert(keys[i], value(i as u64, n + i as u64 + 1));
-                }
-            }
-            let update = start.elapsed();
-            seq += 1;
-            let (prepare, nodes) = shadow_commit(&tree, seq)?;
-            samples.push((format!("tree_m{mutations}_update_ns"), ns(update)));
-            samples.push((format!("tree_m{mutations}_prepare_ns"), ns(prepare)));
-            samples.push((format!("tree_m{mutations}_nodes"), nodes));
-        }
-        let height = tree.borrow().height();
-        let tree_nodes = tree.borrow().node_count();
-        timed("tree_remove", n / 2, &mut || {
-            let mut tree = tree.borrow_mut();
-            for key in keys.iter().take((n / 2) as usize) {
-                tree.remove(key);
-            }
-        });
-        drop(tree);
-
-        // Part B: the slot allocator alone.
-        let slot_count = (n / u64::from(SLOT_UNITS) + 8).max(64);
-        let mut slots = Slots::new(slot_count, Limits::UNLIMITED)?;
-        let mut allocated = 0u64;
-        timed("slots_alloc_commit", n, &mut || {
-            for key in &keys {
-                let Ok(allocation) = slots.allocate(Tier::Cache, UNIT_BYTES as u64) else {
-                    break;
-                };
-                if slots
-                    .commit_record(allocation.slot, allocation.unit, *key, 0)
-                    .is_err()
-                {
-                    break;
-                }
-                allocated += 1;
-            }
-        });
-        let mut evicted_keys = 0u64;
-        let mut evictions = 0u64;
-        let now = now_unix();
-        timed("slots_evict", 32, &mut || {
-            for _ in 0..32 {
-                let Some(eviction) = slots.evict_candidate_in(now, None) else {
-                    break;
-                };
-                evicted_keys += eviction.keys.len() as u64;
-                let _ = slots.finish_eviction(eviction.slot);
-                evictions += 1;
-            }
-        });
-        let start = Instant::now();
-        let _ = slots.usage();
-        samples.push(("slots_usage_ns".into(), ns(start.elapsed())));
-        drop(slots);
-
-        // Part C: the volume API, timing only the synchronous calls.
         let mounted = self.fresh(Limits::UNLIMITED)?;
         let volume = &*mounted.volume;
-        let small = (n.min(1 << 14)) as usize;
+        let capacity = (self.slot_count() - 2) * u64::from(SLOT_UNITS) * 3 / 4;
+        let n = self.args.cpu_entries.clamp(1, capacity) as usize;
+        let mut samples: Vec<(String, u64)> = Vec::new();
+        let small = n.min(1 << 14);
         let start = Instant::now();
         for _ in 0..small {
             drop(volume.allocate(Tier::Cache, UNIT_BYTES as u64));
         }
         report.add("vol_alloc_abort_ns", ns(start.elapsed()));
         report.add("vol_alloc_abort_ops", small as u64);
-        let written = RefCell::new(Vec::with_capacity(small));
-        let budget = Cell::new(small as u64);
+        // Write n records (I/O, untimed below), then publish them (timed).
+        let written = RefCell::new(Vec::with_capacity(n));
+        let budget = Cell::new(n as u64);
         let mut stats = ExecStats::default();
-        let tasks: Vec<Task<'_>> = (0..self.args.qd)
-            .map(|_| Box::pin(self.reserve_lane(&mounted, &written, &budget)) as Task<'_>)
-            .collect();
-        self.run_tasks(tasks, &mut stats)?;
-        let written = written.into_inner();
-        let count = written.len() as u64;
-        let mut published = Vec::with_capacity(written.len());
-        let start = Instant::now();
-        for (reservation, key, generation) in written {
-            if volume
-                .publish(key, reservation, UNIT_BYTES as u32, generation, 0)
-                .is_ok()
-            {
-                published.push(key);
+        let mut published = Vec::with_capacity(n);
+        let mut publish_ns = 0;
+        while budget.get() > 0 {
+            let before = budget.get();
+            let tasks: Vec<Task<'_>> = (0..self.args.qd)
+                .map(|_| Box::pin(self.reserve_lane(&mounted, &written, &budget)) as Task<'_>)
+                .collect();
+            self.run_tasks(tasks, &mut stats)?;
+            let batch = std::mem::take(&mut *written.borrow_mut());
+            let start = Instant::now();
+            for (reservation, key, generation) in batch {
+                if volume
+                    .publish(key, reservation, UNIT_BYTES as u32, generation, 0)
+                    .is_ok()
+                {
+                    published.push(key);
+                }
+            }
+            publish_ns += ns(start.elapsed());
+            if volume.needs_commit() {
+                self.commit_now(volume)?;
+            }
+            if budget.get() == before {
+                break;
             }
         }
-        report.add("vol_publish_ns", ns(start.elapsed()));
-        report.add("vol_publish_ops", count);
+        report.add("vol_publish_ns", publish_ns);
+        report.add("vol_publish_ops", published.len() as u64);
+        let elapsed = self.commit_now(volume)?;
+        samples.push((format!("vol_commit_{}_ns", published.len()), ns(elapsed)));
+        samples.push((
+            format!("vol_commit_{}_pages", published.len()),
+            volume.commit_stats().pages_written,
+        ));
         let picks: Vec<Key> = (0..published.len())
             .map(|_| published[rng.below(published.len())])
             .collect();
+        let mut found = 0u64;
+        let reads = volume.pager_stats().reads;
         let start = Instant::now();
         for key in &picks {
-            found += u64::from(volume.get(key).is_some());
+            found += u64::from(volume.try_get(key).is_some_and(|v| v.is_some()));
+        }
+        report.add("vol_try_get_ns", ns(start.elapsed()));
+        report.add("vol_try_get_ops", picks.len() as u64);
+        let start = Instant::now();
+        for key in &picks {
+            let value = block_on(
+                &self.reactor,
+                &self.timers,
+                volume.get(&self.reactor, key, &SCOPE),
+            )?;
+            found += u64::from(value.is_some());
         }
         report.add("vol_get_ns", ns(start.elapsed()));
         report.add("vol_get_ops", picks.len() as u64);
-        let elapsed = self.commit_now(volume)?;
-        samples.push((format!("vol_commit_{count}_ns"), ns(elapsed)));
+        report.add("vol_get_page_reads", volume.pager_stats().reads - reads);
+        // Mutations then commit: CPU of applying a batch to the trees.
+        for &mutations in &self.args.mutations {
+            let mutations = (mutations as usize).min(published.len());
+            let start = Instant::now();
+            for key in published.iter().take(mutations) {
+                let _ = block_on(
+                    &self.reactor,
+                    &self.timers,
+                    volume.set_retain(&self.reactor, key, 1, &SCOPE),
+                )?;
+            }
+            let update = start.elapsed();
+            let elapsed = self.commit_now(volume)?;
+            samples.push((format!("vol_m{mutations}_update_ns"), ns(update)));
+            samples.push((format!("vol_m{mutations}_commit_ns"), ns(elapsed)));
+            samples.push((
+                format!("vol_m{mutations}_pages"),
+                volume.commit_stats().pages_written,
+            ));
+        }
         // Eviction: whole slots of 4 KiB records, each removing its keys.
         let start = Instant::now();
         let mut vol_evicted = 0u64;
         let mut vol_evictions = 0u64;
         for _ in 0..8 {
-            let Some(removed) = volume.evict_one(now_unix()) else {
+            let Some(removed) = block_on(
+                &self.reactor,
+                &self.timers,
+                volume.evict_one(&self.reactor, now_unix(), &SCOPE),
+            )?
+            else {
                 break;
             };
             vol_evicted += removed.len() as u64;
@@ -1201,7 +1152,12 @@ impl<'a> Worker<'a> {
         let start = Instant::now();
         let mut removed = 0u64;
         for key in &published {
-            removed += u64::from(volume.remove(key).is_some());
+            let old = block_on(
+                &self.reactor,
+                &self.timers,
+                volume.remove(&self.reactor, key, &SCOPE),
+            )?;
+            removed += u64::from(old.is_some());
         }
         report.add("vol_remove_ns", ns(start.elapsed()));
         report.add("vol_remove_ops", published.len() as u64);
@@ -1212,18 +1168,156 @@ impl<'a> Worker<'a> {
         for (name, value) in samples {
             report.sample(name, value);
         }
-        report.add("tree_height_max", u64::from(height));
-        report.add("tree_nodes", tree_nodes as u64);
-        report.add("slots_allocated", allocated);
-        report.add("slots_evictions", evictions);
-        report.add("slots_evicted_keys", evicted_keys);
+        let pager = volume.pager_stats();
+        report.add("pager_hits", pager.hits);
+        report.add("pager_misses", pager.misses);
+        report.add("pager_bytes", pager.bytes);
         report.add("vol_removed", removed);
         report.add("found", found);
         stats.report(report);
         report.note(
-            "cpu: wall and CPU include the I/O used to set up part C; *_ns/*_ops pairs are synchronous calls only",
+            "cpu: wall and CPU include the record writes used for setup; *_ns/*_ops pairs time the index calls only",
         );
         Ok(())
+    }
+
+    /// Cold and hot random lookups through a bounded metadata cache: fill
+    /// `--lookup-entries` 4 KiB cache records (real record writes, untimed),
+    /// commit, remount with the `--metadata-cache` budget, then time random
+    /// `get`s over every key (cold) and over a small hot set (hot), each on
+    /// `--qd` concurrent lanes per worker for `--duration` each.
+    fn lookup(&self, phase: &mut Phase<'_>, report: &mut Report) -> Result<()> {
+        let mounted = self.fresh(Limits::UNLIMITED)?;
+        let capacity = (self.slot_count() - 2) * u64::from(SLOT_UNITS) * 3 / 4;
+        let target = self.args.lookup_entries.clamp(1, capacity);
+        if target < self.args.lookup_entries {
+            report.note(format!(
+                "lookup: capped at {target} entries by volume capacity"
+            ));
+        }
+        let keys = RefCell::new(Vec::new());
+        let fill = RefCell::new(Hot::default());
+        let budget = Cell::new(target);
+        let active = Cell::new(0);
+        let next_key = || self.keys.fresh();
+        let sink = PutSink {
+            next_key: &next_key,
+            keys: Some(&keys),
+            budget: &budget,
+            active: &active,
+        };
+        let config = PutConfig {
+            tier: Tier::Cache,
+            length: UNIT_BYTES as u64,
+            evict: false,
+            commit_each: false,
+            retain_secs: 0,
+            stop_on_busy: false,
+        };
+        let fill_start = Instant::now();
+        let mut fill_stats = ExecStats::default();
+        // The dirty limit applies backpressure; the lazy committer drains it.
+        self.puts(
+            &mounted,
+            &fill,
+            config,
+            self.args.qd,
+            None,
+            true,
+            &sink,
+            &mut fill_stats,
+        )?;
+        self.commit_now(&mounted.volume)?;
+        report.add("fill_ns", ns(fill_start.elapsed()));
+        report.add("fill_entries", mounted.volume.len());
+        let keys = keys.into_inner();
+        if keys.is_empty() {
+            return Err(Error::Busy.into());
+        }
+        let Mounted { slab, volume } = mounted;
+        drop(volume);
+        let (volume, mount, mount_time) = self.remount(&slab)?;
+        report.sample("mount_ns", ns(mount_time));
+        report.add("mount_pages_read", mount.pages_read);
+        report.add("cache_budget_bytes", self.args.metadata_cache);
+        let mounted = Mounted { slab, volume };
+        let mut stats = ExecStats::default();
+        let start = phase.start();
+        let half = self.args.duration / 2;
+        let hot_set: Vec<Key> = {
+            let mut rng = Rng(mix(self.index as u64 ^ 0x407));
+            (0..64).map(|_| keys[rng.below(keys.len())]).collect()
+        };
+        for (name, set, deadline) in [
+            ("cold_", &keys[..], start + half),
+            ("hot_", &hot_set[..], start + half + half),
+        ] {
+            let before = mounted.volume.pager_stats();
+            let hot = RefCell::new(Hot::default());
+            let tasks: Vec<Task<'_>> = (0..self.args.qd)
+                .map(|lane| {
+                    Box::pin(self.lookup_lane(
+                        &mounted,
+                        &hot,
+                        set,
+                        deadline,
+                        mix(lane as u64 ^ (self.index as u64) << 32 ^ name.len() as u64),
+                    )) as Task<'_>
+                })
+                .collect();
+            let lane_start = Instant::now();
+            self.run_tasks(tasks, &mut stats)?;
+            let elapsed = lane_start.elapsed();
+            let after = mounted.volume.pager_stats();
+            let h = hot.borrow();
+            h.report(report, name);
+            let hits = after.hits - before.hits;
+            let misses = after.misses - before.misses;
+            report.add(format!("{name}page_hits"), hits);
+            report.add(format!("{name}page_misses"), misses);
+            report.add(format!("{name}page_reads"), after.reads - before.reads);
+            report.add(format!("{name}ns"), ns(elapsed));
+            report.add(
+                format!("{name}hit_permille"),
+                (hits * 1000).checked_div(hits + misses).unwrap_or(0),
+            );
+            report.max(format!("{name}cache_bytes_max"), after.bytes);
+        }
+        phase.end(report);
+        stats.report(report);
+        Ok(())
+    }
+
+    async fn lookup_lane(
+        &self,
+        mounted: &Mounted,
+        hot: &RefCell<Hot>,
+        keys: &[Key],
+        deadline: Instant,
+        seed: u64,
+    ) {
+        let mut rng = Rng(seed);
+        let volume = &*mounted.volume;
+        let mut ops = 0u64;
+        while Instant::now() < deadline {
+            // Cached lookups complete without awaiting; yield now and then
+            // so one lane cannot starve the others.
+            ops += 1;
+            if ops.is_multiple_of(64) {
+                uring_runtime::drivers::yield_now().await;
+            }
+            let key = keys[rng.below(keys.len())];
+            let start = Instant::now();
+            match volume.get(&self.reactor, &key, &SCOPE).await {
+                Ok(Some(_)) => {
+                    let mut h = hot.borrow_mut();
+                    h.ops += 1;
+                    h.get.record_duration(start.elapsed());
+                }
+                Ok(None) => hot.borrow_mut().misses += 1,
+                Err(error) => hot.borrow_mut().error("get", error),
+            }
+        }
     }
 
     /// Allocate and write 4 KiB reservations without publishing them.
