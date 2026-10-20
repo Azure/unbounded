@@ -19,11 +19,15 @@ import (
 	"math/big"
 	"time"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
 )
@@ -137,6 +141,37 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 
 		updated.Data["ca.crt"] = want
 		plan.Add(component.Operation{Kind: component.OpMergePatch, Component: name, Base: component.ToUnstructured(trust), Object: component.ToUnstructured(updated)})
+
+		result.RequeueAfter = 5 * time.Second
+
+		return plan, result, nil
+	}
+
+	// Once trust is current, the injector webhook must trust the same roots so
+	// the API server keeps reaching the controller across CA rotation.
+	webhook := &unstructured.Unstructured{}
+	webhook.SetGroupVersionKind(admissionv1.SchemeGroupVersion.WithKind("MutatingWebhookConfiguration"))
+
+	err = env.LiveReader().Get(ctx, client.ObjectKey{Name: webhookName}, webhook)
+	if apierrors.IsNotFound(err) {
+		return plan, result, nil
+	}
+
+	if err != nil {
+		return nil, result, err
+	}
+
+	if err := validateRuntimeOwner(webhook, marker.UID); err != nil {
+		return nil, result, err
+	}
+
+	updated := webhook.DeepCopy()
+	if err := setWebhookCABundle(updated, []byte(want)); err != nil {
+		return nil, result, err
+	}
+
+	if !equality.Semantic.DeepEqual(webhook.Object["webhooks"], updated.Object["webhooks"]) {
+		plan.Add(component.Operation{Kind: component.OpMergePatch, Component: name, Base: webhook, Object: updated})
 
 		result.RequeueAfter = 5 * time.Second
 	}

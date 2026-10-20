@@ -380,8 +380,10 @@ func runOrigin(ctx context.Context, o options) error {
 	}
 	defer closeResource(root)
 
-	if err := prepareOriginDirectory(root, []string{"run", "racer", o.cache, "origin"}); err != nil {
-		return errors.New("could not prepare safe origin directory")
+	if err := checkOriginDirectory(root, []string{"run", "racer", o.cache, "origin"}); err != nil {
+		return fmt.Errorf("unsafe or missing origin directory /run/racer/%s/origin (racer-dataplane creates it "+
+			"owned by UID/GID %d with mode 0700; run the origin as UID %d and mount that directory): %w",
+			o.cache, originUID, originUID, err)
 	}
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
@@ -398,8 +400,21 @@ func runOrigin(ctx context.Context, o options) error {
 	return nil
 }
 
-// Walk from a trusted descriptor without following symlinks or changing existing permissions.
-func prepareOriginDirectory(parent *os.File, parts []string) error {
+// originUID is the UID/GID origins run as. The racer-dataplane creates
+// /run/racer/<cache>/origin owned by this user with mode 0700
+// (ORIGIN_UID in cmd/racer-dataplane/src/client/origin_directory.rs).
+const originUID = 65532
+
+// errOriginDirectoryMissing reports that the dataplane has not created the
+// origin directory yet, or that it is not mounted into the pod.
+var errOriginDirectoryMissing = errors.New("origin directory does not exist")
+
+// checkOriginDirectory walks from a trusted descriptor without following
+// symlinks, creating nothing and changing no permissions. Every ancestor must
+// be a directory owned by root or the effective user without group or other
+// write permission. The final component is the dataplane-managed origin
+// directory and must be owned by the effective user.
+func checkOriginDirectory(parent *os.File, parts []string) error {
 	info, err := parent.Stat()
 	if err != nil {
 		return err
@@ -408,12 +423,13 @@ func prepareOriginDirectory(parent *os.File, parts []string) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.IsDir() || info.Mode().Perm()&0o022 != 0 ||
 		(stat.Uid != 0 && stat.Uid != uint32(os.Geteuid())) {
-		return os.ErrPermission
+		return fmt.Errorf("%s: unsafe owner or permissions: %w", parent.Name(), os.ErrPermission)
 	}
 
 	if len(parts) == 0 {
 		if stat.Uid != uint32(os.Geteuid()) {
-			return os.ErrPermission
+			return fmt.Errorf("%s: owned by UID %d, not effective UID %d: %w",
+				parent.Name(), stat.Uid, os.Geteuid(), os.ErrPermission)
 		}
 
 		return nil
@@ -426,21 +442,17 @@ func prepareOriginDirectory(parent *os.File, parts []string) error {
 
 	fd, err := unix.Openat(int(parent.Fd()), part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
-		if err := unix.Mkdirat(int(parent.Fd()), part, 0o755); err != nil && !errors.Is(err, unix.EEXIST) {
-			return err
-		}
-
-		fd, err = unix.Openat(int(parent.Fd()), part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		return fmt.Errorf("%s: %w", part, errOriginDirectoryMissing)
 	}
 
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", part, err)
 	}
 
 	child := os.NewFile(uintptr(fd), part)
 	defer closeResource(child)
 
-	return prepareOriginDirectory(child, parts[1:])
+	return checkOriginDirectory(child, parts[1:])
 }
 
 func runSidecar(ctx context.Context, o options) error {

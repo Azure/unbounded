@@ -1246,8 +1246,70 @@ fn directory_error(error: std::io::Error) -> Error {
     }
 }
 
+/// Create or repair `<cache>/origin` for the unprivileged origin user. Origins
+/// do not create this directory; their pods wait until it exists.
+pub(super) fn prepare_origin_directory(cache: &File) -> Result<()> {
+    super::origin_directory::prepare(cache, origin_owner())
+        .map(|_| ())
+        .map_err(directory_error)
+}
+
+#[cfg(not(test))]
+fn origin_owner() -> super::origin_directory::Owner {
+    super::origin_directory::Owner::ORIGIN
+}
+
+/// Unit tests run unprivileged, so assign the directory to the test user.
+#[cfg(test)]
+fn origin_owner() -> super::origin_directory::Owner {
+    // SAFETY: geteuid/getegid have no preconditions.
+    super::origin_directory::Owner {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    }
+}
+
+/// Search bits that let SDK clients running as users other than the
+/// directory owner reach the client socket. The owner bits and read and
+/// write bits are not changed.
+const CLIENT_DIRECTORY_SEARCH: u32 = 0o011;
+
+/// Make the client directory safe and reachable. Group and other write bits
+/// are removed, and group and other search bits are added, so an existing
+/// 0700 or 0750 directory becomes 0711 or 0751. Ownership is not changed.
 pub(super) fn prepare_client_directory(directory: &File) -> Result<()> {
-    uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)
+    uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)?;
+    grant_client_search(directory)
+}
+
+/// Add [`CLIENT_DIRECTORY_SEARCH`] through the pinned descriptor, then check
+/// that the same directory, owner, and expected mode remain.
+fn grant_client_search(directory: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let before = directory.metadata().map_err(directory_error)?;
+    // restrict_directory already required an effective-user-owned directory.
+    let mode = before.mode() & 0o7777;
+    let wanted = mode | CLIENT_DIRECTORY_SEARCH;
+    if mode == wanted {
+        return Ok(());
+    }
+    // SAFETY: directory retains its descriptor throughout fchmod.
+    if unsafe { libc::fchmod(directory.as_raw_fd(), wanted) } != 0 {
+        return Err(directory_error(std::io::Error::last_os_error()));
+    }
+    let after = directory.metadata().map_err(directory_error)?;
+    let actual = after.mode() & 0o7777;
+    // Linux may clear setgid when the caller is not in the group.
+    if !after.is_dir()
+        || (after.uid(), after.gid()) != (before.uid(), before.gid())
+        || !uds_endpoint::same_inode(&before, &after)
+        || (actual != wanted && actual != wanted & !0o2000)
+    {
+        return Err(directory_error(std::io::Error::other(
+            "client directory changed while granting search",
+        )));
+    }
+    Ok(())
 }
 
 fn bind(
@@ -1278,6 +1340,7 @@ fn bind(
     }
     let root = open_directory(root)?;
     let cache = child_directory(&root, definition.name.as_bytes())?;
+    prepare_origin_directory(&cache)?;
     let directory = child_directory(&cache, b"client")?;
     prepare_client_directory(&directory)?;
     let owner = match previous.and_then(|listener| listener.owner.as_ref()) {

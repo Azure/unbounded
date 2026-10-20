@@ -295,6 +295,8 @@ jobs:
             file: images/racer-controller/Containerfile
           - name: racer-dataplane
             file: images/racer-dataplane/Containerfile
+          - name: racer-object
+            file: images/racer-object/Containerfile
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator
