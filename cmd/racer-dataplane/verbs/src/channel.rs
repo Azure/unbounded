@@ -305,6 +305,12 @@ impl<T> Op<T> {
     }
 }
 
+impl<T> std::fmt::Debug for Op<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Op(..)")
+    }
+}
+
 impl<T> Drop for Op<T> {
     /// Mark the op abandoned and drop any unread result.
     fn drop(&mut self) {

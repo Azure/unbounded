@@ -296,6 +296,32 @@ Grant concurrency: `grants` is capped at `grants_per_link`. A peer whose
 Send queue depth: `send_depth = recv_depth + 2 * grants_per_link + 4`
 (controls, writes, binds, invalidates). All send WRs are signaled.
 
+Links as built (`src/link.rs`), where they refine or differ from the above:
+
+- Each link allocates its own `grants_per_link` MWs and its own small
+  `LOCAL_WRITE` control region (`64 B * 2 * recv_depth`) instead of drawing
+  from device-wide pools. They are freed with the link, after the QP is
+  destroyed, which keeps the destroy ordering local to one link.
+- Work waits in one outbox. Data (`Grant`, `Release`, write) keeps its order
+  and needs two credits; `Credit` and `Close` use the reserved credit and may
+  pass blocked data. A standalone `Credit` is queued when `owed >=
+  recv_depth / 2`, none is queued yet, and either no other control is queued
+  or data is starved of credits (otherwise both sides could wait forever).
+  Binds and invalidates need no credit and pass blocked data.
+- The receiver also tracks credits it has not returned; a peer returning
+  more than it consumed is a credit violation and breaks the link.
+- `grant` fails `Overloaded` if the link already holds `grants_per_link`
+  grants or no page buffer is free. Its op resolves once the `Grant` is
+  posted. A grant still waiting to post its `Grant` at its deadline is
+  invalidated and fails `DeadlineExceeded`, without a break.
+- `write` with `Source::Bytes` fails `Overloaded` if no page buffer is free
+  (it does not wait). A write or release whose `Grant` has not arrived waits
+  for it; at most `2 * grants_per_link` may wait (`Overloaded` beyond). A
+  release replaces a waiting write for the same tag (the write fails
+  `Cancelled`).
+- A write longer than the grant fails `InvalidRange` and leaves the grant in
+  place so the caller can release it.
+
 ## Control messages (`src/control.rs`)
 
 Fixed 64 bytes, network byte order, sent with `IBV_WR_SEND` from the control

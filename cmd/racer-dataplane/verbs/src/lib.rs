@@ -63,6 +63,7 @@
 mod channel;
 mod control;
 mod ffi;
+mod link;
 mod pool;
 
 pub use ffi::Endpoint;
