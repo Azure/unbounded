@@ -318,7 +318,8 @@ func (h *harness) rollout(kind, name string, timeout time.Duration) {
 		kind+"/"+name, "--timeout="+timeout.String())
 }
 
-// dumpDiagnostics logs cluster state when the test failed.
+// dumpDiagnostics logs cluster state when the test failed and writes it to
+// e2e/.artifacts so CI can upload it.
 func (h *harness) dumpDiagnostics(namespaces ...string) {
 	if !h.t.Failed() {
 		return
@@ -341,8 +342,27 @@ func (h *harness) dumpDiagnostics(namespaces ...string) {
 			[]string{"-n", ns, "logs", "-l", "app=fetch", "--all-containers", "--tail=200", "--prefix"})
 	}
 
+	var report strings.Builder
+
 	for _, args := range cmds {
 		out, err := h.exec(time.Minute, nil, "kubectl", args...)
-		h.t.Logf("$ kubectl %s (err=%v)\n%s", strings.Join(args, " "), err, out)
+		entry := fmt.Sprintf("$ kubectl %s (err=%v)\n%s", strings.Join(args, " "), err, out)
+		h.t.Log(entry)
+		report.WriteString(entry + "\n")
 	}
+
+	dir := filepath.Join(h.repoRoot, "e2e", ".artifacts", "racer")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		h.t.Logf("diagnostics: mkdir %s: %v", dir, err)
+		return
+	}
+
+	dst := filepath.Join(dir, strings.ReplaceAll(h.t.Name(), "/", "_")+".log")
+	//#nosec G306 -- test artifact
+	if err := os.WriteFile(dst, []byte(report.String()), 0o644); err != nil {
+		h.t.Logf("diagnostics: could not write %s: %v", dst, err)
+		return
+	}
+
+	h.t.Logf("diagnostics: wrote %s", dst)
 }
