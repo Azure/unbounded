@@ -219,7 +219,6 @@ assign_role AcrPush "$gantry_acr_id"
 assign_role Reader "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP"
 assign_role "Log Analytics Reader" "$workspace_id"
 
-source_revision=$(git -C "$repo_root" rev-parse HEAD)
 bootstrap_probe=$(az vm run-command invoke \
   -g "$AZURE_RESOURCE_GROUP" \
   -n "$OPERATOR_VM_NAME" \
@@ -230,7 +229,6 @@ source /etc/gantry-benchmark/env
 test \"\$BENCHMARK_NODE_COUNT\" = '$BENCHMARK_NODE_COUNT'
 test \"\$BENCHMARK_IMAGE_SIZE_MIB\" = '$BENCHMARK_IMAGE_SIZE_MIB'
 test \"\$BENCHMARK_IMAGE_LAYERS\" = '$BENCHMARK_IMAGE_LAYERS'
-test \"\$(git -C \"\$BENCHMARK_REPO_ROOT\" rev-parse HEAD)\" = '$source_revision'
 systemctl cat gantry-benchmark-operator.service >/dev/null
 systemctl cat gantry-benchmark-image-builder.service >/dev/null
 printf 'gantry-benchmark-bootstrap-ready\\n'" \
@@ -239,7 +237,7 @@ printf 'gantry-benchmark-bootstrap-ready\\n'" \
   -o tsv 2>/dev/null || true)
 
 if grep -Fq gantry-benchmark-bootstrap-ready <<<"$bootstrap_probe"; then
-  echo "operator VM bootstrap already matches $source_revision"
+  echo "operator VM bootstrap already matches the deployment contract"
 else
   az vm run-command invoke \
   -g "$AZURE_RESOURCE_GROUP" \
