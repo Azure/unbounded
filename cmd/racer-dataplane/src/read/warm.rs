@@ -69,6 +69,9 @@ struct Progress {
 
 pub(crate) struct Job {
     previous_until: Option<SystemTime>,
+    /// Lease id, inherited from the completed job this one reverifies so
+    /// repeated warms renew one lease per requester and version.
+    lease: [u8; 16],
     metrics: Metrics,
     version: ObjectVersion,
     scope: RequestScope,
@@ -96,7 +99,7 @@ impl Plan {
     }
 
     fn lease(&self, job: &Job) -> LeaseKey {
-        (self.node.clone(), job.scope.request.0)
+        (self.node.clone(), job.lease)
     }
 }
 
@@ -462,6 +465,7 @@ impl WarmRegistry {
         let config = self.config();
         let mut jobs = self.jobs.lock().unwrap();
         let mut previous_until = None;
+        let mut lease = None;
         jobs.retain(|_, job| {
             let progress = job.progress.lock().unwrap();
             let expired = progress
@@ -483,6 +487,7 @@ impl WarmRegistry {
                 return Err(Error::Overloaded);
             }
             previous_until = progress.until;
+            lease = Some(job.lease);
         }
         if selecting {
             return Err(Error::Overloaded);
@@ -501,6 +506,7 @@ impl WarmRegistry {
         uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
         let job = Arc::new(Job {
             previous_until,
+            lease: lease.unwrap_or(request),
             metrics: self.metrics(),
             version: version.clone(),
             scope: RequestScope::new(
@@ -1649,6 +1655,83 @@ mod tests {
         assert_eq!(metrics.count(Event::WarmCompleted), 2);
         assert_eq!(metrics.count(Event::WarmFailed), 1);
         assert_eq!(metrics.count(Event::WarmRefused), 2);
+    }
+
+    #[test]
+    fn completed_jobs_renew_one_lease_across_many_heads() {
+        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(
+                    super::super::dispatch::WorkerMap::new(vec![crate::model::WorkerId(0)])
+                        .unwrap(),
+                ),
+                vec![crate::model::WorkerId(0)],
+                8,
+            )
+            .unwrap(),
+        );
+        let mut endpoint = directory
+            .install(crate::model::WorkerId(0), local.clone())
+            .unwrap();
+        let origin = crate::security::OriginContext {
+            object: version("renew").object,
+            metadata: None,
+            authorization: None,
+        };
+        let membership = Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let metadata = ObjectMetadata {
+            version: version("renew"),
+            length: 0,
+            content_type: None,
+            expires_at: crate::model::ExpiresAt::from_system_time(SystemTime::UNIX_EPOCH).unwrap(),
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut lease = None;
+        for _ in 0..MAX_LEASES_PER_VERSION + 6 {
+            let caller = scope();
+            let mut admission = Box::pin(admit(
+                directory.clone(),
+                metadata.clone(),
+                membership.clone(),
+                local.credentials.local_context(&origin, &caller).unwrap(),
+                Duration::from_secs(60),
+                &caller,
+            ));
+            let mut result = None;
+            for _ in 0..32 {
+                if let Poll::Ready(value) = admission.as_mut().poll(&mut cx) {
+                    result = Some(value);
+                    break;
+                }
+                queue.poll(&mut cx, 64);
+                endpoint.poll(&mut cx, 64).unwrap();
+            }
+            let until = result.unwrap().unwrap();
+            assert!(until > SystemTime::UNIX_EPOCH);
+            drop(admission);
+            for _ in 0..32 {
+                queue.poll(&mut cx, 64);
+                endpoint.poll(&mut cx, 64).unwrap();
+                if queue.pending() == 0 {
+                    break;
+                }
+            }
+            assert_eq!(queue.pending(), 0);
+            assert_eq!(directory.warm.lease_count(&metadata.version), 1);
+            assert_eq!(directory.warm.lease_total(), 1);
+            let current = directory.warm.jobs.lock().unwrap()[&metadata.version].lease;
+            assert_eq!(
+                *lease.get_or_insert(current),
+                current,
+                "lease id is preserved"
+            );
+        }
     }
 
     #[test]
