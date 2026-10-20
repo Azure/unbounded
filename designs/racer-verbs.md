@@ -429,6 +429,24 @@ The simulator implements every ABI 2 function with the same contracts:
   between QPs (reorder must still be refused by the fence checks), delay
   delivery, duplicate an immediate, corrupt `byte_len`.
 
+Implementation notes (`src/simulation.rs`, module docs):
+
+- Send work runs in post order when the posting QP polls; receive
+  completions queue on the peer and are reported by its next poll.
+- A `WRITE_WITH_IMM` that passes the window check places its data before it
+  looks for a receive, so an RNR can leave data behind, as a multi-packet
+  write can on hardware. The receiver QP is in ERR either way.
+- Until a QP is destroyed, plain RDMA writes through a live grant still land,
+  even if the target QP is in ERR. This keeps tests conservative about late
+  DMA after a failed fence.
+- Window keys are `index << 8 | generation`; a bind must use the window's
+  index and a generation different from its last bind.
+- Receives may be posted before connect, matching the verbs INIT state, so
+  the initial `recv_depth` receives exist before the peer can send.
+- The fault knobs are `Fault::Reject`, `Delay(n)`, `Completion(status)`,
+  `Drop`, `Reorder`, `DuplicateImmediate`, and `ByteLength(n)`, and
+  `Simulation::require_mr_remote_write` selects the provider bind rule.
+
 The simulator remains one fabric per test thread and deterministic.
 
 ## Shutdown

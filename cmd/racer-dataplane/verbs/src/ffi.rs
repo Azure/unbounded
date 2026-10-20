@@ -149,6 +149,12 @@ pub(crate) mod opcode {
     )
 )]
 pub(crate) mod status {
+    /// `IBV_WC_WR_FLUSH_ERR`.
+    pub(crate) const WR_FLUSH_ERR: u32 = 5;
+
+    /// `IBV_WC_REM_ACCESS_ERR`.
+    pub(crate) const REM_ACCESS_ERR: u32 = 10;
+
     /// `IBV_WC_RNR_RETRY_EXC_ERR`.
     pub(crate) const RNR_RETRY_EXC_ERR: u32 = 13;
 }
@@ -1347,7 +1353,14 @@ impl NativeQueuePair {
         {
             return Err(Error::InvalidRequest);
         }
-        if !self.ready() {
+        // Receives may be posted before connect (verbs INIT state), so the
+        // peer never finds the queue empty once it can send.
+        let open = if recv {
+            !self.stopped.get() && !self.terminating.get()
+        } else {
+            self.ready()
+        };
+        if !open {
             return Err(Error::Unavailable);
         }
         let (used, capacity) = if recv {
@@ -1398,7 +1411,8 @@ impl NativeQueuePair {
         )
     }
 
-    /// Post a receive into `length` bytes of `region` at `offset`. Completes
+    /// Post a receive into `length` bytes of `region` at `offset`. Allowed
+    /// before [`Self::connect`]. Completes
     /// with [`opcode::RECV`] (`byte_len <= length`, no immediate) or
     /// [`opcode::RECV_RDMA_WITH_IMM`] (with an immediate).
     pub(crate) fn post_recv(

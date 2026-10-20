@@ -753,6 +753,10 @@ mod faults {
                         NativeFault::Reject => "reject",
                         NativeFault::Delay(_) => "delay",
                         NativeFault::Completion(_) => "completion",
+                        NativeFault::Drop => "drop",
+                        NativeFault::Reorder => "reorder",
+                        NativeFault::DuplicateImmediate => "duplicate-immediate",
+                        NativeFault::ByteLength(_) => "byte-length",
                     }
                 ))
                 .or_default() += 1;
