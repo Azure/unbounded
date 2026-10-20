@@ -222,6 +222,15 @@ names the same link id, tag, transfer id, and length, and AEAD verifies them.
   sooner). Expiry of an `Exposed` grant breaks the link.
 - Pending write waiting for its `Grant`: same deadline; expiry fails the
   write op, and A falls back after `release`.
+- Ambiguous write: if cancellation or the request deadline wins after
+  `Links::send` submitted the write, the owner may already have consumed the
+  tag, and a `Release` for it would wait forever for a `Grant` that never
+  comes. `Links::send` breaks that link epoch with `break_link` instead; the
+  later `release` from `send_native` then lands on a broken epoch.
+- Unadmitted release: `Client::release` fails at once when the worker queue
+  is full or the owner is gone, and then sends nothing. `Links::release`
+  checks that result and falls back to `break_link`, which never drops (a
+  full queue spills to the node's shared break list).
 - Setup: 5 s.
 - Any error CQE, unexpected opcode or wr id, decode failure, unknown or
   duplicate tag, credit or grant-cap violation, RNR, or `Close` breaks the

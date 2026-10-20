@@ -679,4 +679,65 @@ mod staged {
             Ok(Arrival::Released)
         ));
     }
+
+    #[test]
+    fn cancelled_after_the_write_lands_breaks_the_epoch() {
+        let mut w = world();
+        link_up(&mut w);
+        let (pending, grant) = granted(&mut w, 3);
+        let page = page(&w.b.admission.clone(), 35, 0x5a);
+        let links = w.b.links.clone();
+        let scope = scope();
+        let to = node_id(1);
+        let mut send = std::pin::pin!(links.send(&to, &grant, &page, &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+        // The owner completes the write before the worker sees the result.
+        assert_eq!(arrived(&mut w, &pending), vec![0x5a; 35]);
+        scope.cancel().unwrap();
+        assert!(matches!(
+            send.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        // The caller still releases, as `send_native` does; the tag is gone.
+        links.release(&to, &grant);
+        pump!(w);
+        assert!(
+            links.ready(&to, RAIL).is_none(),
+            "ambiguous write broke the epoch"
+        );
+    }
+
+    #[test]
+    fn unadmitted_release_breaks_the_epoch() {
+        let mut w = world();
+        link_up(&mut w);
+        let (pending, grant) = granted(&mut w, 3);
+        let to = node_id(1);
+        let (epoch, _) = w.b.links.ready(&to, RAIL).unwrap();
+        let key = link_key(&to, RAIL);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut held = Vec::new();
+        loop {
+            let op =
+                w.b.links
+                    .client
+                    .release(key, epoch, 1_000 + held.len() as u32);
+            match op.poll(&mut cx) {
+                Poll::Pending => held.push(op),
+                Poll::Ready(error) => {
+                    assert_eq!(error, Err(rdma_verbs::Error::Overloaded));
+                    break;
+                }
+            }
+        }
+        w.b.links.release(&to, &grant);
+        drop(held);
+        pump!(w);
+        assert!(
+            w.b.links.ready(&to, RAIL).is_none(),
+            "release fell back to a break"
+        );
+        drop(pending);
+    }
 }

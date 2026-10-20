@@ -601,17 +601,23 @@ impl Links {
             Some(buffer) => Source::Staged(buffer),
             None => Source::Bytes(Arc::new(PageSource(page.clone()))),
         };
-        self.wait(
-            self.client.write(
-                link_key(peer, grant.rail),
-                epoch,
-                grant.tag,
-                source,
-                scope.deadline.0,
-            ),
-            scope,
-        )
-        .await?;
+        let key = link_key(peer, grant.rail);
+        let written = self
+            .wait(
+                self.client
+                    .write(key, epoch, grant.tag, source, scope.deadline.0),
+                scope,
+            )
+            .await;
+        if let Err(error) = written {
+            // Cancellation or the deadline can win after the owner already
+            // consumed the tag. A `Release` for a consumed tag would wait for
+            // a grant that never comes, so break this epoch instead.
+            if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
+                self.client.break_link(key, epoch);
+            }
+            return Err(error);
+        }
         Ok(NativeSent {
             value: completion_value(grant.link, grant.tag, length as u32, grant.transfer),
         })
@@ -658,10 +664,15 @@ impl Links {
         if let Some((epoch, link)) = self.ready(peer, grant.rail)
             && link == grant.link
         {
-            drop(
-                self.client
-                    .release(link_key(peer, grant.rail), epoch, grant.tag),
-            );
+            let key = link_key(peer, grant.rail);
+            let release = self.client.release(key, epoch, grant.tag);
+            // An op that failed before the owner saw it (full queue, owner
+            // gone) never sends `Release`; the peer would hold the window until
+            // its deadline. Break the epoch on the guaranteed path instead.
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            if let std::task::Poll::Ready(Err(_)) = release.poll(&mut cx) {
+                self.client.break_link(key, epoch);
+            }
         }
     }
 }
