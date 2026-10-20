@@ -340,6 +340,15 @@ if [[ "$action" == destroy ]]; then
     exit 0
   fi
 
+  if az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --output none 2>/dev/null; then
+    aks_state=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --query provisioningState -o tsv)
+    if [[ "$aks_state" == Failed ]]; then
+      log "resubmitting deletion of failed AKS cluster $AZURE_AKS_CLUSTER_NAME"
+      az aks delete -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
+        --yes --no-wait --only-show-errors
+    fi
+  fi
+
   log "submitting deletion of resource group $AZURE_RESOURCE_GROUP"
   az group delete -n "$AZURE_RESOURCE_GROUP" --yes --no-wait --only-show-errors
   log "resource group deletion submitted"
