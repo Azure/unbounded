@@ -3024,6 +3024,38 @@ fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
     assert!(f.store.writer.is_idle());
 }
 
+#[test]
+fn registered_fill_accepted_before_stop_persists_during_drain() {
+    use crate::rdma::links::tests::{link_up, receive_registered, world};
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let cache = page.metadata.version.object.cache.clone();
+    let mut w = world();
+    link_up(&mut w);
+    let received = receive_registered(&mut w, &page.ciphertext);
+    let length = received.len();
+    let reservation = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+        .unwrap();
+    page.ciphertext = crate::memory::BufferPool::new(f.admission.clone())
+        .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
+        .unwrap();
+    assert!(page.ciphertext.is_registered());
+    let dirty = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::DirtyCiphertext, length)
+        .unwrap();
+    f.admission.stop();
+    f.store.writer.enqueue(page, dirty).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    assert!(f.store.writer.is_idle());
+}
+
 mod records {
     use super::*;
     use crate::admission::ResourceClass;

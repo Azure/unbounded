@@ -646,8 +646,13 @@ impl StoreWriter {
         }
         drop(pending);
         // The queue outlives the request: never pin a registered RDMA buffer.
-        page.ciphertext =
-            crate::memory::BufferPool::new(self.admission.clone()).retainable(page.ciphertext)?;
+        // The copy-out uses completion admission like disk staging, because an
+        // accepted fill must still persist after request admission stops.
+        if page.ciphertext.is_registered() {
+            let cache = page.metadata.version.object.cache.clone();
+            let reservation = self.reserve_staging(page.ciphertext.bytes().len(), &cache)?;
+            page.ciphertext = page.ciphertext.rehome(reservation)?;
+        }
         let full = self.pending.borrow().len() >= self.capacity.get();
         if full {
             let retention = self.retention();

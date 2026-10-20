@@ -575,9 +575,13 @@ Recorded while building stage 4a (receive-side zero-copy, done):
    no longer copies (`src/rdma/links.rs`).
 9. Copy-out goes through `BufferPool::retainable` (`src/memory.rs`), which
    takes a fresh `Ciphertext` charge and copies through `rehome`. It runs in
-   `MemoryCache::publish` (skipped for a duplicate page),
-   `MemoryCache::publish_ciphertext`, and `Writer::enqueue_reclaiming`
-   (`src/store.rs`, after the dedup checks). `rehome` always copies a
+   `MemoryCache::publish` (skipped for a duplicate page) and
+   `MemoryCache::publish_ciphertext`. Memory caching is optional, so it uses
+   ordinary admission and stops when admission stops.
+   `Writer::enqueue_reclaiming` (`src/store.rs`, after the dedup checks)
+   instead reserves the copy with `Writer::reserve_staging`, which uses
+   completion admission like disk staging. A fill that already holds an
+   accepted dirty charge still persists its page during drain. `rehome` always copies a
    registered page, even when it holds the only reference. The charge
    reserved for the copy is separate from the request's, so the page is
    counted twice until the request drops it. If the copy cannot be admitted,
