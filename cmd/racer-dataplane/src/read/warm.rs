@@ -279,6 +279,25 @@ impl WarmRegistry {
         last.is_some()
     }
 
+    /// Confirm a lease survived the reservation made for it. A concurrent
+    /// release can drop the last lease while the reservation is pending, and
+    /// workers run that cleanup before queued reservations, so the cleanup can
+    /// finish first and leave the new reservation orphaned. When the lease is
+    /// gone, queue a fresh fenced release that runs after the reservation and
+    /// return false so the caller refuses the hold.
+    pub(crate) fn confirm_lease(
+        &self,
+        version: &ObjectVersion,
+        key: &LeaseKey,
+        workers: &[crate::model::WorkerId],
+    ) -> bool {
+        if self.has_lease(version, key) {
+            return true;
+        }
+        self.drop_lease(version, key, workers);
+        false
+    }
+
     #[cfg(test)]
     pub(crate) fn lease_count(&self, version: &ObjectVersion) -> usize {
         self.leases
@@ -1178,6 +1197,12 @@ async fn reserve(
     if accepted > target {
         directory.warm.grant_lease(version, &lease, accepted)?;
     }
+    if !directory
+        .warm
+        .confirm_lease(version, &lease, &directory.workers())
+    {
+        return Err(Error::Unavailable);
+    }
     if pages == 0 || plan.remote.is_empty() {
         return Ok(accepted);
     }
@@ -1492,6 +1517,15 @@ pub(crate) async fn serve(
                 .reserve_warm(&version, &held, until, scope, &mut fresh)
                 .await
             {
+                // A Release that raced this reservation leaves no live lease.
+                Ok(_)
+                    if !directory
+                        .warm
+                        .confirm_lease(&version, &key, &directory.workers()) =>
+                {
+                    metrics.warm_event(WarmEvent::OwnerHoldRefused);
+                    Ok(PeerResponse::Unavailable)
+                }
                 Ok(_) => {
                     metrics.warm_event(WarmEvent::OwnerHoldAccepted);
                     Ok(PeerResponse::Held { until })
@@ -2143,6 +2177,31 @@ mod tests {
         // Dropping B, the actual last lease, still releases.
         assert!(registry.drop_lease(&v, &b, &[worker]));
         assert_eq!(release_all(&registry, worker), vec![v]);
+    }
+
+    #[test]
+    fn release_during_pending_reservation_requeues_cleanup() {
+        let registry = WarmRegistry::new(4);
+        let worker = crate::model::WorkerId(0);
+        let v = version("a");
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        let a = (NodeId("a".into()), [1; 16]);
+        // Hold grants the lease, then awaits its reservation.
+        registry.grant_lease(&v, &a, until).unwrap();
+        // Release drops the last lease; the worker runs cleanup before the
+        // queued reservation.
+        assert!(registry.drop_lease(&v, &a, &[worker]));
+        assert_eq!(release_all(&registry, worker), vec![v.clone()]);
+        // The reservation now lands with no live lease behind it.
+        assert!(!registry.confirm_lease(&v, &a, &[worker]));
+        assert!(!registry.drained(worker), "cleanup is queued again");
+        assert_eq!(release_all(&registry, worker), vec![v.clone()]);
+        assert!(registry.drained(worker));
+        // A live lease is confirmed and queues nothing.
+        registry.grant_lease(&v, &a, until).unwrap();
+        assert!(registry.confirm_lease(&v, &a, &[worker]));
+        assert!(registry.drained(worker));
+        assert!(release_all(&registry, worker).is_empty());
     }
 
     /// Grants a long and a short lease, drops the long one, and expires the
