@@ -304,7 +304,7 @@ sidecar which store and buckets to read:
 
 | Annotation | Azure Blob with `spec.origin` | S3 |
 |------------|-------------------------------|----|
-| `racer.unbounded-cloud.io/object-namespace` | The account URL with a lowercase host and no trailing slash | The origin's `--namespace` |
+| `racer.unbounded-cloud.io/object-namespace` | The account URL with a lowercase scheme and host, no default port, and no trailing slash | The origin's `--namespace` |
 | `racer.unbounded-cloud.io/object-buckets` | Some or all of `spec.origin.buckets`, comma-separated | Some or all of the origin's `--bucket` values |
 
 The webhook skips pods in `unbounded-system`, so use another namespace. This pod
