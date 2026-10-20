@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -168,7 +169,8 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 		return plan, pending(), nil
 	}
 
-	if err := runtimePlan(ctx, env, plan, marker, secret); err != nil {
+	invalid, waiting, err := runtimePlan(ctx, env, plan, marker, secret)
+	if err != nil {
 		return nil, component.Result{}, err
 	}
 
@@ -181,6 +183,14 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 		return bootstrap, pending(), nil
 	}
 
+	if len(invalid) != 0 {
+		return plan, component.NotReadyAfter("OriginInvalid", "Racer origins not reconciled for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
+	}
+
+	if waiting {
+		return plan, component.NotReadyAfter("OriginPending", "Racer origins wait for the racer-dataplane DaemonSet placement", 30*time.Second), nil
+	}
+
 	return plan, component.ReconciledAfter("Racer controller installation reconciled", time.Hour), nil
 }
 
@@ -188,10 +198,10 @@ func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, e
 	return env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml", "mutating-webhook.yaml"}, nil)
 }
 
-func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) error {
+func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) (invalid []string, waiting bool, err error) {
 	objects, err := decodeRuntimeManifests(env)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 
 	var (
@@ -219,20 +229,20 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			}
 			for key, value := range values {
 				if err := unstructured.SetNestedField(obj.Object, value, "data", key); err != nil {
-					return err
+					return nil, false, err
 				}
 			}
 
 			cm := &corev1.ConfigMap{}
 			if err := env.Scheme.Convert(obj, cm, nil); err != nil {
-				return err
+				return nil, false, err
 			}
 
 			bindRuntime(cm, marker.UID)
 
 			cm, err = preservedConfig(ctx, env, plan, cm, values)
 			if err != nil {
-				return err
+				return nil, false, err
 			}
 
 			configHash = component.ConfigMapPayloadHash(cm)
@@ -248,7 +258,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 				return value, ok
 			})
 			if err != nil {
-				return err
+				return nil, false, err
 			}
 
 			prerequisites = append(prerequisites, component.RefOf(component.ToUnstructured(cm)))
@@ -258,15 +268,15 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			// Publish the same roots as the bootstrap trust so CA rotation and
 			// cross-signing also reach the API server's webhook client.
 			if err := setWebhookCABundle(obj, servingRoots(secret)); err != nil {
-				return err
+				return nil, false, err
 			}
 		case "Deployment":
 			if err := component.SetNamedContainerImage(obj, "controller", env.Config.Image(controllerName)); err != nil {
-				return err
+				return nil, false, err
 			}
 
 			if err := unstructured.SetNestedStringMap(obj.Object, map[string]string{"unbounded-cloud.io/racer-config-hash": configHash}, "spec", "template", "metadata", "annotations"); err != nil {
-				return err
+				return nil, false, err
 			}
 		}
 
@@ -287,7 +297,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 		op, err = ownedRuntimeOperation(ctx, env, op, marker.UID)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 
 		plan.Add(op)
@@ -301,16 +311,20 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	op, err := ownedRuntimeOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(trust), Component: name}, marker.UID)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 
 	plan.Add(op)
 
 	if runtimeConfig == nil {
-		return fmt.Errorf("racer runtime manifests contain no %s", configName)
+		return nil, false, fmt.Errorf("racer runtime manifests contain no %s", configName)
 	}
 
-	return planDataplane(ctx, env, plan, marker, runtimeConfig)
+	if err := planDataplane(ctx, env, plan, marker, runtimeConfig); err != nil {
+		return nil, false, err
+	}
+
+	return planOrigins(ctx, env, plan, marker)
 }
 
 func setWebhookCABundle(obj *unstructured.Unstructured, roots []byte) error {
@@ -345,12 +359,50 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&admissionv1.ValidatingAdmissionPolicy{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&admissionv1.ValidatingAdmissionPolicyBinding{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&admissionv1.MutatingWebhookConfiguration{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == webhookName })))
-	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(clusterCachePredicate()))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
-	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName))))
-	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(dataplaneName))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(runtimeWorkload(env))))
+	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(runtimeWorkload(env))))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
-	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))
+	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(secretWatched(env))))
+}
+
+// runtimeWorkload matches the dataplane and every origin workload or account.
+func runtimeWorkload(env *component.Env) func(client.Object) bool {
+	dataplane, origin := env.InNamespaceNamed(dataplaneName), env.InNamespaceWithPrefix(originPrefix)
+
+	return func(obj client.Object) bool { return dataplane(obj) || origin(obj) }
+}
+
+// secretWatched matches the TLS Secret and every Secret in the operator
+// namespace that a ClusterCache origin reads its credentials from, so a
+// rotated credential rolls the origin Pods.
+func secretWatched(env *component.Env) func(client.Object) bool {
+	tls := env.InNamespaceNamed(tlsName)
+
+	return func(obj client.Object) bool {
+		if tls(obj) {
+			return true
+		}
+
+		if obj.GetNamespace() != env.Namespace {
+			return false
+		}
+
+		caches := &racerv1.ClusterCacheList{}
+		if err := env.Client.List(context.Background(), caches); err != nil {
+			// Reconcile rather than risk missing a rotation.
+			return true
+		}
+
+		for i := range caches.Items {
+			if credentialSecretName(&caches.Items[i]) == obj.GetName() {
+				return true
+			}
+		}
+
+		return false
+	}
 }
 
 func startupConfigPredicate(env *component.Env) predicate.Predicate {
@@ -363,6 +415,27 @@ func startupConfigPredicate(env *component.Env) predicate.Predicate {
 			CreateFunc:  func(e event.CreateEvent) bool { return version(e.Object) },
 			DeleteFunc:  func(e event.DeleteEvent) bool { return version(e.Object) },
 			UpdateFunc:  func(event.UpdateEvent) bool { return false },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+		},
+	)
+}
+
+// clusterCachePredicate passes spec changes and the transition into
+// termination. A finalizer-held cache only gains a deletionTimestamp, which
+// does not bump the generation, but origin planning must prune it right away.
+func clusterCachePredicate() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.Funcs{
+			CreateFunc: func(event.CreateEvent) bool { return false },
+			DeleteFunc: func(event.DeleteEvent) bool { return false },
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				if e.ObjectOld == nil || e.ObjectNew == nil {
+					return false
+				}
+
+				return e.ObjectOld.GetDeletionTimestamp() == nil && e.ObjectNew.GetDeletionTimestamp() != nil
+			},
 			GenericFunc: func(event.GenericEvent) bool { return false },
 		},
 	)

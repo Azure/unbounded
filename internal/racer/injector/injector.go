@@ -199,7 +199,9 @@ func parseAnnotations(a map[string]string) (sidecarSpec, error) {
 		return s, fmt.Errorf("annotation %s is required", NamespaceAnnotation)
 	}
 
-	if _, err := racerobject.NewRequest(s.namespace, "validation", "validation", ""); err != nil {
+	// Share the origin's scope validation so every namespace an origin accepts,
+	// including the account URL of a managed Azure origin, is injectable.
+	if err := racerobject.ValidateOriginScope(s.namespace, nil); err != nil {
 		return s, fmt.Errorf("annotation %s is not a valid upstream identity", NamespaceAnnotation)
 	}
 
@@ -214,7 +216,7 @@ func parseAnnotations(a map[string]string) (sidecarSpec, error) {
 			return s, fmt.Errorf("annotation %s contains an empty bucket entry", BucketsAnnotation)
 		}
 
-		if _, err := racerobject.NewRequest(s.namespace, b, "validation", ""); err != nil {
+		if err := racerobject.ValidateOriginScope(s.namespace, []string{b}); err != nil {
 			return s, fmt.Errorf("annotation %s contains invalid bucket %q", BucketsAnnotation, b)
 		}
 
