@@ -225,7 +225,7 @@ bootstrap_probe=$(az vm run-command invoke \
   --command-id RunShellScript \
   --scripts \
     "set -eu
-source /etc/gantry-benchmark/env
+  . /etc/gantry-benchmark/env
 test \"\$BENCHMARK_NODE_COUNT\" = '$BENCHMARK_NODE_COUNT'
 test \"\$BENCHMARK_IMAGE_SIZE_MIB\" = '$BENCHMARK_IMAGE_SIZE_MIB'
 test \"\$BENCHMARK_IMAGE_LAYERS\" = '$BENCHMARK_IMAGE_LAYERS'
