@@ -4044,3 +4044,182 @@ fn checkpoint_survives_version_with_many_key_ids() {
     }
     f.store.checkpoint.finish_snapshot();
 }
+
+mod continuous_writer {
+    use super::*;
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+
+    fn turn<T>(f: &Fixture, future: &mut Operation<'_, T>) -> Poll<Result<T>> {
+        let poll = future
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()));
+        f.reactor.poll_budgeted(32).unwrap();
+        poll
+    }
+
+    #[test]
+    fn completed_write_starts_next_before_slow_write_finishes() {
+        let simulation = Simulation::new();
+        let _environment = simulation.enter();
+        let f = Fixture::new();
+        let _ = f.open().unwrap();
+        f.store.configure(f.admission.clone(), 64, 64).unwrap();
+        let ids: Vec<_> = (1..=3)
+            .map(|number| {
+                let copy = f.copy(number, 113);
+                let id = copy.ciphertext.envelope().page.clone();
+                f.enqueue(copy).unwrap();
+                id
+            })
+            .collect();
+        simulation.inject("write", Fault::Delay(10_000)).unwrap();
+        let request = scope();
+        let mut progress = f.store.writer.progress_bounded(3, 2, usize::MAX, &request);
+        let index = f.store.writer.index();
+        let mut refilled = false;
+        for _ in 0..1000 {
+            assert!(turn(&f, &mut progress).is_pending());
+            let published = ids
+                .iter()
+                .filter(|id| index.lookup(id).unwrap().is_some())
+                .count();
+            if published == 2 {
+                // The third write started and finished while the slow one runs.
+                assert_eq!(f.store.writer.writes_in_flight(), 1);
+                assert_eq!(f.store.writer.queued_count(), 0);
+                refilled = true;
+                break;
+            }
+        }
+        assert!(refilled, "a completed lane was not refilled");
+        assert_eq!(drive(&f.reactor, progress).unwrap(), 3);
+        assert!(ids.iter().all(|id| index.lookup(id).unwrap().is_some()));
+        assert_eq!(f.store.writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn byte_budget_limits_concurrency_for_large_records() {
+        let simulation = Simulation::new();
+        let _environment = simulation.enter();
+        let f = Fixture::new();
+        let _ = f.open().unwrap();
+        f.store.configure(f.admission.clone(), 64, 64).unwrap();
+        let mut record = 0;
+        for number in 1..=4 {
+            let copy = f.copy(number, 113);
+            record = logical_length(&copy).unwrap();
+            f.enqueue(copy).unwrap();
+        }
+        for _ in 0..4 {
+            simulation.inject("write", Fault::Delay(20)).unwrap();
+        }
+        let request = scope();
+        // Two records fit, a third would exceed the byte budget.
+        let mut progress = f
+            .store
+            .writer
+            .progress_bounded(8, 8, record * 2 + record / 2, &request);
+        let mut peak = 0;
+        loop {
+            match turn(&f, &mut progress) {
+                Poll::Ready(result) => {
+                    assert_eq!(result.unwrap(), 4);
+                    break;
+                }
+                Poll::Pending => peak = peak.max(f.store.writer.writes_in_flight()),
+            }
+        }
+        assert_eq!(peak, 2);
+        assert_eq!(f.store.writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn oversized_record_still_makes_progress_alone() {
+        let simulation = Simulation::new();
+        let _environment = simulation.enter();
+        let f = Fixture::new();
+        let _ = f.open().unwrap();
+        f.store.configure(f.admission.clone(), 64, 64).unwrap();
+        for number in 1..=2 {
+            f.enqueue(f.copy(number, 113)).unwrap();
+        }
+        assert_eq!(
+            drive(
+                &f.reactor,
+                f.store.writer.progress_bounded(8, 8, 1, &scope())
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(f.store.writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn held_page_waiter_completes_while_slow_write_is_in_flight() {
+        let simulation = Simulation::new();
+        let _environment = simulation.enter();
+        let f = Fixture::new();
+        let _ = f.open().unwrap();
+        f.store.configure(f.admission.clone(), 64, 64).unwrap();
+        let slow = f.copy(1, 113);
+        let slow_id = slow.ciphertext.envelope().page.clone();
+        f.enqueue(slow).unwrap();
+        f.enqueue(f.copy(2, 113)).unwrap();
+        simulation.inject("write", Fault::Delay(10_000)).unwrap();
+        simulation.inject("write", Fault::Delay(5)).unwrap();
+        let background_scope = scope();
+        let mut background = f
+            .store
+            .writer
+            .progress_bounded(3, 2, usize::MAX, &background_scope);
+        assert!(turn(&f, &mut background).is_pending());
+        assert_eq!(f.store.writer.writes_in_flight(), 2);
+
+        let held = f.copy(3, 113);
+        let held_id = held.ciphertext.envelope().page.clone();
+        let index = f.store.writer.index();
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        index.reserve_hold(&held_id.version, 1, until).unwrap();
+        let request = scope();
+        let mut persist = f.store.writer.persist_held(held, &request);
+        // The held page takes the lane the fast write frees and publishes
+        // while the slow write is still in flight.
+        let mut published = false;
+        for _ in 0..1000 {
+            assert!(turn(&f, &mut persist).is_pending());
+            assert!(turn(&f, &mut background).is_pending());
+            if index.lookup(&held_id).unwrap().is_some() {
+                published = true;
+                break;
+            }
+        }
+        assert!(published, "held page was not written while a lane was free");
+        assert!(index.lookup(&slow_id).unwrap().is_none());
+        assert_eq!(f.store.writer.writes_in_flight(), 1);
+        assert_eq!(index.lookup(&held_id).unwrap().unwrap().tier, Tier::Storage);
+        // The waiter completes once the writer fence covers the slow write.
+        let mut held_result = None;
+        let mut background_result = None;
+        for _ in 0..20_000 {
+            if held_result.is_none()
+                && let Poll::Ready(result) = turn(&f, &mut persist)
+            {
+                held_result = Some(result);
+            }
+            if background_result.is_none()
+                && let Poll::Ready(result) = turn(&f, &mut background)
+            {
+                background_result = Some(result);
+            }
+            if held_result.is_some() && background_result.is_some() {
+                break;
+            }
+        }
+        held_result
+            .expect("held page waiter did not complete")
+            .unwrap();
+        assert_eq!(background_result.unwrap().unwrap(), 3);
+        assert!(index.lookup(&slow_id).unwrap().is_some());
+        index.release_hold(&held_id.version).unwrap();
+    }
+}
