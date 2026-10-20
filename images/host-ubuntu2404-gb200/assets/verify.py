@@ -52,8 +52,15 @@ def verify():
         "update_initramfs=yes" in Path("/etc/initramfs-tools/update-initramfs.conf").read_text().splitlines(),
         "automatic initramfs updates were not restored",
     )
-    for setting in ("CONFIG_ARM64_64K_PAGES=y", "CONFIG_MICROSOFT_MANA=m"):
-        require(setting in config.splitlines(), f"missing kernel setting: {setting}")
+    require(
+        "CONFIG_ARM64_64K_PAGES=y" in config.splitlines(),
+        "missing kernel setting: CONFIG_ARM64_64K_PAGES=y",
+    )
+    if profile not in ("agentbaker-doca", "agentbaker-doca-imex"):
+        require(
+            "CONFIG_MICROSOFT_MANA=m" in config.splitlines(),
+            "missing kernel setting: CONFIG_MICROSOFT_MANA=m",
+        )
     modules = {}
     for name in ("mana", "mana_ib", "nvidia", "nvidia_uvm"):
         path = Path(command("modinfo", "-k", kernel, "-F", "filename", name))
@@ -168,10 +175,12 @@ def verify():
         "NVIDIA Fabric Manager service is not enabled",
     )
     module_load_path = Path("/etc/modules-load.d/nvidia.conf")
+    expected_boot_modules = ["nvidia", "nvidia_modeset", "nvidia_uvm", "nvidia_drm"]
+    if profile in ("agentbaker-doca", "agentbaker-doca-imex"):
+        expected_boot_modules.append("nvidia_peermem")
     require(
         module_load_path.exists()
-        and module_load_path.read_text().splitlines()
-        == ["nvidia", "nvidia_modeset", "nvidia_uvm", "nvidia_drm"],
+        and module_load_path.read_text().splitlines() == expected_boot_modules,
         "NVIDIA modules are not configured for boot",
     )
     require(

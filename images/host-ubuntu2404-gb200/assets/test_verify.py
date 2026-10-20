@@ -265,6 +265,26 @@ class RootfsContractTest(unittest.TestCase):
         )
         self.rejected("missing pinned DOCA-OFED")
 
+    def test_doca_profile_accepts_external_mana_modules(self):
+        os.environ["GB200_PROFILE"] = "agentbaker-doca"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
+        self.driver = "580.159.04"
+        self.module_version = self.driver
+        self.put(f"/boot/config-{self.kernel}", "CONFIG_ARM64_64K_PAGES=y\n")
+        self.put(
+            "/etc/modules-load.d/nvidia.conf",
+            "nvidia\nnvidia_modeset\nnvidia_uvm\nnvidia_drm\nnvidia_peermem\n",
+        )
+        self.packages = (
+            "nvidia-dkms-580-open\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-utils-580\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64\n"
+            "doca-ofed\t3.1.0-091513\tarm64"
+        )
+        verify.verify()
+
     def test_imex_profile_requires_parameters_and_service(self):
         os.environ["GB200_PROFILE"] = "agentbaker-doca-imex"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"

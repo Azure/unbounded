@@ -120,7 +120,7 @@ install_packages() {
                         "doca-ofed=${DOCA_VERSION}"
                     ;;
             esac
-            apt-get install -y --allow-downgrades --no-install-recommends \
+            if ! apt-get install -y --allow-downgrades --no-install-recommends \
                 "libxnvctrl0=${NVIDIA_VERSION}" \
                 "libnvidia-common-580=${NVIDIA_VERSION}" \
                 "libnvidia-cfg1-580=${NVIDIA_VERSION}" \
@@ -140,7 +140,15 @@ install_packages() {
                 "nvidia-utils-580=${NVIDIA_VERSION}" \
                 "nvidia-fabricmanager=${NVIDIA_VERSION}" \
                 "libnvidia-nscq=${NVIDIA_VERSION}" \
-                "nvidia-modprobe=${NVIDIA_VERSION}"
+                "nvidia-modprobe=${NVIDIA_VERSION}"; then
+                for log in /var/lib/dkms/nvidia/*/build/make.log; do
+                    if [ -f "$log" ]; then
+                        echo "NVIDIA DKMS failure log: $log" >&2
+                        cat "$log" >&2
+                    fi
+                done
+                exit 1
+            fi
             if [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
                 apt-get install -y --allow-downgrades --no-install-recommends \
                     "nvidia-imex=${NVIDIA_VERSION}"
