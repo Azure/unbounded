@@ -42,6 +42,10 @@ const (
 // checks, such as bootstrap token to Machine/Node validation.
 type RequestAuthorizationFunc func(context.Context, *certificatesv1.CertificateSigningRequest, string) (bool, error)
 
+// CredentialRequestAuthorizationFunc authorizes a parsed daemon-controller CSR
+// request for the requested node name using an authenticated credential ID.
+type CredentialRequestAuthorizationFunc func(context.Context, *certificatesv1.CertificateSigningRequest, string, string) (bool, error)
+
 // CSRApproverOptions configures daemon-controller CSR validation.
 type CSRApproverOptions struct {
 	// SignerName is the certificates.k8s.io signerName this approver handles.
@@ -64,6 +68,15 @@ type CSRApproverOptions struct {
 	// AuthorizeBootstrap validates implementation-specific bootstrap-token to node
 	// binding after the generic CSR shape and requester group checks pass.
 	AuthorizeBootstrap RequestAuthorizationFunc
+
+	// CredentialBootstrapRequester is an optional exact requester identity allowed
+	// to bootstrap with a credential ID instead of a Kubernetes bootstrap token.
+	// AuthorizeCredentialBootstrap must also be set when this is set.
+	CredentialBootstrapRequester string
+
+	// AuthorizeCredentialBootstrap validates the credential ID to node binding
+	// after the exact requester identity and credential ID shape checks pass.
+	AuthorizeCredentialBootstrap CredentialRequestAuthorizationFunc
 
 	// AuthorizeRenewal validates implementation-specific existing-cert to node
 	// binding after the generic CSR shape and requester identity checks pass.
@@ -119,6 +132,10 @@ func NewCSRApprover(opts CSRApproverOptions) (*CSRApprover, error) {
 
 	if opts.AuthorizeBootstrap == nil {
 		return nil, fmt.Errorf("bootstrap authorization callback is required")
+	}
+
+	if (opts.CredentialBootstrapRequester == "") != (opts.AuthorizeCredentialBootstrap == nil) {
+		return nil, fmt.Errorf("credential bootstrap requester and authorization callback must be configured together")
 	}
 
 	if opts.AuthorizeRenewal == nil {
@@ -207,10 +224,20 @@ func (a *CSRApprover) hasDaemonRequester(csr *certificatesv1.CertificateSigningR
 		return true
 	}
 
+	if a.opts.CredentialBootstrapRequester != "" &&
+		constantTimeEqual(csr.Spec.Username, a.opts.CredentialBootstrapRequester) {
+		return true
+	}
+
 	return strings.HasPrefix(csr.Spec.Username, SystemNodeUserPrefix) && slices.Contains(csr.Spec.Groups, a.opts.DaemonGroup)
 }
 
 func (a *CSRApprover) evaluateRequester(ctx context.Context, csr *certificatesv1.CertificateSigningRequest, nodeName string) (CSRDecision, error) {
+	if a.opts.CredentialBootstrapRequester != "" &&
+		constantTimeEqual(csr.Spec.Username, a.opts.CredentialBootstrapRequester) {
+		return a.evaluateCredentialBootstrapRequester(ctx, csr, nodeName)
+	}
+
 	if strings.HasPrefix(csr.Spec.Username, BootstrapUserPrefix) {
 		return a.evaluateBootstrapRequester(ctx, csr, nodeName)
 	}
@@ -247,6 +274,34 @@ func (a *CSRApprover) evaluateBootstrapRequester(ctx context.Context, csr *certi
 	}
 
 	return Approve("approved initial daemon-controller certificate for node %q", nodeName), nil
+}
+
+func (a *CSRApprover) evaluateCredentialBootstrapRequester(
+	ctx context.Context,
+	csr *certificatesv1.CertificateSigningRequest,
+	nodeName string,
+) (CSRDecision, error) {
+	for _, group := range csr.Spec.Groups {
+		if _, ok := privilegedRequesterGroups[strings.ToLower(strings.TrimSpace(group))]; ok {
+			return Deny("credential bootstrap requester has forbidden group %q", group), nil
+		}
+	}
+
+	credentialID, credentialValid := singleCredentialID(csr)
+	if !credentialValid {
+		return Deny("credential bootstrap requester must carry exactly one non-empty %s", CredentialIDExtraKey), nil
+	}
+
+	allowed, err := a.opts.AuthorizeCredentialBootstrap(ctx, csr, nodeName, credentialID)
+	if err != nil {
+		return CSRDecision{}, err
+	}
+
+	if !allowed {
+		return Deny("credential bootstrap requester is not allowed to claim node %q", nodeName), nil
+	}
+
+	return Approve("approved initial daemon-controller certificate for credential-bound node %q", nodeName), nil
 }
 
 func (a *CSRApprover) evaluateRenewalRequester(ctx context.Context, csr *certificatesv1.CertificateSigningRequest, nodeName string) (CSRDecision, error) {

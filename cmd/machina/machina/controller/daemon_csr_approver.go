@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 )
 
@@ -25,23 +26,33 @@ const (
 	bootstrapGroup             = "system:bootstrappers:unbounded-agent-daemons"
 
 	machineNodeRefNameField = "spec.kubernetes.nodeRef.name"
+
+	metalmanBootstrapServiceAccount = "metalman-bootstrap"
 )
 
 type daemonCSRClaimChecker struct {
 	client.Client
+	APIReader client.Reader
 }
 
 func NewDaemonCSRApprover(
 	c client.Client,
+	apiReader client.Reader,
 	kubeClient kubernetes.Interface,
 ) (*daemoncred.CSRApproverReconciler, error) {
-	claims := &daemonCSRClaimChecker{Client: c}
+	if apiReader == nil {
+		return nil, fmt.Errorf("daemon CSR approver requires an API reader")
+	}
+
+	claims := &daemonCSRClaimChecker{Client: c, APIReader: apiReader}
 
 	approver, err := daemoncred.NewCSRApprover(daemoncred.CSRApproverOptions{
-		BootstrapGroup:     bootstrapGroup,
-		DaemonGroup:        daemonGroup,
-		AuthorizeBootstrap: claims.bootstrapTokenMayClaimNode,
-		AuthorizeRenewal:   claims.nodeHasMachineBinding,
+		BootstrapGroup:               bootstrapGroup,
+		DaemonGroup:                  daemonGroup,
+		AuthorizeBootstrap:           claims.bootstrapTokenMayClaimNode,
+		CredentialBootstrapRequester: metalmanBootstrapUsername(),
+		AuthorizeCredentialBootstrap: claims.bootstrapCredentialMayClaimNode,
+		AuthorizeRenewal:             claims.nodeHasMachineBinding,
 	})
 	if err != nil {
 		return nil, err
@@ -86,6 +97,36 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 	return true, nil
 }
 
+func (c *daemonCSRClaimChecker) bootstrapCredentialMayClaimNode(
+	ctx context.Context,
+	_ *certificatesv1.CertificateSigningRequest,
+	nodeName, credentialID string,
+) (bool, error) {
+	var machines unboundedv1alpha3.MachineList
+	if err := c.APIReader.List(ctx, &machines); err != nil {
+		return false, fmt.Errorf("list live Machines for bootstrap credential claim check: %w", err)
+	}
+
+	var credentialMachine *unboundedv1alpha3.Machine
+
+	for i := range machines.Items {
+		machine := &machines.Items[i]
+		if machine.Status.Bootstrap == nil || machine.Status.Bootstrap.CredentialID != credentialID {
+			continue
+		}
+
+		if credentialMachine != nil {
+			return false, nil
+		}
+
+		credentialMachine = machine
+	}
+
+	return credentialMachine != nil &&
+		credentialMachine.Status.Bootstrap.NodeName != "" &&
+		credentialMachine.Status.Bootstrap.NodeName == nodeName, nil
+}
+
 func (c *daemonCSRClaimChecker) nodeHasMachineBinding(
 	ctx context.Context,
 	_ *certificatesv1.CertificateSigningRequest,
@@ -99,4 +140,8 @@ func (c *daemonCSRClaimChecker) nodeHasMachineBinding(
 	}
 
 	return len(machines.Items) > 0, nil
+}
+
+func metalmanBootstrapUsername() string {
+	return "system:serviceaccount:" + unbounded.SystemNamespace() + ":" + metalmanBootstrapServiceAccount
 }
