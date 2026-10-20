@@ -48,6 +48,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::task::Poll;
 
+mod link_setup;
 mod retry;
 use retry::NativeRetry;
 
