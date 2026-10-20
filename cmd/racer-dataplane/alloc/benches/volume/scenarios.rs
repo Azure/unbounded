@@ -539,7 +539,14 @@ impl<'a> Worker<'a> {
             if deadline.is_some_and(|d| now >= d) || active.get() == 0 {
                 break;
             }
-            if now.saturating_duration_since(last) < interval || !volume.is_dirty() {
+            if now.saturating_duration_since(last) < interval {
+                continue;
+            }
+            if !volume.is_dirty() {
+                // Restart the interval like a ticker; leaving `last` behind
+                // would make the next tick already expired, and the loop
+                // would spin inside one poll without ever yielding.
+                last = now;
                 continue;
             }
             last = now;
