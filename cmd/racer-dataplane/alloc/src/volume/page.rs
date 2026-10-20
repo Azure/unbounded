@@ -197,9 +197,6 @@ pub struct SlotSummary {
     /// Class of a data slot.
     pub class: u8,
 
-    /// Node slot: which bitmap copy (0 or 1) is current.
-    pub copy: u8,
-
     /// Incarnation, unique per initialization of any slot.
     pub incarnation: u32,
 
@@ -208,9 +205,6 @@ pub struct SlotSummary {
 
     /// Data slot: upper bound of the records' `retain_until`.
     pub retain_until: u64,
-
-    /// Node slot: seq of the current bitmap copy.
-    pub bitmap_seq: u64,
 }
 
 impl SlotSummary {
@@ -220,11 +214,9 @@ impl SlotSummary {
         raw[0] = self.kind;
         raw[1] = self.tier;
         raw[2] = self.class;
-        raw[3] = self.copy;
         raw[4..8].copy_from_slice(&self.incarnation.to_le_bytes());
         raw[8..12].copy_from_slice(&self.used.to_le_bytes());
         raw[16..24].copy_from_slice(&self.retain_until.to_le_bytes());
-        raw[24..32].copy_from_slice(&self.bitmap_seq.to_le_bytes());
         raw
     }
 
@@ -234,25 +226,29 @@ impl SlotSummary {
             kind: raw[0],
             tier: raw[1],
             class: raw[2],
-            copy: raw[3],
             incarnation: u32::from_le_bytes(raw[4..8].try_into().ok()?),
             used: u32::from_le_bytes(raw[8..12].try_into().ok()?),
             retain_until: u64::from_le_bytes(raw[16..24].try_into().ok()?),
-            bitmap_seq: u64::from_le_bytes(raw[24..32].try_into().ok()?),
         };
-        if raw[12..16] != [0; 4] || summary.incarnation == 0 {
+        if raw[3] != 0
+            || raw[12..16] != [0; 4]
+            || raw[24..].iter().any(|&b| b != 0)
+            || summary.incarnation == 0
+        {
             return None;
         }
         let ok = match summary.kind {
-            SLOT_NODE => summary.copy < 2 && summary.tier == 0 && summary.class == 0,
+            SLOT_NODE | SLOT_QUARANTINED => {
+                summary.tier == 0
+                    && summary.class == 0
+                    && summary.used == 0
+                    && summary.retain_until == 0
+            }
             SLOT_DATA => {
                 summary.tier < 2
                     && super::format::class_records(summary.class)
                         .is_some_and(|records| summary.used <= records)
-                    && summary.copy == 0
-                    && summary.bitmap_seq == 0
             }
-            SLOT_QUARANTINED => true,
             _ => false,
         };
         ok.then_some(summary)
@@ -444,7 +440,13 @@ impl TreePage {
         Some(page)
     }
 
+    /// A page this process just encoded, without validation.
+    pub fn trusted(bytes: Box<[u8; UNIT_BYTES]>) -> Self {
+        Self { bytes }
+    }
+
     /// Raw bytes.
+    #[cfg(test)]
     pub fn bytes(&self) -> &[u8; UNIT_BYTES] {
         &self.bytes
     }
@@ -566,17 +568,19 @@ pub fn encode_bitmap(
     seal(buf);
 }
 
-/// Decode a node-slot bitmap written by commit `seq` for `slot` at `addr`.
-/// Bits past the slot's last unit must be clear.
+/// Decode a node-slot bitmap for `slot` at `addr` written by a commit no
+/// newer than `max_seq`. Returns the words and the seq that wrote them. Bits
+/// past the slot's last unit must be clear.
 pub fn decode_bitmap(
     bytes: &[u8],
     volume_id: &[u8; 16],
-    seq: u64,
+    max_seq: u64,
     addr: NodeAddr,
     slot: u32,
-) -> Option<Box<[u64; BITMAP_WORDS]>> {
+) -> Option<(Box<[u64; BITMAP_WORDS]>, u64)> {
+    let seq = u64_at(bytes, 32);
     if !sealed(bytes, &BITMAP_MAGIC, volume_id, addr)
-        || u64_at(bytes, 32) != seq
+        || seq > max_seq
         || u32_at(bytes, 56) != slot
         || bytes[10..16].iter().any(|&b| b != 0)
         || bytes[60..64].iter().any(|&b| b != 0)
@@ -594,7 +598,7 @@ pub fn decode_bitmap(
     if tail != 0 && words[BITMAP_WORDS - 1] >> tail != 0 {
         return None;
     }
-    Some(words)
+    Some((words, seq))
 }
 
 /// One entry of a retired log: space a commit stopped referencing.
@@ -827,18 +831,14 @@ mod tests {
             kind: SLOT_DATA,
             tier: 1,
             class: 4,
-            copy: 0,
             incarnation: 5,
             used: 10,
             retain_until: 99,
-            bitmap_seq: 0,
         };
         assert_eq!(SlotSummary::decode(&summary.encode()), Some(summary));
         let node = SlotSummary {
             kind: SLOT_NODE,
-            copy: 1,
             incarnation: 2,
-            bitmap_seq: 8,
             ..SlotSummary::default()
         };
         assert_eq!(SlotSummary::decode(&node.encode()), Some(node));
@@ -852,7 +852,7 @@ mod tests {
                 used: 5000,
                 ..summary
             },
-            SlotSummary { copy: 2, ..node },
+            SlotSummary { used: 2, ..node },
         ] {
             assert_eq!(SlotSummary::decode(&bad.encode()), None, "{bad:?}");
         }
@@ -871,7 +871,9 @@ mod tests {
         let addr = NodeAddr::new(3, 1);
         let mut buf = [0u8; UNIT_BYTES];
         encode_bitmap(&mut buf, &VOLUME, 9, addr, 3, &words);
-        assert_eq!(*decode_bitmap(&buf, &VOLUME, 9, addr, 3).unwrap(), words);
+        let (decoded, seq) = decode_bitmap(&buf, &VOLUME, 9, addr, 3).unwrap();
+        assert_eq!((*decoded, seq), (words, 9));
+        assert!(decode_bitmap(&buf, &VOLUME, 10, addr, 3).is_some());
         assert!(decode_bitmap(&buf, &VOLUME, 8, addr, 3).is_none());
         assert!(decode_bitmap(&buf, &VOLUME, 9, addr, 4).is_none());
         words[64] = 1 << 8;

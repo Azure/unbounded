@@ -124,12 +124,7 @@ pub fn slab(slots: u64) -> Rc<Slab<()>> {
 
 /// Mount options with no accounting.
 pub fn options(limits: Limits) -> VolumeOptions<()> {
-    VolumeOptions {
-        limits,
-        volume_id: [0x5a; 16],
-        format: true,
-        charge: Rc::new(|_| Ok(())),
-    }
+    VolumeOptions::new(limits, [0x5a; 16], true, Rc::new(|_| Ok(())))
 }
 
 /// A mounted volume, its slab, and the mount report.
@@ -200,7 +195,62 @@ pub fn put(
         length,
     )?;
     volume.publish(key, reservation, length as u32, generation, retain_until)?;
-    Ok(volume.get(&key).unwrap())
+    Ok(get(reactor, volume, &key).unwrap())
+}
+
+/// Current value of `key`.
+pub fn get(reactor: &TestReactor, volume: &Volume<()>, key: &Key) -> Option<Value> {
+    drive(reactor, volume.get(reactor, key, &SCOPE)).unwrap()
+}
+
+/// Every index entry, in key order.
+pub fn entries(reactor: &TestReactor, volume: &Volume<()>) -> Vec<(Key, Value)> {
+    drive(
+        reactor,
+        volume.range(
+            reactor,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            usize::MAX,
+            &SCOPE,
+        ),
+    )
+    .unwrap()
+}
+
+/// Remove `key`.
+pub fn remove(reactor: &TestReactor, volume: &Volume<()>, key: &Key) -> Option<Value> {
+    drive(reactor, volume.remove(reactor, key, &SCOPE)).unwrap()
+}
+
+/// Evict one slot.
+pub fn evict_one(
+    reactor: &TestReactor,
+    volume: &Volume<()>,
+    now: u64,
+) -> Option<Vec<(Key, Value)>> {
+    drive(reactor, volume.evict_one(reactor, now, &SCOPE)).unwrap()
+}
+
+/// Allocate, evicting up to `max` slots.
+pub fn allocate_evicting(
+    reactor: &TestReactor,
+    volume: &Volume<()>,
+    tier: Tier,
+    length: u64,
+    now: u64,
+    max: usize,
+) -> (Result<Reservation, Error>, Vec<(Key, Value)>) {
+    drive(
+        reactor,
+        volume.allocate_evicting(reactor, tier, length, now, max, &SCOPE),
+    )
+    .unwrap()
+}
+
+/// Commit.
+pub fn commit(reactor: &TestReactor, volume: &Volume<()>) -> Result<(), TestError> {
+    drive(reactor, volume.commit(reactor, &SCOPE))
 }
 
 /// Read the record of `value` and check its header.

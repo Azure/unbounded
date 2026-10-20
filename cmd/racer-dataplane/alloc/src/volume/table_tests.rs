@@ -44,8 +44,8 @@ fn pages_are_contiguous_and_spill_into_new_node_slots() {
     let node = spilled[0].slot();
     assert_eq!(spilled[0].unit(), 2);
     assert_eq!(slots.slot_state(node).unwrap().kind, SlotKind::Node);
-    let ops = slots.take_ops();
-    assert!(matches!(ops[&node].ident, Some(Ident::Node(_))));
+    assert!(slots.take_ops().is_empty());
+    assert!(matches!(slots.take_claimed()[..], [(slot, _)] if slot == node));
     let dirty = slots.take_dirty_nodes();
     assert!(dirty.contains(&META_SLOT) && dirty.contains(&node));
     assert!(slots.page_used(*spilled[0]));
@@ -211,6 +211,7 @@ fn slot_ops_merge_and_apply() {
         ident: Some(data),
         retain_max: Some(5),
         retain_set: None,
+        fresh: false,
     };
     op.merge(&SlotOp {
         retain_max: Some(3),
@@ -253,8 +254,6 @@ fn mount_restores_summaries_and_bitmaps() {
             SlotSummary {
                 kind: SLOT_NODE,
                 incarnation: 1,
-                bitmap_seq: 4,
-                copy: 1,
                 ..SlotSummary::default()
             },
         ),
@@ -281,12 +280,13 @@ fn mount_restores_summaries_and_bitmaps() {
     ];
     let mut slots = Slots::mount(SLOTS, Limits::UNLIMITED, summaries, 2).unwrap();
     assert_eq!(slots.next_incarnation(), 9);
-    assert_eq!(slots.node_copy(0), Some((1, 4, 1)));
+    assert_eq!(slots.node_copy(0), Some((0, 0, 1)));
     // Unknown bitmap: the meta slot is full until supplied.
     assert_eq!(slots.slot_state(0).unwrap().used, SLOT_UNITS);
     let mut words = [0u64; BITMAP_WORDS];
     words[0] = 0b1_0000_0000;
-    slots.set_node_bitmap(0, &words);
+    slots.set_node_bitmap(0, &words, 1, 4);
+    assert_eq!(slots.node_copy(0), Some((1, 4, 1)));
     assert_eq!(slots.slot_state(0).unwrap().used, 5);
     let state = slots.slot_state(3).unwrap();
     assert_eq!(

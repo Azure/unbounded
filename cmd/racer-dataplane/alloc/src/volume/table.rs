@@ -208,6 +208,7 @@ pub struct Allocation {
     pub incarnation: u32,
 
     /// Lease on the slot, held until the record is published or aborted.
+    #[allow(dead_code)]
     pub lease: SlotLease,
 }
 
@@ -248,13 +249,19 @@ pub struct SlotOp {
     /// Set `retain_until` to this (after a recompute), then apply
     /// `retain_max`.
     pub retain_set: Option<u64>,
+
+    /// The first queued change took a slot that was free: freeing it again
+    /// cancels the whole entry.
+    pub fresh: bool,
 }
 
 impl SlotOp {
     /// Fold a later op into this one.
     pub fn merge(&mut self, later: &SlotOp) {
         if later.ident.is_some() {
+            let fresh = self.fresh;
             *self = *later;
+            self.fresh = fresh;
             return;
         }
         if let Some(set) = later.retain_set {
@@ -420,6 +427,8 @@ pub struct Slots {
     pending: u64,
     next_incarnation: u32,
     ops: BTreeMap<u32, SlotOp>,
+    // Node slots claimed by `alloc_pages` and not yet taken by a commit.
+    claimed: Vec<(u32, u32)>,
     dirty_nodes: BTreeSet<u32>,
     // Fenwick tree of per-slot used bytes.
     used: Vec<u64>,
@@ -473,6 +482,7 @@ impl Slots {
             pending: 0,
             next_incarnation: 1,
             ops: BTreeMap::new(),
+            claimed: Vec::new(),
             dirty_nodes: BTreeSet::new(),
             used: vec![0; count],
         })
@@ -502,12 +512,7 @@ impl Slots {
                     bitmap.words.fill(u64::MAX);
                     let tail = SLOT_UNITS % 64;
                     bitmap.words[BITMAP_WORDS - 1] = (1u64 << tail) - 1;
-                    bitmap.seq = summary.bitmap_seq;
-                    let entry = &mut table.slots[slot as usize];
-                    entry.used = SLOT_UNITS as u16;
-                    if summary.copy == 1 {
-                        entry.flags |= COPY;
-                    }
+                    table.slots[slot as usize].used = SLOT_UNITS as u16;
                 }
                 SLOT_DATA => {
                     let tier = Tier::from_byte(summary.tier).unwrap_or(Tier::Cache);
@@ -521,9 +526,26 @@ impl Slots {
             }
             table.next_incarnation = table.next_incarnation.max(summary.incarnation + 1);
         }
-        if table.slots[META_SLOT as usize].kind == KIND_FREE {
-            // A slot table without the meta slot is not usable; keep it full.
-            table.init_node(META_SLOT, 0);
+        if table.slots[META_SLOT as usize].kind != SLOT_NODE {
+            // Not recorded yet (a fresh format): the meta slot is always a
+            // node slot. Its bitmap is read like any other.
+            if table.slots[META_SLOT as usize].kind == SLOT_QUARANTINED {
+                table.quarantined -= 1;
+            }
+            let incarnation = table.take_incarnation();
+            table.init_node(META_SLOT, incarnation);
+            table.queue(
+                META_SLOT,
+                SlotOp {
+                    ident: Some(Ident::Node(incarnation)),
+                    ..SlotOp::default()
+                },
+            );
+            // Full until its bitmap arrives.
+            let aux = table.slots[META_SLOT as usize].aux;
+            let bitmap = table.bitmaps[aux as usize].as_mut().expect("node bitmap");
+            bitmap.words.fill(u64::MAX);
+            bitmap.words[BITMAP_WORDS - 1] = (1u64 << (SLOT_UNITS % 64)) - 1;
             table.slots[META_SLOT as usize].used = SLOT_UNITS as u16;
         }
         table.rebuild_free();
@@ -546,15 +568,22 @@ impl Slots {
         }
     }
 
-    /// Supply a node slot's persisted bitmap at mount.
-    pub fn set_node_bitmap(&mut self, slot: u32, words: &[u64; BITMAP_WORDS]) {
+    /// Supply a node slot's persisted bitmap at mount: the words, the copy
+    /// (0 or 1) they were read from, and its seq.
+    pub fn set_node_bitmap(&mut self, slot: u32, words: &[u64; BITMAP_WORDS], copy: u8, seq: u64) {
         let entry = self.slots[slot as usize];
         if entry.kind != SLOT_NODE {
             return;
         }
+        if copy == 1 {
+            self.slots[slot as usize].flags |= COPY;
+        } else {
+            self.slots[slot as usize].flags &= !COPY;
+        }
         let bitmap = self.bitmaps[entry.aux as usize]
             .as_mut()
             .expect("node bitmap");
+        bitmap.seq = seq;
         bitmap.words.copy_from_slice(words);
         let first = u32::from(first_page_unit(slot));
         for bit in 0..first {
@@ -628,7 +657,15 @@ impl Slots {
     /// Put back changes taken by a failed commit, under newer ones.
     pub fn restore_ops(&mut self, mut ops: BTreeMap<u32, SlotOp>) {
         for (slot, later) in std::mem::take(&mut self.ops) {
-            ops.entry(slot).or_default().merge(&later);
+            match ops.get_mut(&slot) {
+                Some(earlier) if earlier.fresh && later.ident == Some(Ident::Free) => {
+                    ops.remove(&slot);
+                }
+                Some(earlier) => earlier.merge(&later),
+                None => {
+                    ops.insert(slot, later);
+                }
+            }
         }
         self.ops = ops;
     }
@@ -639,7 +676,16 @@ impl Slots {
     }
 
     fn queue(&mut self, slot: u32, op: SlotOp) {
-        self.ops.entry(slot).or_default().merge(&op);
+        match self.ops.get_mut(&slot) {
+            Some(entry) if entry.fresh && op.ident == Some(Ident::Free) => {
+                self.ops.remove(&slot);
+            }
+            Some(entry) => entry.merge(&op),
+            None => {
+                let fresh = matches!(op.ident, Some(Ident::Node(_) | Ident::Data { .. }));
+                self.ops.insert(slot, SlotOp { fresh, ..op });
+            }
+        }
     }
 
     fn take_incarnation(&mut self) -> u32 {
@@ -648,7 +694,8 @@ impl Slots {
         incarnation
     }
 
-    /// Persisted state of a node slot: bitmap copy bit and seq.
+    /// Durable bitmap copy of a node slot: copy bit, its seq, and the slot's
+    /// incarnation.
     pub fn node_copy(&self, slot: u32) -> Option<(u8, u64, u32)> {
         let entry = self.slots.get(slot as usize)?;
         if entry.kind != SLOT_NODE {
@@ -716,13 +763,7 @@ impl Slots {
             } else if let Some(slot) = self.claim_free() {
                 let incarnation = self.take_incarnation();
                 self.init_node(slot, incarnation);
-                self.queue(
-                    slot,
-                    SlotOp {
-                        ident: Some(Ident::Node(incarnation)),
-                        ..SlotOp::default()
-                    },
-                );
+                self.claimed.push((slot, incarnation));
                 self.sync_used(slot);
                 slot
             } else {
@@ -757,6 +798,23 @@ impl Slots {
             self.refresh(slot);
         }
         out
+    }
+
+    /// Node slots claimed by [`Slots::alloc_pages`] since the last call,
+    /// with their incarnations. The caller persists them.
+    pub fn take_claimed(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.claimed)
+    }
+
+    /// Free a node unit whose release a durable bitmap already records: like
+    /// [`Slots::free_page`] but the bitmap stays clean.
+    pub fn release_page(&mut self, addr: NodeAddr) -> bool {
+        let clean = !self.dirty_nodes.contains(&addr.slot());
+        let freed = self.free_page(addr);
+        if freed && clean {
+            self.dirty_nodes.remove(&addr.slot());
+        }
+        freed
     }
 
     /// Make a node unit free at once (for units no durable root set
@@ -987,14 +1045,6 @@ impl Slots {
         {
             entry.flags |= REFERENCED;
         }
-    }
-
-    /// Incarnation of a data slot.
-    pub fn incarnation(&self, slot: u32) -> Option<u32> {
-        self.slots
-            .get(slot as usize)
-            .filter(|e| e.is_data())
-            .map(|e| e.incarnation)
     }
 
     /// Raise a data slot's `retain_until` to at least `until`.

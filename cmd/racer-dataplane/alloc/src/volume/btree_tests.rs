@@ -223,7 +223,7 @@ fn scan(disk: &Disk, root: &TreeRoot, seq: u64) -> (Vec<(Key, Raw)>, Vec<(Key, O
                     lost.push((low, high));
                     high
                 }
-                Seek::Leaf(page, _, high) => {
+                Seek::Leaf(page, high) => {
                     for i in 0..page.count() {
                         if page.key(i) >= at {
                             out.push((page.key(i), page.raw(i)));
@@ -343,9 +343,8 @@ fn lost_leaf_is_reported_and_rebuilt() {
         Priority::Leaf,
     ))
     .unwrap();
-    let Seek::Leaf(page, low, high) = found else {
-        let (entries, lost) = scan(&disk, &root, 2);
-        panic!("leaf {} {:?} {:?}", entries.len(), lost, root);
+    let Seek::Leaf(page, _) = found else {
+        panic!("leaf");
     };
     let n = page.count();
     let addr = *disk
@@ -356,10 +355,11 @@ fn lost_leaf_is_reported_and_rebuilt() {
         .unwrap()
         .0;
     disk.units.borrow_mut().get_mut(&addr).unwrap()[200] ^= 1;
-    match block_on(get(&disk, &root, TreeKind::Index, 2, &key(500))).unwrap() {
-        Lookup::Lost(l, h) => assert_eq!((l, h), (low, high)),
+    let (low, high) = match block_on(get(&disk, &root, TreeKind::Index, 2, &key(500))).unwrap() {
+        Lookup::Lost(l, h) => (l, h),
         other => panic!("{other:?}"),
-    }
+    };
+    assert!(low <= key(500) && high.is_none_or(|h| key(500) < h));
     let (entries, lost) = scan(&disk, &root, 2);
     assert_eq!(lost, vec![(low, high)]);
     assert_eq!(entries.len(), 1000 - n);

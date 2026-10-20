@@ -144,10 +144,10 @@ pub trait Sink {
 }
 
 /// A sink that keeps every leaf as a [`NewPage`].
-pub struct Deferred;
+pub struct Deferred<E>(pub std::marker::PhantomData<E>);
 
-impl Sink for Deferred {
-    type Error = std::convert::Infallible;
+impl<E> Sink for Deferred<E> {
+    type Error = E;
 
     fn emit<'a>(
         &'a mut self,
@@ -172,8 +172,8 @@ pub enum Lookup {
 
 /// The leaf that covers a key, for scans.
 pub enum Seek {
-    /// The leaf and its key range `[low, high)`.
-    Leaf(Rc<TreePage>, Key, Option<Key>),
+    /// The leaf and the exclusive upper bound of its key range.
+    Leaf(Rc<TreePage>, Option<Key>),
 
     /// The empty tree.
     Empty,
@@ -238,7 +238,7 @@ pub async fn seek<S: Source>(
             return Ok(Seek::Lost(req.low, req.high));
         };
         if req.level == 0 {
-            return Ok(Seek::Leaf(page, req.low, req.high));
+            return Ok(Seek::Leaf(page, req.high));
         }
         let i = page.child_index(key);
         req = child_request(&page, i, &req, priority);
@@ -257,7 +257,7 @@ pub async fn get<S: Source>(
         match seek(source, root, kind, max_seq, key, Priority::Leaf).await? {
             Seek::Empty => Lookup::Absent,
             Seek::Lost(low, high) => Lookup::Lost(low, high),
-            Seek::Leaf(page, _, _) => match page.search(key) {
+            Seek::Leaf(page, _) => match page.search(key) {
                 Ok(i) => Lookup::Found(page.raw(i)),
                 Err(_) => Lookup::Absent,
             },
@@ -363,7 +363,6 @@ struct Ctx<'a, 'r, S: Source, K: Sink<Error = S::Error>, T> {
     sink: &'a mut K,
     resolve: &'a mut Resolve<'r, T>,
     kind: TreeKind,
-    max_seq: u64,
     out: Applied,
 }
 
@@ -390,7 +389,6 @@ where
         sink,
         resolve,
         kind,
-        max_seq,
         out: Applied::default(),
     };
     if ops.is_empty() {

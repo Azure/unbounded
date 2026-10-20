@@ -1,9 +1,11 @@
-//! The extent volume: slot table, index tree, superblocks, and I/O together.
+//! Extent volume: slot table, paged trees, overlays, and I/O together.
 //!
 //! See `designs/racer-extent-volume.md`. A [`Volume`] is single threaded and
-//! shared as `Rc<Volume<C>>`. Index operations are synchronous and in memory.
-//! Data reads and writes, commits, and mount are [`Operation`]s driven by the
-//! caller's reactor.
+//! shared as `Rc<Volume<C>>`. Index state lives on disk in copy-on-write
+//! trees; only a bounded cache of their pages ([`VolumeOptions::metadata_cache_bytes`])
+//! and the changes since the last commit (the overlay) are in memory.
+//! Lookups that miss the cache read pages from disk, so they are
+//! [`Operation`]s; [`Volume::try_get`] answers from memory only.
 //!
 //! # Write path
 //!
@@ -12,29 +14,27 @@
 //! 2. [`Volume::next_generation`] gives a unique write id. The caller puts it
 //!    in the record header.
 //! 3. [`Volume::write`] writes the record.
-//! 4. [`Volume::publish`] inserts the index entry. It refuses a reservation
-//!    whose write did not complete, so data always precedes its index entry.
+//! 4. [`Volume::publish`] records the index entry in the overlay. It refuses
+//!    a reservation whose write did not complete, so data always precedes
+//!    its index entry.
 //! 5. [`Volume::commit`] makes the entry durable. Storage writes must wait for
 //!    it before they are acknowledged. Cache writes are committed lazily, for
-//!    example by a timer that calls `commit` every second when
-//!    [`Volume::is_dirty`]. Freed storage records and nodes also make the
-//!    volume dirty until later commits release them, so such a timer keeps
-//!    committing until the space is reusable.
+//!    example by a timer that calls `commit` when [`Volume::is_dirty`].
 //!
 //! # Reuse of space
 //!
-//! Tree nodes and storage records that a durable superblock may still
-//! reference are freed through the epoch rule of [`Slots`]: they are reused
-//! only after two later commits succeed. Cache records, and storage slots
-//! removed by eviction after their `retain_until` passed, are reused at once.
+//! Metadata pages and storage records that a durable superblock may still
+//! reference are listed in the retired log of the commit that stopped
+//! referencing them, and become reusable only after the next commit is
+//! durable. Cache records, and slots emptied by eviction, are reused at once.
 //! An older on-disk tree may therefore point at reused space for those. The
 //! reader must check that the record header carries the entry's key and
 //! generation, and treat a mismatch as a miss.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell, RefMut};
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
-use std::marker::PhantomData;
 use std::ops::Bound;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -42,26 +42,30 @@ use std::task::{Poll, Waker};
 
 use uring_runtime::{Budget, Operation, Scope, reactor::Reactor};
 
-use super::format::{
-    Key, MAX_SLOTS, MIN_SLOTS, NodeAddr, SLOT_BYTES, SUPERBLOCK_A_UNIT, SUPERBLOCK_B_UNIT, Tier,
-    UNIT_BYTES, Value, class_units, unit_offset,
-};
-use super::slots::{Allocation, Limits, SlotLease, SlotState, Slots, Usage};
-use super::superblock::Superblock;
-use super::tree::{CommitPlan, LoadReport, Loader, Tree};
+use super::btree::{self, LocalFuture, Lookup, Req, Seek, TreeRoot};
+use super::format::{Key, NodeAddr, SLOT_BYTES, Tier, UNIT_BYTES, Value, class_units, unit_offset};
+use super::page::{RecordDesc, Retired, TreeKind, TreePage, record_key, record_key_parts};
+use super::pager::{FaultResult, FaultRole, Pager, PagerStats, Priority};
+use super::table::{Allocation, Limits, SlotLease, SlotState, Slots, Usage};
 use crate::{AlignedBuffer, Alignment, Charge, Error, Result, Slab};
 
-/// Most node or superblock transfers a mount or commit keeps in flight.
+/// Most metadata transfers a mount or commit keeps in flight.
 pub const IO_CONCURRENCY: usize = 64;
 
-/// Attempts per node read at mount before the copy counts as unreadable.
-const READ_ATTEMPTS: usize = 3;
+/// Attempts per page read before the copy counts as unreadable.
+pub(super) const READ_ATTEMPTS: usize = 3;
 
 /// Generations skipped at mount, past any id handed out but not committed.
 pub const GENERATION_SKIP: u64 = 1 << 40;
 
-/// Cache slots a commit may evict to find space for tree nodes.
-const COMMIT_EVICTIONS: usize = 16;
+/// Default byte budget of the metadata page cache.
+pub const DEFAULT_METADATA_CACHE_BYTES: usize = 64 << 20;
+
+/// Records an eviction step handles before yielding to other tasks.
+pub const EVICT_BATCH: usize = 256;
+
+/// Bytes charged per overlay entry.
+pub(super) const OVERLAY_ENTRY_BYTES: usize = 160;
 
 /// Builds the accounting guard for a metadata buffer of the given length.
 pub type ChargeFn<C> = Rc<dyn Fn(usize) -> Result<C>>;
@@ -79,9 +83,31 @@ pub struct VolumeOptions<C: Charge> {
     /// false, mount fails with `Corrupt` instead.
     pub format: bool,
 
-    /// Accounting guards for the volume's own 4096 byte node and superblock
-    /// buffers.
+    /// Accounting guards for the volume's own metadata I/O buffers.
     pub charge: ChargeFn<C>,
+
+    /// Byte budget of the metadata page cache. Pages in use may exceed it
+    /// briefly.
+    pub metadata_cache_bytes: usize,
+
+    /// Bytes of uncommitted index changes above which allocation returns
+    /// `Busy` until a commit. 0 picks a quarter of the cache budget (at
+    /// least 1 MiB).
+    pub dirty_bytes: usize,
+}
+
+impl<C: Charge> VolumeOptions<C> {
+    /// Options with the default cache budget.
+    pub fn new(limits: Limits, volume_id: [u8; 16], format: bool, charge: ChargeFn<C>) -> Self {
+        Self {
+            limits,
+            volume_id,
+            format,
+            charge,
+            metadata_cache_bytes: DEFAULT_METADATA_CACHE_BYTES,
+            dirty_bytes: 0,
+        }
+    }
 }
 
 /// What [`Volume::mount`] found and repaired.
@@ -100,42 +126,65 @@ pub struct MountReport {
     /// or of another volume.
     pub invalid_superblocks: u8,
 
-    /// The newest superblock's root was unreadable, so the older one was
-    /// mounted.
+    /// The newest superblock's allocation metadata (slot table or retired
+    /// log) was unreadable, so the older one was mounted.
     pub fell_back: bool,
 
-    /// Key ranges `[low, high)` of the mounted tree whose node had no valid
-    /// copy. `high` of `None` is unbounded. Entries in them were salvaged from
-    /// the older tree where possible; others are gone.
-    pub lost: Vec<(Key, Option<Key>)>,
-
-    /// The mounted superblock's root had no valid copy. The tree started
-    /// empty.
+    /// No root set had readable allocation metadata; the newest was mounted
+    /// with the unreadable parts quarantined.
     pub root_lost: bool,
 
-    /// Node copies that were unreadable or invalid in the mounted tree.
+    /// Slot table key ranges `[low, high)` that were unreadable; their slots
+    /// are quarantined.
+    pub lost: Vec<(Key, Option<Key>)>,
+
+    /// Metadata page copies that were invalid while one copy was valid.
     pub invalid_copies: u64,
 
-    /// Entries copied from the older tree into lost ranges.
-    pub salvaged: u64,
-
-    /// Entries removed because they were malformed or overlapped a node or an
-    /// earlier entry.
-    pub dropped: Vec<(Key, Value)>,
+    /// Node slots whose bitmap was rebuilt by walking the trees.
+    pub rebuilt_bitmaps: u64,
 
     /// Entries in the mounted index.
     pub entries: u64,
 
-    /// Node units of the older tree reserved until the reuse rule frees them.
+    /// Metadata pages reserved until the next commit releases them.
     pub pending_nodes: u64,
 
-    /// Storage records of the older tree reserved until the reuse rule frees
-    /// them.
+    /// Storage records reserved until the next commit releases them.
     pub pending_records: u64,
 
-    /// Whether the mounted index differs from the on-disk image (repairs,
-    /// salvage, or drops). Commit to make the repaired index durable.
+    /// Metadata pages read by the mount.
+    pub pages_read: u64,
+
+    /// Whether the mount repaired allocation metadata (rebuilt bitmaps or
+    /// quarantined slots) that only a commit makes durable. The volume is
+    /// dirty after any mount that did not format regardless: the first
+    /// commit persists the generation skip.
     pub dirty: bool,
+}
+
+/// What [`Volume::scrub`] found and repaired.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScrubReport {
+    /// Index key ranges `[low, high)` whose page had no valid copy. Their
+    /// entries are gone; the next commit that touches a range rewrites it.
+    pub lost: Vec<(Key, Option<Key>)>,
+
+    /// Record map ranges whose page had no valid copy.
+    pub lost_records: Vec<(Key, Option<Key>)>,
+
+    /// Index entries removed because they were malformed or did not lie in
+    /// a data slot of their tier and class.
+    pub dropped: Vec<(Key, Value)>,
+
+    /// Index entries visited.
+    pub entries: u64,
+
+    /// Pages read from disk by the scrub.
+    pub pages_read: u64,
+
+    /// Metadata page copies that were invalid while one copy was valid.
+    pub invalid_copies: u64,
 }
 
 /// Commit counters, for diagnostics and tests.
@@ -155,86 +204,215 @@ pub struct CommitStats {
 
     /// Unit of the newest durable superblock (0 for A, 1 for B).
     pub durable_unit: u16,
+
+    /// Metadata pages written by the last successful attempt.
+    pub pages_written: u64,
+
+    /// Metadata write requests submitted by the last successful attempt.
+    pub writes: u64,
+}
+
+/// Uncommitted change to an index entry.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum IndexOp {
+    Put(Value),
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IndexEntry {
+    pub(super) op: IndexOp,
+}
+
+/// Uncommitted change to a record map entry.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RecOp {
+    /// A published record.
+    Put(RecordDesc),
+
+    /// Remove the entry (eviction).
+    Delete,
+
+    /// The index stopped referencing this record: free it (cache) or retire
+    /// it (storage) if the entry still names this key and generation.
+    Release { key: Key, generation: u64 },
+
+    /// A retired storage record of this incarnation is reusable.
+    Retired { incarnation: u32 },
+}
+
+/// One layer of uncommitted changes.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Overlay {
+    pub(super) index: BTreeMap<Key, IndexEntry>,
+    pub(super) records: BTreeMap<Key, RecOp>,
+    /// Change of the index entry count from this layer.
+    pub(super) delta: i64,
+}
+
+impl Overlay {
+    pub(super) fn is_empty(&self) -> bool {
+        self.index.is_empty() && self.records.is_empty()
+    }
+
+    pub(super) fn entries(&self) -> usize {
+        self.index.len() + self.records.len()
+    }
+
+    /// Fold a later layer into this one. Records published and released
+    /// within the two layers never reach disk; they are freed in `slots` at
+    /// once.
+    pub(super) fn absorb(&mut self, later: Overlay, slots: &mut Slots) {
+        for (key, entry) in later.index {
+            match self.index.get_mut(&key) {
+                Some(earlier) => earlier.op = entry.op,
+                None => {
+                    self.index.insert(key, entry);
+                }
+            }
+        }
+        for (rk, op) in later.records {
+            match (self.records.get(&rk).copied(), op) {
+                (None, op) => {
+                    self.records.insert(rk, op);
+                }
+                (Some(RecOp::Put(desc)), RecOp::Release { key, generation })
+                    if desc.key == key && desc.generation == generation =>
+                {
+                    self.records.remove(&rk);
+                    let (slot, unit) = record_key_parts(&rk);
+                    slots.release(slot, unit, desc.incarnation);
+                }
+                (Some(_), RecOp::Release { .. } | RecOp::Retired { .. }) => {}
+                (Some(_), op) => {
+                    self.records.insert(rk, op);
+                }
+            }
+        }
+        self.delta += later.delta;
+    }
+}
+
+/// Root set of the newest durable superblock.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Durable {
+    pub(super) seq: u64,
+    pub(super) trees: [TreeRoot; 3],
 }
 
 /// Index state shared with reservations.
-struct State {
-    tree: Tree,
-    slots: Slots,
-    next_generation: u64,
+pub(super) struct State {
+    pub(super) slots: Slots,
+    pub(super) active: Overlay,
+    pub(super) frozen: Option<Rc<Overlay>>,
+    pub(super) durable: Durable,
+    /// Bumped whenever `durable` or `frozen` changes.
+    pub(super) epoch: u64,
+    pub(super) next_generation: u64,
     /// Bumped on every index change.
-    mutations: u64,
+    pub(super) mutations: u64,
+    /// Retired log of the newest durable superblock.
+    pub(super) log: Vec<Retired>,
+    /// Pages of that log.
+    pub(super) log_pages: Vec<NodeAddr>,
+    /// Whether that log holds more than log pages and leftovers.
+    pub(super) log_real: bool,
+    /// Pages allocated by failed attempts or left over, to retire next.
+    pub(super) carry: Vec<NodeAddr>,
+    /// Lost ranges seen by lookups, per tree.
+    pub(super) lost: Vec<(TreeKind, Key, Option<Key>)>,
+    pub(super) invalid_copies: u64,
 }
 
 impl State {
-    /// Hand tree nodes superseded since the last call to the reuse rule.
-    ///
-    /// Each address is tagged with [`Slots::epoch`]: the first commit attempt
-    /// that has not started yet. Every attempt that may reference the address
-    /// started before it was taken from the tree, so its epoch is lower. The
-    /// rule releases a tag only after a success with an epoch at least the tag
-    /// (the first tree without the address) and one more success, so neither
-    /// on-disk superblock references a released address.
-    fn release_freed(&mut self) {
-        for addr in self.tree.take_freed() {
-            let epoch = self.slots.epoch();
-            // Addresses never reserved in the table (for example skipped at
-            // mount) report `Stale`; there is nothing to release.
-            let _ = self.slots.free_node(addr, epoch);
-        }
-    }
-
-    /// Remove the index entry of `key` and release its record.
-    fn remove(&mut self, key: &Key) -> Option<Value> {
-        let old = self.tree.remove(key)?;
-        self.release(&old);
-        self.mutations += 1;
-        Some(old)
-    }
-
-    /// Release the record of a removed or replaced entry.
-    fn release(&mut self, old: &Value) {
-        let epoch = self.slots.epoch();
-        let _ = self.slots.release_record(old.slot, old.unit, epoch);
-    }
-
-    /// Evict one data slot and remove its entries from the tree.
-    fn evict(&mut self, now: u64, tier: Option<Tier>) -> Option<Vec<(Key, Value)>> {
-        let eviction = self.slots.evict_candidate_in(now, tier)?;
-        let mut removed = Vec::with_capacity(eviction.keys.len());
-        for key in eviction.keys {
-            if self
-                .tree
-                .get(&key)
-                .is_some_and(|value| value.slot == eviction.slot)
-            {
-                let value = self.tree.remove(&key).expect("entry was just found");
-                removed.push((key, value));
+    /// Record a change of `key` to `op` in the active layer. `old` is the
+    /// key's current value and whether it is known. Releases a value only
+    /// the active layer held.
+    pub(super) fn set(&mut self, key: Key, op: IndexOp, old: Option<Option<Value>>) {
+        let new_exists = matches!(op, IndexOp::Put(_));
+        match self.active.index.get_mut(&key) {
+            Some(entry) => {
+                let previous = entry.op;
+                entry.op = op;
+                self.active.delta +=
+                    i64::from(new_exists) - i64::from(matches!(previous, IndexOp::Put(_)));
+                if let IndexOp::Put(prev) = previous {
+                    let same = matches!(op, IndexOp::Put(v) if (v.slot, v.unit, v.generation) == (prev.slot, prev.unit, prev.generation));
+                    if !same {
+                        self.release_active(&key, &prev);
+                    }
+                }
+            }
+            None => {
+                let existed = old.flatten().is_some();
+                self.active.index.insert(key, IndexEntry { op });
+                self.active.delta += i64::from(new_exists) - i64::from(existed);
             }
         }
-        self.slots
-            .finish_eviction(eviction.slot)
-            .expect("slot was chosen for eviction");
-        if !removed.is_empty() {
-            self.mutations += 1;
+        self.mutations += 1;
+    }
+
+    /// Free a record only the active layer referenced.
+    fn release_active(&mut self, key: &Key, value: &Value) {
+        let rk = record_key(value.slot, value.unit);
+        if let Some(RecOp::Put(desc)) = self.active.records.get(&rk).copied()
+            && desc.key == *key
+            && desc.generation == value.generation
+        {
+            self.active.records.remove(&rk);
+            self.slots.release(value.slot, value.unit, desc.incarnation);
+        } else {
+            // In the frozen layer or on disk: the commit releases it.
+            self.active.records.entry(rk).or_insert(RecOp::Release {
+                key: *key,
+                generation: value.generation,
+            });
         }
-        Some(removed)
+    }
+
+    /// Value of `key` in the overlays: `Some(None)` for a delete, `None`
+    /// when neither layer changed it.
+    pub(super) fn overlay_get(&self, key: &Key) -> Option<Option<Value>> {
+        let entry = self
+            .active
+            .index
+            .get(key)
+            .or_else(|| self.frozen.as_ref().and_then(|f| f.index.get(key)))?;
+        Some(match entry.op {
+            IndexOp::Put(value) => Some(value),
+            IndexOp::Delete => None,
+        })
+    }
+
+    pub(super) fn note_lost(&mut self, kind: TreeKind, low: Key, high: Option<Key>) {
+        if !self
+            .lost
+            .iter()
+            .any(|(k, l, h)| *k == kind && *l == low && *h == high)
+        {
+            self.lost.push((kind, low, high));
+        }
+    }
+
+    fn dirty_bytes(&self) -> usize {
+        (self.active.entries() + self.frozen.as_ref().map_or(0, |f| f.entries()))
+            * OVERLAY_ENTRY_BYTES
     }
 }
 
 /// State reachable from reservations.
-struct Shared {
-    state: RefCell<State>,
+pub(super) struct Shared {
+    pub(super) state: RefCell<State>,
     /// Reservations dropped while the state was borrowed.
     aborts: RefCell<Vec<Allocation>>,
 }
 
 impl Shared {
     /// Borrow the state, first aborting reservations dropped earlier.
-    fn state(&self) -> RefMut<'_, State> {
+    pub(super) fn state(&self) -> RefMut<'_, State> {
         let mut state = self.state.borrow_mut();
         for allocation in self.aborts.borrow_mut().drain(..) {
-            let _ = state.slots.abort(allocation);
+            state.slots.abort(allocation);
         }
         state
     }
@@ -242,20 +420,20 @@ impl Shared {
 
 /// Wakeups for commit waiters, and the count of metadata writes in flight.
 #[derive(Default)]
-struct Signals {
-    meta_writes: Cell<usize>,
+pub(super) struct Signals {
+    pub(super) meta_writes: Cell<usize>,
     waiters: RefCell<Vec<Waker>>,
 }
 
 impl Signals {
-    fn register(&self, waker: &Waker) {
+    pub(super) fn register(&self, waker: &Waker) {
         let mut waiters = self.waiters.borrow_mut();
         if !waiters.iter().any(|w| w.will_wake(waker)) {
             waiters.push(waker.clone());
         }
     }
 
-    fn wake(&self) {
+    pub(super) fn wake(&self) {
         let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
         for waker in waiters {
             waker.wake();
@@ -263,11 +441,11 @@ impl Signals {
     }
 }
 
-/// Held by a node or superblock write until its completion.
-struct MetaWrite(Rc<Signals>);
+/// Held by a metadata write until its completion.
+pub(super) struct MetaWrite(Rc<Signals>);
 
 impl MetaWrite {
-    fn new(signals: &Rc<Signals>) -> Self {
+    pub(super) fn new(signals: &Rc<Signals>) -> Self {
         signals.meta_writes.set(signals.meta_writes.get() + 1);
         Self(Rc::clone(signals))
     }
@@ -283,22 +461,24 @@ impl Drop for MetaWrite {
     }
 }
 
-struct Failure {
-    attempt: u64,
-    covered: u64,
-    error: Box<dyn Any>,
+pub(super) struct Failure {
+    pub(super) attempt: u64,
+    pub(super) covered: u64,
+    pub(super) error: Box<dyn Any>,
 }
 
-struct CommitState {
-    running: bool,
-    attempts: u64,
-    finished: u64,
-    succeeded: u64,
-    failed: u64,
-    durable_mutations: u64,
-    failure: Option<Failure>,
-    seq: u64,
-    durable_unit: u16,
+pub(super) struct CommitState {
+    pub(super) running: bool,
+    pub(super) attempts: u64,
+    pub(super) finished: u64,
+    pub(super) succeeded: u64,
+    pub(super) failed: u64,
+    pub(super) durable_mutations: u64,
+    pub(super) failure: Option<Failure>,
+    pub(super) seq: u64,
+    pub(super) durable_unit: u16,
+    pub(super) pages_written: u64,
+    pub(super) writes: u64,
 }
 
 /// A reserved record. Dropping it without [`Volume::publish`] frees the
@@ -321,9 +501,7 @@ impl Drop for Reserved {
     fn drop(&mut self) {
         if let Some(allocation) = self.allocation.get_mut().take() {
             match self.shared.state.try_borrow_mut() {
-                Ok(mut state) => {
-                    let _ = state.slots.abort(allocation);
-                }
+                Ok(mut state) => state.slots.abort(allocation),
                 Err(_) => self.shared.aborts.borrow_mut().push(allocation),
             }
         }
@@ -379,25 +557,13 @@ impl std::fmt::Debug for Reservation {
     }
 }
 
-fn class_bytes(class: u8) -> u64 {
+pub(super) fn class_bytes(class: u8) -> u64 {
     u64::from(class_units(class).unwrap_or(0)) * UNIT_BYTES as u64
-}
-
-fn other_unit(unit: u16) -> u16 {
-    if unit == SUPERBLOCK_A_UNIT {
-        SUPERBLOCK_B_UNIT
-    } else {
-        SUPERBLOCK_A_UNIT
-    }
-}
-
-fn high_bound(high: Option<Key>) -> Bound<Key> {
-    high.map_or(Bound::Unbounded, Bound::Excluded)
 }
 
 /// Run futures with at most `limit` in flight. Returns outputs in completion
 /// order.
-async fn bounded<'a, T: 'a>(
+pub(super) async fn bounded<'a, T: 'a>(
     mut futures: impl Iterator<Item = Pin<Box<dyn Future<Output = T> + 'a>>>,
     limit: usize,
 ) -> Vec<T> {
@@ -435,108 +601,242 @@ async fn bounded<'a, T: 'a>(
     outputs
 }
 
+/// One layer's view of a key during a merged scan.
+pub(super) enum Layer<V> {
+    Set(V),
+    Remove,
+    Pass,
+}
+
+/// Merge sorted tree entries with two overlay layers (later wins) and push
+/// the visible entries to `out` until it holds `limit`. Returns whether the
+/// limit was reached.
+pub(super) fn merge_layers<V: Copy>(
+    tree: impl Iterator<Item = (Key, V)>,
+    frozen: Vec<(Key, Layer<V>)>,
+    active: Vec<(Key, Layer<V>)>,
+    out: &mut Vec<(Key, V)>,
+    limit: usize,
+) -> bool {
+    let mut tree = tree.peekable();
+    let mut frozen = frozen.into_iter().peekable();
+    let mut active = active.into_iter().peekable();
+    loop {
+        if out.len() >= limit {
+            return true;
+        }
+        let next = [
+            tree.peek().map(|e| e.0),
+            frozen.peek().map(|e| e.0),
+            active.peek().map(|e| e.0),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(key) = next else {
+            return false;
+        };
+        let mut value = None;
+        if tree.peek().is_some_and(|e| e.0 == key) {
+            value = tree.next().map(|e| e.1);
+        }
+        for layer in [&mut frozen, &mut active] {
+            if layer.peek().is_some_and(|e| e.0 == key) {
+                match layer.next().expect("peeked").1 {
+                    Layer::Set(v) => value = Some(v),
+                    Layer::Remove => value = None,
+                    Layer::Pass => {}
+                }
+            }
+        }
+        if let Some(value) = value {
+            out.push((key, value));
+        }
+    }
+}
+
+fn index_layer(entry: &IndexEntry) -> Layer<Value> {
+    match entry.op {
+        IndexOp::Put(value) => Layer::Set(value),
+        IndexOp::Delete => Layer::Remove,
+    }
+}
+
+fn record_layer(op: &RecOp) -> Layer<RecordDesc> {
+    match op {
+        RecOp::Put(desc) => Layer::Set(*desc),
+        RecOp::Delete => Layer::Remove,
+        RecOp::Release { .. } | RecOp::Retired { .. } => Layer::Pass,
+    }
+}
+
+fn bound_key(bound: &Bound<Key>) -> Key {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => *key,
+        Bound::Unbounded => Key::MIN,
+    }
+}
+
+fn after_low(key: &Key, low: &Bound<Key>) -> bool {
+    match low {
+        Bound::Included(l) => key >= l,
+        Bound::Excluded(l) => key > l,
+        Bound::Unbounded => true,
+    }
+}
+
+fn before_high(key: &Key, high: &Bound<Key>) -> bool {
+    match high {
+        Bound::Included(h) => key <= h,
+        Bound::Excluded(h) => key < h,
+        Bound::Unbounded => true,
+    }
+}
+
 /// Extent volume. See the module docs.
 pub struct Volume<C: Charge> {
-    slab: Rc<Slab<C>>,
-    charge: ChargeFn<C>,
-    alignment: Alignment,
-    slot_count: u64,
-    volume_id: [u8; 16],
-    shared: Rc<Shared>,
-    commit: RefCell<CommitState>,
-    signals: Rc<Signals>,
+    pub(super) slab: Rc<Slab<C>>,
+    pub(super) charge: ChargeFn<C>,
+    pub(super) alignment: Alignment,
+    pub(super) slot_count: u64,
+    pub(super) volume_id: Cell<[u8; 16]>,
+    pub(super) shared: Rc<Shared>,
+    pub(super) commit: RefCell<CommitState>,
+    pub(super) signals: Rc<Signals>,
+    pub(super) pager: Rc<Pager>,
+    pub(super) dirty_limit: usize,
 }
 
-/// A loaded tree and what loading it found.
-struct Loaded {
-    superblock: Superblock,
-    unit: u16,
-    tree: Tree,
-    report: LoadReport,
+/// Page source for tree code: the pager plus the I/O context of one call.
+pub(super) struct Io<'a, C: Charge, S: Scope, B: Budget> {
+    pub(super) volume: &'a Volume<C>,
+    pub(super) reactor: &'a Reactor<S, B>,
+    pub(super) scope: &'a S,
 }
 
-impl<C: Charge> Volume<C> {
-    /// Mount the volume on `slab`, or format it.
-    ///
-    /// The slab must use `SLOT_BYTES` segments and hold `MIN_SLOTS` to
-    /// `MAX_SLOTS` of them; otherwise this fails with `InvalidConfiguration`.
-    /// Its direct I/O alignment must divide 4096, or this fails with
-    /// `Unsupported`. The slab is bound with [`Slab::open_volume`].
-    ///
-    /// Both superblocks are read. The newest valid one with this geometry and
-    /// a slot count not above the slab's is mounted; if its root is
-    /// unreadable, the other one is. Lost key ranges are salvaged from the
-    /// other tree, the slot table is rebuilt, and space the other tree still
-    /// references is reserved until two commits succeed. A superblock read
-    /// error fails the mount rather than formatting over it. Node read errors
-    /// are retried, then count as an invalid copy.
-    ///
-    /// Mount writes nothing unless it formats. A repaired index
-    /// ([`MountReport::dirty`]) is durable only after a [`Volume::commit`].
-    pub fn mount<'a, S: Scope, B: Budget>(
-        reactor: &'a Reactor<S, B>,
-        slab: Rc<Slab<C>>,
-        options: VolumeOptions<C>,
-        scope: &'a S,
-    ) -> Operation<'a, (Rc<Self>, MountReport), S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        Box::pin(async move {
-            if slab.segment_bytes() != SLOT_BYTES {
-                return Err(Error::InvalidConfiguration.into());
-            }
-            let slot_count = slab.capacity_bytes() / SLOT_BYTES;
-            if !(MIN_SLOTS..=MAX_SLOTS).contains(&slot_count) {
-                return Err(Error::InvalidConfiguration.into());
-            }
-            let alignment = slab.open_volume(slot_count)?;
-            if !(UNIT_BYTES as u64).is_multiple_of(alignment.offset())
-                || !UNIT_BYTES.is_multiple_of(alignment.length())
-                || alignment.memory() > UNIT_BYTES
-            {
-                return Err(Error::Unsupported.into());
-            }
-            let VolumeOptions {
-                limits,
-                volume_id,
-                format,
-                charge,
-            } = options;
-            let mut volume = Self {
-                slab,
-                charge,
-                alignment,
-                slot_count,
-                volume_id,
-                shared: Rc::new(Shared {
-                    state: RefCell::new(State {
-                        tree: Tree::new(volume_id),
-                        slots: Slots::new(slot_count, limits)?,
-                        next_generation: 1,
-                        mutations: 0,
-                    }),
-                    aborts: RefCell::new(Vec::new()),
-                }),
-                commit: RefCell::new(CommitState {
-                    running: false,
-                    attempts: 0,
-                    finished: 0,
-                    succeeded: 0,
-                    failed: 0,
-                    durable_mutations: 0,
-                    failure: None,
-                    seq: 0,
-                    durable_unit: SUPERBLOCK_A_UNIT,
-                }),
-                signals: Rc::new(Signals::default()),
-            };
-            let report = volume.load(reactor, scope, limits, format).await?;
-            Ok((Rc::new(volume), report))
+impl<C: Charge, S: Scope, B: Budget> btree::Source for Io<'_, C, S, B>
+where
+    S::Error: From<Error>,
+{
+    type Error = S::Error;
+
+    fn cached(&self, req: &Req) -> Option<Rc<TreePage>> {
+        req.addrs.iter().filter(|a| !a.is_none()).find_map(|addr| {
+            self.volume
+                .pager
+                .get(*addr, req.priority)
+                .filter(|page| fits(page, req))
         })
     }
 
-    async fn read_unit<S: Scope, B: Budget>(
+    fn load(
+        &self,
+        req: Req,
+    ) -> LocalFuture<'_, std::result::Result<Option<Rc<TreePage>>, S::Error>> {
+        Box::pin(async move { self.volume.load_page(self.reactor, self.scope, req).await })
+    }
+
+    fn prefetch(&self, reqs: Vec<Req>) -> LocalFuture<'_, ()> {
+        Box::pin(async move {
+            let missing: Vec<Req> = reqs
+                .into_iter()
+                .filter(|req| !self.volume.pager.contains(req.addrs[0]))
+                .collect();
+            bounded(
+                missing.into_iter().map(|req| {
+                    Box::pin(async move {
+                        let _ = self.volume.load_page(self.reactor, self.scope, req).await;
+                    }) as Pin<Box<dyn Future<Output = ()> + '_>>
+                }),
+                IO_CONCURRENCY,
+            )
+            .await;
+        })
+    }
+}
+
+fn fits(page: &TreePage, req: &Req) -> bool {
+    page.fits(
+        req.kind,
+        req.level,
+        req.max_seq,
+        &req.low,
+        req.high.as_ref(),
+    )
+}
+
+impl<C: Charge> Volume<C> {
+    pub(super) fn new_unmounted(
+        slab: Rc<Slab<C>>,
+        alignment: Alignment,
+        slot_count: u64,
+        options: &VolumeOptions<C>,
+    ) -> Result<Self> {
+        let dirty_limit = if options.dirty_bytes == 0 {
+            (options.metadata_cache_bytes / 4).max(1 << 20)
+        } else {
+            options.dirty_bytes
+        };
+        Ok(Self {
+            slab,
+            charge: Rc::clone(&options.charge),
+            alignment,
+            slot_count,
+            volume_id: Cell::new(options.volume_id),
+            shared: Rc::new(Shared {
+                state: RefCell::new(State {
+                    slots: Slots::new(slot_count, options.limits)?,
+                    active: Overlay::default(),
+                    frozen: None,
+                    durable: Durable {
+                        seq: 0,
+                        trees: [TreeRoot::EMPTY; 3],
+                    },
+                    epoch: 0,
+                    next_generation: 1,
+                    mutations: 0,
+                    log: Vec::new(),
+                    log_pages: Vec::new(),
+                    log_real: false,
+                    carry: Vec::new(),
+                    lost: Vec::new(),
+                    invalid_copies: 0,
+                }),
+                aborts: RefCell::new(Vec::new()),
+            }),
+            commit: RefCell::new(CommitState {
+                running: false,
+                attempts: 0,
+                finished: 0,
+                succeeded: 0,
+                failed: 0,
+                durable_mutations: 0,
+                failure: None,
+                seq: 0,
+                durable_unit: super::format::SUPERBLOCK_A_UNIT,
+                pages_written: 0,
+                writes: 0,
+            }),
+            signals: Rc::new(Signals::default()),
+            pager: Pager::new(options.metadata_cache_bytes),
+            dirty_limit,
+        })
+    }
+
+    pub(super) fn io<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        scope: &'a S,
+    ) -> Io<'a, C, S, B> {
+        Io {
+            volume: self,
+            reactor,
+            scope,
+        }
+    }
+
+    /// Read one unit, retrying I/O errors.
+    pub(super) async fn read_unit<S: Scope, B: Budget>(
         &self,
         reactor: &Reactor<S, B>,
         offset: u64,
@@ -545,279 +845,89 @@ impl<C: Charge> Volume<C> {
     where
         S::Error: From<Error>,
     {
-        let buffer = self.slab.allocate(UNIT_BYTES, (self.charge)(UNIT_BYTES)?)?;
-        let buffer = self
-            .slab
-            .read_at(reactor, offset, buffer, (), scope)
-            .await?;
-        let mut bytes = Box::new([0u8; UNIT_BYTES]);
-        bytes.copy_from_slice(buffer.as_slice());
-        Ok(bytes)
-    }
-
-    async fn read_node<S: Scope, B: Budget>(
-        &self,
-        reactor: &Reactor<S, B>,
-        addr: NodeAddr,
-        scope: &S,
-    ) -> Option<Box<[u8; UNIT_BYTES]>>
-    where
-        S::Error: From<Error>,
-    {
+        let mut last = None;
         for _ in 0..READ_ATTEMPTS {
-            if let Ok(bytes) = self.read_unit(reactor, addr.offset(), scope).await {
-                return Some(bytes);
+            let buffer = self.slab.allocate(UNIT_BYTES, (self.charge)(UNIT_BYTES)?)?;
+            match self.slab.read_at(reactor, offset, buffer, (), scope).await {
+                Ok(buffer) => {
+                    let mut bytes = Box::new([0u8; UNIT_BYTES]);
+                    bytes.copy_from_slice(buffer.as_slice());
+                    return Ok(bytes);
+                }
+                Err(error) => last = Some(error),
             }
         }
-        None
+        Err(last.expect("a read failed"))
     }
 
-    async fn load_tree<S: Scope, B: Budget>(
+    /// A page copy that fits `req`, through the pager.
+    pub(super) async fn load_page<S: Scope, B: Budget>(
         &self,
         reactor: &Reactor<S, B>,
         scope: &S,
-        superblock: &Superblock,
-    ) -> std::result::Result<(Tree, LoadReport), S::Error>
+        req: Req,
+    ) -> std::result::Result<Option<Rc<TreePage>>, S::Error>
     where
         S::Error: From<Error>,
     {
-        let mut loader = Loader::new(
-            superblock.volume_id,
-            self.slot_count,
-            superblock.seq,
-            superblock.root,
-            superblock.root_level,
-            superblock.entries,
-        );
-        loop {
-            let reads = loader.next_reads();
-            if reads.is_empty() {
-                break;
-            }
-            scope.check()?;
-            let results: Vec<(NodeAddr, Option<Box<[u8; UNIT_BYTES]>>)> = bounded(
-                reads.into_iter().map(|addr| {
-                    Box::pin(async move { (addr, self.read_node(reactor, addr, scope).await) })
-                        as Pin<Box<dyn Future<Output = _> + '_>>
-                }),
-                IO_CONCURRENCY,
-            )
-            .await;
-            for (addr, bytes) in results {
-                loader.supply(addr, bytes.as_deref());
-            }
-        }
-        Ok(loader.finish())
-    }
-
-    async fn load<S: Scope, B: Budget>(
-        &mut self,
-        reactor: &Reactor<S, B>,
-        scope: &S,
-        limits: Limits,
-        format: bool,
-    ) -> std::result::Result<MountReport, S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        let mut report = MountReport::default();
-        let mut candidates = Vec::new();
-        for unit in [SUPERBLOCK_A_UNIT, SUPERBLOCK_B_UNIT] {
-            let mut last = None;
-            let mut bytes = None;
-            for _ in 0..READ_ATTEMPTS {
-                match self.read_unit(reactor, unit_offset(0, unit), scope).await {
-                    Ok(b) => {
-                        bytes = Some(b);
-                        break;
+        let mut io_error = None;
+        let mut invalid = 0;
+        for addr in req.addrs.iter().copied().filter(|a| !a.is_none()) {
+            if let Some(page) = self.pager.get(addr, req.priority) {
+                if fits(&page, &req) {
+                    if invalid != 0 {
+                        self.shared.state().invalid_copies += 1;
                     }
-                    Err(error) => last = Some(error),
+                    return Ok(Some(page));
                 }
+                invalid += 1;
+                continue;
             }
-            let Some(bytes) = bytes else {
-                return Err(last.expect("a read failed"));
+            let found = loop {
+                match self.pager.begin_fault(addr) {
+                    FaultRole::Hit(page) => break Some(page),
+                    FaultRole::Leader(guard) => {
+                        match self.read_unit(reactor, addr.offset(), scope).await {
+                            Ok(bytes) => {
+                                let page = TreePage::decode(
+                                    bytes,
+                                    &self.volume_id.get(),
+                                    addr,
+                                    self.slot_count,
+                                );
+                                match guard.finish(page, req.priority) {
+                                    FaultResult::Page(page) => break Some(page),
+                                    _ => break None,
+                                }
+                            }
+                            Err(error) => {
+                                drop(guard);
+                                io_error = Some(error);
+                                break None;
+                            }
+                        }
+                    }
+                    FaultRole::Follower(follower) => match follower.wait().await {
+                        FaultResult::Page(page) => break Some(page),
+                        FaultResult::Invalid => break None,
+                        FaultResult::Retry => continue,
+                    },
+                }
             };
-            match Superblock::decode(&bytes).filter(|sb| {
-                sb.has_current_geometry() && (MIN_SLOTS..=self.slot_count).contains(&sb.slot_count)
-            }) {
-                Some(sb) => candidates.push((sb, unit)),
-                None => report.invalid_superblocks += 1,
-            }
-        }
-        // Newest first; A wins a tie.
-        candidates.sort_by_key(|(sb, _)| std::cmp::Reverse(sb.seq));
-        if candidates.len() == 2 && candidates[0].0.volume_id != candidates[1].0.volume_id {
-            candidates.pop();
-            report.invalid_superblocks += 1;
-        }
-        if candidates.is_empty() {
-            if !format {
-                return Err(Error::Corrupt.into());
-            }
-            self.format(reactor, scope).await?;
-            report.formatted = true;
-            report.seq = 1;
-            report.superblock_unit = SUPERBLOCK_A_UNIT;
-            return Ok(report);
-        }
-        let highest_seq = candidates[0].0.seq;
-        self.volume_id = candidates[0].0.volume_id;
-
-        let mut loads = Vec::new();
-        for (superblock, unit) in &candidates {
-            let (tree, load_report) = self.load_tree(reactor, scope, superblock).await?;
-            loads.push(Loaded {
-                superblock: *superblock,
-                unit: *unit,
-                tree,
-                report: load_report,
-            });
-        }
-        let mut mounted = loads.remove(0);
-        let mut other = loads.pop();
-        if mounted.report.root_lost && other.as_ref().is_some_and(|other| !other.report.root_lost) {
-            std::mem::swap(&mut mounted, other.as_mut().expect("checked"));
-            report.fell_back = true;
-        }
-        // The other tree is only useful when it differs.
-        if other
-            .as_ref()
-            .is_some_and(|o| o.superblock.seq == mounted.superblock.seq)
-        {
-            other = None;
-        }
-
-        let Loaded {
-            superblock,
-            unit,
-            mut tree,
-            report: load,
-        } = mounted;
-        report.seq = superblock.seq;
-        report.superblock_unit = unit;
-        report.lost = load.lost.clone();
-        report.root_lost = load.root_lost;
-        report.invalid_copies = load.invalid_copies;
-
-        if let Some(other) = &other {
-            for (low, high) in &load.lost {
-                for (key, value) in other.tree.range(Bound::Included(*low), high_bound(*high)) {
-                    if tree.get(&key).is_none() {
-                        tree.insert(key, value);
-                        report.salvaged += 1;
+            match found {
+                Some(page) if fits(&page, &req) => {
+                    if invalid != 0 {
+                        self.shared.state().invalid_copies += 1;
                     }
+                    return Ok(Some(page));
                 }
+                _ => invalid += 1,
             }
         }
-
-        // Addresses the mounted superblock references but whose node is
-        // rewritten (repaired copies) or unreadable. They stay reserved until
-        // the reuse rule frees them.
-        let mut referenced = tree.take_freed();
-        referenced.extend(load.lost_addrs.iter().copied());
-        let nodes: Vec<NodeAddr> = tree
-            .node_addrs()
-            .chain(referenced.iter().copied())
-            .collect();
-        let entries: Vec<(Key, Value)> = tree.range(Bound::Unbounded, Bound::Unbounded).collect();
-        let (mut slots, dropped) = Slots::rebuild(self.slot_count, limits, nodes, entries)?;
-        for (key, value) in &dropped {
-            if tree.get(key) == Some(*value) {
-                tree.remove(key);
-            }
+        match io_error {
+            Some(error) => Err(error),
+            None => Ok(None),
         }
-        report.dropped = dropped;
-        let epoch = slots.epoch();
-        for addr in referenced {
-            let _ = slots.free_node(addr, epoch);
-        }
-        // Freed by the removals above; nothing on disk references them yet,
-        // but tagging them is harmless.
-        for addr in tree.take_freed() {
-            let _ = slots.free_node(addr, epoch);
-        }
-        let mut max_generation = tree
-            .range(Bound::Unbounded, Bound::Unbounded)
-            .map(|(_, v)| v.generation)
-            .max()
-            .unwrap_or(0);
-        if let Some(mut other) = other {
-            let mut addrs: Vec<NodeAddr> = other.tree.node_addrs().collect();
-            addrs.extend(other.tree.take_freed());
-            addrs.extend(other.report.lost_addrs.iter().copied());
-            report.pending_nodes = slots.mark_pending_nodes(addrs, epoch) as u64;
-            let values: Vec<Value> = other
-                .tree
-                .range(Bound::Unbounded, Bound::Unbounded)
-                .map(|(_, v)| v)
-                .collect();
-            max_generation = values
-                .iter()
-                .map(|v| v.generation)
-                .fold(max_generation, u64::max);
-            report.pending_records = slots.mark_pending_records(values, epoch) as u64;
-        }
-        report.entries = tree.len();
-        report.dirty = tree.is_dirty();
-        let next_generation = superblock
-            .next_generation
-            .max(max_generation.saturating_add(1))
-            .saturating_add(GENERATION_SKIP);
-
-        let mut state = self.shared.state.borrow_mut();
-        state.tree = tree;
-        state.slots = slots;
-        state.next_generation = next_generation;
-        // Always dirty: the first commit persists the generation skip, so a
-        // second crash before it cannot hand out the same ids again.
-        state.mutations = 1;
-        let commit = self.commit.get_mut();
-        commit.seq = highest_seq;
-        commit.durable_unit = unit;
-        Ok(report)
-    }
-
-    async fn format<S: Scope, B: Budget>(
-        &mut self,
-        reactor: &Reactor<S, B>,
-        scope: &S,
-    ) -> std::result::Result<(), S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        let superblock = Superblock::empty(self.volume_id, 1, self.slot_count, 1);
-        self.write_unit(
-            reactor,
-            unit_offset(0, SUPERBLOCK_A_UNIT),
-            &superblock.encode(),
-            scope,
-        )
-        .await?;
-        self.slab.sync(reactor, scope).await?;
-        let commit = self.commit.get_mut();
-        commit.seq = 1;
-        commit.durable_unit = SUPERBLOCK_A_UNIT;
-        Ok(())
-    }
-
-    async fn write_unit<S: Scope, B: Budget>(
-        &self,
-        reactor: &Reactor<S, B>,
-        offset: u64,
-        bytes: &[u8; UNIT_BYTES],
-        scope: &S,
-    ) -> std::result::Result<(), S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        let mut buffer = self.slab.allocate(UNIT_BYTES, (self.charge)(UNIT_BYTES)?)?;
-        buffer.as_mut_slice().copy_from_slice(bytes);
-        let guard = MetaWrite::new(&self.signals);
-        let _ = self
-            .slab
-            .write_at(reactor, offset, buffer, guard, scope)
-            .await?;
-        Ok(())
     }
 
     /// Slots in the volume, including the meta slot.
@@ -832,12 +942,16 @@ impl<C: Charge> Volume<C> {
 
     /// Volume id.
     pub fn volume_id(&self) -> [u8; 16] {
-        self.volume_id
+        self.volume_id.get()
     }
 
-    /// Entries in the index.
+    /// Entries in the index. Exact when every overlay change knew whether
+    /// its key existed (always after a commit); a publish that replaced an
+    /// entry whose page was not cached counts as an insert until then.
     pub fn len(&self) -> u64 {
-        self.shared.state().tree.len()
+        let state = self.shared.state();
+        let delta = state.active.delta + state.frozen.as_ref().map_or(0, |f| f.delta);
+        (state.durable.trees[TreeKind::Index.index()].count as i64 + delta).max(0) as u64
     }
 
     /// Whether the index has no entries.
@@ -846,36 +960,309 @@ impl<C: Charge> Volume<C> {
     }
 
     /// Whether a commit has work to do: index changes that are not durable
-    /// yet, (after a mount that did not format) the generation skip, which
-    /// the first commit persists, or freed space that only later successful
-    /// commits release. Freed space drains within two successful commits
-    /// after the last free, so a lazy committer stops once it is released.
+    /// yet, slot table changes, or retired space that the next commit
+    /// releases.
     pub fn is_dirty(&self) -> bool {
         let state = self.shared.state();
-        state.tree.is_dirty()
-            || state.slots.has_pending()
+        !state.active.is_empty()
+            || state.frozen.is_some()
+            || state.slots.has_ops()
+            || state.log_real
             || state.mutations > self.commit.borrow().durable_mutations
     }
 
-    /// Value of `key`.
-    pub fn get(&self, key: &Key) -> Option<Value> {
-        self.shared.state().tree.get(key)
+    /// Whether uncommitted changes reached the dirty limit. Allocation
+    /// returns `Busy` until a commit drains them.
+    pub fn needs_commit(&self) -> bool {
+        self.shared.state().dirty_bytes() >= self.dirty_limit
+    }
+
+    /// Bytes of uncommitted index changes held in memory.
+    pub fn dirty_bytes(&self) -> usize {
+        self.shared.state().dirty_bytes()
+    }
+
+    /// Metadata page cache counters.
+    pub fn pager_stats(&self) -> PagerStats {
+        self.pager.stats()
+    }
+
+    /// Change the metadata page cache budget.
+    pub fn set_metadata_cache_bytes(&self, bytes: usize) {
+        self.pager.set_budget(bytes);
+    }
+
+    /// Key ranges `[low, high)` of the index that lookups found lost since
+    /// mount.
+    pub fn lost_ranges(&self) -> Vec<(Key, Option<Key>)> {
+        self.shared
+            .state()
+            .lost
+            .iter()
+            .filter(|(kind, _, _)| *kind == TreeKind::Index)
+            .map(|(_, low, high)| (*low, *high))
+            .collect()
+    }
+
+    /// Value of `key` from memory only: the overlays and cached pages.
+    /// `None` when answering needs a page read.
+    pub fn try_get(&self, key: &Key) -> Option<Option<Value>> {
+        let state = self.shared.state();
+        if let Some(value) = state.overlay_get(key) {
+            return Some(value);
+        }
+        let durable = state.durable;
+        drop(state);
+        let io = TryIo(self);
+        match btree::try_get(
+            &io,
+            &durable.trees[TreeKind::Index.index()],
+            TreeKind::Index,
+            durable.seq,
+            key,
+        )? {
+            Lookup::Found(raw) => Some(Value::decode(raw[..32].try_into().expect("32"))),
+            Lookup::Absent | Lookup::Lost(..) => Some(None),
+        }
+    }
+
+    /// Current value of `key`, reading pages as needed. Ranges whose page
+    /// is lost read as empty and are listed by [`Volume::lost_ranges`].
+    pub fn get<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        key: &Key,
+        scope: &'a S,
+    ) -> Operation<'a, Option<Value>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let key = *key;
+        Box::pin(async move { self.resolve(reactor, scope, &key).await })
+    }
+
+    /// Current value of `key`. When this returns, the value is still current
+    /// (no await happens after the check).
+    pub(super) async fn resolve<S: Scope, B: Budget>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+        key: &Key,
+    ) -> std::result::Result<Option<Value>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        loop {
+            let (durable, epoch) = {
+                let state = self.shared.state();
+                if let Some(value) = state.overlay_get(key) {
+                    return Ok(value);
+                }
+                (state.durable, state.epoch)
+            };
+            let io = self.io(reactor, scope);
+            let found = btree::get(
+                &io,
+                &durable.trees[TreeKind::Index.index()],
+                TreeKind::Index,
+                durable.seq,
+                key,
+            )
+            .await?;
+            let mut state = self.shared.state();
+            if state.epoch != epoch || state.overlay_get(key).is_some() {
+                continue;
+            }
+            return Ok(match found {
+                Lookup::Found(raw) => Value::decode(raw[..32].try_into().expect("32")),
+                Lookup::Absent => None,
+                Lookup::Lost(low, high) => {
+                    state.note_lost(TreeKind::Index, low, high);
+                    None
+                }
+            });
+        }
     }
 
     /// Entries with keys in `(low, high)`, in key order, at most `limit`.
-    pub fn range(&self, low: Bound<Key>, high: Bound<Key>, limit: usize) -> Vec<(Key, Value)> {
-        self.shared
-            .state()
-            .tree
-            .range(low, high)
-            .take(limit)
-            .collect()
+    pub fn range<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        low: Bound<Key>,
+        high: Bound<Key>,
+        limit: usize,
+        scope: &'a S,
+    ) -> Operation<'a, Vec<(Key, Value)>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move { self.scan_index(reactor, scope, low, high, limit).await })
     }
 
     /// Up to `limit` entries with keys after `after` (from the start if
     /// `None`), in key order.
-    pub fn next_after(&self, after: Option<&Key>, limit: usize) -> Vec<(Key, Value)> {
-        self.shared.state().tree.next_after(after, limit)
+    pub fn next_after<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        after: Option<&Key>,
+        limit: usize,
+        scope: &'a S,
+    ) -> Operation<'a, Vec<(Key, Value)>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let low = after.map_or(Bound::Unbounded, |key| Bound::Excluded(*key));
+        Box::pin(async move {
+            self.scan_index(reactor, scope, low, Bound::Unbounded, limit)
+                .await
+        })
+    }
+
+    pub(super) async fn scan_index<S: Scope, B: Budget>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+        low: Bound<Key>,
+        high: Bound<Key>,
+        limit: usize,
+    ) -> std::result::Result<Vec<(Key, Value)>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let mut out = Vec::new();
+        self.scan(
+            reactor,
+            scope,
+            TreeKind::Index,
+            low,
+            high,
+            limit,
+            &mut out,
+            |raw| Value::decode(raw[..32].try_into().expect("32")),
+            |overlay, low, high| {
+                overlay
+                    .index
+                    .range((low, high))
+                    .map(|(k, e)| (*k, index_layer(e)))
+                    .collect()
+            },
+        )
+        .await?;
+        Ok(out)
+    }
+
+    pub(super) async fn scan_records<S: Scope, B: Budget>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+        low: Bound<Key>,
+        high: Bound<Key>,
+        limit: usize,
+    ) -> std::result::Result<Vec<(Key, RecordDesc)>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let mut out = Vec::new();
+        self.scan(
+            reactor,
+            scope,
+            TreeKind::Records,
+            low,
+            high,
+            limit,
+            &mut out,
+            |raw| RecordDesc::decode(raw),
+            |overlay, low, high| {
+                overlay
+                    .records
+                    .range((low, high))
+                    .map(|(k, op)| (*k, record_layer(op)))
+                    .collect()
+            },
+        )
+        .await?;
+        Ok(out)
+    }
+
+    /// Merged scan of one tree and the overlays, one leaf at a time.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan<S: Scope, B: Budget, V: Copy>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+        kind: TreeKind,
+        low: Bound<Key>,
+        high: Bound<Key>,
+        limit: usize,
+        out: &mut Vec<(Key, V)>,
+        decode: impl Fn(&[u8]) -> Option<V>,
+        layer: impl Fn(&Overlay, Bound<Key>, Bound<Key>) -> Vec<(Key, Layer<V>)>,
+    ) -> std::result::Result<(), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let mut cursor = low;
+        while out.len() < limit {
+            let (durable, epoch) = {
+                let state = self.shared.state();
+                (state.durable, state.epoch)
+            };
+            let start = bound_key(&cursor);
+            if !before_high(&start, &high) && !matches!(cursor, Bound::Unbounded) {
+                break;
+            }
+            let io = self.io(reactor, scope);
+            let seek = btree::seek(
+                &io,
+                &durable.trees[kind.index()],
+                kind,
+                durable.seq,
+                &start,
+                Priority::Scan,
+            )
+            .await?;
+            let mut state = self.shared.state();
+            if state.epoch != epoch {
+                continue;
+            }
+            let (entries, leaf_high): (Vec<(Key, V)>, Option<Key>) = match seek {
+                Seek::Empty => (Vec::new(), None),
+                Seek::Lost(l, h) => {
+                    state.note_lost(kind, l, h);
+                    (Vec::new(), h)
+                }
+                Seek::Leaf(page, h) => (
+                    (0..page.count())
+                        .filter_map(|i| decode(page.value(i)).map(|v| (page.key(i), v)))
+                        .collect(),
+                    h,
+                ),
+            };
+            // The interval [cursor, end) this leaf answers.
+            let end = match (leaf_high, &high) {
+                (Some(h), Bound::Unbounded) => Bound::Excluded(h),
+                (Some(h), Bound::Included(x)) if h <= *x => Bound::Excluded(h),
+                (Some(h), Bound::Excluded(x)) if h < *x => Bound::Excluded(h),
+                (_, other) => *other,
+            };
+            let in_range = |key: &Key| after_low(key, &cursor) && before_high(key, &end);
+            let tree = entries.into_iter().filter(|(k, _)| in_range(k));
+            let frozen = state
+                .frozen
+                .as_ref()
+                .map(|f| layer(f, cursor, end))
+                .unwrap_or_default();
+            let active = layer(&state.active, cursor, end);
+            drop(state);
+            if merge_layers(tree, frozen, active, out, limit) {
+                break;
+            }
+            match (leaf_high, end) {
+                (Some(h), Bound::Excluded(e)) if h == e => cursor = Bound::Included(h),
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     /// Pin a slot so eviction skips it. `None` when out of range.
@@ -887,10 +1274,9 @@ impl<C: Charge> Volume<C> {
     /// bytes. The buffer must follow [`Volume::alignment`] and fit the
     /// record's class, or this fails with `InvalidConfiguration`.
     ///
-    /// The slot is leased when this is called, held until the read completes,
-    /// and its CLOCK reference bit is set. The slot may have been evicted and
-    /// reused between the lookup and this call, so the caller must check the
-    /// record header (key and generation) before using the bytes.
+    /// The slot is leased while the read runs and its CLOCK reference bit is
+    /// set. The slot may have been evicted and reused since the lookup, so
+    /// the caller must check the record header (key and generation).
     pub fn read<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
@@ -924,12 +1310,19 @@ impl<C: Charge> Volume<C> {
     /// the reservation is published or dropped.
     ///
     /// Fails with `InvalidConfiguration` when `length` is 0 or above
-    /// `SLOT_BYTES`, and with `Busy` when there is no free slot, the storage
-    /// quota is reached, or the small-record byte cap would be exceeded. On
-    /// `Busy`, evict ([`Volume::evict_one`]) and retry, or use
-    /// [`Volume::allocate_evicting`].
+    /// `SLOT_BYTES`, and with `Busy` when there is no free or open slot, the
+    /// storage quota is reached, the small-record byte cap would be exceeded,
+    /// or uncommitted changes reached the dirty limit ([`Volume::needs_commit`]).
     pub fn allocate(&self, tier: Tier, length: u64) -> Result<Reservation> {
-        let allocation = self.shared.state().slots.allocate(tier, length)?;
+        let mut state = self.shared.state();
+        if length == 0 || length > SLOT_BYTES {
+            return Err(Error::InvalidConfiguration);
+        }
+        if state.dirty_bytes() >= self.dirty_limit {
+            return Err(Error::Busy);
+        }
+        let allocation = state.slots.allocate(tier, length)?;
+        drop(state);
         Ok(Reservation {
             inner: Rc::new(Reserved {
                 shared: Rc::clone(&self.shared),
@@ -943,62 +1336,10 @@ impl<C: Charge> Volume<C> {
         })
     }
 
-    /// [`Volume::allocate`], evicting up to `max_evictions` slots while it
-    /// returns `Busy`. When the storage slot quota is what blocks a storage
-    /// allocation, only expired storage slots are evicted (cache slots do not
-    /// count toward the quota), and it stops with `Busy` when there are none.
-    /// Returns the reservation and the entries removed by
-    /// eviction (also when allocation still fails, they are gone).
-    pub fn allocate_evicting(
-        &self,
-        tier: Tier,
-        length: u64,
-        now: u64,
-        max_evictions: usize,
-    ) -> (Result<Reservation>, Vec<(Key, Value)>) {
-        let mut evicted = Vec::new();
-        let mut evictions = 0;
-        loop {
-            match self.allocate(tier, length) {
-                Err(Error::Busy) if evictions < max_evictions => {
-                    evictions += 1;
-                    let mut state = self.shared.state();
-                    let only = state
-                        .slots
-                        .storage_quota_blocks(tier, length)
-                        .then_some(Tier::Storage);
-                    let removed = state.evict(now, only);
-                    drop(state);
-                    match removed {
-                        Some(removed) => evicted.extend(removed),
-                        None => return (Err(Error::Busy), evicted),
-                    }
-                }
-                result => return (result, evicted),
-            }
-        }
-    }
-
-    /// Evict one data slot with the CLOCK policy and remove its entries from
-    /// the index. Returns the removed entries, or `None` when no slot can be
-    /// evicted.
-    ///
-    /// A slot can be evicted when it is not open, not leased, its reference
-    /// bit is clear, and it is a cache slot or a storage slot whose largest
-    /// `retain_until` is below `now`. When no such slot exists, an open cache
-    /// slot with no lease and no unpublished record is closed and evicted, so
-    /// open slots of other classes cannot block allocation. The slot is free at once, even for
-    /// storage: an older on-disk tree that still points into it is caught by
-    /// the record header check.
-    pub fn evict_one(&self, now: u64) -> Option<Vec<(Key, Value)>> {
-        self.shared.state().evict(now, None)
-    }
-
     /// A unique, nonzero write id, larger than any id handed out or committed
     /// before on this volume. Mount skips `GENERATION_SKIP` ids past the
     /// committed high-water mark; the skip is durable after the first commit
-    /// following the mount. Until then, a second crash may hand out ids that
-    /// were handed out (but never committed) before it.
+    /// following the mount.
     pub fn next_generation(&self) -> u64 {
         let mut state = self.shared.state();
         let generation = state.next_generation;
@@ -1040,16 +1381,15 @@ impl<C: Charge> Volume<C> {
         })
     }
 
-    /// Insert `key` for the written reservation. Returns the previous value of
-    /// `key`, whose record is released: at once for cache, by the reuse rule
-    /// for storage.
+    /// Insert `key` for the written reservation. The previous value of `key`
+    /// (if any) is released: at once when it was never committed, otherwise
+    /// by the next commit (cache) or the commit after it (storage).
     ///
-    /// `generation` must be the id in the record header (normally from
-    /// [`Volume::next_generation`]) and `length` the bytes written. Fails with
-    /// `InvalidConfiguration` when the reservation was not written, `length`
-    /// is 0 or above its capacity, or `generation` is 0, and with `Busy` while
-    /// a write to it is in flight. On error the reservation is dropped, which
-    /// frees it.
+    /// `generation` must be the id in the record header and `length` the bytes
+    /// written. Fails with `InvalidConfiguration` when the reservation was not
+    /// written, `length` is 0 or above its capacity, or `generation` is 0,
+    /// and with `Busy` while a write to it is in flight. On error the
+    /// reservation is dropped, which frees it.
     pub fn publish(
         &self,
         key: Key,
@@ -1057,7 +1397,7 @@ impl<C: Charge> Volume<C> {
         length: u32,
         generation: u64,
         retain_until: u64,
-    ) -> Result<Option<Value>> {
+    ) -> Result<()> {
         let inner = reservation.inner;
         if Rc::strong_count(&inner) != 1 {
             return Err(Error::Busy);
@@ -1081,81 +1421,219 @@ impl<C: Charge> Volume<C> {
             retain_until,
         };
         drop(inner);
+        let known = self.try_get(&key);
         let mut state = self.shared.state();
-        let old = state.tree.insert(key, value);
-        if let Err(error) = state
-            .slots
-            .commit_record(value.slot, value.unit, key, retain_until)
-        {
-            match old {
-                Some(old) => state.tree.insert(key, old),
-                None => state.tree.remove(&key),
-            };
-            let _ = state.slots.abort(allocation);
-            return Err(error);
+        let incarnation = allocation.incarnation;
+        state.slots.published(allocation);
+        state.active.records.insert(
+            record_key(value.slot, value.unit),
+            RecOp::Put(RecordDesc {
+                key,
+                generation,
+                incarnation,
+            }),
+        );
+        state.set(key, IndexOp::Put(value), known);
+        if retain_until != 0 && value.tier == Tier::Storage {
+            state.slots.retain(value.slot, retain_until);
         }
-        if let Some(old) = &old {
-            state.release(old);
-        }
-        state.mutations += 1;
-        drop(allocation);
-        Ok(old)
+        Ok(())
     }
 
-    /// Remove `key`. Returns its value. The record is released: at once for
-    /// cache, by the reuse rule for storage.
-    pub fn remove(&self, key: &Key) -> Option<Value> {
-        self.shared.state().remove(key)
+    /// Remove `key`. Returns its value.
+    pub fn remove<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        key: &Key,
+        scope: &'a S,
+    ) -> Operation<'a, Option<Value>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let key = *key;
+        Box::pin(async move {
+            let old = self.resolve(reactor, scope, &key).await?;
+            if old.is_some() {
+                self.shared.state().set(key, IndexOp::Delete, Some(old));
+            }
+            Ok(old)
+        })
     }
 
     /// Remove `key` only if its value is `expected`. Returns whether it was
     /// removed.
-    pub fn remove_if(&self, key: &Key, expected: &Value) -> bool {
-        let mut state = self.shared.state();
-        if state.tree.get(key) != Some(*expected) {
-            return false;
-        }
-        state.remove(key).is_some()
+    pub fn remove_if<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        key: &Key,
+        expected: &Value,
+        scope: &'a S,
+    ) -> Operation<'a, bool, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let (key, expected) = (*key, *expected);
+        Box::pin(async move {
+            let old = self.resolve(reactor, scope, &key).await?;
+            if old != Some(expected) {
+                return Ok(false);
+            }
+            self.shared.state().set(key, IndexOp::Delete, Some(old));
+            Ok(true)
+        })
     }
 
-    /// Remove every entry with a key in `(low, high)`. Returns the removed
-    /// entries in key order.
-    pub fn remove_range(&self, low: Bound<Key>, high: Bound<Key>) -> Vec<(Key, Value)> {
-        let mut state = self.shared.state();
-        let entries: Vec<(Key, Value)> = state.tree.range(low, high).collect();
-        for (key, _) in &entries {
-            state.remove(key);
-        }
-        entries
+    /// Remove every entry with a key in `(low, high)`, a batch at a time.
+    /// Returns the removed entries in key order.
+    pub fn remove_range<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        low: Bound<Key>,
+        high: Bound<Key>,
+        scope: &'a S,
+    ) -> Operation<'a, Vec<(Key, Value)>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let mut removed = Vec::new();
+            let mut cursor = low;
+            loop {
+                let batch = self.scan_index(reactor, scope, cursor, high, 1024).await?;
+                let Some(last) = batch.last().map(|(k, _)| *k) else {
+                    break;
+                };
+                for (key, value) in batch {
+                    // Only remove what is still current.
+                    let mut state = self.shared.state();
+                    let current = match state.overlay_get(&key) {
+                        Some(current) => current,
+                        None => Some(value),
+                    };
+                    if current == Some(value) {
+                        state.set(key, IndexOp::Delete, Some(Some(value)));
+                        removed.push((key, value));
+                    }
+                }
+                cursor = Bound::Excluded(last);
+            }
+            Ok(removed)
+        })
     }
 
-    /// Set the `retain_until` of `key`'s entry and update its slot's
-    /// protection. Returns whether `key` was found.
-    pub fn set_retain(&self, key: &Key, until: u64) -> bool {
-        let mut state = self.shared.state();
-        let Some(old) = state.tree.get(key) else {
-            return false;
-        };
-        if old.retain_until == until {
-            return true;
-        }
-        state.tree.update(key, |value| value.retain_until = until);
-        state.mutations += 1;
-        if until > old.retain_until {
-            state.slots.retain(old.slot, until);
+    /// Set the `retain_until` of `key`'s entry. Raising also raises its
+    /// slot's bound at once; lowering leaves the slot's bound loose until
+    /// [`Volume::refresh_retain`] recomputes it. Returns whether `key` was
+    /// found.
+    pub fn set_retain<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        key: &Key,
+        until: u64,
+        scope: &'a S,
+    ) -> Operation<'a, bool, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let key = *key;
+        Box::pin(async move {
+            let Some(old) = self.resolve(reactor, scope, &key).await? else {
+                return Ok(false);
+            };
+            if old.retain_until == until {
+                return Ok(true);
+            }
+            let mut state = self.shared.state();
+            state.set(
+                key,
+                IndexOp::Put(Value {
+                    retain_until: until,
+                    ..old
+                }),
+                Some(Some(old)),
+            );
+            if old.tier == Tier::Storage {
+                if until > old.retain_until {
+                    state.slots.retain(old.slot, until);
+                } else {
+                    state.slots.retain_lowered(old.slot);
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    /// Recompute the `retain_until` bound of up to `limit` storage slots
+    /// whose records lowered theirs. Returns how many were recomputed.
+    pub fn refresh_retain<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        limit: usize,
+        scope: &'a S,
+    ) -> Operation<'a, usize, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let stale = self.shared.state().slots.stale_retain(limit);
+            let mut done = 0;
+            for (slot, incarnation) in stale {
+                let Some(seen) = self
+                    .shared
+                    .state()
+                    .slots
+                    .slot_state(slot)
+                    .map(|s| s.retain_until)
+                else {
+                    continue;
+                };
+                let mut max = 0;
+                for (rk, desc) in self.slot_records(reactor, scope, slot).await? {
+                    if desc.incarnation != incarnation {
+                        continue;
+                    }
+                    let (_, unit) = record_key_parts(&rk);
+                    if let Some(value) = self.resolve(reactor, scope, &desc.key).await?
+                        && value.slot == slot
+                        && value.unit == unit
+                    {
+                        max = max.max(value.retain_until);
+                    }
+                }
+                // Retired records of the slot stay protected until released.
+                self.shared
+                    .state()
+                    .slots
+                    .set_retain(slot, incarnation, seen, max);
+                done += 1;
+            }
+            Ok(done)
+        })
+    }
+
+    /// Record map entries of one slot, merged with the overlays.
+    pub(super) async fn slot_records<S: Scope, B: Budget>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+        slot: u32,
+    ) -> std::result::Result<Vec<(Key, RecordDesc)>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let high = if u64::from(slot) + 1 < self.slot_count {
+            Bound::Excluded(record_key(slot + 1, 0))
         } else {
-            let slot = old.slot;
-            let keys = state.slots.keys(slot);
-            let max = keys
-                .iter()
-                .filter_map(|k| state.tree.get(k))
-                .filter(|v| v.slot == slot)
-                .map(|v| v.retain_until)
-                .max()
-                .unwrap_or(0);
-            state.slots.set_retain(slot, max);
-        }
-        true
+            Bound::Unbounded
+        };
+        self.scan_records(
+            reactor,
+            scope,
+            Bound::Included(record_key(slot, 0)),
+            high,
+            usize::MAX,
+        )
+        .await
     }
 
     /// Occupancy summary.
@@ -1164,14 +1642,12 @@ impl<C: Charge> Volume<C> {
     }
 
     /// State of one slot, or `None` when out of range. Slot `i` covers bytes
-    /// `[i * SLOT_BYTES, (i + 1) * SLOT_BYTES)` of the slab, which lets the
-    /// caller attribute usage to backing devices.
+    /// `[i * SLOT_BYTES, (i + 1) * SLOT_BYTES)` of the slab.
     pub fn slot_state(&self, slot: u32) -> Option<SlotState> {
         self.shared.state().slots.slot_state(slot)
     }
 
-    /// Bytes in use by node units and records in slots `range`, for usage per
-    /// backing device. O(log slots).
+    /// Bytes in use by node units and records in slots `range`. O(log slots).
     pub fn used_bytes(&self, range: std::ops::Range<u32>) -> u64 {
         self.shared.state().slots.used_bytes(range)
     }
@@ -1195,273 +1671,35 @@ impl<C: Charge> Volume<C> {
             failed: commit.failed,
             seq: commit.seq,
             durable_unit: commit.durable_unit,
+            pages_written: commit.pages_written,
+            writes: commit.writes,
         }
     }
+}
 
-    /// Make every index change made before this call durable.
-    ///
-    /// Concurrent callers share one commit attempt. A caller whose changes
-    /// came after the running attempt started waits for it and then runs (or
-    /// joins) a follow-up attempt. A failed attempt reports its error to every
-    /// caller it covered; the volume stays usable and the next commit retries
-    /// the same changes. Dropping the future of the caller running an attempt
-    /// fails that attempt with `Cancelled` for the other callers.
-    ///
-    /// An attempt writes every dirty node to new addresses, fsyncs (which
-    /// also makes all published data durable, because entries are published
-    /// only after their write completed), writes the superblock that does not
-    /// hold the newest durable one, and fsyncs again. When there is no space
-    /// for nodes, it evicts cache slots.
-    pub fn commit<'a, S: Scope, B: Budget>(
-        &'a self,
-        reactor: &'a Reactor<S, B>,
-        scope: &'a S,
-    ) -> Operation<'a, (), S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        let target = self.shared.state().mutations;
-        // Freed space is released only by later successful commits. When
-        // some is pending, this call runs (or joins) at least one attempt
-        // that starts after it, even with no new changes. One such attempt
-        // is enough, so repeated calls drain the space without looping.
-        let reclaim = self.shared.state().slots.has_pending();
-        let (finished_at_call, attempts_at_call) = {
-            let commit = self.commit.borrow();
-            (commit.finished, commit.attempts)
-        };
-        Box::pin(async move {
-            loop {
-                let wait_for = {
-                    let commit = self.commit.borrow();
-                    if commit.durable_mutations >= target
-                        && (!reclaim || commit.finished > attempts_at_call)
-                    {
-                        if let Some(failure) = &commit.failure
-                            && reclaim
-                            && failure.attempt == commit.finished
-                            && failure.attempt > attempts_at_call
-                        {
-                            return Err(failure
-                                .error
-                                .downcast_ref::<S::Error>()
-                                .copied()
-                                .unwrap_or_else(|| uring_runtime::Error::Io.into()));
-                        }
-                        return Ok(());
-                    }
-                    if let Some(failure) = &commit.failure
-                        && failure.attempt > finished_at_call
-                        && failure.covered >= target
-                    {
-                        return Err(failure
-                            .error
-                            .downcast_ref::<S::Error>()
-                            .copied()
-                            .unwrap_or_else(|| uring_runtime::Error::Io.into()));
-                    }
-                    commit.running.then_some(commit.attempts)
-                };
-                match wait_for {
-                    Some(attempt) => {
-                        poll_fn(|cx| {
-                            if self.commit.borrow().finished >= attempt {
-                                Poll::Ready(())
-                            } else {
-                                self.signals.register(cx.waker());
-                                Poll::Pending
-                            }
-                        })
-                        .await
-                    }
-                    None => return self.attempt(reactor, scope).await,
-                }
-            }
+/// Cache-only page source for [`Volume::try_get`].
+struct TryIo<'a, C: Charge>(&'a Volume<C>);
+
+impl<C: Charge> btree::Source for TryIo<'_, C> {
+    type Error = std::convert::Infallible;
+
+    fn cached(&self, req: &Req) -> Option<Rc<TreePage>> {
+        req.addrs.iter().filter(|a| !a.is_none()).find_map(|addr| {
+            self.0
+                .pager
+                .get(*addr, req.priority)
+                .filter(|p| fits(p, req))
         })
     }
 
-    async fn attempt<S: Scope, B: Budget>(
+    fn load(
         &self,
-        reactor: &Reactor<S, B>,
-        scope: &S,
-    ) -> std::result::Result<(), S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        let id = {
-            let mut commit = self.commit.borrow_mut();
-            commit.running = true;
-            commit.attempts += 1;
-            commit.attempts
-        };
-        let mut attempt = Attempt::<C, S::Error> {
-            volume: self,
-            id,
-            plan: None,
-            epoch: None,
-            covered: 0,
-            done: false,
-            error: PhantomData,
-        };
-        // A canceled attempt may leave writes in flight. Wait for them so they
-        // cannot land after this attempt reuses an address or superblock.
-        poll_fn(|cx| {
-            if self.signals.meta_writes.get() == 0 {
-                Poll::Ready(())
-            } else {
-                self.signals.register(cx.waker());
-                Poll::Pending
-            }
-        })
-        .await;
-        if let Err(error) = scope.check() {
-            return attempt.fail(error);
-        }
-        let (mut plan, next_generation) = {
-            let mut state = self.shared.state();
-            state.release_freed();
-            let epoch = state.slots.begin_commit();
-            attempt.epoch = Some(epoch);
-            let seq = {
-                let mut commit = self.commit.borrow_mut();
-                commit.seq += 1;
-                commit.seq
-            };
-            let mut evictions = 0;
-            let plan = loop {
-                let State { tree, slots, .. } = &mut *state;
-                match tree.prepare_commit(seq, &mut || slots.alloc_node()) {
-                    Ok(plan) => break plan,
-                    Err(Error::Busy) if evictions < COMMIT_EVICTIONS => {
-                        evictions += 1;
-                        state.release_freed();
-                        // `now = 0` never evicts protected storage.
-                        if state.evict(0, None).is_none() {
-                            drop(state);
-                            return attempt.fail(Error::Busy.into());
-                        }
-                    }
-                    Err(error) => {
-                        drop(state);
-                        return attempt.fail(error.into());
-                    }
-                }
-            };
-            attempt.covered = state.mutations;
-            (plan, state.next_generation)
-        };
-        let writes = std::mem::take(&mut plan.writes);
-        let superblock = Superblock {
-            volume_id: self.volume_id,
-            seq: plan.seq,
-            unit_bytes: UNIT_BYTES as u32,
-            slot_units: super::format::SLOT_UNITS,
-            slot_count: self.slot_count,
-            root: plan.root,
-            root_level: plan.root_level,
-            entries: plan.entries,
-            next_generation,
-        };
-        attempt.plan = Some(plan);
-        let results: Vec<std::result::Result<(), S::Error>> = bounded(
-            writes.iter().map(|(addr, bytes)| {
-                Box::pin(self.write_unit(reactor, addr.offset(), bytes, scope))
-                    as Pin<Box<dyn Future<Output = _> + '_>>
-            }),
-            IO_CONCURRENCY,
-        )
-        .await;
-        if let Some(Err(error)) = results.into_iter().find(|r| r.is_err()) {
-            return attempt.fail(error);
-        }
-        if let Err(error) = self.slab.sync(reactor, scope).await {
-            return attempt.fail(error);
-        }
-        let unit = other_unit(self.commit.borrow().durable_unit);
-        if let Err(error) = self
-            .write_unit(reactor, unit_offset(0, unit), &superblock.encode(), scope)
-            .await
-        {
-            return attempt.fail(error);
-        }
-        if let Err(error) = self.slab.sync(reactor, scope).await {
-            return attempt.fail(error);
-        }
-        attempt.succeed(unit);
-        Ok(())
-    }
-}
-
-/// One running commit attempt. Dropping it unfinished fails it.
-struct Attempt<'v, C: Charge, E: Copy + 'static + From<uring_runtime::Error>> {
-    volume: &'v Volume<C>,
-    id: u64,
-    plan: Option<CommitPlan>,
-    epoch: Option<u64>,
-    covered: u64,
-    done: bool,
-    error: PhantomData<E>,
-}
-
-impl<C: Charge, E: Copy + 'static + From<uring_runtime::Error>> Attempt<'_, C, E> {
-    fn succeed(&mut self, unit: u16) {
-        self.finish(None, Some(unit));
+        _req: Req,
+    ) -> LocalFuture<'_, std::result::Result<Option<Rc<TreePage>>, Self::Error>> {
+        Box::pin(async { Ok(None) })
     }
 
-    fn fail(&mut self, error: E) -> std::result::Result<(), E> {
-        self.finish(Some(error), None);
-        Err(error)
-    }
-
-    fn finish(&mut self, error: Option<E>, unit: Option<u16>) {
-        self.done = true;
-        let volume = self.volume;
-        {
-            let mut state = volume.shared.state();
-            let State { tree, slots, .. } = &mut *state;
-            match (&error, self.plan.take()) {
-                (None, Some(plan)) => tree.commit_succeeded(plan),
-                (_, Some(plan)) => tree.commit_failed(plan),
-                (_, None) => {}
-            }
-            if let Some(epoch) = self.epoch {
-                if error.is_none() {
-                    slots.commit_succeeded(epoch);
-                } else {
-                    slots.commit_failed(epoch);
-                }
-            }
-            state.release_freed();
-        }
-        let mut commit = volume.commit.borrow_mut();
-        commit.running = false;
-        commit.finished = self.id;
-        match error {
-            None => {
-                commit.succeeded += 1;
-                commit.durable_mutations = commit.durable_mutations.max(self.covered);
-                if let Some(unit) = unit {
-                    commit.durable_unit = unit;
-                }
-            }
-            Some(error) => {
-                commit.failed += 1;
-                commit.failure = Some(Failure {
-                    attempt: self.id,
-                    covered: self.covered,
-                    error: Box::new(error),
-                });
-            }
-        }
-        drop(commit);
-        volume.signals.wake();
-    }
-}
-
-impl<C: Charge, E: Copy + 'static + From<uring_runtime::Error>> Drop for Attempt<'_, C, E> {
-    fn drop(&mut self) {
-        if !self.done {
-            self.finish(Some(uring_runtime::Error::Cancelled.into()), None);
-        }
+    fn prefetch(&self, _reqs: Vec<Req>) -> LocalFuture<'_, ()> {
+        Box::pin(async {})
     }
 }

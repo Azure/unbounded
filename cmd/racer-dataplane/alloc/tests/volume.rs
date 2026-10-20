@@ -9,7 +9,10 @@ use page_alloc::volume::{Limits, SLOT_BYTES, Tier};
 #[cfg(feature = "simulation")]
 mod simulation {
     use super::*;
-    use page_alloc::volume::{Key, RETAIN_FOREVER, SlotKind, UNIT_BYTES, WHOLE_SLOT_CLASS};
+    use page_alloc::volume::{
+        Key, MountReport, RETAIN_FOREVER, SlotKind, UNIT_BYTES, Value, VolumeOptions,
+        WHOLE_SLOT_CLASS,
+    };
     use std::ops::Bound;
     use std::rc::Rc;
     use uring_runtime::reactor::simulation::{Fault, Simulation, disk::DiskState};
@@ -41,6 +44,8 @@ mod simulation {
         assert!(report.formatted);
         assert_eq!((report.seq, report.entries), (1, 0));
         assert_eq!(volume.slot_count(), SLOTS);
+        assert!(volume.is_dirty(), "the meta slot entry is not recorded yet");
+        commit(&reactor, &volume).unwrap();
         assert!(!volume.is_dirty());
         let mut expected = Vec::new();
         for n in 0..300 {
@@ -63,43 +68,54 @@ mod simulation {
             expected.push((key(1, n), value));
         }
         assert!(volume.is_dirty());
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        assert_eq!(volume.len(), 300);
+        commit(&reactor, &volume).unwrap();
+        assert_eq!(volume.commit_stats().succeeded, 2);
+        // Retired pages drain within two commits; then a commit with
+        // nothing to do writes nothing.
+        let mut drains = 0;
+        while volume.is_dirty() {
+            commit(&reactor, &volume).unwrap();
+            drains += 1;
+            assert!(drains <= 2);
+        }
+        let attempts = volume.commit_stats().attempts;
+        commit(&reactor, &volume).unwrap();
+        assert_eq!(volume.commit_stats().attempts, attempts);
         assert!(!volume.is_dirty());
-        assert_eq!(volume.commit_stats().succeeded, 1);
-        // A commit with nothing to do writes nothing.
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
-        assert_eq!(volume.commit_stats().attempts, 1);
         // Uncommitted changes are lost on crash.
         put(&reactor, &volume, &slab, Tier::Storage, key(2, 0), 10, 0).unwrap();
-        volume.remove(&key(1, 1));
+        remove(&reactor, &volume, &key(1, 1));
         let generation = volume.next_generation();
+        let seq = volume.commit_stats().seq;
         crash(&sim, volume, slab);
 
         let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         assert!(!report.formatted);
-        assert_eq!(report.seq, 2);
-        assert_eq!(report.superblock_unit, 1);
-        assert!(report.lost.is_empty() && report.dropped.is_empty() && !report.dirty);
+        assert_eq!(report.seq, seq);
+        assert!(report.lost.is_empty() && !report.dirty && !report.fell_back);
         assert_eq!(report.entries, 300);
-        assert_eq!(volume.get(&key(2, 0)), None);
+        assert_eq!(volume.len(), 300);
+        assert_eq!(get(&reactor, &volume, &key(2, 0)), None);
         for (key, value) in &expected {
-            assert_eq!(volume.get(key), Some(*value));
+            assert_eq!(get(&reactor, &volume, key), Some(*value));
             assert!(check(&reactor, &volume, &slab, key, value).unwrap());
         }
+        expected.sort_by_key(|(key, _)| *key);
+        assert!(entries(&reactor, &volume) == expected);
         assert!(volume.next_generation() > generation);
         // Keep working after the remount.
         put(&reactor, &volume, &slab, Tier::Storage, key(2, 1), 10, 0).unwrap();
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
-        assert_eq!(volume.commit_stats().durable_unit, 0);
+        commit(&reactor, &volume).unwrap();
         crash(&sim, volume, slab);
         let (volume, _slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
-        assert_eq!(report.seq, 3);
+        assert_eq!(report.seq, seq + 1);
         assert_eq!(report.entries, 301);
-        // Nodes only the older tree references stay reserved.
+        // Pages only the older tree references stay reserved.
         assert!(report.pending_nodes > 0);
         assert!(volume.usage().pending_units >= report.pending_nodes);
         assert!(volume.is_dirty());
-        assert!(volume.get(&key(2, 1)).is_some());
+        assert!(get(&reactor, &volume, &key(2, 1)).is_some());
     }
 
     #[test]
@@ -182,7 +198,7 @@ mod simulation {
         crash(&sim, volume, slab);
         let (volume, _slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         assert_eq!(report.entries, 52);
-        assert!(volume.get(&key(2, 1)).is_some());
+        assert!(get(&reactor, &volume, &key(2, 1)).is_some());
     }
 
     #[test]
@@ -193,13 +209,13 @@ mod simulation {
         for n in 0..100 {
             put(&reactor, &volume, &slab, Tier::Storage, key(1, n), 4096, 0).unwrap();
         }
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
         for n in 100..200 {
             put(&reactor, &volume, &slab, Tier::Storage, key(1, n), 4096, 0).unwrap();
         }
-        volume.remove(&key(1, 0));
+        remove(&reactor, &volume, &key(1, 0));
         let before = volume.usage();
-        // Node write failure.
+        // Page write failure.
         sim.inject("write", Fault::Errno(libc::EIO)).unwrap();
         let tasks: Vec<Task<'_, _>> = (0..3).map(|_| volume.commit(&reactor, &SCOPE)).collect();
         for result in drive_all(&reactor, tasks) {
@@ -211,28 +227,32 @@ mod simulation {
                 sim.inject("fsync", Fault::Delay(0)).unwrap();
             }
             sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
-            assert!(drive(&reactor, volume.commit(&reactor, &SCOPE)).is_err());
+            assert!(commit(&reactor, &volume).is_err());
         }
         let stats = volume.commit_stats();
         assert_eq!((stats.attempts, stats.failed), (4, 3));
         assert!(volume.is_dirty());
-        // Failed attempts leak nothing beyond pending nodes.
+        // Failed attempts leak no records.
         assert_eq!(volume.usage().records, before.records);
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
-        // Freed space drains with two more commits.
+        commit(&reactor, &volume).unwrap();
+        // Retired space drains with two more commits.
         assert!(volume.is_dirty());
         for _ in 0..2 {
-            drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+            commit(&reactor, &volume).unwrap();
         }
         assert!(!volume.is_dirty());
+        assert_eq!(volume.usage().records, 199);
         crash(&sim, volume, slab);
         let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         assert_eq!(report.entries, 199);
         assert!(report.lost.is_empty());
         for n in 1..200 {
-            let value = volume.get(&key(1, n)).unwrap();
+            let value = get(&reactor, &volume, &key(1, n)).unwrap();
             assert!(check(&reactor, &volume, &slab, &key(1, n), &value).unwrap());
         }
+        let scrub = drive(&reactor, volume.scrub(&reactor, &SCOPE)).unwrap();
+        assert!(scrub.lost.is_empty() && scrub.dropped.is_empty());
+        assert_eq!(scrub.entries, 199);
     }
 
     #[test]
@@ -253,7 +273,7 @@ mod simulation {
             drive(&reactor, waiter),
             Err(TestError::Runtime(uring_runtime::Error::Cancelled))
         );
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
         crash(&sim, volume, slab);
         let (_volume, _slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         assert_eq!(report.entries, 100);
@@ -282,36 +302,38 @@ mod simulation {
         assert_eq!(volume.allocate(Tier::Cache, whole).err(), Some(Error::Busy));
         // A leased slot is skipped.
         let lease = volume.lease(a.slot).unwrap();
-        let evicted = volume.evict_one(50).unwrap();
+        let evicted = evict_one(&reactor, &volume, 50).unwrap();
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].0, key(1, 2));
         drop(lease);
-        assert_eq!(volume.get(&key(1, 2)), None);
-        let (reservation, evicted) = volume.allocate_evicting(Tier::Cache, whole, 50, 4);
+        assert_eq!(get(&reactor, &volume, &key(1, 2)), None);
+        let (reservation, evicted) =
+            allocate_evicting(&reactor, &volume, Tier::Cache, whole, 50, 4);
         let reservation = reservation.unwrap();
         assert!(evicted.is_empty());
         drop(reservation);
         // Storage is protected until retain_until passes.
         put(&reactor, &volume, &slab, Tier::Cache, key(1, 3), whole, 0).unwrap();
-        let (reservation, evicted) = volume.allocate_evicting(Tier::Cache, whole, 50, 8);
+        let (reservation, evicted) =
+            allocate_evicting(&reactor, &volume, Tier::Cache, whole, 50, 8);
         let mut held = vec![reservation.unwrap()];
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].1.tier, Tier::Cache);
-        while let Some(evicted) = volume.evict_one(50) {
+        while let Some(evicted) = evict_one(&reactor, &volume, 50) {
             assert!(evicted.iter().all(|(_, v)| v.tier == Tier::Cache));
         }
-        assert!(volume.get(&key(1, 1)).is_some());
+        assert!(get(&reactor, &volume, &key(1, 1)).is_some());
         while let Ok(reservation) = volume.allocate(Tier::Cache, whole) {
             held.push(reservation);
         }
         assert_eq!(held.len(), 2);
-        assert_eq!(volume.evict_one(50), None);
-        let evicted = volume.evict_one(101).unwrap();
+        assert_eq!(evict_one(&reactor, &volume, 50), None);
+        let evicted = evict_one(&reactor, &volume, 101).unwrap();
         assert_eq!(
             evicted.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [key(1, 1)]
         );
-        assert_eq!(volume.get(&key(1, 1)), None);
+        assert_eq!(get(&reactor, &volume, &key(1, 1)), None);
     }
 
     #[test]
@@ -344,11 +366,12 @@ mod simulation {
         // A reservation in flight pins its open slot; the others are taken.
         let pinned = volume.allocate(Tier::Cache, page).unwrap();
         assert_eq!(pinned.slot(), slots[0]);
-        let (reservation, evicted) = volume.allocate_evicting(Tier::Cache, page * 8, 0, 1);
+        let (reservation, evicted) =
+            allocate_evicting(&reactor, &volume, Tier::Cache, page * 8, 0, 1);
         let reservation = reservation.unwrap();
         assert_eq!(evicted.len(), 1);
         assert_ne!(evicted[0].1.slot, slots[0]);
-        assert!(volume.get(&key(1, 0)).is_some());
+        assert!(get(&reactor, &volume, &key(1, 0)).is_some());
         drop(reservation);
         drop(pinned);
         // With no leases or holds, a full page fits after one eviction.
@@ -362,7 +385,8 @@ mod simulation {
             0,
         )
         .unwrap();
-        let (reservation, evicted) = volume.allocate_evicting(Tier::Cache, SLOT_BYTES, 0, 4);
+        let (reservation, evicted) =
+            allocate_evicting(&reactor, &volume, Tier::Cache, SLOT_BYTES, 0, 4);
         assert!(reservation.is_ok());
         assert!(!evicted.is_empty());
     }
@@ -393,21 +417,23 @@ mod simulation {
         }
         // Quota reached and the storage slot is retained: no cache slot is
         // evicted for a storage allocation.
-        let (reservation, evicted) = volume.allocate_evicting(Tier::Storage, whole, 50, 64);
+        let (reservation, evicted) =
+            allocate_evicting(&reactor, &volume, Tier::Storage, whole, 50, 64);
         assert_eq!(reservation.err(), Some(Error::Busy));
         assert!(evicted.is_empty());
         for n in 0..3 {
-            assert!(volume.get(&key(1, n)).is_some());
+            assert!(get(&reactor, &volume, &key(1, n)).is_some());
         }
         // Once the storage slot expires, it is evicted and reused.
-        let (reservation, evicted) = volume.allocate_evicting(Tier::Storage, whole, 2000, 64);
+        let (reservation, evicted) =
+            allocate_evicting(&reactor, &volume, Tier::Storage, whole, 2000, 64);
         assert!(reservation.is_ok());
         assert_eq!(
             evicted.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [key(1, 0)]
         );
         for n in 1..3 {
-            assert!(volume.get(&key(1, n)).is_some());
+            assert!(get(&reactor, &volume, &key(1, n)).is_some());
         }
     }
 
@@ -480,15 +506,16 @@ mod simulation {
         assert_eq!(reservation.capacity(), UNIT_BYTES as u64);
         assert_eq!(
             volume.publish(key(1, 0), reservation, 100, generation, 0),
-            Ok(None)
+            Ok(())
         );
-        let first = volume.get(&key(1, 0)).unwrap();
+        let first = get(&reactor, &volume, &key(1, 0)).unwrap();
         assert_eq!(first.length, 100);
-        // Replacing returns the previous value; the cache record is freed.
+        // Replacing an uncommitted value frees its record at once.
         let second = put(&reactor, &volume, &slab, Tier::Cache, key(1, 0), 5000, 0).unwrap();
         assert_ne!(first, second);
         assert!(volume.next_generation() > second.generation);
         assert_eq!(volume.usage().records, 1);
+        assert_eq!(volume.len(), 1);
         // An in-flight write blocks publish.
         let reservation = volume.allocate(Tier::Cache, 100).unwrap();
         let buffer = record(&slab, &key(1, 1), 9, 100);
@@ -506,6 +533,12 @@ mod simulation {
         while reactor.in_flight() != 0 {
             reactor.poll_budgeted(64).unwrap();
         }
+        assert_eq!(volume.usage().records, 1);
+        // Replacing a committed value frees its record with the next commit.
+        commit(&reactor, &volume).unwrap();
+        put(&reactor, &volume, &slab, Tier::Cache, key(1, 0), 100, 0).unwrap();
+        assert_eq!(volume.usage().records, 2);
+        commit(&reactor, &volume).unwrap();
         assert_eq!(volume.usage().records, 1);
     }
 
@@ -528,40 +561,69 @@ mod simulation {
                 .unwrap();
             }
         }
+        commit(&reactor, &volume).unwrap();
         let low = Key::new([2; 8], [0; 12], 0);
         let high = Key::new([3; 8], [0; 12], 0);
-        let removed = volume.remove_range(Bound::Included(low), Bound::Excluded(high));
+        let removed = drive(
+            &reactor,
+            volume.remove_range(
+                &reactor,
+                Bound::Included(low),
+                Bound::Excluded(high),
+                &SCOPE,
+            ),
+        )
+        .unwrap();
         assert_eq!(removed.len(), 20);
         assert!(removed.iter().all(|(k, _)| k.cache() == [2; 8]));
         assert_eq!(volume.len(), 40);
-        let value = volume.get(&key(1, 0)).unwrap();
+        let value = get(&reactor, &volume, &key(1, 0)).unwrap();
         let mut other = value;
         other.generation += 1;
-        assert!(!volume.remove_if(&key(1, 0), &other));
-        assert!(volume.remove_if(&key(1, 0), &value));
-        assert!(!volume.remove_if(&key(1, 0), &value));
-        assert_eq!(volume.remove(&key(1, 0)), None);
+        let remove_if = |value: &Value| {
+            drive(
+                &reactor,
+                volume.remove_if(&reactor, &key(1, 0), value, &SCOPE),
+            )
+            .unwrap()
+        };
+        assert!(!remove_if(&other));
+        assert!(remove_if(&value));
+        assert!(!remove_if(&value));
+        assert_eq!(remove(&reactor, &volume, &key(1, 0)), None);
+        let set_retain = |key: &Key, until: u64| {
+            drive(&reactor, volume.set_retain(&reactor, key, until, &SCOPE)).unwrap()
+        };
+        let refresh = || drive(&reactor, volume.refresh_retain(&reactor, 64, &SCOPE)).unwrap();
         // All storage records of cache 1 and 3 share one slot.
-        let slot = volume.get(&key(1, 1)).unwrap().slot;
+        let slot = get(&reactor, &volume, &key(1, 1)).unwrap().slot;
         assert_eq!(volume.slot_state(slot).unwrap().retain_until, 10);
-        assert!(volume.set_retain(&key(1, 1), 50));
+        assert!(set_retain(&key(1, 1), 50));
         assert_eq!(volume.slot_state(slot).unwrap().retain_until, 50);
-        assert!(volume.set_retain(&key(1, 1), 0));
+        // Lowering leaves the slot bound loose until a recompute.
+        assert!(set_retain(&key(1, 1), 0));
+        assert_eq!(volume.slot_state(slot).unwrap().retain_until, 50);
+        assert_eq!(refresh(), 1);
         assert_eq!(volume.slot_state(slot).unwrap().retain_until, 10);
-        for (key, _) in volume.range(Bound::Unbounded, Bound::Unbounded, usize::MAX) {
-            assert!(volume.set_retain(&key, 0));
+        for (key, _) in entries(&reactor, &volume) {
+            assert!(set_retain(&key, 0));
         }
+        refresh();
         assert_eq!(volume.slot_state(slot).unwrap().retain_until, 0);
-        assert!(!volume.set_retain(&key(9, 9), 0));
-        assert_eq!(volume.next_after(None, 5).len(), 5);
-        let page = volume.next_after(Some(&key(1, 19)), 100);
-        assert_eq!(page.len(), 20);
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        assert!(!set_retain(&key(9, 9), 0));
+        let page = |after: Option<&Key>, limit| {
+            drive(&reactor, volume.next_after(&reactor, after, limit, &SCOPE)).unwrap()
+        };
+        assert_eq!(page(None, 5).len(), 5);
+        assert_eq!(page(Some(&key(1, 19)), 100).len(), 20);
+        commit(&reactor, &volume).unwrap();
         crash(&sim, volume, slab);
         let (volume, _slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         assert_eq!(volume.len(), 39);
-        assert_eq!(volume.get(&key(1, 1)).unwrap().retain_until, 0);
-        assert!(volume.get(&key(2, 1)).is_none());
+        assert_eq!(get(&reactor, &volume, &key(1, 1)).unwrap().retain_until, 0);
+        assert!(get(&reactor, &volume, &key(2, 1)).is_none());
+        // The recomputed bound survived the remount.
+        assert_eq!(volume.slot_state(slot).unwrap().retain_until, 0);
     }
 
     /// Storage records freed by a remove are not reused until two commits
@@ -572,14 +634,14 @@ mod simulation {
         let reactor = TestReactor::new(64, ());
         let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         let first = put(&reactor, &volume, &slab, Tier::Storage, key(1, 0), 4096, 0).unwrap();
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
-        volume.remove(&key(1, 0));
+        commit(&reactor, &volume).unwrap();
+        remove(&reactor, &volume, &key(1, 0));
         let next = put(&reactor, &volume, &slab, Tier::Storage, key(1, 1), 4096, 0).unwrap();
         assert_ne!((next.slot, next.unit), (first.slot, first.unit));
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
         let next = put(&reactor, &volume, &slab, Tier::Storage, key(1, 2), 4096, 0).unwrap();
         assert_ne!((next.slot, next.unit), (first.slot, first.unit));
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
         let next = put(&reactor, &volume, &slab, Tier::Storage, key(1, 3), 4096, 0).unwrap();
         assert_eq!((next.slot, next.unit), (first.slot, first.unit));
     }
@@ -597,9 +659,9 @@ mod simulation {
         let (volume, slab, _) = mount(&reactor, SLOTS, limits).unwrap();
         let whole = SLOT_BYTES;
         put(&reactor, &volume, &slab, Tier::Storage, key(1, 0), whole, 0).unwrap();
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
-        volume.remove(&key(1, 0));
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
+        remove(&reactor, &volume, &key(1, 0));
+        commit(&reactor, &volume).unwrap();
         // The removed record is still charged.
         assert_eq!(
             volume.allocate(Tier::Storage, whole).err(),
@@ -609,101 +671,324 @@ mod simulation {
         let mut commits = 0;
         while volume.is_dirty() {
             assert!(commits < 4, "pending space never drained");
-            drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+            commit(&reactor, &volume).unwrap();
             commits += 1;
         }
         assert!(commits >= 1);
         assert!(volume.allocate(Tier::Storage, whole).is_ok());
         // Once drained, a commit has nothing to do.
         let attempts = volume.commit_stats().attempts;
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
         assert_eq!(volume.commit_stats().attempts, attempts);
         assert!(!volume.is_dirty());
     }
 
-    /// A corrupt leaf loses only its range, which is salvaged from the older
-    /// tree; a corrupt superblock falls back to the other one.
+    /// Find the first unit of the meta slot holding a tree page of `kind`
+    /// (1 index, 2 record map, 3 slot table) at `level` written by `seq`.
+    fn find_page(sim: &Simulation, kind: u8, level: u8, seq: u64) -> Option<u64> {
+        let path = std::path::Path::new(PATH);
+        (4..4104u64).find(|unit| {
+            let bytes = sim
+                .disk()
+                .read(path, unit * UNIT_BYTES as u64, 64, DiskState::Durable)
+                .unwrap();
+            bytes[..8] == *b"RCRVPAGE"
+                && bytes[10] == kind
+                && bytes[11] == level
+                && bytes[32..40] == seq.to_le_bytes()
+        })
+    }
+
+    fn flip(sim: &Simulation, unit: u64, offset: u64) {
+        let path = std::path::Path::new(PATH);
+        let at = unit * UNIT_BYTES as u64 + offset;
+        let byte = sim.disk().read(path, at, 1, DiskState::Durable).unwrap()[0];
+        sim.disk()
+            .corrupt(path, at, &[!byte], DiskState::Durable)
+            .unwrap();
+    }
+
+    /// A corrupt leaf loses only its range; a corrupt superblock falls back
+    /// to the other one.
     #[test]
-    fn corruption_is_repaired_from_the_older_tree() {
+    fn corrupt_leaf_loses_only_its_range() {
         let (sim, _env) = setup();
         let reactor = TestReactor::new(64, ());
         let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         for n in 0..500 {
             put(&reactor, &volume, &slab, Tier::Storage, key(1, n), 4096, 0).unwrap();
         }
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
         // Touch one leaf so the newest tree differs.
         put(&reactor, &volume, &slab, Tier::Storage, key(2, 0), 4096, 0).unwrap();
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        commit(&reactor, &volume).unwrap();
+        let seq = volume.commit_stats().seq;
         crash(&sim, volume, slab);
-
-        // Find a leaf of the newest tree that the older tree shares: corrupt
-        // the first node unit that decodes as a leaf with key(1, 0).
-        let path = std::path::Path::new(PATH);
-        let mut corrupted = 0;
-        for unit in 2..4104u64 {
-            let bytes = sim
-                .disk()
-                .read(
-                    path,
-                    unit * UNIT_BYTES as u64,
-                    UNIT_BYTES,
-                    DiskState::Durable,
-                )
-                .unwrap();
-            // A leaf written by the last commit (seq 3); the older tree has
-            // its previous version elsewhere.
-            if bytes[..8] == *b"RCRVNODE" && bytes[11] == 0 && bytes[32..40] == 3u64.to_le_bytes() {
-                sim.disk()
-                    .corrupt(
-                        path,
-                        unit * UNIT_BYTES as u64 + 100,
-                        &[!bytes[100]],
-                        DiskState::Durable,
-                    )
-                    .unwrap();
-                corrupted += 1;
-                break;
-            }
-        }
-        assert_eq!(corrupted, 1);
-        // Durable-only corruption shows after power loss.
+        let unit = find_page(&sim, 1, 0, seq).expect("an index leaf of the last commit");
+        flip(&sim, unit, 100);
         sim.disk().crash().unwrap();
         let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
-        assert_eq!(report.lost.len(), 1, "{report:?}");
-        assert!(report.salvaged > 0);
-        assert!(report.dirty);
-        // Everything but the key added by the last commit is salvaged.
-        assert_eq!(report.entries, 500);
-        assert!(volume.get(&key(2, 0)).is_none());
-        for n in 0..500 {
-            let value = volume.get(&key(1, n)).unwrap();
-            assert!(check(&reactor, &volume, &slab, &key(1, n), &value).unwrap());
+        // Mount does not read index leaves, so it sees nothing wrong.
+        assert!(report.lost.is_empty() && !report.fell_back);
+        let scrub = drive(&reactor, volume.scrub(&reactor, &SCOPE)).unwrap();
+        assert_eq!(scrub.lost.len(), 1, "{scrub:?}");
+        assert_eq!(volume.lost_ranges(), scrub.lost);
+        let survivors = entries(&reactor, &volume);
+        assert!(survivors.len() < 501 && survivors.len() >= 501 - 72);
+        for (key, value) in &survivors {
+            assert!(check(&reactor, &volume, &slab, key, value).unwrap());
         }
-        drive(&reactor, volume.commit(&reactor, &SCOPE)).unwrap();
+        // Writes into the lost range rebuild it.
+        let (low, _) = scrub.lost[0];
+        put(&reactor, &volume, &slab, Tier::Cache, low, 4096, 0).unwrap();
+        commit(&reactor, &volume).unwrap();
+        crash(&sim, volume, slab);
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        let scrub = drive(&reactor, volume.scrub(&reactor, &SCOPE)).unwrap();
+        assert!(scrub.lost.is_empty(), "{scrub:?}");
+        assert_eq!(entries(&reactor, &volume).len(), survivors.len() + 1);
+        commit(&reactor, &volume).unwrap();
         crash(&sim, volume, slab);
 
         // Corrupt the newest superblock: the other one is mounted.
         let (_, _, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         let unit = report.superblock_unit;
         sim.disk().crash().unwrap();
-        sim.disk()
-            .corrupt(
-                path,
-                u64::from(unit) * UNIT_BYTES as u64 + 40,
-                &[0xff],
-                DiskState::Durable,
-            )
-            .unwrap();
+        flip(&sim, u64::from(unit), 40);
         sim.disk().crash().unwrap();
         let (volume, _slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
         assert_ne!(report.superblock_unit, unit);
         assert_eq!(report.invalid_superblocks, 1);
-        // The older superblock still has the corrupt leaf, and there is no
-        // valid tree to salvage from.
-        assert_eq!(report.lost.len(), 1);
-        assert_eq!(report.salvaged, 0);
-        assert!(volume.len() < 500 && volume.len() >= 500 - 72);
+        let scrub = drive(&reactor, volume.scrub(&reactor, &SCOPE)).unwrap();
+        assert!(scrub.lost.is_empty());
+        assert_eq!(scrub.entries, survivors.len() as u64 + 1);
+    }
+
+    /// Unreadable allocation metadata falls back to the older root set; a
+    /// bad bitmap copy is rebuilt from the trees.
+    #[test]
+    fn allocation_metadata_corruption_is_contained() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        for n in 0..300 {
+            put(&reactor, &volume, &slab, Tier::Storage, key(1, n), 4096, 0).unwrap();
+        }
+        commit(&reactor, &volume).unwrap();
+        put(&reactor, &volume, &slab, Tier::Storage, key(2, 0), 4096, 0).unwrap();
+        commit(&reactor, &volume).unwrap();
+        let seq = volume.commit_stats().seq;
+        crash(&sim, volume, slab);
+        // The newest slot table leaf: fall back to the older root set.
+        let unit = find_page(&sim, 3, 0, seq).expect("a slot table leaf");
+        flip(&sim, unit, 70);
+        sim.disk().crash().unwrap();
+        let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        assert!(report.fell_back && !report.root_lost, "{report:?}");
+        assert_eq!(report.seq, seq - 1);
+        assert_eq!(report.entries, 300);
+        assert!(get(&reactor, &volume, &key(2, 0)).is_none());
+        for (key, value) in entries(&reactor, &volume) {
+            assert!(check(&reactor, &volume, &slab, &key, &value).unwrap());
+        }
+        commit(&reactor, &volume).unwrap();
+        let seq = volume.commit_stats().seq;
+        crash(&sim, volume, slab);
+        // Both bitmap copies of the meta slot: rebuilt by walking the trees.
+        for copy in [2u64, 3] {
+            flip(&sim, copy, 70);
+        }
+        sim.disk().crash().unwrap();
+        let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        assert_eq!(report.seq, seq);
+        assert_eq!(report.rebuilt_bitmaps, 1, "{report:?}");
+        assert!(report.dirty);
+        // The rebuilt bitmap protects every live page: keep writing, then
+        // check everything after a remount.
+        for n in 0..200 {
+            put(&reactor, &volume, &slab, Tier::Storage, key(3, n), 4096, 0).unwrap();
+        }
+        commit(&reactor, &volume).unwrap();
+        crash(&sim, volume, slab);
+        let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        assert_eq!(report.rebuilt_bitmaps, 0);
+        let scrub = drive(&reactor, volume.scrub(&reactor, &SCOPE)).unwrap();
+        assert!(scrub.lost.is_empty() && scrub.lost_records.is_empty());
+        assert_eq!(scrub.entries, 500);
+        for (key, value) in entries(&reactor, &volume) {
+            assert!(check(&reactor, &volume, &slab, &key, &value).unwrap());
+        }
+    }
+
+    fn small_cache(limits: Limits, cache: usize) -> VolumeOptions<()> {
+        let mut options = options(limits);
+        options.metadata_cache_bytes = cache;
+        options
+    }
+
+    fn mount_with(
+        reactor: &TestReactor,
+        options: VolumeOptions<()>,
+    ) -> (
+        Rc<page_alloc::volume::Volume<()>>,
+        Rc<page_alloc::Slab<()>>,
+        MountReport,
+    ) {
+        let slab = slab(SLOTS);
+        let (volume, report) = drive(
+            reactor,
+            page_alloc::volume::Volume::mount(reactor, slab.clone(), options, &SCOPE),
+        )
+        .unwrap();
+        (volume, slab, report)
+    }
+
+    /// Mount reads the allocation metadata only, lookups fault index pages
+    /// in through a cache that stays within its budget, and hot lookups hit.
+    #[test]
+    fn cold_lookups_fault_through_a_tiny_cache() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        let count = 5000u32;
+        let mut values = Vec::new();
+        for n in 0..count {
+            values.push(put(&reactor, &volume, &slab, Tier::Cache, key(1, n), 100, 0).unwrap());
+        }
+        commit(&reactor, &volume).unwrap();
+        crash(&sim, volume, slab);
+        let budget = 8 * page_alloc::volume::FRAME_BYTES;
+        let (volume, _slab, report) = mount_with(&reactor, small_cache(Limits::UNLIMITED, budget));
+        // 5000 index entries need about 70 leaves: mount reads none of them.
+        assert!(report.pages_read < 10, "{report:?}");
+        let reads = volume.pager_stats().reads;
+        for n in (0..count).step_by(97) {
+            assert_eq!(get(&reactor, &volume, &key(1, n)), Some(values[n as usize]));
+            assert!(volume.pager_stats().bytes <= budget as u64);
+        }
+        let cold = volume.pager_stats().reads - reads;
+        assert!(cold >= 40, "cold lookups read pages: {cold}");
+        // A hot key stays cached: no reads.
+        let hot = key(1, 7);
+        get(&reactor, &volume, &hot);
+        let reads = volume.pager_stats().reads;
+        for _ in 0..10 {
+            get(&reactor, &volume, &hot);
+            assert!(volume.try_get(&hot).is_some());
+        }
+        assert_eq!(volume.pager_stats().reads, reads);
+        // A full scan does not flush the hot leaf.
+        assert_eq!(entries(&reactor, &volume).len(), count as usize);
+        assert!(volume.pager_stats().bytes <= budget as u64);
+        let reads = volume.pager_stats().reads;
+        get(&reactor, &volume, &hot);
+        assert_eq!(
+            volume.pager_stats().reads,
+            reads,
+            "a scan flushed a hot leaf"
+        );
+        // A miss with a cold path is answered by try_get only after a fault.
+        assert!(volume.try_get(&key(1, count - 1)).is_none());
+    }
+
+    /// Uncommitted changes are bounded: allocation pushes back until a
+    /// commit drains them.
+    #[test]
+    fn dirty_limit_applies_backpressure() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let mut options = options(Limits::UNLIMITED);
+        options.dirty_bytes = 100 * 160;
+        let (volume, slab, _) = mount_with(&reactor, options);
+        let mut n = 0;
+        while !volume.needs_commit() {
+            put(&reactor, &volume, &slab, Tier::Cache, key(1, n), 100, 0).unwrap();
+            n += 1;
+        }
+        assert!(n < 100);
+        assert_eq!(volume.allocate(Tier::Cache, 100).err(), Some(Error::Busy));
+        let (reservation, evicted) = allocate_evicting(&reactor, &volume, Tier::Cache, 100, 0, 4);
+        assert_eq!(reservation.err(), Some(Error::Busy));
+        assert!(evicted.is_empty(), "backpressure must not evict");
+        commit(&reactor, &volume).unwrap();
+        assert!(!volume.needs_commit());
+        assert!(volume.allocate(Tier::Cache, 100).is_ok());
+        assert_eq!(volume.len(), u64::from(n));
+    }
+
+    /// Commits write pages in contiguous runs, far fewer requests than pages.
+    #[test]
+    fn commits_write_contiguous_runs() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        for n in 0..12_000 {
+            put(&reactor, &volume, &slab, Tier::Cache, key(1, n), 100, 0).unwrap();
+        }
+        commit(&reactor, &volume).unwrap();
+        let stats = volume.commit_stats();
+        assert!(stats.pages_written > 300, "{stats:?}");
+        assert!(stats.writes * 16 < stats.pages_written, "{stats:?}");
+    }
+
+    /// Lose power after every number of reactor turns of a commit: the
+    /// mounted index is the state before or after the commit.
+    #[test]
+    fn crash_at_every_commit_stage() {
+        let mut turns = 0;
+        loop {
+            let (sim, _env) = setup();
+            let reactor = TestReactor::new(64, ());
+            let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+            for n in 0..400 {
+                put(&reactor, &volume, &slab, Tier::Storage, key(1, n), 4096, 0).unwrap();
+            }
+            commit(&reactor, &volume).unwrap();
+            let before = entries(&reactor, &volume);
+            for n in 0..100 {
+                remove(&reactor, &volume, &key(1, n * 3));
+                put(&reactor, &volume, &slab, Tier::Storage, key(2, n), 4096, 0).unwrap();
+            }
+            let after = entries(&reactor, &volume);
+            let mut task: Task<'_, _> = volume.commit(&reactor, &SCOPE);
+            let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
+            let mut finished = false;
+            for _ in 0..turns {
+                if task.as_mut().poll(cx).is_ready() {
+                    finished = true;
+                    break;
+                }
+                reactor.poll_budgeted(1).unwrap();
+            }
+            drop(task);
+            drop(volume);
+            drop(slab);
+            sim.disk().crash().unwrap();
+            while reactor.in_flight() != 0 {
+                reactor.poll_budgeted(64).unwrap();
+            }
+            let (volume, slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+            assert!(!report.root_lost && report.lost.is_empty(), "{report:?}");
+            let mounted = entries(&reactor, &volume);
+            assert!(
+                mounted == before || mounted == after,
+                "turn {turns}: mounted {} entries",
+                mounted.len()
+            );
+            for (key, value) in &mounted {
+                assert!(check(&reactor, &volume, &slab, key, value).unwrap());
+            }
+            let scrub = drive(&reactor, volume.scrub(&reactor, &SCOPE)).unwrap();
+            assert!(scrub.lost.is_empty() && scrub.dropped.is_empty());
+            // Keep working.
+            put(&reactor, &volume, &slab, Tier::Storage, key(3, 0), 4096, 0).unwrap();
+            commit(&reactor, &volume).unwrap();
+            if finished {
+                break;
+            }
+            turns += 1;
+            assert!(turns < 10_000);
+        }
     }
 }
 
@@ -762,7 +1047,7 @@ fn io_uring_volume_round_trip() {
     assert_eq!(report.entries, 20);
     for (n, value) in values.iter().enumerate() {
         let key = key(1, n as u32);
-        assert_eq!(volume.get(&key), Some(*value));
+        assert_eq!(get(&reactor, &volume, &key), Some(*value));
         assert!(check(&reactor, &volume, &slab, &key, value).unwrap());
     }
     assert_eq!(reactor.in_flight(), 0);
