@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
+	"github.com/Azure/unbounded/internal/racerobject"
 )
 
 const testImage = "example.com/racer-object:v1"
@@ -663,4 +664,35 @@ func TestHandler(t *testing.T) {
 			t.Fatalf("resp = %+v", resp)
 		}
 	})
+}
+
+// TestMutateAcceptsManagedOriginScope keeps the injector and the managed Azure
+// origin in agreement: whatever namespace and buckets an operator-managed origin
+// serves must be injectable, and whatever the origin rejects must be rejected.
+func TestMutateAcceptsManagedOriginScope(t *testing.T) {
+	identity, err := racerobject.AzureOriginIdentity("https://account.blob.core.windows.net/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := racerobject.ValidateOriginScope(identity, []string{"models"}); err != nil {
+		t.Fatalf("origin rejects its own scope: %v", err)
+	}
+
+	pod := newPod(map[string]string{NamespaceAnnotation: identity, BucketsAnnotation: "models", CacheAnnotation: "shared"})
+	if err := Mutate(pod, testCfg); err != nil {
+		t.Fatalf("injector rejects managed origin scope %q: %v", identity, err)
+	}
+
+	for _, tc := range []struct{ namespace, bucket string }{
+		{"store\x00", "one"},
+		{"store", "bad\x00bucket"},
+	} {
+		originErr := racerobject.ValidateOriginScope(tc.namespace, []string{tc.bucket})
+		injectErr := Mutate(newPod(map[string]string{NamespaceAnnotation: tc.namespace, BucketsAnnotation: tc.bucket}), testCfg)
+
+		if (originErr == nil) != (injectErr == nil) {
+			t.Fatalf("scope %q/%q: origin err %v, injector err %v", tc.namespace, tc.bucket, originErr, injectErr)
+		}
+	}
 }
