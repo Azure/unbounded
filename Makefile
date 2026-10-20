@@ -95,6 +95,10 @@ MACHINE_OPS_SITE ?=
 PROJECT_SIGNAL_CONTROLLER_BIN=bin/project-signal-controller
 PROJECT_SIGNAL_CONTROLLER_CMD=./cmd/project-signal-controller
 SIGNAL_CONTROLLER_IMAGE ?= example.invalid/project-signal-controller:replace-me
+PROJECT_SIGNAL_ADAPTER_BIN=bin/project-signal-adapter
+PROJECT_SIGNAL_ADAPTER_CMD=./cmd/project-signal-adapter
+SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
 SIGNAL_NAMESPACE ?= project-signal
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
@@ -237,14 +241,14 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build signal-manifests image-project-signal-controller-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build signal-manifests image-project-signal-controller-local image-project-signal-adapter-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller project-signal-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller project-signal-controller project-signal-adapter token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -297,6 +301,7 @@ help: ## Show this help
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  project-signal-controller        Build Project Signal controller"
+	@echo "  project-signal-adapter           Build Project Signal participant adapter"
 	@echo "  signal-manifests                 Render Project Signal manifests"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
@@ -319,6 +324,7 @@ help: ## Show this help
 	@echo "  image-token-refresher-local      Build token-refresher image"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-project-signal-controller-local Build Project Signal controller image"
+	@echo "  image-project-signal-adapter-local Build Project Signal adapter image"
 	@echo "  Build Project Signal recovery verifier image"
 	@echo "  Build Project Signal GPU runner image"
 	@echo "   Build and push Project Signal GPU runner image"
@@ -1094,6 +1100,12 @@ project-signal-controller-build: signal-manifests ## Build Project Signal contro
 
 project-signal-controller: test project-signal-controller-build ## Build Project Signal controller (implies test)
 
+project-signal-adapter-build: signal-manifests ## Build Project Signal adapter without lint/test
+	@mkdir -p bin
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(PROJECT_SIGNAL_ADAPTER_BIN) $(PROJECT_SIGNAL_ADAPTER_CMD)
+
+project-signal-adapter: test project-signal-adapter-build ## Build Project Signal adapter (implies test)
+
 image-project-signal-controller-local: ## Build Project Signal controller image locally
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
@@ -1102,6 +1114,15 @@ image-project-signal-controller-local: ## Build Project Signal controller image 
 		-t project-signal-controller:$(VERSION_TAG) -t $(SIGNAL_CONTROLLER_IMAGE) \
 		-f ./images/project-signal-controller/Containerfile .
 	$(call trivy-maybe,$(SIGNAL_CONTROLLER_IMAGE))
+
+image-project-signal-adapter-local: ## Build Project Signal adapter image locally
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t project-signal-adapter:$(VERSION_TAG) -t $(SIGNAL_ADAPTER_BUILD_IMAGE) \
+		-f ./images/project-signal-adapter/Containerfile .
+	$(call trivy-maybe,$(SIGNAL_ADAPTER_BUILD_IMAGE))
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
@@ -1182,7 +1203,8 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--templates-dir $(SIGNAL_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(SIGNAL_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(SIGNAL_NAMESPACE) \
-		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE)
+		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
+		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE)
 	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
 	@cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (image: $(SIGNAL_CONTROLLER_IMAGE))"

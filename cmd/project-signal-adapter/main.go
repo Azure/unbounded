@@ -1,0 +1,165 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	osSignal "os/signal"
+	"path/filepath"
+	"syscall"
+
+	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
+	"github.com/Azure/unbounded/internal/signaladapter"
+	"github.com/Azure/unbounded/internal/version"
+)
+
+const adapterName = "project-signal-adapter"
+
+type config struct {
+	signaladapter.Config
+	outputDirectory string
+}
+
+func main() {
+	var cfg config
+
+	command := &cobra.Command{
+		Use:     adapterName,
+		Short:   "Run participant-aware Project Signal backend workloads",
+		Version: version.Version + " (commit: " + version.GitCommit + ")",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx, cancel := osSignal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+
+			return run(ctx, cfg)
+		},
+	}
+
+	flags := command.Flags()
+	flags.StringVar(&cfg.Namespace, "namespace", "", "Namespace for backend resources")
+	flags.StringVar(&cfg.WorkflowName, "workflow-name", "", "Owning Argo Workflow name")
+	flags.StringVar(&cfg.RunName, "run-name", "", "CertificationRun name")
+	flags.Var(uidValue{target: &cfg.RunUID}, "run-uid", "CertificationRun UID")
+	flags.StringVar(&cfg.ParticipantsJSON, "participants-json", "", "Ordered participant snapshot JSON")
+	flags.IntVar(&cfg.ParticipantCount, "participant-count", 0, "Declared participant count")
+	flags.StringVar(&cfg.RequestNodeName, "request-node-name", "", "Compatibility request Node name")
+	flags.StringVar(&cfg.LegacyParticipants, "participants", "", "Compatibility comma-separated Node names")
+	flags.StringVar(&cfg.ScriptConfigMap, "script-configmap", "", "Immutable script ConfigMap")
+	flags.StringVar(&cfg.ScriptKey, "script-key", "", "Script ConfigMap key")
+	flags.StringVar(&cfg.ScriptDigest, "script-digest", "", "SHA-256 digest of the script bytes")
+	flags.StringVar(&cfg.RunnerImage, "runner-image", "", "Digest-pinned runner image")
+	flags.StringVar(&cfg.BackendAPIVersion, "backend-api-version", "", "Backend API version")
+	flags.StringVar(&cfg.BackendKind, "backend-kind", "", "Backend kind")
+	flags.StringVar(&cfg.Queue, "queue", "", "Kueue LocalQueue name")
+	flags.StringVar(&cfg.TolerationsJSON, "tolerations", "[]", "JSON-encoded Pod tolerations")
+	flags.StringVar(&cfg.ScriptEnvironmentJSON, "script-environment", "{}", "JSON-encoded script environment")
+	flags.StringVar(&cfg.GPUResourceCount, "gpu-resource-count", "0", "GPU resource limit per participant")
+	flags.BoolVar(&cfg.Privileged, "privileged", false, "Run the participant workload with a privileged security context")
+	flags.IntVar(&cfg.Attempt, "attempt", 0, "One-based Workflow attempt number")
+	flags.Int64Var(&cfg.BackoffLimit, "backoff-limit", 0, "MPIJob backoff limit")
+	flags.Int64Var(&cfg.TTLSeconds, "ttl-seconds-after-finished", 3600, "MPIJob TTL after completion")
+	flags.StringVar(&cfg.outputDirectory, "output-directory", "/outputs", "Argo output directory")
+
+	command.CompletionOptions.DisableDefaultCmd = true
+
+	if err := command.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, cfg config) error {
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return fmt.Errorf("load in-cluster Kubernetes configuration: %w", err)
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("create dynamic Kubernetes client: %w", err)
+	}
+
+	kubernetesClient, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes client: %w", err)
+	}
+
+	runner := &signaladapter.Runner{
+		Dynamic:    dynamicClient,
+		Kubernetes: kubernetesClient,
+	}
+
+	output, err := runner.Execute(ctx, cfg.Config)
+	if err != nil {
+		return err
+	}
+
+	return writeOutputs(cfg.outputDirectory, output)
+}
+
+func writeOutputs(directory string, output signaladapter.AggregateOutput) error {
+	if directory == "" {
+		return errors.New("output-directory is required")
+	}
+
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
+
+	outputs := map[string]string{
+		"verdict":           output.Verdict,
+		"reason":            output.Reason,
+		"measurements":      output.Measurements,
+		"backend-resources": output.BackendJSON,
+	}
+	for name, value := range outputs {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(value), 0o600); err != nil {
+			return fmt.Errorf("write %s output: %w", name, err)
+		}
+	}
+
+	evidence, err := json.Marshal(output)
+	if err != nil {
+		return fmt.Errorf("encode adapter result: %w", err)
+	}
+
+	fmt.Println(string(evidence))
+
+	return nil
+}
+
+type uidValue struct {
+	target *types.UID
+}
+
+func (v uidValue) String() string {
+	if v.target == nil {
+		return ""
+	}
+
+	return string(*v.target)
+}
+
+func (v uidValue) Set(value string) error {
+	if v.target == nil {
+		return errors.New("UID target is nil")
+	}
+
+	*v.target = types.UID(value)
+
+	return nil
+}
+
+func (uidValue) Type() string {
+	return "uid"
+}
