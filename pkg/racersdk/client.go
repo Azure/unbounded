@@ -48,6 +48,11 @@ const (
 	smallConnections      = 4
 	smallQueue            = 128
 	statQueue             = 128
+	// statIdleConnections bounds pooled Stat and Warm connections apart from
+	// the Stat lane. Racer holds an ingress slot for each open connection,
+	// and Get always dials, so a burst of Stats must not leave the pool
+	// holding the slots a later Get needs.
+	statIdleConnections = 4
 	// pageCredits is the number of pages Racer may send ahead of the reader.
 	pageCredits = 2
 )
@@ -125,7 +130,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	return &Client{
 		path:    path,
 		limits:  defaultClientLimits,
-		maxIdle: config.MaxConnections,
+		maxIdle: min(statIdleConnections, config.MaxConnections),
 		bulk:    newLane(config.MaxConnections, bulkQueue),
 		small:   newLane(smallConnections, smallQueue),
 		stat:    newLane(config.MaxConnections, statQueue),
