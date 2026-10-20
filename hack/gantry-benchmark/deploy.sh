@@ -828,7 +828,11 @@ wait_for_nodes() {
   local attempt total ready unschedulable
   for attempt in $(seq 1 120); do
     local nodes
-    nodes=$(kubectl get nodes -l "agentpool=$AKS_NODE_POOL_NAME" -o json)
+    if ! nodes=$(timeout 30s kubectl --request-timeout=25s get nodes -l "agentpool=$AKS_NODE_POOL_NAME" -o json); then
+      log "unable to read AKS nodes on attempt $attempt/120; retrying"
+      sleep 30
+      continue
+    fi
     total=$(jq '.items|length' <<<"$nodes")
     ready=$(jq '[.items[]|select(any(.status.conditions[];.type=="Ready" and .status=="True"))]|length' <<<"$nodes")
     unschedulable=$(jq '[.items[]|select(.spec.unschedulable==true)]|length' <<<"$nodes")
