@@ -14,7 +14,6 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
@@ -22,16 +21,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/stretchr/testify/require"
-	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
-	clienttesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -173,46 +169,106 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: unbounded.SystemNamespace()},
 	}
-	sa := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "metalman-bootstrap",
-			Namespace: unbounded.SystemNamespace(),
-		},
-	}
-	clientset := fake.NewClientset(ns, sa)
-
-	var tokenCount int
-
-	clientset.PrependReactor("create", "serviceaccounts/token", func(action clienttesting.Action) (bool, runtime.Object, error) {
-		tokenCount++
-
-		return true, &authenticationv1.TokenRequest{
-			Status: authenticationv1.TokenRequestStatus{
-				Token:               fakeJWT(t, map[string]any{"jti": fmt.Sprintf("jti-%d", tokenCount)}),
-				ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
-			},
-		}, nil
-	})
+	clientset := fake.NewClientset(ns)
 
 	return &Handler{
 		Clientset:      clientset,
 		LookupNodeByIP: testLookupByIP(crClient),
-		StatusUpdater:  &testStatusUpdater{client: crClient},
+		ResolveBootstrapToken: func(context.Context, *v1alpha3.Machine) (string, error) {
+			return "fake-bootstrap-token-for-testing", nil
+		},
+		StatusUpdater: &testStatusUpdater{client: crClient},
 	}
 }
 
-// fakeJWT builds an unsigned JWT-shaped token with the given claims.
-func fakeJWT(t *testing.T, claims map[string]any) string {
-	t.Helper()
-
-	payload, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatal(err)
+func TestBootstrapTokenUsesMachineSecret(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem},
+		Type:       corev1.SecretTypeBootstrapToken,
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte("0123456789abcdef"),
+		},
+	}
+	handler := &Handler{Clientset: fake.NewClientset(secret)}
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
+		Spec: v1alpha3.MachineSpec{Kubernetes: &v1alpha3.KubernetesSpec{
+			BootstrapTokenRef: &v1alpha3.LocalObjectReference{Name: secret.Name},
+		}},
 	}
 
-	enc := base64.RawURLEncoding
+	token, err := handler.bootstrapToken(t.Context(), machine)
+	require.NoError(t, err)
+	require.Equal(t, "abc123.0123456789abcdef", token)
+}
 
-	return enc.EncodeToString([]byte(`{"alg":"RS256"}`)) + "." + enc.EncodeToString(payload) + ".sig"
+func TestBootstrapTokenRequiresMachineReference(t *testing.T) {
+	handler := &Handler{Clientset: fake.NewClientset()}
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1"}}
+
+	_, err := handler.bootstrapToken(t.Context(), machine)
+	require.ErrorContains(t, err, "spec.kubernetes.bootstrapTokenRef.name is required")
+}
+
+func TestBootstrapTokenRejectsWrongSecretType(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem},
+		Type:       corev1.SecretTypeOpaque,
+	}
+	handler := &Handler{Clientset: fake.NewClientset(secret)}
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
+		Spec: v1alpha3.MachineSpec{Kubernetes: &v1alpha3.KubernetesSpec{
+			BootstrapTokenRef: &v1alpha3.LocalObjectReference{Name: secret.Name},
+		}},
+	}
+
+	_, err := handler.bootstrapToken(t.Context(), machine)
+	require.ErrorContains(t, err, "expected \"bootstrap.kubernetes.io/token\"")
+}
+
+func TestBootstrapTokenRequiresTokenFields(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      map[string][]byte
+		wantError string
+	}{
+		{
+			name: "missing token ID",
+			data: map[string][]byte{
+				"token-secret": []byte("0123456789abcdef"),
+			},
+			wantError: "has no token-id",
+		},
+		{
+			name: "missing token secret",
+			data: map[string][]byte{
+				"token-id": []byte("abc123"),
+			},
+			wantError: "has no token-secret",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem},
+				Type:       corev1.SecretTypeBootstrapToken,
+				Data:       tt.data,
+			}
+			handler := &Handler{Clientset: fake.NewClientset(secret)}
+			machine := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
+				Spec: v1alpha3.MachineSpec{Kubernetes: &v1alpha3.KubernetesSpec{
+					BootstrapTokenRef: &v1alpha3.LocalObjectReference{Name: secret.Name},
+				}},
+			}
+
+			_, err := handler.bootstrapToken(t.Context(), machine)
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
 }
 
 // doAttest performs an attest request from the given IP and returns the parsed response.
@@ -442,7 +498,7 @@ func TestAttestRetainedMediaAfterLeaseEdit(t *testing.T) {
 	require.NoError(t, err)
 	token, err := gcm.Open(nil, resp.GCMNonce, resp.EncryptedToken, nil)
 	require.NoError(t, err)
-	require.Equal(t, fakeJWT(t, map[string]any{"jti": "jti-1"}), string(token))
+	require.Equal(t, "fake-bootstrap-token-for-testing", string(token))
 	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(node), node))
 	require.NotEmpty(t, node.Status.TPM.EKPublicKey)
 	require.Equal(t, "192.0.2.99", node.Spec.Netboot().DHCPLeases[0].IPv4)
@@ -720,18 +776,7 @@ func (u *countingStatusUpdater) Update(ctx context.Context, node *v1alpha3.Machi
 	return u.inner.Update(ctx, node)
 }
 
-func setTokenReactor(handler *Handler, token string, calls *int) {
-	handler.Clientset.(*fake.Clientset).PrependReactor("create", "serviceaccounts/token",
-		func(action clienttesting.Action) (bool, runtime.Object, error) {
-			*calls++
-
-			return true, &authenticationv1.TokenRequest{
-				Status: authenticationv1.TokenRequestStatus{Token: token},
-			}, nil
-		})
-}
-
-func TestAttestRecordsCredentialIDWithEKInOneUpdate(t *testing.T) {
+func TestAttestStoresEKInOneUpdate(t *testing.T) {
 	_, ekPub := testEKKeyPair(t)
 	srkPub, _ := testSRKPub(t)
 	handler := testHandler(t, newPXEMachine("bind-01", "aa:bb:cc:dd:ee:10", "10.0.2.10"))
@@ -739,73 +784,15 @@ func TestAttestRecordsCredentialIDWithEKInOneUpdate(t *testing.T) {
 	counter := &countingStatusUpdater{inner: inner}
 	handler.StatusUpdater = counter
 
-	before := time.Now().Add(-time.Second)
-
 	doAttest(t, handler, "10.0.2.10", ekPub, srkPub)
 
 	require.Equal(t, 1, counter.calls)
 	require.NotNil(t, counter.seen[0].Status.TPM)
 	require.NotEmpty(t, counter.seen[0].Status.TPM.EKPublicKey)
-	require.NotNil(t, counter.seen[0].Status.Bootstrap)
 
 	var m v1alpha3.Machine
 	require.NoError(t, inner.client.Get(t.Context(), client.ObjectKey{Name: "bind-01"}, &m))
 	require.NotEmpty(t, m.Status.TPM.EKPublicKey)
-	require.NotNil(t, m.Status.Bootstrap)
-	require.Equal(t, "JTI=jti-1", m.Status.Bootstrap.CredentialID)
-	require.Equal(t, "bind-01", m.Status.Bootstrap.NodeName)
-	require.NotNil(t, m.Status.Bootstrap.IssuedAt)
-	require.True(t, m.Status.Bootstrap.IssuedAt.After(before))
-}
-
-func TestAttestReattestReplacesCredentialID(t *testing.T) {
-	_, ekPub := testEKKeyPair(t)
-	srkPub, _ := testSRKPub(t)
-	handler := testHandler(t, newPXEMachine("bind-02", "aa:bb:cc:dd:ee:11", "10.0.2.11"))
-	c := handler.StatusUpdater.(*testStatusUpdater).client
-
-	doAttest(t, handler, "10.0.2.11", ekPub, srkPub)
-
-	var m v1alpha3.Machine
-	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-02"}, &m))
-	require.Equal(t, "JTI=jti-1", m.Status.Bootstrap.CredentialID)
-	firstEK := m.Status.TPM.EKPublicKey
-
-	doAttest(t, handler, "10.0.2.11", ekPub, srkPub)
-	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-02"}, &m))
-	require.Equal(t, "JTI=jti-2", m.Status.Bootstrap.CredentialID)
-	require.Equal(t, firstEK, m.Status.TPM.EKPublicKey)
-}
-
-func TestAttestMissingJTIFailsClosed(t *testing.T) {
-	_, ekPub := testEKKeyPair(t)
-	srkPub, _ := testSRKPub(t)
-
-	for name, token := range map[string]string{
-		"no jti":     fakeJWT(t, map[string]any{"sub": "x"}),
-		"empty jti":  fakeJWT(t, map[string]any{"jti": ""}),
-		"opaque":     "not-a-jwt",
-		"bad base64": "a.!!!.c",
-	} {
-		t.Run(name, func(t *testing.T) {
-			handler := testHandler(t, newPXEMachine("bind-03", "aa:bb:cc:dd:ee:12", "10.0.2.12"))
-			c := handler.StatusUpdater.(*testStatusUpdater).client
-
-			var calls int
-			setTokenReactor(handler, token, &calls)
-
-			w := rawAttest(handler, "10.0.2.12", ekPub, srkPub)
-			require.Equal(t, http.StatusInternalServerError, w.Code)
-			require.Equal(t, 1, calls)
-			require.NotContains(t, w.Body.String(), token)
-			require.NotContains(t, w.Body.String(), "encryptedToken")
-
-			var m v1alpha3.Machine
-			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-03"}, &m))
-			require.Nil(t, m.Status.Bootstrap)
-			require.Nil(t, m.Status.TPM, "EK must not be pinned when attestation fails")
-		})
-	}
 }
 
 func TestAttestStatusUpdateFailureWithholdsToken(t *testing.T) {
@@ -855,49 +842,15 @@ func TestAttestEKMismatchMintsNoToken(t *testing.T) {
 	doAttest(t, handler, "10.0.2.15", ekPub, srkPub)
 
 	var calls int
-	setTokenReactor(handler, fakeJWT(t, map[string]any{"jti": "should-not-mint"}), &calls)
+	handler.ResolveBootstrapToken = func(context.Context, *v1alpha3.Machine) (string, error) {
+		calls++
+
+		return "should-not-resolve", nil
+	}
 
 	w := rawAttest(handler, "10.0.2.15", otherEKPub, srkPub)
 	require.Equal(t, http.StatusForbidden, w.Code)
 	require.Equal(t, 0, calls)
-
-	var m v1alpha3.Machine
-	require.NoError(t, handler.StatusUpdater.(*testStatusUpdater).client.Get(t.Context(), client.ObjectKey{Name: "bind-06"}, &m))
-	require.Equal(t, "JTI=jti-1", m.Status.Bootstrap.CredentialID)
-}
-
-func TestCredentialIDFromToken(t *testing.T) {
-	enc := base64.RawURLEncoding
-	padded := base64.URLEncoding.EncodeToString([]byte(`{"jti":"abc-123"}`))
-
-	cases := []struct {
-		name    string
-		token   string
-		want    string
-		wantErr bool
-	}{
-		{name: "valid", token: fakeJWT(t, map[string]any{"jti": "abc-123", "sub": "s"}), want: "JTI=abc-123"},
-		{name: "padded payload", token: "h." + padded + ".s", want: "JTI=abc-123"},
-		{name: "missing jti", token: fakeJWT(t, map[string]any{"sub": "s"}), wantErr: true},
-		{name: "empty jti", token: fakeJWT(t, map[string]any{"jti": ""}), wantErr: true},
-		{name: "non-string jti", token: fakeJWT(t, map[string]any{"jti": 42}), wantErr: true},
-		{name: "two segments", token: "a.b", wantErr: true},
-		{name: "empty", token: "", wantErr: true},
-		{name: "bad base64", token: "a.***.c", wantErr: true},
-		{name: "bad json", token: "a." + enc.EncodeToString([]byte("nope")) + ".c", wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := CredentialIDFromToken(tc.token)
-			if tc.wantErr {
-				require.Error(t, err)
-				return
-			}
-
-			require.NoError(t, err)
-			require.Equal(t, tc.want, got)
-		})
-	}
 }
 
 func TestAttestIgnoresForwardedHeaders(t *testing.T) {
@@ -928,31 +881,4 @@ func TestAttestIgnoresForwardedHeaders(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("spoofed forwarded headers: expected 404, got %d: %s", w.Code, w.Body.String())
 	}
-}
-
-func TestAttestRecordsLookupNodeName(t *testing.T) {
-	_, ekPub := testEKKeyPair(t)
-	srkPub, _ := testSRKPub(t)
-	handler := testHandler(t, newPXEMachine("bind-ref", "aa:bb:cc:dd:ee:1f", "10.0.2.31"))
-	c := handler.StatusUpdater.(*testStatusUpdater).client
-
-	// The lookup may pin a node name (for example the name a virtual-media
-	// replacement captured) that differs from the live nodeRef.
-	handler.LookupMachine = func(r *http.Request) (*v1alpha3.Machine, error) {
-		var m v1alpha3.Machine
-		if err := c.Get(r.Context(), client.ObjectKey{Name: "bind-ref"}, &m); err != nil {
-			return nil, err
-		}
-
-		m.Spec.Kubernetes = &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{Name: "node-captured"}}
-
-		return &m, nil
-	}
-
-	doAttest(t, handler, "10.0.2.31", ekPub, srkPub)
-
-	var m v1alpha3.Machine
-	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "bind-ref"}, &m))
-	require.Equal(t, "node-captured", m.Status.Bootstrap.NodeName)
-	require.Nil(t, m.Spec.Kubernetes)
 }

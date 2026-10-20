@@ -12,7 +12,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
@@ -25,19 +24,15 @@ import (
 	"strings"
 
 	"github.com/google/go-tpm/tpm2"
-	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/utils/ptr"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
-	BootstrapSAName = "metalman-bootstrap"
-
 	// maxRequestBodySize limits attestation request bodies to 1 MiB.
 	maxRequestBodySize = 1 << 20
 )
@@ -47,8 +42,9 @@ type Handler struct {
 	ClusterCA      []byte // PEM-encoded cluster CA certificate
 	LookupNodeByIP func(ctx context.Context, ip string) (*v1alpha3.Machine, error)
 	// LookupMachine takes precedence over LookupNodeByIP when set.
-	LookupMachine func(r *http.Request) (*v1alpha3.Machine, error)
-	StatusUpdater StatusUpdater
+	LookupMachine         func(r *http.Request) (*v1alpha3.Machine, error)
+	ResolveBootstrapToken func(ctx context.Context, machine *v1alpha3.Machine) (string, error)
+	StatusUpdater         StatusUpdater
 }
 
 // StatusUpdater updates the status subresource of a Machine.
@@ -158,11 +154,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TOFU: record or verify the EK public key. On first use the pin is
-	// only staged on the in-memory object here; it is persisted together
-	// with the bootstrap credential ID in a single status update after the
-	// token is minted (see below). A mismatched EK is rejected before any
-	// token is minted.
+	// TOFU: store or verify the EK public key.
 	if node.Status.TPM == nil || node.Status.TPM.EKPublicKey == "" {
 		der, err := x509.MarshalPKIXPublicKey(ekKey)
 		if err != nil {
@@ -179,8 +171,14 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		node.Status.TPM.EKPublicKey = ekPubPEM
+		if err := h.StatusUpdater.Update(ctx, node); err != nil {
+			log.Error("attest: storing EK public key", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 
-		log.Info("TOFU: staging EK public key")
+			return
+		}
+
+		log.Info("TOFU: stored EK public key")
 	} else {
 		block, _ := pem.Decode([]byte(node.Status.TPM.EKPublicKey))
 		if block == nil {
@@ -269,52 +267,9 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	binary.BigEndian.PutUint16(encryptedSecret[:2], uint16(len(encSecret)))
 	copy(encryptedSecret[2:], encSecret)
 
-	// Create a short-lived bootstrap token.
-	tokenRequest := &authenticationv1.TokenRequest{
-		Spec: authenticationv1.TokenRequestSpec{
-			ExpirationSeconds: ptr.To(int64(3600)),
-		},
-	}
-
-	tokenResp, err := h.Clientset.CoreV1().ServiceAccounts(unbounded.SystemNamespace()).CreateToken(
-		ctx, BootstrapSAName, tokenRequest, metav1.CreateOptions{},
-	)
+	bootstrapToken, err := h.bootstrapToken(ctx, node)
 	if err != nil {
-		log.Error("attest: creating SA token", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-
-		return
-	}
-
-	// Bind the token to this Machine. The machina CSR approver only approves
-	// kubelet client CSRs from the bootstrap ServiceAccount whose
-	// credential-id matches a Machine's status.bootstrap.credentialID, so the
-	// credential ID must be persisted before the token is handed out. Fail
-	// closed if it cannot be determined or stored.
-	credentialID, err := CredentialIDFromToken(tokenResp.Status.Token)
-	if err != nil {
-		log.Error("attest: bootstrap token has no usable jti claim; the API server must issue "+
-			"ServiceAccount tokens with a jti (Kubernetes 1.30+, ServiceAccountTokenJTI)", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-
-		return
-	}
-
-	// Re-attestation overwrites any previous credential ID, so tokens issued
-	// by earlier attestations can no longer get kubelet client certificates
-	// approved for this Machine.
-	issuedAt := metav1.Now()
-	node.Status.Bootstrap = &v1alpha3.BootstrapStatus{
-		CredentialID: credentialID,
-		NodeName:     node.NodeName(),
-		IssuedAt:     &issuedAt,
-	}
-
-	// Single status update: persists the TOFU EK pin (if staged above) and
-	// the bootstrap credential ID together. A conflict or any other error
-	// aborts without returning the token.
-	if err := h.StatusUpdater.Update(ctx, node); err != nil {
-		log.Error("attest: recording bootstrap credential on Machine status", "err", err)
+		log.Error("attest: resolving bootstrap token", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -345,9 +300,9 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encryptedToken := gcm.Seal(nil, gcmNonce, []byte(tokenResp.Status.Token), nil)
+	encryptedToken := gcm.Seal(nil, gcmNonce, []byte(bootstrapToken), nil)
 
-	tokenHash := sha256.Sum256([]byte(tokenResp.Status.Token))
+	tokenHash := sha256.Sum256([]byte(bootstrapToken))
 	log.Info("attest: issued encrypted bootstrap token", "tokenID", fmt.Sprintf("%x", tokenHash[:8]))
 
 	resp := AttestResponse{
@@ -365,34 +320,44 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// CredentialIDFromToken extracts the jti claim from a ServiceAccount JWT and
-// returns it in the form kube-apiserver reports in the
-// "authentication.kubernetes.io/credential-id" user extra ("JTI=<jti>").
-// The signature is not verified; the token was just minted by the API server.
-func CredentialIDFromToken(token string) (string, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return "", fmt.Errorf("token is not a JWT: expected 3 segments, got %d", len(parts))
+func (h *Handler) bootstrapToken(ctx context.Context, machine *v1alpha3.Machine) (string, error) {
+	if h.ResolveBootstrapToken != nil {
+		return h.ResolveBootstrapToken(ctx, machine)
 	}
 
-	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if h.Clientset == nil {
+		return "", fmt.Errorf("kubernetes client is required")
+	}
+
+	if machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.BootstrapTokenRef == nil {
+		return "", fmt.Errorf("machine %s spec.kubernetes.bootstrapTokenRef.name is required", machine.Name)
+	}
+
+	secretName := strings.TrimSpace(machine.Spec.Kubernetes.BootstrapTokenRef.Name)
+	if secretName == "" {
+		return "", fmt.Errorf("machine %s spec.kubernetes.bootstrapTokenRef.name is required", machine.Name)
+	}
+
+	secret, err := h.Clientset.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, secretName, metav1.GetOptions{})
 	if err != nil {
-		return "", fmt.Errorf("decoding JWT payload: %w", err)
+		return "", fmt.Errorf("get bootstrap token secret %s: %w", secretName, err)
 	}
 
-	var claims struct {
-		JTI any `json:"jti"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return "", fmt.Errorf("parsing JWT claims: %w", err)
+	if secret.Type != corev1.SecretTypeBootstrapToken {
+		return "", fmt.Errorf("secret %s has type %q, expected %q", secretName, secret.Type, corev1.SecretTypeBootstrapToken)
 	}
 
-	jti, ok := claims.JTI.(string)
-	if !ok || jti == "" {
-		return "", fmt.Errorf("JWT has no string jti claim")
+	tokenID := strings.TrimSpace(string(secret.Data["token-id"]))
+	if tokenID == "" {
+		return "", fmt.Errorf("secret %s has no token-id", secretName)
 	}
 
-	return "JTI=" + jti, nil
+	tokenSecret := strings.TrimSpace(string(secret.Data["token-secret"]))
+	if tokenSecret == "" {
+		return "", fmt.Errorf("secret %s has no token-secret", secretName)
+	}
+
+	return tokenID + "." + tokenSecret, nil
 }
 
 // publicKeysEqual compares two crypto.PublicKey values structurally.
