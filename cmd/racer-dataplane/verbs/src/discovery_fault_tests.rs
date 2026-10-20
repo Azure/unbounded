@@ -1,6 +1,6 @@
 //! Real C discovery and open faults, without an RDMA provider or Rust simulator.
 use super::*;
-use crate::{Configuration, NativeService, pair};
+use crate::{NodeConfig, Owner, node};
 
 /// The C fixture's fault state is process-global.
 static FAULTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -75,38 +75,20 @@ fn internal_close_failures_keep_admission_and_adapter() {
             assert_eq!(charged.get(), usize::from(leaks));
 
             unsafe { reset(mode, fail_close) };
-            let (io, port) = pair(1).unwrap();
-            let mut native = NativeService::new(port);
             let (guard, charged) = crate::test_guard::guard();
-            futures::executor::block_on(io.configure(Configuration {
-                discover: true,
-                guards: vec![guard],
-                bytes: 32,
-                selector: Box::new(|ports| {
-                    assert!(ports.is_empty());
-                    Ok(Vec::new())
-                }),
-            }))
-            .unwrap();
-            native.poll_budgeted(2).unwrap();
             let expected = if leaks || matches!(mode, 4 | 7) {
                 Err(Error::Unavailable)
             } else {
                 Ok(0)
             };
-            assert_eq!(io.activation().unwrap().map(|ports| ports.len()), expected);
-            io.close();
-            native.poll_budgeted(2).unwrap();
-            assert_eq!(
-                io.reopen(),
-                if leaks {
-                    Err(Error::Overloaded)
-                } else {
-                    Ok(())
-                }
-            );
-            drop(native);
-            drop(io);
+            let (native, io) = activate(guard, |ports| {
+                assert!(ports.is_empty());
+                Ok(Vec::new())
+            });
+            assert_eq!(native.map(|ports| ports.len()), expected);
+            let (owner, client) = io;
+            owner_close(owner, &client, leaks);
+            drop(client);
             assert_eq!(charged.get(), usize::from(leaks));
         }
     }
@@ -210,23 +192,14 @@ fn open_cleanup_failures_keep_admission_and_adapter() {
         }
 
         unsafe { reset(mode, fail_close) };
-        let (io, port) = pair(1).unwrap();
-        let mut native = NativeService::new(port);
         let (guard, charged) = crate::test_guard::guard();
-        futures::executor::block_on(io.configure(Configuration {
-            discover: true,
-            guards: vec![guard],
-            bytes: 32,
-            selector: Box::new(move |descriptions| {
-                assert!(!leaks, "leaked open must not reach selection");
-                assert_eq!(descriptions.len(), ports);
-                Ok(Vec::new())
-            }),
-        }))
-        .unwrap();
-        native.poll_budgeted(2).unwrap();
+        let (activation, (owner, client)) = activate(guard, move |descriptions| {
+            assert!(!leaks, "leaked open must not reach selection");
+            assert_eq!(descriptions.len(), ports);
+            Ok(Vec::new())
+        });
         assert_eq!(
-            io.activation().unwrap().map(|ports| ports.len()),
+            activation.map(|ports| ports.len()),
             if leaks {
                 Err(Error::Unavailable)
             } else {
@@ -234,18 +207,50 @@ fn open_cleanup_failures_keep_admission_and_adapter() {
             }
         );
         assert_eq!(unsafe { count(3) }, allocations);
-        io.close();
-        native.poll_budgeted(2).unwrap();
-        assert_eq!(
-            io.reopen(),
-            if leaks {
-                Err(Error::Overloaded)
-            } else {
-                Ok(())
-            }
-        );
-        drop(native);
-        drop(io);
+        owner_close(owner, &client, leaks);
+        drop(client);
         assert_eq!(charged.get(), usize::from(leaks));
     }
+}
+
+/// Activate a one-worker node owner with `selector` and poll it once.
+fn activate(
+    guard: crate::Guard,
+    selector: impl FnOnce(&[crate::PortInfo]) -> Result<Vec<(u16, usize)>> + Send + 'static,
+) -> (Result<Vec<crate::Selection>>, (Owner, crate::Client)) {
+    let (mut clients, port) = node(1).unwrap();
+    let mut owner = Owner::new(port);
+    let client = clients.remove(0);
+    let activation = client.activate(NodeConfig {
+        selector: Box::new(selector),
+        pool_bytes: 4096,
+        buffer_len: 4096,
+        max_links: 1,
+        grants_per_link: 1,
+        idle: std::time::Duration::from_secs(1),
+        mr_remote_write: false,
+        guard,
+    });
+    owner.poll_budgeted(2).unwrap();
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    let std::task::Poll::Ready(result) = activation.poll(&mut cx) else {
+        panic!("activation did not finish");
+    };
+    (result, (owner, client))
+}
+
+/// Close the owner; a leaked discovery charge keeps it from draining, so
+/// reopen stays refused.
+fn owner_close(mut owner: Owner, client: &crate::Client, leaks: bool) {
+    client.close();
+    owner.poll_budgeted(2).unwrap();
+    assert_eq!(
+        client.reopen(),
+        if leaks {
+            Err(Error::Overloaded)
+        } else {
+            Ok(())
+        }
+    );
+    drop(owner);
 }

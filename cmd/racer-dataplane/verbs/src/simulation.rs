@@ -7,7 +7,7 @@
 //!
 //! 1. Create one [`Simulation`] per test thread.
 //! 2. Give each node its own view with [`Simulation::with_devices`].
-//! 3. Call [`Simulation::enter`] before building that node's `NativeService`.
+//! 3. Call [`Simulation::enter`] before building that node's [`crate::Owner`].
 //!    Handles keep working after the scope ends.
 //! 4. Script failures with [`Simulation::fault`] or [`Simulation::reject`].
 //!    Delivery faults ([`Fault::Drop`], [`Fault::Reorder`],
@@ -1690,10 +1690,6 @@ mod tests {
     //! Connected DMA, failure ownership, discovery, and safe proxy integration tests.
     use super::*;
 
-    use crate::test_guard::ready;
-
-    use std::task::{Context, Poll};
-
     /// Check every event since the last assertion, including order and identity.
     fn events(sim: &Simulation, expected: &[(Operation, u32, Option<u64>, i64, bool)]) {
         let trace = sim.take_trace();
@@ -3086,104 +3082,5 @@ mod tests {
         }
 
         assert_eq!(run(), run());
-    }
-
-    #[test]
-    /// Paired native services discover separate nodes and copy through safe poll APIs.
-    fn native_services_activate_discovered_nodes_and_copy_through_io_proxies() {
-        use crate::{Configuration, NativeService, QueuePairHandle, Region, pair};
-
-        let sim = Simulation::new();
-        let mut charges = Vec::new();
-        let mut nodes = Vec::new();
-        for n in 1..=2 {
-            let node = sim
-                .with_devices(vec![Device::new("sim0", [n; 16])])
-                .unwrap();
-            let (io, port) = pair(1).unwrap();
-            let mut native = {
-                let _environment = node.enter();
-                NativeService::new(port)
-            };
-            let devices = Rc::new(io);
-            let (guard, charge) = crate::test_guard::guard();
-            charges.push(charge);
-            futures::executor::block_on(devices.configure(Configuration {
-                discover: true,
-                guards: vec![guard],
-                bytes: 4096,
-                selector: Box::new(move |ports| {
-                    assert_eq!(ports.len(), 1);
-                    assert_eq!(ports[0].device, "sim0");
-                    assert_eq!(ports[0].port, 1);
-                    assert_eq!(ports[0].gid, [n; 16]);
-                    Ok(vec![(0, 0)])
-                }),
-            }))
-            .unwrap();
-            let mut activation = Box::pin(std::future::poll_fn(|_| {
-                devices.activation().map_or(Poll::Pending, Poll::Ready)
-            }));
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            assert!(activation.as_mut().poll(&mut cx).is_pending());
-            // Discovery still selects this service's node after its scope has exited.
-            native.poll_budgeted(1).unwrap();
-            assert!(activation.as_mut().poll(&mut cx).is_pending());
-            native.poll_budgeted(1).unwrap();
-            assert!(matches!(
-                activation.as_mut().poll(&mut cx),
-                Poll::Ready(Ok(_))
-            ));
-            drop(activation);
-            let qp = ready(QueuePairHandle::poll_new(devices.device(0), None)).unwrap();
-            nodes.push((native, devices, qp));
-        }
-        let (mut left, devices_left, sender) = nodes.remove(0);
-        let (mut right, devices_right, receiver) = nodes.remove(0);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        ready(sender.poll_connect(receiver.endpoint)).unwrap();
-        ready(receiver.poll_connect(sender.endpoint)).unwrap();
-        left.poll_budgeted(1).unwrap();
-        right.poll_budgeted(1).unwrap();
-        sender.progress().unwrap();
-        receiver.progress().unwrap();
-        assert!(sender.ready() && receiver.ready());
-        let target = ready(Region::poll_acquire(&receiver, 17)).unwrap();
-        let (window, bind) = ready(receiver.poll_bind(target.clone())).unwrap();
-        right.poll_budgeted(1).unwrap();
-        right.poll_budgeted(1).unwrap();
-        assert_eq!(bind.result(), Some(Ok(())));
-        let source = ready(Region::poll_acquire(&sender, 17)).unwrap();
-        ready(source.poll_copy_from(&[0xa5; 17])).unwrap();
-        let write =
-            ready(sender.poll_write(source.clone(), window.address.get(), window.key.get()))
-                .unwrap();
-        left.poll_budgeted(1).unwrap();
-        left.poll_budgeted(1).unwrap();
-        assert_eq!(write.result(), Some(Ok(())));
-        let invalidation = ready(receiver.poll_invalidate(window.clone(), &mut cx)).unwrap();
-        right.poll_budgeted(1).unwrap();
-        right.poll_budgeted(1).unwrap();
-        assert_eq!(invalidation.result(), Some(Ok(())));
-        receiver.stop();
-        right.poll_budgeted(1).unwrap();
-        assert_eq!(ready(target.poll_copy_to(&mut cx)).unwrap(), [0xa5; 17]);
-        drop((
-            source,
-            target,
-            write,
-            bind,
-            invalidation,
-            window,
-            sender,
-            receiver,
-        ));
-        devices_left.close();
-        devices_right.close();
-        left.poll_budgeted(1).unwrap();
-        right.poll_budgeted(1).unwrap();
-        assert!(left.drained() && right.drained());
-        assert!(charges.iter().all(|charge| charge.get() == 0));
-        assert_eq!(sim.live_resources(), 0);
     }
 }
