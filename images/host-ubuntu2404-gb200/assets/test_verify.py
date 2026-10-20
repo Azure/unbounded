@@ -143,6 +143,9 @@ class RootfsContractTest(unittest.TestCase):
         self.assertIn("AGENTBAKER_KERNEL_VERSION=6.14.0-1009.9", versions)
         self.assertIn("AGENTBAKER_NVIDIA_VERSION=580.159.04-1ubuntu1", versions)
         self.assertIn("DOCA_VERSION=3.1.0-091513", versions)
+        self.assertIn('"libnvidia-gl-580=${NVIDIA_VERSION}"', source)
+        self.assertIn('"nvidia-dkms-580-open=${NVIDIA_VERSION}"', source)
+        self.assertIn('"nvidia-kernel-common-580=${NVIDIA_VERSION}"', source)
         self.assertIn('"nvidia-imex=${NVIDIA_VERSION}"', source)
         self.assertIn('"doca-ofed=${DOCA_VERSION}"', source)
 

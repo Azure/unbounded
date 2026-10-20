@@ -121,10 +121,26 @@ install_packages() {
                     ;;
             esac
             apt-get install -y --allow-downgrades --no-install-recommends \
+                "libxnvctrl0=${NVIDIA_VERSION}" \
+                "libnvidia-common-580=${NVIDIA_VERSION}" \
+                "libnvidia-cfg1-580=${NVIDIA_VERSION}" \
+                "libnvidia-gpucomp-580=${NVIDIA_VERSION}" \
+                "libnvidia-gl-580=${NVIDIA_VERSION}" \
+                "nvidia-firmware-580=${NVIDIA_VERSION}" \
+                "nvidia-dkms-580-open=${NVIDIA_VERSION}" \
+                "nvidia-kernel-common-580=${NVIDIA_VERSION}" \
+                "nvidia-kernel-source-580-open=${NVIDIA_VERSION}" \
+                "libnvidia-compute-580=${NVIDIA_VERSION}" \
+                "libnvidia-extra-580=${NVIDIA_VERSION}" \
+                "libnvidia-decode-580=${NVIDIA_VERSION}" \
+                "libnvidia-encode-580=${NVIDIA_VERSION}" \
+                "xserver-xorg-video-nvidia-580=${NVIDIA_VERSION}" \
+                "libnvidia-fbc1-580=${NVIDIA_VERSION}" \
                 "nvidia-driver-580-open=${NVIDIA_VERSION}" \
                 "nvidia-utils-580=${NVIDIA_VERSION}" \
                 "nvidia-fabricmanager=${NVIDIA_VERSION}" \
-                "libnvidia-nscq=${NVIDIA_VERSION}"
+                "libnvidia-nscq=${NVIDIA_VERSION}" \
+                "nvidia-modprobe=${NVIDIA_VERSION}"
             if [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
                 apt-get install -y --allow-downgrades --no-install-recommends \
                     "nvidia-imex=${NVIDIA_VERSION}"
