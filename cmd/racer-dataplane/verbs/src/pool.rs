@@ -190,10 +190,31 @@ impl PoolShared {
             return Some(Ok(buffer));
         }
 
-        lock(&self.waiters).push(waker.clone());
+        {
+            let mut waiters = lock(&self.waiters);
+            // Repeated polls from one task register it once.
+            if !waiters.iter().any(|w| w.will_wake(waker)) {
+                waiters.push(waker.clone());
+            }
+        }
 
         // A buffer may have returned between the first try and registering.
         self.stage(len).map(Ok)
+    }
+
+    /// Take a free buffer as a [`SendBuffer`] of `len` bytes without
+    /// registering a waiter. `Ok(None)` when none is free.
+    pub(crate) fn try_stage(self: &Arc<Self>, len: usize) -> Result<Option<SendBuffer>> {
+        if len == 0 || len > self.buffer_len {
+            return Err(Error::InvalidRange);
+        }
+
+        Ok(self.stage(len))
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        lock(&self.waiters).len()
     }
 
     /// Take a free buffer as a [`SendBuffer`] of `len` bytes, if any.
@@ -546,13 +567,11 @@ mod tests {
 
     impl Wake for Reenter {
         fn wake(self: Arc<Self>) {
-            if self.wakes.fetch_add(1, Ordering::SeqCst) > 0 {
-                return;
-            }
+            self.wakes.fetch_add(1, Ordering::SeqCst);
             let waker = Waker::from(self.clone());
             let staged = self.shared.poll_stage(5, &waker);
             assert!(matches!(staged, Some(Ok(_))), "the returned buffer is free");
-            // Dropping the staged buffer returns it and wakes again.
+            // Dropping the staged buffer reenters `push` from inside a wake.
         }
     }
 
@@ -569,11 +588,65 @@ mod tests {
         });
         let waker = Waker::from(reenter.clone());
         assert!(shared.poll_stage(5, &waker).is_none());
-        // Register a second time so the nested return also finds a waiter.
-        assert!(shared.poll_stage(5, &waker).is_none());
         drop(held);
-        assert!(reenter.wakes.load(Ordering::SeqCst) >= 2);
+        assert_eq!(reenter.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.waiter_count(), 0);
         assert_eq!(shared.count_in(BufferState::Free), 1);
+    }
+
+    #[test]
+    /// Repeated polls from one task register a single waiter.
+    fn repeated_polls_register_once() {
+        let sim = Simulation::new();
+        let (pool, _charge) = pool(&sim, 1);
+        let shared = pool.shared().clone();
+        let held = shared.stage(5).unwrap();
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        for _ in 0..5 {
+            assert!(shared.poll_stage(5, &waker).is_none());
+        }
+        assert_eq!(shared.waiter_count(), 1);
+        drop(held);
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.waiter_count(), 0);
+    }
+
+    #[test]
+    /// Distinct tasks each register and each is woken.
+    fn distinct_tasks_are_all_woken() {
+        let sim = Simulation::new();
+        let (pool, _charge) = pool(&sim, 1);
+        let shared = pool.shared().clone();
+        let held = shared.stage(5).unwrap();
+        let first = Arc::new(Count(AtomicUsize::new(0)));
+        let second = Arc::new(Count(AtomicUsize::new(0)));
+        assert!(shared.poll_stage(5, &Waker::from(first.clone())).is_none());
+        assert!(shared.poll_stage(5, &Waker::from(second.clone())).is_none());
+        assert_eq!(shared.waiter_count(), 2);
+        drop(held);
+        assert_eq!(first.0.load(Ordering::SeqCst), 1);
+        assert_eq!(second.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    /// `try_stage` never registers a waiter.
+    fn try_stage_does_not_register() {
+        let sim = Simulation::new();
+        let (pool, _charge) = pool(&sim, 1);
+        let shared = pool.shared().clone();
+        assert!(matches!(shared.try_stage(0), Err(Error::InvalidRange)));
+        assert!(matches!(
+            shared.try_stage(LEN + 1),
+            Err(Error::InvalidRange)
+        ));
+        let held = shared.try_stage(5).unwrap().unwrap();
+        assert_eq!(held.len(), 5);
+        assert!(shared.try_stage(5).unwrap().is_none());
+        assert_eq!(shared.waiter_count(), 0);
+        drop(held);
+        assert!(shared.try_stage(5).unwrap().is_some());
+        assert_eq!(shared.waiter_count(), 0);
     }
 
     #[test]

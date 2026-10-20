@@ -200,7 +200,9 @@ As built (`src/node.rs`, stage 2e), the API differs from the sketch above:
   when the rail has `max_links` links. A full command queue also returns it;
   `Client::poll_ready` waits for room.
 - `send_buffer(rail, len, cx)` takes the rail (pools are per device) and a
-  `Context` to wait on. `buffers(rail, state)` reports pool counts.
+  `Context` to wait on; repeated polls from one task register one waiter.
+  `try_send_buffer(rail, len)` takes a buffer only if one is free now and
+  registers no waiter. `buffers(rail, state)` reports pool counts.
 - `close`, `closed`, `drained`, and `reopen` follow the old slot API's rules;
   there is no `register_driver` on `Client` (each `Op` wakes its poller).
 - `break_link` never loses the request: if the queue is full it goes to a

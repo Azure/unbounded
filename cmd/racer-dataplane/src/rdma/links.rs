@@ -630,15 +630,14 @@ impl Links {
             return Ok(None);
         };
         // Never wait for a buffer here: the owner queues `Source::Bytes`
-        // writes itself, and a parked waker would only cause a spurious wake.
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        let staged = match self.client.send_buffer(rail.0, page.bytes().len(), &mut cx) {
-            Poll::Ready(Ok(buffer)) => match crypto.stage(page.clone(), buffer, scope).await {
+        // writes itself, so take one only if it is free right now.
+        let staged = match self.client.try_send_buffer(rail.0, page.bytes().len()) {
+            Ok(Some(buffer)) => match crypto.stage(page.clone(), buffer, scope).await {
                 Ok(buffer) => Some(buffer),
                 Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
                 Err(_) => None,
             },
-            Poll::Ready(Err(_)) | Poll::Pending => None,
+            Ok(None) | Err(_) => None,
         };
         #[cfg(test)]
         {

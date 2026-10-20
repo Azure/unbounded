@@ -419,6 +419,20 @@ impl Client {
         }
     }
 
+    /// Take a free page buffer of `rail` without waiting. `Ok(None)` when
+    /// none is free right now or the pool table is busy; registers no waker.
+    pub fn try_send_buffer(&self, rail: u16, len: usize) -> Result<Option<SendBuffer>> {
+        let pool = match self.shared.pools.try_read() {
+            Ok(pools) => pools.get(&rail).cloned(),
+            Err(_) => return Ok(None),
+        };
+        let Some(pool) = pool else {
+            return Err(Error::Unavailable);
+        };
+
+        pool.try_stage(len)
+    }
+
     /// Page buffers of `rail` in `state`, for diagnostics.
     pub fn buffers(&self, rail: u16, state: BufferState) -> Option<usize> {
         let pools = self.shared.pools.try_read().ok()?;
