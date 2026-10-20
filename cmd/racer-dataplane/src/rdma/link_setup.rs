@@ -152,7 +152,6 @@ impl LinkId {
 }
 
 /// Rail named by encoded setup bytes, before the full decode.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into the setup handler next.
 pub(crate) fn rail_of(bytes: &[u8]) -> Result<RailId> {
     if bytes.len() != SETUP_LEN || !bytes.starts_with(SETUP_PREFIX) {
         return Err(Error::InvalidRequest);

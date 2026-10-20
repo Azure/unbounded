@@ -964,6 +964,205 @@ impl Transfers {
     }
 }
 
+/// Status for a link setup the responder declines without touching the owner.
+fn link_status(status: u16) -> MessageHead {
+    MessageHead {
+        start: StartLine::Response { status },
+        headers: vec![extension("content-length", b"0".to_vec())],
+    }
+}
+
+/// Whether `local` and `peer` may hold a link on `rail`: both are members of
+/// the same nonempty Site and both publish the rail of the rail domain (the
+/// `select_hop` membership rules).
+pub(crate) fn link_allowed(
+    membership: &crate::topology::Membership,
+    local: &NodeId,
+    peer: &NodeId,
+    rail: RailId,
+) -> bool {
+    let (Ok(ours), Ok(theirs)) = (membership.member(local), membership.member(peer)) else {
+        return false;
+    };
+    !ours.site.is_empty()
+        && ours.site == theirs.site
+        && membership.rail_domain().contains(&rail)
+        && ours.rails.iter().any(|m| m.rail == rail)
+        && theirs.rails.iter().any(|m| m.rail == rail)
+}
+
+/// Initiator side of one link setup on an authenticated connection: open the
+/// link, send the signed `RdmaLink` request, verify the signed response, and
+/// connect. Any failure breaks the attempt, which backs the link off.
+pub(crate) async fn link_exchange(
+    io: &HttpIo,
+    signatures: &Signatures,
+    links: &crate::rdma::Links,
+    connection: ConnectionLease,
+    peer: &NodeId,
+    rail: RailId,
+    scope: &RequestScope,
+) -> Result<ConnectionLease> {
+    let (epoch, ours) = links.open(peer, rail, scope).await?;
+    let result = async {
+        let signed = peer_wire::link::RdmaLink {
+            setup: ours.clone(),
+            binding: None,
+        }
+        .sign(signatures.wire(), peer)?;
+        let connection = io
+            .send_head(connection, frame(signed)?, scope)
+            .await?
+            .connection;
+        let received = io.receive_head(connection, scope).await?;
+        if !matches!(received.value.start, StartLine::Response { status: 200 }) {
+            // 409: our offer lost the tie-break; the peer's offer replaces it.
+            // 429 and 503: try again after backoff.
+            return Err(Error::Unavailable);
+        }
+        let mut connection = received.connection;
+        let (verified, _) = peer_wire::link::RdmaLink::verify(
+            signatures.wire(),
+            Some(peer),
+            unframe(received.value, true)?,
+            true,
+        )?;
+        let (signed, verified_peer) = verified.into_parts();
+        let head = VerifiedHead {
+            signed,
+            peer: verified_peer,
+        };
+        let theirs = crate::rdma::signed_value(&head, SETUP_HEADER, peer_wire::link::MAX_SETUP)?;
+        let binding = crate::rdma::signed_value(&head, SETUP_BINDING_HEADER, 32)?;
+        connection.finish_exchange()?;
+        links
+            .connect(peer, rail, epoch, &ours, &theirs, &binding, scope)
+            .await?;
+        Ok(connection)
+    }
+    .await;
+    if result.is_err() {
+        links.abandon(peer, rail, epoch);
+    }
+    result
+}
+
+/// Background link setup over a new pooled connection to `endpoint`.
+pub(crate) async fn connect_link(
+    http: Rc<HttpPool>,
+    io: Rc<HttpIo>,
+    signatures: Rc<Signatures>,
+    links: Rc<crate::rdma::Links>,
+    endpoint: crate::http::Endpoint,
+    peer: NodeId,
+    rail: RailId,
+) -> Result<()> {
+    let mut request = [0; 16];
+    racer_platform::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
+    let scope = RequestScope::new(
+        crate::model::RequestId(request),
+        racer_platform::environment::now() + crate::rdma::SETUP_DEADLINE,
+    )?;
+    let connection = http
+        .checkout_with_state(&endpoint, Default::default(), &scope)
+        .await?;
+    let connection =
+        crate::peer::protocol::connect(&io, connection, signatures.clone(), &peer, &scope).await?;
+    link_exchange(&io, &signatures, &links, connection, &peer, rail, &scope).await?;
+    Ok(())
+}
+
+impl Transfers {
+    /// Start a background link setup when a page to `peer` on `rail` would use
+    /// RDMA but the link is not ready. The page itself uses HTTP.
+    pub(crate) fn ensure_link(
+        &self,
+        endpoint: &crate::http::Endpoint,
+        peer: &NodeId,
+        rail: RailId,
+    ) {
+        let Some(links) = &self.links else {
+            return;
+        };
+        if !links.wants(peer, rail) {
+            return;
+        }
+        let task = connect_link(
+            self.http.clone(),
+            self.io.clone(),
+            self.signatures.clone(),
+            links.clone(),
+            endpoint.clone(),
+            peer.clone(),
+            rail,
+        );
+        links.spawn(Box::pin(async move {
+            // Failures back the link off; pages keep using HTTP meanwhile.
+            let _ = task.await;
+            Ok(())
+        }));
+    }
+
+    /// Responder side of an `RdmaLink` setup: verify the signed offer, check
+    /// membership, rate limit and tie-break, accept, and answer signed. Declined
+    /// offers get `409` (our concurrent offer wins), `429` (rate limit or
+    /// overload), or `503` (no RDMA here) and never reach the owner.
+    pub(crate) async fn serve_link(
+        &self,
+        connection: ConnectionLease,
+        original: Arc<SignedHead>,
+        membership: Result<Arc<crate::topology::Membership>>,
+        scope: &RequestScope,
+    ) -> Result<ConnectionLease> {
+        let signed = Arc::try_unwrap(original).map_err(|_| Error::InvalidRequest)?;
+        let (verified, _) =
+            peer_wire::link::RdmaLink::verify(self.signatures.wire(), None, signed, false)?;
+        let (signed, verified_peer) = verified.into_parts();
+        let head = VerifiedHead {
+            signed,
+            peer: verified_peer,
+        };
+        let peer = head.peer.node().clone();
+        if connection.state().session.as_ref().map(|s| s.peer()) != Some(&peer) {
+            return Err(Error::Unauthorized);
+        }
+        let theirs = crate::rdma::signed_value(&head, SETUP_HEADER, peer_wire::link::MAX_SETUP)?;
+        let rail = crate::rdma::link_setup::rail_of(&theirs)?;
+        let local = self.signatures.node();
+        let reply = match &self.links {
+            None => link_status(503),
+            Some(_) if !membership.is_ok_and(|m| link_allowed(&m, local, &peer, rail)) => {
+                return Err(Error::Unauthorized);
+            }
+            Some(links) => match links.admit_setup(&peer, rail) {
+                crate::rdma::SetupAdmission::Conflict => link_status(409),
+                crate::rdma::SetupAdmission::Busy => link_status(429),
+                crate::rdma::SetupAdmission::Accept => {
+                    match links.accept(&peer, rail, &theirs, scope).await {
+                        Ok(ours) => frame(
+                            peer_wire::link::RdmaLink {
+                                setup: ours,
+                                binding: Some(crate::rdma::link_setup::binding(&theirs)),
+                            }
+                            .sign(self.signatures.wire(), &peer)?,
+                        )?,
+                        Err(Error::Overloaded) => link_status(429),
+                        Err(error) if recoverable(error) => link_status(503),
+                        Err(error) => return Err(error),
+                    }
+                }
+            },
+        };
+        let mut connection = self
+            .io
+            .send_head(connection, reply, scope)
+            .await?
+            .connection;
+        connection.finish_exchange()?;
+        Ok(connection)
+    }
+}
+
 /// Stable, quota-owned transport staging. Never contains plaintext page data.
 /// Construction normalizes capacity before pointer extraction; Vec backing then
 /// stays fixed while ownership moves through reactor completion closures.
@@ -1061,6 +1260,7 @@ pub struct Transfers {
     pub(super) rdma: Option<Rc<Sessions>>,
     pub(super) wire: (Rc<flow_control::Quotas<AdmissionPolicy>>, Rc<SecurityCodec>),
     pub(super) native: Option<Rc<crate::rdma::Sessions>>,
+    pub(super) links: Option<Rc<crate::rdma::Links>>,
 }
 impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
@@ -1095,7 +1295,13 @@ impl Transfers {
             rdma,
             wire: (admission, codec),
             native: None,
+            links: None,
         }
+    }
+    /// Use persistent RDMA links for pages and link setup.
+    pub fn with_links(mut self, links: Rc<crate::rdma::Links>) -> Self {
+        self.links = Some(links);
+        self
     }
     pub fn with_native(mut self, sessions: Rc<crate::rdma::Sessions>) -> Self {
         self.native = Some(sessions);
@@ -1231,6 +1437,15 @@ impl Transfers {
             } else {
                 None
             };
+            if let TransportPlan::Rdma { rail } = plan
+                && membership.is_some()
+                && self
+                    .links
+                    .as_ref()
+                    .is_some_and(|links| links.ready(&peer, rail).is_none())
+            {
+                self.ensure_link(&endpoint, &peer, rail);
+            }
             scope.candidate_progress()?;
             if let Some((_, accept, _)) = &native {
                 attach(&mut head, accept)?;
@@ -1632,6 +1847,227 @@ mod tests {
                 .unwrap(),
             )
         }
+        /// Outcome of one `RdmaLink` setup over a real socket pair.
+        struct LinkSetupCase {
+            /// Initiator signer index (0 or 2); the other is the responder.
+            initiator: usize,
+            /// Responder has RDMA links.
+            responder_links: bool,
+            /// Responder starts its own setup first (simultaneous offers).
+            responder_opens: bool,
+            sites: [&'static str; 2],
+        }
+
+        fn link_setup(
+            case: LinkSetupCase,
+        ) -> (
+            crate::rdma::links::tests::World,
+            Result<()>,
+            Result<()>,
+            NodeId,
+            NodeId,
+        ) {
+            use crate::rdma::links::tests::world_for;
+            let signers = crate::peer::tests::signers();
+            let membership = test_membership(&signers, &[0, 2], &case.sites);
+            let responder = 2 - case.initiator;
+            let mut w = world_for(
+                [
+                    signers[case.initiator].node().clone(),
+                    signers[responder].node().clone(),
+                ],
+                false,
+            );
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            )));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let initiator = transfers(signers[case.initiator].clone(), &admission, &reactor)
+                .with_links(w.a.links.clone());
+            let mut server = transfers(signers[responder].clone(), &admission, &reactor);
+            if case.responder_links {
+                server = server.with_links(w.b.links.clone());
+            }
+            let scope =
+                RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(10))
+                    .unwrap();
+            let (peer, local) = (
+                signers[responder].node().clone(),
+                signers[case.initiator].node().clone(),
+            );
+            if case.responder_opens {
+                let mut open = std::pin::pin!(w.b.links.open(&local, RailId(7), &scope));
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                loop {
+                    if let Poll::Ready(result) = open.as_mut().poll(&mut cx) {
+                        result.unwrap();
+                        break;
+                    }
+                    w.a.owner.poll_budgeted(8).unwrap();
+                    w.b.owner.poll_budgeted(8).unwrap();
+                }
+            }
+            let (a, b) = UnixStream::pair().unwrap();
+            let a = crate::http::from_accepted(a.into(), &admission).unwrap();
+            let b = crate::http::from_accepted(b.into(), &admission).unwrap();
+            let (client_result, serve_result) = {
+                let client = async {
+                    let a = p::connect(
+                        &initiator.io,
+                        a,
+                        signers[case.initiator].clone(),
+                        &peer,
+                        &scope,
+                    )
+                    .await?;
+                    link_exchange(
+                        &initiator.io,
+                        &signers[case.initiator],
+                        initiator.links.as_ref().unwrap(),
+                        a,
+                        &peer,
+                        RailId(7),
+                        &scope,
+                    )
+                    .await
+                    .map(drop)
+                };
+                let serve = async {
+                    let b = p::accept(&server.io, b, signers[responder].clone(), &scope).await?;
+                    let received = server.io.receive_head(b, &scope).await?;
+                    let (auth, length) = decode_envelope(received.value, false)?;
+                    assert_eq!(length, 0);
+                    server
+                        .serve_link(
+                            received.connection,
+                            auth.original,
+                            Ok(membership.clone()),
+                            &scope,
+                        )
+                        .await
+                        .map(drop)
+                };
+                let mut client = std::pin::pin!(client);
+                let mut serve = std::pin::pin!(serve);
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                let (mut client_result, mut serve_result) = (None, None);
+                for _ in 0..10_000 {
+                    if client_result.is_none()
+                        && let Poll::Ready(result) = client.as_mut().poll(&mut cx)
+                    {
+                        client_result = Some(result);
+                    }
+                    if serve_result.is_none()
+                        && let Poll::Ready(result) = serve.as_mut().poll(&mut cx)
+                    {
+                        serve_result = Some(result);
+                    }
+                    if client_result.is_some() && serve_result.is_some() {
+                        break;
+                    }
+                    reactor.poll_budgeted(128).unwrap();
+                    reactor.wait(Duration::from_millis(1)).unwrap();
+                    w.a.owner.poll_budgeted(16).unwrap();
+                    w.b.owner.poll_budgeted(16).unwrap();
+                }
+                (client_result, serve_result)
+            };
+            for _ in 0..8 {
+                w.a.owner.poll_budgeted(16).unwrap();
+                w.b.owner.poll_budgeted(16).unwrap();
+            }
+            (
+                w,
+                client_result.expect("initiator finished"),
+                serve_result.expect("responder finished"),
+                local,
+                peer,
+            )
+        }
+
+        #[test]
+        fn signed_link_setup_connects_both_sides() {
+            for initiator in [0, 2] {
+                let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
+                    initiator,
+                    responder_links: true,
+                    responder_opens: false,
+                    sites: ["site1", "site1"],
+                });
+                client.unwrap();
+                serve.unwrap();
+                let (_, ours) = w.a.links.ready(&peer, RailId(7)).expect("initiator ready");
+                let (_, theirs) = w.b.links.ready(&local, RailId(7)).expect("responder ready");
+                assert_eq!(ours, theirs);
+            }
+        }
+
+        #[test]
+        fn signed_link_setup_tie_break_rejects_the_higher_offer() {
+            let signers = crate::peer::tests::signers();
+            // The initiator has the higher NodeId and the responder is also
+            // initiating: the responder answers 409 and keeps its own offer.
+            let initiator =
+                if crate::rdma::link_setup::tie_break(signers[0].node(), signers[2].node())
+                    == crate::rdma::link_setup::TieBreak::AcceptPeer
+                {
+                    0
+                } else {
+                    2
+                };
+            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
+                initiator,
+                responder_links: true,
+                responder_opens: true,
+                sites: ["site1", "site1"],
+            });
+            assert_eq!(client, Err(Error::Unavailable));
+            serve.unwrap();
+            assert!(w.a.links.ready(&peer, RailId(7)).is_none());
+            assert!(matches!(
+                w.a.links.state(&peer, RailId(7)),
+                rdma_verbs::LinkState::Backoff(_) | rdma_verbs::LinkState::Breaking
+            ));
+            assert!(matches!(
+                w.b.links.state(&local, RailId(7)),
+                rdma_verbs::LinkState::Connecting(_)
+            ));
+            // The lower node's offer is accepted by the same rule.
+            assert_eq!(
+                w.a.links.admit_setup(&peer, RailId(7)),
+                crate::rdma::SetupAdmission::Accept
+            );
+        }
+
+        #[test]
+        fn signed_link_setup_declines_without_rdma_or_across_sites() {
+            let (w, client, serve, _, peer) = link_setup(LinkSetupCase {
+                initiator: 0,
+                responder_links: false,
+                responder_opens: false,
+                sites: ["site1", "site1"],
+            });
+            assert_eq!(client, Err(Error::Unavailable));
+            serve.unwrap();
+            assert!(w.a.links.ready(&peer, RailId(7)).is_none());
+            for sites in [["site1", "site2"], ["", ""]] {
+                let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
+                    initiator: 0,
+                    responder_links: true,
+                    responder_opens: false,
+                    sites,
+                });
+                assert!(client.is_err());
+                assert_eq!(serve, Err(Error::Unauthorized));
+                assert!(w.a.links.ready(&peer, RailId(7)).is_none());
+                assert_eq!(
+                    w.b.links.state(&local, RailId(7)),
+                    rdma_verbs::LinkState::Idle,
+                    "rejected offers never reach the owner"
+                );
+            }
+        }
+
         #[test]
         fn real_socket_signed_offer_falls_back_when_local_provider_is_unavailable() {
             offer_fallback(false, None, false);

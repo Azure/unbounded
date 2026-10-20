@@ -377,6 +377,22 @@ impl PeerServer {
             if length != 0 {
                 return Err(Error::InvalidRequest);
             }
+            if crate::peer::protocol::field(&authentication.original.head, "racer-kind")
+                .is_ok_and(|kind| kind == peer_wire::link::KIND)
+            {
+                if native_control.is_some() || !authentication.hops.is_empty() {
+                    return Err(Error::InvalidRequest);
+                }
+                return self
+                    .transfers
+                    .serve_link(
+                        received.connection,
+                        authentication.original,
+                        self.relay.network.current_membership(),
+                        &header_scope,
+                    )
+                    .await;
+            }
             let request = codec.request(authentication, scope)?;
             // Listener scopes bound connection lifetime, while the signed request
             // supplies correlation and can only shorten the deadline.

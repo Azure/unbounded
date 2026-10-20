@@ -14,7 +14,7 @@ use std::task::Context;
 const RAIL: RailId = RailId(7);
 
 pub(crate) struct Node {
-    pub links: Links,
+    pub links: Rc<Links>,
     pub owner: Owner,
     pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
@@ -22,7 +22,7 @@ pub(crate) struct Node {
 pub(crate) struct World {
     pub _sim: Simulation,
     pub clock: SimulationClock,
-    pub _environment: racer_platform::environment::Guard,
+    pub _environment: Option<racer_platform::environment::Guard>,
     pub a: Node,
     pub b: Node,
 }
@@ -49,25 +49,25 @@ pub(crate) fn scope() -> RequestScope {
     .unwrap()
 }
 
-fn node(sim: &Simulation, n: u8, environment: &Environment) -> Node {
+fn node(sim: &Simulation, n: u8, id: NodeId, environment: Option<&Environment>) -> Node {
     let view = sim
         .with_devices(vec![Device::new(format!("sim{n}"), [n; 16])])
         .unwrap();
     let (mut clients, port) = rdma_verbs::node(1).unwrap();
     let owner = {
         let _scope = view.enter();
-        let _environment = environment.enter();
+        let _environment = environment.map(Environment::enter);
         Owner::new(port)
     };
     let limits = crate::test_support::cluster::config(true).limits;
     Node {
-        links: Links::new(
+        links: Rc::new(Links::new(
             clients.remove(0),
             Arc::new(LinkNode::default()),
-            node_id(n),
+            id,
             2,
             None,
-        ),
+        )),
         owner,
         admission: Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits))),
     }
@@ -141,12 +141,18 @@ pub(crate) fn page(
 }
 
 pub(crate) fn world() -> World {
+    world_for([node_id(1), node_id(2)], true)
+}
+
+/// Two activated nodes named `ids`, on the simulated clock if `simulated`,
+/// else on the real clock (for tests over real sockets).
+pub(crate) fn world_for([id_a, id_b]: [NodeId; 2], simulated: bool) -> World {
     let sim = Simulation::new();
     let clock = SimulationClock::new(7);
     let environment = clock.environment(1);
-    let a = node(&sim, 1, &environment);
-    let b = node(&sim, 2, &environment);
-    let guard = environment.enter();
+    let a = node(&sim, 1, id_a, simulated.then_some(&environment));
+    let b = node(&sim, 2, id_b, simulated.then_some(&environment));
+    let guard = simulated.then(|| environment.enter());
     let mut world = World {
         _sim: sim,
         clock,
@@ -193,7 +199,7 @@ pub(crate) fn world() -> World {
 
 /// `a` initiates, `b` accepts, `a` connects. Returns the link id.
 pub(crate) fn link_up(w: &mut World) -> u64 {
-    let (a, b) = (node_id(1), node_id(2));
+    let (a, b) = (w.a.links.local().clone(), w.b.links.local().clone());
     let scope = scope();
     assert!(w.a.links.wants(&b, RAIL));
     let (epoch, ours) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
@@ -276,7 +282,7 @@ fn activation_without_two_buffers_settles_inactive() {
     let sim = Simulation::new();
     let clock = SimulationClock::new(7);
     let environment = clock.environment(1);
-    let mut n = node(&sim, 1, &environment);
+    let mut n = node(&sim, 1, node_id(1), Some(&environment));
     let _guard = environment.enter();
     let scope = scope();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());

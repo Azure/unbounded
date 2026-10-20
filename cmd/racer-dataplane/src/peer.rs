@@ -225,6 +225,16 @@ impl PeerNetwork {
             .ok_or(Error::IncompatibleMembership)
     }
 
+    /// Membership of the newest accepted publication.
+    pub fn current_membership(&self) -> Result<std::sync::Arc<crate::topology::Membership>> {
+        Ok(self
+            .published
+            .current()?
+            .ok_or(Error::IncompatibleMembership)?
+            .membership
+            .clone())
+    }
+
     pub fn endpoint(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,

@@ -48,8 +48,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::task::Poll;
 
-mod link_setup;
-mod links;
+pub(crate) mod link_setup;
+pub(crate) mod links;
 mod retry;
 pub use links::AuthenticatedGrant;
 pub use links::BUFFER_LEN;
