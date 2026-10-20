@@ -124,6 +124,10 @@ pub enum FaultResult {
 
 #[derive(Default)]
 struct Fault {
+    // Set when the address was invalidated or rewritten while the read was in
+    // flight: the bytes read may predate the current page, so they are handed
+    // to the waiters (who check them against their own tree) but not cached.
+    stale: std::cell::Cell<bool>,
     result: RefCell<Option<FaultResult>>,
     waiters: RefCell<Vec<Waker>>,
 }
@@ -156,7 +160,9 @@ impl FaultGuard {
         let result = match page {
             Some(page) => {
                 let page = Rc::new(page);
-                self.pager.insert(self.addr, Rc::clone(&page), priority);
+                if !self.fault.stale.get() {
+                    self.pager.insert_read(self.addr, &page, priority);
+                }
                 FaultResult::Page(page)
             }
             None => {
@@ -169,7 +175,16 @@ impl FaultGuard {
     }
 
     fn publish(&self, result: FaultResult) {
-        self.pager.state.borrow_mut().inflight.remove(&self.addr);
+        let mut state = self.pager.state.borrow_mut();
+        // A stale fault was detached already; a newer fault may own the slot.
+        if state
+            .inflight
+            .get(&self.addr)
+            .is_some_and(|f| Rc::ptr_eq(f, &self.fault))
+        {
+            state.inflight.remove(&self.addr);
+        }
+        drop(state);
         *self.fault.result.borrow_mut() = Some(result);
         for waker in self.fault.waiters.take() {
             waker.wake();
@@ -303,12 +318,31 @@ impl Pager {
         })
     }
 
-    /// Cache a page written by a commit (or read by a fault).
+    /// Cache a page read by a fault. Never replaces a cached frame: one that
+    /// is there already was written or read after this fault began.
+    fn insert_read(&self, addr: NodeAddr, page: &Rc<TreePage>, priority: Priority) {
+        if self.contains(addr) {
+            return;
+        }
+        self.insert(addr, Rc::clone(page), priority);
+    }
+
+    /// Mark an in-flight read of `addr` stale and detach it, so its bytes are
+    /// never cached and later callers start a fresh read.
+    fn detach_fault(state: &mut State, addr: NodeAddr) {
+        if let Some(fault) = state.inflight.remove(&addr) {
+            fault.stale.set(true);
+        }
+    }
+
+    /// Cache a page written by a commit. An in-flight read of the same address
+    /// is detached: it may return the bytes that were there before.
     pub fn insert(&self, addr: NodeAddr, page: Rc<TreePage>, priority: Priority) {
         let mut state = self.state.borrow_mut();
+        Self::detach_fault(&mut state, addr);
         if let Some(frame) = state.map.get_mut(&addr) {
             frame.page = page;
-            frame.credit = priority.credit();
+            frame.credit = frame.credit.max(priority.credit());
             frame.probation = priority == Priority::Scan;
             if frame.probation {
                 state.probation.push_back(addr);
@@ -345,6 +379,7 @@ impl Pager {
     /// Drop `addr` from the cache, for example when its unit is reused.
     pub fn invalidate(&self, addr: NodeAddr) {
         let mut state = self.state.borrow_mut();
+        Self::detach_fault(&mut state, addr);
         if let Some(frame) = state.map.remove(&addr) {
             state.ring[frame.slot] = None;
             state.free.push(frame.slot);
@@ -420,6 +455,10 @@ mod tests {
     use crate::volume::page::{RAW_BYTES, TreeKind, encode_leaf};
 
     fn page(addr: NodeAddr) -> TreePage {
+        leaf_with_seq(addr, 1)
+    }
+
+    fn leaf_with_seq(addr: NodeAddr, seq: u64) -> TreePage {
         let mut bytes = Box::new([0u8; UNIT_BYTES]);
         let key = Key::new([1; 8], [2; 12], 3);
         let mut raw = [0u8; RAW_BYTES];
@@ -440,7 +479,7 @@ mod tests {
             &mut bytes[..],
             TreeKind::Index,
             &[0; 16],
-            1,
+            seq,
             addr,
             [(&key, &raw)].into_iter(),
         );
@@ -520,5 +559,67 @@ mod tests {
         ));
         assert!(matches!(pager.begin_fault(addr), FaultRole::Hit(_)));
         assert_eq!(pager.stats().reads, 2);
+    }
+
+    #[test]
+    fn a_slow_read_never_replaces_a_reused_page() {
+        // R faults X under an old root; X is released and invalidated, then a
+        // later commit writes a new page at X. R's old bytes must not enter
+        // the cache.
+        let pager = Pager::new(16 * FRAME_BYTES);
+        let addr = NodeAddr::new(1, 2);
+        let FaultRole::Leader(old_read) = pager.begin_fault(addr) else {
+            panic!("leads");
+        };
+        let FaultRole::Follower(old_follower) = pager.begin_fault(addr) else {
+            panic!("follows");
+        };
+        pager.invalidate(addr);
+        // A reader after the release does not join the stale read.
+        let FaultRole::Leader(fresh) = pager.begin_fault(addr) else {
+            panic!("a fresh read leads");
+        };
+        drop(fresh);
+        pager.insert(addr, Rc::new(leaf_with_seq(addr, 9)), Priority::Leaf);
+        let result = old_read.finish(Some(leaf_with_seq(addr, 1)), Priority::Leaf);
+        assert!(matches!(result, FaultResult::Page(ref p) if p.seq() == 1));
+        let cx = &mut std::task::Context::from_waker(Waker::noop());
+        let mut wait = Box::pin(old_follower.wait());
+        assert!(matches!(
+            wait.as_mut().poll(cx),
+            Poll::Ready(FaultResult::Page(ref p)) if p.seq() == 1
+        ));
+        assert_eq!(pager.get(addr, Priority::Leaf).unwrap().seq(), 9);
+    }
+
+    #[test]
+    fn a_stale_read_is_not_cached_after_invalidate() {
+        let pager = Pager::new(16 * FRAME_BYTES);
+        let addr = NodeAddr::new(1, 2);
+        let FaultRole::Leader(old_read) = pager.begin_fault(addr) else {
+            panic!("leads");
+        };
+        pager.invalidate(addr);
+        let FaultRole::Leader(fresh) = pager.begin_fault(addr) else {
+            panic!("a fresh read leads");
+        };
+        old_read.finish(Some(leaf_with_seq(addr, 1)), Priority::Leaf);
+        assert!(!pager.contains(addr));
+        // The stale finish did not detach the fresh fault.
+        assert!(matches!(pager.begin_fault(addr), FaultRole::Follower(_)));
+        fresh.finish(Some(leaf_with_seq(addr, 5)), Priority::Leaf);
+        assert_eq!(pager.get(addr, Priority::Leaf).unwrap().seq(), 5);
+    }
+
+    #[test]
+    fn rewriting_a_frame_keeps_its_credit() {
+        let pager = Pager::new(16 * FRAME_BYTES);
+        let addr = NodeAddr::new(1, 2);
+        pager.insert(addr, Rc::new(page(addr)), Priority::Inner);
+        pager.insert(addr, Rc::new(page(addr)), Priority::Leaf);
+        assert_eq!(
+            pager.state.borrow().map[&addr].credit,
+            Priority::Inner.credit()
+        );
     }
 }

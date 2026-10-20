@@ -241,7 +241,12 @@ commit, then the durable tree. It remembers the root set it started on. If a
 commit published a new root set while it read pages, it starts again, so the
 answer is never older than the latest state when it returns. A page that was
 freed and reused while a slow reader held an old root fails the seq or range
-check and the reader starts again.
+check and the reader starts again. The check is only a bound (seq not above
+the reader's root), so the cache must never hold bytes older than the page
+now at an address: freeing or rewriting an address detaches any read of it
+still in flight, and that read hands its bytes to its own waiters (who check
+them against their own root) without caching them. A read also never
+replaces a page already cached at its address.
 
 Range scans work one leaf at a time and merge the leaf with both overlays.
 
