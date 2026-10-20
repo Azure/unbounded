@@ -4,6 +4,7 @@
 package goalstates
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -24,6 +25,45 @@ func TestNVIDIAStateAvailable(t *testing.T) {
 		LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
 		DriverVersion:  "580.1",
 	}))
+}
+
+func TestResolveNvidiaHostRejectsUnusableGPUs(t *testing.T) {
+	t.Parallel()
+
+	for _, hardwareOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hardwareOnly=%t", hardwareOnly), func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			pciDir := filepath.Join(root, "pci")
+			deviceDir := filepath.Join(root, "dev")
+			require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+			if hardwareOnly {
+				addNVIDIAPCIDevice(t, pciDir)
+			} else {
+				require.NoError(t, os.WriteFile(filepath.Join(deviceDir, "nvidia0"), nil, 0o644))
+			}
+
+			deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
+			deps.hostDistro = func() string { return hostDistroUbuntu2404 }
+			deps.lookPath = func(name string) (string, error) {
+				require.Equal(t, "nvidia-smi", name)
+				return name, nil
+			}
+			deps.outputCmd = func(_ context.Context, name string, args ...string) ([]byte, error) {
+				require.Equal(t, "nvidia-smi", name)
+				require.Equal(t, []string{"-L"}, args)
+
+				return []byte("No devices found.\n"), nil
+			}
+
+			host, err := resolveNvidiaHost("amd64", deps, false)
+			require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
+			require.ErrorContains(t, err, "repair the host NVIDIA driver")
+			require.Empty(t, host)
+		})
+	}
 }
 
 func TestAzureLinuxUsesNVIDIACDIRuntime(t *testing.T) {

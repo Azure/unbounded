@@ -4,6 +4,7 @@
 package goalstates
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -65,6 +66,17 @@ func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 			},
 		)
 		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
+	})
+
+	t.Run("unusable GPUs prevent worker goal resolution", func(t *testing.T) {
+		gs, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) {
+				return NvidiaHost{}, fmt.Errorf("%w: nvidia-smi did not report valid NVIDIA GPU enumeration", ErrNVIDIAStateUnavailable)
+			},
+		)
+		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
+		require.Nil(t, gs)
 	})
 }
 
