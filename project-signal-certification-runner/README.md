@@ -36,6 +36,8 @@ checked against [`ubuntu-InRelease.sha256`](ubuntu-InRelease.sha256).
 `Check-Valid-Until: no` permits this historical snapshot; it does not disable
 signature verification. Mutable Ubuntu/CUDA package repositories are removed
 from the build configuration.
+APT retries transient HTTPS failures against the same locked snapshot URL; it
+does not fall back to another mirror, timestamp, package version, or source.
 
 [`script-contract.json`](script-contract.json) binds the recipe to all fifteen
 regular `0755` script files at

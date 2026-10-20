@@ -74,6 +74,12 @@ class InputTests(unittest.TestCase):
         self.assertIn("WORKDIR /opt/gpu-burn\n", recipe)
         self.assertIn("ENTRYPOINT []\n", recipe)
 
+    def test_apt_retries_only_the_locked_snapshot(self):
+        recipe = (ROOT / "Containerfile").read_text()
+        self.assertEqual(recipe.count("Acquire::Retries=10"), 2)
+        self.assertIn("Acquire::https::Timeout=60", recipe)
+        self.assertNotIn("--fix-missing", recipe)
+
     def test_build_checks_real_nonroot_ssh_without_adding_privileges(self):
         recipe = (ROOT / "Containerfile").read_text()
         self.assertIn("setpriv --reuid=65532 --regid=65532 --clear-groups", recipe)

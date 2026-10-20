@@ -12,9 +12,11 @@ RUN : > /etc/apt/sources.list \
     && install -m 0644 /opt/certification-image/ubuntu.sources /etc/apt/sources.list.d/certification.sources \
     && printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod 0755 /usr/sbin/policy-rc.d \
-    && apt-get update \
+    && apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=60 update \
     && (cd /var/lib/apt/lists && sha256sum -c /opt/certification-image/ubuntu-InRelease.sha256) \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Acquire::Retries=10 -o Acquire::https::Timeout=60 \
+        install -y --no-install-recommends \
         bash binutils ca-certificates cmake coreutils curl findutils fio g++ gawk gcc \
         git grep iproute2 libgomp1 libnuma-dev libopenmpi-dev make numactl \
         openmpi-bin openssh-client openssh-server pkg-config procps python3 python3-venv \
