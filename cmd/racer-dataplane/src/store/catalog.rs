@@ -466,6 +466,9 @@ impl Index {
             }
         }
         let mut versions: HashMap<ObjectVersion, super::holds::Hold> = HashMap::default();
+        // Pages are visited in hash order; collect them and sort each set once
+        // rather than paying a vector shift per out-of-order insert.
+        let mut members: HashMap<ObjectVersion, Vec<crate::model::PageNumber>> = HashMap::default();
         for (page, entry) in self.state.borrow().pages.iter() {
             if let Some(until) = deadlines.get(&entry.location.extent.offset()) {
                 let Some(monotonic) = until
@@ -488,8 +491,16 @@ impl Index {
                         });
                 hold.until = hold.until.max(*until);
                 hold.monotonic = hold.monotonic.max(monotonic);
-                hold.pages.insert(page.number);
                 hold.locations.insert(page.number, entry.location.clone());
+                members
+                    .entry(page.version.clone())
+                    .or_default()
+                    .push(page.number);
+            }
+        }
+        for (version, pages) in members {
+            if let Some(hold) = versions.get_mut(&version) {
+                hold.pages = pages.into_iter().collect();
             }
         }
         self.holds.borrow_mut().entries = versions;
@@ -1471,6 +1482,42 @@ mod tests {
         index
             .reserve_hold_pages(&other, &page_set(&[0]), until)
             .unwrap();
+    }
+
+    #[test]
+    fn restored_hold_rebuilds_sorted_page_set_from_unordered_visits() {
+        let segments = Rc::new(segments(1024, 64));
+        let index = Rc::new(index(64));
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let count = 40u64;
+        let bytes = count * crate::model::PAGE_BYTES;
+        let (first, _) = indexed(descriptor("many", bytes), 0);
+        for number in 0..count {
+            let (mut page, entry) = indexed(descriptor("many", bytes), number);
+            page.number = crate::model::PageNumber(number);
+            drop(segments.append(1024).unwrap());
+            index.publish(page, entry).unwrap();
+        }
+        let held: Vec<u64> = (0..count).rev().step_by(3).collect();
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&first.version, &page_set(&held), until)
+            .unwrap();
+        let mut snapshots = segments.snapshot();
+        let mut remaining = usize::MAX;
+        index
+            .snapshot_holds(&mut snapshots, &mut remaining)
+            .unwrap();
+        index.holds.borrow_mut().entries.clear();
+        index.restore_holds(&snapshots).unwrap();
+        let holds = index.holds.borrow();
+        let hold = &holds.entries[&first.version];
+        assert_eq!(hold.pages, page_set(&held));
+        let restored: Vec<u64> = hold.pages.iter().map(|p| p.0).collect();
+        let mut expected = held.clone();
+        expected.sort_unstable();
+        assert_eq!(restored, expected);
+        assert_eq!(hold.locations.len(), held.len());
     }
 
     #[test]
