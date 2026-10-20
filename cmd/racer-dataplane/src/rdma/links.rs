@@ -102,15 +102,24 @@ enum Initiating {
 }
 
 /// Holds an `Initiating::Reserved` entry while `open` waits on the owner.
-/// Dropping it (error or cancellation) clears only its own reservation.
+/// Dropping it (error or cancellation) clears only its own reservation and,
+/// if the owner already opened a link the caller never read, breaks that
+/// epoch so the link does not sit in `Connecting`. The owner breaks links
+/// it opens after the op is gone.
 struct Reservation<'a> {
     node: &'a LinkNode,
     key: LinkKey,
     token: u64,
+    pending: Option<(&'a Client, Op<rdma_verbs::Opened>)>,
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
+        if let Some((client, op)) = self.pending.take()
+            && let Some(Ok(opened)) = op.cancel()
+        {
+            client.break_link(self.key, opened.epoch);
+        }
         let mut initiating = LinkNode::lock(&self.node.initiating);
         if initiating.get(&self.key) == Some(&Initiating::Reserved(self.token)) {
             initiating.remove(&self.key);
@@ -461,7 +470,7 @@ impl Links {
         scope: &RequestScope,
     ) -> Result<(Epoch, Vec<u8>)> {
         let key = link_key(peer, rail);
-        let reservation = {
+        let mut reservation = {
             let mut initiating = LinkNode::lock(&self.node.initiating);
             if initiating.contains_key(&key) {
                 return Err(Error::Overloaded);
@@ -476,9 +485,15 @@ impl Links {
                 node: &self.node,
                 key,
                 token,
+                pending: Some((&self.client, self.client.open(key))),
             }
         };
-        let opened = self.wait(self.client.open(key), scope).await?;
+        let opened = match &reservation.pending {
+            Some((_, op)) => self.retry.wait(scope, poll_fn(|cx| op.poll(cx))).await?,
+            None => return Err(Error::InvalidRequest),
+        };
+        // Read: the caller now owns the epoch.
+        reservation.pending = None;
         {
             let mut initiating = LinkNode::lock(&self.node.initiating);
             // A responder-side accept may have replaced our reservation.

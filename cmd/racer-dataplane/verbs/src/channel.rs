@@ -313,6 +313,21 @@ impl<T> Op<T> {
             State::Taken => Poll::Ready(Err(Error::InvalidRequest)),
         }
     }
+
+    /// Abandon the op and return its result if it completed but was not
+    /// read. Atomic with respect to the owner's completion: a result is
+    /// either returned here or handed back to the owner, never lost.
+    pub fn cancel(self) -> Option<Result<T>> {
+        let mut waiting = lock(&self.0.waiting);
+        *waiting = false;
+        let state = std::mem::replace(&mut *lock(&self.0.state), State::Taken);
+        drop(waiting);
+
+        match state {
+            State::Done(result) => Some(result),
+            State::Pending | State::Taken => None,
+        }
+    }
 }
 
 impl<T> std::fmt::Debug for Op<T> {
@@ -536,6 +551,23 @@ mod tests {
         drop(completer);
         assert_eq!(wakes(&count), 1);
         assert_eq!(op.poll(&mut cx), Poll::Ready(Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn cancel_returns_an_unread_result() {
+        let (op, completer) = op::<u32>();
+
+        assert!(completer.complete(Ok(7)).is_ok());
+        assert_eq!(op.cancel(), Some(Ok(7)));
+    }
+
+    #[test]
+    fn cancel_before_completion_returns_value_to_owner() {
+        let (op, completer) = op::<u32>();
+
+        assert_eq!(op.cancel(), None);
+        assert!(completer.is_abandoned());
+        assert_eq!(completer.complete(Ok(7)), Err(Ok(7)));
     }
 
     #[test]

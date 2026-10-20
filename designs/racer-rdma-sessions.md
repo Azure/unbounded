@@ -123,7 +123,14 @@ Who initiates: any worker that needs a link and sees `Idle`. `Client::open`
 returns `Busy` if another worker already started, so at most one setup runs
 per key. The initiator holds its per-key reservation in drop guards from
 `open` through the HTTP exchange and `connect`, so a cancelled or failed setup
-clears only its own reservation and breaks only its own epoch. Pages never wait for a link: while it is not `Ready`, pages use HTTP.
+clears only its own reservation and breaks only its own epoch. If `open` is
+dropped while the owner is still opening, the owner sees the abandoned op and
+breaks the link it opened; if the owner already answered but the result was
+never read, the reservation guard takes the result and breaks that epoch. The
+link then backs off instead of sitting in `Connecting` until its setup
+deadline, and a later attempt for the same peer and rail proceeds after the
+backoff. `LinkNode::reset` does not touch reservations: every entry is owned by
+a live guard that clears it. Pages never wait for a link: while it is not `Ready`, pages use HTTP.
 
 ## Link setup over HTTP
 

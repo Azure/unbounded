@@ -482,9 +482,42 @@ fn cancelled_open_clears_its_reservation() {
     }
     pump!(w);
     assert!(LinkNode::lock(&w.a.links.node.initiating).is_empty());
-    // The owner still holds the half-open link from the dropped request until
-    // its setup deadline; after that, a later attempt is allowed and succeeds.
-    assert_eq!(w.a.links.state(&b, RAIL), LinkState::Connecting(Epoch(1)));
+    // The owner broke the link it opened for the dropped request; after the
+    // backoff, a later attempt is allowed and succeeds.
+    assert!(matches!(
+        w.a.links.state(&b, RAIL),
+        LinkState::Backoff(_) | LinkState::Breaking
+    ));
+    for _ in 0..8 {
+        w.clock.advance(SETUP_DEADLINE);
+        pump!(w);
+    }
+    assert!(w.a.links.wants(&b, RAIL));
+    drive!(w, w.a.links.open(&b, RAIL, &self::scope())).unwrap();
+}
+
+#[test]
+fn open_dropped_after_the_owner_answered_breaks_its_epoch() {
+    let mut w = world();
+    let b = node_id(2);
+    let scope = scope();
+    {
+        let mut open = std::pin::pin!(w.a.links.open(&b, RAIL, &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(open.as_mut().poll(&mut cx).is_pending());
+        // The owner answers, but the caller never polls again.
+        pump!(w);
+        assert!(matches!(
+            w.a.links.state(&b, RAIL),
+            LinkState::Connecting(_)
+        ));
+    }
+    pump!(w);
+    assert!(LinkNode::lock(&w.a.links.node.initiating).is_empty());
+    assert!(matches!(
+        w.a.links.state(&b, RAIL),
+        LinkState::Backoff(_) | LinkState::Breaking
+    ));
     for _ in 0..8 {
         w.clock.advance(SETUP_DEADLINE);
         pump!(w);
@@ -506,6 +539,12 @@ fn dropped_setup_attempt_abandons_its_epoch() {
         w.a.links.state(&b, RAIL),
         LinkState::Backoff(_) | LinkState::Breaking
     ));
+    for _ in 0..8 {
+        w.clock.advance(SETUP_DEADLINE);
+        pump!(w);
+    }
+    assert!(w.a.links.wants(&b, RAIL));
+    drive!(w, w.a.links.open(&b, RAIL, &self::scope())).unwrap();
 }
 
 #[test]
@@ -520,6 +559,7 @@ fn stale_setup_guards_leave_a_newer_attempt() {
         node: &w.a.links.node,
         key,
         token: u64::MAX,
+        pending: None,
     });
     drop(SetupAttempt::new(&w.a.links, &b, RAIL, Epoch(epoch.0 + 1)));
     pump!(w);

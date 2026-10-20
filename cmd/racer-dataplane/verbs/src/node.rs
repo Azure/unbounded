@@ -673,7 +673,10 @@ impl Owner {
                 let _ = done.complete(result);
             }
             Command::Open(key, done) => {
-                let _ = done.complete(self.open(key, now));
+                // The initiator went away: do not leave the link Connecting.
+                if let Err(Ok(opened)) = done.complete(self.open(key, now)) {
+                    self.break_matching(key, opened.epoch, now);
+                }
             }
             Command::Accept {
                 key,
