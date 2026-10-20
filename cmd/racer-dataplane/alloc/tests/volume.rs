@@ -894,7 +894,24 @@ mod simulation {
             "a scan flushed a hot leaf"
         );
         // A miss with a cold path is answered by try_get only after a fault.
-        assert!(volume.try_get(&key(1, count - 1)).is_none());
+        let cold = key(1, count - 1);
+        assert!(volume.try_get(&cold).is_none());
+        let after = Bound::Excluded(cold);
+        assert!(volume.try_range(after, Bound::Unbounded, 3).is_none());
+        drive(&reactor, volume.prefetch(&reactor, &cold, &SCOPE)).unwrap();
+        assert_eq!(
+            volume.try_get(&cold),
+            Some(Some(values[(count - 1) as usize]))
+        );
+        let expected = drive(
+            &reactor,
+            volume.range(&reactor, after, Bound::Unbounded, 3, &SCOPE),
+        )
+        .unwrap();
+        drive(&reactor, volume.prefetch(&reactor, &cold, &SCOPE)).unwrap();
+        if let Some(found) = volume.try_range(after, Bound::Unbounded, 3) {
+            assert_eq!(found, expected);
+        }
     }
 
     /// Uncommitted changes are bounded: allocation pushes back until a

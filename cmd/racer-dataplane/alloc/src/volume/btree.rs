@@ -297,6 +297,29 @@ pub fn try_get<S: Source>(
     }
 }
 
+/// Leaf covering `key` from cached pages only. `None` when a page on the
+/// path is not cached.
+pub fn try_seek<S: Source>(
+    source: &S,
+    root: &TreeRoot,
+    kind: TreeKind,
+    max_seq: u64,
+    key: &Key,
+) -> Option<Seek> {
+    if root.is_empty() {
+        return Some(Seek::Empty);
+    }
+    let mut req = request(root, kind, max_seq, Priority::Leaf);
+    loop {
+        let page = source.cached(&req)?;
+        if req.level == 0 {
+            return Some(Seek::Leaf(page, req.high));
+        }
+        let i = page.child_index(key);
+        req = child_request(&page, i, &req, Priority::Leaf);
+    }
+}
+
 /// Every page address of a tree above the leaves, and every leaf address,
 /// visiting only inner pages. Calls `visit` with each address and level.
 /// Returns the lost ranges of inner pages.

@@ -1273,6 +1273,100 @@ impl<C: Charge> Volume<C> {
         Ok(())
     }
 
+    /// Entries with keys in `(low, high)`, at most `limit`, from memory only:
+    /// the overlays and cached pages. `None` when a page would have to be
+    /// read; [`Volume::prefetch`] loads it.
+    pub fn try_range(
+        &self,
+        low: Bound<Key>,
+        high: Bound<Key>,
+        limit: usize,
+    ) -> Option<Vec<(Key, Value)>> {
+        let mut out = Vec::new();
+        let mut cursor = low;
+        let state = self.shared.state();
+        let durable = state.durable;
+        let io = TryIo(self);
+        while out.len() < limit {
+            let start = bound_key(&cursor);
+            if !before_high(&start, &high) && !matches!(cursor, Bound::Unbounded) {
+                break;
+            }
+            let seek = btree::try_seek(
+                &io,
+                &durable.trees[TreeKind::Index.index()],
+                TreeKind::Index,
+                durable.seq,
+                &start,
+            )?;
+            let (entries, leaf_high): (Vec<(Key, Value)>, Option<Key>) = match seek {
+                Seek::Empty => (Vec::new(), None),
+                Seek::Lost(_, h) => (Vec::new(), h),
+                Seek::Leaf(page, h) => (
+                    (0..page.count())
+                        .filter_map(|i| {
+                            Value::decode(page.value(i).try_into().ok()?).map(|v| (page.key(i), v))
+                        })
+                        .collect(),
+                    h,
+                ),
+            };
+            let end = match (leaf_high, &high) {
+                (Some(h), Bound::Unbounded) => Bound::Excluded(h),
+                (Some(h), Bound::Included(x)) if h <= *x => Bound::Excluded(h),
+                (Some(h), Bound::Excluded(x)) if h < *x => Bound::Excluded(h),
+                (_, other) => *other,
+            };
+            let in_range = |key: &Key| after_low(key, &cursor) && before_high(key, &end);
+            let tree = entries.into_iter().filter(|(k, _)| in_range(k));
+            let layer = |overlay: &Overlay| -> Vec<(Key, Layer<Value>)> {
+                overlay
+                    .index
+                    .range((cursor, end))
+                    .map(|(k, e)| (*k, index_layer(e)))
+                    .collect()
+            };
+            let frozen = state.frozen.as_ref().map(|f| layer(f)).unwrap_or_default();
+            let active = layer(&state.active);
+            if merge_layers(tree, frozen, active, &mut out, limit) {
+                break;
+            }
+            match (leaf_high, end) {
+                (Some(h), Bound::Excluded(e)) if h == e => cursor = Bound::Included(h),
+                _ => break,
+            }
+        }
+        Some(out)
+    }
+
+    /// Load the index pages on the path to `key` into the cache, so memory
+    /// only calls ([`Volume::try_get`], [`Volume::try_range`]) can answer.
+    pub fn prefetch<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        key: &Key,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let key = *key;
+        Box::pin(async move {
+            let durable = self.shared.state().durable;
+            let io = self.io(reactor, scope);
+            btree::seek(
+                &io,
+                &durable.trees[TreeKind::Index.index()],
+                TreeKind::Index,
+                durable.seq,
+                &key,
+                Priority::Leaf,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     /// Pin a slot so eviction skips it. `None` when out of range.
     pub fn lease(&self, slot: u32) -> Option<SlotLease> {
         (u64::from(slot) < self.slot_count).then(|| self.shared.state().slots.lease(slot))
