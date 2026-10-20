@@ -3161,6 +3161,31 @@ pub mod ready_set {
         }
 
         #[test]
+        /// Probe level readiness without waiting, caching indices for `next`.
+        fn has_ready_caches_level_readiness_and_defers_to_an_idle_wait() {
+            let mut set = ReadySet::<Error>::new().unwrap();
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            set.insert(reader.as_raw_fd(), 4).unwrap();
+            assert_eq!(set.has_ready(), Ok(false));
+            writer.write_all(b"x").unwrap();
+            assert_eq!(set.has_ready(), Ok(true));
+            assert_eq!(set.ready.len(), 1);
+            assert_eq!(set.has_ready(), Ok(true), "cached index is not refilled");
+            assert_eq!(set.ready.len(), 1);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert_eq!(set.next(&mut cx, 1, |_| panic!("cached")), Ok(Some(4)));
+            reader.read_exact(&mut [0]).unwrap();
+            assert_eq!(
+                set.next(&mut cx, 1, |_| Box::pin(std::future::pending())),
+                Ok(None)
+            );
+            writer.write_all(b"x").unwrap();
+            assert_eq!(set.has_ready(), Ok(false), "the idle wait owns the wake");
+            assert!(set.ready.is_empty());
+        }
+
+        #[test]
         /// Keep the epoll owner alive until an abandoned idle operation is fenced.
         fn abandoned_idle_wait_retains_epoll_until_completion_fence() {
             use crate::reactor::tests::{drive, kernel_reactor, scope};

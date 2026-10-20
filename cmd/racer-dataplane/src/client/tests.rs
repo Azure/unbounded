@@ -3960,3 +3960,39 @@ mod parser_tests {
         }
     }
 }
+
+#[test]
+fn handoff_acceptor_drains_backlog_and_wakes_only_while_one_remains() {
+    use crate::admission::Ingress;
+    use crate::model::WorkerId;
+    use crate::test_support::WakeCounter;
+    use std::task::Waker;
+
+    let mut acceptor = Fixture::new();
+    let worker = Fixture::new();
+    let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
+    ingress
+        .install(WorkerId(1), &worker.listeners.admission)
+        .unwrap();
+    acceptor.listeners = acceptor.listeners.with_ingress(ingress.clone());
+    acceptor.reconcile(&[definition()]).unwrap();
+    let _sockets: Vec<_> = (0..3).map(|_| acceptor.connect()).collect();
+    assert!(
+        ingress
+            .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
+            .unwrap()[0]
+            .is_none()
+    );
+    let wakes = Arc::new(WakeCounter::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    // One accept per listener per turn would leave two connections queued.
+    assert_eq!(acceptor.listeners.poll_budgeted(&mut cx, 2).unwrap(), 2);
+    assert_eq!(wakes.count(), 1, "the budget ran out with a backlog left");
+    assert_eq!(acceptor.listeners.poll_budgeted(&mut cx, 8).unwrap(), 1);
+    assert_eq!(wakes.count(), 1, "a drained backlog does not self-wake");
+    for _ in 0..3 {
+        worker.install_handoff(&ingress);
+    }
+    assert_eq!(worker.listeners.active_connections_for(&definition().id), 3);
+}
