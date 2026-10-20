@@ -137,6 +137,7 @@ func TestStatLaneScalesWithMaxConnections(t *testing.T) {
 			for range tt.want + 1 {
 				local, peer := net.Pipe()
 				peers = append(peers, peer)
+
 				c.recycle(&clientConn{Conn: local, r: bufio.NewReader(local), expires: time.Now().Add(time.Minute)})
 			}
 
