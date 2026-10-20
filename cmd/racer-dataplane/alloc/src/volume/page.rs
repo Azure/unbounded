@@ -374,8 +374,11 @@ pub fn encode_inner(
 }
 
 /// A validated tree page. Accessors read the raw bytes in place.
+///
+/// The bytes are inline, so a cached `Rc<TreePage>` reaches its header
+/// without a second pointer chase.
 pub struct TreePage {
-    bytes: Box<[u8; UNIT_BYTES]>,
+    bytes: [u8; UNIT_BYTES],
 }
 
 impl std::fmt::Debug for TreePage {
@@ -422,7 +425,7 @@ impl TreePage {
         if bytes[end..].iter().any(|&b| b != 0) {
             return None;
         }
-        let page = Self { bytes };
+        let page = Self { bytes: *bytes };
         let mut previous: Option<&[u8]> = None;
         for i in 0..count {
             let at = HEADER_BYTES + i * width;
@@ -452,7 +455,7 @@ impl TreePage {
 
     /// A page this process just encoded, without validation.
     pub fn trusted(bytes: Box<[u8; UNIT_BYTES]>) -> Self {
-        Self { bytes }
+        Self { bytes: *bytes }
     }
 
     /// Raw bytes.
@@ -528,7 +531,8 @@ impl TreePage {
         while low < high {
             let mid = (low + high) / 2;
             let at = HEADER_BYTES + mid * width;
-            match bytes[at..at + KEY_BYTES].cmp(&key.0[..]) {
+            let probe: &[u8; KEY_BYTES] = bytes[at..at + KEY_BYTES].try_into().expect("key bytes");
+            match super::format::compare_keys(probe, &key.0) {
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Greater => high = mid,
                 std::cmp::Ordering::Equal => return Ok(mid),

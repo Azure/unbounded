@@ -155,8 +155,36 @@ impl fmt::Debug for NodeAddr {
 }
 
 /// Index key: cache hash (8), version hash (12), big-endian page number (4).
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// Ordered bytewise.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Key(pub [u8; KEY_BYTES]);
+
+/// Bytewise order of two encoded keys, as three big-endian words instead of
+/// a `memcmp` call. Lookups compare keys on every probe of every level.
+#[inline]
+pub fn compare_keys(a: &[u8; KEY_BYTES], b: &[u8; KEY_BYTES]) -> std::cmp::Ordering {
+    let word = |k: &[u8; KEY_BYTES], i: usize| {
+        u64::from_be_bytes(k[i * 8..i * 8 + 8].try_into().expect("8 bytes"))
+    };
+    word(a, 0)
+        .cmp(&word(b, 0))
+        .then_with(|| word(a, 1).cmp(&word(b, 1)))
+        .then_with(|| word(a, 2).cmp(&word(b, 2)))
+}
+
+impl Ord for Key {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_keys(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for Key {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl Key {
     /// Smallest key.
@@ -385,5 +413,25 @@ mod tests {
         assert_eq!(key.page(), 0x0102_0304);
         assert!(Key::new([1; 8], [2; 12], 1) < Key::new([1; 8], [2; 12], 256));
         assert!(Key::MIN < key && key < Key::MAX);
+    }
+
+    #[test]
+    fn key_order_matches_bytewise_order() {
+        // Differences in every byte position, in both directions, and ties.
+        let base = [0x80u8; KEY_BYTES];
+        let mut keys = vec![Key(base), Key::MIN, Key::MAX];
+        for i in 0..KEY_BYTES {
+            for v in [0x00, 0x7f, 0x81, 0xff] {
+                let mut k = base;
+                k[i] = v;
+                keys.push(Key(k));
+            }
+        }
+        for a in &keys {
+            for b in &keys {
+                assert_eq!(a.cmp(b), a.0[..].cmp(&b.0[..]), "{a:?} {b:?}");
+                assert_eq!(compare_keys(&a.0, &b.0), a.0.cmp(&b.0));
+            }
+        }
     }
 }
