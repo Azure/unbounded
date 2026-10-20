@@ -146,6 +146,12 @@ printed. For example, invalid JSON, missing required config fields, invalid
 bootstrap authentication, unsupported download settings, or an unresolvable
 rootfs goal state can stop the command before check output is produced.
 
+NVIDIA discovery for preflight is diagnostic-only: it does not initialize GPU
+devices or require driver readiness during goal resolution. Driver failures are
+reported by the named `nvidia-driver` check, including in JSON output, and support
+`--ignore-preflight-errors=nvidia-driver`. Bootstrap still enforces readiness
+independently before provisioning; ignoring preflight errors does not bypass it.
+
 ## Current Checks
 
 After config loading and goal resolution succeed, the current preflight check

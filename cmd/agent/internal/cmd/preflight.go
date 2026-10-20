@@ -29,11 +29,16 @@ type preflightHandler struct {
 	failOnWarnings        bool
 	output                string
 	writer                io.Writer
+	checks                []preflight.Checker
 }
 
 func newCmdPreflight(cmdCtx *CommandContext) *cobra.Command {
 	handler := &preflightHandler{cmdCtx: cmdCtx, writer: os.Stdout}
 
+	return handler.command()
+}
+
+func (handler *preflightHandler) command() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "preflight",
 		Short: "Run non-mutating preflight checks",
@@ -99,7 +104,7 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("resolve download overrides: %w", err)
 	}
 
-	goalState, err := goalstates.ResolveMachine(
+	goalState, err := goalstates.ResolveMachineForPreflight(
 		logger,
 		&cfg.AgentConfig,
 		goalstates.NSpawnMachineKube1,
@@ -109,11 +114,14 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("resolve goal state: %w", err)
 	}
 
-	checks := preflight.Flatten(
-		host.Preflight(logger, cfg.AgentConfig, goalState),
-		nodestart.Preflight(logger, cfg.AgentConfig, goalState),
-		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
-	)
+	checks := h.checks
+	if checks == nil {
+		checks = preflight.Flatten(
+			host.Preflight(logger, cfg.AgentConfig, goalState),
+			nodestart.Preflight(logger, cfg.AgentConfig, goalState),
+			rootfs.Preflight(logger, cfg.AgentConfig, goalState),
+		)
+	}
 
 	if disposition == installstate.Resume {
 		// A resumed installation owns the artifacts a clean host must not have.

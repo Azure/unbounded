@@ -137,28 +137,36 @@ type NvidiaRuntime struct {
 // architectures. On a non-GPU host the returned struct has all nil/empty
 // fields (except ContainerLibDir).
 func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
+	return resolveNvidiaHostWithReadiness(arch, true)
+}
+
+func resolveNvidiaHostWithReadiness(arch string, requireReadiness bool) (NvidiaHost, error) {
 	hostDistro, useCDIRuntime := detectNVIDIAHostOS()
 	initDeps := defaultNvidiaDeviceInitDeps()
 	initDeps.hostDistro = func() string { return hostDistro }
 
-	return resolveNvidiaHost(arch, initDeps, useCDIRuntime)
+	return resolveNvidiaHost(arch, initDeps, useCDIRuntime, requireReadiness)
 }
 
-func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, useCDIRuntime bool) (NvidiaHost, error) {
+func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, useCDIRuntime, requireReadiness bool) (NvidiaHost, error) {
 	archInfo, ok := nvidiaArchMap[arch]
 	if !ok {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	if err := initializeAzureLinuxNVIDIADevices(initDeps); err != nil {
-		return NvidiaHost{}, err
+	if requireReadiness {
+		if err := initializeAzureLinuxNVIDIADevices(initDeps); err != nil {
+			return NvidiaHost{}, err
+		}
 	}
 
 	devices := discoverNVIDIADevicesIn(initDeps.deviceDir)
-	if len(devices) > 0 || hasNVIDIADisplayHardware(initDeps) {
+	if requireReadiness && (len(devices) > 0 || hasNVIDIADisplayHardware(initDeps)) {
 		if err := nvidia.CheckReadiness(context.Background(), initDeps.lookPath, initDeps.outputCmd); err != nil {
 			return NvidiaHost{}, fmt.Errorf("%w: %w", ErrNVIDIAStateUnavailable, err)
 		}
+
+		devices = discoverNVIDIADevicesIn(initDeps.deviceDir)
 	}
 
 	libraries := resolveNVIDIALibraries(archInfo)

@@ -58,12 +58,63 @@ func TestResolveNvidiaHostRejectsUnusableGPUs(t *testing.T) {
 				return []byte("No devices found.\n"), nil
 			}
 
-			host, err := resolveNvidiaHost("amd64", deps, false)
+			host, err := resolveNvidiaHost("amd64", deps, false, true)
 			require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
 			require.ErrorContains(t, err, "repair the host NVIDIA driver")
 			require.Empty(t, host)
 		})
 	}
+}
+
+func TestResolveNvidiaHostRefreshesDevicesAfterReadiness(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "pci")
+	deviceDir := filepath.Join(root, "dev")
+
+	addNVIDIAPCIDevice(t, pciDir)
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
+	deps.hostDistro = func() string { return hostDistroUbuntu2404 }
+	deps.lookPath = func(string) (string, error) { return "nvidia-smi", nil }
+	deps.outputCmd = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		require.NoError(t, os.WriteFile(filepath.Join(deviceDir, "nvidia0"), nil, 0o644))
+
+		return []byte("GPU 0: Tesla T4 (UUID: GPU-12345678-1234-1234-1234-123456789abc)\n"), nil
+	}
+
+	host, err := resolveNvidiaHost("amd64", deps, false, true)
+	require.NoError(t, err)
+	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
+}
+
+func TestResolveNvidiaHostForPreflightDefersReadiness(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "pci")
+	deviceDir := filepath.Join(root, "dev")
+
+	addNVIDIAPCIDevice(t, pciDir)
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(deviceDir, "nvidia0"), nil, 0o644))
+
+	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
+	deps.hostDistro = func() string { return hostDistroAzureLinux3 }
+	deps.lookPath = func(string) (string, error) {
+		t.Fatal("preflight discovery must defer NVIDIA initialization and readiness to named checks")
+		return "", nil
+	}
+	deps.outputCmd = func(context.Context, string, ...string) ([]byte, error) {
+		t.Fatal("preflight discovery must not query NVIDIA readiness")
+		return nil, nil
+	}
+
+	host, err := resolveNvidiaHost("amd64", deps, false, false)
+	require.NoError(t, err)
+	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
 }
 
 func TestAzureLinuxUsesNVIDIACDIRuntime(t *testing.T) {
