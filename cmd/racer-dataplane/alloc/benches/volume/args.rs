@@ -67,6 +67,7 @@ pub struct Args {
     pub cpu_entries: u64,
     pub lookup_entries: u64,
     pub metadata_cache: u64,
+    pub dirty_bytes: u64,
     pub spin: u32,
     pub ring_entries: usize,
     pub verify: bool,
@@ -104,6 +105,8 @@ RUN:
   --cpu-entries N         entries for the cpu scenario (default 1000000, capped by capacity)
   --lookup-entries N      4 KiB entries the lookup scenario fills per worker (default 1000000)
   --metadata-cache SIZE   metadata page cache budget per volume (default 64M)
+  --dirty-bytes SIZE      uncommitted index change limit per volume; fills commit when
+                          it is reached (default 0: the volume's default)
   --spin N                idle executor turns before blocking in wait (default 0)
   --ring-entries N        io_uring queue entries per worker (default 1024)
   --no-verify             skip record header checks on reads
@@ -186,6 +189,7 @@ impl Args {
             cpu_entries: 1_000_000,
             lookup_entries: 1_000_000,
             metadata_cache: 64 << 20,
+            dirty_bytes: 0,
             spin: 0,
             ring_entries: 1024,
             verify: true,
@@ -244,6 +248,7 @@ impl Args {
                 "--cpu-entries" => args.cpu_entries = number(value()?)?,
                 "--lookup-entries" => args.lookup_entries = number(value()?)?,
                 "--metadata-cache" => args.metadata_cache = number(value()?)?,
+                "--dirty-bytes" => args.dirty_bytes = number(value()?)?,
                 "--spin" => args.spin = number(value()?)? as u32,
                 "--ring-entries" => args.ring_entries = number(value()?)? as usize,
                 "--no-verify" => args.verify = false,

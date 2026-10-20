@@ -19,6 +19,10 @@ use crate::stats::{Hist, Report, ThreadUsage};
 /// `src/store/disk.rs`.
 pub const EVICTION_BUDGET: usize = 64;
 
+/// Free slots the lazy committer keeps ahead of allocation, as the
+/// dataplane's maintenance does.
+const FREE_RESERVE: u64 = 2;
+
 type Result<T> = std::result::Result<T, BenchError>;
 
 /// Buffer accounting for the benchmark. Production charges volume buffers as
@@ -184,6 +188,9 @@ struct Hot {
     first_error: Option<String>,
     evicted_entries: u64,
     evicting_allocs: u64,
+    dirty_commits: u64,
+    background_evictions: u64,
+    background_evict: Hist,
     alloc: Hist,
     evict_alloc: Hist,
     write: Hist,
@@ -219,6 +226,8 @@ impl Hot {
             ("errors", self.errors),
             ("evicted_entries", self.evicted_entries),
             ("evicting_allocs", self.evicting_allocs),
+            ("background_evictions", self.background_evictions),
+            ("dirty_commits", self.dirty_commits),
             ("commit_calls", self.commit_calls),
             ("commit_errors", self.commit_errors),
             ("lazy_commits", self.lazy_commits),
@@ -234,6 +243,7 @@ impl Hot {
         for (name, hist) in [
             ("alloc_ns", &self.alloc),
             ("alloc_evicting_ns", &self.evict_alloc),
+            ("background_evict_ns", &self.background_evict),
             ("write_ns", &self.write),
             ("publish_ns", &self.publish),
             ("op_ns", &self.op),
@@ -343,6 +353,7 @@ impl<'a> Worker<'a> {
         let mut options =
             VolumeOptions::new(limits, volume_id, format, Rc::new(move |_| Ok(charge)));
         options.metadata_cache_bytes = self.args.metadata_cache as usize;
+        options.dirty_bytes = self.args.dirty_bytes as usize;
         options
     }
 
@@ -495,6 +506,16 @@ impl<'a> Worker<'a> {
                     if sink.budget.get() != u64::MAX {
                         sink.budget.set(sink.budget.get() + 1);
                     }
+                    if error == Error::Busy && volume.needs_commit() {
+                        // The overlay of uncommitted changes is full: commit
+                        // (concurrent lanes share the attempt), as the
+                        // dataplane's writer does, and retry.
+                        hot.borrow_mut().dirty_commits += 1;
+                        if let Err(error) = volume.commit(&self.reactor, &SCOPE).await {
+                            hot.borrow_mut().error("dirty-limit commit", error);
+                        }
+                        continue;
+                    }
                     if error == Error::Busy {
                         hot.borrow_mut().busy += 1;
                     } else {
@@ -582,6 +603,24 @@ impl<'a> Worker<'a> {
             let now = Instant::now();
             if deadline.is_some_and(|d| now >= d) || active.get() == 0 {
                 break;
+            }
+            // Keep a few slots free ahead of allocation, as the dataplane's
+            // maintenance does, so foreground writes rarely evict.
+            if volume.free_slots() < FREE_RESERVE {
+                let start = Instant::now();
+                match volume
+                    .reserve_free(&self.reactor, FREE_RESERVE, now_unix(), 2, &SCOPE)
+                    .await
+                {
+                    Ok(evicted) if !evicted.is_empty() => {
+                        let mut h = hot.borrow_mut();
+                        h.background_evictions += 1;
+                        h.evicted_entries += evicted.len() as u64;
+                        h.background_evict.record_duration(start.elapsed());
+                    }
+                    Ok(_) => {}
+                    Err(error) => hot.borrow_mut().error("reserve_free", error),
+                }
             }
             // Commit early when uncommitted changes reach the dirty limit:
             // allocation returns Busy until they drain.
@@ -1131,6 +1170,7 @@ impl<'a> Worker<'a> {
             ));
         }
         // Eviction: whole slots of 4 KiB records, each removing its keys.
+        let evict_reads = volume.pager_stats().reads;
         let start = Instant::now();
         let mut vol_evicted = 0u64;
         let mut vol_evictions = 0u64;
@@ -1149,6 +1189,10 @@ impl<'a> Worker<'a> {
         report.add("vol_evict_one_ns", ns(start.elapsed()));
         report.add("vol_evict_one_ops", vol_evictions);
         report.add("vol_evicted_entries", vol_evicted);
+        report.add(
+            "vol_evict_page_reads",
+            volume.pager_stats().reads - evict_reads,
+        );
         let start = Instant::now();
         let mut removed = 0u64;
         for key in &published {
