@@ -3,7 +3,8 @@
 Status: approved direction, target design. The verbs crate side is in
 [racer-verbs.md](racer-verbs.md). This file covers threading, the link
 handshake, the per-page protocol, Racer types, zero-copy, configuration,
-deletions, tests, and the implementation plan.
+deletions, tests, and the implementation plan. Stage 4a (receive-side
+zero-copy) is implemented; see "Deviations in the implementation".
 
 Paths are relative to `cmd/racer-dataplane/` unless noted.
 
@@ -554,3 +555,26 @@ Recorded while building stage 3; the code is authoritative.
    `select`, `select_hop`, `select_worker`, `match_publication`, and
    `signed_value` stay. `NativeRetry::fence` went with the per-transfer
    sessions.
+
+Recorded while building stage 4a (receive-side zero-copy, done):
+
+8. `CiphertextStorage::Registered` holds `{ page: RegisteredPage,
+   reservation: Charge }` rather than `{ page, len }`; the length is
+   `RegisteredPage::len`, and the ciphertext charge lives with the page.
+   `PendingReceive::finish` calls `BufferPool::registered_ciphertext` and
+   no longer copies (`src/rdma/links.rs`).
+9. Copy-out goes through `BufferPool::retainable` (`src/memory.rs`), which
+   takes a fresh `Ciphertext` charge and copies through `rehome`. It runs in
+   `MemoryCache::publish` (skipped for a duplicate page),
+   `MemoryCache::publish_ciphertext`, and `Writer::enqueue_reclaiming`
+   (`src/store.rs`, after the dedup checks). `rehome` always copies a
+   registered page, even when it holds the only reference. The charge
+   reserved for the copy is separate from the request's, so the page is
+   counted twice until the request drops it. If the copy cannot be admitted,
+   the publish or enqueue fails with the admission error and the request
+   still releases the buffer when it ends.
+10. The cache keeps a copy, not the request's `Arc`, so
+    `MemoryCache::invalidate_ciphertext` matches a registered argument by
+    envelope and bytes as well as by pointer.
+11. Relays: send-side code is unchanged in 4a. A relayed registered page goes
+    through the existing `Source::Bytes` copy; stage 4b owns that path.
