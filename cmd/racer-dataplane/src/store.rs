@@ -1035,7 +1035,16 @@ impl StoreWriter {
                     let Some(id) = self.queue.borrow().get(position).cloned() else {
                         break;
                     };
-                    let copy = self.copy_only(&id)?;
+                    // Errors below stop new work but drain the writes in
+                    // flight: returning early would drop them part way.
+                    let copy = match self.copy_only(&id) {
+                        Ok(copy) => copy,
+                        Err(error) => {
+                            failure = Some(error);
+                            stopped = true;
+                            break;
+                        }
+                    };
                     let bytes = copy
                         .as_ref()
                         .map_or(0, |page| logical_length(page).unwrap_or(0));
@@ -1054,16 +1063,16 @@ impl StoreWriter {
                     };
                     // Install cleanup BEFORE allocation, reclamation or submission.
                     // Every attempted copy leaves the queue, including disposable failures.
+                    let Some(ticket) = self.pending.borrow().get(&id).map(|d| d.ticket) else {
+                        failure = Some(Error::Unavailable);
+                        stopped = true;
+                        break;
+                    };
                     let mut cleanup = DirtyCleanup {
                         writer: self,
                         persisted: false,
                         page: id.clone(),
-                        ticket: self
-                            .pending
-                            .borrow()
-                            .get(&id)
-                            .ok_or(Error::Unavailable)?
-                            .ticket,
+                        ticket,
                     };
                     in_flight_bytes += bytes;
                     writes.push(async move {
