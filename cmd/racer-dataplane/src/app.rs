@@ -1655,7 +1655,10 @@ impl WorkerApplication {
             let writer = self.store.writer.clone();
             let write_scope = scope(self.timeout)?;
             self.writer_task = Some(Box::pin(async move {
-                writer.progress(8, &write_scope).await.map(|_| ())
+                writer
+                    .progress(crate::store::WRITER_PROGRESS_BUDGET, &write_scope)
+                    .await
+                    .map(|_| ())
             }));
         }
         self.poll_disk_commit(cx)

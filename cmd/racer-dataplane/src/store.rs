@@ -366,6 +366,14 @@ impl Dirty {
 /// Foreground queue selection and positional removal inspect only this prefix.
 /// VecDeque::remove shifts the shorter side, so a prefix victim also bounds moves.
 const QUEUE_RECLAIM_CANDIDATES: usize = 64;
+/// Record bytes one writer keeps in flight, so large records cannot build a
+/// deep device queue ahead of small and metadata I/O.
+pub(crate) const WRITER_IN_FLIGHT_BYTES: usize = 64 << 20;
+/// Writes one writer keeps in flight.
+pub(crate) const WRITER_IN_FLIGHT_WRITES: usize = 8;
+/// Writes one background `progress` call starts before it returns, so periodic
+/// checkpoints and other callers regain control.
+pub(crate) const WRITER_PROGRESS_BUDGET: usize = 4 * WRITER_IN_FLIGHT_WRITES;
 
 /// Locate queued work without inspecting the unselected suffix.
 fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
@@ -613,7 +621,7 @@ impl StoreWriter {
                 {
                     break;
                 }
-                if let Err(error) = self.progress(8, scope).await {
+                if let Err(error) = self.progress(WRITER_PROGRESS_BUDGET, scope).await {
                     self.remove_queued_ticket(&id, ticket);
                     self.slabs.fence_writes().await?;
                     return Err(error);
@@ -966,8 +974,27 @@ impl StoreWriter {
         self.note_discard(removed);
         released
     }
-    /// Drive at most `budget` writes. Keep polling this future through reactor completion.
+    /// Drive at most `budget` writes. At most [`WRITER_IN_FLIGHT_WRITES`] writes
+    /// and [`WRITER_IN_FLIGHT_BYTES`] record bytes are in flight, and the next
+    /// write starts as soon as any completes. Keep polling this future through
+    /// reactor completion.
     pub fn progress<'a>(&'a self, budget: usize, scope: &'a RequestScope) -> Operation<'a, usize> {
+        self.progress_bounded(
+            budget,
+            WRITER_IN_FLIGHT_WRITES,
+            WRITER_IN_FLIGHT_BYTES,
+            scope,
+        )
+    }
+    /// Like [`Self::progress`] with explicit in-flight count and byte limits.
+    /// One write is always admitted, so an oversized record still progresses.
+    pub(crate) fn progress_bounded<'a>(
+        &'a self,
+        budget: usize,
+        lanes: usize,
+        max_bytes: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, usize> {
         Box::pin(async move {
             if self.busy.replace(true) {
                 return Err(Error::Overloaded);
@@ -977,59 +1004,79 @@ impl StoreWriter {
             use futures::StreamExt;
             use futures::stream::FuturesUnordered;
             let mut writes = FuturesUnordered::new();
-            for _ in 0..budget {
-                if scope.check().is_err() {
-                    self.discard_unsubmitted();
-                    break;
-                }
-                let position = {
-                    let queue = self.queue.borrow();
-                    let retention = self.retention();
-                    // Reverse the tie breaker to keep FIFO within equal value.
-                    queue
-                        .iter()
-                        .enumerate()
-                        .take(QUEUE_RECLAIM_CANDIDATES)
-                        .max_by_key(|(position, id)| {
-                            (retention.score(id), std::cmp::Reverse(*position))
-                        })
-                        .map(|(position, _)| position)
-                };
-                let id =
-                    match position.and_then(|position| self.queue.borrow_mut().remove(position)) {
-                        Some(id) => id,
-                        None => break,
-                    };
-                let page = match self.copy_only(&id)? {
-                    Some(p) => p,
-                    None => {
-                        self.pending.borrow_mut().remove(&id);
-                        continue;
-                    }
-                };
-                // Install cleanup BEFORE allocation, reclamation or submission.
-                // Every attempted copy leaves the queue, including disposable failures.
-                let mut cleanup = DirtyCleanup {
-                    writer: self,
-                    persisted: false,
-                    page: id.clone(),
-                    ticket: self
-                        .pending
-                        .borrow()
-                        .get(&id)
-                        .ok_or(Error::Unavailable)?
-                        .ticket,
-                };
-                writes.push(async move {
-                    let result = self.persist(&id, &page, scope).await;
-                    cleanup.persisted = result.is_ok();
-                    drop(cleanup);
-                    result
-                });
-            }
+            let mut started = 0;
+            let mut in_flight_bytes = 0usize;
+            let mut stopped = false;
             let mut completed = 0;
             let mut failure = None;
-            while let Some(result) = writes.next().await {
+            loop {
+                while !stopped && writes.len() < lanes.max(1) && started < budget {
+                    if scope.check().is_err() {
+                        self.discard_unsubmitted();
+                        stopped = true;
+                        break;
+                    }
+                    let position = {
+                        let queue = self.queue.borrow();
+                        let retention = self.retention();
+                        // Reverse the tie breaker to keep FIFO within equal value.
+                        queue
+                            .iter()
+                            .enumerate()
+                            .take(QUEUE_RECLAIM_CANDIDATES)
+                            .max_by_key(|(position, id)| {
+                                (retention.score(id), std::cmp::Reverse(*position))
+                            })
+                            .map(|(position, _)| position)
+                    };
+                    let Some(position) = position else {
+                        break;
+                    };
+                    let Some(id) = self.queue.borrow().get(position).cloned() else {
+                        break;
+                    };
+                    let copy = self.copy_only(&id)?;
+                    let bytes = copy
+                        .as_ref()
+                        .map_or(0, |page| logical_length(page).unwrap_or(0));
+                    // Always admit one write so an oversized record still makes progress.
+                    if !writes.is_empty() && in_flight_bytes.saturating_add(bytes) > max_bytes {
+                        break;
+                    }
+                    self.queue.borrow_mut().remove(position);
+                    started += 1;
+                    let page = match copy {
+                        Some(p) => p,
+                        None => {
+                            self.pending.borrow_mut().remove(&id);
+                            continue;
+                        }
+                    };
+                    // Install cleanup BEFORE allocation, reclamation or submission.
+                    // Every attempted copy leaves the queue, including disposable failures.
+                    let mut cleanup = DirtyCleanup {
+                        writer: self,
+                        persisted: false,
+                        page: id.clone(),
+                        ticket: self
+                            .pending
+                            .borrow()
+                            .get(&id)
+                            .ok_or(Error::Unavailable)?
+                            .ticket,
+                    };
+                    in_flight_bytes += bytes;
+                    writes.push(async move {
+                        let result = self.persist(&id, &page, scope).await;
+                        cleanup.persisted = result.is_ok();
+                        drop(cleanup);
+                        (bytes, result)
+                    });
+                }
+                let Some((bytes, result)) = writes.next().await else {
+                    break;
+                };
+                in_flight_bytes -= bytes;
                 completed += 1;
                 // Quota/space pressure and cache I/O failures never fail the node.
                 if let Err(error) = result {
@@ -1044,9 +1091,11 @@ impl StoreWriter {
                             | Error::DeadlineExceeded
                     ) {
                         failure = Some(error);
+                        stopped = true;
                     }
                     if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
                         self.discard_unsubmitted();
+                        stopped = true;
                     }
                 }
             }
@@ -1145,7 +1194,7 @@ impl StoreWriter {
             .await?;
             while self.pending_count() != 0 {
                 scope.check()?;
-                self.progress(8, scope).await?;
+                self.progress(WRITER_PROGRESS_BUDGET, scope).await?;
             }
             self.slabs.fence_writes().await?;
             // Make cache writes durable on a clean shutdown. Cache I/O failures
