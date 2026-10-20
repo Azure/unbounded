@@ -297,6 +297,94 @@ pub fn try_get<S: Source>(
     }
 }
 
+/// Load every leaf of a tree that overlaps `[low, high)` into the cache,
+/// reading the leaves under each inner page concurrently.
+pub async fn prefetch_range<S: Source>(
+    source: &S,
+    root: &TreeRoot,
+    kind: TreeKind,
+    max_seq: u64,
+    low: &Key,
+    high: Option<&Key>,
+) -> Result<(), S::Error> {
+    if root.is_empty() || root.level == 0 {
+        return Ok(());
+    }
+    let mut stack = vec![request(root, kind, max_seq, Priority::Scan)];
+    while let Some(req) = stack.pop() {
+        let Some(page) = source.load(req).await? else {
+            continue;
+        };
+        let first = page.child_index(low);
+        let mut leaves = Vec::new();
+        for i in first..page.count() {
+            if high.is_some_and(|h| page.key(i) >= *h) {
+                break;
+            }
+            let child = child_request(&page, i, &req, Priority::Scan);
+            if child.level == 0 {
+                leaves.push(child);
+            } else {
+                stack.push(child);
+            }
+        }
+        if !leaves.is_empty() {
+            source.prefetch(leaves).await;
+        }
+    }
+    Ok(())
+}
+
+/// Values of many keys (sorted ascending) from cached pages only, sharing
+/// the descent through common inner pages. `out[i]` is `None` when a page
+/// on the path to `keys[i]` is not cached.
+pub fn try_get_many<S: Source>(
+    source: &S,
+    root: &TreeRoot,
+    kind: TreeKind,
+    max_seq: u64,
+    keys: &[Key],
+) -> Vec<Option<Lookup>> {
+    let mut out = vec![None; keys.len()];
+    if root.is_empty() {
+        out.fill(Some(Lookup::Absent));
+        return out;
+    }
+    let req = request(root, kind, max_seq, Priority::Leaf);
+    get_many_rec(source, req, keys, 0, &mut out);
+    out
+}
+
+fn get_many_rec<S: Source>(
+    source: &S,
+    req: Req,
+    keys: &[Key],
+    offset: usize,
+    out: &mut [Option<Lookup>],
+) {
+    let Some(page) = source.cached(&req) else {
+        return;
+    };
+    if req.level == 0 {
+        for (i, key) in keys.iter().enumerate() {
+            out[offset + i] = Some(match page.search(key) {
+                Ok(at) => Lookup::Found(page.raw(at)),
+                Err(_) => Lookup::Absent,
+            });
+        }
+        return;
+    }
+    let mut start = 0;
+    while start < keys.len() {
+        let child = page.child_index(&keys[start]);
+        let high = (child + 1 < page.count()).then(|| page.key(child + 1));
+        let end = start + keys[start..].partition_point(|k| high.is_none_or(|h| *k < h));
+        let child_req = child_request(&page, child, &req, Priority::Leaf);
+        get_many_rec(source, child_req, &keys[start..end], offset + start, out);
+        start = end;
+    }
+}
+
 /// Leaf covering `key` from cached pages only. `None` when a page on the
 /// path is not cached.
 pub fn try_seek<S: Source>(

@@ -11,7 +11,7 @@ use uring_runtime::{Budget, Operation, Scope, drivers::yield_now, reactor::React
 
 use super::format::{Key, Tier, Value};
 use super::page::{record_key, record_key_parts};
-use super::store::{EVICT_BATCH, IndexOp, RecOp, Reservation, Volume};
+use super::store::{EVICT_BATCH, IndexOp, Reservation, Volume};
 use crate::{Charge, Error};
 
 /// A reservation (or why there is none) and the entries evicted for it.
@@ -84,9 +84,9 @@ impl<C: Charge> Volume<C> {
         } else {
             Bound::Unbounded
         };
+        self.prefetch_slot_records(reactor, scope, slot).await?;
         let mut cursor = Bound::Included(record_key(slot, 0));
         let mut removed = Vec::new();
-        let mut entries = Vec::new();
         loop {
             let batch = self
                 .scan_records(reactor, scope, cursor, high, EVICT_BATCH)
@@ -94,31 +94,65 @@ impl<C: Charge> Volume<C> {
             let Some(last) = batch.last().map(|(k, _)| *k) else {
                 break;
             };
-            for (rk, desc) in batch {
-                entries.push(rk);
-                if desc.incarnation != incarnation {
-                    continue;
+            // This incarnation's records, by index key, resolved together.
+            let mut owned: Vec<(Key, u16, u64)> = batch
+                .iter()
+                .filter(|(_, desc)| desc.incarnation == incarnation)
+                .map(|(rk, desc)| (desc.key, record_key_parts(rk).1, desc.generation))
+                .collect();
+            owned.sort_unstable_by_key(|(key, _, _)| *key);
+            let mut pending: Vec<(Key, u16, u64)> = owned;
+            // Resolve from memory; read the missing index pages concurrently
+            // and retry, then fall back to one lookup at a time.
+            for round in 0..2 {
+                let keys: Vec<Key> = pending.iter().map(|(key, _, _)| *key).collect();
+                let cached = self.try_get_many(&keys);
+                let mut misses = Vec::new();
+                {
+                    let mut state = self.shared.state();
+                    for ((key, unit, generation), cached) in pending.into_iter().zip(cached) {
+                        match cached {
+                            Some(Some(value))
+                                if value.slot == slot
+                                    && value.unit == unit
+                                    && value.generation == generation =>
+                            {
+                                state.set(key, IndexOp::Delete, Some(Some(value)));
+                                removed.push((key, value));
+                            }
+                            Some(_) => {}
+                            None => misses.push((key, unit, generation)),
+                        }
+                    }
                 }
-                let (_, unit) = record_key_parts(&rk);
-                let value = self.resolve(reactor, scope, &desc.key).await?;
-                if let Some(value) = value
+                pending = misses;
+                if pending.is_empty() {
+                    break;
+                }
+                if round == 0 {
+                    let keys: Vec<Key> = pending.iter().map(|(key, _, _)| *key).collect();
+                    self.prefetch_keys(reactor, scope, &keys).await;
+                }
+            }
+            for (key, unit, generation) in pending {
+                if let Some(value) = self.resolve(reactor, scope, &key).await?
                     && value.slot == slot
                     && value.unit == unit
-                    && value.generation == desc.generation
+                    && value.generation == generation
                 {
                     self.shared
                         .state()
-                        .set(desc.key, IndexOp::Delete, Some(Some(value)));
-                    removed.push((desc.key, value));
+                        .set(key, IndexOp::Delete, Some(Some(value)));
+                    removed.push((key, value));
                 }
             }
             cursor = Bound::Excluded(last);
             yield_now().await;
         }
+        // The slot's record map entries are not deleted here: the slot's
+        // next incarnation ignores them, the index deletes above release
+        // them at the next commit, and reused units overwrite them.
         let mut state = self.shared.state();
-        for rk in entries {
-            state.active.records.insert(rk, RecOp::Delete);
-        }
         let low = record_key(slot, 0);
         let lost = state.lost.iter().any(|(kind, l, h)| {
             *kind == super::page::TreeKind::Records
@@ -226,6 +260,12 @@ impl<C: Charge> Volume<C> {
                 }
             }
         })
+    }
+
+    /// Free slots. O(1). Callers that keep a reserve with
+    /// [`Volume::reserve_free`] compare against this.
+    pub fn free_slots(&self) -> u64 {
+        self.shared.state().slots.free_slots()
     }
 
     /// Storage data slots whose `retain_until` bound is at least `now`: the

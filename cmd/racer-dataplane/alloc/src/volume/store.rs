@@ -65,7 +65,7 @@ pub const DEFAULT_METADATA_CACHE_BYTES: usize = 64 << 20;
 pub const DEFAULT_DIRTY_BYTES: usize = 8 << 20;
 
 /// Records an eviction step handles before yielding to other tasks.
-pub const EVICT_BATCH: usize = 256;
+pub const EVICT_BATCH: usize = 1024;
 
 /// Bytes charged per overlay entry.
 pub(super) const OVERLAY_ENTRY_BYTES: usize = 160;
@@ -232,9 +232,6 @@ pub(super) struct IndexEntry {
 pub(super) enum RecOp {
     /// A published record.
     Put(RecordDesc),
-
-    /// Remove the entry (eviction).
-    Delete,
 
     /// The index stopped referencing this record: free it (cache) or retire
     /// it (storage) if the entry still names this key and generation.
@@ -671,7 +668,6 @@ fn index_layer(entry: &IndexEntry) -> Layer<Value> {
 fn record_layer(op: &RecOp) -> Layer<RecordDesc> {
     match op {
         RecOp::Put(desc) => Layer::Set(*desc),
-        RecOp::Delete => Layer::Remove,
         RecOp::Release { .. } | RecOp::Retired { .. } => Layer::Pass,
     }
 }
@@ -1034,6 +1030,35 @@ impl<C: Charge> Volume<C> {
         }
     }
 
+    /// Values of `keys` (sorted ascending) from memory only, like
+    /// [`Volume::try_get`] for each, sharing the tree descent.
+    pub fn try_get_many(&self, keys: &[Key]) -> Vec<Option<Option<Value>>> {
+        let state = self.shared.state();
+        let durable = state.durable;
+        let mut out: Vec<Option<Option<Value>>> =
+            keys.iter().map(|k| state.overlay_get(k)).collect();
+        drop(state);
+        let pending: Vec<usize> = (0..keys.len()).filter(|&i| out[i].is_none()).collect();
+        if pending.is_empty() {
+            return out;
+        }
+        let tree_keys: Vec<Key> = pending.iter().map(|&i| keys[i]).collect();
+        let found = btree::try_get_many(
+            &TryIo(self),
+            &durable.trees[TreeKind::Index.index()],
+            TreeKind::Index,
+            durable.seq,
+            &tree_keys,
+        );
+        for (&i, lookup) in pending.iter().zip(found) {
+            out[i] = lookup.map(|lookup| match lookup {
+                Lookup::Found(raw) => Value::decode(raw[..32].try_into().expect("32")),
+                Lookup::Absent | Lookup::Lost(..) => None,
+            });
+        }
+        out
+    }
+
     /// Current value of `key`, reading pages as needed. Ranges whose page
     /// is lost read as empty and are listed by [`Volume::lost_ranges`].
     pub fn get<'a, S: Scope, B: Budget>(
@@ -1060,6 +1085,10 @@ impl<C: Charge> Volume<C> {
     where
         S::Error: From<Error>,
     {
+        // Fast path: overlays and cached pages, no future per level.
+        if let Some(value) = self.try_get(key) {
+            return Ok(value);
+        }
         loop {
             let (durable, epoch) = {
                 let state = self.shared.state();
@@ -1731,6 +1760,49 @@ impl<C: Charge> Volume<C> {
         })
     }
 
+    /// Load the record map leaves of `slot` into the cache, concurrently.
+    pub(super) async fn prefetch_slot_records<S: Scope, B: Budget>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+        slot: u32,
+    ) -> std::result::Result<(), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        let durable = self.shared.state().durable;
+        let high = (u64::from(slot) + 1 < self.slot_count).then(|| record_key(slot + 1, 0));
+        btree::prefetch_range(
+            &self.io(reactor, scope),
+            &durable.trees[TreeKind::Records.index()],
+            TreeKind::Records,
+            durable.seq,
+            &record_key(slot, 0),
+            high.as_ref(),
+        )
+        .await
+    }
+
+    /// Load the index pages on the paths to `keys`, concurrently.
+    pub(super) async fn prefetch_keys<S: Scope, B: Budget>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+        keys: &[Key],
+    ) where
+        S::Error: From<Error>,
+    {
+        bounded(
+            keys.iter().map(|key| {
+                Box::pin(async move {
+                    let _ = self.prefetch(reactor, key, scope).await;
+                }) as Pin<Box<dyn Future<Output = ()> + '_>>
+            }),
+            IO_CONCURRENCY,
+        )
+        .await;
+    }
+
     /// Record map entries of one slot, merged with the overlays.
     pub(super) async fn slot_records<S: Scope, B: Budget>(
         &self,
@@ -1741,6 +1813,7 @@ impl<C: Charge> Volume<C> {
     where
         S::Error: From<Error>,
     {
+        self.prefetch_slot_records(reactor, scope, slot).await?;
         let high = if u64::from(slot) + 1 < self.slot_count {
             Bound::Excluded(record_key(slot + 1, 0))
         } else {

@@ -963,6 +963,40 @@ mod simulation {
         }
     }
 
+    /// Batched memory-only lookups agree with single ones, and eviction of a
+    /// slot whose index and record map pages are cold reads them and
+    /// removes every entry.
+    #[test]
+    fn batched_lookups_and_cold_eviction() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        for n in 0..3000 {
+            put(&reactor, &volume, &slab, Tier::Cache, key(1, n), 100, 0).unwrap();
+        }
+        commit(&reactor, &volume).unwrap();
+        let mut keys: Vec<Key> = (0..3000).map(|n| key(1, n)).collect();
+        keys.push(key(9, 9));
+        keys.sort();
+        let many = volume.try_get_many(&keys);
+        for (key, found) in keys.iter().zip(&many) {
+            assert_eq!(*found, volume.try_get(key));
+        }
+        assert_eq!(*many.last().unwrap(), Some(None), "absent key");
+        crash(&sim, volume, slab);
+        let (volume, _slab, _) = mount_with(
+            &reactor,
+            small_cache(Limits::UNLIMITED, 4 * page_alloc::volume::FRAME_BYTES),
+        );
+        assert!(volume.try_get(&key(1, 0)).is_none(), "cold");
+        let reads = volume.pager_stats().reads;
+        let evicted = evict_one(&reactor, &volume, 0).unwrap();
+        assert_eq!(evicted.len(), 3000);
+        assert!(volume.pager_stats().reads > reads);
+        assert!(entries(&reactor, &volume).is_empty());
+        assert!(volume.free_slots() >= SLOTS - 2);
+    }
+
     /// Uncommitted changes are bounded: allocation pushes back until a
     /// commit drains them.
     #[test]

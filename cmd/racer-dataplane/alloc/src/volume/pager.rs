@@ -16,11 +16,35 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use super::format::NodeAddr;
 use super::page::TreePage;
+
+/// Hasher for page addresses: they are already well spread `slot << 16 |
+/// unit` values, so one multiply is enough.
+#[derive(Default)]
+pub struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (value ^ (value >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+type AddrMap<V> = HashMap<NodeAddr, V, BuildHasherDefault<AddrHasher>>;
 
 /// Bytes charged per cached page: the page plus bookkeeping.
 pub const FRAME_BYTES: usize = 4096 + 96;
@@ -181,13 +205,13 @@ impl Follower {
 }
 
 struct State {
-    map: HashMap<NodeAddr, usize>,
+    map: AddrMap<usize>,
     frames: Vec<Option<Frame>>,
     free: Vec<usize>,
     hand: usize,
     bytes: usize,
     budget: usize,
-    inflight: HashMap<NodeAddr, Rc<Fault>>,
+    inflight: AddrMap<Rc<Fault>>,
     // Scan-faulted pages in arrival order. May hold stale addresses.
     probation: VecDeque<NodeAddr>,
     stats: PagerStats,
@@ -203,13 +227,13 @@ impl Pager {
     pub fn new(budget: usize) -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(State {
-                map: HashMap::new(),
+                map: AddrMap::default(),
                 frames: Vec::new(),
                 free: Vec::new(),
                 hand: 0,
                 bytes: 0,
                 budget,
-                inflight: HashMap::new(),
+                inflight: AddrMap::default(),
                 probation: VecDeque::new(),
                 stats: PagerStats::default(),
             }),

@@ -630,12 +630,6 @@ impl<C: Charge> Volume<C> {
                     *deltas.entry((slot, desc.incarnation)).or_default() += 1;
                     Some(*desc)
                 }
-                RecOp::Delete => {
-                    if let Some(old) = &old {
-                        remove(&mut deltas, old);
-                    }
-                    None
-                }
                 RecOp::Release { key, generation } => match old {
                     Some(desc) if desc.key == *key && desc.generation == *generation => {
                         let storage = self

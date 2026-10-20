@@ -522,10 +522,13 @@ impl TreePage {
 
     /// Position of `key` among the entries, as `binary_search` reports it.
     pub fn search(&self, key: &Key) -> Result<usize, usize> {
+        let width = self.width();
+        let bytes = &self.bytes[..];
         let (mut low, mut high) = (0, self.count());
         while low < high {
             let mid = (low + high) / 2;
-            match self.key(mid).cmp(key) {
+            let at = HEADER_BYTES + mid * width;
+            match bytes[at..at + KEY_BYTES].cmp(&key.0[..]) {
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Greater => high = mid,
                 std::cmp::Ordering::Equal => return Ok(mid),
