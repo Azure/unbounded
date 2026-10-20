@@ -5,6 +5,7 @@ use crate::client::{ClientRequest, ReadKind};
 use crate::peer::forwarding::{Forwarding, VerifiedResponse};
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::WarmAction;
+use crate::peer::server::LocalPageService;
 use crate::read::ReadPayload;
 use crate::test_support::security::{network, node};
 
@@ -1029,4 +1030,356 @@ fn warm_follower_cancellation_waits_for_existing_foreground_supplier() {
     }
     assert!(done);
     assert_eq!(f.origin.calls.get(), 1);
+}
+
+/// Members with one dominant share, so placement is deterministic per test.
+fn weighted(version: u64, shares: &[u32]) -> Arc<Membership> {
+    Arc::new(
+        Membership::validate(
+            racer_control_wire::MembershipVersion(version),
+            shares
+                .iter()
+                .enumerate()
+                .map(|(i, shares)| Member {
+                    node: node(i),
+                    shares: NonZeroU32::new(*shares).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8200 + i),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    )
+}
+
+/// Remote warm owner double: scripted hold and fill outcomes per destination.
+struct Owners {
+    sender: Forwarding,
+    receivers: Vec<(racer_control_wire::NodeId, Forwarding)>,
+    refuse_hold: Option<racer_control_wire::NodeId>,
+    fail_fill: bool,
+    holds: RefCell<Vec<racer_control_wire::NodeId>>,
+    fills: Cell<usize>,
+    releases: RefCell<Vec<racer_control_wire::NodeId>>,
+}
+impl Owners {
+    fn available(&self, _: &Arc<Membership>, _: &racer_control_wire::NodeId) -> bool {
+        false
+    }
+    fn direct<'a>(
+        &'a self,
+        _: PeerRequest,
+        _: Arc<Membership>,
+        _: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async { panic!("unexpected hedge") })
+    }
+    fn request<'a>(
+        &'a self,
+        request: PeerRequest,
+        _: Arc<Membership>,
+        _: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async move {
+            let destination = request.route.destination.clone();
+            let PeerOperation::Warm { action, .. } = &request.operation else {
+                panic!("only warm requests expected");
+            };
+            let response = match action {
+                WarmAction::Hold { until, .. } => {
+                    self.holds.borrow_mut().push(destination.clone());
+                    if self.refuse_hold.as_ref() == Some(&destination) {
+                        PeerResponse::Overloaded
+                    } else {
+                        PeerResponse::Held { until: *until }
+                    }
+                }
+                WarmAction::Fill { .. } => {
+                    self.fills.set(self.fills.get() + 1);
+                    if self.fail_fill {
+                        PeerResponse::Overloaded
+                    } else {
+                        PeerResponse::Warmed
+                    }
+                }
+                WarmAction::Release => {
+                    self.releases.borrow_mut().push(destination.clone());
+                    PeerResponse::Released
+                }
+            };
+            let (_, receiver) = self
+                .receivers
+                .iter()
+                .find(|(node, _)| node == &destination)
+                .unwrap();
+            let (signed, binding) = self.sender.sign_request_to(request, &destination)?;
+            let verified = receiver.verify_request(signed)?;
+            self.sender.verify_response(
+                receiver.sign_response(verified.binding(), response)?,
+                &binding,
+            )
+        })
+    }
+}
+
+/// Run a warm HEAD from node(0) against scripted remote owners.
+fn remote_warm(
+    shares: &[u32],
+    refuse_hold: Option<usize>,
+    fail_fill: bool,
+) -> (
+    Option<std::time::SystemTime>,
+    Rc<Owners>,
+    Arc<crate::read::dispatch::WorkerDirectory>,
+    ObjectVersion,
+) {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(shares.len());
+    let mut f = fixture_with(8 * PAGE_BYTES, None);
+    f.reactor.init().unwrap();
+    let membership = weighted(1, shares);
+    let owners = Rc::new(Owners {
+        sender: Forwarding::new(signers[0].clone()),
+        receivers: signers[1..]
+            .iter()
+            .map(|s| (s.node().clone(), Forwarding::new(s.clone())))
+            .collect(),
+        refuse_hold: refuse_hold.map(node),
+        fail_fill,
+        holds: RefCell::new(Vec::new()),
+        fills: Cell::new(0),
+        releases: RefCell::new(Vec::new()),
+    });
+    let requester = Requester::scripted(
+        owners.clone(),
+        Owners::available,
+        Owners::request,
+        Owners::direct,
+    );
+    let (local, mut endpoint, _publication) = coordinator(&f, &signers[0], &membership, requester);
+    let directory = f.fill.dependencies.metadata_owner.clone();
+    let mut head = local.read(
+        ClientRequest {
+            kind: ReadKind::HeadPinned {
+                etag: f.page.version.etag.clone(),
+            },
+            retain: Some(Duration::from_secs(60)),
+            origin: OriginContext {
+                object: f.context.object.clone(),
+                metadata: None,
+                authorization: None,
+            },
+        },
+        &f.scope,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut response = None;
+    for _ in 0..4096 {
+        if response.is_none()
+            && let Poll::Ready(result) = head.as_mut().poll(&mut cx)
+        {
+            response = Some(result.unwrap());
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        if response.is_some() && directory.warm.snapshot().0 == 0 && queue.pending() == 0 {
+            break;
+        }
+        if response.is_some() && !fail_fill && refuse_hold.is_none() && queue.pending() == 0 {
+            break;
+        }
+    }
+    drop(head);
+    for _ in 0..64 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert_eq!(
+        f.origin.calls.get(),
+        0,
+        "the requester never fills remote pages"
+    );
+    let version = f.page.version.clone();
+    (
+        response.expect("HEAD completes").retain_until,
+        owners,
+        directory,
+        version,
+    )
+}
+
+#[test]
+fn warm_holds_only_on_remote_primary_owners_and_requester_keeps_none() {
+    let (until, owners, directory, version) = remote_warm(&[1, 1_000_000], None, false);
+    assert!(until.is_some());
+    assert_eq!(*owners.holds.borrow(), vec![node(1)]);
+    assert_eq!(owners.fills.get(), 8, "the owner fills every page it holds");
+    assert!(owners.releases.borrow().is_empty());
+    assert_eq!(directory.warm.lease_count(&version), 1, "local lease only");
+    for number in 0..8 {
+        assert!(!directory.warm.is_local_page(&PageId {
+            version: version.clone(),
+            number: PageNumber(number),
+        }));
+    }
+}
+
+#[test]
+fn warm_refused_by_any_primary_releases_every_owner_and_reports_no_retention() {
+    let (until, owners, directory, version) =
+        remote_warm(&[1, 1_000_000, 1_000_000], Some(2), false);
+    assert_eq!(until, None, "one refusing owner refuses the whole HEAD");
+    let mut holds = owners.holds.borrow().clone();
+    holds.sort();
+    assert_eq!(holds, vec![node(1), node(2)], "pages span both owners");
+    let mut releases = owners.releases.borrow().clone();
+    releases.sort();
+    assert_eq!(releases, vec![node(1), node(2)]);
+    assert_eq!(owners.fills.get(), 0);
+    assert_eq!(directory.warm.lease_count(&version), 0);
+    assert_eq!(directory.warm.snapshot().0, 0);
+}
+
+#[test]
+fn warm_owner_fill_failure_fails_job_and_releases_remote_hold() {
+    let (until, owners, directory, version) = remote_warm(&[1, 1_000_000], None, true);
+    assert!(until.is_some(), "HEAD returns before any page is filled");
+    assert_eq!(
+        owners.fills.get(),
+        3,
+        "transient refusals retry within the attempt bound, then fail"
+    );
+    assert_eq!(*owners.releases.borrow(), vec![node(1)]);
+    assert_eq!(directory.warm.lease_count(&version), 0);
+    assert_eq!(directory.warm.snapshot().0, 0);
+}
+
+#[test]
+fn owner_holds_only_primary_pages_and_shares_capacity_across_leases() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(2);
+    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let stale = weighted(1, &[1, 1_000_000]);
+    let primary = weighted(2, &[1_000_000, 1]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &primary, NoPeer::requester());
+    let directory = f.fill.dependencies.metadata_owner.clone();
+    let sender = Forwarding::new(signers[1].clone());
+    let receiver = Forwarding::new(signers[0].clone());
+    let context = OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let version = f.page.version.clone();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let mut id = 0u8;
+    let mut serve = |lease: u8, action: WarmAction, membership: &Arc<Membership>| {
+        id += 1;
+        let scope = RequestScope::new(RequestId([id; 16]), f.scope.deadline.0).unwrap();
+        let attempt = crate::model::AttemptId([id; 16]);
+        let request = PeerRequest {
+            operation: PeerOperation::Warm {
+                version: version.clone(),
+                lease: [lease; 16],
+                action,
+            },
+            origin: local.credentials.seal(&context, attempt, &scope).unwrap(),
+            route: crate::topology::RouteBudget {
+                membership: membership.version,
+                request: scope.request,
+                attempt,
+                destination: node(0),
+                visited: vec![node(1)],
+                remaining_links: 4,
+                remaining_attempts: 4,
+                deadline: scope.deadline,
+            },
+        };
+        let (signed, _) = sender.sign_request(request).unwrap();
+        let verified = receiver.verify_request(signed).unwrap();
+        let mut response = local.serve_peer(verified, membership.clone(), &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..4096 {
+            if let Poll::Ready(result) = response.as_mut().poll(&mut cx) {
+                drop(response);
+                for _ in 0..8 {
+                    pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+                }
+                return result.unwrap();
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+            f.reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+        panic!("warm request did not complete");
+    };
+    let hold = WarmAction::Hold { pages: 2, until };
+    let index = f.fill.dependencies.writer.index().clone();
+    assert!(matches!(
+        serve(1, hold.clone(), &stale),
+        PeerResponse::StaleMembership
+    ));
+    assert_eq!(directory.warm.lease_count(&version), 0);
+    assert_eq!(index.hold_expiry(&version), None);
+    let PeerResponse::Held { until: held } = serve(1, hold.clone(), &primary) else {
+        panic!("primary owner refused hold");
+    };
+    assert!(held <= until && held + Duration::from_millis(1) > until);
+    assert!(matches!(
+        serve(2, hold, &primary),
+        PeerResponse::Held { .. }
+    ));
+    assert_eq!(directory.warm.lease_count(&version), 2);
+    assert!(index.hold_expiry(&version).is_some());
+    assert!(
+        matches!(
+            serve(
+                3,
+                WarmAction::Fill {
+                    page: PageNumber(0)
+                },
+                &primary
+            ),
+            PeerResponse::Unavailable
+        ),
+        "a fill needs a live lease"
+    );
+    assert!(matches!(
+        serve(
+            1,
+            WarmAction::Fill {
+                page: PageNumber(0)
+            },
+            &primary
+        ),
+        PeerResponse::Warmed
+    ));
+    assert_eq!(f.origin.calls.get(), 1, "the owner fills from origin");
+    assert!(index.held_page_expiry(&f.page).is_some());
+    assert!(matches!(
+        serve(1, WarmAction::Release, &primary),
+        PeerResponse::Released
+    ));
+    assert_eq!(directory.warm.lease_count(&version), 1);
+    assert!(
+        directory.warm.drained(WorkerId(0)),
+        "another live lease keeps unused capacity"
+    );
+    assert!(index.hold_expiry(&version).is_some());
+    assert!(matches!(
+        serve(2, WarmAction::Release, &primary),
+        PeerResponse::Released
+    ));
+    assert_eq!(directory.warm.lease_count(&version), 0);
+    assert!(
+        index.held_page_expiry(&f.page).is_some(),
+        "release frees unused capacity but keeps published pages until expiry"
+    );
+    for _ in 0..8 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(directory.warm.drained(WorkerId(0)));
+    endpoint.uninstall().unwrap();
 }
