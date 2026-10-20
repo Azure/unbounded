@@ -87,7 +87,35 @@ pub struct LinkNode {
     setups: Mutex<HashMap<LinkKey, Instant>>,
 
     /// Setups this node initiated and has not finished.
-    initiating: Mutex<HashMap<LinkKey, Epoch>>,
+    initiating: Mutex<HashMap<LinkKey, Initiating>>,
+
+    /// Source of reservation tokens for `initiating`.
+    reservations: std::sync::atomic::AtomicU64,
+}
+
+/// One setup this node initiated: reserved before the owner answers, then
+/// keyed by the epoch the owner opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Initiating {
+    Reserved(u64),
+    Opened(Epoch),
+}
+
+/// Holds an `Initiating::Reserved` entry while `open` waits on the owner.
+/// Dropping it (error or cancellation) clears only its own reservation.
+struct Reservation<'a> {
+    node: &'a LinkNode,
+    key: LinkKey,
+    token: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut initiating = LinkNode::lock(&self.node.initiating);
+        if initiating.get(&self.key) == Some(&Initiating::Reserved(self.token)) {
+            initiating.remove(&self.key);
+        }
+    }
 }
 
 impl LinkNode {
@@ -115,6 +143,41 @@ impl LinkNode {
         Self::lock(&self.active).clear();
         self.settled
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Initiator guard for one opened setup through the HTTP exchange and
+/// `connect`: unless `finish`ed, dropping it abandons its own epoch only.
+pub struct SetupAttempt<'a> {
+    links: &'a Links,
+    peer: &'a NodeId,
+    rail: RailId,
+    epoch: Epoch,
+    done: bool,
+}
+
+impl<'a> SetupAttempt<'a> {
+    pub fn new(links: &'a Links, peer: &'a NodeId, rail: RailId, epoch: Epoch) -> Self {
+        Self {
+            links,
+            peer,
+            rail,
+            epoch,
+            done: false,
+        }
+    }
+
+    /// The setup connected; keep the link.
+    pub fn finish(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for SetupAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.links.abandon(self.peer, self.rail, self.epoch);
+        }
     }
 }
 
@@ -398,22 +461,32 @@ impl Links {
         scope: &RequestScope,
     ) -> Result<(Epoch, Vec<u8>)> {
         let key = link_key(peer, rail);
-        {
+        let reservation = {
             let mut initiating = LinkNode::lock(&self.node.initiating);
             if initiating.contains_key(&key) {
                 return Err(Error::Overloaded);
             }
             // Reserve the key before the owner answers; replaced with the epoch.
-            initiating.insert(key, Epoch(0));
-        }
-        let opened = match self.wait(self.client.open(key), scope).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                LinkNode::lock(&self.node.initiating).remove(&key);
-                return Err(error);
+            let token = self
+                .node
+                .reservations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            initiating.insert(key, Initiating::Reserved(token));
+            Reservation {
+                node: &self.node,
+                key,
+                token,
             }
         };
-        LinkNode::lock(&self.node.initiating).insert(key, opened.epoch);
+        let opened = self.wait(self.client.open(key), scope).await?;
+        {
+            let mut initiating = LinkNode::lock(&self.node.initiating);
+            // A responder-side accept may have replaced our reservation.
+            if initiating.get(&key) == Some(&Initiating::Reserved(reservation.token)) {
+                initiating.insert(key, Initiating::Opened(opened.epoch));
+            }
+        }
+        drop(reservation);
         let setup = link_setup::Setup::new(
             rail,
             opened.setup.endpoint.to_bytes(),
@@ -471,7 +544,7 @@ impl Links {
 
     fn finish_initiating(&self, key: LinkKey, epoch: Epoch) {
         let mut initiating = LinkNode::lock(&self.node.initiating);
-        if initiating.get(&key) == Some(&epoch) {
+        if initiating.get(&key) == Some(&Initiating::Opened(epoch)) {
             initiating.remove(&key);
         }
     }

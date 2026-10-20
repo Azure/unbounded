@@ -121,7 +121,9 @@ offer from the same peer for the same rail:
 
 Who initiates: any worker that needs a link and sees `Idle`. `Client::open`
 returns `Busy` if another worker already started, so at most one setup runs
-per key. Pages never wait for a link: while it is not `Ready`, pages use HTTP.
+per key. The initiator holds its per-key reservation in drop guards from
+`open` through the HTTP exchange and `connect`, so a cancelled or failed setup
+clears only its own reservation and breaks only its own epoch. Pages never wait for a link: while it is not `Ready`, pages use HTTP.
 
 ## Link setup over HTTP
 

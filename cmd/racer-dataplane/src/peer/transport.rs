@@ -643,6 +643,8 @@ pub(crate) async fn link_exchange(
     scope: &RequestScope,
 ) -> Result<ConnectionLease> {
     let (epoch, ours) = links.open(peer, rail, scope).await?;
+    // Abandons the attempt on error or if this future is dropped mid-exchange.
+    let attempt = crate::rdma::SetupAttempt::new(links, peer, rail, epoch);
     let result = async {
         let signed = peer_wire::link::RdmaLink {
             setup: ours.clone(),
@@ -680,8 +682,8 @@ pub(crate) async fn link_exchange(
         Ok(connection)
     }
     .await;
-    if result.is_err() {
-        links.abandon(peer, rail, epoch);
+    if result.is_ok() {
+        attempt.finish();
     }
     result
 }

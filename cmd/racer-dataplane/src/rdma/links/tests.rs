@@ -470,6 +470,70 @@ fn tie_break_rate_limit_and_bad_response() {
 }
 
 #[test]
+fn cancelled_open_clears_its_reservation() {
+    let mut w = world();
+    let b = node_id(2);
+    let scope = scope();
+    {
+        let mut open = std::pin::pin!(w.a.links.open(&b, RAIL, &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(open.as_mut().poll(&mut cx).is_pending());
+        assert!(!w.a.links.wants(&b, RAIL), "reserved while waiting");
+    }
+    pump!(w);
+    assert!(LinkNode::lock(&w.a.links.node.initiating).is_empty());
+    // The owner still holds the half-open link from the dropped request until
+    // its setup deadline; after that, a later attempt is allowed and succeeds.
+    assert_eq!(w.a.links.state(&b, RAIL), LinkState::Connecting(Epoch(1)));
+    for _ in 0..8 {
+        w.clock.advance(SETUP_DEADLINE);
+        pump!(w);
+    }
+    assert!(w.a.links.wants(&b, RAIL));
+    drive!(w, w.a.links.open(&b, RAIL, &self::scope())).unwrap();
+}
+
+#[test]
+fn dropped_setup_attempt_abandons_its_epoch() {
+    let mut w = world();
+    let b = node_id(2);
+    let scope = scope();
+    let (epoch, _) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
+    drop(SetupAttempt::new(&w.a.links, &b, RAIL, epoch));
+    pump!(w);
+    assert!(LinkNode::lock(&w.a.links.node.initiating).is_empty());
+    assert!(matches!(
+        w.a.links.state(&b, RAIL),
+        LinkState::Backoff(_) | LinkState::Breaking
+    ));
+}
+
+#[test]
+fn stale_setup_guards_leave_a_newer_attempt() {
+    let mut w = world();
+    let b = node_id(2);
+    let scope = scope();
+    let (epoch, _) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
+    let key = link_key(&b, RAIL);
+    // A reservation token that is not the current entry.
+    drop(Reservation {
+        node: &w.a.links.node,
+        key,
+        token: u64::MAX,
+    });
+    drop(SetupAttempt::new(&w.a.links, &b, RAIL, Epoch(epoch.0 + 1)));
+    pump!(w);
+    assert_eq!(
+        LinkNode::lock(&w.a.links.node.initiating).get(&key),
+        Some(&Initiating::Opened(epoch))
+    );
+    assert!(!w.a.links.wants(&b, RAIL));
+    // The live attempt still finishes normally.
+    SetupAttempt::new(&w.a.links, &b, RAIL, epoch).finish();
+    assert!(LinkNode::lock(&w.a.links.node.initiating).contains_key(&key));
+}
+
+#[test]
 fn drain_stops_setups_and_closes_the_node() {
     let mut w = world();
     let b = node_id(2);
