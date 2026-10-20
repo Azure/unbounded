@@ -145,23 +145,31 @@ func resolveNvidiaHostWithReadiness(arch string, requireReadiness bool) (NvidiaH
 	initDeps := defaultNvidiaDeviceInitDeps()
 	initDeps.hostDistro = func() string { return hostDistro }
 
-	return resolveNvidiaHost(arch, initDeps, useCDIRuntime, requireReadiness)
+	return resolveNvidiaHost(arch, initDeps, nvidiaHostOptions{
+		useCDIRuntime:    useCDIRuntime,
+		requireReadiness: requireReadiness,
+	})
 }
 
-func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, useCDIRuntime, requireReadiness bool) (NvidiaHost, error) {
+type nvidiaHostOptions struct {
+	useCDIRuntime    bool
+	requireReadiness bool
+}
+
+func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, opts nvidiaHostOptions) (NvidiaHost, error) {
 	archInfo, ok := nvidiaArchMap[arch]
 	if !ok {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	if requireReadiness {
+	if opts.requireReadiness {
 		if err := initializeAzureLinuxNVIDIADevices(initDeps); err != nil {
 			return NvidiaHost{}, err
 		}
 	}
 
 	devices := discoverNVIDIADevicesIn(initDeps.deviceDir)
-	if requireReadiness && (len(devices) > 0 || hasNVIDIADisplayHardware(initDeps)) {
+	if opts.requireReadiness && (len(devices) > 0 || hasNVIDIADisplayHardware(initDeps)) {
 		if err := nvidia.CheckReadiness(context.Background(), initDeps.lookPath, initDeps.outputCmd); err != nil {
 			return NvidiaHost{}, fmt.Errorf("%w: %w", ErrNVIDIAStateUnavailable, err)
 		}
@@ -172,7 +180,7 @@ func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, useCDIRuntime
 	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
-		UseCDIRuntime:     useCDIRuntime,
+		UseCDIRuntime:     opts.useCDIRuntime,
 		GPUDevicePaths:    devices,
 		ContainerLibDir:   archInfo.libDir,
 		LibMappings:       libraries.libMappings,

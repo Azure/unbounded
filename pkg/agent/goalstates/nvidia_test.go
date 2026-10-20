@@ -58,7 +58,7 @@ func TestResolveNvidiaHostRejectsUnusableGPUs(t *testing.T) {
 				return []byte("No devices found.\n"), nil
 			}
 
-			host, err := resolveNvidiaHost("amd64", deps, false, true)
+			host, err := resolveNvidiaHost("amd64", deps, nvidiaHostOptions{requireReadiness: true})
 			require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
 			require.ErrorContains(t, err, "repair the host NVIDIA driver")
 			require.Empty(t, host)
@@ -85,8 +85,12 @@ func TestResolveNvidiaHostRefreshesDevicesAfterReadiness(t *testing.T) {
 		return []byte("GPU 0: Tesla T4 (UUID: GPU-12345678-1234-1234-1234-123456789abc)\n"), nil
 	}
 
-	host, err := resolveNvidiaHost("amd64", deps, false, true)
+	host, err := resolveNvidiaHost("amd64", deps, nvidiaHostOptions{
+		useCDIRuntime:    true,
+		requireReadiness: true,
+	})
 	require.NoError(t, err)
+	require.True(t, host.UseCDIRuntime)
 	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
 }
 
@@ -112,8 +116,9 @@ func TestResolveNvidiaHostForPreflightDefersReadiness(t *testing.T) {
 		return nil, nil
 	}
 
-	host, err := resolveNvidiaHost("amd64", deps, false, false)
+	host, err := resolveNvidiaHost("amd64", deps, nvidiaHostOptions{})
 	require.NoError(t, err)
+	require.False(t, host.UseCDIRuntime)
 	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
 }
 
