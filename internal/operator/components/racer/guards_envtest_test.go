@@ -140,7 +140,7 @@ func TestEnvtestGuardContainmentDefaults(t *testing.T) {
 				// Containment revokes grants before changing a drifted guard.
 				current := guard.DeepCopyObject().(client.Object)
 				require.NoError(t, admin.Get(ctx, client.ObjectKeyFromObject(guard), current))
-				require.Equal(t, effectiveGuardSpec(guard), effectiveGuardSpec(current))
+				require.Equal(t, component.EffectiveAdmissionSpec(guard), component.EffectiveAdmissionSpec(current))
 				original.SetResourceVersion(current.GetResourceVersion())
 				require.NoError(t, admin.Update(ctx, original))
 

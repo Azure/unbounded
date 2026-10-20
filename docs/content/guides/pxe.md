@@ -207,7 +207,16 @@ Metalman uses trust-on-first-use (TOFU) for TPM attestation: once a machine's EK
 3. Metalman wraps an AES-256 key via `tpm2.CreateCredential` (bound to the EK and SRK), then encrypts a 1-hour ServiceAccount token with AES-256-GCM and returns both to the client.
 4. The agent uses the TPM `ActivateCredential` operation to recover the AES key, decrypts the token, and writes a bootstrap kubeconfig for kubelet to use during TLS bootstrapping.
 
-The `metalman-bootstrap` ServiceAccount has RBAC for `system:node-bootstrapper` and `certificatesigningrequests:nodeclient` auto-approval.
+Before it returns the token, metalman stores the token's credential ID (`JTI=<jti>`) in the Machine's `status.bootstrap.credentialID` (with `issuedAt`), in the same status update that pins the EK. Attesting again replaces it. This needs Kubernetes 1.30 or later, where ServiceAccount tokens carry a `jti`. On older clusters attestation fails.
+
+Metalman also sets the agent's node name to the Machine's node name (`spec.kubernetes.nodeRef.name`, or the Machine name if unset).
+
+The `metalman-bootstrap` ServiceAccount token is limited:
+
+- Kubelet client CSRs from this ServiceAccount are not auto-approved by kube-controller-manager. Metalman approves a CSR only when its `authentication.kubernetes.io/credential-id` extra matches the `status.bootstrap.credentialID` of exactly one Machine, and the CN is `system:node:<status.bootstrap.nodeName of that Machine>`, the node name recorded when the token was issued. Otherwise it denies the CSR. Each metalman instance decides only CSRs whose credential is recorded on a Machine in its own Site, and leaves other CSRs pending.
+- A ValidatingAdmissionPolicy lets the ServiceAccount update only the status of its own Machine (matched by credential ID), and never `status.tpm` or `status.bootstrap`. It cannot create Machines.
+
+Metalman identifies clients only by the TCP peer address. It ignores `X-Forwarded-For`, `X-Real-IP`, and `Forwarded` headers. Running metalman behind an HTTP proxy is not supported.
 
 ## Site Isolation
 
@@ -250,7 +259,7 @@ Running metalman's DHCP server on a network segment that already has an active D
 
 **TPM attestation rejected (403).** The EK public key has changed since the initial TOFU. If the TPM was legitimately replaced, clear `status.tpm.ekPublicKey` from the Machine CR to allow re-enrollment.
 
-**Node not joining.** Verify the target machine can reach the Kubernetes API on TCP/6443. Check that the `metalman-bootstrap` ServiceAccount and RBAC are in place. Inspect kubelet logs on the target for certificate signing request errors.
+**Node not joining.** Verify the target machine can reach the Kubernetes API on TCP/6443. Check that the `metalman-bootstrap` ServiceAccount and RBAC are in place, that the Machine has `status.bootstrap.credentialID` set, and that the metalman controller for the Machine's Site is running to approve the kubelet CSR. Inspect kubelet logs on the target for certificate signing request errors.
 
 ## Limitations
 

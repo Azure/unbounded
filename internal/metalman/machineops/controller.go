@@ -612,7 +612,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 		return change
 	}
 
-	nodeName := nodeNameForMachine(machine)
+	nodeName := machine.NodeName()
 
 	var node corev1.Node
 	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
@@ -887,14 +887,6 @@ func cloudInitReplaceStatus(conditions []metav1.Condition, target v1alpha3.Machi
 	target.Message = "waiting for first-boot cloud-init to complete"
 
 	return targetChange{target: target}, true
-}
-
-func nodeNameForMachine(machine *v1alpha3.Machine) string {
-	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil && machine.Spec.Kubernetes.NodeRef.Name != "" {
-		return machine.Spec.Kubernetes.NodeRef.Name
-	}
-
-	return machine.Name
 }
 
 func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange, restoreHostReplaceTriggerConditions bool) error {

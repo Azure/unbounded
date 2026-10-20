@@ -95,6 +95,76 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsDefaultTokenMachineSite(t *tes
 	require.True(t, allowed)
 }
 
+func TestDaemonCSRBootstrapCredentialMayClaimNode(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(machineWithBootstrapStatus("machine-a", "node-a", "JTI=credential-a"))
+
+	allowed, err := checker.bootstrapCredentialMayClaimNode(
+		context.Background(),
+		csrForBinding(metalmanBootstrapUsername()),
+		"node-a",
+		"JTI=credential-a",
+	)
+	require.NoError(t, err)
+	require.True(t, allowed)
+}
+
+func TestDaemonCSRBootstrapCredentialRequiresRecordedNode(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(machineWithBootstrapStatus("machine-a", "node-a", "JTI=credential-a"))
+
+	allowed, err := checker.bootstrapCredentialMayClaimNode(
+		context.Background(),
+		csrForBinding(metalmanBootstrapUsername()),
+		"node-b",
+		"JTI=credential-a",
+	)
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
+func TestDaemonCSRBootstrapCredentialRejectsUnknownCredential(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(machineWithBootstrapStatus("machine-a", "node-a", "JTI=credential-a"))
+
+	allowed, err := checker.bootstrapCredentialMayClaimNode(
+		context.Background(),
+		csrForBinding(metalmanBootstrapUsername()),
+		"node-a",
+		"JTI=credential-b",
+	)
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
+func TestDaemonCSRBootstrapCredentialRejectsSupersededCredential(t *testing.T) {
+	cached := testDaemonCSRClaimChecker(machineWithBootstrapStatus("machine-a", "node-a", "JTI=credential-old"))
+	live := testDaemonCSRClaimChecker(machineWithBootstrapStatus("machine-a", "node-a", "JTI=credential-new"))
+	cached.APIReader = live.APIReader
+
+	allowed, err := cached.bootstrapCredentialMayClaimNode(
+		context.Background(),
+		csrForBinding(metalmanBootstrapUsername()),
+		"node-a",
+		"JTI=credential-old",
+	)
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
+func TestDaemonCSRBootstrapCredentialRequiresUniqueMachine(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(
+		machineWithBootstrapStatus("machine-a", "node-a", "JTI=credential-a"),
+		machineWithBootstrapStatus("machine-b", "node-a", "JTI=credential-a"),
+	)
+
+	allowed, err := checker.bootstrapCredentialMayClaimNode(
+		context.Background(),
+		csrForBinding(metalmanBootstrapUsername()),
+		"node-a",
+		"JTI=credential-a",
+	)
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
 func TestDaemonCSRNodeHasMachineBinding(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(machineForToken("machine-a", "node-a", "abc123", "site-a"))
 	csr := csrForBinding("system:node:node-a")
@@ -136,7 +206,7 @@ func testDaemonCSRClaimChecker(objs ...client.Object) *daemonCSRClaimChecker {
 		}).
 		Build()
 
-	return &daemonCSRClaimChecker{Client: c}
+	return &daemonCSRClaimChecker{Client: c, APIReader: c}
 }
 
 func csrForBinding(username string) *certificatesv1.CertificateSigningRequest {
@@ -199,4 +269,16 @@ func machineWithoutNodeRef(machineName, tokenID, site string) *unboundedv1alpha3
 	machine.Spec.Kubernetes.NodeRef = nil
 
 	return machine
+}
+
+func machineWithBootstrapStatus(machineName, nodeName, credentialID string) *unboundedv1alpha3.Machine {
+	return &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: machineName},
+		Status: unboundedv1alpha3.MachineStatus{
+			Bootstrap: &unboundedv1alpha3.BootstrapStatus{
+				CredentialID: credentialID,
+				NodeName:     nodeName,
+			},
+		},
+	}
 }
