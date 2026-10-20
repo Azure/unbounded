@@ -1,10 +1,11 @@
 # Project Signal controller
 
 Project Signal is a Kubernetes controller for admitting approved idle Nodes to
-operator-supplied certification workflows. The upstream integration provides
-the API, controller, CRDs, RBAC, and controller Deployment. It intentionally
-does not publish certification scripts, runner images, CertificationProfiles,
-or WorkflowTemplates.
+certification workflows. The upstream integration provides the API, controller,
+CRDs, controller Deployment, and an optional generic participant adapter for
+ordinary Pods and Kubeflow MPIJobs. It intentionally does not publish
+certification scripts, runner images, CertificationProfiles, hardware policy,
+or environment-specific queue configuration.
 
 ## Architecture
 
@@ -21,7 +22,7 @@ approved Node or recurring policy
  immutable CertificationRun input + SHA-256 digest
               |
               v
- operator-supplied Argo WorkflowTemplate
+ operator-supplied or generic adapter WorkflowTemplate
               |
               v
  typed result -> retained evidence -> Node projection -> cleanup
@@ -37,13 +38,21 @@ The controller does not contain or publish certification script bodies.
 - Argo Workflows `argoproj.io/v1alpha1` Workflow API.
 - A controller image built from `cmd/project-signal-controller`.
 - An operator-owned script ConfigMap and execution image.
-- An operator-owned WorkflowTemplate implementing the interface below.
+- An operator-owned WorkflowTemplate implementing the interface below, or the
+  included `project-signal-participant-adapter` WorkflowTemplate.
 - Explicitly reviewed Node selectors, resource requests, tolerations, policy
   values, and cleanup behavior.
 
-Backends such as Jobs, MPIJobs, or other workload APIs are operator choices.
-Install their controllers and grant their runner permissions separately.
-Project Signal does not install them or grant generic workload-runner RBAC.
+The execution image used with the included adapter must contain Bash and the
+standard `mkdir`, `chmod`, `base64`, and `tr` utilities, plus every tool required
+by the selected script. The adapter image and execution image are separate: the
+upstream adapter creates and observes workloads, while the operator-owned
+execution image runs the script.
+
+The included adapter supports `v1` Pods and `kubeflow.org/v2beta1` MPIJobs.
+Project Signal does not install MPI Operator or Kueue. Its adapter RBAC is
+namespace-scoped and intentionally grants only the Pod, Pod log, MPIJob,
+Workflow, and Argo task-result access needed by the included template.
 
 ## WorkflowTemplate interface
 
@@ -98,18 +107,26 @@ reservation rolls back every reservation already acquired. Each participant is
 bound by Node UID and an immutable capacity and allocatable snapshot in the
 CertificationRun.
 
-The participant group is a certification boundary, not necessarily one
-distributed process group. Operator WorkflowTemplates should create one
-independently pinned backend workload per participant unless a test explicitly
-requires a cross-Node world. The backend adapter owns launcher and worker
-topology, rank environment, rendezvous or SSH configuration, workload RBAC,
-deadline propagation, foreground cleanup, and result aggregation.
+The participant group is a certification boundary, not one distributed process
+group. The included adapter creates one independently pinned backend workload
+per participant. Ordinary diagnostics use one Pod per participant. MPI
+diagnostics use one MPIJob per participant with one launcher and one GPU worker;
+only the worker is pinned to the participant Node and receives the configured
+GPU limit. The adapter propagates the Workflow active deadline, uses the
+profile's queue, records API-assigned workload UIDs, reads the final typed result
+from bounded workload logs, aggregates diagnostic state separately from backend
+execution state, and foreground-deletes every created workload.
 
-The currently validated adapter contract uses ordinary single-Node workloads
-for Node diagnostics and `kubeflow.org/v2beta1` MPIJobs for tests that require
-an OpenMPI launcher and worker. Kubeflow Trainer v2 TrainJobs can be supplied by
-operators through the same generic interface, but require a separately managed,
-version-pinned MPI TrainingRuntime and are not installed by Project Signal.
+The selected script is invoked with no arguments for a Pod backend,
+`mpi-launcher <gpu-count>` in an MPIJob launcher, and `mpi-worker` in its worker.
+Scripts write `verdict`, `reason`, and optional `measurements.txt` under
+`/results`. A nonzero process exit remains an execution error and cannot be
+converted into a diagnostic `Fail`. Missing results, partial backend execution,
+identity gaps, malformed output, deadline interruption, and cleanup failure are
+all `Inconclusive`.
+
+Other backend kinds remain operator-supplied and are not installed or granted
+permissions by the included adapter.
 
 ## Render and install
 
@@ -117,8 +134,13 @@ Render the controller manifests:
 
 ```bash
 make signal-manifests \
-  SIGNAL_CONTROLLER_IMAGE=<controller-image@sha256:digest>
+  SIGNAL_CONTROLLER_IMAGE=<controller-image@sha256:digest> \
+  SIGNAL_ADAPTER_IMAGE=<adapter-image@sha256:digest>
 ```
+
+Local adapter builds use the separate mutable
+`SIGNAL_ADAPTER_BUILD_IMAGE=<registry/repository:tag>` staging reference because
+container engines cannot tag a local build with an `image@sha256:` reference.
 
 Generated output is written to `deploy/signal/rendered/`. Validate it with the
 target cluster before applying:
@@ -131,8 +153,37 @@ kubectl apply -f deploy/signal/rendered/
 ```
 
 The upstream manifests install no profiles. Operators must create a
-CertificationProfile that references their own script ConfigMap,
-WorkflowTemplate, backend, and digest-pinned runner image.
+CertificationProfile that references their own script ConfigMap and
+digest-pinned runner image. To use the included adapter, set
+`spec.workflow.name: project-signal-participant-adapter` and select either:
+
+```yaml
+backend:
+  apiVersion: v1
+  kind: Pod
+```
+
+or an explicit Kueue queue:
+
+```yaml
+backend:
+  apiVersion: kubeflow.org/v2beta1
+  kind: MPIJob
+  queue: <local-queue>
+```
+
+`gpu-resource-count` remains an operator-supplied profile parameter. It may be
+zero for Pod diagnostics and must be positive for MPIJobs. The MPIJob policy is
+fail-closed: `backoffLimit: 0`, `cleanPodPolicy: All`, a one-hour post-finish
+TTL, replica-level `restartPolicy: Never`, `WaitForWorkersReady`, and
+`runLauncherAsWorker: false`.
+
+Operators can override the nonnegative MPI retry and TTL values through profile
+parameters `backend-backoff-limit` and
+`backend-ttl-seconds-after-finished`. These become
+`BACKEND_BACKOFF_LIMIT` and `BACKEND_TTL_SECONDS_AFTER_FINISHED` in the validated
+script environment and remain explicit per-profile policy rather than cluster
+defaults.
 
 ## Results and evidence
 

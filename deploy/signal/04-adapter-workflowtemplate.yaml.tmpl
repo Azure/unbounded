@@ -1,0 +1,116 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-participant-adapter
+  namespace: {{ default "project-signal" .Namespace }}
+spec:
+  serviceAccountName: project-signal-adapter
+  entrypoint: certification
+  arguments:
+    parameters:
+      - name: run-name
+      - name: run-uid
+      - name: participants
+      - name: participants-json
+      - name: participant-count
+      - name: request-node-name
+      - name: script-configmap
+      - name: script-key
+      - name: script-digest
+      - name: backend-api-version
+      - name: backend-kind
+      - name: queue
+      - name: runner-image
+      - name: tolerations
+        value: "[]"
+      - name: script-environment
+        value: "{}"
+      - name: mpi-payload-mode
+        value: ""
+      - name: expected-gpu-product-regex
+        value: ""
+      - name: expected-gpu-count
+        value: "0"
+      - name: observed-gpu-capacity
+        value: "0"
+      - name: observed-gpu-allocatable
+        value: "0"
+      - name: gpu-resource-count
+        value: "0"
+      - name: privileged
+        value: "false"
+      - name: attempt
+  templates:
+    - name: certification
+      container:
+        image: {{ default "example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000" .AdapterImage }}
+        imagePullPolicy: IfNotPresent
+        args:
+          - --namespace
+          - "$(POD_NAMESPACE)"
+          - --workflow-name
+          - "$(WORKFLOW_NAME)"
+          - --run-name
+          - "{{`{{workflow.parameters.run-name}}`}}"
+          - --run-uid
+          - "{{`{{workflow.parameters.run-uid}}`}}"
+          - --participants
+          - "{{`{{workflow.parameters.participants}}`}}"
+          - --participants-json
+          - "{{`{{workflow.parameters.participants-json}}`}}"
+          - --participant-count
+          - "{{`{{workflow.parameters.participant-count}}`}}"
+          - --request-node-name
+          - "{{`{{workflow.parameters.request-node-name}}`}}"
+          - --script-configmap
+          - "{{`{{workflow.parameters.script-configmap}}`}}"
+          - --script-key
+          - "{{`{{workflow.parameters.script-key}}`}}"
+          - --script-digest
+          - "{{`{{workflow.parameters.script-digest}}`}}"
+          - --runner-image
+          - "{{`{{workflow.parameters.runner-image}}`}}"
+          - --backend-api-version
+          - "{{`{{workflow.parameters.backend-api-version}}`}}"
+          - --backend-kind
+          - "{{`{{workflow.parameters.backend-kind}}`}}"
+          - --queue
+          - "{{`{{workflow.parameters.queue}}`}}"
+          - --tolerations
+          - "{{`{{workflow.parameters.tolerations}}`}}"
+          - --script-environment
+          - "{{`{{workflow.parameters.script-environment}}`}}"
+          - --gpu-resource-count
+          - "{{`{{workflow.parameters.gpu-resource-count}}`}}"
+          - "--privileged={{`{{workflow.parameters.privileged}}`}}"
+          - --attempt
+          - "{{`{{workflow.parameters.attempt}}`}}"
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: WORKFLOW_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['workflows.argoproj.io/workflow']
+        volumeMounts:
+          - name: outputs
+            mountPath: /outputs
+      volumes:
+        - name: outputs
+          emptyDir: {}
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /outputs/verdict
+          - name: reason
+            valueFrom:
+              path: /outputs/reason
+          - name: measurements
+            valueFrom:
+              path: /outputs/measurements
+          - name: backend-resources
+            valueFrom:
+              path: /outputs/backend-resources

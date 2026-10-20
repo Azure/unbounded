@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func TestUpstreamManifestsContainOnlyControllerSurface(t *testing.T) {
+func TestUpstreamManifestsContainControllerAndGenericAdapter(t *testing.T) {
 	t.Parallel()
 
 	templates, err := filepath.Glob("*.yaml.tmpl")
@@ -26,6 +26,8 @@ func TestUpstreamManifestsContainOnlyControllerSurface(t *testing.T) {
 		"00-namespace.yaml.tmpl",
 		"01-serviceaccounts.yaml.tmpl",
 		"02-rbac.yaml.tmpl",
+		"03-adapter-serviceaccount-rbac.yaml.tmpl",
+		"04-adapter-workflowtemplate.yaml.tmpl",
 		"06-deployment.yaml.tmpl",
 	}
 	if !reflect.DeepEqual(templates, want) {
@@ -42,6 +44,40 @@ func TestUpstreamManifestsContainOnlyControllerSurface(t *testing.T) {
 		if strings.Contains(manifest, "project-signal-runner") ||
 			strings.Contains(manifest, "kubeflow.org") {
 			t.Fatalf("%s contains bundled runner surface", path)
+		}
+	}
+}
+
+func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("04-adapter-workflowtemplate.yaml.tmpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := string(content)
+	for _, required := range []string{
+		"participants-json",
+		"participant-count",
+		"request-node-name",
+		"backend-resources",
+		"backend-api-version",
+		"backend-kind",
+		"queue",
+	} {
+		if !strings.Contains(manifest, required) {
+			t.Fatalf("adapter WorkflowTemplate does not contain %q", required)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"project-signal-certification/",
+		"REPLACE_WITH_",
+		"internal-node",
+	} {
+		if strings.Contains(manifest, forbidden) {
+			t.Fatalf("adapter WorkflowTemplate contains downstream-specific value %q", forbidden)
 		}
 	}
 }
