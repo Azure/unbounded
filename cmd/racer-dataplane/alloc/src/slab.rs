@@ -67,6 +67,45 @@ pub struct Slab<C: Charge> {
     idle_buffer: Rc<RefCell<crate::BufferPool<C>>>,
 
     resize_mismatched: bool,
+
+    // Per distinct descriptor: completed a write since its last sync.
+    dirty: RefCell<Vec<bool>>,
+}
+
+/// Fsync descriptors in parallel; the first error wins after all finish.
+async fn sync_all<S: Scope, B: Budget>(
+    reactor: &Reactor<S, B>,
+    files: Vec<Rc<Descriptor>>,
+    scope: &S,
+) -> std::result::Result<(), S::Error> {
+    let mut running: Vec<Option<Operation<'_, (), S::Error>>> = files
+        .into_iter()
+        .map(|file| Some(reactor.file_sync(file, scope)))
+        .collect();
+    let mut error = None;
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for slot in &mut running {
+            if let Some(op) = slot {
+                match op.as_mut().poll(cx) {
+                    Poll::Ready(result) => {
+                        if let Err(e) = result {
+                            error.get_or_insert(e);
+                        }
+                        *slot = None;
+                    }
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    error.map_or(Ok(()), Err)
 }
 
 impl<C: Charge> Slab<C> {
@@ -86,6 +125,7 @@ impl<C: Charge> Slab<C> {
             writes: Rc::new(WriteState::default()),
             idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
             resize_mismatched: false,
+            dirty: RefCell::new(Vec::new()),
         }
     }
 
@@ -284,25 +324,30 @@ impl<C: Charge> Slab<C> {
                 alignment,
             } => {
                 let mut files = HashMap::new();
+                let mut distinct: Vec<Rc<Descriptor>> = Vec::new();
                 let mut opened = Vec::with_capacity(placements.borrow().len());
                 for placement in placements.borrow().iter() {
-                    let file = match files.entry(Arc::as_ptr(&placement.file)) {
-                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    let index = match files.entry(Arc::as_ptr(&placement.file)) {
+                        std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             let file = placement
                                 .file
                                 .try_clone()
                                 .map_err(|e| system_error("dup", e))?;
-                            entry.insert(Rc::new(Descriptor::from(file)))
+                            distinct.push(Rc::new(Descriptor::from(file)));
+                            *entry.insert(distinct.len() - 1)
                         }
                     };
                     opened.push(OpenPlacement {
-                        file: file.clone(),
+                        file: distinct[index].clone(),
+                        index,
                         offset: placement.offset,
                     });
                 }
                 let segment_count = opened.len() as u64;
+                *self.dirty.borrow_mut() = vec![false; distinct.len()];
                 *self.opened.borrow_mut() = Some(OpenSlab {
+                    files: distinct,
                     backing: OpenBacking::Devices(opened),
                     alignment: *alignment,
                     segment_count,
@@ -439,8 +484,11 @@ impl<C: Charge> Slab<C> {
 
     /// Publish geometry with its owning file, initially without I/O authority.
     fn publish(&self, file: Descriptor, alignment: Alignment, segment_count: u64) {
+        let file = Rc::new(file);
+        *self.dirty.borrow_mut() = vec![false];
         *self.opened.borrow_mut() = Some(OpenSlab {
-            backing: OpenBacking::File(Rc::new(file)),
+            files: vec![file.clone()],
+            backing: OpenBacking::File(file),
             alignment,
             segment_count,
             volume: None,
@@ -488,7 +536,7 @@ impl<C: Charge> Slab<C> {
         &self,
         offset: u64,
         buffer: &AlignedBuffer<C>,
-    ) -> Result<(Rc<Descriptor>, Extent)> {
+    ) -> Result<(Rc<Descriptor>, Extent, usize)> {
         let opened = self.opened.borrow();
         let slab = opened.as_ref().ok_or(Error::Unavailable)?;
         let count = slab.volume.ok_or(Error::Unavailable)?;
@@ -503,7 +551,7 @@ impl<C: Charge> Slab<C> {
             return Err(Error::Corrupt);
         }
         match &slab.backing {
-            OpenBacking::File(file) => Ok((file.clone(), extent)),
+            OpenBacking::File(file) => Ok((file.clone(), extent, 0)),
             OpenBacking::Devices(placements) => {
                 let position = usize::try_from(segment).map_err(|_| Error::Corrupt)?;
                 let placement = placements.get(position).ok_or(Error::Corrupt)?;
@@ -515,7 +563,7 @@ impl<C: Charge> Slab<C> {
                     buffer.len(),
                 )?;
                 slab.alignment.check(physical, buffer)?;
-                Ok((placement.file.clone(), physical))
+                Ok((placement.file.clone(), physical, placement.index))
             }
         }
     }
@@ -527,8 +575,9 @@ impl<C: Charge> Slab<C> {
         buffer: AlignedBuffer<C>,
         guard: G,
     ) -> Result<Submission<C, G>> {
-        let (file, extent) = self.volume_submission(offset, &buffer)?;
+        let (file, extent, index) = self.volume_submission(offset, &buffer)?;
         Ok(Submission {
+            index,
             file,
             extent,
             buffer,
@@ -575,8 +624,13 @@ impl<C: Charge> Slab<C> {
     {
         Box::pin(async move {
             let submission = self.prepare_at(offset, buffer, guard)?;
+            let index = submission.index;
             let fence = self.writes.acquire()?;
-            submission.write(reactor, scope, fence).await
+            let buffer = submission.write(reactor, scope, fence).await?;
+            if let Some(dirty) = self.dirty.borrow_mut().get_mut(index) {
+                *dirty = true;
+            }
+            Ok(buffer)
         })
     }
 
@@ -593,29 +647,87 @@ impl<C: Charge> Slab<C> {
     {
         Box::pin(async move {
             let files = self.descriptors()?;
-            for file in files {
-                reactor.file_sync(file, scope).await?;
+            let count = files.len();
+            let result = sync_all(reactor, files, scope).await;
+            if result.is_ok() {
+                let mut dirty = self.dirty.borrow_mut();
+                dirty.iter_mut().take(count).for_each(|d| *d = false);
             }
-            Ok(())
+            result
         })
     }
 
-    /// Distinct backing descriptors, in first-use order.
+    /// Fsync, in parallel, only the descriptors that completed a write since
+    /// their last successful sync. Writes still in flight are not covered.
+    /// A failed sync marks its descriptors dirty again.
+    pub fn sync_dirty<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let files = self.descriptors()?;
+            let taken: Vec<usize> = {
+                let mut dirty = self.dirty.borrow_mut();
+                let taken = (0..dirty.len()).filter(|&i| dirty[i]).collect();
+                dirty.iter_mut().for_each(|d| *d = false);
+                taken
+            };
+            let chosen = taken.iter().map(|&i| files[i].clone()).collect();
+            let result = sync_all(reactor, chosen, scope).await;
+            if result.is_err() {
+                let mut dirty = self.dirty.borrow_mut();
+                for i in taken {
+                    dirty[i] = true;
+                }
+            }
+            result
+        })
+    }
+
+    /// Fsync only the descriptor that backs `offset` of a volume-bound slab.
+    pub fn sync_at<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        offset: u64,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let file = {
+                let opened = self.opened.borrow();
+                let slab = opened.as_ref().ok_or(Error::Unavailable)?;
+                match &slab.backing {
+                    OpenBacking::File(file) => file.clone(),
+                    OpenBacking::Devices(placements) => {
+                        let segment = usize::try_from(offset / self.segment_bytes)
+                            .map_err(|_| Error::Corrupt)?;
+                        placements.get(segment).ok_or(Error::Corrupt)?.file.clone()
+                    }
+                }
+            };
+            reactor.file_sync(file, scope).await
+        })
+    }
+
+    /// Number of distinct backing descriptors, cached at open.
+    pub fn descriptor_count(&self) -> usize {
+        self.opened
+            .borrow()
+            .as_ref()
+            .map_or(0, |slab| slab.files.len())
+    }
+
+    /// Distinct backing descriptors, in first-use order, cached at open.
     fn descriptors(&self) -> Result<Vec<Rc<Descriptor>>> {
         let opened = self.opened.borrow();
         let slab = opened.as_ref().ok_or(Error::Unavailable)?;
-        Ok(match &slab.backing {
-            OpenBacking::File(file) => vec![file.clone()],
-            OpenBacking::Devices(placements) => {
-                let mut files: Vec<Rc<Descriptor>> = Vec::new();
-                for placement in placements {
-                    if !files.iter().any(|f| Rc::ptr_eq(f, &placement.file)) {
-                        files.push(placement.file.clone());
-                    }
-                }
-                files
-            }
-        })
+        Ok(slab.files.clone())
     }
 
     /// Reuse charged capacity in the same size class without discarding mismatches.
@@ -666,7 +778,9 @@ impl<C: Charge> Slab<C> {
         let OpenBacking::File(current) = &mut slab.backing else {
             return Err(Error::InvalidConfiguration);
         };
-        *current = Rc::new(file);
+        let file = Rc::new(file);
+        *current = file.clone();
+        slab.files = vec![file];
         Ok(())
     }
 }
@@ -674,6 +788,9 @@ impl<C: Charge> Slab<C> {
 /// Backing and geometry own their binding; a closed slab cannot retain authority.
 struct OpenSlab {
     backing: OpenBacking,
+
+    // Distinct descriptors in first-use order, computed once at open.
+    files: Vec<Rc<Descriptor>>,
 
     alignment: Alignment,
 
@@ -693,12 +810,17 @@ enum OpenBacking {
 /// One logical segment's worker-local destination.
 struct OpenPlacement {
     file: Rc<Descriptor>,
+    // Position of `file` in `OpenSlab::files`.
+    index: usize,
     offset: u64,
 }
 
 /// A validated transfer owns every resource needed to keep kernel access safe.
 /// Only Slab::prepare_at constructs this capability, and submission consumes it.
 struct Submission<C: Charge, G: 'static> {
+    // Position of `file` in `OpenSlab::files`.
+    index: usize,
+
     file: Rc<Descriptor>,
 
     extent: Extent,
@@ -1406,9 +1528,9 @@ mod tests {
         .unwrap();
         let _ = slab.open_volume(2).unwrap();
         let buffer = slab.allocate(4096, ()).unwrap();
-        let (_, physical) = slab.volume_submission(4096, &buffer).unwrap();
+        let (_, physical, _) = slab.volume_submission(4096, &buffer).unwrap();
         assert_eq!(physical, Extent::new(0, 4096).unwrap());
-        let (_, physical) = slab.volume_submission(0, &buffer).unwrap();
+        let (_, physical, _) = slab.volume_submission(0, &buffer).unwrap();
         assert_eq!(physical, Extent::new(8192, 4096).unwrap());
         for (offset, expected) in [
             (8192, Error::Corrupt),
