@@ -302,7 +302,11 @@ Decoding rejects: wrong length (`byte_len != 64`), unknown version or kind,
 nonzero reserved bytes, wrong link id, fields not valid for the kind, a
 `Grant` with zero length or length above `buffer_len`, a `Release` or write
 with immediate for an unknown tag, and a duplicate tag. Every rejection
-breaks the link. None of them can make the receiver accept bytes: acceptance
+breaks the link. Fields not valid for the kind must be zero: `Release` has no
+rkey, address, or length; `Credit` and `Close` also have zero tag and transfer
+id. `Grant` and `Release` need a nonzero tag. The codec checks everything that
+needs no link state; unknown and duplicate tags are checked by the link layer.
+None of them can make the receiver accept bytes: acceptance
 still needs the signed HTTP head and AEAD in Racer.
 
 Removed from the earlier plan, with reasons:
