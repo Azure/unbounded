@@ -1,11 +1,11 @@
 # Racer persistent bidirectional RDMA sessions
 
-Status: approved direction, target design. The verbs crate side is in
+Status: implemented (stages 1 to 5 done). The verbs crate side is in
 [racer-verbs.md](racer-verbs.md). This file covers threading, the link
 handshake, the per-page protocol, Racer types, zero-copy, configuration,
-deletions, tests, and the implementation plan. Stages 4a (receive-side
-zero-copy) and 4b (staged sends on the crypto thread) are implemented; see
-"Deviations in the implementation".
+deletions, tests, and the implementation plan. The code is authoritative;
+see "Deviations in the implementation". Hardware validation is still open
+(see "Contradictions with the plan and open risks").
 
 Paths are relative to `cmd/racer-dataplane/` unless noted.
 
@@ -352,7 +352,7 @@ Deleted copies: `Region::poll_copy_from` and `poll_copy_to` staging
 - `src/app/native.rs`: `slot_count` becomes `buffer_count`; `NativePair`
   per worker becomes one owner port plus one `Client` per worker.
 
-Docs to update in the last stage: `docs/content/reference/racer.md:104` (the
+Docs updated in stage 5: `docs/content/reference/racer.md:104` (the
 `RACER_REGISTERED_BYTES` row) and the RDMA section (`racer.md:803-857`):
 persistent links, node-wide pinned pool at activation, fallback behavior,
 and that links reconnect with backoff.
@@ -361,8 +361,9 @@ and that links reconnect with backoff.
 
 - verbs: `Slot`, `Mailbox`, `Lease`, `QueuePairHandle`, `Region`, `Window`,
   `Ticket`, `Transfer`, `Receive`, `QpSet`, `IoPort`, `NativePort`,
-  `DeviceHandle`, `pair`, slot rebuild, per-slot admission guards, staging
-  bytes, and `rdma_verbs_write`.
+  `DeviceHandle`, `pair`, `NativeService`, `Configuration`, the `testing`
+  hooks, slot rebuild, per-slot admission guards, and staging bytes.
+  `rdma_verbs_write` is not deleted (deviation 13).
 - racer: `Sessions`, `PreparedSession`, `SessionLease` and `claim()`,
   `SetupParameters` (v1), `Grant`, `RemoteDescriptor`,
   `AuthenticatedDescriptor`, `SendCompletion`, `RegisteredLease`,
@@ -601,3 +602,29 @@ Recorded while building stage 4b (staged sends, done):
     stage job runs without a key lease and records no crypto metrics
     (`checksum_only`). The owner still copies under pool exhaustion, so it is
     not entirely free of bulk copies.
+
+Recorded while building stage 5 (cleanup, done):
+
+13. `rdma_verbs_write` stays in the adapter, and the native ABI stays at 2.
+    Links never post a plain write, but about 15 adapter and simulator tests
+    (`src/ffi.rs`, `src/simulation.rs`) use the whole-region bind, plain
+    write, and invalidate ticket path to check window revocation, delayed
+    DMA, stop fences, and quarantine. That path is now `cfg(test)` in
+    `src/ffi.rs`, so production builds carry only the `Api::write` symbol
+    pointer. Removing the symbol needs those tests ported to write with
+    immediate first.
+14. The C discovery fault tests (`src/discovery_fault_tests.rs`) now activate
+    through a one-worker node `Owner` instead of `NativeService`. They still
+    check that a leaked discovery or open keeps its guard charged and blocks
+    reopen (`Overloaded`).
+15. The worker test `shared_native_wrappers_are_drained_and_destroyed_on_owner_thread`
+    (`src/worker.rs`) hosts a node `Owner` through `WithNative::with_host`.
+16. The slot crate tests `tests/public_api.rs`, `tests/startup.rs`, and
+    `tests/device_discovery.rs`, the slot unit tests in `src/lib.rs`
+    (including two ignored hardware tests), and the slot simulation test
+    `native_services_activate_discovered_nodes_and_copy_through_io_proxies`
+    are deleted with the API. Their live concerns are covered by
+    `tests/links.rs`, the node and link unit tests, and the discovery fault
+    tests. The ignored loopback test
+    `ffi::tests::native_available_provider_write_bind_invalidate_and_fence`
+    remains the only real-hardware DMA test, and it uses plain writes.

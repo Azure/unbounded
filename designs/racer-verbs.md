@@ -1,9 +1,9 @@
 # Racer RDMA verbs library (`rdma-verbs`)
 
-Status: target design. Stage 1 to 5 of
-[racer-rdma-sessions.md](racer-rdma-sessions.md) move the code from the
-per-transfer slot model to this design. Until the last stage lands, the code
-still contains the slot API; this document describes where it is going.
+Status: implemented. Stages 1 to 5 of
+[racer-rdma-sessions.md](racer-rdma-sessions.md) moved the code from the
+per-transfer slot model to this design; stage 5 removed the slot API. The
+code is authoritative where it differs.
 The session protocol, threading, HTTP integration, and the implementation
 plan live in `racer-rdma-sessions.md`. This file covers only the crate.
 
@@ -62,8 +62,7 @@ Non-goals:
 ## Threads
 
 There is one `Owner` per node. It runs as a `uring-runtime` service on one
-crypto thread through `WithNative` (`src/lib.rs`), exactly like
-`NativeService` today. All libibverbs calls run on that thread. Each I/O
+crypto thread through `WithNative` (`src/lib.rs`). All libibverbs calls run on that thread. Each I/O
 worker holds one `Client`. A `Client` and the `Owner` share one `Channel`
 per worker (`src/channel.rs`): one bounded command queue (I/O to owner) and
 two `AtomicWaker`s (one per side). Results come back
@@ -181,16 +180,15 @@ As built (`src/node.rs`, stage 2e), the API differs from the sketch above:
 
 - `node(workers) -> Result<(Vec<Client>, OwnerPort)>`; `Owner::new(port)` on
   the native thread captures its environment (and simulation). Host it with
-  `WithNative::with_host(inner, owner)`: `WithNative<T, N = NativeService>`
-  is now generic over the `NativeHost` trait (`register_driver`,
-  `poll_budgeted`, `close`, `drained`), so `WithNative::new(inner,
-  NativePort)` keeps working for the slot path. `Owner::poll_budgeted`
+  `WithNative::with_host(inner, owner)`: `WithNative<T, N>` is generic over
+  the `NativeHost` trait (`register_driver`, `poll_budgeted`, `close`,
+  `drained`). There is no `WithNative::new`. `Owner::poll_budgeted`
   handles up to `budget` commands, then progresses every link, runs timers,
   and advances shutdown; completions and timers need periodic polls.
 - `Client` is `Send` (it holds only `Arc`s), not `!Send`.
 - `activate(config) -> Op<Vec<Selection>>` instead of `Result<()>`, so the
   caller learns the selected rails. `NodeConfig::selector` is a `FnOnce`
-  returning `(rail: u16, index)` pairs (the slot path's shape), and
+  returning `(rail: u16, index)` pairs (the old slot selector's shape), and
   `NodeConfig` carries `mr_remote_write`.
 - The link id is the caller's: `accept(key, remote, link_id, initiator)` and
   `connect(key, epoch, remote, link_id)` take it, because Racer derives it
@@ -203,7 +201,7 @@ As built (`src/node.rs`, stage 2e), the API differs from the sketch above:
   `Client::poll_ready` waits for room.
 - `send_buffer(rail, len, cx)` takes the rail (pools are per device) and a
   `Context` to wait on. `buffers(rail, state)` reports pool counts.
-- `close`, `closed`, `drained`, and `reopen` follow the slot path's rules;
+- `close`, `closed`, `drained`, and `reopen` follow the old slot API's rules;
   there is no `register_driver` on `Client` (each `Op` wakes its poller).
 - `break_link` never loses the request: if the queue is full it goes to a
   shared list the owner drains.
@@ -217,9 +215,9 @@ As built (`src/node.rs`, stage 2e), the API differs from the sketch above:
 
 Removed types: `Slot`, `Lease`, `Mailbox`, `QueuePairHandle`, `Region`,
 `Window`, `Ticket`, `Transfer`, `Receive`, `QpSet`, `IoPort`, `NativePort`,
-`DeviceHandle`, and `pair(slots)`. `NativeService` is renamed `Owner`.
-`Endpoint`, `PortInfo`, `Selection`, `Guard`, `Error`, `inventory`,
-`discovery`, and `WithNative` stay.
+`DeviceHandle`, `pair(slots)`, `Configuration`, and the `testing` hooks.
+`NativeService` is replaced by `Owner`. `Endpoint`, `PortInfo`, `Selection`,
+`Guard`, `Error`, `inventory`, `discovery`, and `WithNative` stay.
 
 ## Page buffer pool (`src/pool.rs`)
 
@@ -468,8 +466,11 @@ int rdma_verbs_post_recv(struct rdma_verbs_qp *, struct rdma_verbs_mr *, uint64_
                          uint32_t length, uint64_t id);             /* new */
 ```
 
-`rdma_verbs_write` (plain write) is removed in stage 5; it stays in ABI 2
-until then so the slot path keeps compiling. `rdma_verbs_invalidate`,
+`rdma_verbs_write` (plain write) stays in ABI 2. Links never use it, but
+the adapter and simulator tests still drive whole-region bind, plain write,
+and invalidate through a `cfg(test)` ticket path in `src/ffi.rs` to check
+window and fence rules. Removing it needs those tests ported to write with
+immediate first. `rdma_verbs_invalidate`,
 `stop`, `qp_free`, `deregister`, `bytes`, `window`, `window_free`,
 `discover`, `open`, `close`, and `poll` (with the new struct) keep their
 contracts. Every offset/length pair is bounds-checked in C against the MR
@@ -489,11 +490,11 @@ Rust wrappers (`src/ffi.rs`): `NativeQueuePair::new_with_depth`, `send`,
 `progress_with`, plus `MemoryWindow` (reusable MW that tracks its next rkey)
 and `NativeRegion::with_access`. Ranged posts take the caller's `wr_id`,
 which must have a nonzero kind byte (`CALLER_ID_MASK`) so it never collides
-with the slot path's sequential ids while both exist. The QP still keeps a
+with the test harness's sequential ids. The QP still keeps a
 per-id table of outstanding WRs and breaks on any CQE that does not match
 its id, queue (send or receive), opcode, immediate flag, or receive length;
 `NativeQueuePair::failure` reports the first such CQE (for example
-`IBV_WC_RNR_RETRY_EXC_ERR`). Ranged posts do not use the slot path's
+`IBV_WC_RNR_RETRY_EXC_ERR`). Ranged posts do not use the test harness's
 `busy` flag; the page pool owns per-buffer state.
 
 The `_Static_assert`s and the Rust layout test cover the new struct and
@@ -543,8 +544,8 @@ The simulator remains one fabric per test thread and deterministic.
 `Client::close` sends `Close` to the owner. The owner sends `Close` control
 messages on ready links, breaks every link, waits for destroys, deallocates
 MWs, deregisters regions once no `RegisteredPage` or `SendBuffer` remains,
-and only then marks the node drained. Reopen is blocked until drained, as
-today. `WithNative` keeps the rule that NIC shutdown ignores scope deadlines.
+and only then marks the node drained. Reopen is blocked until
+drained. `WithNative` keeps the rule that NIC shutdown ignores scope deadlines.
 
 ## Testing
 
