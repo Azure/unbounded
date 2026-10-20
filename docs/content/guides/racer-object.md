@@ -366,8 +366,8 @@ The sidecar listens on `127.0.0.1:8080`. Read a blob from the example container:
 ```bash
 kubectl -n racer-object-example wait --for=condition=Ready pod/racer-object-example --timeout=5m
 kubectl -n racer-object-example exec racer-object-example -c app -- sh -c \
-  'curl --fail --show-error --path-as-is --max-time 300 \
-    http://127.0.0.1:8080/mnist/t10k-labels-idx1-ubyte.gz | sha256sum'
+  'curl --fail --show-error --path-as-is --max-time 300 -o /tmp/obj \
+    http://127.0.0.1:8080/mnist/t10k-labels-idx1-ubyte.gz && sha256sum /tmp/obj'
 ```
 
 The output starts with `f7ae60f92e00ec6debd23a6088c31dbd2371eca3ffa0defaefb259924204aec6`.
