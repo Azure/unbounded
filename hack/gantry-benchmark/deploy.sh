@@ -342,12 +342,20 @@ if [[ "$action" == destroy ]]; then
 
   if az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --output none 2>/dev/null; then
     aks_state=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --query provisioningState -o tsv)
-    if [[ "$aks_state" == Failed ]]; then
+    if [[ "$aks_state" == Failed || "$aks_state" == Deleting ]]; then
       aks_node_resource_group=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
         --query nodeResourceGroup -o tsv)
       if [[ -n "$aks_node_resource_group" ]] && [[ $(az group exists -n "$aks_node_resource_group") == true ]]; then
         while IFS= read -r orphaned_vmss; do
           [[ -n "$orphaned_vmss" ]] || continue
+          rolling_upgrade_state=$(az vmss rolling-upgrade get-latest \
+            -g "$aks_node_resource_group" -n "$orphaned_vmss" \
+            --query runningStatus.code -o tsv 2>/dev/null || true)
+          if [[ "$rolling_upgrade_state" == RollingForward || "$rolling_upgrade_state" == Starting ]]; then
+            log "canceling rolling upgrade for orphaned AKS VM scale set $orphaned_vmss"
+            az vmss rolling-upgrade cancel -g "$aks_node_resource_group" -n "$orphaned_vmss" \
+              --only-show-errors
+          fi
           log "submitting deletion of orphaned AKS VM scale set $orphaned_vmss"
           az vmss delete -g "$aks_node_resource_group" -n "$orphaned_vmss" \
             --no-wait --only-show-errors
@@ -357,7 +365,7 @@ if [[ "$action" == destroy ]]; then
         az group delete -n "$aks_node_resource_group" --yes --no-wait --only-show-errors
       fi
 
-      log "resubmitting deletion of failed AKS cluster $AZURE_AKS_CLUSTER_NAME"
+      log "resubmitting deletion of $aks_state AKS cluster $AZURE_AKS_CLUSTER_NAME"
       az aks delete -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
         --yes --no-wait --only-show-errors
     fi
