@@ -1144,6 +1144,12 @@ async fn reserve(
     let mut accepted = directory
         .reserve_warm(version, &plan.held, target, scope, fresh)
         .await?;
+    // Local holds may inherit a later deadline from an existing hold. Cover it
+    // so expiry pruning cannot release unfilled capacity before the promised
+    // RetainUntil, whether it is reported alone or as the earliest owner.
+    if accepted > target {
+        directory.warm.grant_lease(version, &lease, accepted)?;
+    }
     if pages == 0 || plan.remote.is_empty() {
         return Ok(accepted);
     }
@@ -2050,6 +2056,124 @@ mod tests {
 
     /// Grants a long and a short lease, drops the long one, and expires the
     /// short one in place. Returns the version and registered worker.
+    #[test]
+    fn retry_with_shorter_ttl_keeps_lease_through_advertised_deadline() {
+        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(
+                    super::super::dispatch::WorkerMap::new(vec![crate::model::WorkerId(0)])
+                        .unwrap(),
+                ),
+                vec![crate::model::WorkerId(0)],
+                8,
+            )
+            .unwrap(),
+        );
+        let mut endpoint = directory
+            .install(crate::model::WorkerId(0), local.clone())
+            .unwrap();
+        let origin = crate::security::OriginContext {
+            object: version("shorter").object,
+            metadata: None,
+            authorization: None,
+        };
+        let membership = Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let metadata = ObjectMetadata {
+            version: version("shorter"),
+            length: 0,
+            content_type: None,
+            expires_at: crate::model::ExpiresAt::from_system_time(SystemTime::UNIX_EPOCH).unwrap(),
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let max = directory.warm.config().max_ttl;
+        // A hold that outlived its lease, such as completed pages kept after a
+        // failed warm, already promises a long deadline.
+        let long = uring_runtime::environment::wall_now() + max;
+        let caller = scope();
+        let mut seed = Box::pin({
+            let directory = directory.clone();
+            let version = metadata.version.clone();
+            async move {
+                let held = BTreeMap::from([(0, crate::store::holds::HoldPages::prefix(1))]);
+                let mut fresh = Vec::new();
+                directory
+                    .reserve_warm(&version, &held, long, &caller, &mut fresh)
+                    .await
+            }
+        });
+        let mut seeded = None;
+        for _ in 0..32 {
+            if let Poll::Ready(value) = seed.as_mut().poll(&mut cx) {
+                seeded = Some(value);
+                break;
+            }
+            queue.poll(&mut cx, 64);
+            endpoint.poll(&mut cx, 64).unwrap();
+        }
+        assert_eq!(seeded.unwrap(), Ok(long));
+        assert_eq!(directory.warm.lease_count(&metadata.version), 0);
+
+        // Retry with a shorter TTL: the hold keeps its longer deadline.
+        let ttl = max / 4;
+        let caller = scope();
+        let requested = uring_runtime::environment::wall_now() + ttl;
+        let mut admission = Box::pin(admit(
+            directory.clone(),
+            metadata.clone(),
+            membership.clone(),
+            local.credentials.local_context(&origin, &caller).unwrap(),
+            ttl,
+            &caller,
+        ));
+        let mut result = None;
+        for _ in 0..32 {
+            if let Poll::Ready(value) = admission.as_mut().poll(&mut cx) {
+                result = Some(value);
+                break;
+            }
+            queue.poll(&mut cx, 64);
+            endpoint.poll(&mut cx, 64).unwrap();
+        }
+        let advertised = result.unwrap().unwrap();
+        assert_eq!(advertised, long, "advertises the inherited deadline");
+        assert!(advertised > requested);
+        drop(admission);
+        for _ in 0..32 {
+            queue.poll(&mut cx, 64);
+            endpoint.poll(&mut cx, 64).unwrap();
+            if queue.pending() == 0 {
+                break;
+            }
+        }
+        let expiry = directory.warm.leases.lock().unwrap().versions[&metadata.version]
+            .1
+            .values()
+            .copied()
+            .max()
+            .unwrap();
+        assert!(
+            expiry >= advertised,
+            "lease covers the advertised RetainUntil"
+        );
+        // Pruning past the requested deadline but before the advertised one
+        // must not release the hold.
+        let between = requested + Duration::from_secs(1);
+        let emptied = directory.warm.leases.lock().unwrap().prune(between);
+        assert!(emptied.is_empty(), "no release before advertised expiry");
+        assert_eq!(directory.warm.lease_count(&metadata.version), 1);
+        // Once the advertised deadline passes, the lease is released.
+        let after = advertised + Duration::from_secs(1);
+        let emptied = directory.warm.leases.lock().unwrap().prune(after);
+        assert_eq!(emptied.len(), 1);
+        assert_eq!(emptied[0].0, metadata.version);
+    }
+
     fn expire_last_lease(registry: &WarmRegistry) -> (ObjectVersion, crate::model::WorkerId) {
         let worker = crate::model::WorkerId(0);
         assert!(release_all(registry, worker).is_empty(), "registers worker");
