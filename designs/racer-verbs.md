@@ -1,199 +1,429 @@
 # Racer RDMA verbs library (`rdma-verbs`)
 
+Status: target design. Stage 1 to 5 of
+[racer-rdma-sessions.md](racer-rdma-sessions.md) move the code from the
+per-transfer slot model to this design. Until the last stage lands, the code
+still contains the slot API; this document describes where it is going.
+The session protocol, threading, HTTP integration, and the implementation
+plan live in `racer-rdma-sessions.md`. This file covers only the crate.
+
+Paths below are relative to `cmd/racer-dataplane/verbs/` unless noted.
+
 ## Summary
 
-`rdma-verbs` lets Racer move bytes between nodes with one-sided RDMA writes.
-A receiver opens a memory window over one of its buffers and hands the peer an
-address and key. The sender writes into that window. There are no RDMA sends,
-receives, reads, or atomics.
+`rdma-verbs` moves ciphertext pages between Racer nodes over persistent,
+bidirectional RC queue pairs (QPs). There is one QP per (peer, rail) per
+node, used in both directions. Each transfer:
 
-The crate has three parts:
+1. The receiver binds a type 2 memory window (MW) with a fresh rkey over one
+   page buffer and sends a `Grant` control message to the peer.
+2. The sender posts one `RDMA_WRITE_WITH_IMM` with `imm = tag`, or sends a
+   `Release(tag)` control message if it will not write.
+3. The receiver gets exactly one receive completion for the tag (write with
+   immediate or `Release`). RC ordering guarantees that every write the peer
+   posted before it has been placed. That completion is the fence.
+4. The receiver posts a signaled, fenced `LOCAL_INV` of the rkey. After its
+   completion the CPU may read the buffer. AEAD verification still happens
+   later, in Racer.
 
-- `src/lib.rs`: the public API, the slot pool, and the native service.
-- `src/ffi.rs`: safe Rust wrappers around a small C adapter, plus the rules for
-  freeing (or leaking) NIC objects.
-- `native/verbs.c`: the C adapter that calls libibverbs.
+QPs are destroyed only on error, timeout, idle close, or shutdown. Destroying
+a QP stays the fallback fence for every abnormal path.
 
-A simulated fabric (`src/simulation.rs`) replaces the C adapter in tests.
+The crate has these parts:
 
-Paths below are relative to `cmd/racer-dataplane/verbs/`.
+- `src/lib.rs`: public API: `node`, `Client`, `Owner`, `WithNative`, errors.
+- `src/link.rs`: per-link (QP) state, credits, tags, grants.
+- `src/pool.rs`: registered page buffers and their ownership states.
+- `src/control.rs`: the fixed-size in-band control message codec.
+- `src/channel.rs`: bounded per-worker command and completion queues.
+- `src/ffi.rs`: safe wrappers around the C adapter and the leak rules.
+- `native/verbs.c`: the C adapter (ABI version 2).
+- `src/simulation.rs`: deterministic fabric implementing the adapter ABI.
+- `src/discovery.rs`: unchanged.
 
 ## Goals and non-goals
 
 Goals:
 
-- Never let the CPU reuse or free memory that the NIC can still write.
-- Keep libibverbs off the I/O thread, so a slow NIC call cannot stall it.
-- Fixed, bounded resources that are allocated up front.
-- Fail closed. When cleanup fails, leak the resource and keep it counted.
-- Test every lifetime and failure path without RDMA hardware.
+- Never let the CPU read, reuse, or free memory that the NIC may still write.
+- Keep libibverbs off I/O threads.
+- Bounded resources sized up front: page buffers, links, queue depths.
+- Fail closed: an unexpected completion breaks the link, never accepts data.
+- No RNR: receive credits make it impossible to send without a posted receive.
+- Test every lifetime and failure path in simulation.
 
 Non-goals:
 
-- Authentication, peer admission, topology, retries, and timeouts. The caller
-  owns all of these.
-- A general verbs binding. The crate exposes only what Racer needs.
+- Authentication, peer identity, tie-break policy, HTTP handshake, and
+  fallback. Racer (`src/rdma.rs`) owns these. The crate takes an opaque
+  `LinkKey` and an `initiator` flag from the caller.
+- A general verbs binding.
 
-## Threads and slots
+## Threads
 
-There are two threads: the I/O thread and the native thread
-(`src/lib.rs:1-62`). All libibverbs calls run on the native thread. The I/O
-thread never touches RDMA objects or registered memory. The crate spawns no
-threads and runs no executor. Time and randomness come from the
-`uring-runtime` environment, so the same code runs in simulation.
+There is one `Owner` per node. It runs as a `uring-runtime` service on one
+crypto thread through `WithNative` (`src/lib.rs`), exactly like
+`NativeService` today. All libibverbs calls run on that thread. Each I/O
+worker holds one `Client`. A `Client` and the `Owner` share one `Channel`
+per worker (`src/channel.rs`): one bounded command queue (I/O to owner) and
+two `AtomicWaker`s (one per side). Results come back
+through per-operation one-shot cells (`Op<T>`), not a queue, so a worker
+never has to drain unrelated results.
 
-The threads share a fixed pool of 1 to 256 slots (`src/lib.rs:905-950`). A
-slot is one queue pair (QP) and one registered buffer. Each slot has a mailbox
-behind a mutex (`src/lib.rs:791-819`) and holds at most one pending command:
-connect, bind, write, or invalidate (`src/lib.rs:776-789`). Neither side waits
-on a mailbox lock; both use `try_lock` and retry on the next poll
-(`src/lib.rs:1796-1806`). Callers must therefore also poll on a timer.
+Rationale is in `racer-rdma-sessions.md` ("Threading").
 
-`NativeService::poll_budgeted` (`src/lib.rs:1317-1413`) does one step per
-budget unit: discover devices, build one slot, or service one slot. Budgets
-count steps, not time.
+## Public API
 
-Why this shape: libibverbs calls can block, and an I/O thread that stalls
-stops every connection. A fixed pool keeps memory and NIC usage bounded and
-lets the native side check every resource on shutdown.
+```rust
+/// Opaque caller identity for a link. Racer uses SHA-256(NodeId) and RailId.
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub struct LinkKey { pub peer: [u8; 32], pub rail: u16 }
 
-## Lifecycle
+/// One QP incarnation. Never reused within a process.
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub struct Epoch(pub u64);
 
-1. `pair(slots)` returns an `IoPort` and a `NativePort`. The native side
-   creates a `NativeService`, which is not `Send` (`src/lib.rs:234-256`).
-2. `IoPort::activate` sends a `Configuration` (`src/lib.rs:206-221`): a port
-   selector, one admission guard per slot, and the buffer size per slot. The
-   selector runs on the native thread against discovered ports.
-3. The native side validates the plan (`src/lib.rs:1200-1254`), then builds
-   one slot per step (`src/lib.rs:1256-1315`). It spreads slots over the
-   selected ports, registers each buffer, creates each QP, and checks that the
-   device can create a memory window. No slot becomes ready until all are
-   built.
-4. A caller leases a ready slot on a port with `QueuePairHandle::poll_new`
-   (`src/lib.rs:531-579`). If none is free it gets `Overloaded`.
-5. Peers swap a 32-byte `Endpoint` over the caller's own channel
-   (`src/lib.rs:329-363`) and connect.
-6. The receiver binds a window over its region and sends the address and key
-   to the sender. The sender fills its region and writes.
-7. The caller stops the QP and waits for `poll_stopped` before it reads
-   received bytes. Dropping the handle returns the slot. The native side stops
-   the QP if needed and rebuilds the slot with a fresh QP.
+pub struct NodeConfig {
+    pub selector: Box<dyn Fn(&[PortInfo]) -> Vec<Selection> + Send>,
+    /// Registered bytes per selected device; split into page buffers.
+    pub pool_bytes: usize,
+    /// Page buffer length, already rounded to 4 KiB (MAX_CIPHERTEXT rounded).
+    pub buffer_len: usize,
+    /// Max links (QPs) per device. Racer uses topology::MAX_DEGREE.
+    pub max_links: usize,
+    /// Max concurrent grants a peer may hold against us, per link.
+    pub grants_per_link: u32,
+    /// Idle time after which a link with no transfers is closed.
+    pub idle: Duration,
+    /// Admission guard charged for the pool; leaks with leaked resources.
+    pub guard: Guard,
+}
 
-Discovery only accepts devices that support type 2B memory windows, active
-ports, and GID index 0 (`native/verbs.c:53-88`).
+/// Create one owner and `workers` clients.
+pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)>;
+
+impl Client {                                  // !Send, lives on one I/O worker
+    pub fn activate(&self, config: NodeConfig) -> Result<()>;
+    pub fn link(&self, key: LinkKey) -> LinkState;      // lock-free snapshot
+    /// Start a link as initiator. Returns the local setup to sign and send.
+    pub fn open(&self, key: LinkKey) -> Op<Opened>;
+    /// Responder side: create a QP and connect it to `remote` in one step.
+    pub fn accept(&self, key: LinkKey, remote: Setup, initiator: bool) -> Op<Opened>;
+    /// Initiator side: finish with the responder's setup.
+    pub fn connect(&self, key: LinkKey, epoch: Epoch, remote: Setup) -> Op<()>;
+    /// Receiver: bind a window over a free buffer and send Grant.
+    pub fn grant(&self, key: LinkKey, epoch: Epoch, transfer: [u8; 16],
+                 length: u32, deadline: Instant) -> Op<Granted>;
+    /// Sender: copy (or move) a staged page into the peer's granted window.
+    pub fn write(&self, key: LinkKey, epoch: Epoch, tag: u32, source: Source,
+                 deadline: Instant) -> Op<()>;
+    /// Sender: decline a grant. Always safe; consumes one credit.
+    pub fn release(&self, key: LinkKey, epoch: Epoch, tag: u32) -> Op<()>;
+    /// Break the link now (ERR + destroy). Outstanding ops fail.
+    pub fn break_link(&self, key: LinkKey, epoch: Epoch);
+    pub fn send_buffer(&self, len: usize) -> Poll<Result<SendBuffer>>;
+    pub fn close(&self);
+    pub fn register_driver(&self, waker: &Waker);
+}
+
+pub enum LinkState { Idle, Connecting(Epoch), Ready(Epoch), Backoff(Instant) }
+
+pub struct Setup {                       // carried in the signed HTTP setup
+    pub endpoint: Endpoint,              // existing 32-byte encoding
+    pub recv_credits: u32,               // receives the peer may consume
+}
+pub struct Opened { pub epoch: Epoch, pub setup: Setup }
+
+pub struct Granted { pub tag: u32, pub arrival: Op<Arrival> }
+pub enum Arrival {
+    /// Write with immediate observed, invalidate done. Exclusive CPU access.
+    Page(RegisteredPage),
+    /// Peer sent Release(tag). Buffer already returned to the pool.
+    Released,
+}
+
+pub enum Source { Bytes(Arc<dyn AsRef<[u8]> + Send + Sync>), Staged(SendBuffer) }
+
+/// A page buffer with no valid MW and no posted WR. The only way Rust code
+/// can see registered page memory.
+pub struct RegisteredPage { /* Arc<PoolShared>, index, len */ }
+impl RegisteredPage { pub fn bytes(&self) -> &[u8]; }      // Send + Sync
+pub struct SendBuffer { /* same, writable */ }
+impl SendBuffer { pub fn bytes_mut(&mut self) -> &mut [u8]; pub fn truncate(&mut self, len: usize); }
+
+pub struct Op<T>(Arc<OpCell<T>>);
+impl<T> Op<T> { pub fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<T>>; }
+```
+
+`Op` drop semantics: dropping an `Op<Arrival>` before it resolves abandons
+the grant. The owner keeps the tag until the peer's write with immediate or
+`Release` arrives, then frees the buffer without exposing it. If neither
+arrives by the grant deadline, the owner breaks the link, because
+invalidation alone cannot fence an exposed window (see "Memory safety
+rules"). Dropping `Op<Granted>` before the bind completes frees the buffer
+after the bind CQE and breaks nothing if the `Grant` was not yet posted. Dropping `Op<()>` for a write does not
+cancel the posted WR; the owner keeps the source until its completion.
+
+Removed types: `Slot`, `Lease`, `Mailbox`, `QueuePairHandle`, `Region`,
+`Window`, `Ticket`, `Transfer`, `Receive`, `QpSet`, `IoPort`, `NativePort`,
+`DeviceHandle`, and `pair(slots)`. `NativeService` is renamed `Owner`.
+`Endpoint`, `PortInfo`, `Selection`, `Guard`, `Error`, `inventory`,
+`discovery`, and `WithNative` stay.
+
+## Page buffer pool (`src/pool.rs`)
+
+Per selected device, the owner registers one region of
+`pool_bytes / buffer_len * buffer_len` bytes, 4 KiB aligned, with
+`LOCAL_WRITE | MW_BIND` and no remote access (see "Least access" for the
+fallback). It is split into `n` page buffers of `buffer_len` each. A second,
+small region (`LOCAL_WRITE` only) holds control slots: `64 B * (send_depth +
+recv_depth)` per link.
+
+Each page buffer has one state, kept in an `AtomicU8` array in `PoolShared`
+plus owner-only bookkeeping:
+
+| State | Holder | CPU access | NIC access |
+|---|---|---|---|
+| `Free` | pool free list | none | none |
+| `Staging` | `SendBuffer` (I/O or crypto) | `&mut [u8]` | none |
+| `Sending` | owner, posted `WRITE_WITH_IMM` | none | local read |
+| `Binding` | owner, posted `BIND_MW` | none | none yet |
+| `Exposed` | owner, rkey sent in `Grant` | none | remote write |
+| `Invalidating` | owner, posted `LOCAL_INV` | none | remote write until CQE |
+| `Owned` | `RegisteredPage` | `&[u8]` | none |
+| `Quarantined` | owner, link breaking | none | maybe, until QP destroyed |
+| `Leaked` | nobody, counted forever | none | maybe |
+
+Transitions:
+
+- `Free -> Staging`: `Client::send_buffer`. `SendBuffer` drop returns `Free`.
+- `Staging -> Sending`: `write(Source::Staged)`. With `Source::Bytes` the owner
+  takes a `Free` buffer and copies on its own thread (`Free -> Sending`).
+- `Sending -> Free`: send completion, success or flush error.
+- `Free -> Binding -> Exposed`: `grant`, after the bind CQE succeeds and the
+  `Grant` message is posted.
+- `Exposed -> Invalidating`: receive completion for the tag (write with
+  immediate or `Release`).
+- `Invalidating -> Owned`: `LOCAL_INV` CQE success. With `Arrival::Released`
+  the owner goes straight to `Free` instead.
+- `Owned -> Free`: `RegisteredPage` drop pushes the index onto the free list
+  (a `Mutex<Vec<u32>>`; the critical section is one push, so `lock()` is used,
+  not `try_lock`).
+- `Binding | Exposed | Invalidating -> Quarantined`: any link break, cancel,
+  deadline, or failed CQE on that link.
+- `Quarantined -> Free`: QP destroyed successfully (`rdma_verbs_stop` returns 0)
+  and the MW invalidated or deallocated.
+- `Quarantined -> Leaked`: destroy failed. The guard leaks with it (existing
+  rule, `src/ffi.rs:1-5`).
+
+`RegisteredPage` and `SendBuffer` hold an `Arc<PoolShared>`. The region is
+deregistered only after every `Arc` is gone and every link is destroyed, so
+a `RegisteredPage` held by the cache cannot dangle.
+
+Windows: the owner allocates `grants_per_link * max_links` type 2 MWs per
+device at activation, kept on a free list. Each bind uses
+`ibv_inc_rkey(previous)`, so every grant has a fresh rkey and a stale rkey
+from an earlier grant can never match.
+
+## Links (`src/link.rs`)
+
+Each link is one RC QP with its own CQ (kept per QP so the existing
+destroy-ordering code in `src/ffi.rs` is unchanged), `send_depth` and
+`recv_depth` from "Credits", and a control slot ring.
+
+Per-link owner state:
+
+```rust
+struct Link {
+    key: LinkKey, epoch: Epoch, qp: ffi::QueuePair,
+    state: State,                          // Connecting | Ready | Breaking | Closed
+    credits: u32,                          // peer receives we may still consume
+    owed: u32,                             // receives we reposted but not reported
+    next_tag: u32,                         // receiver-side tag allocator
+    grants: Slab<GrantEntry>,              // tags we issued (receiver side)
+    remote: HashMap<u32, RemoteGrant>,     // grants the peer issued (sender side)
+    waiting: Vec<PendingWrite>,            // writes waiting for their Grant
+    sends: u32, last_used: Instant,
+}
+```
+
+Tags are `u32`, allocated by the receiver per link, nonzero, skipping tags
+still in `grants`. `imm_data = tag` (network order on the wire per verbs).
+
+Credits:
+
+- Each side posts `recv_depth = 2 * grants_per_link + 4` receives at connect
+  and advertises it in `Setup.recv_credits`. `credits` starts at the peer's
+  value.
+- Every `SEND` and `WRITE_WITH_IMM` consumes one credit. A message is never
+  posted with `credits == 0`.
+- One credit is reserved for `Credit` messages. Data writes, `Grant`, and
+  `Release` need `credits >= 2`; if not, they wait in `waiting` until credits
+  return or their deadline passes.
+- On each receive completion the owner reposts that receive immediately and
+  increments `owed`. Every outgoing control message carries `credits = owed`
+  and resets it. When `owed >= recv_depth / 2` and nothing else is queued,
+  the owner sends a standalone `Credit` message.
+- A peer that exceeds its credits causes RNR. QPs connect with
+  `rnr_retry = 0`, so that surfaces as an error completion and breaks the link
+  instead of stalling.
+
+Grant concurrency: `grants` is capped at `grants_per_link`. A peer whose
+`Grant` would exceed our advertised `grants_per_link` (the sender-side table
+`remote` is full) breaks the link.
+
+Send queue depth: `send_depth = recv_depth + 2 * grants_per_link + 4`
+(controls, writes, binds, invalidates). All send WRs are signaled.
+
+## Control messages (`src/control.rs`)
+
+Fixed 64 bytes, network byte order, sent with `IBV_WR_SEND` from the control
+region, received into control slots:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | version = 1 |
+| 1 | 1 | kind: 1 `Grant`, 2 `Release`, 3 `Credit`, 4 `Close` |
+| 2 | 2 | reserved, zero |
+| 4 | 4 | credits returned |
+| 8 | 8 | epoch (sender's view of the link epoch pair, see below) |
+| 16 | 4 | tag |
+| 20 | 4 | rkey (`Grant` only) |
+| 24 | 8 | remote address (`Grant` only) |
+| 32 | 4 | length (`Grant` only, max bytes the peer may write) |
+| 36 | 4 | reserved, zero |
+| 40 | 16 | transfer id (`Grant` and `Release`) |
+| 56 | 8 | reserved, zero |
+
+`epoch` on the wire is the 64-bit link id agreed in the handshake (low 64
+bits of the session binding hash), not the local `Epoch` counter.
+
+Decoding rejects: wrong length (`byte_len != 64`), unknown version or kind,
+nonzero reserved bytes, wrong link id, fields not valid for the kind, a
+`Grant` with zero length or length above `buffer_len`, a `Release` or write
+with immediate for an unknown tag, and a duplicate tag. Every rejection
+breaks the link. None of them can make the receiver accept bytes: acceptance
+still needs the signed HTTP head and AEAD in Racer.
+
+Removed from the earlier plan, with reasons:
+
+- `Complete`: the write with immediate completion replaces it.
+- `Done`: the sender frees its source on its own send CQE, and the HTTP
+  response head is the authoritative outcome. Nothing waits for `Done`.
+- `Abort` (receiver revokes a grant): invalidation without a preceding
+  receive completion is not a fence, because a multi-packet write may still
+  be in flight. A receiver that must abandon an exposed grant breaks the link
+  instead. The sender's decline is `Release`, which is a fence because it is
+  ordered after every write the sender posted on the same QP.
 
 ## Memory safety rules
 
-**Only a stopped QP is a fence.** Invalidating a window or timing out does not
-stop writes the NIC has already accepted (`src/lib.rs:31-38`,
-`src/lib.rs:654-666`). Stopping moves the QP to the error state and destroys
-it (`native/verbs.c:173-184`). Only after that succeeds does the crate treat
-the buffer as quiet. A bound region stays busy until then
-(`src/ffi.rs:722-760`, `src/ffi.rs:846-865`).
+**Fence on the normal path.** A receive completion for the tag (either opcode)
+proves that every earlier RDMA write on that QP has been placed. The owner
+then posts `LOCAL_INV` with `IBV_SEND_FENCE | IBV_SEND_SIGNALED`. Only its
+successful CQE moves the buffer to `Owned`. A late write using the old rkey
+then fails with a remote access error, which breaks the link on both sides.
 
-**The I/O thread only sees staging copies.** Writes from the I/O thread go to
-staging bytes in the mailbox. The native thread copies them into registered
-memory when it runs the write (`src/lib.rs:1568-1573`). Received bytes are
-copied out only after the QP stops (`src/lib.rs:1459-1468`), and
-`Region::poll_copy_to` fails before that (`src/lib.rs:450-458`). So a late
-remote write can never race with a CPU read.
+**Fence on every other path.** Cancel, deadline, any error CQE, any
+unexpected opcode, wr id, tag, or byte length, decode failure, credit
+violation, or owner shutdown breaks the link: modify to ERR, destroy the QP,
+then move its quarantined buffers to `Free`. If destroy fails, the buffers,
+MWs, link, and guard are leaked and stay counted (existing rule,
+`src/ffi.rs:1-5`).
 
-**QPs are never reused.** After a lease ends, the native side clears the full
-buffer, zeroes the staging copy, and builds a new QP (`src/ffi.rs:423-432`,
-`src/lib.rs:1490-1531`). A new lease never sees old data or a QP with stale
-state. The buffer stays registered for the life of the pool, so there is no
-registration cost per lease.
+**Rust sees registered memory only through `RegisteredPage` and
+`SendBuffer`.** Both exist only in states with no valid MW and no posted WR.
+There is no API that returns a pointer or slice for any other state.
 
-**Leak on failure.** If freeing a NIC object fails, the object is leaked on
-purpose along with everything it depends on (`src/ffi.rs:1-5`). This covers
-devices, regions, windows, QPs, and probe windows (`src/ffi.rs:261-272`,
-`447-456`, `470-479`, `581-587`, `651-663`, `868-886`). Freeing memory the NIC
-may still write is worse than leaking it.
+**Least access.** The QP grants `IBV_ACCESS_REMOTE_WRITE`. The page region is
+registered `LOCAL_WRITE | MW_BIND`; remote write is granted only through a
+window of exactly the granted length. If a provider rejects a remote-write
+bind on an MR without `REMOTE_WRITE`, the owner fails activation with
+`Unsupported`, and a `NodeConfig::mr_remote_write` escape hatch re-adds the
+flag. This must be checked on target hardware (see risks in
+`racer-rdma-sessions.md`). Control slots use `LOCAL_WRITE` only.
 
-**Leaks stay counted.** Each slot holds the caller's admission guard. When a
-resource leaks, its guard leaks too (`src/lib.rs:132-135`), so the leak keeps
-counting against the caller's limits. The crate wraps each guard in its own
-`Arc` (`src/lib.rs:1765-1794`). Its strong count then shows leaks no matter how
-many clones the caller holds. A leaked slot is never refilled
-(`src/lib.rs:1493-1497`).
+**Random starting PSN and QPN.** Unchanged (`src/ffi.rs`). The link id in
+every control message is bound to the signed handshake.
 
-**Completions are checked.** Each QP allows at most 32 posted requests
-(`src/ffi.rs:682-708`). Any failed status, unknown request, or wrong opcode
-stops the QP and returns an error (`src/ffi.rs:799-840`). Starting PSNs are
-random (`src/ffi.rs:589-607`).
+## Native adapter ABI version 2
 
-**Least access.** QPs allow only remote writes (`native/verbs.c:119-172`).
-Windows grant remote write over exactly the bound length
-(`native/verbs.c:221-233`). Invalidation uses a fenced send
-(`native/verbs.c:234-240`).
+`rdma_verbs_abi()` returns 2. Rust refuses any other value. Changes:
 
-## Shutdown and reopen
+```c
+struct rdma_verbs_wc {          /* 32 bytes */
+    uint64_t id;
+    uint32_t status, opcode;    /* opcode UINT32_MAX unless status == SUCCESS */
+    uint32_t byte_len, imm;     /* imm valid only if flags & 1 */
+    uint32_t flags, vendor_err;
+};
+_Static_assert(IBV_WC_SEND == 0 && IBV_WC_RDMA_WRITE == 1 && IBV_WC_BIND_MW == 5 &&
+               IBV_WC_LOCAL_INV == 6 && IBV_WC_RECV == 128 &&
+               IBV_WC_RECV_RDMA_WITH_IMM == 129, "completion opcode ABI");
 
-`IoPort::close` cancels all slots and returns at once
-(`src/lib.rs:1115-1124`). The native service then stops each QP. It marks the
-pool drained only when every resource is freed, nothing is quarantined, and
-the crate holds the only reference to every guard. `IoPort::reopen` returns
-`Overloaded` until then and bumps a generation so old device handles go stale
-(`src/lib.rs:1040-1069`).
+enum { RDMA_VERBS_MR_PAGES = 1, RDMA_VERBS_MR_CONTROL = 2, RDMA_VERBS_MR_REMOTE_WRITE = 4 };
 
-`WithNative` (`src/lib.rs:258-269`, `src/lib.rs:1663-1744`) joins the native
-service with a `uring-runtime` service. On drain it stops the NIC first and
-ignores scope deadlines (`src/lib.rs:1746-1763`), because the NIC must stop
-before any memory is freed.
+void *rdma_verbs_qp(struct rdma_verbs_device *, uint8_t port, uint32_t send_depth,
+                    uint32_t recv_depth, uint32_t *qpn);            /* changed */
+int rdma_verbs_connect(...);                    /* rnr_retry = 0, else unchanged */
+void *rdma_verbs_register(struct rdma_verbs_device *, uint64_t length,
+                          uint32_t access);                         /* changed */
+int rdma_verbs_bind(struct rdma_verbs_qp *, struct ibv_mw *, struct rdma_verbs_mr *,
+                    uint32_t key, uint64_t id, uint64_t offset, uint32_t length);
+int rdma_verbs_write_imm(struct rdma_verbs_qp *, struct rdma_verbs_mr *, uint64_t offset,
+                         uint32_t length, uint64_t address, uint32_t key, uint32_t imm,
+                         uint64_t id);                              /* new */
+int rdma_verbs_send(struct rdma_verbs_qp *, struct rdma_verbs_mr *, uint64_t offset,
+                    uint32_t length, uint64_t id);                  /* new */
+int rdma_verbs_post_recv(struct rdma_verbs_qp *, struct rdma_verbs_mr *, uint64_t offset,
+                         uint32_t length, uint64_t id);             /* new */
+```
 
-## Native adapter
+`rdma_verbs_write` (plain write) is removed in stage 5; it stays in ABI 2
+until then so the slot path keeps compiling. `rdma_verbs_invalidate`,
+`stop`, `qp_free`, `deregister`, `bytes`, `window`, `window_free`,
+`discover`, `open`, `close`, and `poll` (with the new struct) keep their
+contracts. Every offset/length pair is bounds-checked in C against the MR
+(`EINVAL`), and again in Rust before the call.
 
-Rust does not link libibverbs. It loads `librdma_verbs.so.1` with `dlopen` and
-calls a few functions that take small, fixed structs (`native/verbs.c:1-10`).
-The libibverbs structs and inline helpers stay in C, built against the
-installed headers. This avoids copying large, version-specific structs into
-Rust.
+`wr_id` encoding (Rust only): bits 63..56 kind (send ctl, recv ctl, write,
+bind, inv), 55..32 link slot, 31..0 buffer, control slot, or tag. Any CQE
+whose decoded kind, link, or index does not match an outstanding WR breaks
+the link.
 
-Because the link is dynamic, the compiler cannot check the ABI. Three checks
-stand in for it:
+The `_Static_assert`s and the Rust layout test cover the new struct and
+opcodes. `native/discovery_faults.c` is unchanged.
 
-- The adapter reports ABI version 1 and Rust refuses any other
-  (`native/verbs.c:51-52`, `src/ffi.rs:174-235`).
-- `_Static_assert`s in C (`native/verbs.c:37-44`) and a Rust test check the
-  same struct sizes, offsets, and opcode values.
-- CI builds the adapter and loads every symbol.
+## Simulation parity (`src/simulation.rs`)
 
-Without the `native` feature, loading returns `Unavailable`
-(`src/ffi.rs:160-165`), so the crate builds on hosts without libibverbs.
+The simulator implements every ABI 2 function with the same contracts:
 
-Discovery returns `INT_MIN` if closing a temporary context fails. This is
-distinct from a negative errno or port count. It stops on the first failed
-close, frees the device list, and leaves at most one context leaked. Rust
-quarantines and retains the discovery admission owner and adapter reference.
-Reopen stays blocked even when no ports were returned.
+- Per-QP receive queue. `SEND` and `WRITE_WITH_IMM` consume the peer's head
+  receive; none posted means RNR, which with `rnr_retry = 0` produces
+  `IBV_WC_RNR_RETRY_EXC_ERR` on the sender and moves both QPs to ERR.
+- Writes and sends on one QP are delivered in order. Writes check the
+  window: valid rkey, bound range, MW not invalidated; otherwise
+  `REM_ACCESS_ERR` on the sender, both QPs to ERR, nothing written.
+- `LOCAL_INV` with fence completes after all earlier WRs on the QP.
+- ERR flushes every posted WR with `WR_FLUSH_ERR`.
+- MR access flags are recorded; binding a remote-write MW on an MR without
+  `MW_BIND` fails; the remote-write-without-MR-remote-write rule is a
+  simulator option so both provider behaviors are tested.
+- Fault injection: fail any call, any CQE status, drop or reorder a packet
+  between QPs (reorder must still be refused by the fence checks), delay
+  delivery, duplicate an immediate, corrupt `byte_len`.
 
-Open returns `NULL` for a clean failure and `(void *)UINTPTR_MAX` if PD
-allocation fails and the context cannot close. The latter is not a handle.
-Rust charges an owner before each open, retains it and the adapter on this
-result, and stops opening ports. Previously opened devices close normally.
+The simulator remains one fabric per test thread and deterministic.
 
-## Simulation
+## Shutdown
 
-`src/simulation.rs` implements the same C functions as the adapter. The real
-`src/ffi.rs` wrappers run unchanged on top of it. It is deterministic, has one
-fabric per test thread, and can inject faults on any call. The `testing`
-module exposes slot state and can hold mailbox locks to force contention.
+`Client::close` sends `Close` to the owner. The owner sends `Close` control
+messages on ready links, breaks every link, waits for destroys, deallocates
+MWs, deregisters regions once no `RegisteredPage` or `SendBuffer` remains,
+and only then marks the node drained. Reopen is blocked until drained, as
+today. `WithNative` keeps the rule that NIC shutdown ignores scope deadlines.
 
 ## Testing
 
-`src/ffi.rs` tests inject failures into each free path and check that the
-object and its guard stay leaked. `tests/public_api.rs` covers the public
-API: port selection, reopen, guards across failed fences, copies only after
-stop, cleared buffers on reuse, contention, and empty plans.
-
-The `racer-verbs` CI job runs four feature sets: none, `simulation`,
-`native`, and both. Native runs install `libibverbs-dev`, build the adapter
-with `images/racer-dataplane/build-native.sh`, and load it. Each set runs
-fmt, check, clippy, and tests. Hosted runners have no RDMA hardware, so CI
-does not test real DMA or fencing. Tests that need a device stay ignored.
-
-Native CI also builds `native/discovery_faults.c`, which includes the production
-C adapter with controlled libibverbs calls. `src/discovery_fault_tests.rs`
-checks both internal discovery closes, failed-open cleanup, quarantine,
-library retention, and blocked reopen. The Rust simulator's `Close` fault only
-covers device handles returned after discovery, not these temporary contexts.
+See "Test plan" in `racer-rdma-sessions.md`. The crate-level CI matrix
+(none, `simulation`, `native`, both) is unchanged.
