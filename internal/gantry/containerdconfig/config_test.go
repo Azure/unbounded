@@ -206,3 +206,33 @@ func TestMarshalDropInVersion3(t *testing.T) {
 		t.Fatalf("CRI snapshotter = %q, want gantry-overlaybd", got)
 	}
 }
+
+func TestMarshalDropInVersion2WithCRIImagesPlugin(t *testing.T) {
+	config := []byte(`version = 2
+[plugins."io.containerd.cri.v1.images"]
+snapshotter = "overlaybd"
+`)
+
+	data, err := marshalDropIn(config, "/run/adapter.sock", "gantry-overlaybd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var dropIn struct {
+		Version int `toml:"version"`
+		Plugins map[string]struct {
+			Snapshotter string `toml:"snapshotter"`
+		} `toml:"plugins"`
+	}
+	if err := toml.Unmarshal(data, &dropIn); err != nil {
+		t.Fatal(err)
+	}
+
+	if dropIn.Version != 2 {
+		t.Fatalf("managed drop-in version = %d, want 2", dropIn.Version)
+	}
+
+	if got := dropIn.Plugins["io.containerd.cri.v1.images"].Snapshotter; got != "gantry-overlaybd" {
+		t.Fatalf("CRI snapshotter = %q, want gantry-overlaybd", got)
+	}
+}

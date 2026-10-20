@@ -314,14 +314,16 @@ func stringSlice(value any) ([]string, error) {
 
 func marshalDropIn(config []byte, address, snapshotterName string) ([]byte, error) {
 	var source struct {
-		Version int `toml:"version"`
+		Version int            `toml:"version"`
+		Plugins map[string]any `toml:"plugins"`
 	}
 	if err := toml.Unmarshal(config, &source); err != nil {
 		return nil, fmt.Errorf("containerd config: parse version: %w", err)
 	}
 
 	plugins := make(map[string]any, 1)
-	if source.Version >= 3 {
+	_, hasCRIImagesPlugin := source.Plugins["io.containerd.cri.v1.images"]
+	if hasCRIImagesPlugin || source.Version >= 3 {
 		plugins["io.containerd.cri.v1.images"] = map[string]any{
 			"snapshotter": snapshotterName,
 		}
