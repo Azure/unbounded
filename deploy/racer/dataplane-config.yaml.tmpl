@@ -43,6 +43,9 @@ data:
   # Encoded checkpoints remain capped at 64 MiB; oversized cuts are skipped.
   RACER_METADATA_ENTRIES: "4096"
   RACER_DISK_PAGE_ENTRIES: "65536"
+  # Per-worker memory for the disk index page cache. The index itself lives
+  # on disk; lookups that miss this cache read index pages from disk.
+  RACER_DISK_METADATA_CACHE_BYTES: "268435456"
   RACER_CHECKPOINT_BYTES: "67108864"
   # Byte admission budgets default to per-I/O-worker amounts that are multiplied
   # by the final I/O worker count, so automatic sizing works on any core count:

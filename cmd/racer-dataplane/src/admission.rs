@@ -192,10 +192,10 @@ impl Policy for AdmissionPolicy {
         match class {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
             // Disk ciphertext retains one padded, size-class-rounded slab allocation.
-            ResourceClass::Ciphertext => page_alloc::buffer_capacity(
-                PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES + 4096,
-            )
-            .expect("bounded page capacity"),
+            ResourceClass::Ciphertext => {
+                page_alloc::buffer_capacity(crate::store::MAX_RECORD_BYTES + 4096)
+                    .expect("bounded page capacity")
+            }
             ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
             _ => 1,
         }
@@ -514,7 +514,7 @@ mod tests {
         let policy = AdmissionPolicy::new(crate::test_support::cluster::config(false).limits);
         assert_eq!(policy.floor(ResourceClass::Ciphertext), 16_842_752);
         for alignment in [512usize, 4096] {
-            let logical = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
+            let logical = crate::store::MAX_RECORD_BYTES;
             let extent = logical.div_ceil(alignment) * alignment;
             assert!(
                 page_alloc::buffer_capacity(extent).unwrap()

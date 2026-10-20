@@ -1758,15 +1758,7 @@ impl Fill {
         {
             return;
         }
-        if self
-            .dependencies
-            .writer
-            .index()
-            .lookup(id)
-            .ok()
-            .flatten()
-            .is_some()
-        {
+        if self.dependencies.writer.index().on_disk_cached(id) {
             return;
         }
         let cache = &result.metadata.version.object.cache;

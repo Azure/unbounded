@@ -47,8 +47,10 @@ pub struct DiskClassSnapshot {
     pub published_payload_bytes: u64,
     pub index_evicted_pages: u64,
     pub index_evicted_payload_bytes: u64,
-    pub segment_evicted_pages: u64,
-    pub segment_evicted_payload_bytes: u64,
+    /// Pages lost to volume slot eviction, exported under the historical
+    /// `racer_disk_class_segment_evicted_*` names.
+    pub slot_evicted_pages: u64,
+    pub slot_evicted_payload_bytes: u64,
     pub read_payload_bytes: u64,
 }
 /// Counts one storage owner's logical page payload, not ciphertext or padding.
@@ -66,11 +68,15 @@ impl Drop for Payload {
 pub(crate) type Ownership = Rc<dyn Fn(&PageId) -> bool>;
 pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 
+/// Scores with one ownership pass. Disk eviction is now the volume's CLOCK, so
+/// only tests rank pages this way.
+#[cfg(test)]
 pub(crate) struct Scoring<'a> {
     retention: &'a Retention,
     ownership: Ownership,
     now: Instant,
 }
+#[cfg(test)]
 impl Scoring<'_> {
     pub(crate) fn score(&self, page: &PageId) -> u8 {
         self.retention
@@ -136,6 +142,7 @@ impl Retention {
     pub(crate) fn set_ownership_pass(&self, prepare: OwnershipPass) {
         *self.ownership_pass.borrow_mut() = Some(prepare);
     }
+    #[cfg(test)]
     pub(crate) fn scoring_at(&self, now: Instant) -> Scoring<'_> {
         let ownership = match self.ownership_pass.borrow().as_ref() {
             Some(prepare) => prepare(),
@@ -259,13 +266,12 @@ impl Retention {
             c.published_payload_bytes = c.published_payload_bytes.saturating_add(bytes);
         });
     }
-    pub(crate) fn evicted(&self, page: &PageId, bytes: u64, segment: bool) {
+    /// Count an evicted disk page: by volume slot eviction when `slot`, else
+    /// by index eviction.
+    pub(crate) fn evicted(&self, page: &PageId, bytes: u64, slot: bool) {
         self.disk_event(page, |c| {
-            let (pages, payload) = if segment {
-                (
-                    &mut c.segment_evicted_pages,
-                    &mut c.segment_evicted_payload_bytes,
-                )
+            let (pages, payload) = if slot {
+                (&mut c.slot_evicted_pages, &mut c.slot_evicted_payload_bytes)
             } else {
                 (
                     &mut c.index_evicted_pages,
@@ -385,8 +391,8 @@ mod tests {
             assert_eq!(snapshot.disk[1].read_payload_bytes, 17);
             assert_eq!(snapshot.disk[1].index_evicted_pages, 1);
             assert_eq!(snapshot.disk[1].index_evicted_payload_bytes, 17);
-            assert_eq!(snapshot.disk[0].segment_evicted_pages, 1);
-            assert_eq!(snapshot.disk[0].segment_evicted_payload_bytes, 3);
+            assert_eq!(snapshot.disk[0].slot_evicted_pages, 1);
+            assert_eq!(snapshot.disk[0].slot_evicted_payload_bytes, 3);
             assert_eq!(snapshot.observations, 0);
             assert_eq!(snapshot.heat_entries, 0);
         }

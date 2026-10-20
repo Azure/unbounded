@@ -1231,16 +1231,167 @@ fn assembled_worker_exports_live_quota_gauges() {
 }
 
 #[test]
+fn lazy_disk_commit_waits_for_interval_and_pending_changes() {
+    let now = Instant::now();
+    assert!(!lazy_commit_due(None, now, false, false, false));
+    assert!(lazy_commit_due(None, now, true, false, false));
+    assert!(!lazy_commit_due(None, now, true, true, false));
+    assert!(!lazy_commit_due(
+        Some(now),
+        now + DISK_COMMIT_INTERVAL - Duration::from_millis(1),
+        true,
+        false,
+        false
+    ));
+    assert!(lazy_commit_due(
+        Some(now),
+        now + DISK_COMMIT_INTERVAL,
+        true,
+        false,
+        false
+    ));
+    assert!(!lazy_commit_due(
+        Some(now),
+        now + DISK_COMMIT_INTERVAL,
+        false,
+        false,
+        false
+    ));
+    assert!(!lazy_commit_due(None, now, true, false, true));
+}
+
+#[test]
+fn worker_lazily_commits_cache_index_changes() {
+    use page_alloc::volume::{Key, Tier};
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let mut worker = wake_test_worker();
+    worker.runtime.reactor.init().unwrap();
+    let startup = scope(Duration::from_secs(5)).unwrap();
+    drive_peer(&worker.runtime.reactor, worker.prepare_storage(&startup)).unwrap();
+    let index = worker.store.writer.index().clone();
+    let volume = index.volume().unwrap();
+    assert!(!index.is_dirty(), "a fresh format has nothing to commit");
+    // Publish one cache-tier entry directly; it stays uncommitted.
+    let reservation = volume.allocate(Tier::Cache, 4096).unwrap();
+    let charge = worker
+        .runtime
+        .admission
+        .reserve(None, ResourceClass::Ciphertext, 4096)
+        .unwrap();
+    let buffer = worker.store.writer.slabs().allocate(4096, charge).unwrap();
+    let _ = drive_peer(
+        &worker.runtime.reactor,
+        volume.write(&*worker.runtime.reactor, &reservation, buffer, &startup),
+    )
+    .unwrap();
+    let generation = volume.next_generation();
+    volume
+        .publish(
+            Key::new([1; 8], [2; 12], 0),
+            reservation,
+            4096,
+            generation,
+            0,
+        )
+        .unwrap();
+    assert!(index.is_dirty());
+    let before = volume.commit_stats().succeeded;
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while index.is_dirty() || worker.commit_task.is_some() {
+        worker.poll_writer(&mut cx).unwrap();
+        worker.runtime.reactor.poll_budgeted(64).unwrap();
+        assert!(Instant::now() < deadline, "lazy commit did not finish");
+    }
+    assert_eq!(volume.commit_stats().succeeded, before + 1);
+    // Nothing is pending, so polling starts no further commit.
+    worker.poll_writer(&mut cx).unwrap();
+    assert!(worker.commit_task.is_none());
+}
+
+#[test]
+fn stopping_worker_starts_no_lazy_commit_but_finishes_in_flight_one() {
+    use page_alloc::volume::{Key, Tier};
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let mut worker = wake_test_worker();
+    worker.runtime.reactor.init().unwrap();
+    let startup = scope(Duration::from_secs(5)).unwrap();
+    drive_peer(&worker.runtime.reactor, worker.prepare_storage(&startup)).unwrap();
+    let index = worker.store.writer.index().clone();
+    let volume = index.volume().unwrap();
+    macro_rules! publish {
+        ($seed:expr) => {{
+            let seed: u8 = $seed;
+            let reservation = volume.allocate(Tier::Cache, 4096).unwrap();
+            let charge = worker
+                .runtime
+                .admission
+                .reserve(None, ResourceClass::Ciphertext, 4096)
+                .unwrap();
+            let buffer = worker.store.writer.slabs().allocate(4096, charge).unwrap();
+            let _ = drive_peer(
+                &worker.runtime.reactor,
+                volume.write(&*worker.runtime.reactor, &reservation, buffer, &startup),
+            )
+            .unwrap();
+            let generation = volume.next_generation();
+            volume
+                .publish(
+                    Key::new([seed; 8], [2; 12], 0),
+                    reservation,
+                    4096,
+                    generation,
+                    0,
+                )
+                .unwrap();
+        }};
+    }
+    publish!(1);
+    assert!(index.is_dirty());
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    // Start a lazy commit, then begin stopping while it is in flight.
+    worker.poll_writer(&mut cx).unwrap();
+    assert!(worker.commit_task.is_some());
+    worker.stopping = true;
+    // Stopping still polls the in-flight commit to completion.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worker.commit_task.is_some() {
+        worker.poll_writer(&mut cx).unwrap();
+        worker.runtime.reactor.poll_budgeted(64).unwrap();
+        assert!(Instant::now() < deadline, "in-flight commit did not finish");
+    }
+    // New changes leave the index dirty, as a failing commit would. With
+    // the interval elapsed, stopping must still start no new attempt.
+    publish!(3);
+    assert!(index.is_dirty());
+    worker.last_commit = None;
+    for _ in 0..4 {
+        worker.poll_writer(&mut cx).unwrap();
+        worker.runtime.reactor.poll_budgeted(64).unwrap();
+    }
+    assert!(
+        index.is_dirty(),
+        "remaining changes are left to the final commit"
+    );
+    assert!(
+        worker.commit_task.is_none(),
+        "stopping starts no new lazy commit"
+    );
+}
+
+#[test]
 fn disk_usage_worker_samples_recovery_and_reset() {
     let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let worker = wake_test_worker();
-    let geometry = futures::executor::block_on(worker.prepare_storage()).unwrap();
-    let mut image = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
+    worker.runtime.reactor.init().unwrap();
+    let startup = scope(Duration::from_secs(5)).unwrap();
+    drive_peer(&worker.runtime.reactor, worker.prepare_storage(&startup)).unwrap();
+    let slab_bytes = worker.store.writer.slabs().capacity_bytes();
+    let image = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
     worker.store.checkpoint.finish_snapshot();
-    image.segments[0].state = page_alloc::SegmentState::Sealed;
-    image.segments[0].used_bytes = geometry.alignment().unwrap().length() as u64;
-    let used = image.segments[0].used_bytes;
     futures::executor::block_on(worker.store.recovery.install_shard(Some(image))).unwrap();
     worker.observe_health().unwrap();
     let scrape = || {
@@ -1254,16 +1405,17 @@ fn disk_usage_worker_samples_recovery_and_reset() {
     };
     let output = scrape();
     assert!(output.contains(&format!(
-        "racer_disk_size_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {}\n",
-        geometry.slab_bytes
+        "racer_disk_size_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {slab_bytes}\n"
     )));
-    assert!(output.contains(&format!(
-        "racer_disk_used_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {used}\n"
-    )));
+    // A freshly formatted volume uses only its superblock units.
+    let used = "racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} ";
+    assert!(output.contains(used));
+    assert!(!output.contains(&format!("{used}0\n")));
     futures::executor::block_on(worker.store.recovery.install_shard(None)).unwrap();
     assert_eq!(scrape(), output, "samples change only on observation");
+    // Metadata recovery never touches disk pages.
     worker.observe_health().unwrap();
-    assert!(scrape().contains("racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} 0\n"));
+    assert_eq!(scrape(), output);
 }
 
 #[test]
@@ -1739,7 +1891,9 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
         .attach_io(rt0.reactor.clone(), rt0.admission.clone())
         .unwrap();
     for app in [&mut first, &mut second] {
-        let _ = futures::executor::block_on(app.store.writer.open()).unwrap();
+        app.runtime.reactor.init().unwrap();
+        let startup = scope(Duration::from_secs(5)).unwrap();
+        let _ = drive_peer(&app.runtime.reactor, app.store.writer.open(&startup)).unwrap();
         app.caches = vec![definition()];
     }
     first
@@ -3901,7 +4055,7 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
 }
 
-fn drive_peer<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
+pub(super) fn drive_peer<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let watchdog = Instant::now() + Duration::from_secs(30);

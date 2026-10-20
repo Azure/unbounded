@@ -464,12 +464,17 @@ impl WorkerDirectory {
                 scope,
                 None,
             )?;
+            // Record the worker before awaiting: a hold whose commit fails is
+            // still reserved in memory, and a failed admission must release
+            // its unused capacity. Releasing keeps published pages and refuses
+            // while a fill is active, so a worker that reserved nothing is
+            // unaffected.
+            fresh.push(mailbox.worker);
             match std::future::poll_fn(|cx| receipt.poll_completion(cx))
                 .await?
                 .value?
             {
                 Value::Held(_created, expiry) => {
-                    fresh.push(mailbox.worker);
                     accepted = accepted.max(expiry);
                 }
                 _ => return Err(Error::StaleFlight),
@@ -889,13 +894,12 @@ async fn execute(
     scope.check()?;
     match work {
         Work::Hold(version, pages, until) => {
-            let previous = local.fill.dependencies.writer.index().hold_expiry(&version);
-            local
-                .fill
-                .dependencies
-                .writer
-                .index()
-                .reserve_hold(&version, pages, until)?;
+            let writer = &local.fill.dependencies.writer;
+            let previous = writer.index().hold_expiry(&version);
+            // The reported deadline covers pages already on disk, so every
+            // retention change, including one left by an earlier failed
+            // commit, must be durable before replying.
+            writer.reserve_hold(&version, pages, until, scope).await?;
             Ok(Value::Held(
                 previous.is_none(),
                 previous.map_or(until, |old| old.max(until)),

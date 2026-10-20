@@ -62,7 +62,6 @@ use racer_dataplane::security::PageCryptoEngine;
 use racer_dataplane::store::StoreReader;
 use racer_dataplane::store::StoreWriter;
 use racer_dataplane::store::catalog::Index;
-use racer_dataplane::store::catalog::SegmentClock;
 use racer_dataplane::topology::LinkHealth;
 
 use racer_crypto::identity::Certificates;
@@ -810,18 +809,18 @@ fn open_fixture_storage(
     availability: Rc<racer_dataplane::control::Availability>,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
     let index = Rc::new(Index::new(worker, entries, availability.clone()));
-    let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
+    // The extent volume uses whole slots; a remainder is left unused.
+    let slot = page_alloc::volume::SLOT_BYTES;
+    let slab_bytes = slab_bytes / slot * slot;
+    assert!(slab_bytes >= page_alloc::volume::MIN_SLOTS * slot);
     let slabs = Rc::new(page_alloc::Slab::new(
         path.join(format!("worker-{}-slab-0.dat", worker.0)),
         slab_bytes,
-        64 * 1024 * 1024,
+        slot,
         racer_dataplane::model::PAGE_BYTES as usize + racer_dataplane::store::MAX_HEADER_BYTES + 16,
     ));
-    let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let disk = Rc::new(StoreReader::new(
-        eviction.clone(),
         index.clone(),
-        segments.clone(),
         slabs.clone(),
         admission.clone(),
         reactor.clone(),
@@ -829,16 +828,25 @@ fn open_fixture_storage(
     ));
     let writer = Rc::new(StoreWriter::new(
         index.clone(),
-        segments,
         slabs,
         admission.clone(),
         reactor.clone(),
         availability,
     ));
-    writer
-        .configure(admission.clone(), eviction, 64, entries)
-        .unwrap();
-    let _ = futures::executor::block_on(writer.open()).expect("real O_DIRECT slab must open");
+    writer.configure(admission.clone(), 64, entries).unwrap();
+    reactor.init().expect("fixture storage requires io_uring");
+    let scope = RequestScope::new(RequestId([3; 16]), Instant::now() + TIMEOUT).unwrap();
+    let mut open = writer.open(&scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    loop {
+        reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = open.as_mut().poll(&mut cx) {
+            let _ = result.expect("real O_DIRECT slab must mount");
+            break;
+        }
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    drop(open);
     (index, disk, writer)
 }
 
@@ -1232,9 +1240,9 @@ fn full_page_writeback_reclaims_idle_ciphertext_at_default_worker_budget() {
         rig.flush();
         assert_eq!(rig.writer.pending_count(), 0);
         assert_eq!(rig.writer.discarded_count(), 0);
-        let entries = rig.writer.index().snapshot().unwrap().entries;
+        let entries = rig.writer.index().disk_pages();
         assert!(
-            entries.iter().any(|(page, _)| page.version.etag
+            entries.iter().any(|entry| entry.page.version.etag
                 == StrongEtag::parse(format!("\"v{version}\"").as_bytes()).unwrap()),
             "successful full-page fill v{version} lost disk publication with an idle writer and reclaimable cached bytes"
         );
@@ -1282,7 +1290,7 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
     check(&rig.bootstrap(0xab), 3, 0, P, P);
     rig.flush();
     assert_eq!(
-        rig.writer.index().snapshot().unwrap().entries.len(),
+        rig.writer.index().disk_pages().len(),
         2,
         "live leases cannot be reclaimed to force persistence"
     );
@@ -1297,11 +1305,9 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
     assert!(
         rig.writer
             .index()
-            .snapshot()
-            .unwrap()
-            .entries
+            .disk_pages()
             .iter()
-            .any(|(id, _)| id == &page(0xab, 4)),
+            .any(|entry| entry.page == page(0xab, 4)),
         "v4 persistence missing: ciphertext={} plaintext={} pending={} discarded={}",
         rig.admission.used(ResourceClass::Ciphertext),
         rig.admission.used(ResourceClass::Plaintext),
@@ -1338,7 +1344,7 @@ fn small_versions_keep_persisting_at_index_capacity_and_serve_from_disk_offline(
         rig.adapter.state.lock().unwrap().version = version;
         check(&rig.bootstrap(0xab), version, 0, 113, 113);
         rig.flush();
-        assert!(rig.writer.index().snapshot().unwrap().entries.len() <= 2);
+        assert!(rig.writer.index().disk_pages().len() <= 2);
         rig.memory.evict_idle(usize::MAX).unwrap();
         assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
         rig.adapter.offline();
@@ -1493,7 +1499,7 @@ fn subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline
         assert_eq!(call.range.as_deref(), Some(expected.as_str()));
     }
     rig.flush();
-    assert_eq!(rig.writer.index().snapshot().unwrap().entries.len(), 3);
+    assert_eq!(rig.writer.index().disk_pages().len(), 3);
     rig.adapter.offline();
     assert!(rig.memory.evict_idle(usize::MAX).unwrap() > 0);
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
@@ -1599,7 +1605,7 @@ fn bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin
     rig.flush();
     let calls = rig.adapter.calls();
     assert_eq!(calls.len(), 6);
-    assert_eq!(rig.writer.index().snapshot().unwrap().entries.len(), 6);
+    assert_eq!(rig.writer.index().disk_pages().len(), 6);
     assert!(
         calls[1..]
             .iter()
@@ -1768,12 +1774,13 @@ fn dirty_drain_and_byte_pressure_keep_long_range_progressing() {
     assert_eq!(rig.adapter.calls().len(), 8);
     // Under pressure, Fill may discard unsubmitted writes or skip persistence.
     // A drained queue is not evidence that every fetched page reached disk.
-    let persisted = rig.writer.index().snapshot().unwrap().entries;
+    let persisted = rig.writer.index().disk_pages();
     assert!(!persisted.is_empty(), "dirty drain persisted no pages");
     rig.adapter.offline();
     rig.memory.evict_idle(usize::MAX).unwrap();
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
-    for (page, _) in persisted {
+    for entry in persisted {
+        let page = entry.page;
         let start = page.number.0 * P;
         let end = (start + P).min(length);
         check(

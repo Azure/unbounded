@@ -27,7 +27,6 @@ use crate::security::PageCryptoEngine;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::store::catalog::Index;
-use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::Placement;
 use crate::worker::CryptoRuntime;
@@ -293,6 +292,7 @@ pub mod cluster {
             peer_receive: Default::default(),
             shares: NonZeroU32::new(4).unwrap(),
             disk_page_entries: NonZeroUsize::new(65536).unwrap(),
+            disk_metadata_cache_bytes: NonZeroUsize::new(64 << 20).unwrap(),
             admission_mode: crate::config::AdmissionMode::SecondSight,
             admission_history_bytes: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
             admission_period: Duration::from_secs(60),
@@ -316,9 +316,7 @@ pub mod cluster {
             service_account_token: "unused/token".into(),
             identity_directory: "unused/identity".into(),
             slab_directory: "unused/slabs".into(),
-            slab_bytes: 1024 * 1024 * 1024,
-            segment_bytes: 64 * 1024 * 1024,
-            free_segment_reserve: 2,
+            slab_bytes: 64 * page_alloc::volume::SLOT_BYTES,
             origin_connections_per_cache: NonZeroUsize::new(8).unwrap(),
             request_timeout: Duration::from_secs(30),
             peer_attempt_timeout: Duration::from_secs(30),
@@ -549,26 +547,22 @@ impl ReadWorker {
         );
         let buffers = BufferPool::new(admission.clone());
         let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
-        let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
-        // Reads use an empty disk index. No slabs need to be opened or written.
+        // Reads use an unmounted, empty disk. No slabs need to be opened or written.
         let slabs = Rc::new(page_alloc::Slab::new(
             origin.root.join("slabs/worker-0-slab-0.dat"),
-            256 * 1024 * 1024,
-            64 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            16 * page_alloc::volume::SLOT_BYTES,
+            page_alloc::volume::SLOT_BYTES,
+            crate::store::MAX_RECORD_BYTES,
         ));
         let writer = Rc::new(StoreWriter::new(
             index.clone(),
-            segments.clone(),
             slabs.clone(),
             admission.clone(),
             reactor.clone(),
             availability.clone(),
         ));
         let disk = Rc::new(StoreReader::new(
-            Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
             index.clone(),
-            segments,
             slabs,
             admission.clone(),
             reactor.clone(),

@@ -1,25 +1,19 @@
-//! Worker-local aligned storage with caller-owned accounting and I/O policy.
+//! Worker-local aligned storage with caller-owned accounting and direct I/O.
 //!
-//! This internal crate owns generic bytes and caller-keyed retention indexes, not
-//! key schemas, records, encryption, integrity checks, versions, admission classes,
-//! or a persistence protocol. The caller
-//! supplies accounting guards, a reactor, cancellation policy, and index callbacks.
-//! There is no assumed OS page size and no cross-thread allocation authority.
+//! This internal crate owns generic bytes, the [`volume`] extent store, and
+//! small retention filters in [`retention`]. It does not own record formats,
+//! encryption, integrity checks, admission classes, or key schemas. The caller
+//! supplies accounting guards, a reactor, and cancellation policy. There is no
+//! assumed OS page size and no cross-thread allocation authority.
 //!
 //! # Startup and binding
 //!
-//! Construct [`Slab::new`] with a full file path and [`Segments::new`] with the
-//! same segment size, then call [`Slab::open_configured`] outside the worker's
-//! latency-sensitive path. Directory traversal, locking, sizing, and probing are
-//! blocking. Alignment comes from `statx(STATX_DIOALIGN)` rather than a fixed page
-//! size. A configured partial table must match capacity, segment size, and
-//! alignment. The slab reports physical geometry even with a partial table.
-//!
-//! Opening and binding are separate steps: failed binding can leave the file open
-//! and locked but cannot authorize I/O. Fix the table and retry or drop the slab.
-//! Rebinding to a different table is rejected even when its geometry matches.
-//! The maximum record size only checks that its padded size fits a segment at
-//! startup; it is not an allocation quota or a per-submission record-size limit.
+//! Construct [`Slab::new`] with a full file path, or [`Slab::from_devices`]
+//! with one [`DevicePlacement`] per segment, then call [`Slab::open_volume`]
+//! outside the worker's latency-sensitive path. Directory traversal, locking,
+//! sizing, and probing are blocking. Alignment comes from
+//! `statx(STATX_DIOALIGN)` rather than a fixed page size. The maximum record
+//! size only checks that its padded size fits a segment at startup.
 //!
 //! Linux traversal rejects parent components and intermediate/final symlinks.
 //! Missing directories and files are created with modes 0700 and 0600, subject to
@@ -30,23 +24,20 @@
 //! direct I/O. Parent directories still must be trusted against hostile rename
 //! and unlink; neither traversal nor flock stops noncooperating writers.
 //!
-//! [`Slab::from_devices`] instead accepts one [`DevicePlacement`] per logical
-//! segment. The caller opens devices with O_EXCL and O_DIRECT and supplies common
-//! alignment. Bounds use BLKGETSIZE64 for block devices and length for regular
-//! files. Placements can share an `Arc<File>` to use one
-//! runtime descriptor per device. Startup never creates, resizes, or locks these
-//! files. Logical extents still use segment-table offsets; submissions translate
-//! them to the placement's physical range after checking lease bounds. Overlap
-//! checks only compare the same inode or device identity within one slab. They
-//! cannot detect whole-disk, partition, or device-mapper aliases. The caller must
-//! guarantee disjoint physical storage across aliases and slabs, keep exclusive
-//! ownership, and not change file flags or sizes while in use.
+//! In device mode the caller opens devices with O_EXCL and O_DIRECT and supplies
+//! common alignment. Bounds use BLKGETSIZE64 for block devices and length for
+//! regular files. Placements can share an `Arc<File>` to use one runtime
+//! descriptor per device. Startup never creates, resizes, or locks these files.
+//! Offsets are logical slab offsets; submissions translate them to the
+//! placement's physical range. Overlap checks only compare the same inode or
+//! device identity within one slab. They cannot detect whole-disk, partition, or
+//! device-mapper aliases. The caller must guarantee disjoint physical storage.
 //!
-//! In file mode, empty files are sparsely extended to capacity; nonempty size mismatches are
-//! rejected without truncation. Capacity is a logical bound, not reserved disk
-//! space, so later writes can fail with ENOSPC. Recycling changes metadata only:
-//! it does not erase, truncate, or hole-punch disk bytes. Buffer zeroization is
-//! not secure erasure of the file, and physical blocks can survive eviction.
+//! In file mode, empty files are sparsely extended to capacity and synced with
+//! their parent directories; nonempty size mismatches are rejected without
+//! truncation. Capacity is a logical bound, not reserved disk space, so later
+//! writes can fail with ENOSPC. Buffer zeroization is not secure erasure of the
+//! file.
 //!
 //! # Alignment and accounting
 //!
@@ -54,119 +45,45 @@
 //! alignment must be a supported power of two. Extent padding uses their least
 //! common multiple, so offset unit 768 and length unit 512 require multiples of
 //! 1536. Arithmetic and the conservative 1 GiB transfer cap are checked before
-//! allocating. Larger logical records must be split by the caller. An [`Extent`]
-//! alone checks a range, not its alignment or permission to access a segment.
+//! allocating. Larger logical records must be split by the caller.
 //!
 //! [`AlignedBuffer`] owns initialized stable storage that cannot be resized.
 //! The primary [`Charge`] must truthfully account for its entire padded size;
 //! `()` opts out of accounting. Additional guards attached with
 //! [`AlignedBuffer::retain`] remain live through completion, but not idle pooling.
-//! [`Slab::allocate`] uses bounded size-class free lists. Idle memory retains its
-//! primary charge. Reuse requires admission for the full capacity and replaces
-//! the old charge. Mismatches leave idle storage untouched. Full, borrowed, or
-//! dropped pools cannot retain returned storage.
-//! Outstanding buffers do not keep the pool alive. Reclaim reaches idle bytes
-//! only, never memory still owned by the kernel.
+//! [`Slab::allocate`] reuses a bounded free list: at most 8 idle buffers and
+//! 128 MiB, matched by 64 KiB size class. Idle memory retains its primary
+//! charge. Reuse requires admission for the full capacity and replaces the old
+//! charge. Full, borrowed, or dropped pools do not retain returned storage.
+//! [`Slab::reclaim_idle`] frees idle bytes only, never memory owned by the
+//! kernel. [`AlignedBuffer::freeze`] detaches completed storage as a sendable,
+//! immutable [`FrozenBuffer`].
 //!
 //! # Completion ownership
 //!
-//! For writes, round the logical size, append the padded length, allocate matching
-//! storage, copy bytes into the zeroed buffer, and submit [`Slab::write`]. Publish
-//! the caller's mapping only after the write succeeds. Append reserves space and
-//! does not roll it back on failed writes. For reads, validate the stored slot,
-//! generation, and extent, acquire a lease, allocate storage, and submit a read.
-//! A lease authorizes the segment's used prefix at acquisition, not just the last
-//! appended record; it cannot authorize bytes appended afterward.
-//! Any lease, including one from [`Segments::lease`], permits writes in that prefix.
-//! Leases do not grant exclusive record ownership. The trusted caller must write
-//! only reserved extents it owns and never overwrite published or readable records.
-//! A lease does not prove initialization in its generation: append reserves space
-//! without writing it. Recycled bytes may come from an earlier generation or a
-//! different cache. Before exposing them as a valid record, the caller must check
-//! record integrity, authentication, and cache identity, even after a successful read.
-//!
-//! Submission checks table identity, alignment, length, segment boundaries, and
-//! captured used bytes. Reads and writes reject short completions. Accepted I/O
-//! owns the buffer, all charges, and the lease through the runtime completion
-//! fence, even when its waiting future is dropped. Writes also own their counter
-//! guard. An unpolled future has submitted nothing. Continue driving the reactor
-//! to complete or cancel accepted work before expecting resources to be released.
-//! [`Slab::fence_writes`] neither waits for reads nor prevents new writes. Stop
-//! admitting writes first if quiescence is required. It is a completion fence,
-//! not a durability barrier: it never calls fsync or fdatasync.
-//!
-//! # Recovery and reclamation
-//!
-//! Slots normally progress from Free to Open to Sealed to Evicting to Free.
-//! Append selects a fitting open tail or the lowest free slot. Full segments and
-//! rotated tails become sealed. A valid rollover with no free slot seals the old
-//! tail before returning Busy, enabling reclamation and retry. Malformed requests
-//! and lease-counter overflow leave the table unchanged. New leases reject
-//! eviction, but existing leases remain usable. Recycling requires no remaining
-//! leases and increments generation without wrapping.
-//!
-//! A [`FreezeGuard`] blocks table mutation, not reads, snapshots, new read leases,
-//! caller index mutation, or accepted I/O. It may outlive its table. Only one guard
-//! exists at a time. Restore requires both thawing and draining all leases,
-//! including reads and abandoned I/O. It validates the whole ordered image before
-//! publication, seals an open tail, rebuilds free slots, and advances an epoch
-//! that clears the eviction cursor and recent-read state. Invalid or busy restores
-//! never partially publish.
-//! Raw file opening, table configuration, and manual eviction are simulation-only
-//! escape hatches. Production startup binds with [`Slab::open_configured`], and
-//! [`SegmentClock`] owns the ordering of mapping removal before physical reuse.
-//! The table, slab, and clock are cache-line aligned to isolate worker-local state;
-//! their Rc ownership prevents moving authority to a different worker thread.
-//!
-//! For a checkpoint, stop mutation admission, retain a freeze guard, drive writes
-//! through their completion fence, then capture compatible allocator and caller
-//! metadata. Keep admission coordinated around thaw and restore. Neither the
-//! image nor the completion fence proves durability or record validity. Recovery
-//! must validate identity, lengths, integrity, and versions. Invalid, stale, torn,
-//! or missing cache records must become misses and be refetched.
-//!
-//! [`SegmentClock`] shares a cursor and second-chance set across bounded sweeps.
-//! Index reclamation forgets mappings without touching bytes or generations.
-//! Physical reclamation selects only Sealed/Evicting slots and recycles empty slots
-//! after leases drain. Index and unscored sweeps visit at most two rotations,
-//! further capped by the caller. Scored reclamation visits at most
-//! min(slot count, max_visits, 64) slots, including skipped slots, then ranks
-//! eligible candidates. For a nonzero reserve, [`SegmentClock::reclaim`] and
-//! [`SegmentClock::reclaim_scored`] can succeed once the reserve (capped at the
-//! slot count) is met, even with pending evictions. Success is not a drain guarantee.
-//! Busy means the bounded sweep could not meet the reserve, or table mutation was
-//! blocked. Use [`Segments::free_count`] to check capacity and retry bounded
-//! reclamation when more free slots are needed rather than spinning.
-//! A zero reserve is a no-op, not a drain request; a zero entry budget
-//! can recycle empty slots but cannot begin populated eviction. There is no
-//! compaction. [`SegmentEntries`] implementations
-//! must compare current mappings before removal and report within budget; an
-//! error cannot undo callback side effects. Freeze does not block index sweeps.
+//! [`Slab::read_at`] and [`Slab::write_at`] check alignment and that the
+//! transfer stays inside one bound segment. Accepted I/O owns the buffer, all
+//! charges, and the caller's guard through the runtime completion fence, even
+//! when its waiting future is dropped. Short completions fail. An unpolled
+//! future has submitted nothing. [`Slab::fence_writes`] waits for accepted
+//! writes to complete; it is not a durability barrier. [`Slab::sync`] fsyncs
+//! every backing descriptor.
 //!
 //! # Validation
 //!
 //! Run `cargo test -p page-alloc --no-default-features` and
 //! `cargo test -p page-alloc --all-features` under an external TERM timeout.
 //! Simulation provides deterministic fault and cancellation ordering, not proof
-//! of filesystem security or kernel support. Descriptor-replacement test hooks
-//! require an open slab and no live writes and do not revalidate geometry.
-//! Real tests print explicit capability skips with `-- --nocapture`; set
-//! `PAGE_ALLOC_REQUIRE_REAL_IO=1` to turn those skips into failures. A skip is not
-//! evidence that the real path passed. Miri can cover the pure `buffer_tests`,
-//! `geometry_tests`, and `segments::tests` filters, but not real kernel I/O.
+//! of filesystem security or kernel support. Real tests print explicit
+//! capability skips with `-- --nocapture`; set `PAGE_ALLOC_REQUIRE_REAL_IO=1`
+//! to turn those skips into failures. Miri can cover the pure `buffer_tests`.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
-pub mod index;
 pub mod retention;
-mod segments;
-
 mod slab;
+pub mod volume;
 
-pub use segments::{
-    FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
-    SegmentSnapshot, SegmentState, Segments,
-};
 pub use slab::{DevicePlacement, Slab};
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
@@ -187,13 +104,13 @@ pub enum Error {
     /// Caller configuration or an implementation contract is invalid.
     InvalidConfiguration,
 
-    /// A transient lease, freeze, or resource limit prevents progress.
+    /// A transient lease or resource limit prevents progress.
     Busy,
 
     /// An extent or persisted allocator image is malformed.
     Corrupt,
 
-    /// A generation, segment state, or table identity is no longer valid.
+    /// A generation or binding is no longer valid.
     Stale,
 
     /// Storage is unopened, locked elsewhere, or has exhausted a generation.
@@ -242,77 +159,6 @@ impl std::error::Error for Error {}
 
 /// Result of an allocator operation before conversion into a caller's scope error.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Maximum number of slots retained by a segment allocation table.
-pub const MAX_SEGMENTS: u64 = 1_000_000;
-
-/// Validated physical dimensions, independent of record formats and slot quotas.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SegmentGeometry {
-    slab_bytes: u64,
-
-    segment_bytes: u64,
-
-    segment_count: u64,
-
-    alignment: Alignment,
-}
-
-impl SegmentGeometry {
-    /// Validate physical geometry; retained tables separately enforce MAX_SEGMENTS.
-    pub fn new(
-        slab_bytes: u64,
-        segment_bytes: u64,
-        segment_count: u64,
-        alignment: Alignment,
-    ) -> Result<Self> {
-        if segment_bytes == 0
-            || slab_bytes == 0
-            || segment_count == 0
-            || !slab_bytes.is_multiple_of(segment_bytes)
-            || segment_count > slab_bytes / segment_bytes
-            || !segment_bytes.is_multiple_of(alignment.offset())
-            || !segment_bytes.is_multiple_of(alignment.length() as u64)
-            || segment_count.checked_mul(segment_bytes).is_none()
-        {
-            return Err(Error::Corrupt);
-        }
-        Ok(Self {
-            slab_bytes,
-            segment_bytes,
-            segment_count,
-            alignment,
-        })
-    }
-
-    /// Full logical size of the physical file.
-    pub fn slab_bytes(self) -> u64 {
-        self.slab_bytes
-    }
-
-    /// Fixed physical size of each segment.
-    pub fn segment_bytes(self) -> u64 {
-        self.segment_bytes
-    }
-
-    /// Number of exposed segments, possibly less than the physical file allows.
-    pub fn segment_count(self) -> u64 {
-        self.segment_count
-    }
-
-    /// Direct-I/O requirements validated with these dimensions.
-    pub fn alignment(self) -> Alignment {
-        self.alignment
-    }
-
-    /// Compare table dimensions only, not occupancy or alignment compatibility.
-    #[cfg(test)]
-    fn matches_segments(&self, segments: &Segments) -> bool {
-        segments.capacity_bytes() == self.slab_bytes
-            && segments.segment_bytes() == self.segment_bytes
-            && segments.count() as u64 == self.segment_count
-    }
-}
 
 /// Caller-owned accounting retained while memory is live, including idle pooling.
 pub trait Charge: 'static {
@@ -1532,105 +1378,5 @@ mod buffer_tests {
         assert_eq!(live.get(), 0);
         assert!(pool.borrow().entries.is_empty());
         assert_eq!(wipes.get(), 1);
-    }
-}
-
-/// Pure geometry boundary tests independent of file I/O and checkpoint formats.
-#[cfg(test)]
-mod geometry_tests {
-    use super::*;
-
-    /// Standard test units, not a host-page-size assumption.
-    fn alignment() -> Alignment {
-        Alignment::new(512, 512, 512).unwrap()
-    }
-
-    /// Physical geometry does not impose the retained table's slot bound.
-    #[test]
-    fn geometry_accepts_partial_tables_without_checkpoint_item_policy() {
-        let geometry = SegmentGeometry::new(4096, 1024, 2, alignment()).unwrap();
-        assert_eq!(geometry.slab_bytes(), 4096);
-        assert_eq!(geometry.segment_bytes(), 1024);
-        assert_eq!(geometry.segment_count(), 2);
-        assert_eq!(geometry.alignment(), alignment());
-        assert!(SegmentGeometry::new(1024 * MAX_SEGMENTS, 1024, MAX_SEGMENTS, alignment()).is_ok());
-        assert!(
-            SegmentGeometry::new(
-                1024 * (MAX_SEGMENTS + 1),
-                1024,
-                MAX_SEGMENTS + 1,
-                alignment()
-            )
-            .is_ok()
-        );
-        assert!(
-            SegmentGeometry::new(u64::MAX, 1, u64::MAX, Alignment::new(1, 1, 1).unwrap()).is_ok()
-        );
-    }
-
-    /// Reject zero units, inconsistent capacity, misalignment, and overflow.
-    #[test]
-    fn geometry_rejects_zero_misalignment_capacity_and_overflow() {
-        for (slab, segment, count) in [
-            (0, 512, 1),
-            (512, 0, 1),
-            (512, 512, 0),
-            (513, 512, 1),
-            (512, 512, 2),
-            (514, 257, 2),
-            (u64::MAX, u64::MAX, 2),
-        ] {
-            assert_eq!(
-                SegmentGeometry::new(slab, segment, count, alignment()),
-                Err(Error::Corrupt)
-            );
-        }
-        assert_eq!(
-            SegmentGeometry::new(1024, 1024, 1, Alignment::new(512, 512, 768).unwrap()),
-            Err(Error::Corrupt)
-        );
-    }
-
-    /// Table matching ignores occupancy but compares each configured dimension.
-    #[test]
-    fn matching_live_table_ignores_occupancy_but_requires_dimensions() {
-        let geometry = SegmentGeometry::new(4096, 1024, 2, alignment()).unwrap();
-        let segments = Segments::new(1024);
-        assert!(!geometry.matches_segments(&segments));
-        segments.configure(4096, 2, alignment()).unwrap();
-        assert!(geometry.matches_segments(&segments));
-        let _held = segments.append(512).unwrap();
-        assert!(geometry.matches_segments(&segments));
-        assert!(
-            !SegmentGeometry::new(4096, 1024, 3, alignment())
-                .unwrap()
-                .matches_segments(&segments)
-        );
-        assert!(
-            !SegmentGeometry::new(2048, 1024, 2, alignment())
-                .unwrap()
-                .matches_segments(&segments)
-        );
-        assert!(
-            !SegmentGeometry::new(4096, 512, 2, alignment())
-                .unwrap()
-                .matches_segments(&segments)
-        );
-    }
-
-    /// Segment boundaries must satisfy both direct-I/O units simultaneously.
-    #[test]
-    fn divisibility_by_each_unit_is_equivalent_to_lcm_divisibility() {
-        let alignment = Alignment::new(512, 512, 768).unwrap();
-        assert!(SegmentGeometry::new(3072, 1536, 2, alignment).is_ok());
-        assert_eq!(
-            SegmentGeometry::new(2048, 1024, 2, alignment),
-            Err(Error::Corrupt)
-        );
-        assert_eq!(
-            SegmentGeometry::new(1536, 768, 2, alignment),
-            Err(Error::Corrupt)
-        );
-        assert!(SegmentGeometry::new(u64::MAX, 1, 1, Alignment::new(1, 1, 1).unwrap()).is_ok());
     }
 }

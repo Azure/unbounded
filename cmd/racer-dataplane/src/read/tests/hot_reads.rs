@@ -552,8 +552,15 @@ mod duplex_release {
         let mut byte = [255];
         independent_client.read_exact(&mut byte).unwrap();
         assert_eq!(byte, [0], "other reader retains its own page and cursor");
+        // Socket completions arrive asynchronously; under load a fixed number
+        // of non-blocking turns may not observe them all.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         for _ in 0..128 {
             pump(&mut endpoint);
+        }
+        while f.reactor.in_flight() != 0 && std::time::Instant::now() < deadline {
+            pump(&mut endpoint);
+            std::thread::yield_now();
         }
         assert_eq!(
             f.reactor.in_flight(),
@@ -1544,7 +1551,7 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     assert_eq!(f.fill.metrics.count(Event::PeerHit), 0);
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     f.reactor.init().unwrap();
-    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
     drop((result, second, copy, pending));
     assert!(f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap() > 0);

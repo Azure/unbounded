@@ -1,12 +1,14 @@
-//! Worker-local hard holds. Each reserved page charges one whole segment.
-//! Live expiry requires both clocks to pass the deadline. Restart uses wall time
-//! only; checkpoints and payloads keep the store's existing no-fsync crash limits.
+//! Worker-local hard holds over the extent volume's storage tier. Each reserved
+//! page charges one data slot of the hold quota. Published held pages are
+//! storage-tier entries whose `retain_until` is the hold deadline, so the
+//! volume keeps their slots until the deadline passes and they survive a
+//! crash once committed. Live expiry requires both clocks to pass the
+//! deadline. Restart rebuilds holds from storage entries using wall time only.
 
-use super::catalog::RecordLocation;
+use super::key::VersionKey;
 use crate::error::{Error, Result};
-use crate::model::{ObjectVersion, PageNumber};
 use crate::runtime::HashMap;
-use page_alloc::{SegmentId, Segments};
+use crate::runtime::HashSet;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -19,10 +21,22 @@ pub(super) struct Hold {
     pub pages: usize,
     pub inflight: Rc<Cell<usize>>,
     pub active: Rc<Cell<usize>>,
-    pub locations: HashMap<PageNumber, RecordLocation>,
+    /// Page numbers published as storage-tier entries under this hold.
+    pub published: HashSet<u32>,
 }
 
 impl Hold {
+    pub fn new(until: SystemTime, monotonic: Instant) -> Self {
+        Self {
+            until,
+            monotonic,
+            pages: 0,
+            inflight: Rc::new(Cell::new(0)),
+            active: Rc::new(Cell::new(0)),
+            published: HashSet::default(),
+        }
+    }
+
     pub fn live(&self) -> bool {
         uring_runtime::environment::wall_now() < self.until
             || uring_runtime::environment::now() < self.monotonic
@@ -30,14 +44,12 @@ impl Hold {
 
     pub fn unused(&self) -> usize {
         self.pages
-            .saturating_sub(self.locations.len() + self.inflight.get())
+            .saturating_sub(self.published.len() + self.inflight.get())
     }
 }
 
 pub(super) struct Holds {
-    pub entries: HashMap<ObjectVersion, Hold>,
-    pub segments: Option<Rc<Segments>>,
-    pub free_reserve: usize,
+    pub entries: HashMap<VersionKey, Hold>,
     pub percent: usize,
 }
 
@@ -45,8 +57,6 @@ impl Default for Holds {
     fn default() -> Self {
         Self {
             entries: HashMap::default(),
-            segments: None,
-            free_reserve: 1,
             percent: 50,
         }
     }
@@ -56,20 +66,6 @@ impl Holds {
     pub fn expire(&mut self) {
         self.entries
             .retain(|_, hold| hold.live() || hold.inflight.get() != 0 || hold.active.get() != 0);
-    }
-
-    pub fn unused(&self) -> usize {
-        self.entries.values().map(Hold::unused).sum()
-    }
-
-    pub fn segment_held(&self, segment: SegmentId) -> bool {
-        self.entries.values().any(|hold| {
-            hold.live()
-                && hold
-                    .locations
-                    .values()
-                    .any(|location| location.segment == segment)
-        })
     }
 
     pub fn deadline(until: SystemTime) -> Result<Instant> {
@@ -85,9 +81,20 @@ impl Holds {
     }
 }
 
+/// Keeps a hold alive while a persistence call protects it.
 pub(super) struct HoldGuard(pub Rc<Cell<usize>>);
 
 impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+/// Charges one reserved page of a hold to an in-flight storage write, from
+/// tier selection until publication or abort.
+pub(super) struct HoldTicket(pub Rc<Cell<usize>>);
+
+impl Drop for HoldTicket {
     fn drop(&mut self) {
         self.0.set(self.0.get() - 1);
     }

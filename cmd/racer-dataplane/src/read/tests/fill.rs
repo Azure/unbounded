@@ -2849,7 +2849,6 @@ pub(super) use racer_control_wire::CacheId;
 
 pub(super) use crate::security::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;
-pub(super) use crate::store::catalog::SegmentClock;
 pub(super) use crate::topology::Member;
 pub(super) use crate::topology::Membership;
 pub(super) use crate::topology::Placement;
@@ -3158,7 +3157,6 @@ fn fixture_with_caches(
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let index = Rc::new(Index::new(worker, 16, availability.clone()));
-    let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -3169,20 +3167,14 @@ fn fixture_with_caches(
         ));
     let slabs = Rc::new(page_alloc::Slab::new(
         directory.join(format!("worker-{}-slab-0.dat", worker.0)),
-        1024 * 1024 * 1024,
-        64 * 1024 * 1024,
-        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+        16 * page_alloc::volume::SLOT_BYTES,
+        page_alloc::volume::SLOT_BYTES,
+        crate::store::MAX_RECORD_BYTES,
     ));
-    let _ = slabs
-        .open_configured(&segments)
-        .expect("read fixture filesystem supports direct slab alignment");
-    let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let metrics = Metrics::default();
     let disk = Rc::new(
         StoreReader::new(
-            clock,
             index.clone(),
-            segments.clone(),
             slabs.clone(),
             admission.clone(),
             reactor.clone(),
@@ -3190,14 +3182,19 @@ fn fixture_with_caches(
         )
         .with_metrics(metrics.clone()),
     );
+    let slabs_for_open = slabs.clone();
     let writer = Rc::new(StoreWriter::new(
         index,
-        segments,
         slabs,
         admission.clone(),
         reactor.clone(),
         availability.clone(),
     ));
+    // Open the slab so writes can be sized and accepted, as the old fixture
+    // did. Tests that need disk pages mount the volume with `writer.open`.
+    let _ = slabs_for_open
+        .open_now()
+        .expect("read fixture filesystem supports direct slab alignment");
     let context = OriginContext {
         object: ObjectId {
             cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
@@ -4242,7 +4239,7 @@ fn cold_disk_fixture() -> Fixture {
     let mut f = fixture();
     f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
     f.reactor.init().unwrap();
-    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let original = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(
@@ -4275,7 +4272,7 @@ fn local_tail_fixture(length: u64, disk: bool) -> Fixture {
     let mut f = fixture_with(length, None);
     f.page.number = PageNumber(3);
     f.reactor.init().unwrap();
-    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let original = acquire(&mut f, &mut budget).unwrap();
     if disk {
@@ -4429,6 +4426,85 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
     }
 }
 
+/// AEAD/CRC failure on a held storage-tier page removes the bad entry, and the
+/// origin fill that follows writes the page back to the storage tier with the
+/// hold's deadline.
+#[test]
+fn corrupt_held_storage_page_is_repaired_to_storage_tier_by_fill() {
+    use page_alloc::volume::Tier;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for corrupt_tag in [false, true] {
+        let mut f = fixture();
+        f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
+        f.reactor.init().unwrap();
+        let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
+        let index = f.fill.dependencies.writer.index().clone();
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        index.reserve_hold_now(&f.page.version, 1, until).unwrap();
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        drop(acquire(&mut f, &mut budget).unwrap());
+        assert_eq!(
+            drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap(),
+            1
+        );
+        let first = index.lookup(&f.page).unwrap().unwrap();
+        assert_eq!(first.tier, Tier::Storage);
+        assert_eq!(index.held_page_expiry(&f.page), Some(until));
+        f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        f.origin.calls.set(0);
+        drive_disk(
+            &f,
+            f.fill
+                .dependencies
+                .writer
+                .rewrite_record(&f.page, &f.scope, |bytes| {
+                    let extent = page_alloc::Extent::new(0, bytes.len()).unwrap();
+                    let parsed = crate::store::parse_bytes(bytes, extent).unwrap();
+                    let offset = if corrupt_tag {
+                        parsed.ciphertext.end - 1
+                    } else {
+                        parsed.ciphertext.start
+                    };
+                    bytes[offset] ^= 1;
+                }),
+        )
+        .unwrap();
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        drop(
+            drive_io(
+                f.fill.acquire(
+                    f.page.clone(),
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut budget,
+                ),
+                &f.reactor,
+                &mut f.engine,
+                &f.crypto,
+            )
+            .unwrap(),
+        );
+        assert_eq!(f.fill.metrics.count(Event::CorruptMiss), 1);
+        assert_eq!(f.origin.calls.get(), 1);
+        // The hold survives; only the damaged publication was dropped.
+        assert_eq!(index.hold_expiry(&f.page.version), Some(until));
+        assert!(
+            index
+                .lookup(&f.page)
+                .unwrap()
+                .is_none_or(|value| value.generation != first.generation)
+        );
+        drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
+        let repaired = index.lookup(&f.page).unwrap().unwrap();
+        assert_eq!(repaired.tier, Tier::Storage);
+        assert_ne!(repaired.generation, first.generation);
+        assert_eq!(repaired.retain_until, first.retain_until);
+        assert_eq!(index.held_page_expiry(&f.page), Some(until));
+    }
+}
+
 #[test]
 fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -4437,39 +4513,18 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
         for corrupt_tag in [false, true] {
             let mut f = cold_disk_fixture();
             let writer = &f.fill.dependencies.writer;
-            let location = writer.index().lookup(&f.page).unwrap().unwrap().location;
-            let staging = writer
-                .slabs()
-                .allocate(
-                    location.extent.length(),
-                    f.fill
-                        .dependencies
-                        .admission
-                        .reserve(None, ResourceClass::Ciphertext, location.extent.length())
-                        .unwrap(),
-                )
-                .unwrap();
-            let lease = writer.lease(&location).unwrap();
-            let mut stored = drive_disk(
+            drive_disk(
                 &f,
-                writer
-                    .slabs()
-                    .read(&f.reactor, location.extent, staging, lease, &f.scope),
-            )
-            .unwrap();
-            let parsed = crate::store::parse(&stored, location.extent).unwrap();
-            let offset = if corrupt_tag {
-                parsed.ciphertext.end - 1
-            } else {
-                parsed.ciphertext.start
-            };
-            stored.bytes_mut().unwrap()[offset] ^= 1;
-            let lease = writer.lease(&location).unwrap();
-            let _ = drive_disk(
-                &f,
-                writer
-                    .slabs()
-                    .write(&f.reactor, location.extent, stored, lease, &f.scope),
+                writer.rewrite_record(&f.page, &f.scope, |bytes| {
+                    let extent = page_alloc::Extent::new(0, bytes.len()).unwrap();
+                    let parsed = crate::store::parse_bytes(bytes, extent).unwrap();
+                    let offset = if corrupt_tag {
+                        parsed.ciphertext.end - 1
+                    } else {
+                        parsed.ciphertext.start
+                    };
+                    bytes[offset] ^= 1;
+                }),
             )
             .unwrap();
             if acquire {
@@ -4578,7 +4633,7 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
     Arc::get_mut(&mut stale.ciphertext.inner).unwrap().checksum =
         std::sync::OnceLock::from(checksum ^ 1);
     let writer = &f.fill.dependencies.writer;
-    let old = writer.index().lookup(&f.page).unwrap().unwrap().location;
+    let old = writer.index().lookup(&f.page).unwrap().unwrap();
     // Enqueue now deduplicates resident pages. Model the invalidation that
     // permits a replacement while the older read token remains outstanding.
     f.fill.dependencies.disk.invalidate(&token).unwrap();
@@ -4594,7 +4649,7 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
         .unwrap();
     writer.enqueue(replacement, dirty).unwrap();
     drive_disk(&f, writer.progress(1, &f.scope)).unwrap();
-    let new = writer.index().lookup(&f.page).unwrap().unwrap().location;
+    let new = writer.index().lookup(&f.page).unwrap().unwrap();
     assert_ne!(old, new);
     assert_eq!(
         drive(
@@ -4604,10 +4659,7 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
         ),
         Err(Error::CorruptRecord)
     );
-    assert_eq!(
-        writer.index().lookup(&f.page).unwrap().unwrap().location,
-        new
-    );
+    assert_eq!(writer.index().lookup(&f.page).unwrap().unwrap(), new);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let intact = drive_io(
         f.fill.acquire_ciphertext(
@@ -5058,7 +5110,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let mut f = fixture_with(PAGE_BYTES, Some(limits));
     f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
     f.reactor.init().unwrap();
-    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let original = acquire(&mut f, &mut budget).unwrap();
     let expected = original.ciphertext.bytes().to_vec();

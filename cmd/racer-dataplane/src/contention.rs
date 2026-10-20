@@ -1067,7 +1067,6 @@ mod fidelity {
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
-    use crate::store::catalog::SegmentClock;
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Placement;
@@ -1551,20 +1550,17 @@ mod fidelity {
 
         let worker = WorkerId(0);
         let index = Rc::new(Index::new(worker, 16, availability.clone()));
-        let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         // Never opened: dirty saturation must bypass writer enqueue and all disk I/O.
         let reactor = Rc::new(Reactor::new(real.clone()));
         let slabs = Rc::new(page_alloc::Slab::new(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("target/contention-fidelity-unopened/worker-0-slab-0.dat"),
-            128 * 1024 * 1024,
-            64 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            8 * page_alloc::volume::SLOT_BYTES,
+            page_alloc::volume::SLOT_BYTES,
+            crate::store::MAX_RECORD_BYTES,
         ));
         let disk = Rc::new(StoreReader::new(
-            Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
             index.clone(),
-            segments.clone(),
             slabs.clone(),
             real.clone(),
             reactor.clone(),
@@ -1572,7 +1568,6 @@ mod fidelity {
         ));
         let writer = Rc::new(StoreWriter::new(
             index,
-            segments,
             slabs,
             real.clone(),
             reactor,
