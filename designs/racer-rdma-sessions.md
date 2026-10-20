@@ -548,3 +548,9 @@ Recorded while building stage 3; the code is authoritative.
 5. Owner maps are ordered (`BTreeMap`) so simulated runs replay exactly.
 6. The grant extension carries the rail; the transfer id is already bound by
    the signed `Accept`. The grant length is `MAX_CIPHERTEXT`.
+7. `Devices` and the slot `WithNative` alias are deleted from `src/rdma.rs`
+   rather than kept: they wrapped the slot `IoPort`, and `Links::activate`
+   now does rail selection and activation for the node. `Inventory`,
+   `select`, `select_hop`, `select_worker`, `match_publication`, and
+   `signed_value` stay. `NativeRetry::fence` went with the per-transfer
+   sessions.

@@ -30,22 +30,10 @@ pub struct Binding {
 pub enum Phase {
     /// Request carrying the receiver's in-band grant.
     Accept,
-    /// Offer transport setup.
-    Offer,
-    /// Bind remote setup.
-    Setup,
-    /// Confirm setup readiness.
-    Ready,
-    /// Grant a destination descriptor.
-    Grant,
     /// Confirm native completion.
     Complete,
-    /// Report native failure.
-    Failed,
     /// Request HTTP fallback.
     Fallback,
-    /// Acknowledge completion.
-    Done,
     /// Finish with optional fallback body.
     Finish,
 }
@@ -54,33 +42,21 @@ impl Phase {
     fn name(self) -> &'static str {
         match self {
             Self::Accept => "accept",
-            Self::Offer => "offer",
-            Self::Setup => "setup",
-            Self::Ready => "ready",
-            Self::Grant => "grant",
             Self::Complete => "complete",
-            Self::Failed => "failed",
             Self::Fallback => "fallback",
-            Self::Done => "done",
             Self::Finish => "finish",
         }
     }
 
     /// Whether the wire phase uses an HTTP response start line.
     pub fn response(self) -> bool {
-        matches!(
-            self,
-            Self::Offer | Self::Ready | Self::Complete | Self::Failed | Self::Finish
-        )
+        matches!(self, Self::Complete | Self::Finish)
     }
 
     /// Ordered extension fields required by this phase.
     pub fn fields(self) -> &'static [&'static str] {
         match self {
             Self::Accept => &["racer-rdma-grant"],
-            Self::Offer => &["racer-rdma-setup"],
-            Self::Setup | Self::Ready => &["racer-rdma-setup", "racer-rdma-setup-binding"],
-            Self::Grant => &["racer-rdma-descriptor"],
             Self::Complete => &["racer-rdma-complete"],
             _ => &[],
         }

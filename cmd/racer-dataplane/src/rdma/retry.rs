@@ -106,56 +106,12 @@ impl NativeRetry {
         .await
     }
 
-    /// Retry a required fence without applying a request's cancellation policy.
-    pub(super) async fn fence(
-        &self,
-        operation: impl Future<Output = rdma_verbs::Result<()>>,
-    ) -> Result<()> {
-        let mut operation = std::pin::pin!(operation);
-        let mut alarm: Option<Operation<'_, ()>> = None;
-        poll_fn(|cx| {
-            if let Poll::Ready(result) = operation.as_mut().poll(cx) {
-                return Poll::Ready(result.map_err(Into::into));
-            }
-            if let Some(timer) = alarm.as_mut() {
-                match timer.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => result?,
-                }
-            }
-            alarm = Some(Box::pin(async {
-                // This scope owns only the alarm. It cannot cancel the DMA fence.
-                let scope = RequestScope::new(
-                    crate::model::RequestId([0; 16]),
-                    racer_platform::environment::now() + Duration::from_secs(30),
-                )?;
-                self.alarm(&scope).await
-            }));
-            match alarm.as_mut().unwrap().as_mut().poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                Poll::Ready(Ok(())) => {
-                    alarm = None;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }
-        })
-        .await
-    }
-
     /// Fire only registered alarms; this is not a blanket executor wake.
     #[cfg(test)]
     pub(super) fn fire(&self) {
         for alarm in self.alarms.take() {
             let _ = alarm.send(());
         }
-    }
-
-    /// Inject a terminal alarm delivery failure without polling the child directly.
-    #[cfg(test)]
-    pub(super) fn fail(&self) {
-        self.alarms.borrow_mut().clear();
     }
 }
 
@@ -273,25 +229,6 @@ mod tests {
             Pin::new(&mut active).poll_next(&mut cx),
             Poll::Ready(Some(Err(Error::DeadlineExceeded)))
         );
-    }
-
-    #[test]
-    fn fence_alarm_never_reports_success_before_native_fence() {
-        let retry = NativeRetry::unattached();
-        let ready = Cell::new(false);
-        let mut operation = Box::pin(retry.fence(poll_fn(|_| {
-            if ready.get() {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
-        })));
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(operation.as_mut().poll(&mut cx).is_pending());
-        retry.fire();
-        assert!(operation.as_mut().poll(&mut cx).is_pending());
-        ready.set(true);
-        assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
 
     #[test]

@@ -508,7 +508,7 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
             .sign(&n[0], n[1].node(), Phase::Fallback, &previous, 0, vec![])
             .unwrap();
         let allowed = if fault == 0 {
-            Phase::Done
+            Phase::Finish
         } else {
             Phase::Fallback
         };
@@ -521,7 +521,7 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
                 .is_err()
         );
     }
-    assert!(binding.head(Phase::Offer, &previous, 0, vec![]).is_err());
+    assert!(binding.head(Phase::Accept, &previous, 0, vec![]).is_err());
     assert!(
         binding
             .head(Phase::Finish, &previous, MAX_BODY, vec![])
@@ -589,7 +589,7 @@ fn request_builders_supply_host_for_strict_http_codec() {
         deadline: 1,
         rail: racer_control_wire::RailId(1),
     };
-    for phase in [Phase::Fallback, Phase::Done, Phase::Finish] {
+    for phase in [Phase::Fallback, Phase::Finish] {
         let head = binding.head(phase, &[0; 32], 0, vec![]).unwrap();
         assert_eq!(
             head.unique("host").unwrap(),

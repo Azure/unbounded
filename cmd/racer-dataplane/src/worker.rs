@@ -1802,7 +1802,7 @@ mod tests {
                 let engine: Box<dyn Service<RequestScope>> = if self.native {
                     let (io, native) = rdma_verbs::pair(1)?;
                     self.observed.native.lock().unwrap().push(io);
-                    Box::new(crate::rdma::WithNative::new(page, native))
+                    Box::new(rdma_verbs::WithNative::new(page, native))
                 } else {
                     Box::new(page)
                 };

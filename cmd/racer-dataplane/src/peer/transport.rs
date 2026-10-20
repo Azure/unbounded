@@ -2419,16 +2419,7 @@ mod tests {
             let b = signer(&receiver);
             let scope = scope();
             let original = binding(&scope);
-            for phase in [
-                Phase::Accept,
-                Phase::Offer,
-                Phase::Setup,
-                Phase::Ready,
-                Phase::Grant,
-                Phase::Complete,
-                Phase::Done,
-                Phase::Finish,
-            ] {
+            for phase in [Phase::Accept, Phase::Complete, Phase::Finish] {
                 let extensions = phase
                     .fields()
                     .iter()
@@ -2495,7 +2486,7 @@ mod tests {
                 }
                 let previous = if mutation == 6 { [8; 32] } else { [9; 32] };
                 let phase = if mutation == 7 {
-                    Phase::Done
+                    Phase::Finish
                 } else {
                     Phase::Fallback
                 };
@@ -2546,17 +2537,17 @@ mod tests {
         fn control_extension_and_fallback_length_schema_is_closed() {
             let binding = binding(&scope());
             for (phase, length, extensions) in [
-                (Phase::Offer, 0, vec![]),
+                (Phase::Accept, 0, vec![]),
                 (
                     Phase::Complete,
                     0,
                     vec![extension("racer-rdma-completion", b"bad".to_vec())],
                 ),
                 (
-                    Phase::Grant,
+                    Phase::Complete,
                     17,
                     vec![extension(
-                        "racer-rdma-descriptor",
+                        "racer-rdma-complete",
                         p::binary(&[0; 32]).into_bytes(),
                     )],
                 ),

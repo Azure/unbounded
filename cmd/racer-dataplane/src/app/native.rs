@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn default_worker_sizing_funds_native_slots_within_node_budgets() {
+    fn default_worker_sizing_funds_node_wide_native_buffers() {
         let mut config = default_config(true);
         assert_eq!(config.limits.registered_bytes.get(), 96 * 1024 * 1024);
         let mut plan = four_pair_plan(&config);
