@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -104,6 +105,10 @@ func renderOrigin(cache *racerv1.ClusterCache) (originSpec, error) {
 			if c.Default.SecretRef != nil {
 				if c.Default.SecretRef.Name == "" {
 					return originSpec{}, errors.New("spec.origin.azure.credential.default.secretRef.name is required")
+				}
+
+				if errs := validation.IsDNS1123Subdomain(c.Default.SecretRef.Name); len(errs) > 0 {
+					return originSpec{}, fmt.Errorf("spec.origin.azure.credential.default.secretRef.name: %s", strings.Join(errs, "; "))
 				}
 
 				out.envFrom = []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: c.Default.SecretRef.Name}}}}

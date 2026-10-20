@@ -94,9 +94,11 @@ spec:
                                   AZURE_TENANT_ID, and AZURE_CLIENT_SECRET.
                                 properties:
                                   name:
-                                    description: Name of the Secret.
+                                    description: Name of the Secret. It must be a
+                                      DNS-1123 subdomain.
                                     maxLength: 253
                                     minLength: 1
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                                     type: string
                                 required:
                                 - name

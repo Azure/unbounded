@@ -131,11 +131,12 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"http workload": {map[string]any{"origin": withOrigin(func(o map[string]any) {
 			o["azure"] = map[string]any{"accountURL": "http://account", "credential": map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID}}}
 		})}, "accountURL must use https"},
-		"client and secret":   {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID, "secretRef": map[string]any{"name": "azure"}}})}, "clientID and secretRef are mutually exclusive"},
-		"empty secret name":   {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": ""}}})}, "name"},
-		"bad default client":  {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
-		"workload no client":  {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
-		"workload bad tenant": {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
+		"client and secret":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID, "secretRef": map[string]any{"name": "azure"}}})}, "clientID and secretRef are mutually exclusive"},
+		"malformed secret name": {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "bad/name"}}})}, "name"},
+		"empty secret name":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": ""}}})}, "name"},
+		"bad default client":    {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
+		"workload no client":    {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
+		"workload bad tenant":   {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
 	}
 	for name, tc := range invalid {
 		t.Run("rejects "+name, func(t *testing.T) {

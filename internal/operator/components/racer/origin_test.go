@@ -341,6 +341,9 @@ func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
 		{"default-both", func(o *racerv1.ObjectOrigin) {
 			o.Azure.Credential = &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{ClientID: "c", SecretRef: &racerv1.SecretReference{Name: "s"}}}
 		}, "mutually exclusive"},
+		{"secret-slash", secretRefName("bad/name"), "secretRef.name"},
+		{"secret-dots", secretRefName(".."), "secretRef.name"},
+		{"secret-upper", secretRefName("Azure"), "secretRef.name"},
 		{"wi-no-client", func(o *racerv1.ObjectOrigin) {
 			o.Azure.Credential = &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{}}
 		}, "clientID is required"},
@@ -362,6 +365,44 @@ func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
 			require.ErrorContains(t, err, tc.want)
 		})
 	}
+}
+
+func secretRefName(name string) func(*racerv1.ObjectOrigin) {
+	return func(o *racerv1.ObjectOrigin) {
+		o.Azure.Credential = &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{SecretRef: &racerv1.SecretReference{Name: name}}}
+	}
+}
+
+func TestRenderOriginAcceptsValidSecretNames(t *testing.T) {
+	for _, name := range []string{"azure", "azure-creds", "a.b-c.d"} {
+		cache := originCache("cache", nil)
+		secretRefName(name)(cache.Spec.Origin)
+
+		spec, err := renderOrigin(cache)
+		require.NoError(t, err, name)
+		require.Equal(t, name, spec.envFrom[0].SecretRef.Name)
+	}
+}
+
+func TestOriginMalformedSecretRefIsIsolated(t *testing.T) {
+	env := testEnv(t, originCache("bad", nil), originCache("good", nil))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	// The fake client does not enforce the CRD pattern, modeling a cache that bypassed admission.
+	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { secretRefName("bad/name")(c.Spec.Origin) })
+	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.Buckets = append(c.Spec.Origin.Buckets, "more") })
+
+	plan, result := planResult(t, env)
+	require.Equal(t, "OriginInvalid", result.Reason)
+	require.Contains(t, result.Message, "bad (")
+	require.NotContains(t, result.Message, "good")
+
+	dataplaneOp(t, plan)
+	persist(t, env, plan)
+
+	good, _ := liveOrigin(t, env, "good")
+	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--bucket=more")
 }
 
 func TestUnmanagedOriginIsNotAdopted(t *testing.T) {
