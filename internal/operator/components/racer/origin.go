@@ -69,6 +69,10 @@ type originSpec struct {
 	envFrom       []corev1.EnvFromSource
 	saAnnotations map[string]string
 	podLabels     map[string]string
+	// secretDigest digests the data of the credential Secret named by envFrom.
+	// envFrom is resolved only at container start, so the digest makes a
+	// rotated Secret roll the origin Pods.
+	secretDigest string
 }
 
 // renderOrigin validates spec.origin and renders the origin process inputs. It
@@ -182,7 +186,8 @@ func (o originSpec) hash() (string, error) {
 		Env           []corev1.EnvVar        `json:"env"`
 		EnvFrom       []corev1.EnvFromSource `json:"envFrom"`
 		SAAnnotations map[string]string      `json:"saAnnotations"`
-	}{o.args, o.env, o.envFrom, o.saAnnotations})
+		SecretDigest  string                 `json:"secretDigest,omitempty"`
+	}{o.args, o.env, o.envFrom, o.saAnnotations, o.secretDigest})
 	if err != nil {
 		return "", err
 	}
@@ -190,6 +195,52 @@ func (o originSpec) hash() (string, error) {
 	sum := sha256.Sum256(data)
 
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// credentialSecretName returns the credential Secret a cache's origin reads
+// through envFrom, or "" when it reads none.
+func credentialSecretName(cache *racerv1.ClusterCache) string {
+	if cache.Spec.Origin == nil || cache.Spec.Origin.Azure == nil {
+		return ""
+	}
+
+	c := cache.Spec.Origin.Azure.Credential
+	if c == nil || c.Default == nil || c.Default.SecretRef == nil {
+		return ""
+	}
+
+	return c.Default.SecretRef.Name
+}
+
+// credentialDigest digests the data of the credential Secret in the origin
+// namespace without exposing it. A missing Secret digests to "", so creating
+// it later still rolls the origin Pods, which otherwise stay stuck failing to
+// start on the absent envFrom source.
+func credentialDigest(ctx context.Context, env *component.Env, name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+
+	secret := &corev1.Secret{}
+
+	err := env.LiveReader().Get(ctx, objectKey(env, name), secret)
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("get origin credential secret %s: %w", name, err)
+	}
+
+	h := sha256.New()
+
+	keys := slices.Sorted(maps.Keys(secret.Data))
+	for _, k := range keys {
+		h.Write(fmt.Appendf(nil, "%d:%s%d:", len(k), k, len(secret.Data[k])))
+		h.Write(secret.Data[k])
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // originMirror holds the pod template fields an origin copies from the live
@@ -404,6 +455,11 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 		if err != nil {
 			invalid = append(invalid, fmt.Sprintf("%s (%v)", cache.Name, err))
 			continue
+		}
+
+		spec.secretDigest, err = credentialDigest(ctx, env, credentialSecretName(cache))
+		if err != nil {
+			return nil, false, err
 		}
 
 		if !placement {

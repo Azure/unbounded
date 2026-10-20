@@ -574,3 +574,57 @@ func TestOriginPruneProceedsWhileDataplaneWithheld(t *testing.T) {
 	requireNoOrigin(t, env, "stale")
 	liveOrigin(t, env, "keep")
 }
+
+func TestOriginCredentialSecretRotationRollsPods(t *testing.T) {
+	cache := originCache("cache", &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{SecretRef: &racerv1.SecretReference{Name: "creds"}}})
+	env := testEnv(t, cache)
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	hash := func() string {
+		ds, _ := liveOrigin(t, env, "cache")
+		return ds.Spec.Template.Annotations[originConfigHash]
+	}
+
+	missing := hash()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: env.Namespace},
+		Data:       map[string][]byte{"AZURE_CLIENT_SECRET": []byte("one")},
+	}
+	require.NoError(t, env.Client.Create(t.Context(), secret))
+	persist(t, env, planPass(t, env))
+
+	first := hash()
+	require.NotEqual(t, missing, first, "creating the Secret rolls the Pods")
+
+	persist(t, env, planPass(t, env))
+	require.Equal(t, first, hash(), "unchanged Secret keeps the hash")
+
+	secret.Data["AZURE_CLIENT_SECRET"] = []byte("two")
+	require.NoError(t, env.Client.Update(t.Context(), secret))
+	persist(t, env, planPass(t, env))
+
+	rotated := hash()
+	require.NotEqual(t, first, rotated, "rotating the Secret rolls the Pods")
+	require.NotContains(t, rotated, "two")
+
+	require.NoError(t, env.Client.Delete(t.Context(), secret))
+	persist(t, env, planPass(t, env))
+	require.Equal(t, missing, hash())
+}
+
+func TestSecretWatchedMatchesReferencedCredentials(t *testing.T) {
+	cache := originCache("cache", &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{SecretRef: &racerv1.SecretReference{Name: "creds"}}})
+	env := testEnv(t, cache, originCache("anon", nil))
+	match := secretWatched(env)
+
+	secret := func(ns, name string) *corev1.Secret {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
+	}
+
+	require.True(t, match(secret(env.Namespace, tlsName)))
+	require.True(t, match(secret(env.Namespace, "creds")))
+	require.False(t, match(secret("other", "creds")), "other namespace")
+	require.False(t, match(secret(env.Namespace, "unrelated")))
+}

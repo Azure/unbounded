@@ -364,7 +364,7 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(runtimeWorkload(env))))
 	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(runtimeWorkload(env))))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
-	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))
+	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(secretWatched(env))))
 }
 
 // runtimeWorkload matches the dataplane and every origin workload or account.
@@ -372,6 +372,37 @@ func runtimeWorkload(env *component.Env) func(client.Object) bool {
 	dataplane, origin := env.InNamespaceNamed(dataplaneName), env.InNamespaceWithPrefix(originPrefix)
 
 	return func(obj client.Object) bool { return dataplane(obj) || origin(obj) }
+}
+
+// secretWatched matches the TLS Secret and every Secret in the operator
+// namespace that a ClusterCache origin reads its credentials from, so a
+// rotated credential rolls the origin Pods.
+func secretWatched(env *component.Env) func(client.Object) bool {
+	tls := env.InNamespaceNamed(tlsName)
+
+	return func(obj client.Object) bool {
+		if tls(obj) {
+			return true
+		}
+
+		if obj.GetNamespace() != env.Namespace {
+			return false
+		}
+
+		caches := &racerv1.ClusterCacheList{}
+		if err := env.Client.List(context.Background(), caches); err != nil {
+			// Reconcile rather than risk missing a rotation.
+			return true
+		}
+
+		for i := range caches.Items {
+			if credentialSecretName(&caches.Items[i]) == obj.GetName() {
+				return true
+			}
+		}
+
+		return false
+	}
 }
 
 func startupConfigPredicate(env *component.Env) predicate.Predicate {
