@@ -3,8 +3,10 @@
 //! Drives `Volume` (allocate, write, publish, read, commit, mount) the way the
 //! racer dataplane does, on a production-like device plan, and reports where
 //! time goes: device throughput and utilization, per-call latency, commit and
-//! mount cost against index size, pure CPU cost of index operations, and each
+//! mount cost against index size, CPU cost of cached index operations, cold
+//! and hot lookups through a bounded metadata page cache (`lookup`), and each
 //! worker's CPU time and executor loop breakdown against wall time.
+//! `--metadata-cache SIZE` sets the page cache budget of every volume.
 //!
 //! **`--devices` mode overwrites the named block devices. All data on them is
 //! destroyed.** It requires `--destroy-data`.
@@ -18,6 +20,9 @@
 //!     --devices /dev/nvme1n1,/dev/nvme2n1 --destroy-data --workers 2 --scenario write
 //! ./cmd/racer-dataplane/target/release/deps/volume-<hash> \
 //!     --file tmp/slab.dat --file-bytes 2G --scenario all --duration 2
+//! ./cmd/racer-dataplane/target/release/deps/volume-<hash> \
+//!     --file tmp/slab.dat --file-bytes 8G --scenario lookup \
+//!     --lookup-entries 1000000 --metadata-cache 16M --duration 10
 //! ```
 //!
 //! Run with `--help` for every option. Each result prints a table and one
