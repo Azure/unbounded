@@ -666,8 +666,8 @@ impl PendingReceive {
     /// and the envelope's length, then waits for the page. A failed arrival after
     /// a signed completion is `Io`: the HTTP body was never sent.
     ///
-    /// Stage 3 copies the registered page into an owned ciphertext buffer here;
-    /// stage 4 keeps it in registered memory.
+    /// The ciphertext stays in registered memory; retaining paths copy it out
+    /// (`BufferPool::retainable`).
     pub async fn finish(
         self,
         head: &VerifiedHead,
@@ -705,9 +705,7 @@ impl PendingReceive {
         if page.len() != length as usize {
             return Err(Error::InvalidRange);
         }
-        let bytes = page.bytes().to_vec();
-        drop(page);
-        BufferPool::new(admission.clone()).ciphertext(reservation, envelope, bytes)
+        BufferPool::new(admission.clone()).registered_ciphertext(reservation, envelope, page)
     }
 }
 

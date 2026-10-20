@@ -540,7 +540,7 @@ impl Transfers {
                 .await;
         }
         let (admission, _) = &self.wire;
-        // Stage 4 keeps the arrival in registered memory instead of copying it.
+        // The arrival stays in registered memory; retaining paths copy it out.
         let page = pending
             .finish(&verified, envelope, admission, &native_scope(scope))
             .await?;
@@ -1727,7 +1727,12 @@ mod tests {
         }
 
         struct PageOutcome {
-            result: Result<SignedResponse>,
+            /// Received page bytes; the response is dropped before `free`.
+            result: Result<Vec<u8>>,
+            /// The received ciphertext was still in registered memory.
+            registered: bool,
+            /// Free buffers while the response was still held.
+            held: (Option<usize>, Option<usize>),
             sent: Result<bool>,
             completed: usize,
             fallbacks: usize,
@@ -2033,25 +2038,38 @@ mod tests {
                 }
             };
             crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+            let free = |w: &crate::rdma::links::tests::World| {
+                (
+                    w.a.links.buffers(RailId(7), rdma_verbs::BufferState::Free),
+                    w.b.links.buffers(RailId(7), rdma_verbs::BufferState::Free),
+                )
+            };
+            let held = free(&w);
+            let registered = matches!(
+                &result,
+                Ok(SignedResponse { response: PeerResponse::Page { ciphertext, .. }, .. })
+                    if ciphertext.is_registered()
+            );
+            let result = result.map(|response| match &response.response {
+                PeerResponse::Page { ciphertext, .. } => ciphertext.bytes().to_vec(),
+                _ => panic!("expected page"),
+            });
+            crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
             PageOutcome {
                 result,
+                registered,
+                held,
                 sent,
                 completed: sender.native_completed.get(),
                 fallbacks: sender.native_fallbacks.get(),
                 completions: receiver.native_completions.get(),
                 released: released.get(),
-                free: (
-                    w.a.links.buffers(RailId(7), rdma_verbs::BufferState::Free),
-                    w.b.links.buffers(RailId(7), rdma_verbs::BufferState::Free),
-                ),
+                free: free(&w),
             }
         }
 
-        fn page_bytes(result: &Result<SignedResponse>) -> Vec<u8> {
-            match &result.as_ref().expect("page").response {
-                PeerResponse::Page { ciphertext, .. } => ciphertext.bytes().to_vec(),
-                _ => panic!("expected page"),
-            }
+        fn page_bytes(result: &Result<Vec<u8>>) -> Vec<u8> {
+            result.as_ref().expect("page").clone()
         }
 
         #[test]
@@ -2070,6 +2088,11 @@ mod tests {
                         (1, 0, 1),
                         "HTTP fallback cannot pass a native success test"
                     );
+                    // The response held the receiver's buffer without a copy;
+                    // dropping it returned the buffer.
+                    assert!(outcome.registered);
+                    // `w.a` is always the receiving node.
+                    assert_eq!(outcome.held, (Some(1), Some(2)));
                     assert_eq!(outcome.free, (Some(2), Some(2)));
                 }
             }

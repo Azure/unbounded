@@ -597,7 +597,7 @@ impl StoreWriter {
     /// map borrow may span it because it can release other unsubmitted copies.
     pub(crate) fn enqueue_reclaiming(
         &self,
-        page: CiphertextCopy,
+        mut page: CiphertextCopy,
         dirty: flow_control::Charge<AdmissionPolicy>,
         reserve_staging: impl FnOnce(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<u64> {
@@ -644,8 +644,11 @@ impl StoreWriter {
             }
             return Ok(existing.ticket);
         }
-        let full = pending.len() >= self.capacity.get();
         drop(pending);
+        // The queue outlives the request: never pin a registered RDMA buffer.
+        page.ciphertext =
+            crate::memory::BufferPool::new(self.admission.clone()).retainable(page.ciphertext)?;
+        let full = self.pending.borrow().len() >= self.capacity.get();
         if full {
             let retention = self.retention();
             let victim = self

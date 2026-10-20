@@ -93,6 +93,14 @@ pub(crate) enum CiphertextStorage {
         buffer: page_alloc::FrozenBuffer<flow_control::Charge<AdmissionPolicy>>,
         range: std::ops::Range<usize>,
     },
+    /// A received RDMA page still in registered pool memory. Request-scoped
+    /// only: every retaining path copies it out (see `retainable`) so pool
+    /// buffers are never pinned by caches or write queues. Dropping it on any
+    /// thread returns the buffer to the pool.
+    Registered {
+        page: rdma_verbs::RegisteredPage,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+    },
 }
 
 impl From<flow_control::ChargedBytes<AdmissionPolicy>> for CiphertextStorage {
@@ -106,12 +114,14 @@ impl CiphertextBytes {
         match &self.storage {
             CiphertextStorage::Owned(storage) => &storage.reservation,
             CiphertextStorage::Slab { buffer, .. } => buffer.charge(),
+            CiphertextStorage::Registered { reservation, .. } => reservation,
         }
     }
     pub(crate) fn capacity(&self) -> usize {
         match &self.storage {
             CiphertextStorage::Owned(storage) => storage.bytes.capacity(),
             CiphertextStorage::Slab { buffer, .. } => buffer.capacity(),
+            CiphertextStorage::Registered { page, .. } => page.len(),
         }
     }
 }
@@ -125,6 +135,7 @@ impl std::ops::Deref for CiphertextBytes {
         match &self.storage {
             CiphertextStorage::Owned(storage) => storage,
             CiphertextStorage::Slab { .. } => panic!("slab ciphertext is immutable"),
+            CiphertextStorage::Registered { .. } => panic!("registered ciphertext is immutable"),
         }
     }
 }
@@ -136,6 +147,7 @@ impl std::ops::DerefMut for CiphertextBytes {
         match &mut self.storage {
             CiphertextStorage::Owned(storage) => storage,
             CiphertextStorage::Slab { .. } => panic!("slab ciphertext is immutable"),
+            CiphertextStorage::Registered { .. } => panic!("registered ciphertext is immutable"),
         }
     }
 }
@@ -187,6 +199,47 @@ impl BufferPool {
                 storage: flow_control::ChargedBytes { bytes, reservation }.into(),
             }),
         })
+    }
+    /// Wrap a received registered page without copying. The reservation
+    /// covers exactly the received length, the page's visible capacity.
+    pub(crate) fn registered_ciphertext(
+        &self,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        envelope: PageEnvelope,
+        page: rdma_verbs::RegisteredPage,
+    ) -> Result<CiphertextPage> {
+        envelope.validate()?;
+        if page.len() != envelope.ciphertext_length as usize {
+            return Err(Error::CorruptRecord);
+        }
+        self.validate_reservation(
+            &reservation,
+            ResourceClass::Ciphertext,
+            page.len(),
+            Some(&envelope.page.version.object.cache),
+        )?;
+        Ok(CiphertextPage {
+            provenance: None,
+            inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
+                envelope,
+                storage: CiphertextStorage::Registered { page, reservation },
+            }),
+        })
+    }
+    /// Copy registered ciphertext into owned bytes under a fresh charge before
+    /// retaining it; other storage is returned unchanged. Reserve before any
+    /// cache borrow because admission may reclaim.
+    pub(crate) fn retainable(&self, ciphertext: CiphertextPage) -> Result<CiphertextPage> {
+        if !ciphertext.is_registered() {
+            return Ok(ciphertext);
+        }
+        let reservation = self.admission.reserve(
+            Some(&ciphertext.envelope().page.version.object.cache),
+            ResourceClass::Ciphertext,
+            ciphertext.bytes().len(),
+        )?;
+        ciphertext.rehome(reservation)
     }
     pub(crate) fn slab_ciphertext(
         &self,
@@ -282,10 +335,14 @@ impl CiphertextPage {
         if reservation.key() != Some(&self.envelope().page.version.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+        // Registered pages always copy out: retaining them would pin pool buffers.
+        if !self.is_registered()
+            && let Some(inner) = Arc::get_mut(&mut self.inner)
+        {
             match &mut inner.storage {
                 CiphertextStorage::Owned(storage) => storage.reservation = reservation,
                 CiphertextStorage::Slab { buffer, .. } => buffer.rebind(reservation)?,
+                CiphertextStorage::Registered { .. } => unreachable!(),
             }
             return Ok(self);
         }
@@ -336,7 +393,12 @@ impl CiphertextPage {
         match &self.inner.storage {
             CiphertextStorage::Owned(storage) => &storage.bytes,
             CiphertextStorage::Slab { buffer, range } => &buffer.as_slice()[range.clone()],
+            CiphertextStorage::Registered { page, .. } => page.bytes(),
         }
+    }
+    /// Whether the bytes still live in a registered RDMA pool buffer.
+    pub(crate) fn is_registered(&self) -> bool {
+        matches!(self.inner.storage, CiphertextStorage::Registered { .. })
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
@@ -642,7 +704,7 @@ impl MemoryCache {
         }
         Ok(entries.get(page).cloned())
     }
-    pub(crate) fn publish_ciphertext(&self, page: UnverifiedPage) -> Result<()> {
+    pub(crate) fn publish_ciphertext(&self, mut page: UnverifiedPage) -> Result<()> {
         self.pool.validate_ciphertext(&page.copy)?;
         let id = &page.copy.ciphertext.envelope().page;
         if !self.availability.page(
@@ -651,6 +713,11 @@ impl MemoryCache {
         ) {
             return Err(Error::MissingKey);
         }
+        if self.ciphertext_entries.borrow().contains_key(id) {
+            return Ok(());
+        }
+        page.copy.ciphertext = self.pool.retainable(page.copy.ciphertext)?;
+        let id = &page.copy.ciphertext.envelope().page;
         let mut entries = self.ciphertext_entries.borrow_mut();
         if entries.contains_key(id) {
             return Ok(());
@@ -664,8 +731,13 @@ impl MemoryCache {
     pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
         let id = &page.copy.ciphertext.envelope().page;
         let mut entries = self.ciphertext_entries.borrow_mut();
+        // A registered page was copied out on publish, so match its contents.
+        let registered = page.copy.ciphertext.is_registered();
         if entries.get(id).is_some_and(|entry| {
             Arc::ptr_eq(&entry.copy.ciphertext.inner, &page.copy.ciphertext.inner)
+                || (registered
+                    && entry.copy.ciphertext.envelope() == page.copy.ciphertext.envelope()
+                    && entry.copy.ciphertext.bytes() == page.copy.ciphertext.bytes())
         }) {
             entries.remove(id);
         }
@@ -675,7 +747,18 @@ impl MemoryCache {
         self.pool.validate_page(&page)?;
         self.publish_validated(page)
     }
-    fn publish_validated(&self, page: PageResult) -> Result<()> {
+    fn publish_validated(&self, mut page: PageResult) -> Result<()> {
+        // Copy registered ciphertext out before retaining it; a duplicate is
+        // rejected or ignored below and keeps the original entry.
+        if page.ciphertext.is_registered()
+            && !self
+                .entries
+                .borrow()
+                .pages
+                .contains_key(page.plaintext.page())
+        {
+            page.ciphertext = self.pool.retainable(page.ciphertext)?;
+        }
         let id = page.plaintext.page();
         self.ciphertext_entries.borrow_mut().remove(id);
         if !self.availability.cache(&id.version.object.cache) {
@@ -1662,14 +1745,12 @@ pub(crate) mod tests {
         }
     }
 
-    pub(in crate::memory) fn admission(
-        entries: usize,
-    ) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
+    pub(crate) fn admission(entries: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.metadata_entries = std::num::NonZeroUsize::new(entries).unwrap();
         Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)))
     }
-    pub(in crate::memory) fn bundle(
+    pub(crate) fn bundle(
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         version: &str,
     ) -> PageResult {
@@ -2255,7 +2336,7 @@ pub(crate) mod tests {
         use flow_control::Quotas;
         use std::task::Waker;
 
-        pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
+        pub(crate) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
             let small = std::num::NonZeroUsize::new(8).unwrap();
             let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
             Rc::new(Quotas::new(AdmissionPolicy::new(Limits {
