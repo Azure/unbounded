@@ -2,8 +2,11 @@
 //!
 //! See `designs/racer-extent-volume.md`.
 
+mod btree;
 mod format;
 mod node;
+mod page;
+mod pager;
 mod slots;
 mod store;
 mod superblock;

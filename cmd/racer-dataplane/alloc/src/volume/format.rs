@@ -28,8 +28,27 @@ pub const SUPERBLOCK_A_UNIT: u16 = 0;
 /// Unit of superblock B in the meta slot.
 pub const SUPERBLOCK_B_UNIT: u16 = 1;
 
-/// First unit in the meta slot that may hold a tree node.
-pub const META_FIRST_NODE_UNIT: u16 = 2;
+/// First unit in the meta slot that may hold a metadata page. Units 2 and 3
+/// hold the meta slot's two bitmap copies.
+pub const META_FIRST_NODE_UNIT: u16 = 4;
+
+/// First unit in other node slots that may hold a metadata page. Units 0 and
+/// 1 hold the slot's two bitmap copies.
+pub const NODE_FIRST_UNIT: u16 = 2;
+
+/// First unit of `slot` that may hold a metadata page.
+pub fn first_page_unit(slot: u32) -> u16 {
+    if slot == META_SLOT {
+        META_FIRST_NODE_UNIT
+    } else {
+        NODE_FIRST_UNIT
+    }
+}
+
+/// Unit of bitmap copy `copy` (0 or 1) of node slot `slot`.
+pub fn bitmap_unit(slot: u32, copy: u8) -> u16 {
+    first_page_unit(slot) - 2 + u16::from(copy)
+}
 
 /// Size classes in units. The last class is a whole slot.
 pub const CLASSES: [u32; 23] = [
@@ -121,7 +140,7 @@ impl NodeAddr {
         !self.is_none()
             && u64::from(self.slot()) < slot_count
             && u32::from(self.unit()) < SLOT_UNITS
-            && !(self.slot() == META_SLOT && self.unit() < META_FIRST_NODE_UNIT)
+            && self.unit() >= first_page_unit(self.slot())
     }
 }
 
@@ -349,7 +368,12 @@ mod tests {
         assert!(!addr.valid_for(3));
         assert!(!NodeAddr::NONE.valid_for(u64::MAX));
         assert!(!NodeAddr::new(META_SLOT, SUPERBLOCK_B_UNIT).valid_for(4));
+        assert!(!NodeAddr::new(META_SLOT, 3).valid_for(4));
         assert!(NodeAddr::new(META_SLOT, META_FIRST_NODE_UNIT).valid_for(4));
+        assert!(!NodeAddr::new(2, 1).valid_for(4));
+        assert!(NodeAddr::new(2, NODE_FIRST_UNIT).valid_for(4));
+        assert_eq!((bitmap_unit(0, 0), bitmap_unit(0, 1)), (2, 3));
+        assert_eq!((bitmap_unit(5, 0), bitmap_unit(5, 1)), (0, 1));
         assert!(!NodeAddr::new(1, 4104).valid_for(4));
     }
 
