@@ -46,8 +46,8 @@ const (
 	bulkQueue             = 128
 	smallConnections      = 4
 	smallQueue            = 128
-	statConnections       = 4
-	statQueue             = 16
+	statConnections       = 64
+	statQueue             = 256
 	// pageCredits is the number of pages Racer may send ahead of the reader.
 	pageCredits = 2
 )
