@@ -113,13 +113,6 @@ const WC_IMM: u32 = 1;
 const ABI_VERSION: u32 = 2;
 
 /// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
 pub(crate) mod opcode {
     /// `IBV_WC_SEND`.
     pub(crate) const SEND: u32 = 0;
@@ -140,14 +133,8 @@ pub(crate) mod opcode {
     pub(crate) const RECV_RDMA_WITH_IMM: u32 = 129;
 }
 
-/// Completion statuses (`enum ibv_wc_status`) the crate names.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
+/// Completion statuses (`enum ibv_wc_status`) the tests name.
+#[cfg(test)]
 pub(crate) mod status {
     /// `IBV_WC_WR_FLUSH_ERR`.
     pub(crate) const WR_FLUSH_ERR: u32 = 5;
@@ -163,13 +150,6 @@ pub(crate) mod status {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Access(u32);
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
 impl Access {
     /// Page buffers: `LOCAL_WRITE | MW_BIND`. Remote writes only via windows.
     pub(crate) const PAGES: Self = Self(1);
@@ -177,8 +157,8 @@ impl Access {
     /// Control slots: `LOCAL_WRITE` only.
     pub(crate) const CONTROL: Self = Self(2);
 
-    /// Page buffers plus `REMOTE_WRITE` on the region itself. The slot path
-    /// and the `mr_remote_write` escape hatch use this.
+    /// Page buffers plus `REMOTE_WRITE` on the region itself. The
+    /// `mr_remote_write` escape hatch uses this.
     pub(crate) const PAGES_REMOTE_WRITE: Self = Self(1 | 4);
 
     /// The raw ABI value.
@@ -221,14 +201,14 @@ pub(crate) struct Failure {
 /// Build the [`Api`] function table and its symbol loader from a list of
 /// `rdma_verbs_<name>` functions.
 macro_rules! native_api {
-    ($($field:ident: $signature:ty),* $(,)?) => {
+    ($($(#[$meta:meta])* $field:ident: $signature:ty),* $(,)?) => {
         /// The C adapter's functions. Every native object holds an `Rc` to it
         /// so the library stays loaded.
-        #[cfg_attr(not(test), allow(dead_code, reason = "the ranged API is used by the link layer from stage 2"))]
         struct Api {
             library: Option<NonNull<c_void>>,
 
             $(
+                $(#[$meta])*
                 $field: $signature,
 
             )*
@@ -281,6 +261,9 @@ native_api! {
 
     invalidate: unsafe extern "C" fn(*mut c_void, u32, u64) -> c_int,
 
+    /// Plain RDMA write. Links only write with immediate; the adapter and
+    /// simulator tests still drive this to check window and fence rules.
+    #[cfg_attr(not(test), allow(dead_code, reason = "only adapter tests post plain writes"))]
     write: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32) -> c_int,
 
     write_imm: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32, u32, u64) -> c_int,
@@ -502,14 +485,7 @@ fn discover_with_api(
 /// A registered memory buffer (MR) the NIC can read and write.
 ///
 /// `busy` is set while the NIC may touch it. The CPU may not copy in or out
-/// while busy. Holds the slot's guard and leaks it if deregister fails.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
+/// while busy. Holds the node's guard and leaks it if deregister fails.
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
 
@@ -529,7 +505,8 @@ pub(crate) struct NativeRegion {
 }
 
 impl NativeRegion {
-    /// Allocate and register `length` bytes for the slot path:
+    #[cfg(test)]
+    /// Allocate and register `length` bytes for the test harness:
     /// [`Access::PAGES_REMOTE_WRITE`], at most `u32::MAX` bytes.
     pub(crate) fn new(
         device: Rc<NativeDevice>,
@@ -544,7 +521,7 @@ impl NativeRegion {
 
     /// Allocate and register `length` bytes with `access`.
     ///
-    /// The `busy` flag, `resize`, and the copy helpers serve the slot path.
+    /// The `busy` flag, `resize`, and the copy helpers serve the test harness.
     /// Ranged posts ([`NativeQueuePair::send`], [`NativeQueuePair::post_recv`],
     /// [`NativeQueuePair::write_imm`], [`NativeQueuePair::bind_window`]) do not
     /// track per-range ownership; their caller must.
@@ -575,19 +552,11 @@ impl NativeRegion {
     /// The start of the registered buffer, valid while `self` lives.
     ///
     /// The caller must not read or write any range the NIC may still access.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the stage 2 page pool uses it"))]
     pub(crate) fn as_ptr(&self) -> *mut u8 {
         unsafe { (self.device.api.bytes)(self.raw.as_ptr()) }
     }
 
     /// True if `[offset, offset + length)` is a nonempty range of the region.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the ranged API is used by the link layer from stage 2"
-        )
-    )]
     fn contains(&self, offset: u64, length: u32) -> bool {
         length != 0
             && offset
@@ -609,6 +578,7 @@ impl NativeRegion {
         self.used.get()
     }
 
+    #[cfg(test)]
     /// Set bytes in use. Not while busy.
     pub(crate) fn resize(&self, length: usize) -> Result<()> {
         if self.busy.get() || length == 0 || length > self.length {
@@ -618,21 +588,7 @@ impl NativeRegion {
         Ok(())
     }
 
-    /// Copy the buffer out. Not while busy.
-    pub(crate) fn copy_into(&self, bytes: &mut [u8]) -> Result<()> {
-        if self.busy.get() || bytes.len() != self.length() {
-            return Err(Error::Unavailable);
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (self.device.api.bytes)(self.raw.as_ptr()),
-                bytes.as_mut_ptr(),
-                bytes.len(),
-            );
-        }
-        Ok(())
-    }
-
+    #[cfg(test)]
     /// Copy into the buffer. Not while busy.
     pub(crate) fn copy_from(&self, bytes: &[u8]) -> Result<()> {
         if self.busy.get() || bytes.len() != self.length() {
@@ -644,17 +600,6 @@ impl NativeRegion {
                 (self.device.api.bytes)(self.raw.as_ptr()),
                 self.length(),
             );
-        }
-        Ok(())
-    }
-
-    /// Clear the full allocation, not just the active range. Not while busy.
-    pub(crate) fn clear(&self) -> Result<()> {
-        if self.busy.get() {
-            return Err(Error::Unavailable);
-        }
-        unsafe {
-            std::ptr::write_bytes((self.device.api.bytes)(self.raw.as_ptr()), 0, self.length);
         }
         Ok(())
     }
@@ -690,6 +635,10 @@ pub(crate) struct Window {
     raw: NonNull<c_void>,
 
     /// Remote key for the peer.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "only the test harness binds whole-region windows")
+    )]
     pub(crate) key: u32,
 
     region: Rc<NativeRegion>,
@@ -712,13 +661,6 @@ impl Drop for Window {
 /// stale key from an earlier grant never matches. The window keeps the last
 /// region it was bound to alive until it is freed, because the NIC may still
 /// accept writes through it.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
 pub(crate) struct MemoryWindow {
     device: Rc<NativeDevice>,
 
@@ -730,13 +672,6 @@ pub(crate) struct MemoryWindow {
     region: RefCell<Option<Rc<NativeRegion>>>,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
 impl MemoryWindow {
     /// Allocate a window on `device`.
     pub(crate) fn new(device: &Rc<NativeDevice>) -> Result<Rc<Self>> {
@@ -751,19 +686,13 @@ impl MemoryWindow {
         }))
     }
 
+    #[cfg(test)]
     /// The key the next bind will use.
     pub(crate) fn next_key(&self) -> u32 {
         self.next_key.get()
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
 /// `ibv_inc_rkey`: bump the low 8 key bits, keep the 24-bit index.
 pub(crate) fn inc_rkey(key: u32) -> u32 {
     (key & 0xffff_ff00) | (key.wrapping_add(1) & 0xff)
@@ -785,7 +714,7 @@ impl Drop for MemoryWindow {
 }
 
 /// Caller-chosen work request ids must set at least one of these bits, so
-/// they never collide with the ids the slot path assigns from 1 upward.
+/// they never collide with the ids the test harness assigns from 1 upward.
 pub(crate) const CALLER_ID_MASK: u64 = 0xff << 56;
 
 /// Where a work request's result lands.
@@ -799,6 +728,7 @@ struct TicketState {
 pub(crate) struct Ticket(Rc<TicketState>);
 
 impl Ticket {
+    #[cfg(test)]
     /// The result, or `None` if still in flight.
     pub(crate) fn result(&self) -> Option<Result<()>> {
         self.0.result.get()
@@ -808,7 +738,7 @@ impl Ticket {
 /// A posted work request. Keeps its region and window alive until it
 /// completes or the QP stops.
 struct Pending {
-    /// Set for slot-path work; ranged posts report through `progress_with`.
+    /// Set for test-harness work; ranged posts report through `progress_with`.
     ticket: Option<Ticket>,
 
     /// Expected completion opcode. Ignored for receives.
@@ -864,15 +794,8 @@ impl Pending {
 ///
 /// Tracks posted work (up to 32) and the bound window. [`Self::stop`] is the
 /// only way to be sure the NIC is done with its memory.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
 pub(crate) struct NativeQueuePair {
-    /// Keeps every QP, CQ, and probe leak charged to its slot.
+    /// Keeps every QP, CQ, and probe leak charged to its owner.
     quota: Arc<GuardOwner>,
 
     /// Publishes successful DMA stop even when it occurs during destructor retry.
@@ -893,6 +816,7 @@ pub(crate) struct NativeQueuePair {
     connected: Cell<bool>,
 
     /// Next work request ID.
+    #[cfg(test)]
     next: Cell<u64>,
 
     /// Posted work by ID.
@@ -929,7 +853,8 @@ impl NativeQueuePair {
         )
     }
 
-    /// Create a slot-path QP with its slot's charge and a random starting
+    #[cfg(test)]
+    /// Create a test-harness QP with a charge and a random starting
     /// PSN: 64 send WRs (32 tracked at once) and one receive WR.
     pub(crate) fn new_charged(
         device: Rc<NativeDevice>,
@@ -994,6 +919,7 @@ impl NativeQueuePair {
             stopped: Cell::new(false),
             terminating: Cell::new(false),
             connected: Cell::new(false),
+            #[cfg(test)]
             next: Cell::new(1),
             pending: RefCell::new(BTreeMap::new()),
             send_capacity: capacity.0,
@@ -1031,21 +957,6 @@ impl NativeQueuePair {
         &self.device
     }
 
-    /// Check the device can create memory windows, by making and freeing one.
-    pub(crate) fn probe_window(&self) -> Result<()> {
-        let mut key = 0;
-        let window =
-            NonNull::new(unsafe { (self.device.api.window)(self.device.raw.as_ptr(), &mut key) })
-                .ok_or(Error::Unavailable)?;
-        if unsafe { (self.device.api.window_free)(window.as_ptr()) } != 0 {
-            self.quota.quarantine();
-            std::mem::forget(self.quota.clone());
-            std::mem::forget(self.device.clone());
-            return Err(Error::Io);
-        }
-        Ok(())
-    }
-
     /// True if connected and not stopping.
     pub(crate) fn ready(&self) -> bool {
         self.connected.get() && !self.stopped.get() && !self.terminating.get()
@@ -1063,6 +974,7 @@ impl NativeQueuePair {
         self.expires.set(Some(deadline));
     }
 
+    #[cfg(test)]
     /// Record a work request before posting it. Up to 32 at once.
     fn reserve(
         &self,
@@ -1133,6 +1045,7 @@ impl NativeQueuePair {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Open `region` to remote writes through a new window. One window at a
     /// time. The region stays busy until the QP stops.
     pub(crate) fn bind(&self, region: Rc<NativeRegion>) -> Result<(Rc<Window>, Ticket)> {
@@ -1174,6 +1087,7 @@ impl NativeQueuePair {
         Ok((window, ticket))
     }
 
+    #[cfg(test)]
     /// Revoke `window`. The region stays busy until the QP stops.
     pub(crate) fn invalidate(&self, window: Rc<Window>) -> Result<Ticket> {
         if !self.windows.borrow().iter().any(|w| Rc::ptr_eq(w, &window)) {
@@ -1185,6 +1099,7 @@ impl NativeQueuePair {
         Ok(ticket)
     }
 
+    #[cfg(test)]
     /// Write `region` to the peer at `address` with `key`. The region is busy
     /// until the write completes.
     pub(crate) fn write(&self, region: Rc<NativeRegion>, address: u64, key: u32) -> Result<Ticket> {
@@ -1211,6 +1126,7 @@ impl NativeQueuePair {
         Ok(ticket)
     }
 
+    #[cfg(test)]
     /// Read up to 32 completions without blocking. Returns how many.
     ///
     /// Any failed or unexpected completion stops the QP and returns
@@ -1303,13 +1219,6 @@ impl NativeQueuePair {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the ranged API is used by the link layer from stage 2"
-    )
-)]
 impl NativeQueuePair {
     /// Create a QP with `send_depth` send and `recv_depth` receive WRs, and
     /// a CQ for both. Both depths must be nonzero.
@@ -1913,18 +1822,6 @@ pub(crate) mod lifetime_tests {
     /// Queue a full completion record for the next fixture progress call.
     fn push(completion: Completion) {
         FAULTS.with_borrow_mut(|f| f.cq.push_back(completion));
-    }
-
-    /// Enable or clear repeated terminal-fence failures.
-    pub(crate) fn fail_stop(fail: bool) {
-        FAULTS.with_borrow_mut(|f| f.stop_fails = fail);
-    }
-
-    /// Create an unconnected queue pair alongside charged source memory.
-    pub(crate) fn fresh_fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
-        let (qp, region, charged) = fixture();
-        let fresh = NativeQueuePair::new(qp.device.clone()).unwrap();
-        (fresh, region, charged)
     }
 
     #[test]
