@@ -335,7 +335,7 @@ mod tests {
             .collect();
         assert_eq!(
             values.len(),
-            13 + usize::from(values.contains_key("RACER_MAX_THREADS"))
+            14 + usize::from(values.contains_key("RACER_MAX_THREADS"))
         );
         let mut config = Config::from_lookup(|name| {
             Ok(values

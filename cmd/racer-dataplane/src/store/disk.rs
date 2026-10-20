@@ -455,7 +455,8 @@ impl Index {
             })
     }
 
-    /// Reserve a record, reopening partly filled slots and evicting at most
+    /// Reserve a record, committing first when the volume's dirty limit is
+    /// reached, then reopening partly filled slots and evicting at most
     /// [`EVICTION_BUDGET`] slots with the volume CLOCK. Fails with
     /// `Overloaded` when no space can be found.
     pub(super) async fn allocate(
@@ -465,6 +466,12 @@ impl Index {
         scope: &RequestScope,
     ) -> Result<Reservation> {
         let (volume, reactor) = self.io().ok_or(Error::Unavailable)?;
+        // A full overlay of uncommitted changes makes allocation return
+        // `Busy` until a commit drains it. Commit here (concurrent writers
+        // share the attempt) instead of failing or spinning.
+        if volume.needs_commit() {
+            volume.commit(&*reactor, scope).await?;
+        }
         let (result, evicted) = volume
             .allocate_evicting(&*reactor, tier, length, now_unix(), EVICTION_BUDGET, scope)
             .await?;

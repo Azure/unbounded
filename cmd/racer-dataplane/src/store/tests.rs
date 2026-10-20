@@ -4179,7 +4179,7 @@ mod continuous_writer {
         let held_id = held.ciphertext.envelope().page.clone();
         let index = f.store.writer.index();
         let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-        index.reserve_hold(&held_id.version, 1, until).unwrap();
+        index.reserve_hold_now(&held_id.version, 1, until).unwrap();
         let request = scope();
         let mut persist = f.store.writer.persist_held(held, &request);
         // The held page takes the lane the fast write frees and publishes

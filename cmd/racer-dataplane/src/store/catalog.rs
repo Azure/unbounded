@@ -1243,4 +1243,31 @@ mod tests {
         assert_eq!(index.disk_len(), 1);
         assert!(index.lookup(&page(&new, 0)).unwrap().is_some());
     }
+
+    #[test]
+    fn allocation_commits_when_the_dirty_limit_is_reached() {
+        let index = index(4096);
+        let disk = TestDisk::mount(&index, 8);
+        let metadata = descriptor("dirty", crate::model::PAGE_BYTES * 8192);
+        let volume = index.volume().unwrap();
+        let mut number = 0;
+        while !volume.needs_commit() {
+            disk.put(
+                &index,
+                &page(&metadata, number),
+                &metadata,
+                key_id(),
+                Tier::Cache,
+            );
+            number += 1;
+        }
+        assert_eq!(
+            volume.allocate(Tier::Cache, 4096).err(),
+            Some(page_alloc::Error::Busy)
+        );
+        let attempts = volume.commit_stats().attempts;
+        drop(index.allocate_now(Tier::Cache, 4096).unwrap());
+        assert!(volume.commit_stats().attempts > attempts);
+        assert!(!volume.needs_commit());
+    }
 }

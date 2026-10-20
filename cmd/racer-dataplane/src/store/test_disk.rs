@@ -64,7 +64,7 @@ impl TestDisk {
     /// and install it into `index`.
     pub(crate) fn remount(&self, index: &Index) {
         let admission = self.admission.clone();
-        let options = VolumeOptions::new(
+        let mut options = VolumeOptions::new(
             index.volume_limits(self.slab.capacity_bytes() / SLOT_BYTES),
             [7; 16],
             true,
@@ -74,6 +74,8 @@ impl TestDisk {
                     .map_err(|_| page_alloc::Error::Busy)
             }),
         );
+        // Small enough for tests to reach the dirty limit.
+        options.dirty_bytes = 1 << 20;
         let scope = scope();
         let (volume, report) = self
             .drive(Volume::mount(
