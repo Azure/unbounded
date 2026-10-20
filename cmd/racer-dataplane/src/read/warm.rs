@@ -252,9 +252,7 @@ impl WarmRegistry {
             .map_or(0, |(_, entry)| entry.len())
     }
 
-    /// Pages a remote primary owner holds are not stored on this node.
-    /// Starts a job whose pages are all held by remote primary owners and
-    /// publishes the first `frontier` pages.
+    /// Starts a job whose pages are all held by remote primary owners.
     #[cfg(test)]
     pub(crate) fn begin_remote(
         &self,
@@ -268,17 +266,19 @@ impl WarmRegistry {
             node,
             membership,
             local: vec![0; usize::try_from(pages.div_ceil(64)).unwrap()],
-            counts: BTreeMap::new(),
+            held: BTreeMap::new(),
             remote: Vec::new(),
         }));
         Ok(job)
     }
 
+    /// Publishes the first `frontier` pages of a test job.
     #[cfg(test)]
     pub(crate) fn publish_through(job: &Job, frontier: u64) {
         job.update(|progress| progress.frontier = frontier);
     }
 
+    /// Pages a remote primary owner holds are not stored on this node.
     pub(crate) fn is_local_page(&self, page: &PageId) -> bool {
         let job = self.jobs.lock().unwrap().get(&page.version).cloned();
         job.and_then(|job| job.plan.lock().unwrap().clone())
