@@ -1574,6 +1574,58 @@ mod socket {
         assert!(drive(&reactor, watch).is_err());
     }
 
+    #[cfg(feature = "simulation")]
+    #[test]
+    /// Nonzero waits check scope deadlines in the reactor's captured clock, not
+    /// in whichever environment the caller selected before waiting.
+    fn wait_scans_cancellations_in_reactor_environment() {
+        for expired in [false, true] {
+            let sim = simulation::Simulation::new();
+            let _sim = sim.enter();
+            let reactor_clock = crate::environment::SimulationClock::new(5);
+            let caller_clock = crate::environment::SimulationClock::new(6);
+            let reactor_environment = reactor_clock.environment(0);
+            let entered = reactor_environment.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
+            reactor.init().unwrap();
+            let request =
+                RequestScope::new((), crate::environment::now() + Duration::from_secs(1)).unwrap();
+            let (fd, _peer) = sim.socket_pair();
+            let mut watch = reactor.readiness(Rc::new(fd), libc::POLLHUP as u32, &request);
+            assert!(poll(&mut watch).is_pending());
+            reactor.wait(Duration::ZERO).unwrap();
+            drop(entered);
+
+            // Expire the deadline in exactly one of the two clocks.
+            if expired {
+                reactor_clock.advance(Duration::from_secs(3600));
+            } else {
+                caller_clock.advance(Duration::from_secs(3600));
+            }
+            let caller = caller_clock.environment(0).enter();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+            drop(caller);
+
+            let state = reactor.state.borrow();
+            let entry = state.entries.first_key_value().unwrap().1;
+            assert_eq!(
+                entry.completion.needs_cancel(),
+                !expired,
+                "wait must check the deadline in the reactor's clock (expired: {expired})"
+            );
+            assert_eq!(
+                entry.cancel_reason,
+                expired.then_some(Error::DeadlineExceeded)
+            );
+            drop(state);
+
+            let _reactor = reactor_environment.enter();
+            request.cancel().unwrap();
+            assert!(drive(&reactor, watch).is_err());
+            assert_eq!(reactor.in_flight(), 0);
+        }
+    }
+
     #[test]
     /// Retry accept publication after SQ pressure without disturbing unrelated owners.
     fn listener_retry_recovers_from_full_sq_without_losing_owners() {

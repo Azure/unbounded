@@ -1785,6 +1785,9 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         // fenced operation completes only after ASYNC_CANCEL. Queue those
         // cancels now so their CQEs end the sleep instead of the timeout.
         if !duration.is_zero() {
+            // Scope checks read the ambient clock, so scan in the reactor's
+            // captured environment exactly as poll_budgeted does.
+            let _environment = self.environment.enter();
             let pending = self.state.borrow().entries.len();
             self.queue_cancellations(pending);
         }
