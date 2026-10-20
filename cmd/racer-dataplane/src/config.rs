@@ -2107,6 +2107,18 @@ mod tests {
         .unwrap();
         assert_eq!(config.disk_page_entries.get(), 8192);
         assert_eq!(config.limits.metadata_entries.get(), 32);
+        assert_eq!(
+            parse(&[]).unwrap().disk_metadata_cache_bytes.get(),
+            256 << 20
+        );
+        let config = parse(&[("RACER_DISK_METADATA_CACHE_BYTES", "16777216")]).unwrap();
+        assert_eq!(config.disk_metadata_cache_bytes.get(), 16 << 20);
+        for value in ["0", "1048575", "68719476737"] {
+            assert!(
+                parse(&[("RACER_DISK_METADATA_CACHE_BYTES", value)]).is_err(),
+                "{value}"
+            );
+        }
         for value in [
             "",
             " 8",

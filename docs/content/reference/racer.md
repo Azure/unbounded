@@ -104,6 +104,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
 | `RACER_REQUEST_CONTEXT_BYTES` | Unset: `33554432` (32 MiB) per final I/O worker | Request-context budget; an explicit value is node-wide |
 | `RACER_METADATA_ENTRIES` | `4096` | Node-wide catalog entries; at most 1,048,576 |
+| `RACER_DISK_METADATA_CACHE_BYTES` | `268435456` (256 MiB) | Per-worker memory for the disk index page cache; 1 MiB..64 GiB. The index lives on disk; lookups that miss the cache read index pages |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget in file mode; configured value at most 1,048,576; device mode can raise it as described below |
 | `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
 | `RACER_ADMISSION_HISTORY_BYTES` | `4194304` (4 MiB) | Node-wide Bloom history budget; 32 bytes..512 MiB, divided among final I/O workers, requiring at least 32 bytes per worker |

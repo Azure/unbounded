@@ -1185,4 +1185,62 @@ mod tests {
         assert!(index.current(&m.version.object).unwrap().is_none());
         assert_eq!(index.version(&m.version).unwrap(), Some(m));
     }
+
+    #[test]
+    fn memory_only_callers_queue_prefetch_on_a_cold_index() {
+        let index = index(64);
+        let disk = TestDisk::mount(&index, 8);
+        let metadata = descriptor("cold", crate::model::PAGE_BYTES * 40);
+        for number in 0..40 {
+            disk.put(
+                &index,
+                &page(&metadata, number),
+                &metadata,
+                key_id(),
+                Tier::Cache,
+            );
+        }
+        disk.commit(&index);
+        // A remount starts with an empty page cache.
+        let disk = disk.crash(&index);
+        let first = page(&metadata, 0);
+        assert!(!index.maintenance_due());
+        assert!(!index.on_disk_cached(&first));
+        let (cursor, pages) = index.resident_pages_after(None, 8);
+        assert_eq!(
+            (cursor, pages.len()),
+            (Some(page_alloc::volume::Key::MIN), 0)
+        );
+        assert!(index.maintenance_due() && index.is_dirty());
+        index.maintain_now();
+        assert!(index.on_disk_cached(&first));
+        let (_, pages) = index.resident_pages_after(None, 8);
+        assert_eq!(pages.len(), 8);
+        assert_eq!(index.disk_pages().len(), 40);
+        drop(disk);
+    }
+
+    #[test]
+    fn cache_removal_hides_pages_at_once_and_deletes_them_in_maintenance() {
+        let index = index(64);
+        let disk = TestDisk::mount(&index, 8);
+        let old = descriptor("old", crate::model::PAGE_BYTES * 3);
+        for number in 0..3 {
+            disk.put(&index, &page(&old, number), &old, key_id(), Tier::Cache);
+        }
+        disk.commit(&index);
+        index.remove_cache(&old.version.object.cache);
+        assert!(index.lookup(&page(&old, 0)).unwrap().is_none());
+        assert!(index.disk_pages().is_empty());
+        // Entries stay in the volume until maintenance deletes them.
+        assert_eq!(index.disk_len(), 3);
+        assert!(index.maintenance_due());
+        // A page written after the removal is kept.
+        let new = descriptor("new", 4096);
+        disk.put(&index, &page(&new, 0), &new, key_id(), Tier::Cache);
+        disk.commit(&index);
+        assert!(!index.maintenance_due());
+        assert_eq!(index.disk_len(), 1);
+        assert!(index.lookup(&page(&new, 0)).unwrap().is_some());
+    }
 }
