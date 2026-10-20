@@ -593,6 +593,7 @@ impl<'a> Worker<'a> {
         hot: &RefCell<Hot>,
         deadline: Option<Instant>,
         active: &Cell<usize>,
+        reserve: bool,
     ) {
         let interval = self.args.commit_interval;
         let mut last = Instant::now();
@@ -605,8 +606,10 @@ impl<'a> Worker<'a> {
                 break;
             }
             // Keep a few slots free ahead of allocation, as the dataplane's
-            // maintenance does, so foreground writes rarely evict.
-            if volume.free_slots() < FREE_RESERVE {
+            // maintenance does, so foreground writes rarely evict. Fills
+            // that must stop when the volume is full skip this, or eviction
+            // would keep making room and the fill would never end.
+            if reserve && volume.free_slots() < FREE_RESERVE {
                 let start = Instant::now();
                 match volume
                     .reserve_free(&self.reactor, FREE_RESERVE, now_unix(), 2, &SCOPE)
@@ -671,6 +674,7 @@ impl<'a> Worker<'a> {
                 hot,
                 deadline,
                 sink.active,
+                config.evict,
             )));
         }
         self.run_tasks(tasks, stats)
