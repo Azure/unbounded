@@ -1024,12 +1024,14 @@ mod simulation {
         assert!(volume.free_slots() >= SLOTS - 2);
     }
 
+    type Evicted = Vec<(Key, Value)>;
+
     /// Poll `evict_one` until it has removed `key(1, 0)` but not finished.
     fn evict_part_way<'a>(
         reactor: &'a TestReactor,
         volume: &'a page_alloc::volume::Volume<()>,
         now: u64,
-    ) -> Task<'a, Result<Option<Vec<(Key, Value)>>, TestError>> {
+    ) -> Task<'a, Result<Option<Evicted>, TestError>> {
         let mut eviction: Task<'a, _> = volume.evict_one(reactor, now, &SCOPE);
         for _ in 0..100_000 {
             let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
