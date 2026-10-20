@@ -316,6 +316,7 @@ impl WarmRegistry {
     }
 
     /// Pages a remote primary owner holds are not stored on this node.
+    #[cfg(test)]
     pub(crate) fn is_local_page(&self, page: &PageId) -> bool {
         let job = self.jobs.lock().unwrap().get(&page.version).cloned();
         job.and_then(|job| job.plan.lock().unwrap().clone())
@@ -588,10 +589,12 @@ impl WarmRegistry {
     }
 
     /// Wait even for pages outside the current warm window. A miss permits normal Fill.
-    pub(crate) async fn wait(&self, page: &PageId, scope: &RequestScope) -> Result<bool> {
+    /// Placement comes from the job that satisfied the wait, not a later lookup,
+    /// because the registry entry may be replaced or removed after completion.
+    pub(crate) async fn wait(&self, page: &PageId, scope: &RequestScope) -> Result<WarmWait> {
         let job = self.jobs.lock().unwrap().get(&page.version).cloned();
         let Some(job) = job else {
-            return Ok(false);
+            return Ok(WarmWait::Unwarmed);
         };
         let mut waiter = Waiter {
             job,
@@ -611,7 +614,21 @@ impl WarmRegistry {
             Ok(false) => WarmEvent::WaitFallback,
             Err(_) => WarmEvent::WaitFailed,
         });
-        result
+        if !result? {
+            return Ok(WarmWait::Unwarmed);
+        }
+        let local = waiter
+            .job
+            .plan
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|plan| plan.is_local(page.number.0));
+        Ok(if local {
+            WarmWait::Local
+        } else {
+            WarmWait::Remote
+        })
     }
 
     fn remove(&self, job: &Arc<Job>) {
@@ -633,6 +650,17 @@ impl WarmRegistry {
                 .sum(),
         )
     }
+}
+
+/// Outcome of waiting for a warm job to publish a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WarmWait {
+    /// No job covers the page, or it stopped first; use normal Fill.
+    Unwarmed,
+    /// The completing job stored the page on this node.
+    Local,
+    /// The completing job left the page with a remote primary owner.
+    Remote,
 }
 
 impl Job {
@@ -1840,13 +1868,16 @@ mod tests {
             Err(Error::Overloaded)
         );
         job.update(|p| p.frontier = 1);
-        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(true)));
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(WarmWait::Local))
+        );
         drop(waiting);
         assert_eq!(metrics.count(Event::WarmWaitCompleted), 1);
         assert_eq!(metrics.count(Event::WarmWaitFailed), 0);
         assert_eq!(
             futures::executor::block_on(registry.wait(&page, &scope)),
-            Ok(true)
+            Ok(WarmWait::Local)
         );
         let page = PageId {
             number: PageNumber(1),
@@ -1869,20 +1900,61 @@ mod tests {
         let mut waiting = Box::pin(registry.wait(&page, &scope));
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         job.stop();
-        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(false)));
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(WarmWait::Unwarmed))
+        );
         drop(waiting);
         assert_eq!(metrics.count(Event::WarmWaitFallback), 1);
         assert_eq!(
             futures::executor::block_on(registry.wait(&page, &scope)),
-            Ok(false)
+            Ok(WarmWait::Unwarmed)
         );
         registry.remove(&job);
         assert_eq!(
             futures::executor::block_on(registry.wait(&page, &scope)),
-            Ok(false)
+            Ok(WarmWait::Unwarmed)
         );
         assert_eq!(metrics.count(Event::WarmWaitStarted), 4);
         assert_eq!(metrics.count(Event::WarmWaitFailed), 2);
+    }
+
+    #[test]
+    fn wait_placement_comes_from_the_completing_job() {
+        let registry = WarmRegistry::new(1);
+        let version = version("placement");
+        let membership = Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let job = registry
+            .begin_remote(
+                &version,
+                racer_control_wire::NodeId("remote".into()),
+                membership,
+                1,
+            )
+            .unwrap();
+        let page = PageId {
+            version: version.clone(),
+            number: PageNumber(0),
+        };
+        let scope = scope();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        WarmRegistry::publish_through(&job, 1);
+        // Replace the completed remote job with a planless one before the
+        // waiter observes completion.
+        registry.remove(&job);
+        let (replacement, fresh) = registry.begin(&version).unwrap();
+        assert!(fresh);
+        assert!(replacement.plan.lock().unwrap().is_none());
+        assert!(registry.is_local_page(&page), "a fresh lookup says local");
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(WarmWait::Remote))
+        );
     }
 
     fn version(etag: &str) -> ObjectVersion {
@@ -2375,7 +2447,10 @@ mod tests {
         assert!(wakes.count() > 0);
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         job.update(|progress| progress.frontier = 8);
-        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(true)));
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(WarmWait::Local))
+        );
         drop(waiting);
         assert_eq!(registry.snapshot(), (1, 0));
     }
@@ -2399,7 +2474,10 @@ mod tests {
         assert!(matches!(registry.begin(&version), Err(Error::Unavailable)));
         job.stop();
         registry.remove(&job);
-        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(false)));
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(WarmWait::Unwarmed))
+        );
         assert_eq!(registry.snapshot(), (0, 0));
     }
 
@@ -2439,7 +2517,7 @@ mod tests {
         other.version.etag = crate::model::StrongEtag::test_value("b");
         assert_eq!(
             futures::executor::block_on(registry.wait(&other, &scope)),
-            Ok(false)
+            Ok(WarmWait::Unwarmed)
         );
     }
 

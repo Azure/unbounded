@@ -5,6 +5,7 @@
 
 use super::Coordinator;
 use super::flight::AcquisitionBudget;
+use super::warm::WarmWait;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -526,15 +527,14 @@ impl WorkerDirectory {
 
     /// Waits for any active warm job to publish `page` before it is acquired.
     pub(super) async fn warmed_page(&self, page: &PageId, scope: &RequestScope) -> Result<Warmed> {
-        if !self.warm.wait(page, scope).await? {
-            return Ok(Warmed::Unwarmed);
-        }
-        // Pages held by a remote primary owner are read through normal Fill,
-        // which routes to that owner's held copy under the usual topology.
-        // Only this page has passed the frontier, so callers must not widen
-        // the fill beyond it.
-        if !self.warm.is_local_page(page) {
-            return Ok(Warmed::Remote);
+        match self.warm.wait(page, scope).await? {
+            WarmWait::Unwarmed => return Ok(Warmed::Unwarmed),
+            // Pages held by a remote primary owner are read through normal Fill,
+            // which routes to that owner's held copy under the usual topology.
+            // Only this page has passed the frontier, so callers must not widen
+            // the fill beyond it.
+            WarmWait::Remote => return Ok(Warmed::Remote),
+            WarmWait::Local => {}
         }
         let owner = self.page_owner(page)?;
         let result = if self.is_local(owner) {

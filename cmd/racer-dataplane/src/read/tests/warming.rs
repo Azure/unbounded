@@ -197,7 +197,10 @@ fn completed_extension(refuse: bool) {
                 .as_mut()
                 .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
         {
-            assert_eq!(result.unwrap(), !refuse);
+            assert_eq!(
+                result.unwrap() == crate::read::warm::WarmWait::Local,
+                !refuse
+            );
             delivered = true;
         }
         pump(None);
