@@ -31,7 +31,6 @@ import (
 
 const (
 	originPrefix        = "racer-origin-"
-	originImageName     = "racer-object"
 	originContainerName = "origin"
 	originAppName       = "racer-origin"
 	originCacheLabel    = "racer.unbounded-cloud.io/origin-cache"
@@ -295,7 +294,7 @@ func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec origi
 					PreemptionPolicy:              ptr.To(corev1.PreemptLowerPriority),
 					TerminationGracePeriodSeconds: ptr.To(int64(5)),
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsUser: ptr.To(int64(0)), RunAsGroup: ptr.To(int64(0)), RunAsNonRoot: ptr.To(false),
+						RunAsUser: ptr.To(int64(65532)), RunAsGroup: ptr.To(int64(65532)), RunAsNonRoot: ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Affinity:         mirror.affinity,
@@ -304,7 +303,7 @@ func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec origi
 					ImagePullSecrets: mirror.pullSecrets,
 					Containers: []corev1.Container{{
 						Name:                     originContainerName,
-						Image:                    env.Config.Image(originImageName),
+						Image:                    env.Config.Image(objectImageName),
 						ImagePullPolicy:          corev1.PullIfNotPresent,
 						TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
@@ -323,7 +322,7 @@ func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec origi
 					}},
 					Volumes: []corev1.Volume{{
 						Name:         originContainerName,
-						VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: socketDir, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}},
+						VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: socketDir, Type: ptr.To(corev1.HostPathDirectory)}},
 					}},
 				},
 			},

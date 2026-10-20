@@ -151,8 +151,9 @@ func TestOriginCredentialRendering(t *testing.T) {
 			require.Equal(t, originName("cache"), pod.ServiceAccountName)
 			require.False(t, *pod.AutomountServiceAccountToken)
 			require.EqualValues(t, 5, *pod.TerminationGracePeriodSeconds)
-			require.EqualValues(t, 0, *pod.SecurityContext.RunAsUser)
-			require.False(t, *pod.SecurityContext.RunAsNonRoot)
+			require.EqualValues(t, 65532, *pod.SecurityContext.RunAsUser)
+			require.EqualValues(t, 65532, *pod.SecurityContext.RunAsGroup)
+			require.True(t, *pod.SecurityContext.RunAsNonRoot)
 			require.Equal(t, corev1.SeccompProfileTypeRuntimeDefault, pod.SecurityContext.SeccompProfile.Type)
 			require.Len(t, pod.Containers, 1)
 
@@ -170,7 +171,7 @@ func TestOriginCredentialRendering(t *testing.T) {
 			require.Equal(t, []corev1.Capability{"ALL"}, c.SecurityContext.Capabilities.Drop)
 			require.Equal(t, "/run/racer/cache/origin", c.VolumeMounts[0].MountPath)
 			require.Equal(t, "/run/racer/cache/origin", pod.Volumes[0].HostPath.Path)
-			require.Equal(t, corev1.HostPathDirectoryOrCreate, *pod.Volumes[0].HostPath.Type)
+			require.Equal(t, corev1.HostPathDirectory, *pod.Volumes[0].HostPath.Type)
 			require.Equal(t, "100%", ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.String())
 
 			// Steady state is idempotent.
