@@ -390,11 +390,19 @@ metadata pages read.
   open, not leased, has no reservation, its reference bit is clear, and it is
   a cache slot or a storage slot whose `retain_until` bound has passed. When
   none is found, an idle open cache slot is closed and evicted.
-- Eviction reads the slot's record map entries `EVICT_BATCH` (256) at a time,
-  removes the index entries that still point at each record, yields between
-  batches, then deletes the slot's record map entries and frees the slot. It
-  returns the removed entries.
+- Eviction first reads the slot's record map leaves concurrently, then
+  walks its entries `EVICT_BATCH` (1024) at a time. For each batch it
+  looks up the keys together from cached pages (one descent shared by keys
+  under the same inner pages), reads any missing index pages concurrently,
+  removes the index entries that still point at the slot, and yields. It
+  then frees the slot and returns the removed entries. The slot's record map
+  entries are not deleted: the slot's next incarnation ignores them, the
+  index deletions release them at the next commit, and reused units
+  overwrite them. A full 4 KiB slot costs about 2 ms of CPU when the index
+  is cached.
 - `reserve_free` evicts ahead of allocation until a number of slots is free.
+  The dataplane's maintenance keeps two slots free this way, so foreground
+  allocations normally find a free slot and do not evict.
 - Lowering a storage entry's `retain_until` does not scan its slot. The
   slot's bound stays loose and the slot is marked. `refresh_retain`
   recomputes marked slots; `allocate_evicting` calls it when nothing can be
@@ -437,7 +445,8 @@ metadata pages read.
   bounded memory) to drop pages of caches removed before a crash.
 - Restoring residency reads every page entry of known versions, in the
   background; the dataplane keeps one residency entry per such page.
-- Eviction looks up each record's index key one at a time.
+- With a cache smaller than the index, eviction of a cold slot reads its
+  record map and index leaves (about 130 page reads for a full 4 KiB slot).
 
 - Compaction of partly empty storage slots and of node slots.
 - Repair of lost storage pages from peers.
