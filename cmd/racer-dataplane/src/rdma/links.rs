@@ -47,6 +47,12 @@ pub fn buffer_count(registered_bytes: usize) -> usize {
     registered_bytes / BUFFER_LEN
 }
 
+/// RDMA devices a node-wide registered budget funds out of `devices`.
+/// Each device needs one send and one receive buffer at least.
+pub fn funded_devices(registered_bytes: usize, devices: usize) -> usize {
+    (buffer_count(registered_bytes) / 2).min(devices)
+}
+
 /// Grants per link: each concurrent page to a peer already needs one HTTP connection.
 pub fn grants_per_link(connections_per_neighbor: usize) -> u32 {
     u32::try_from(connections_per_neighbor)
@@ -264,8 +270,7 @@ impl Links {
         // Racer's quota profile charges 4 KiB physical pages.
         validate_native_page_size(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
         self.client.reopen()?;
-        // Each device needs one send and one receive buffer at least.
-        let fit = buffer_count(registered_bytes) / 2;
+        let fit = funded_devices(registered_bytes, publication.len());
         if fit == 0 {
             eprintln!("racer-dataplane: RACER_REGISTERED_BYTES funds no RDMA device; using HTTP");
             return Err(Error::Unavailable);

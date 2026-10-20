@@ -144,7 +144,7 @@ impl WorkerApplication {
             &self.discovered_nics,
             0,
             numa,
-            usize::from(self.links.is_some()),
+            publication_capacity(self.links.is_some()),
         ))
     }
     pub(super) fn poll_native(&mut self, cx: &mut Context<'_>) -> Result<()> {
@@ -228,6 +228,12 @@ impl WorkerApplication {
     }
 }
 
+/// Rails discovery may select. Every rail is eligible when links exist;
+/// `funded_devices` in activation applies the node-wide buffer budget.
+fn publication_capacity(links: bool) -> usize {
+    if links { usize::MAX } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +245,31 @@ mod tests {
     use racer_control_wire::PublicationSequence;
     use racer_control_wire::RailId;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn publication_selects_every_rail_and_budget_limits_activation() {
+        use crate::rdma::links::{BUFFER_LEN, funded_devices};
+        let nic = |device: &str, rail| racer_control_wire::RailMapping {
+            device: device.into(),
+            port: 1,
+            rail: RailId(rail),
+            gid: Some([1; 16]),
+            numa_node: Some(0),
+        };
+        let nics = vec![nic("a", 1), nic("b", 2), nic("c", 3)];
+        let select = |links| {
+            crate::rdma::select_worker(&nics, &nics, 0, Some(0), publication_capacity(links))
+        };
+        assert_eq!(select(true).len(), 3);
+        assert!(select(false).is_empty());
+        // Budget funds every rail: all activate.
+        assert_eq!(funded_devices(6 * BUFFER_LEN, 3), 3);
+        assert_eq!(funded_devices(usize::MAX, 3), 3);
+        // Budget funds only some rails: only those activate.
+        assert_eq!(funded_devices(4 * BUFFER_LEN, 3), 2);
+        assert_eq!(funded_devices(2 * BUFFER_LEN, 3), 1);
+        assert_eq!(funded_devices(BUFFER_LEN, 3), 0);
+    }
 
     #[test]
     fn shared_inventory_recovers_new_hardware_and_revokes_removed_or_changed_ports() {
