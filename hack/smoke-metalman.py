@@ -1137,6 +1137,8 @@ def main() -> None:
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
+    # Earlier releases auto-approved any kubelet client CSR from metalman tokens.
+    run_quiet([KUBECTL, "delete", "clusterrolebinding", "metalman:node-autoapprove-bootstrap", "--ignore-not-found"], check=True)
 
     log("Creating Kubernetes resources")
     kubectl(["-n", NODE_NS, "create", "secret", "generic",

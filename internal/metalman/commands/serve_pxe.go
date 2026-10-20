@@ -123,6 +123,11 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("indexing by IP: %w", err)
 			}
 
+			if err := mgr.GetFieldIndexer().IndexField(ctx, &v1alpha3.Machine{}, indexing.IndexMachineByBootstrapCredentialID,
+				indexing.IndexMachineByBootstrapCredentialIDFunc); err != nil {
+				return fmt.Errorf("indexing by bootstrap credential ID: %w", err)
+			}
+
 			if err := os.MkdirAll(filepath.Join(cacheDir, "sha256"), 0o755); err != nil {
 				return fmt.Errorf("creating cache dir: %w", err)
 			}
@@ -319,6 +324,14 @@ func ServePXECmd() *cobra.Command {
 				ClusterCA:     clusterCA,
 				LookupMachine: media.LookupAttestationMachine,
 				StatusUpdater: &StatusUpdater{Client: mgr.GetClient()},
+			}
+
+			if err := (&attestation.CSRApprover{
+				Client:     mgr.GetClient(),
+				APIReader:  mgr.GetAPIReader(),
+				KubeClient: clientset,
+			}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setting up kubelet CSR approver: %w", err)
 			}
 
 			httpMux := http.NewServeMux()

@@ -99,6 +99,7 @@ func DefaultRegistry() *component.Registry {
 			gantry.New(),
 			tokenrefresher.New(),
 			racer.New(),
+			metalman.NewBootstrap(),
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),

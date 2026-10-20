@@ -277,6 +277,16 @@ func (s *MachineSpec) Netboot() *PXESpec {
 	return s.PXE
 }
 
+// NodeName returns the Kubernetes Node name expected for the Machine:
+// spec.kubernetes.nodeRef.name when set, otherwise the Machine name.
+func (m *Machine) NodeName() string {
+	if m.Spec.Kubernetes != nil && m.Spec.Kubernetes.NodeRef != nil && m.Spec.Kubernetes.NodeRef.Name != "" {
+		return m.Spec.Kubernetes.NodeRef.Name
+	}
+
+	return m.Name
+}
+
 // External provider names.
 const (
 	ExternalProviderAzureVM     = "AzureVM"
@@ -720,6 +730,11 @@ type MachineStatus struct {
 	// +optional
 	TPM *TPMStatus `json:"tpm,omitempty"`
 
+	// Bootstrap records the bootstrap credential most recently issued to
+	// this Machine by TPM attestation.
+	// +optional
+	Bootstrap *BootstrapStatus `json:"bootstrap,omitempty"`
+
 	// Agent holds the applied agent settings.
 	// +optional
 	Agent *AgentStatus `json:"agent,omitempty"`
@@ -779,6 +794,28 @@ type TPMStatus struct {
 	// EKPublicKey is the TPM endorsement key public key, written
 	// when the PXE boot image requests a bootstrap token.
 	EKPublicKey string `json:"ekPublicKey,omitempty"`
+}
+
+// BootstrapStatus identifies the bootstrap credential issued to a Machine.
+type BootstrapStatus struct {
+	// CredentialID is the ID of the most recent bootstrap ServiceAccount
+	// token issued for this Machine, in the form the API server reports in
+	// the authentication.kubernetes.io/credential-id user extra
+	// (for example "JTI=<uuid>"). Kubelet client certificate requests made
+	// with the token are approved only for NodeName.
+	// +optional
+	CredentialID string `json:"credentialID,omitempty"`
+
+	// NodeName is the Kubernetes Node name the credential was issued for.
+	// It is the name written into the agent config served to the host, so
+	// later spec.kubernetes.nodeRef edits do not change which node the
+	// credential may claim.
+	// +optional
+	NodeName string `json:"nodeName,omitempty"`
+
+	// IssuedAt is when the credential was issued.
+	// +optional
+	IssuedAt *metav1.Time `json:"issuedAt,omitempty"`
 }
 
 // AgentStatus holds the applied agent settings for the machine.

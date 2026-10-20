@@ -938,3 +938,145 @@ func TestDependencyWaitsForEveryOperationOnTheObject(t *testing.T) {
 		t.Fatalf("the dependent ran before the second operation on its dependency:\n%s", order)
 	}
 }
+
+// revokeEnv returns an Env seeded with a DaemonSet from an earlier pass, whose
+// ConfigMap applies fail when named broken and whose deletes fail with
+// deleteErr when it is set.
+func revokeEnv(t *testing.T, broken string, deleteErr error) *Env {
+	t.Helper()
+
+	scheme := testScheme(t)
+	existing := daemonSetObject("granted")
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				named, ok := obj.(interface{ GetName() string })
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				if named.GetName() == broken {
+					return errors.New("apiserver said no")
+				}
+
+				return nil
+			},
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if deleteErr != nil {
+					return deleteErr
+				}
+
+				return cl.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	return &Env{Client: cl, Scheme: scheme, Namespace: DefaultNamespace}
+}
+
+func grantedExists(t *testing.T, env *Env) bool {
+	t.Helper()
+
+	err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: DefaultNamespace, Name: "granted"}, daemonSetObject("granted"))
+
+	switch {
+	case err == nil:
+		return true
+	case apierrors.IsNotFound(err):
+		return false
+	default:
+		t.Fatalf("get granted: %v", err)
+
+		return false
+	}
+}
+
+func TestRevokeOnDependencyFailureDeletesExistingObject(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		broken     string
+		revoke     bool
+		deleteErr  error
+		wantExists bool
+		wantSkip   bool
+		wantFail   bool
+		wantInErr  string
+	}{
+		{name: "dependency fails", broken: "restriction", revoke: true, wantSkip: true},
+		{name: "dependency succeeds", revoke: true, wantExists: true},
+		{name: "flag unset", broken: "restriction", wantExists: true, wantSkip: true},
+		{name: "unrelated tier failure", broken: "other", revoke: true, wantExists: true, wantSkip: true},
+		{
+			name: "revoke fails", broken: "restriction", revoke: true, deleteErr: errors.New("delete refused"),
+			wantExists: true, wantFail: true, wantInErr: "delete refused",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := revokeEnv(t, tc.broken, tc.deleteErr)
+			restriction := configMapObject("restriction")
+
+			plan := NewPlan()
+			plan.Add(
+				Operation{Kind: OpApply, Object: restriction, Component: "c", FailureDomain: "restriction"},
+				Operation{Kind: OpApply, Object: configMapObject("other"), Component: "c"},
+				Operation{
+					Kind: OpApply, Object: daemonSetObject("granted"), Component: "c",
+					DependsOn: []ObjectRef{RefOf(restriction)}, RevokeOnDependencyFailure: tc.revoke,
+				},
+			)
+
+			result, err := env.Execute(t.Context(), plan)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			if got := grantedExists(t, env); got != tc.wantExists {
+				t.Fatalf("granted exists = %v, want %v", got, tc.wantExists)
+			}
+
+			var skipped []OperationResult
+
+			for _, r := range result.Skipped() {
+				if r.Ref.Name == "granted" {
+					skipped = append(skipped, r)
+				}
+			}
+
+			if (len(skipped) == 1) != tc.wantSkip {
+				t.Fatalf("granted skipped = %v, want %v", skipped, tc.wantSkip)
+			}
+
+			var failed []OperationResult
+
+			for _, r := range result.Results {
+				if r.Ref.Name == "granted" && r.Status == OpFailed {
+					failed = append(failed, r)
+				}
+			}
+
+			if (len(failed) == 1) != tc.wantFail {
+				t.Fatalf("granted failed = %v, want %v", failed, tc.wantFail)
+			}
+
+			if !tc.wantFail {
+				return
+			}
+
+			if !strings.Contains(failed[0].Err.Error(), tc.wantInErr) {
+				t.Fatalf("failure = %v, want it to mention %q", failed[0].Err, tc.wantInErr)
+			}
+
+			if err := result.Err(); err == nil || !strings.Contains(err.Error(), tc.wantInErr) {
+				t.Fatalf("ExecutionResult.Err() = %v, want it to mention %q", err, tc.wantInErr)
+			}
+
+			combined := CombineResult("c", "", Reconciled(), result)
+			if combined.Err == nil || !strings.Contains(combined.Err.Error(), tc.wantInErr) {
+				t.Fatalf("CombineResult error = %v, want it to mention %q", combined.Err, tc.wantInErr)
+			}
+		})
+	}
+}

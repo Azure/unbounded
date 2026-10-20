@@ -214,6 +214,8 @@ def setup_kubernetes_and_images() -> None:
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/01-namespace.yaml")])
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/crd")])
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/06-metalman-rbac.yaml")])
+    # Earlier releases auto-approved any kubelet client CSR from metalman tokens.
+    run(["kubectl", "delete", "clusterrolebinding", "metalman:node-autoapprove-bootstrap", "--ignore-not-found"])
     for resource in (
         f"machineoperation/http-smoke-host-replace",
         f"machine/{NODE}",

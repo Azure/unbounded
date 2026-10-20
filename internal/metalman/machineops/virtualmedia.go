@@ -453,7 +453,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 
 		target.BootMedia = &v1alpha3.MachineOperationBootMediaStatus{
 			ID: id, Phase: "Preparing", MachineUID: machine.UID, Netboot: machine.Spec.Netboot().DeepCopy(),
-			Site: r.Site, NodeName: nodeNameForMachine(machine), PhaseStartedAt: &now,
+			Site: r.Site, NodeName: machine.NodeName(), PhaseStartedAt: &now,
 		}
 		if machine.Status.Redfish != nil {
 			target.BootMedia.CertFingerprint = machine.Status.Redfish.CertFingerprint
