@@ -405,6 +405,25 @@ metadata pages read.
 
 - The record format keeps its self-describing header. Its generation field is
   the value's generation.
+- `RACER_DISK_METADATA_CACHE_BYTES` sets each worker's page cache budget
+  (default 256 MiB).
+- Async paths await index reads: the reader's lookup, the writer's
+  `already_on_disk` check and allocation, hold reservation, startup cache
+  retention, and hold rebuild at mount.
+- Synchronous callers answer from memory (`try_get`, `try_range`) and queue
+  work in `Index::maintain` when a page is not cached: enqueue's duplicate
+  check (answers "not on disk"; the writer checks again), the ownership pass
+  (`resident_pages_after`), held page metrics, and invalidating a bad record.
+  `remove_cache` drops holds and version descriptors at once and hides the
+  cache's pages from lookups; maintenance deletes the entries in batches,
+  keeping pages published after the call. The lazy committer runs
+  maintenance as soon as work is queued or the volume's dirty limit is
+  reached, and also evicts ahead to keep two slots free.
+- Holds are rebuilt at mount from the storage slots whose `retain_until`
+  bound has not passed, through the record map, so the mount does not scan
+  cache-tier entries.
+- Restored version descriptors are checked against the volume, and
+  residency of their pages restored, in maintenance batches after startup.
 - Held pages are stored in the storage tier with `retain_until` set to the
   hold expiry. Storage-tier writes with no live hold use `retain_until` 0.
   Eviction compares `retain_until` with wall clock time.
@@ -413,6 +432,12 @@ metadata pages read.
 - The checkpoint file keeps only object metadata.
 
 ## Not in this change
+
+- Startup `retain_caches` still walks the whole index (in batches, with
+  bounded memory) to drop pages of caches removed before a crash.
+- Restoring residency reads every page entry of known versions, in the
+  background; the dataplane keeps one residency entry per such page.
+- Eviction looks up each record's index key one at a time.
 
 - Compaction of partly empty storage slots and of node slots.
 - Repair of lost storage pages from peers.
