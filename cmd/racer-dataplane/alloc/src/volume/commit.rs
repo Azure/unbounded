@@ -589,7 +589,7 @@ impl<C: Charge> Volume<C> {
             &mut resolve_index,
         )
         .await;
-        attempt.allocated.extend(writer.allocated.drain(..));
+        attempt.allocated.append(&mut writer.allocated);
         let index = index?;
         drop(index_ops);
 
@@ -691,7 +691,7 @@ impl<C: Charge> Volume<C> {
             &mut resolve_records,
         )
         .await;
-        attempt.allocated.extend(writer.allocated.drain(..));
+        attempt.allocated.append(&mut writer.allocated);
         let records = records?;
         drop(record_ops);
         writer.return_spare();

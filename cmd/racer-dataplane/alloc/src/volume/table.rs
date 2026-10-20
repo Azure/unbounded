@@ -1364,7 +1364,7 @@ impl Slots {
         let entry = self.slots[slot as usize];
         match entry.kind {
             SLOT_NODE => {
-                if slot != META_SLOT && entry.used == first_page_unit(slot) as u16 {
+                if slot != META_SLOT && entry.used == first_page_unit(slot) {
                     self.make_free(slot);
                 } else if u32::from(entry.used) < SLOT_UNITS {
                     self.node_partial.insert(slot);

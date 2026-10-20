@@ -14,6 +14,9 @@ use super::page::{record_key, record_key_parts};
 use super::store::{EVICT_BATCH, IndexOp, RecOp, Reservation, Volume};
 use crate::{Charge, Error};
 
+/// A reservation (or why there is none) and the entries evicted for it.
+pub type Allocated = (crate::Result<Reservation>, Vec<(Key, Value)>);
+
 /// Partly filled slots [`Volume::allocate_evicting`] may reopen per call.
 const REOPENS: usize = 2;
 
@@ -185,7 +188,7 @@ impl<C: Charge> Volume<C> {
         now: u64,
         max_evictions: usize,
         scope: &'a S,
-    ) -> Operation<'a, (crate::Result<Reservation>, Vec<(Key, Value)>), S::Error>
+    ) -> Operation<'a, Allocated, S::Error>
     where
         S::Error: From<Error>,
     {

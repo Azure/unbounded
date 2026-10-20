@@ -28,6 +28,9 @@ use super::superblock::Superblock;
 use super::table::{SlotKind, Slots};
 use crate::{Charge, Error, Slab};
 
+/// A node bitmap read at mount: words, copy, and seq.
+type NodeBitmap = (Box<[u64; BITMAP_WORDS]>, u8, u64);
+
 /// A root set whose allocation metadata was read.
 struct Loaded {
     superblock: Superblock,
@@ -38,7 +41,7 @@ struct Loaded {
     log_pages: Vec<NodeAddr>,
     log_ok: bool,
     /// Per node slot: its bitmap if valid, and whether one was expected.
-    bitmaps: Vec<(u32, Option<(Box<[u64; BITMAP_WORDS]>, u8, u64)>, bool)>,
+    bitmaps: Vec<(u32, Option<NodeBitmap>, bool)>,
 }
 
 impl Loaded {

@@ -211,7 +211,7 @@ fn commit(
     )
 }
 
-fn scan(disk: &Disk, root: &TreeRoot, seq: u64) -> (Vec<(Key, Raw)>, Vec<(Key, Option<Key>)>) {
+fn scan(disk: &Disk, root: &TreeRoot, seq: u64) -> (Vec<(Key, Raw)>, Ranges) {
     let mut out = Vec::new();
     let mut lost = Vec::new();
     let mut at = Key::MIN;

@@ -603,6 +603,12 @@ mod simulation {
         // Lowering leaves the slot bound loose until a recompute.
         assert!(set_retain(&key(1, 1), 0));
         assert_eq!(volume.slot_state(slot).unwrap().retain_until, 50);
+        // Removed records still protected by older trees keep the bound.
+        assert_eq!(refresh(), 0);
+        assert_eq!(volume.slot_state(slot).unwrap().retain_until, 50);
+        // Two commits release them.
+        commit(&reactor, &volume).unwrap();
+        commit(&reactor, &volume).unwrap();
         assert_eq!(refresh(), 1);
         assert_eq!(volume.slot_state(slot).unwrap().retain_until, 10);
         for (key, _) in entries(&reactor, &volume) {

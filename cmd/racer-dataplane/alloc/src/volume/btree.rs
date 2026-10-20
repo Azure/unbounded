@@ -25,6 +25,12 @@ use super::format::{Key, NodeAddr};
 use super::page::{INNER_CAPACITY, Raw, TreeKind, TreePage};
 use super::pager::Priority;
 
+/// Key ranges `[low, high)`; `None` is unbounded.
+pub type Ranges = Vec<(Key, Option<Key>)>;
+
+/// Entries replacing a page: lowest key and child of each new page.
+pub type ChildList = Vec<(Key, Child)>;
+
 /// Boxed local future.
 pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
@@ -300,7 +306,7 @@ pub async fn walk_inner<S: Source>(
     kind: TreeKind,
     max_seq: u64,
     visit: &mut dyn FnMut(NodeAddr, u8),
-) -> Result<Vec<(Key, Option<Key>)>, S::Error> {
+) -> Result<Ranges, S::Error> {
     let mut lost = Vec::new();
     if root.is_empty() {
         return Ok(lost);
@@ -352,7 +358,7 @@ pub struct Applied {
     pub freed: Vec<NodeAddr>,
 
     /// Lost ranges the batch touched (rebuilt from the batch alone).
-    pub lost: Vec<(Key, Option<Key>)>,
+    pub lost: Ranges,
 }
 
 /// Change for one key: the resolver turns the old value into the new one.
@@ -533,7 +539,7 @@ impl<S: Source, K: Sink<Error = S::Error>, T> Ctx<'_, '_, S, K, T> {
         &'s mut self,
         req: Req,
         ops: &'s [(Key, T)],
-    ) -> LocalFuture<'s, Result<Vec<(Key, Child)>, S::Error>> {
+    ) -> LocalFuture<'s, Result<ChildList, S::Error>> {
         Box::pin(async move {
             let Some(page) = self.source.load(req).await? else {
                 // Lost: rebuild the range from the batch alone.

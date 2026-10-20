@@ -276,6 +276,7 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn header(
     buf: &mut [u8],
     magic: &[u8; 8],

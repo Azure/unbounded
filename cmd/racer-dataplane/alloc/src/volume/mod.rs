@@ -15,6 +15,7 @@ mod superblock;
 mod table;
 
 pub use btree::TreeRoot;
+pub use evict::Allocated;
 pub use format::{
     CLASSES, KEY_BYTES, Key, MAX_SLOTS, META_FIRST_NODE_UNIT, META_SLOT, MIN_SLOTS,
     NODE_FIRST_UNIT, NodeAddr, RETAIN_FOREVER, SLOT_BYTES, SLOT_UNITS, SUPERBLOCK_A_UNIT,

@@ -1176,7 +1176,7 @@ impl<C: Charge> Volume<C> {
             high,
             limit,
             &mut out,
-            |raw| RecordDesc::decode(raw),
+            RecordDesc::decode,
             |overlay, low, high| {
                 overlay
                     .records
