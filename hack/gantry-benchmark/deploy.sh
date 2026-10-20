@@ -343,6 +343,13 @@ if [[ "$action" == destroy ]]; then
   if az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --output none 2>/dev/null; then
     aks_state=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --query provisioningState -o tsv)
     if [[ "$aks_state" == Failed ]]; then
+      aks_node_resource_group=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
+        --query nodeResourceGroup -o tsv)
+      if [[ -n "$aks_node_resource_group" ]] && [[ $(az group exists -n "$aks_node_resource_group") == true ]]; then
+        log "submitting deletion of orphaned AKS node resource group $aks_node_resource_group"
+        az group delete -n "$aks_node_resource_group" --yes --no-wait --only-show-errors
+      fi
+
       log "resubmitting deletion of failed AKS cluster $AZURE_AKS_CLUSTER_NAME"
       az aks delete -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
         --yes --no-wait --only-show-errors
