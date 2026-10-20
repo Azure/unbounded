@@ -346,8 +346,9 @@ existing workloads after you add or change them.
 
 The webhook adds an init container named `racer-object` that runs for the life of
 the pod, mounts the Racer socket into it only, and limits the pod to Linux nodes
-that run Racer. It does not add tolerations. Add them yourself if Racer runs on
-tainted nodes. Check that it ran:
+that are not excluded from Racer. It does not copy any other Racer node selector,
+affinity, or tolerations. If you limit where `racer-dataplane` runs, give your pod
+the same limits, or it can land on a node without Racer and fail to start. Check that it ran:
 
 ```bash
 kubectl -n racer-object-example get pod racer-object-example \
