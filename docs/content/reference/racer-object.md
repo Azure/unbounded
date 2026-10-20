@@ -17,8 +17,11 @@ Blob API to applications. For a working setup, start with
 
 The binary has two commands:
 
-- `origin` runs on every eligible Racer node and reads the upstream store.
+- `origin` runs on every eligible Racer node and reads the upstream store. For
+  Azure Blob, the operator can run it from the ClusterCache. See
+  [Managed Azure origin]({{< relref "reference/racer" >}}#managed-azure-origin).
 - `sidecar` runs in the application pod and serves the read API on pod loopback.
+  A webhook adds it to labeled pods. See [Automatic Injection](#automatic-injection).
 
 The read path is application -> sidecar -> Racer -> origin -> upstream. Racer owns
 the cache. Neither command keeps a separate cache, and neither falls back to the
@@ -282,7 +285,7 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 
 | Annotation | Default | Meaning |
 |------------|---------|---------|
-| `object-namespace` | none, required | Sets `--namespace`. Must match the origin. |
+| `object-namespace` | none, required | Sets `--namespace`. Must match the origin. For a managed Azure origin, use the normalized account URL. |
 | `object-buckets` | none, required | Comma-separated list. Each entry sets one `--bucket`. Must match the origin. |
 | `object-cache` | `racer-object` | Sets `--cache` and the socket mount path. |
 | `object-api` | flag default (`s3`) | Sets `--api`. `s3` or `azure`. |

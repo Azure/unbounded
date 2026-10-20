@@ -102,7 +102,9 @@ An origin answers two kinds of requests:
 
 Origins do not push data into Racer. Any participating node can own a page, so
 Racer runs the origin on each such node, usually as a DaemonSet
-that mounts the cache's origin socket directory.
+that mounts the cache's origin socket directory. For Azure Blob, the operator
+can run this DaemonSet for you; see the
+[racer-object guide]({{< relref "guides/racer-object" >}}).
 
 The client can pass `Metadata` and `Authorization` values with each read. Racer
 forwards them to the origin unchanged on a cache miss. Use them to tell the
