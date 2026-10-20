@@ -56,15 +56,32 @@ def verify():
         "CONFIG_ARM64_64K_PAGES=y" in config.splitlines(),
         "missing kernel setting: CONFIG_ARM64_64K_PAGES=y",
     )
-    if profile not in ("agentbaker-doca", "agentbaker-doca-imex"):
-        require(
-            "CONFIG_MICROSOFT_MANA=m" in config.splitlines(),
-            "missing kernel setting: CONFIG_MICROSOFT_MANA=m",
-        )
+    mana_setting = (
+        "CONFIG_MICROSOFT_MANA=m"
+        if profile == "canonical-control"
+        else "CONFIG_MICROSOFT_MANA=y"
+    )
+    require(mana_setting in config.splitlines(), f"missing kernel setting: {mana_setting}")
+    require(
+        "CONFIG_MANA_INFINIBAND=m" in config.splitlines(),
+        "missing kernel setting: CONFIG_MANA_INFINIBAND=m",
+    )
     modules = {}
     for name in ("mana", "mana_ib", "nvidia", "nvidia_uvm"):
-        path = Path(command("modinfo", "-k", kernel, "-F", "filename", name))
+        filename = command("modinfo", "-k", kernel, "-F", "filename", name)
+        if name == "mana" and profile != "canonical-control":
+            require(filename == "(builtin)", "MANA Ethernet driver is not built into the kernel")
+            builtins = Path(f"/lib/modules/{kernel}/modules.builtin")
+            require(
+                "kernel/drivers/net/ethernet/microsoft/mana/mana.ko"
+                in builtins.read_text().splitlines(),
+                "MANA Ethernet driver is absent from built-in module metadata",
+            )
+            modules[name] = {"builtin": True, "metadata_sha256": sha256(builtins)}
+            continue
+        path = Path(filename)
         vermagic = command("modinfo", "-k", kernel, "-F", "vermagic", name)
+        require(vermagic, f"{name} lacks kernel ABI metadata")
         require(vermagic.split()[0] == kernel, f"{name} kernel ABI mismatch")
         require("aarch64" in vermagic.split(), f"{name} is not ARM64")
         modules[name] = {"vermagic": vermagic, "sha256": sha256(path)}
@@ -82,10 +99,11 @@ def verify():
                 require(signer, f"{name} lacks a module signature")
             modules[name]["signer"] = signer
     initrd = command("lsinitramfs", f"/boot/initrd.img-{kernel}").splitlines()
-    require(
-        any(re.search(r"/mana\.ko(?:\.(?:zst|xz|gz))?$", p) for p in initrd),
-        "MANA is absent from the initramfs",
-    )
+    if profile == "canonical-control":
+        require(
+            any(re.search(r"/mana\.ko(?:\.(?:zst|xz|gz))?$", p) for p in initrd),
+            "MANA is absent from the initramfs",
+        )
     firmware = {}
     for name in ("BOOTAA64.EFI", "grubaa64.efi", "mmaa64.efi"):
         path = Path("/boot/efi/EFI/BOOT") / name

@@ -27,13 +27,19 @@ class RootfsContractTest(unittest.TestCase):
         self.license = "Dual MIT/GPL"
         self.signer = "Canonical Ltd. Secure Boot Signing"
         self.module_version = self.driver
+        self.mana_builtin = False
         self.packages = (
             "linux-image\t7.0\tarm64\n"
             "nvidia-utils-580-server\t580.178.04\tarm64\n"
             "nvidia-fabricmanager-580\t580.178.04\tarm64\n"
             "libnvidia-nscq-580\t580.178.04\tarm64"
         )
-        self.put(f"/boot/config-{self.kernel}", "CONFIG_ARM64_64K_PAGES=y\nCONFIG_MICROSOFT_MANA=m\n")
+        self.put(
+            f"/boot/config-{self.kernel}",
+            "CONFIG_ARM64_64K_PAGES=y\n"
+            "CONFIG_MICROSOFT_MANA=m\n"
+            "CONFIG_MANA_INFINIBAND=m\n",
+        )
         self.put("/etc/machine-id", "")
         self.put(f"/boot/initrd.img-{self.kernel}", "initramfs fixture")
         self.put("/etc/initramfs-tools/update-initramfs.conf", "update_initramfs=yes\n")
@@ -96,6 +102,8 @@ class RootfsContractTest(unittest.TestCase):
             return self.initrd
         if args[0] == "modinfo":
             field, name = args[4:]
+            if name == "mana" and self.mana_builtin:
+                return {"filename": "(builtin)"}[field]
             return {
                 "filename": f"/lib/modules/{self.kernel}/{name}.ko",
                 "vermagic": self.vermagic,
@@ -104,6 +112,19 @@ class RootfsContractTest(unittest.TestCase):
                 "signer": self.signer,
             }[field]
         self.fail(f"unexpected command: {args}")
+
+    def configure_agentbaker_kernel(self):
+        self.mana_builtin = True
+        self.put(
+            f"/boot/config-{self.kernel}",
+            "CONFIG_ARM64_64K_PAGES=y\n"
+            "CONFIG_MICROSOFT_MANA=y\n"
+            "CONFIG_MANA_INFINIBAND=m\n",
+        )
+        self.put(
+            f"/lib/modules/{self.kernel}/modules.builtin",
+            "kernel/drivers/net/ethernet/microsoft/mana/mana.ko\n",
+        )
 
     def rejected(self, message):
         with self.assertRaisesRegex(RuntimeError, message):
@@ -143,6 +164,7 @@ class RootfsContractTest(unittest.TestCase):
         self.assertIn("AGENTBAKER_KERNEL_VERSION=6.14.0-1009.9", versions)
         self.assertIn("AGENTBAKER_NVIDIA_VERSION=580.159.04-1ubuntu1", versions)
         self.assertIn("DOCA_VERSION=3.1.0-091513", versions)
+        self.assertIn("gcc-13", source)
         self.assertIn('"libnvidia-gl-580=${NVIDIA_VERSION}"', source)
         self.assertIn('"nvidia-dkms-580-open=${NVIDIA_VERSION}"', source)
         self.assertIn('"nvidia-kernel-common-580=${NVIDIA_VERSION}"', source)
@@ -173,11 +195,17 @@ class RootfsContractTest(unittest.TestCase):
         self.rejected("not ARM64")
 
     def test_non_64k_kernel(self):
-        self.put(f"/boot/config-{self.kernel}", "CONFIG_MICROSOFT_MANA=m\n")
+        self.put(
+            f"/boot/config-{self.kernel}",
+            "CONFIG_MICROSOFT_MANA=m\nCONFIG_MANA_INFINIBAND=m\n",
+        )
         self.rejected("CONFIG_ARM64_64K_PAGES")
 
     def test_missing_mana_configuration(self):
-        self.put(f"/boot/config-{self.kernel}", "CONFIG_ARM64_64K_PAGES=y\n")
+        self.put(
+            f"/boot/config-{self.kernel}",
+            "CONFIG_ARM64_64K_PAGES=y\nCONFIG_MANA_INFINIBAND=m\n",
+        )
         self.rejected("CONFIG_MICROSOFT_MANA")
 
     def test_missing_mana_initramfs(self):
@@ -226,6 +254,7 @@ class RootfsContractTest(unittest.TestCase):
         self.rejected("missing pinned nvidia-fabricmanager-580")
 
     def test_agentbaker_driver_profile_accepts_pinned_open_dkms(self):
+        self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-driver"
         os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
@@ -241,6 +270,7 @@ class RootfsContractTest(unittest.TestCase):
         verify.verify()
 
     def test_agentbaker_driver_profile_requires_open_dkms(self):
+        self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-driver"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
         self.driver = "580.159.04"
@@ -253,6 +283,7 @@ class RootfsContractTest(unittest.TestCase):
         self.rejected("missing pinned open DKMS driver")
 
     def test_doca_profile_requires_doca_ofed(self):
+        self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-doca"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
         self.driver = "580.159.04"
@@ -266,12 +297,12 @@ class RootfsContractTest(unittest.TestCase):
         self.rejected("missing pinned DOCA-OFED")
 
     def test_doca_profile_accepts_external_mana_modules(self):
+        self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-doca"
         os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
         self.driver = "580.159.04"
         self.module_version = self.driver
-        self.put(f"/boot/config-{self.kernel}", "CONFIG_ARM64_64K_PAGES=y\n")
         self.put(
             "/etc/modules-load.d/nvidia.conf",
             "nvidia\nnvidia_modeset\nnvidia_uvm\nnvidia_drm\nnvidia_peermem\n",
@@ -286,6 +317,7 @@ class RootfsContractTest(unittest.TestCase):
         verify.verify()
 
     def test_imex_profile_requires_parameters_and_service(self):
+        self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-doca-imex"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
         self.driver = "580.159.04"

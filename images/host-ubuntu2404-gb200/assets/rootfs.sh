@@ -85,7 +85,8 @@ install_packages() {
             esac
             apt-get update
             apt-get install -y --no-install-recommends \
-                "linux-azure-nvidia=${KERNEL_VERSION}"
+                "linux-azure-nvidia=${KERNEL_VERSION}" \
+                gcc-13
             ;;
     esac
 
