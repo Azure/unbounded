@@ -382,6 +382,7 @@ impl<C: Charge> Volume<C> {
         }
         let pending = log.len() as u64;
         slots.set_pending(pending);
+        slots.set_commit_entries(self.commit_entries());
         let mut state = self.shared.state();
         state.slots = slots;
         state.durable = Durable {

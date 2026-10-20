@@ -321,6 +321,27 @@ a free slot, taking the lowest free units so runs are contiguous. A node slot
 whose pages are all released returns to the free pool. Bitmap copies live at
 fixed units, so writing them needs no allocation and cannot recurse.
 
+Data allocation never claims the last free slots: it fails with `Busy` while
+the free slots do not exceed a metadata reserve, so a commit always finds
+pages, even on a volume full of storage records that cannot be evicted. The
+reserve is the worst-case pages of one commit, minus the free units in node
+slots, in slots, plus one spare slot (on volumes of 64 slots or more) so the
+cursor can find a contiguous run when node slots are full of holes. The
+worst case assumes a commit covers the overlay entries the dirty limit
+allows (plus 1024), capped at one per unit of the volume. Each entry gives
+up to four tree operations (an index change; a record put, release, or
+retirement); each operation rewrites at most two leaves, capped by the
+pages the trees hold now; inserts add a leaf per half leaf of new entries;
+inner pages are written twice; and the slot table and retired log are
+bounded the same way. With a 16 MiB dirty limit (the default for a
+64 MiB page cache) the bound tops out at about 3.4 GiB, and at about 13.6
+GiB with the dataplane's 256 MiB cache (64 MiB dirty limit). The cap is
+reached only when the trees hold that much; until then the reserve is about
+the trees' size plus the growth of one commit. `Volume::free_slots` and `reserve_free` count only the free
+slots above the reserve, so the dataplane's free-slot reserve sits on top
+of it. Bitmap copies live at
+fixed units, so writing them needs no allocation and cannot recurse.
+
 ### Tiers
 
 - Cache writes are committed lazily (for example every second when the
@@ -384,9 +405,10 @@ metadata pages read.
 ## Allocation and eviction
 
 - `allocate(tier, length)` uses the open slot of the tier and class, then a
-  closed partly filled slot whose bitmap was loaded, then a free slot. It
-  returns `Busy` when there is no space, the storage quota or the small
-  record byte cap is reached, or the overlay is full.
+  closed partly filled slot whose bitmap was loaded, then a free slot above
+  the metadata reserve (see "Metadata space"). It returns `Busy` when there
+  is no space, the storage quota or the small record byte cap is reached, or
+  the overlay is full.
 - `allocate_evicting` first loads the bitmap of a closed partly filled slot
   of the class from the record map (reopen), then evicts. When the storage
   quota blocks a storage allocation, only expired storage slots are evicted.
@@ -405,7 +427,8 @@ metadata pages read.
   index deletions release them at the next commit, and reused units
   overwrite them. A full 4 KiB slot costs about 2 ms of CPU when the index
   is cached.
-- `reserve_free` evicts ahead of allocation until a number of slots is free.
+- `reserve_free` evicts ahead of allocation until a number of slots above
+  the metadata reserve is free.
   The dataplane's maintenance keeps two slots free this way, so foreground
   allocations normally find a free slot and do not evict.
 - Lowering a storage entry's `retain_until` does not scan its slot. The

@@ -313,10 +313,12 @@ impl<C: Charge> Volume<C> {
         })
     }
 
-    /// Free slots. O(1). Callers that keep a reserve with
+    /// Free slots data allocation may claim: free slots minus the metadata
+    /// reserve that keeps commits able to place their pages. O(node slots
+    /// with free units). Callers that keep a reserve with
     /// [`Volume::reserve_free`] compare against this.
     pub fn free_slots(&self) -> u64 {
-        self.shared.state().slots.free_slots()
+        self.shared.state().slots.data_free_slots()
     }
 
     /// Storage data slots whose `retain_until` bound is at least `now`: the
@@ -352,7 +354,8 @@ impl<C: Charge> Volume<C> {
         })
     }
 
-    /// Evict until at least `free_slots` slots are free or nothing more can
+    /// Evict until at least `free_slots` slots are free for data (see
+    /// [`Volume::free_slots`]) or nothing more can
     /// be evicted, at most `max_evictions` slots. Run it ahead of allocation
     /// (for example from a timer) so foreground writes rarely evict. Returns
     /// the removed entries.
@@ -370,7 +373,7 @@ impl<C: Charge> Volume<C> {
         Box::pin(async move {
             let mut evicted = Vec::new();
             for _ in 0..max_evictions {
-                if self.shared.state().slots.free_slots() >= free_slots {
+                if self.shared.state().slots.data_free_slots() >= free_slots {
                     break;
                 }
                 match self.evict(reactor, scope, now, None).await? {

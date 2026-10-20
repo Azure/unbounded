@@ -772,7 +772,17 @@ fn fits(page: &TreePage, req: &Req) -> bool {
     )
 }
 
+/// Most overlay entries one commit covers under `dirty_limit`: allocation
+/// stops at the limit, and a few changes may land past it.
+fn commit_entries(dirty_limit: usize) -> u64 {
+    (dirty_limit / OVERLAY_ENTRY_BYTES) as u64 + 1024
+}
+
 impl<C: Charge> Volume<C> {
+    pub(super) fn commit_entries(&self) -> u64 {
+        commit_entries(self.dirty_limit)
+    }
+
     pub(super) fn new_unmounted(
         slab: Rc<Slab<C>>,
         alignment: Alignment,
@@ -792,7 +802,11 @@ impl<C: Charge> Volume<C> {
             volume_id: Cell::new(options.volume_id),
             shared: Rc::new(Shared {
                 state: RefCell::new(State {
-                    slots: Slots::new(slot_count, options.limits)?,
+                    slots: {
+                        let mut slots = Slots::new(slot_count, options.limits)?;
+                        slots.set_commit_entries(commit_entries(dirty_limit));
+                        slots
+                    },
                     active: Overlay::default(),
                     frozen: None,
                     durable: Durable {

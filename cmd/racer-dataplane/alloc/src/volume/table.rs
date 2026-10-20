@@ -42,6 +42,43 @@ const COPY: u8 = 32;
 /// Node pages a commit takes per run: 64 pages, 256 KiB.
 pub const RUN_PAGES: usize = 64;
 
+/// Smallest volume that keeps a spare slot for metadata runs.
+const SPARE_MIN_SLOTS: u64 = 64;
+
+/// Upper bound on the metadata pages one commit writes when it covers at
+/// most `entries` overlay entries, the trees hold about `live` pages, and the
+/// volume has `slots` slots.
+///
+/// An overlay entry is one index change or one published record, so a
+/// commit applies at most `entries` index operations and `3 * entries`
+/// record map operations (puts, releases its index changes queue, and
+/// storage records the previous commit retired). Each operation rewrites at
+/// most two leaves (its own and an underfull neighbor merged into it), but
+/// never more leaves than exist; inserts add at most one leaf per half a
+/// leaf of new entries. Inner pages are written twice and at most one per
+/// half an inner page of changed children, plus one path per tree. The slot
+/// table changes at most one summary per slot or operation. The retired log
+/// lists what the commit frees and what it carries over. No commit covers
+/// more entries than the volume has units, since each names a record.
+pub(super) fn commit_pages_bound(entries: u64, live: u64, slots: u64) -> u64 {
+    use super::page::{INNER_CAPACITY, LOG_CAPACITY, TreeKind};
+    const MAX_DEPTH: u64 = 8;
+    // Every change names a record, and the volume holds at most one record
+    // per unit.
+    let entries = entries.min(slots * u64::from(SLOT_UNITS));
+    let ops = 4 * entries;
+    let half_leaf = (TreeKind::Records.leaf_capacity() / 2) as u64;
+    let growth = (2 * entries).div_ceil(half_leaf);
+    let slot_leaves = slots
+        .min(ops)
+        .div_ceil((TreeKind::Slots.leaf_capacity() / 2) as u64);
+    let leaves = (2 * ops).min(live) + growth + slot_leaves + 3;
+    let inner = 2 * (leaves.div_ceil((INNER_CAPACITY / 2) as u64) + 3 * MAX_DEPTH);
+    let log =
+        (leaves + inner + 2 * entries + 2 * LOG_CAPACITY as u64).div_ceil(LOG_CAPACITY as u64);
+    leaves + inner + log + 2 * RUN_PAGES as u64
+}
+
 /// Allocation limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
@@ -437,6 +474,8 @@ pub struct Slots {
     ready: Vec<Vec<u32>>,
     open: Vec<u32>,
     node_open: u32,
+    // Most overlay entries one commit can cover; sizes the metadata reserve.
+    commit_entries: u64,
     node_partial: BTreeSet<u32>,
     hand: u32,
     limits: Limits,
@@ -486,6 +525,7 @@ impl Slots {
             ready: (0..2 * CLASS_COUNT).map(|_| Vec::new()).collect(),
             open: vec![NONE; 2 * CLASS_COUNT],
             node_open: NONE,
+            commit_entries: 0,
             node_partial: BTreeSet::new(),
             hand: 1,
             limits,
@@ -824,6 +864,43 @@ impl Slots {
         out
     }
 
+    /// Set the most overlay entries one commit can cover. Sizes the metadata
+    /// reserve that data allocation leaves free; 0 disables it.
+    pub fn set_commit_entries(&mut self, entries: u64) {
+        self.commit_entries = entries;
+    }
+
+    /// Free slots held back from data allocation so that a commit of
+    /// [`Slots::set_commit_entries`] overlay entries finds metadata pages.
+    /// The bound counts every page such a commit can write, capped by the
+    /// pages the trees hold now (a commit cannot rewrite more than exists,
+    /// plus what it adds), minus the units free in node slots, plus one
+    /// slot for contiguous metadata runs on volumes of at least
+    /// [`SPARE_MIN_SLOTS`] slots. O(node slots with free units).
+    pub fn meta_reserve_slots(&self) -> u64 {
+        if self.commit_entries == 0 {
+            return 0;
+        }
+        let free_units: u64 = self
+            .node_partial
+            .iter()
+            .map(|&s| u64::from(SLOT_UNITS - u32::from(self.slots[s as usize].used)))
+            .sum();
+        let live = (self.node_slots * u64::from(SLOT_UNITS)).saturating_sub(free_units);
+        let need = commit_pages_bound(self.commit_entries, live, self.slot_count());
+        let usable = u64::from(SLOT_UNITS - u32::from(first_page_unit(1)));
+        // One more slot gives metadata a contiguous run when node slots are
+        // full of holes, on volumes large enough to spare it.
+        let spare = u64::from(self.slot_count() >= SPARE_MIN_SLOTS);
+        need.saturating_sub(free_units).div_ceil(usable) + spare
+    }
+
+    /// Free slots data allocation may claim: free slots above the metadata
+    /// reserve.
+    pub fn data_free_slots(&self) -> u64 {
+        self.free_count.saturating_sub(self.meta_reserve_slots())
+    }
+
     /// Node slots claimed by [`Slots::alloc_pages`] since the last call,
     /// with their incarnations. The caller persists them.
     pub fn take_claimed(&mut self) -> Vec<(u32, u32)> {
@@ -914,6 +991,9 @@ impl Slots {
                 continue;
             }
             if tier == Tier::Storage && self.storage_slots >= self.limits.storage_slots {
+                return Err(Error::Busy);
+            }
+            if self.free_count <= self.meta_reserve_slots() {
                 return Err(Error::Busy);
             }
             let slot = self.claim_free().ok_or(Error::Busy)?;
@@ -1311,11 +1391,6 @@ impl Slots {
             .filter(|(_, e)| e.is_data() && e.tier() == Tier::Storage && e.retain_until >= now)
             .map(|(slot, _)| slot as u32)
             .collect()
-    }
-
-    /// Free slots.
-    pub fn free_slots(&self) -> u64 {
-        self.free_count
     }
 
     fn evicting(&self, slot: u32) -> Result<()> {

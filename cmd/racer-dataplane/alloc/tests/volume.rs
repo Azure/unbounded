@@ -1203,6 +1203,132 @@ mod simulation {
         assert!(stats.writes * 16 < stats.pages_written, "{stats:?}");
     }
 
+    /// Allocate, write one unit, and publish a record of `length` bytes.
+    /// Writing only the first unit keeps large records cheap in the
+    /// simulated disk.
+    fn put_short(
+        reactor: &TestReactor,
+        volume: &page_alloc::volume::Volume<()>,
+        slab: &page_alloc::Slab<()>,
+        tier: Tier,
+        key: Key,
+        length: u64,
+    ) -> Result<(), common::TestError> {
+        let reservation = volume.allocate(tier, length)?;
+        let generation = volume.next_generation();
+        write(
+            reactor,
+            volume,
+            slab,
+            &reservation,
+            &key,
+            generation,
+            UNIT_BYTES as u64,
+        )?;
+        volume.publish(key, reservation, length as u32, generation, RETAIN_FOREVER)?;
+        Ok(())
+    }
+
+    /// Fill `volume` with `tier` records, the first `small` of one unit and
+    /// then whole-slot ones, committing every `batch` puts and whenever
+    /// allocation asks for a commit, until allocation fails with `Busy`
+    /// right after a commit. Returns the puts.
+    fn fill(
+        reactor: &TestReactor,
+        volume: &page_alloc::volume::Volume<()>,
+        slab: &page_alloc::Slab<()>,
+        tier: Tier,
+        small: u32,
+        batch: u32,
+    ) -> u32 {
+        let mut n = 0;
+        let mut since = 0;
+        loop {
+            let length = if n < small {
+                UNIT_BYTES as u64
+            } else {
+                SLOT_BYTES - 100
+            };
+            match put_short(reactor, volume, slab, tier, key(2, n), length) {
+                Ok(()) => {
+                    n += 1;
+                    since += 1;
+                    if since == batch {
+                        commit(reactor, volume).unwrap();
+                        since = 0;
+                    }
+                }
+                Err(common::TestError::Alloc(Error::Busy)) if since == 0 => return n,
+                Err(common::TestError::Alloc(Error::Busy)) => {
+                    commit(reactor, volume).unwrap();
+                    since = 0;
+                }
+                Err(e) => panic!("put {n}: {e:?}"),
+            }
+        }
+    }
+
+    /// Data allocation stops short of the metadata reserve: a volume filled
+    /// with cache data until `Busy` still commits, and keeps committing
+    /// removals and the space they free.
+    #[test]
+    fn data_fill_leaves_room_for_commits() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, 8, Limits::UNLIMITED).unwrap();
+        let n = fill(&reactor, &volume, &slab, Tier::Cache, 3000, 64);
+        assert!(n > 3000, "{n}");
+        assert_eq!(volume.free_slots(), 0);
+        assert_eq!(
+            volume.allocate(Tier::Cache, SLOT_BYTES).err(),
+            Some(Error::Busy)
+        );
+        // Commits still find pages, with and without changes.
+        commit(&reactor, &volume).unwrap();
+        for i in 1500..n {
+            remove(&reactor, &volume, &key(2, i));
+            if volume.needs_commit() {
+                commit(&reactor, &volume).unwrap();
+            }
+        }
+        commit(&reactor, &volume).unwrap();
+        while volume.is_dirty() {
+            commit(&reactor, &volume).unwrap();
+        }
+        assert_eq!(volume.len(), 1500);
+        assert!(volume.allocate(Tier::Cache, SLOT_BYTES).is_ok());
+    }
+
+    /// Storage records cannot be evicted, so a held-only fill must not take
+    /// the pages commits need: every commit after the fill succeeds.
+    #[test]
+    fn held_fill_cannot_wedge_commits() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, 8, Limits::UNLIMITED).unwrap();
+        let n = fill(&reactor, &volume, &slab, Tier::Storage, 3000, 8);
+        assert!(n > 3000, "{n}");
+        for _ in 0..3 {
+            commit(&reactor, &volume).unwrap();
+        }
+        // Overwrites retire storage records and rewrite the trees.
+        for i in 0..512 {
+            match put_short(
+                &reactor,
+                &volume,
+                &slab,
+                Tier::Storage,
+                key(2, i),
+                UNIT_BYTES as u64,
+            ) {
+                Ok(()) | Err(common::TestError::Alloc(Error::Busy)) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+            commit(&reactor, &volume).unwrap();
+        }
+        assert_eq!(volume.len(), u64::from(n));
+    }
+
     /// Lose power after every number of reactor turns of a commit: the
     /// mounted index is the state before or after the commit.
     #[test]

@@ -65,6 +65,36 @@ fn pages_are_contiguous_and_spill_into_new_node_slots() {
 }
 
 #[test]
+fn data_claims_leave_the_metadata_reserve() {
+    let mut slots = table();
+    slots.set_commit_entries(100_000);
+    let reserve = slots.meta_reserve_slots();
+    assert!(reserve >= 1, "reserve {reserve}");
+    assert_eq!(slots.data_free_slots(), SLOTS - 1 - reserve);
+    let mut claimed = 0;
+    while slots.allocate(Tier::Storage, SLOT_BYTES).is_ok() {
+        claimed += 1;
+    }
+    assert_eq!(claimed, SLOTS - 1 - reserve);
+    assert_eq!(slots.data_free_slots(), 0);
+    assert_eq!(slots.usage().free_slots, reserve);
+    // Metadata may still take the reserve.
+    assert!(!slots.alloc_pages(SLOT_UNITS as usize).is_empty());
+    // Without a reserve, data takes every slot.
+    slots.set_commit_entries(0);
+    assert_eq!(slots.meta_reserve_slots(), 0);
+}
+
+#[test]
+fn commit_bound_is_capped_by_live_pages() {
+    let small = commit_pages_bound(50_000, 100, 1000);
+    let large = commit_pages_bound(50_000, u64::MAX / 4, 1000);
+    assert!(small < large);
+    assert!(large >= 8 * 50_000);
+    assert!(commit_pages_bound(0, 0, 4) > 0);
+}
+
+#[test]
 fn records_fill_open_slot_then_reopen_with_a_loaded_bitmap() {
     let mut slots = table();
     let first = slots.allocate(Tier::Cache, 4096).unwrap();
