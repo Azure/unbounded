@@ -164,6 +164,17 @@ pub struct WorkerEndpoint {
     active: Executor,
 }
 
+/// Outcome of waiting for an active warm job to reach one page.
+pub(super) enum Warmed {
+    /// No warm job covers the version, or the job was abandoned.
+    Unwarmed,
+    /// Warm has published the page on a remote primary owner. Only this page
+    /// may be filled; later pages can still be behind the warm frontier.
+    Remote,
+    /// Warm has published the page locally and this is its held copy.
+    Local(Box<PageResult>),
+}
+
 impl WorkerDirectory {
     #[cfg(test)]
     pub(crate) fn test_warm_command(
@@ -512,18 +523,17 @@ impl WorkerDirectory {
         }
     }
 
-    pub(super) async fn warmed_page(
-        &self,
-        page: &PageId,
-        scope: &RequestScope,
-    ) -> Result<Option<PageResult>> {
+    /// Waits for any active warm job to publish `page` before it is acquired.
+    pub(super) async fn warmed_page(&self, page: &PageId, scope: &RequestScope) -> Result<Warmed> {
         if !self.warm.wait(page, scope).await? {
-            return Ok(None);
+            return Ok(Warmed::Unwarmed);
         }
         // Pages held by a remote primary owner are read through normal Fill,
         // which routes to that owner's held copy under the usual topology.
+        // Only this page has passed the frontier, so callers must not widen
+        // the fill beyond it.
         if !self.warm.is_local_page(page) {
-            return Ok(None);
+            return Ok(Warmed::Remote);
         }
         let owner = self.page_owner(page)?;
         let result = if self.is_local(owner) {
@@ -539,7 +549,7 @@ impl WorkerDirectory {
             }
         };
         // A lost held copy is an error, not permission to race the active warm job.
-        result.map(Some)
+        result.map(|page| Warmed::Local(Box::new(page)))
     }
 
     fn submit(
@@ -1011,8 +1021,10 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::Ordered(page, membership, envelope, guard) => {
-            if let Some(result) = local.streams.directory().warmed_page(&page, scope).await? {
-                return Ok(Value::Page(result));
+            if let Warmed::Local(result) =
+                local.streams.directory().warmed_page(&page, scope).await?
+            {
+                return Ok(Value::Page(*result));
             }
             let context = local.open_context(envelope)?;
             local

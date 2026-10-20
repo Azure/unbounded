@@ -252,6 +252,32 @@ impl WarmRegistry {
     }
 
     /// Pages a remote primary owner holds are not stored on this node.
+    /// Starts a job whose pages are all held by remote primary owners and
+    /// publishes the first `frontier` pages.
+    #[cfg(test)]
+    pub(crate) fn begin_remote(
+        &self,
+        version: &ObjectVersion,
+        node: NodeId,
+        membership: Arc<Membership>,
+        pages: u64,
+    ) -> Result<Arc<Job>> {
+        let (job, _) = self.begin(version)?;
+        *job.plan.lock().unwrap() = Some(Arc::new(Plan {
+            node,
+            membership,
+            local: vec![0; usize::try_from(pages.div_ceil(64)).unwrap()],
+            counts: BTreeMap::new(),
+            remote: Vec::new(),
+        }));
+        Ok(job)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_through(job: &Job, frontier: u64) {
+        job.update(|progress| progress.frontier = frontier);
+    }
+
     pub(crate) fn is_local_page(&self, page: &PageId) -> bool {
         let job = self.jobs.lock().unwrap().get(&page.version).cloned();
         job.and_then(|job| job.plan.lock().unwrap().clone())
