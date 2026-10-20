@@ -1,0 +1,51 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: racer e2e
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: racer-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  KIND_EXPERIMENTAL_PROVIDER: docker
+
+jobs:
+  racer-e2e:
+    name: racer object cache e2e (kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 130
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.30.0
+
+      - name: Verify e2e prerequisites
+        run: |
+          set -euo pipefail
+          for bin in kind kubectl docker; do
+            command -v "$bin" >/dev/null 2>&1 || { echo "missing required binary: $bin" >&2; exit 1; }
+          done
+          docker info >/dev/null
+
+      # CI=1 makes missing Azure blob egress fail instead of skipping.
+      - name: Run Racer e2e
+        env:
+          CI: "1"
+        run: make e2e-racer
