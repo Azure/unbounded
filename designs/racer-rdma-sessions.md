@@ -230,7 +230,11 @@ names the same link id, tag, transfer id, and length, and AEAD verifies them.
   protocol still allows it (`recoverable` and `native_failure`,
   `src/peer/transport.rs:192-208`, kept).
 - Shutdown: `Links::drain` closes the client; the owner breaks every link and
-  drains as in `racer-verbs.md`.
+  drains as in `racer-verbs.md`. `WithNative` drain and fence close the owner,
+  then drive it and the crypto engine's drain or fence together until both
+  finish (`verbs/src/lib.rs`, `close_alongside`). A queued crypto job (a Stage
+  or a registered-page decrypt) can own a pool buffer the owner waits for, so
+  draining the owner first would deadlock.
 
 ## Racer types (`src/rdma.rs`)
 

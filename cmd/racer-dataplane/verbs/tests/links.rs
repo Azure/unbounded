@@ -608,6 +608,55 @@ fn owner_hosted_by_with_native() {
     assert_eq!(w.sim.live_resources(), 0);
 }
 
+#[test]
+/// Drain and fence drive inner work alongside the native drain. The inner
+/// side holds a pool buffer (like a queued crypto Stage job) that it only
+/// returns while its own drain or fence runs; draining the native side first
+/// would wait forever.
+fn with_native_drives_inner_work_holding_buffers() {
+    use racer_platform::group::Service;
+
+    for fence in [false, true] {
+        let mut w = world();
+        let owner = w.a.owner.take().unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok(staged)) = w.a.clients[1].send_buffer(7, 4, &mut cx) else {
+            panic!("no staged buffer");
+        };
+        assert_eq!(
+            w.a.clients[1].buffers(7, BufferState::Free),
+            Some(BUFFERS - 1)
+        );
+        let holder = inner::Holder(Some(staged));
+        let mut service = rdma_verbs::WithNative::with_host(holder, owner);
+        service.register_driver(cx.waker());
+        service.poll(&mut cx, 8).unwrap();
+        let scope = inner::Scope;
+        let mut teardown = if fence {
+            service.fence(&scope)
+        } else {
+            service.drain(&scope)
+        };
+        let mut finished = None;
+        for _ in 0..64 {
+            if let Poll::Ready(result) = teardown.as_mut().poll(&mut cx) {
+                finished = Some(result);
+                break;
+            }
+        }
+        assert!(
+            matches!(finished, Some(Ok(()))),
+            "teardown stalled (fence={fence})"
+        );
+        drop(teardown);
+        assert!(w.a.clients[0].drained());
+        drop(service);
+        w.b.clients[0].close();
+        pump(&mut w);
+        assert_eq!(w.sim.live_resources(), 0);
+    }
+}
+
 mod inner {
     use std::task::{Context, Waker};
 
@@ -650,6 +699,55 @@ mod inner {
     }
 
     pub struct Inner;
+
+    /// Holds a buffer until its drain or fence runs, like a queued crypto job.
+    pub struct Holder(pub Option<rdma_verbs::SendBuffer>);
+
+    impl Service<Scope> for Holder {
+        fn waker(&self) -> Result<Waker, Failure> {
+            Ok(Waker::noop().clone())
+        }
+
+        fn register_driver(&self, _: &Waker) {}
+
+        fn start<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
+            maximum
+        }
+
+        fn drain<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
+            Box::pin(async move {
+                self.0.take();
+                Ok(())
+            })
+        }
+
+        fn stop_admission(&mut self) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn fence<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
+            Box::pin(async move {
+                self.0.take();
+                Ok(())
+            })
+        }
+
+        fn shutdown<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     impl Service<Scope> for Inner {
         fn waker(&self) -> Result<Waker, Failure> {

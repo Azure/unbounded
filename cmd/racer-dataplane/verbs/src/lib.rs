@@ -168,8 +168,11 @@ pub struct Selection {
 ///
 /// - Poll: polls both with the same budget.
 /// - Stop admission: only the inner service. Native work keeps going.
-/// - Drain and fence: close and fully drain the native side first, even if
-///   the scope has expired. Then run the inner one.
+/// - Drain and fence: close the native side, then drive it and the inner
+///   drain or fence together until both finish. The native side always
+///   drains fully, even if the scope has expired or the inner side failed.
+///   Driving them together matters: inner work (such as a queued crypto job)
+///   can own a pool buffer the native side waits for.
 /// - Close: closes both, native first.
 pub struct WithNative<T, N> {
     inner: T,
@@ -297,12 +300,10 @@ where
         self.inner.stop_admission()
     }
 
-    /// Drain the native side fully, then the inner service.
+    /// Drain the native side and the inner service together.
     fn drain<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        Box::pin(async move {
-            close_and_fence(&mut self.native).await?;
-            self.inner.drain(scope).await
-        })
+        let inner = self.inner.drain(scope);
+        close_alongside(&mut self.native, inner)
     }
 
     /// Close the native side, then the inner service.
@@ -311,12 +312,10 @@ where
         self.inner.close()
     }
 
-    /// Drain the native side fully, then fence the inner service.
+    /// Drain the native side and fence the inner service together.
     fn fence<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        Box::pin(async move {
-            close_and_fence(&mut self.native).await?;
-            self.inner.fence(scope).await
-        })
+        let inner = self.inner.fence(scope);
+        close_alongside(&mut self.native, inner)
     }
 
     /// Pass through to the inner service.
@@ -325,21 +324,34 @@ where
     }
 }
 
-/// Close `native` and poll it until drained. Ignores scope deadlines: the
-/// NIC must be stopped before memory is freed.
-async fn close_and_fence<N: NativeHost>(native: &mut N) -> Result<()> {
+/// Close `native`, then poll it and `inner` until both finish. Ignores scope
+/// deadlines for the native side: the NIC must be stopped before memory is
+/// freed, so an inner error is held until the native side has drained. A
+/// native error returns at once, as before.
+fn close_alongside<'a, N: NativeHost, E: From<Error> + 'a>(
+    native: &'a mut N,
+    mut inner: Operation<'a, (), E>,
+) -> Operation<'a, (), E> {
     native.close();
-    std::future::poll_fn(|cx| {
+    let mut outcome: Option<std::result::Result<(), E>> = None;
+    Box::pin(std::future::poll_fn(move |cx| {
         native.register_driver(cx.waker());
-        native.poll_budgeted(1)?;
-        if native.drained() {
-            Poll::Ready(Ok(()))
-        } else {
-            // Relies on the runtime's periodic ticks to retry.
-            Poll::Pending
+        if outcome.is_none()
+            && let Poll::Ready(result) = inner.as_mut().poll(cx)
+        {
+            outcome = Some(result);
         }
-    })
-    .await
+        // Poll after the inner side so buffers it just returned count.
+        native.poll_budgeted(1)?;
+        if !native.drained() {
+            // Relies on the runtime's periodic ticks to retry.
+            return Poll::Pending;
+        }
+        match outcome.take() {
+            Some(result) => Poll::Ready(result),
+            None => Poll::Pending,
+        }
+    }))
 }
 
 /// Our own `Arc` around a caller's [`Guard`].
