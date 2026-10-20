@@ -283,3 +283,102 @@ func TestRetryClampsSleepToRemainingBudget(t *testing.T) {
 		t.Fatalf("attempts = %d, want 2", attempts)
 	}
 }
+
+// failingScript writes an executable that prints body's output and exits 3.
+func failingScript(t *testing.T, body string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "fail")
+
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\nexit 3\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	return path
+}
+
+// TestOutputCmdErrorIncludesStderrTail covers the reason the tail exists: a
+// caller that only reports the returned error must still see why the command
+// failed, not just its exit status.
+func TestOutputCmdErrorIncludesStderrTail(t *testing.T) {
+	path := failingScript(t, `for i in 1 2 3 4 5 6 7; do echo "line $i" >&2; done; echo "not stderr"`)
+
+	_, err := OutputCmd(t.Context(), discardLogger(), path)
+	if err == nil {
+		t.Fatal("OutputCmd succeeded, want the script's failure")
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("err = %v, want it to wrap the exit status", err)
+	}
+
+	msg := err.Error()
+	if want := "line 3; line 4; line 5; line 6; line 7"; !strings.HasSuffix(msg, want) {
+		t.Fatalf("err = %q, want it to end with %q", msg, want)
+	}
+
+	for _, unwanted := range []string{"line 2", "not stderr"} {
+		if strings.Contains(msg, unwanted) {
+			t.Fatalf("err = %q, want only the last stderr lines, found %q", msg, unwanted)
+		}
+	}
+}
+
+func TestRunCmdErrorIncludesStderrTail(t *testing.T) {
+	path := failingScript(t, `echo "failed to generate CDI spec" >&2`)
+
+	err := RunCmd(t.Context(), discardLogger(), commandAt(path))
+	if err == nil {
+		t.Fatal("RunCmd succeeded, want the script's failure")
+	}
+
+	if !strings.HasSuffix(err.Error(), ": failed to generate CDI spec") {
+		t.Fatalf("err = %q, want it to end with the stderr line", err)
+	}
+}
+
+func TestOutputCmdErrorWithoutStderr(t *testing.T) {
+	path := failingScript(t, "")
+
+	_, err := OutputCmd(t.Context(), discardLogger(), path)
+	if err == nil {
+		t.Fatal("OutputCmd succeeded, want the script's failure")
+	}
+
+	if want := path + " failed: exit status 3"; err.Error() != want {
+		t.Fatalf("err = %q, want %q", err, want)
+	}
+}
+
+func TestStderrTailBoundsLines(t *testing.T) {
+	var tail stderrTail
+
+	tail.add("   ")
+	tail.add(strings.Repeat("x", stderrTailLineBytes+100))
+
+	if len(tail.lines) != 1 {
+		t.Fatalf("lines = %d, want blank lines skipped", len(tail.lines))
+	}
+
+	if want := strings.Repeat("x", stderrTailLineBytes) + "..."; tail.lines[0] != want {
+		t.Fatalf("line length = %d, want it cut to %d bytes plus an ellipsis", len(tail.lines[0]), stderrTailLineBytes)
+	}
+
+	// A cut through a multibyte character must not leave invalid UTF-8.
+	tail = stderrTail{}
+	tail.add(strings.Repeat("x", stderrTailLineBytes-1) + "é")
+
+	if want := strings.Repeat("x", stderrTailLineBytes-1) + "..."; tail.lines[0] != want {
+		t.Fatalf("line = %q, want the partial character dropped", tail.lines[0])
+	}
+}
+
+func TestMachineRunArgsAreQuiet(t *testing.T) {
+	got := machineRunArgs("kube1", "nvidia-ctk", "cdi", "generate")
+	want := []string{"--machine=kube1", "--pipe", "--wait", "--quiet", "nvidia-ctk", "cdi", "generate"}
+
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}

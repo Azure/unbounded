@@ -20,6 +20,10 @@ const (
 	SystemdSystemDir = "/etc/systemd/system"
 	BPFFSMountDir    = "/run/bpffs"
 
+	// MachinesDir is the host directory that holds nspawn machine root
+	// filesystems.
+	MachinesDir = "/var/lib/machines"
+
 	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
 	DaemonUnit = "unbounded-agent-daemon.service"
 
@@ -86,6 +90,12 @@ func AlternateMachine(current string) string {
 // BPFFSMountPath returns the host-side bpffs mount path for an nspawn machine.
 func BPFFSMountPath(machineName string) string {
 	return fmt.Sprintf("%s/%s", BPFFSMountDir, machineName)
+}
+
+// MachineDir returns the host directory of the named nspawn machine's root
+// filesystem.
+func MachineDir(machineName string) string {
+	return MachinesDir + "/" + machineName
 }
 
 // ConfigRegenerationUnit returns the systemd unit that regenerates host-side

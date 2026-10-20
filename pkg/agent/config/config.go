@@ -77,6 +77,36 @@ type AgentConfig struct {
 	// Empty remains unobserved for legacy installations; it is not inferred from
 	// the host distribution. The daemon reports explicit values in Machine status.
 	ProvisioningFormat string `json:"ProvisioningFormat,omitempty"`
+
+	// RequiredHardware lists hardware the node must bring up before it joins
+	// the cluster. When listed hardware is missing or cannot be set up, node
+	// start fails instead of joining without it. By default a node whose
+	// hardware cannot be set up joins without that hardware. Supported values:
+	// HardwareNvidiaGPU.
+	RequiredHardware []string `json:"RequiredHardware,omitempty"`
+}
+
+// HardwareNvidiaGPU requires NVIDIA GPUs that the agent can set up for
+// workloads.
+const HardwareNvidiaGPU = "NvidiaGPU"
+
+// ValidateRequiredHardware checks that every RequiredHardware entry names
+// hardware the agent knows how to require.
+func ValidateRequiredHardware(hardware []string) error {
+	var errs []error
+
+	for _, value := range hardware {
+		if value != HardwareNvidiaGPU {
+			errs = append(errs, fmt.Errorf("RequiredHardware entry %q is not supported; supported values: %s", value, HardwareNvidiaGPU))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// RequiresHardware reports whether hardware lists kind.
+func RequiresHardware(hardware []string, kind string) bool {
+	return slices.Contains(hardware, kind)
 }
 
 const (
@@ -193,6 +223,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.Kubelet.Configuration = deepCopyKubeletConfiguration(a.Kubelet.Configuration)
 	out.Kubelet.ImageCredentialProvider = a.Kubelet.ImageCredentialProvider.DeepCopy()
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
+	out.RequiredHardware = slices.Clone(a.RequiredHardware)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
 	if a.Gantry != nil {
@@ -247,6 +278,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateProvisioningFormat(a.ProvisioningFormat); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateRequiredHardware(a.RequiredHardware); err != nil {
 		errs = append(errs, err)
 	}
 

@@ -35,6 +35,66 @@ func TestConfigureContainerdWritesGantryHostsConfig(t *testing.T) {
 	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
 }
 
+func TestConfigureContainerdNVIDIARuntimeDropIn(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		enabled    bool
+		lastStatus *goalstates.GPUStatus
+		want       bool
+	}{
+		{name: "CPU node", enabled: false},
+		{name: "GPU node", enabled: true, want: true},
+		{
+			name:       "GPU node whose GPUs worked at the last start",
+			enabled:    true,
+			lastStatus: &goalstates.GPUStatus{Ready: true, Reason: goalstates.GPUReasonSetupSucceeded},
+			want:       true,
+		},
+		{
+			// The post-start hook removed the drop-in and started containerd
+			// without it; writing it back would not reach the running containerd.
+			name:       "GPU node whose GPU setup failed at the last start",
+			enabled:    true,
+			lastStatus: &goalstates.GPUStatus{Reason: goalstates.GPUReasonSetupFailed},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			machineDir := t.TempDir()
+			dropIn := filepath.Join(machineDir, goalstates.NvidiaRuntimeDropInPath)
+
+			// Start from an existing drop-in to show it is removed when it should be.
+			require.NoError(t, os.MkdirAll(filepath.Dir(dropIn), 0o755))
+			require.NoError(t, os.WriteFile(dropIn, []byte("stale"), 0o644))
+
+			if tt.lastStatus != nil {
+				require.NoError(t, goalstates.WriteGPUStatus(machineDir, *tt.lastStatus))
+			}
+
+			goalState := &goalstates.NodeStart{
+				MachineDir: machineDir,
+				Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{NvidiaRequired: tt.enabled}),
+			}
+			require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
+
+			if !tt.want {
+				require.NoFileExists(t, dropIn)
+				return
+			}
+
+			data, err := os.ReadFile(dropIn)
+			require.NoError(t, err)
+			require.Contains(t, string(data), `default_runtime_name = "nvidia"`)
+			require.Contains(t, string(data), `BinaryName = "/usr/bin/nvidia-container-runtime"`)
+		})
+	}
+}
+
 func TestConfigureContainerdSetsImagePullTuning(t *testing.T) {
 	t.Parallel()
 

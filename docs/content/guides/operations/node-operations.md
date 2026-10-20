@@ -92,6 +92,7 @@ automatically. Adding operation kinds like `NodeReimage`, `NodeUpgrade`, or
 | Symptom | Action | Why |
 |---------|--------|-----|
 | Kubelet or containerd is stuck | `NodeReboot` | Restarts the nspawn container without replacing the rootfs. |
+| GPUs were fixed on the host but the Node reports `GPUReady=False` | `NodeReboot` | The next start of the nspawn container sets the GPUs up again. See [When GPUs Cannot Be Set Up]({{< relref "reference/gpu/nvidia#when-gpus-cannot-be-set-up" >}}). |
 | Need a new Kubernetes version | Cordon, drain, then delete the Node | Agent recreates with the desired MachineConfiguration. |
 | Node rootfs is corrupted | Cordon, drain, then delete the Node | Agent replaces the rootfs entirely. |
 | Host kernel or OS needs updating | `HostReboot` or `HostReplace` | Requires host-level action. See [Host Operations]({{< relref "guides/operations/host-operations" >}}). |

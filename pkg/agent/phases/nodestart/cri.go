@@ -145,22 +145,35 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 	return c.write(dest, buf.Bytes(), 0o644)
 }
 
-// ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.
-// When the nvidia runtime is enabled the drop-in is written; otherwise it is
-// removed.
+// ensureGPUDropInConfigs manages GPU-related containerd drop-in configs. The
+// NVIDIA runtime drop-in is written when the runtime is enabled and removed
+// otherwise.
+//
+// It is also removed when the machine's last start could not set up its GPUs.
+// The post-start hook removed it then and started containerd without it, and
+// this drop-in is not change-tracked, so rewriting it on a running node would
+// leave the file on disk disagreeing with containerd until the next start. The
+// next machine start checks the GPUs again and writes it if they work.
 func (c *configureContainerd) ensureGPUDropInConfigs() error {
 	nvidia := c.goalState.Containerd.NvidiaRuntime
+	if nvidia.Enabled && !gpuSetupFailedAtLastStart(c.goalState.MachineDir) {
+		_, err := writeNVIDIARuntimeDropIn(c.goalState.MachineDir, nvidia)
 
-	return ensureDropInConfig(
-		c.goalState.MachineDir,
-		filepath.Base(goalstates.NvidiaRuntimeDropInPath),
-		nvidia.Enabled,
-		map[string]any{
-			"RuntimePath":                nvidia.RuntimePath,
-			"RuntimeClassName":           nvidia.RuntimeClassName,
-			"DisableSetAsDefaultRuntime": nvidia.DisableSetAsDefaultRuntime,
-		},
-	)
+		return err
+	}
+
+	_, err := removeNVIDIARuntimeDropIn(c.goalState.MachineDir)
+
+	return err
+}
+
+// gpuSetupFailedAtLastStart reports whether the machine's last start recorded
+// GPUs that could not be set up. An unreadable record counts as none: the next
+// machine start rewrites it.
+func gpuSetupFailedAtLastStart(machineDir string) bool {
+	status, err := goalstates.ReadGPUStatus(machineDir)
+
+	return err == nil && status != nil && !status.Ready
 }
 
 type startContainerd struct {
@@ -258,30 +271,36 @@ func stagedContainerImageArchives(hostDir string) ([]stagedContainerImageArchive
 	return archives, nil
 }
 
-// ensureDropInConfig writes or removes a containerd drop-in config file in the
-// machine rootfs. If enabled is true, the template is rendered and written.
-// If enabled is false, the drop-in is removed if it exists.
-func ensureDropInConfig(
-	machineDir string,
-	dropInName string,
-	enabled bool,
-	templateData map[string]any,
-) error {
-	dropInPath := filepath.Join(machineDir, goalstates.ContainerdConfDropInDir, dropInName)
-
-	if !enabled {
-		err := os.Remove(dropInPath)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-
-		return err
-	}
-
+// writeNVIDIARuntimeDropIn writes the containerd drop-in that registers the
+// NVIDIA runtime into the machine rootfs. It reports whether the file changed.
+func writeNVIDIARuntimeDropIn(machineDir string, nvidia goalstates.NvidiaRuntime) (bool, error) {
 	buf := &bytes.Buffer{}
-	if err := assetsTemplate.ExecuteTemplate(buf, dropInName, templateData); err != nil {
-		return err
+	if err := assetsTemplate.ExecuteTemplate(buf, filepath.Base(goalstates.NvidiaRuntimeDropInPath), map[string]any{
+		"RuntimePath":                nvidia.RuntimePath,
+		"RuntimeClassName":           nvidia.RuntimeClassName,
+		"DisableSetAsDefaultRuntime": nvidia.DisableSetAsDefaultRuntime,
+	}); err != nil {
+		return false, err
 	}
 
-	return utilio.WriteFile(dropInPath, buf.Bytes(), 0o644)
+	return utilio.WriteFileIfChanged(filepath.Join(machineDir, goalstates.NvidiaRuntimeDropInPath), buf.Bytes(), 0o644)
+}
+
+// removeNVIDIARuntimeDropIn removes the NVIDIA runtime drop-in from the machine
+// rootfs. It reports whether there was one to remove.
+func removeNVIDIARuntimeDropIn(machineDir string) (bool, error) {
+	return removeFileIfPresent(filepath.Join(machineDir, goalstates.NvidiaRuntimeDropInPath))
+}
+
+// removeFileIfPresent removes path and reports whether it existed.
+func removeFileIfPresent(path string) (bool, error) {
+	err := os.Remove(path)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, err
+	}
 }

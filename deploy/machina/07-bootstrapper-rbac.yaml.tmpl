@@ -1,11 +1,16 @@
 ---
 # Grant daemon controller certificates the permissions required by the
 # unbounded-agent daemon. Further per-daemon restrictions can be enforced via
-# VPA. The daemon self-registers a
+# VAP. The daemon self-registers a
 # Machine CR at startup when one does not already exist, then runs an in-VM
 # controller loop that watches its local Node, its Machine CR, and
 # MachineOperation CRs targeting the machine. It also reads configuration
 # versions for repave and updates operation/Machine status after reconciliation.
+#
+# The daemon also sets the GPUReady condition on its local Node. That needs no
+# rule here: the certificate names the daemon system:node:<node> in the
+# system:nodes group, so the Node authorizer allows the status update and the
+# NodeRestriction admission plugin limits it to the daemon's own Node.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

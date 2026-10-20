@@ -75,6 +75,7 @@ for command usage, exit behavior, and the current check list.
 | `LocalDNS.RequiredPlugins` | *(optional)* Additional plugins that the selected binary must report through `coredns -plugins`. |
 | `LocalDNS.CorefileTemplate` | *(optional)* Full replacement Go template for the Corefile. Empty uses the built-in two-listener template. |
 | `Downloads.CoreDNS` | *(optional)* CoreDNS URL, BaseURL, and version override. The offline manifest `versions.coredns` takes precedence when offline artifacts are configured. |
+| `RequiredHardware` | *(optional)* Hardware the node must set up before it joins. Supported value: `NvidiaGPU`. When required hardware is missing or cannot be set up, node start fails and is retried instead of joining without it. When empty, a node whose GPUs cannot be set up joins without them and reports why in its `GPUReady` condition. See [When GPUs Cannot Be Set Up]({{< relref "reference/gpu/nvidia#when-gpus-cannot-be-set-up" >}}). |
 | `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |
 
 LocalDNS requires direct IPv4 nameservers in `/etc/resolv.conf`, or a

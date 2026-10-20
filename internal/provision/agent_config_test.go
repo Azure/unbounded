@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 func TestAgentConfig_MarshalJSON(t *testing.T) {
@@ -263,6 +264,42 @@ func TestBuildAgentConfig(t *testing.T) {
 			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "machine-name", cfg.MachineName)
 				require.Equal(t, "node-name", cfg.NodeName)
+			},
+		},
+		{
+			name: "required hardware",
+			params: BuildAgentConfigParams{
+				Machine: &v1alpha3.Machine{
+					ObjectMeta: metav1.ObjectMeta{Name: "gpu-machine"},
+					Spec: v1alpha3.MachineSpec{
+						Agent: &v1alpha3.AgentSpec{
+							RequiredHardware: []v1alpha3.HardwareKind{v1alpha3.HardwareKindNvidiaGPU},
+						},
+					},
+				},
+			},
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
+				require.Equal(t, []string{"NvidiaGPU"}, cfg.RequiredHardware)
+				// The API enum value must be one the agent accepts.
+				require.NoError(t, config.ValidateRequiredHardware(cfg.RequiredHardware))
+			},
+		},
+		{
+			name: "no required hardware",
+			params: BuildAgentConfigParams{
+				Machine: &v1alpha3.Machine{
+					ObjectMeta: metav1.ObjectMeta{Name: "cpu-machine"},
+					Spec: v1alpha3.MachineSpec{
+						Agent: &v1alpha3.AgentSpec{Image: "ghcr.io/org/rootfs:v1"},
+					},
+				},
+			},
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
+				require.Nil(t, cfg.RequiredHardware)
+
+				data, err := json.Marshal(cfg)
+				require.NoError(t, err)
+				require.NotContains(t, string(data), "RequiredHardware")
 			},
 		},
 		{

@@ -156,24 +156,32 @@ Two systemd hooks run common lifecycle reconciliation around every nspawn
 start. The pre-start hook refreshes host devices, mounts, and GPU paths changed
 by a host reboot. On GPU hosts, the post-start hook stops kubelet and containerd,
 rewires the driver root and CDI state, then restores both services. Hook failures
-fail the nspawn start and are retried through systemd. On the host,
-`unbounded-agent-nspawn-lifecycle nspawn-lifecycle reconcile <machine>` triggers both
-steps by restarting the managed nspawn unit. Managed `NodeReboot` operations
-invoke the same reconcile flow.
+fail the nspawn start and are retried through systemd. GPUs that cannot be set
+up are not a hook failure unless the node requires them; see
+[When GPUs Cannot Be Set Up]({{< relref "reference/gpu/nvidia#when-gpus-cannot-be-set-up" >}}).
+On the host, `unbounded-agent-nspawn-lifecycle nspawn-lifecycle reconcile <machine>`
+triggers both steps by restarting the managed nspawn unit. Managed `NodeReboot`
+operations invoke the same reconcile flow.
 
 Each lifecycle refresh discovers NVIDIA devices and driver libraries from the
 current host. On a node provisioned with the NVIDIA-capable rootfs, complete GPU
-discovery runs post-start rewiring, while incomplete driver state causes the
-start to retry. Adding a GPU to a node provisioned with the CPU rootfs is not an
-in-place migration path: that rootfs does not contain the required NVIDIA tools
-or containerd runtime configuration. Reinitialize or repave the node with the
-NVIDIA-capable rootfs image instead. Post-start rewiring refreshes the driver
-root and CDI state after every machine start.
+discovery runs post-start rewiring. When GPUs are present but their driver state
+is incomplete, or post-start setup fails, the machine starts without them, unless
+`RequiredHardware` lists `NvidiaGPU`; then the start fails and is retried. The
+agent selects the NVIDIA-capable rootfs whenever NVIDIA devices are present, even
+when they cannot be set up yet, so a later start can set them up. Adding a GPU to
+a node provisioned with the CPU rootfs is not an in-place migration path: that
+rootfs does not contain the required NVIDIA tools or containerd runtime
+configuration. Reinitialize or repave the node with the NVIDIA-capable rootfs
+image instead. Post-start rewiring refreshes the driver root and CDI state after
+every machine start.
 
 When an upgraded daemon starts for a machine created by an older agent, it
 idempotently installs the host lifecycle hooks without restarting the running
 machine or its services. The daemon migration uses the same current-host
-discovery and fails explicitly if NVIDIA devices have incomplete driver state.
+discovery: NVIDIA devices with incomplete driver state are left out of the
+regenerated configuration, and the migration fails only when the node requires
+them.
 
 During the first bootstrap, the applied config is persisted only after the node
 starts successfully. If the host reboots before that point, pre-start keeps the
@@ -296,8 +304,11 @@ The agent's three-phase bootstrap drives the nspawn lifecycle:
 3. **Node start.** Starts the nspawn machine and runs the hidden
    `nspawn-lifecycle post-start` hook. On GPU hosts, the hook stops kubelet and
    containerd, rebuilds NVIDIA driver-root and CDI state, then starts containerd
-   and kubelet again. A post-start failure fails the nspawn unit so its existing
-   `Restart=on-failure` policy retries the complete lifecycle.
+   and kubelet again. When the GPUs cannot be set up, the hook starts containerd
+   without the NVIDIA runtime and the node joins without GPUs, unless the node
+   requires them. Any other post-start failure, or a failure to set up required
+   GPUs, fails the nspawn unit so its existing `Restart=on-failure` policy
+   retries the complete lifecycle.
 
 ### Removal
 

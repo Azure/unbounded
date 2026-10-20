@@ -53,33 +53,48 @@ func resolveNSpawnConfig(
 	machineName string,
 	resolveNVIDIA resolveNVIDIAHostFunc,
 ) (*RootFS, error) {
+	rootFS, _, err := resolveNSpawnConfigWithNVIDIA(cfg, machineName, resolveNVIDIA)
+
+	return rootFS, err
+}
+
+// resolveNSpawnConfigWithNVIDIA resolves the nspawn configuration and also
+// returns the NVIDIA assessment it was based on.
+//
+// GPUs that are present but cannot be set up are left out of the
+// configuration, so the machine starts without them, unless
+// cfg.RequiredHardware lists them, in which case resolution fails.
+func resolveNSpawnConfigWithNVIDIA(
+	cfg *config.AgentConfig,
+	machineName string,
+	resolveNVIDIA resolveNVIDIAHostFunc,
+) (*RootFS, NVIDIAAssessment, error) {
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
-		return nil, err
+		return nil, NVIDIAAssessment{}, err
+	}
+
+	if err := config.ValidateRequiredHardware(cfg.RequiredHardware); err != nil {
+		return nil, NVIDIAAssessment{}, err
 	}
 
 	additionalHostMounts, err := resolveAdditionalHostMounts(cfg.AdditionalHostMounts)
 	if err != nil {
-		return nil, err
+		return nil, NVIDIAAssessment{}, err
 	}
 
-	nvidia, err := resolveNVIDIA(runtime.GOARCH)
-	if err != nil {
-		return nil, fmt.Errorf("resolve nvidia host: %w", err)
+	assessment := AssessNVIDIAHost(resolveNVIDIA(runtime.GOARCH))
+	if err := assessment.Require(config.RequiresHardware(cfg.RequiredHardware, config.HardwareNvidiaGPU)); err != nil {
+		return nil, assessment, fmt.Errorf("machine %s: %w", machineName, err)
 	}
 
-	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
-	if nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
-		return nil, fmt.Errorf("%w for machine %s: fresh host state is incomplete", ErrNVIDIAStateUnavailable, machineName)
-	}
-
-	if nvidiaRequired {
+	var nvidia NvidiaHost
+	if assessment.Usable {
+		nvidia = assessment.Host
 		nvidia.Required = true
-	} else {
-		nvidia = NvidiaHost{}
 	}
 
 	return &RootFS{
-		MachineDir: filepath.Join("/var/lib/machines", machineName),
+		MachineDir: MachineDir(machineName),
 		NSpawnConfigFile: filepath.Join(
 			SystemdNSpawnDir,
 			machineName+".nspawn",
@@ -94,7 +109,8 @@ func resolveNSpawnConfig(
 		AMD:                    ResolveAMDHost(),
 		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
 		AdditionalHostMounts:   additionalHostMounts,
-	}, nil
+		RequiredHardware:       slices.Clone(cfg.RequiredHardware),
+	}, assessment, nil
 }
 
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
@@ -113,9 +129,17 @@ func resolveMachine(
 ) (*MachineGoalState, error) {
 	sandboxImage := cfg.CRI.Containerd.SandboxImage
 
-	nspawnConfig, err := resolveNSpawnConfig(cfg, machineName, resolveNVIDIA)
+	nspawnConfig, nvidiaAssessment, err := resolveNSpawnConfigWithNVIDIA(cfg, machineName, resolveNVIDIA)
 	if err != nil {
 		return nil, err
+	}
+
+	if nvidiaAssessment.Present && !nvidiaAssessment.Usable {
+		log.Warn("NVIDIA GPUs are present but cannot be set up; configuring the machine without them",
+			"machine", machineName,
+			"reason", nvidiaAssessment.Reason,
+			"message", nvidiaAssessment.Message,
+		)
 	}
 
 	kernel, err := hostKernel()
@@ -131,7 +155,10 @@ func resolveMachine(
 	nvidia := nspawnConfig.Nvidia
 	amd := nspawnConfig.AMD
 
-	ociImage := ResolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
+	// Select the NVIDIA image whenever GPUs are present, even ones that cannot
+	// be set up now, so a later machine start can set them up without
+	// provisioning a new rootfs. The image works as a CPU node too.
+	ociImage := ResolveOCIImage(log, cfg.OCIImage, nvidiaAssessment.Present)
 
 	kubelet, err := resolveKubelet(cfg)
 	if err != nil {
@@ -182,6 +209,7 @@ func resolveMachine(
 		AMD:                    amd,
 		HostDevices:            nspawnConfig.HostDevices,
 		AdditionalHostMounts:   nspawnConfig.AdditionalHostMounts,
+		RequiredHardware:       nspawnConfig.RequiredHardware,
 	}
 
 	containerd := ResolveContainerd(ContainerdOptions{
@@ -193,7 +221,7 @@ func resolveMachine(
 		MachineName:     machineName,
 		KubeMachineName: cfg.MachineName,
 		NodeName:        cfg.NodeName,
-		MachineDir:      filepath.Join("/var/lib/machines", machineName),
+		MachineDir:      MachineDir(machineName),
 		Containerd:      containerd,
 		Gantry:          ResolveGantry(cfg.Gantry),
 		Kubelet:         kubelet,

@@ -178,8 +178,9 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 
 	// Resolve download overrides and LocalDNS from the Machine spec.
 	var (
-		downloads *AgentDownloads
-		localDNS  *config.AgentLocalDNSConfig
+		downloads        *AgentDownloads
+		localDNS         *config.AgentLocalDNSConfig
+		requiredHardware []string
 	)
 
 	if machine.Spec.Agent != nil {
@@ -190,6 +191,8 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		if machine.Spec.Agent.LocalDNS != nil {
 			localDNS = LocalDNSFromSpec(machine.Spec.Agent.LocalDNS)
 		}
+
+		requiredHardware = requiredHardwareFromSpec(machine.Spec.Agent.RequiredHardware)
 	}
 
 	cfg := UnboundedAgentConfig{
@@ -209,8 +212,9 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},
-			OCIImage: ociImage,
-			LocalDNS: localDNS,
+			OCIImage:         ociImage,
+			LocalDNS:         localDNS,
+			RequiredHardware: requiredHardware,
 		},
 		Downloads: downloads,
 	}
@@ -220,6 +224,22 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	}
 
 	return cfg
+}
+
+// requiredHardwareFromSpec converts the Machine API hardware requirements to
+// agent config values. Returns nil when nothing is required, so the resulting
+// JSON config omits the field.
+func requiredHardwareFromSpec(kinds []v1alpha3.HardwareKind) []string {
+	if len(kinds) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		out = append(out, string(kind))
+	}
+
+	return out
 }
 
 // LocalDNSFromSpec converts the Machine API LocalDNS settings to agent config.

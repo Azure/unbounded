@@ -119,7 +119,8 @@ func retryWhileTextFileBusy(ctx context.Context, logger *slog.Logger, policy ret
 }
 
 // RunCmd creates a command from the given factory, appends args, streams stdout
-// at Debug and stderr at Info, and waits for it to finish.
+// at Debug and stderr at Info, and waits for it to finish. A failure carries the
+// last lines the command wrote to stderr.
 func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Context) *exec.Cmd, args ...string) error {
 	return RunCmdAt(ctx, logger, slog.LevelInfo, newCmd, args...)
 }
@@ -158,26 +159,29 @@ func runCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level
 		return fmt.Errorf("failed to start %s: %w", cmd.Path, err)
 	}
 
-	var wg sync.WaitGroup
+	var (
+		wg   sync.WaitGroup
+		tail stderrTail
+	)
 
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stdout, slog.LevelDebug)
+		streamLogs(ctx, logger, stdout, slog.LevelDebug, nil)
 	}()
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, stderrLevel)
+		streamLogs(ctx, logger, stderr, stderrLevel, tail.add)
 	}()
 
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("%s failed: %w", cmd.Path, err)
+		return tail.wrap(fmt.Errorf("%s failed: %w", cmd.Path, err))
 	}
 
 	return nil
@@ -186,6 +190,7 @@ func runCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level
 // OutputCmd runs the command specified by name and args, streams stdout at
 // Debug and stderr at Info, and returns the captured stdout as a string.
 // Unlike RunCmd it does not require a command factory - just a binary path.
+// A failure carries the last lines the command wrote to stderr.
 func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...string) (string, error) {
 	return OutputCmdAt(ctx, logger, slog.LevelInfo, name, args...)
 }
@@ -228,45 +233,97 @@ func outputCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Le
 		return "", fmt.Errorf("failed to start %s: %w", cmd.Path, err)
 	}
 
-	var buf bytes.Buffer
-
-	var wg sync.WaitGroup
+	var (
+		buf  bytes.Buffer
+		wg   sync.WaitGroup
+		tail stderrTail
+	)
 
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, io.TeeReader(stdout, &buf), slog.LevelDebug)
+		streamLogs(ctx, logger, io.TeeReader(stdout, &buf), slog.LevelDebug, nil)
 	}()
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, stderrLevel)
+		streamLogs(ctx, logger, stderr, stderrLevel, tail.add)
 	}()
 
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
-		return "", fmt.Errorf("%s failed: %w", cmd.Path, err)
+		return "", tail.wrap(fmt.Errorf("%s failed: %w", cmd.Path, err))
 	}
 
 	return strings.TrimRight(buf.String(), "\n"), nil
 }
 
 // MachineRun executes a command inside the named nspawn machine using
-// systemd-run --machine=<machine> --pipe --wait. It streams stdout at Debug
-// and stderr at Error, and returns the captured stdout.
+// systemd-run --machine=<machine> --pipe --wait --quiet. It streams stdout at
+// Debug and stderr at Info, and returns the captured stdout. A failure carries
+// the last lines the command wrote to stderr.
 func MachineRun(ctx context.Context, log *slog.Logger, machine string, args ...string) (string, error) {
-	runArgs := make([]string, 0, 3+len(args))
-	runArgs = append(runArgs, "--machine="+machine, "--pipe", "--wait")
-	runArgs = append(runArgs, args...)
-
-	return OutputCmd(ctx, log, "systemd-run", runArgs...)
+	return OutputCmd(ctx, log, "systemd-run", machineRunArgs(machine, args...)...)
 }
 
-// streamLogs reads lines from reader and logs each one at the given level.
+// machineRunArgs builds the systemd-run arguments for MachineRun. --quiet
+// suppresses systemd-run's own progress lines, such as "Running as unit" and
+// the summary printed when the unit finishes, so stderr holds only what the
+// command wrote and the tail reported on failure names the actual cause.
+func machineRunArgs(machine string, args ...string) []string {
+	runArgs := make([]string, 0, 4+len(args))
+	runArgs = append(runArgs, "--machine="+machine, "--pipe", "--wait", "--quiet")
+
+	return append(runArgs, args...)
+}
+
+// stderrTailLines and stderrTailLineBytes bound how much of a failed command's
+// stderr is copied into its error.
+const (
+	stderrTailLines     = 5
+	stderrTailLineBytes = 512
+)
+
+// stderrTail keeps the last lines a command wrote to stderr. The full output is
+// still logged as it streams, but a caller that only reports the returned error
+// would otherwise see nothing beyond the exit status.
+//
+// It is written by the stderr streaming goroutine and read after that goroutine
+// has finished, so it needs no locking.
+type stderrTail struct {
+	lines []string
+}
+
+func (t *stderrTail) add(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+
+	if len(line) > stderrTailLineBytes {
+		line = strings.ToValidUTF8(line[:stderrTailLineBytes], "") + "..."
+	}
+
+	if len(t.lines) == stderrTailLines {
+		t.lines = t.lines[1:]
+	}
+
+	t.lines = append(t.lines, line)
+}
+
+// wrap appends the collected stderr lines to err.
+func (t *stderrTail) wrap(err error) error {
+	if len(t.lines) == 0 {
+		return err
+	}
+
+	return fmt.Errorf("%w: %s", err, strings.Join(t.lines, "; "))
+}
+
 // closeAll releases pipes belonging to a command that never started.
 func closeAll(closers ...io.Closer) {
 	for _, closer := range closers {
@@ -274,7 +331,9 @@ func closeAll(closers ...io.Closer) {
 	}
 }
 
-func streamLogs(ctx context.Context, logger *slog.Logger, reader io.Reader, level slog.Level) {
+// streamLogs reads lines from reader and logs each one at the given level.
+// When record is not nil it also receives every line.
+func streamLogs(ctx context.Context, logger *slog.Logger, reader io.Reader, level slog.Level, record func(string)) {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		select {
@@ -282,6 +341,10 @@ func streamLogs(ctx context.Context, logger *slog.Logger, reader io.Reader, leve
 			return
 		default:
 			logger.Log(ctx, level, scanner.Text())
+
+			if record != nil {
+				record(scanner.Text())
+			}
 		}
 	}
 }

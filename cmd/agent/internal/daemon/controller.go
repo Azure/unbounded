@@ -53,9 +53,9 @@ func runController(
 		},
 		Cache: ctrlcache.Options{
 			// Keep the daemon cache intentionally small. The daemon only needs
-			// the local Node for node-label selector matching and delete-triggered
-			// repave, plus the local Machine as fallback selector state before the
-			// Node has joined.
+			// the local Node for node-label selector matching, delete-triggered
+			// repave, and its GPUReady condition, plus the local Machine as
+			// fallback selector state before the Node has joined.
 			ByObject: map[client.Object]ctrlcache.ByObject{
 				&corev1.Node{}: {
 					Field: fields.OneTermEqualSelector("metadata.name", nodeName),
@@ -118,6 +118,10 @@ func runController(
 		repaveReconciler,
 	); err != nil {
 		return fmt.Errorf("setup daemon controller: %w", err)
+	}
+
+	if err := daemon.SetupGPUConditionController(mgr, nodeName, goalstates.MachinesDir); err != nil {
+		return fmt.Errorf("setup GPU condition controller: %w", err)
 	}
 
 	err = mgr.Start(mgrCtx)

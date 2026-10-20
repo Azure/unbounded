@@ -581,7 +581,26 @@ type AgentSpec struct {
 	// LocalDNS configures the optional CoreDNS cache inside the nspawn machine.
 	// +optional
 	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+
+	// RequiredHardware lists hardware the node must bring up before it joins
+	// the cluster. When listed hardware is missing or cannot be set up, node
+	// start fails instead of joining without it. By default a node whose
+	// hardware cannot be set up joins without that hardware and reports the
+	// problem in its GPUReady condition.
+	// +optional
+	// +listType=set
+	RequiredHardware []HardwareKind `json:"requiredHardware,omitempty"`
 }
+
+// HardwareKind identifies hardware that a Machine can require.
+// +kubebuilder:validation:Enum=NvidiaGPU
+type HardwareKind string
+
+const (
+	// HardwareKindNvidiaGPU requires NVIDIA GPUs that the agent can set up for
+	// workloads.
+	HardwareKindNvidiaGPU HardwareKind = "NvidiaGPU"
+)
 
 // LocalDNSSpec configures machine-local CoreDNS.
 type LocalDNSSpec struct {

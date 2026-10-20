@@ -51,4 +51,9 @@ type RootFS struct {
 	// AdditionalHostMounts holds configured non-device host paths to be
 	// bind-mounted into the nspawn container.
 	AdditionalHostMounts []config.AdditionalHostMount
+
+	// RequiredHardware lists hardware the node must bring up before it joins,
+	// from AgentConfig.RequiredHardware. The service drop-in passes it to the
+	// nspawn lifecycle hooks in EnvRequiredHardware.
+	RequiredHardware []string
 }

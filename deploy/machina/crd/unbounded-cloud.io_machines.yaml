@@ -254,6 +254,21 @@ spec:
                           type: string
                         type: array
                     type: object
+                  requiredHardware:
+                    description: |-
+                      RequiredHardware lists hardware the node must bring up before it joins
+                      the cluster. When listed hardware is missing or cannot be set up, node
+                      start fails instead of joining without it. By default a node whose
+                      hardware cannot be set up joins without that hardware and reports the
+                      problem in its GPUReady condition.
+                    items:
+                      description: HardwareKind identifies hardware that a Machine
+                        can require.
+                      enum:
+                      - NvidiaGPU
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
                   url:
                     description: |-
                       URL is a fully qualified download URL for the unbounded-agent

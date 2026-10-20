@@ -9,7 +9,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime"
+	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/config"
@@ -30,13 +32,15 @@ type Hooks struct {
 
 // Lifecycle implements reusable pre-start, post-start, and reconcile flows.
 type Lifecycle struct {
-	log           *slog.Logger
-	loadConfig    ConfigLoader
-	resolveConfig func(*config.AgentConfig, string) (*goalstates.RootFS, error)
-	resolveNVIDIA func(string) (goalstates.NvidiaHost, error)
-	waitMachine   func(context.Context, *slog.Logger, string) error
-	execute       func(context.Context, *slog.Logger, phases.Task) error
-	reloadSystemd func(context.Context, *slog.Logger) error
+	log             *slog.Logger
+	loadConfig      ConfigLoader
+	resolveConfig   func(*config.AgentConfig, string) (*goalstates.RootFS, error)
+	resolveNVIDIA   func(string) (goalstates.NvidiaHost, error)
+	waitMachine     func(context.Context, *slog.Logger, string) error
+	execute         func(context.Context, *slog.Logger, phases.Task) error
+	reloadSystemd   func(context.Context, *slog.Logger) error
+	getenv          func(string) string
+	reconcileNVIDIA func(*slog.Logger, *goalstates.NodeStart, nodestart.NVIDIAReconcileOptions) phases.Task
 }
 
 // New returns a lifecycle implementation using shared agent behavior and the
@@ -60,6 +64,8 @@ func New(log *slog.Logger, hooks Hooks) (*Lifecycle, error) {
 		reloadSystemd: func(ctx context.Context, log *slog.Logger) error {
 			return executil.RunCmd(ctx, log, executil.Systemctl(), "daemon-reload")
 		},
+		getenv:          os.Getenv,
+		reconcileNVIDIA: nodestart.ReconcileNVIDIA,
 	}, nil
 }
 
@@ -92,40 +98,57 @@ func (l *Lifecycle) PreStart(ctx context.Context, machineName string) error {
 	return nil
 }
 
-// PostStart repairs ephemeral NVIDIA state after the managed nspawn unit starts.
+// PostStart sets up NVIDIA GPUs after the managed nspawn unit starts. GPUs that
+// cannot be set up are left out and the node starts without them, unless the
+// unit's EnvRequiredHardware lists them. Then PostStart fails, which fails the
+// unit, and its restart policy tries again. Each start checks the GPUs afresh
+// and records the outcome for the GPUReady node condition.
 func (l *Lifecycle) PostStart(ctx context.Context, machineName string) error {
-	nvidia, err := l.resolveNVIDIA(runtime.GOARCH)
-	if err != nil {
-		return fmt.Errorf("resolve NVIDIA host state: %w", err)
+	assessment := goalstates.AssessNVIDIAHost(l.resolveNVIDIA(runtime.GOARCH))
+	required := config.RequiresHardware(
+		parseRequiredHardware(l.getenv(goalstates.EnvRequiredHardware)),
+		config.HardwareNvidiaGPU,
+	)
+
+	// Only hosts with GPUs run commands inside the machine.
+	if assessment.Present {
+		if err := l.waitMachine(ctx, l.log, machineName); err != nil {
+			return fmt.Errorf("wait for machine %s: %w", machineName, err)
+		}
 	}
 
-	if len(nvidia.GPUDevicePaths) == 0 {
-		l.log.Info("no NVIDIA devices discovered; skipping post-start rewiring", "machine", machineName)
-
-		return nil
-	}
-
-	if !goalstates.NVIDIAStateAvailable(nvidia) {
-		return fmt.Errorf("%w for machine %s", goalstates.ErrNVIDIAStateUnavailable, machineName)
-	}
-
-	nvidia.Required = true
-
-	if err := l.waitMachine(ctx, l.log, machineName); err != nil {
-		return fmt.Errorf("wait for machine %s: %w", machineName, err)
-	}
+	nvidia := assessment.Host
+	nvidia.Required = assessment.Usable
 
 	nodeStart := &goalstates.NodeStart{
 		MachineName: machineName,
-		MachineDir:  "/var/lib/machines/" + machineName,
+		MachineDir:  goalstates.MachineDir(machineName),
 		Containerd:  goalstates.ResolveContainerd(goalstates.ContainerdOptions{NvidiaRequired: true}),
 		Nvidia:      nvidia,
 	}
-	if err := l.execute(ctx, l.log, nodestart.ReconcileNVIDIA(l.log, nodeStart)); err != nil {
+
+	task := l.reconcileNVIDIA(l.log, nodeStart, nodestart.NVIDIAReconcileOptions{
+		Assessment: assessment,
+		Required:   required,
+	})
+	if err := l.execute(ctx, l.log, task); err != nil {
 		return fmt.Errorf("reconcile NVIDIA state for %s: %w", machineName, err)
 	}
 
 	return nil
+}
+
+// parseRequiredHardware splits the comma-separated EnvRequiredHardware value.
+func parseRequiredHardware(value string) []string {
+	var hardware []string
+
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			hardware = append(hardware, item)
+		}
+	}
+
+	return hardware
 }
 
 // Reconcile restarts the managed nspawn unit, which invokes PreStart and

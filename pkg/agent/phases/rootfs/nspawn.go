@@ -131,6 +131,10 @@ type nspawnTemplateData struct {
 	AMDSysFSPaths          []string
 	ConfigRegenerationUnit string
 	AgentBinaryPath        string
+	// RequiredHardwareEnv is the NAME=value assignment that passes
+	// RequiredHardware to the lifecycle hooks, or empty when nothing is
+	// required.
+	RequiredHardwareEnv string
 }
 
 // TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
@@ -168,6 +172,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
 		AgentBinaryPath:              goalstates.ResolveHostPaths().NSpawnLifecycleBinary,
+		RequiredHardwareEnv:          requiredHardwareEnv(goalState.RequiredHardware),
 	}
 
 	if len(hostDevicePaths) > 0 {
@@ -240,6 +245,18 @@ func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {
 	}
 
 	return ""
+}
+
+// requiredHardwareEnv returns the environment assignment that tells the
+// lifecycle hooks which hardware the node requires, or empty when nothing is
+// required. The values are validated against a fixed set, so they need no
+// quoting.
+func requiredHardwareEnv(hardware []string) string {
+	if len(hardware) == 0 {
+		return ""
+	}
+
+	return goalstates.EnvRequiredHardware + "=" + strings.Join(hardware, ",")
 }
 
 func nvidiaNSpawnDeviceTargets(paths []string) []NSpawnDeviceTarget {

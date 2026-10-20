@@ -33,7 +33,8 @@ func TestReconcileNVIDIANonGPUIsNoop(t *testing.T) {
 
 	require.NoError(t, ReconcileNVIDIA(
 		slog.New(slog.DiscardHandler),
-		&goalstates.NodeStart{MachineName: "kube1"},
+		&goalstates.NodeStart{MachineName: "kube1", MachineDir: t.TempDir()},
+		NVIDIAReconcileOptions{},
 	).Do(context.Background()))
 }
 

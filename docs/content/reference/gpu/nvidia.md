@@ -21,6 +21,9 @@ Before the agent can expose GPUs, the **host VM** must have:
    (`SYSTEM_DRIVER_MISMATCH`).
 4. **Persistence mode enabled.** `nvidia-smi -pm 1` keeps the driver loaded
    between GPU process invocations and avoids cold-start latency.
+5. **GPUs initialized by the driver.** `nvidia-smi` on the host must list every
+   GPU. If it reports `No devices were found`, the node joins without GPUs; see
+   [When GPUs Cannot Be Set Up](#when-gpus-cannot-be-set-up).
 
 The GPU OCI images (`agent-ubuntu2404-nvidia`, `agent-ubuntu2604-nvidia`,
 `agent-azlinux3-nvidia`) include the NVIDIA Container Toolkit (`nvidia-ctk`,
@@ -52,7 +55,8 @@ full sequence is:
    and multiarch compatibility symlinks. The agent then runs `ldconfig` and
    `nvidia-ctk cdi generate` to produce the CDI spec at
    `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid interference
-   with the nspawn environment.
+   with the nspawn environment. If the GPUs cannot be set up, the node starts
+   without them; see [When GPUs Cannot Be Set Up](#when-gpus-cannot-be-set-up).
 5. **containerd runtime configuration.** Writes a containerd drop-in that
    enables CDI support and registers the `nvidia` runtime class. On Azure
    Linux hosts, the agent also selects the toolkit's CDI runtime mode so the
@@ -89,6 +93,75 @@ copied libraries and their SONAME aliases. When the host provides
 `--driver-root`, this copy allows the CDI specification to expose a
 version-compatible `nvidia-smi` to GPU containers. The binary is useful for
 diagnostics and monitoring but is not required for compute-only CUDA access.
+
+## When GPUs Cannot Be Set Up
+
+By default, a node whose GPUs cannot be set up still joins the cluster, without
+GPUs. This applies when NVIDIA device files exist but the driver libraries or
+driver version cannot be found, when host GPU discovery fails, and when setup
+inside the nspawn machine fails, for example because `nvidia-ctk cdi generate`
+finds no GPU the driver could initialize. The agent then:
+
+- starts containerd as on a CPU-only node, without the NVIDIA runtime and
+  without the generated CDI specification;
+- sets the Node condition `GPUReady` to `False`, with a reason and the error.
+
+The GPUs are checked again at every start of the nspawn machine: a host reboot,
+a `NodeReboot` operation, or a restart of `systemd-nspawn@<MachineName>`. Nothing
+checks them while the machine is running.
+
+| `GPUReady` | Reason | Meaning |
+|---|---|---|
+| `True` | `SetupSucceeded` | The GPUs were set up at the last machine start. |
+| `False` | `SetupFailed` | Setup inside the machine failed. The message ends with the last lines the failing command wrote to stderr. |
+| `False` | `DriverStateIncomplete` | NVIDIA device files exist, but the driver libraries or the driver version were not found on the host. |
+| `False` | `DiscoveryFailed` | Host GPU discovery returned an error, for example `nvidia-modprobe` failing on Azure Linux. |
+| `False` | `NotFound` | The node requires GPUs, but none were found. |
+
+Nodes on hosts without NVIDIA devices do not get the condition unless they
+require GPUs. To read it:
+
+```bash
+kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="GPUReady")]}'
+```
+
+The agent daemon sets the condition from a record the post-start hook writes at
+`/var/lib/unbounded/gpu-status.json` inside the machine, so it follows each
+machine start and disappears when the machine is removed.
+
+### Requiring GPUs
+
+To keep a node from joining without working GPUs, list them as required
+hardware. On the Machine:
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: gpu-worker-01
+spec:
+  agent:
+    requiredHardware:
+      - NvidiaGPU
+```
+
+In the agent configuration, set `"RequiredHardware": ["NvidiaGPU"]`. Missing
+GPUs, or GPUs that cannot be set up, then fail the node start instead of letting
+the node join without them. Once the nspawn machine exists, systemd retries its
+start every 10 seconds until the GPUs work.
+
+### Recovering GPUs
+
+Fix the host first: `nvidia-smi` on the host must list every GPU. Then restart
+the nspawn machine so its next start sets the GPUs up:
+
+- reboot the host, or
+- create a `NodeReboot` operation, for example with
+  `kubectl unbounded machine node-reboot <machine>`.
+
+To start over instead, reset the agent with an `AgentReset` operation or
+`unbounded-agent reset`, then bootstrap the node again. See
+[Agent Operations]({{< relref "guides/operations/agent-operations" >}}).
 
 ## Architecture Support
 
@@ -141,3 +214,35 @@ The host NVIDIA libraries are not visible inside the nspawn. Check that:
 Ensure the kernel driver is loaded (`lsmod | grep nvidia`) and that
 `/dev/nvidia0` exists. If the driver is installed but not loaded, reboot the
 host.
+
+### `GPUReady` is `False` with reason `SetupFailed`
+
+The condition message ends with the last lines the failing command wrote to
+stderr, and the full output is in the journal of the nspawn unit:
+
+```bash
+journalctl -u systemd-nspawn@<MachineName>.service -b --no-pager -o cat | grep -A40 'generating CDI spec'
+```
+
+If `nvidia-ctk cdi generate` failed, check whether the host driver initialized
+the GPUs: run `nvidia-smi` on the host and look for `RmInitAdapter failed` in
+`dmesg`.
+
+### Host `nvidia-smi` reports `No devices were found`
+
+The kernel driver is loaded but could not initialize any GPU, so the node joins
+without GPUs. When `dmesg` shows `CPU does not support confidential compute`
+before each `RmInitAdapter failed`, the GPUs are in a confidential-computing mode
+(CC, Protected PCIe, or multi-GPU NVLink encryption) on a host that is not
+running as a confidential-computing guest. Query the modes with NVIDIA's
+[gpu-admin-tools](https://github.com/NVIDIA/gpu-admin-tools):
+
+```bash
+sudo python3 ./nvidia_gpu_tools.py --devices gpus --query-cc-mode
+sudo python3 ./nvidia_gpu_tools.py --devices gpus,nvswitches --query-ppcie-mode
+```
+
+If the GPUs should not be in that mode, turn it off with `--set-cc-mode=off
+--reset-after-cc-mode-switch` or `--set-ppcie-mode=off
+--reset-after-ppcie-mode-switch`, confirm that `nvidia-smi` lists the GPUs,
+then [recover the GPUs](#recovering-gpus).

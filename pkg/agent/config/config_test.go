@@ -276,6 +276,19 @@ func TestAgentConfig_Validate(t *testing.T) {
 			},
 			wantErr: "AdditionalHostMounts[0].Source",
 		},
+		{
+			name: "required NVIDIA GPU",
+			mutate: func(cfg *AgentConfig) {
+				cfg.RequiredHardware = []string{HardwareNvidiaGPU}
+			},
+		},
+		{
+			name: "unsupported required hardware",
+			mutate: func(cfg *AgentConfig) {
+				cfg.RequiredHardware = []string{"nvidia-gpu"}
+			},
+			wantErr: "RequiredHardware",
+		},
 	}
 
 	for _, tt := range tests {
@@ -345,7 +358,8 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 		AdditionalHostMounts: []AdditionalHostMount{{
 			Source: "/opt/config",
 		}},
-		Gantry: &GantryConfig{Disabled: true},
+		Gantry:           &GantryConfig{Disabled: true},
+		RequiredHardware: []string{HardwareNvidiaGPU},
 	}
 
 	copy := original.DeepCopy()
@@ -366,6 +380,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
 	copy.Gantry.Disabled = false
+	copy.RequiredHardware[0] = "other"
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
@@ -376,6 +391,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
 	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
 	require.True(t, original.Gantry.Disabled)
+	require.Equal(t, HardwareNvidiaGPU, original.RequiredHardware[0])
 }
 
 func TestAgentKubeletConfigValidate(t *testing.T) {

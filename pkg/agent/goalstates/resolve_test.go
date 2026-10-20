@@ -4,6 +4,7 @@
 package goalstates
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"testing"
@@ -36,35 +37,82 @@ func TestResolveNSpawnConfigDoesNotResolveLocalDNS(t *testing.T) {
 func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 	t.Parallel()
 
-	t.Run("complete GPU discovery enables NVIDIA", func(t *testing.T) {
-		gs, err := resolveMachine(
-			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
-			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
+	resolveWith := func(cfg *config.AgentConfig, host NvidiaHost, err error) (*MachineGoalState, error) {
+		return resolveMachine(
+			discardLogger(), cfg, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) { return host, err },
 		)
+	}
+
+	requireCPUState := func(t *testing.T, gs *MachineGoalState) {
+		t.Helper()
+
+		require.False(t, gs.RootFS.Nvidia.Required)
+		require.Empty(t, gs.RootFS.Nvidia.GPUDevicePaths, "no GPU bind mounts")
+		require.False(t, gs.NodeStart.Nvidia.Required)
+		require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+	}
+
+	required := &config.AgentConfig{RequiredHardware: []string{config.HardwareNvidiaGPU}}
+
+	t.Run("complete GPU discovery enables NVIDIA", func(t *testing.T) {
+		gs, err := resolveWith(&config.AgentConfig{}, completeResolvedNVIDIA(), nil)
 		require.NoError(t, err)
 		require.True(t, gs.RootFS.Nvidia.Required)
 		require.True(t, gs.NodeStart.Nvidia.Required)
 		require.True(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+		require.Equal(t, ResolveOCIImage(discardLogger(), "", true), gs.RootFS.OCIImage)
 	})
 
 	t.Run("empty discovery produces CPU state", func(t *testing.T) {
-		gs, err := resolveMachine(
-			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
-			func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
-		)
+		gs, err := resolveWith(&config.AgentConfig{}, NvidiaHost{}, nil)
 		require.NoError(t, err)
-		require.False(t, gs.RootFS.Nvidia.Required)
-		require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+		requireCPUState(t, gs)
+		require.Equal(t, ResolveOCIImage(discardLogger(), "", false), gs.RootFS.OCIImage)
 	})
 
-	t.Run("incomplete GPU discovery fails", func(t *testing.T) {
-		_, err := resolveMachine(
-			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
-			func(string) (NvidiaHost, error) {
-				return NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}}, nil
-			},
-		)
+	t.Run("incomplete GPU discovery configures the machine without GPUs", func(t *testing.T) {
+		gs, err := resolveWith(&config.AgentConfig{}, NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}}, nil)
+		require.NoError(t, err)
+		requireCPUState(t, gs)
+		// The NVIDIA image stays selected so a later start can set the GPUs up.
+		require.Equal(t, ResolveOCIImage(discardLogger(), "", true), gs.RootFS.OCIImage)
+	})
+
+	t.Run("discovery error configures the machine without GPUs", func(t *testing.T) {
+		gs, err := resolveWith(&config.AgentConfig{}, NvidiaHost{}, errors.New("nvidia-modprobe failed"))
+		require.NoError(t, err)
+		requireCPUState(t, gs)
+		require.Equal(t, ResolveOCIImage(discardLogger(), "", true), gs.RootFS.OCIImage)
+	})
+
+	t.Run("required GPU with complete discovery enables NVIDIA", func(t *testing.T) {
+		gs, err := resolveWith(required, completeResolvedNVIDIA(), nil)
+		require.NoError(t, err)
+		require.True(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+		require.Equal(t, []string{config.HardwareNvidiaGPU}, gs.RootFS.RequiredHardware)
+	})
+
+	t.Run("required GPU with incomplete discovery fails", func(t *testing.T) {
+		_, err := resolveWith(required, NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}}, nil)
+		require.ErrorIs(t, err, ErrRequiredHardwareUnavailable)
 		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
+	})
+
+	t.Run("required GPU with discovery error fails", func(t *testing.T) {
+		_, err := resolveWith(required, NvidiaHost{}, errors.New("nvidia-modprobe failed"))
+		require.ErrorIs(t, err, ErrRequiredHardwareUnavailable)
+		require.ErrorContains(t, err, "nvidia-modprobe failed")
+	})
+
+	t.Run("required GPU that is missing fails", func(t *testing.T) {
+		_, err := resolveWith(required, NvidiaHost{}, nil)
+		require.ErrorIs(t, err, ErrRequiredHardwareUnavailable)
+	})
+
+	t.Run("unsupported required hardware fails", func(t *testing.T) {
+		_, err := resolveWith(&config.AgentConfig{RequiredHardware: []string{"Unknown"}}, completeResolvedNVIDIA(), nil)
+		require.ErrorContains(t, err, "RequiredHardware")
 	})
 }
 

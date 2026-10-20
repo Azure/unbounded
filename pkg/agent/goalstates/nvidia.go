@@ -37,7 +37,9 @@ import (
 //     to update the linker cache.
 
 // ErrNVIDIAStateUnavailable indicates that discovered NVIDIA devices do not
-// have the complete host state needed for safe startup.
+// have the complete host state needed for safe startup. It is returned, wrapped
+// with ErrRequiredHardwareUnavailable, only when the GPUs are required;
+// otherwise the machine is configured without them.
 var ErrNVIDIAStateUnavailable = errors.New("required NVIDIA host state is unavailable")
 
 // NvidiaHost aggregates all NVIDIA-related host state discovered at agent

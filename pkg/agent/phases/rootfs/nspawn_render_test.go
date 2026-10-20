@@ -94,6 +94,13 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 
 			return data
 		}(),
+		"nvidia-required": func() nspawnTemplateData {
+			data := nspawnRenderScenarioData()
+			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia0", "/dev/nvidiactl"})
+			data.RequiredHardwareEnv = requiredHardwareEnv([]string{config.HardwareNvidiaGPU})
+
+			return data
+		}(),
 	}
 
 	for name, data := range cases {
@@ -362,6 +369,35 @@ func TestServiceOverride_CPUNodesRunCommonPostStartHook(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
 	require.Contains(t, buf.String(), "nspawn-lifecycle post-start")
+}
+
+func TestServiceOverride_RequiredHardwareEnvironment(t *testing.T) {
+	t.Parallel()
+
+	var defaultBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&defaultBuf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
+	require.NotContains(t, defaultBuf.String(), "Environment="+goalstates.EnvRequiredHardware,
+		"nothing is required by default, so the hooks must not see the variable")
+
+	data := defaultNSpawnTemplateData("kube1")
+	data.RequiredHardwareEnv = requiredHardwareEnv([]string{config.HardwareNvidiaGPU})
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
+
+	out := buf.String()
+	line := "Environment=UNBOUNDED_AGENT_REQUIRED_HARDWARE=NvidiaGPU"
+	require.Contains(t, out, line)
+
+	// Environment= applies to ExecStartPost only from the [Service] section.
+	require.Less(t, strings.Index(out, "[Service]"), strings.Index(out, line))
+}
+
+func TestRequiredHardwareEnv(t *testing.T) {
+	t.Parallel()
+
+	require.Empty(t, requiredHardwareEnv(nil))
+	require.Equal(t, "UNBOUNDED_AGENT_REQUIRED_HARDWARE=NvidiaGPU,Other", requiredHardwareEnv([]string{"NvidiaGPU", "Other"}))
 }
 
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
