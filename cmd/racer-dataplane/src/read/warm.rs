@@ -120,6 +120,25 @@ struct LeaseState {
 }
 /// A requester node and the warm job identifier it chose for one version.
 type LeaseKey = (NodeId, [u8; 16]);
+/// Live lease entries allowed per configured warm job slot, node-wide.
+pub(crate) const LEASES_PER_JOB: usize = 64;
+/// Live lease entries allowed for one object version.
+pub(crate) const MAX_LEASES_PER_VERSION: usize = 64;
+
+impl LeaseState {
+    /// Drop expired leases everywhere. Versions left empty are removed; their
+    /// holds lapse by expiry, and no newer grant exists to fence.
+    fn prune(&mut self, now: SystemTime) {
+        self.versions.retain(|_, (_, entry)| {
+            entry.retain(|_, expiry| *expiry > now);
+            !entry.is_empty()
+        });
+    }
+
+    fn live(&self) -> usize {
+        self.versions.values().map(|(_, entry)| entry.len()).sum()
+    }
+}
 type ReleaseQueue = (Option<Waker>, BTreeMap<ObjectVersion, u64>);
 
 impl WarmRegistry {
@@ -137,9 +156,33 @@ impl WarmRegistry {
 
     /// Record or extend a lease before reserving capacity for it, so a racing
     /// release of another lease cannot trim this reservation.
-    pub(crate) fn grant_lease(&self, version: &ObjectVersion, key: &LeaseKey, until: SystemTime) {
+    ///
+    /// The same (requester, job) key coalesces into one entry whose expiry only
+    /// grows. A new key is refused with `Overloaded` once its version holds
+    /// [`MAX_LEASES_PER_VERSION`] live leases or the node holds
+    /// [`LEASES_PER_JOB`] times `max_jobs` live leases; expired leases are
+    /// pruned first so only live leases count. Refusal never touches existing
+    /// leases or their generation stamp.
+    pub(crate) fn grant_lease(
+        &self,
+        version: &ObjectVersion,
+        key: &LeaseKey,
+        until: SystemTime,
+    ) -> Result<()> {
         let now = uring_runtime::environment::wall_now();
+        let cap = self.config().max_jobs.saturating_mul(LEASES_PER_JOB);
         let mut leases = self.leases.lock().unwrap();
+        let known = leases
+            .versions
+            .get(version)
+            .is_some_and(|(_, entry)| entry.get(key).is_some_and(|expiry| *expiry > now));
+        if !known {
+            leases.prune(now);
+            let per_version = leases.versions.get(version).map_or(0, |(_, e)| e.len());
+            if per_version >= MAX_LEASES_PER_VERSION || leases.live() >= cap {
+                return Err(Error::Overloaded);
+            }
+        }
         leases.next += 1;
         let generation = leases.next;
         let (stamp, entry) = leases.versions.entry(version.clone()).or_default();
@@ -147,6 +190,12 @@ impl WarmRegistry {
         entry.retain(|_, expiry| *expiry > now);
         let expiry = entry.entry(key.clone()).or_insert(until);
         *expiry = (*expiry).max(until);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lease_total(&self) -> usize {
+        self.leases.lock().unwrap().live()
     }
 
     pub(crate) fn has_lease(&self, version: &ObjectVersion, key: &LeaseKey) -> bool {
@@ -1026,7 +1075,7 @@ async fn reserve(
     fresh: &mut Vec<crate::model::WorkerId>,
 ) -> Result<SystemTime> {
     let lease = plan.lease(job);
-    directory.warm.grant_lease(version, &lease, target);
+    directory.warm.grant_lease(version, &lease, target)?;
     let mut accepted = directory
         .reserve_warm(version, &plan.counts, target, scope, fresh)
         .await?;
@@ -1302,7 +1351,10 @@ pub(crate) async fn serve(
                 return Ok(PeerResponse::StaleMembership);
             }
             let renewal = directory.warm.has_lease(&version, &key);
-            directory.warm.grant_lease(&version, &key, until);
+            if let Err(error) = directory.warm.grant_lease(&version, &key, until) {
+                metrics.warm_event(WarmEvent::OwnerHoldRefused);
+                return Err(error);
+            }
             let mut fresh = Vec::new();
             match directory
                 .reserve_warm(&version, &counts, until, scope, &mut fresh)
@@ -1666,6 +1718,89 @@ mod tests {
     }
 
     #[test]
+    fn repeated_grant_for_same_lease_coalesces_without_shortening() {
+        let registry = WarmRegistry::new(4);
+        let v = version("a");
+        let now = uring_runtime::environment::wall_now();
+        let a = (NodeId("a".into()), [1; 16]);
+        let far = now + Duration::from_secs(120);
+        registry.grant_lease(&v, &a, far).unwrap();
+        for _ in 0..1000 {
+            registry
+                .grant_lease(&v, &a, now + Duration::from_secs(60))
+                .unwrap();
+        }
+        assert_eq!(registry.lease_count(&v), 1);
+        assert_eq!(registry.lease_total(), 1);
+        let expiry = registry.leases.lock().unwrap().versions[&v].1[&a];
+        assert_eq!(expiry, far, "expiry never shrinks");
+    }
+
+    #[test]
+    fn lease_caps_refuse_new_keys_without_touching_existing() {
+        let registry = WarmRegistry::new(4);
+        registry
+            .configure(Config {
+                max_jobs: 1,
+                ..Config::default()
+            })
+            .unwrap();
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        let v = version("a");
+        let key = |i: u8| (NodeId(format!("n{i}")), [i; 16]);
+        for i in 0..MAX_LEASES_PER_VERSION as u8 {
+            registry.grant_lease(&v, &key(i), until).unwrap();
+        }
+        let stamp = registry.leases.lock().unwrap().versions[&v].0;
+        assert_eq!(
+            registry.grant_lease(&v, &key(200), until),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(registry.lease_count(&v), MAX_LEASES_PER_VERSION);
+        assert_eq!(registry.leases.lock().unwrap().versions[&v].0, stamp);
+        // Renewing an existing lease still succeeds at the cap.
+        registry.grant_lease(&v, &key(0), until).unwrap();
+        // The node-wide cap (LEASES_PER_JOB * max_jobs) also refuses other versions.
+        assert_eq!(
+            registry.grant_lease(&version("b"), &key(201), until),
+            Err(Error::Overloaded)
+        );
+        assert!(registry.has_lease(&v, &key(1)));
+        assert_eq!(registry.lease_total(), LEASES_PER_JOB);
+    }
+
+    #[test]
+    fn expired_leases_are_pruned_to_free_capacity() {
+        let registry = WarmRegistry::new(4);
+        registry
+            .configure(Config {
+                max_jobs: 1,
+                ..Config::default()
+            })
+            .unwrap();
+        let now = uring_runtime::environment::wall_now();
+        let key = |i: u8| (NodeId(format!("n{i}")), [i; 16]);
+        // Fill the node-wide cap with already expired leases on other versions.
+        for i in 0..LEASES_PER_JOB as u8 {
+            registry
+                .leases
+                .lock()
+                .unwrap()
+                .versions
+                .entry(version(&format!("old{i}")))
+                .or_default()
+                .1
+                .insert(key(i), now - Duration::from_secs(1));
+        }
+        let v = version("a");
+        registry
+            .grant_lease(&v, &key(250), now + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(registry.lease_total(), 1);
+        assert_eq!(registry.leases.lock().unwrap().versions.len(), 1);
+    }
+
+    #[test]
     fn release_queued_after_newer_grant_does_not_trim_new_lease() {
         let registry = WarmRegistry::new(4);
         let worker = crate::model::WorkerId(0);
@@ -1673,7 +1808,7 @@ mod tests {
         let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         let a = (NodeId("a".into()), [1; 16]);
         let b = (NodeId("b".into()), [2; 16]);
-        registry.grant_lease(&v, &a, until);
+        registry.grant_lease(&v, &a, until).unwrap();
         // Simulate the enqueue race: A observes it is last, then B is granted
         // and reserves before A's release reaches the queue.
         let observed = {
@@ -1681,7 +1816,7 @@ mod tests {
             leases.versions.remove(&v);
             leases.next
         };
-        registry.grant_lease(&v, &b, until);
+        registry.grant_lease(&v, &b, until).unwrap();
         registry.release(&v, observed, &[worker]);
         assert!(release_all(&registry, worker).is_empty());
         assert!(registry.drained(worker), "stale release is discarded");
@@ -1699,7 +1834,7 @@ mod tests {
         let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         let a = (NodeId("a".into()), [1; 16]);
         let b = (NodeId("b".into()), [2; 16]);
-        registry.grant_lease(&v, &a, until);
+        registry.grant_lease(&v, &a, until).unwrap();
         assert!(registry.drop_lease(&v, &a, &[worker]));
         let waker = Waker::from(Arc::new(crate::test_support::WakeCounter::default()));
         let mut cx = Context::from_waker(&waker);
@@ -1707,7 +1842,7 @@ mod tests {
             .poll_releases_with(worker, &mut cx, |_| Err(Error::Overloaded))
             .unwrap();
         assert!(!registry.drained(worker), "release is deferred");
-        registry.grant_lease(&v, &b, until);
+        registry.grant_lease(&v, &b, until).unwrap();
         assert!(release_all(&registry, worker).is_empty());
         assert!(registry.drained(worker));
         assert!(registry.has_lease(&v, &b));

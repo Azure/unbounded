@@ -286,6 +286,12 @@ can warm the same version on one owner. An owner frees unused hold capacity only
 after the last lease for that version is released or expires. A release never
 drops pages already written under a hold; they stay held until the hold expires.
 
+Lease entries are bounded. A repeated HEAD for the same requesting node and warm
+job extends its existing lease (never shortening it) instead of adding one. A
+new lease is refused as overloaded once the version has 64 live leases or the
+node has 64 times `RACER_WARM_MAX_JOBS` live leases; expired leases are pruned
+first, and existing leases are never affected by a refusal.
+
 Both ordered and unordered reads of that exact version on the requesting node
 follow the warm progress, including pages the warm job has not started. Reads
 remain pipelined: they need not wait for the whole object, but cannot move a
