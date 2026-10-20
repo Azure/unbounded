@@ -132,6 +132,10 @@ when you need an exact one and the upstream supports versioning.
 
 ## Deploying the Origin
 
+For Azure Blob, the operator can run the origin for you. See
+[Managed Azure origin](racer.md#managed-azure-origin). The rest of this section
+covers deploying an origin yourself.
+
 Run the origin as a DaemonSet in the Racer installation namespace, one per
 ClusterCache. Start from the S3 example below and change the provider flags for
 Azure Blob. Run only one origin DaemonSet per cache.
