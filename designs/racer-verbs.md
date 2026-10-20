@@ -233,6 +233,14 @@ Transitions:
 deregistered only after every `Arc` is gone and every link is destroyed, so
 a `RegisteredPage` held by the cache cannot dangle.
 
+Pool details (as built, `src/pool.rs`): owner-held states are a `Buffer`
+token with no slice or pointer API; only `SendBuffer` (`Staging`) and
+`RegisteredPage` (`Owned`) expose bytes. `BufferState` is public for
+diagnostics. Dropping the owner's `Pool` while any page or send buffer is
+alive, or while any buffer is `Quarantined` or `Leaked`, leaks the region and
+quarantines its charge instead of deregistering, so pages never dangle.
+Waiting clients register through `PoolShared::poll_stage`.
+
 Windows: the owner allocates `grants_per_link * max_links` type 2 MWs per
 device at activation, kept on a free list. Each bind uses
 `ibv_inc_rkey(previous)`, so every grant has a fresh rkey and a stale rkey

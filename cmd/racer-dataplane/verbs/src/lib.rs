@@ -63,8 +63,10 @@
 mod channel;
 mod control;
 mod ffi;
+mod pool;
 
 pub use ffi::Endpoint;
+pub use pool::{BufferState, RegisteredPage, SendBuffer};
 
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
