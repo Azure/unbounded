@@ -142,6 +142,28 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		t.Fatalf("rendered manifest does not use the benchmark node-exporter port")
 	}
 
+	for _, collector := range []string{
+		"--collector.disable-defaults",
+		"--collector.cpu",
+		"--collector.diskstats",
+		"--collector.filesystem",
+		"--collector.meminfo",
+		"--collector.netclass",
+		"--collector.netdev",
+		"--collector.textfile",
+		"--collector.uname",
+	} {
+		if !strings.Contains(string(rendered), collector) {
+			t.Fatalf("rendered manifest does not configure required node-exporter collector %q", collector)
+		}
+	}
+
+	for _, resource := range []string{"cpu: 50m", "memory: 64Mi", "cpu: 500m", "memory: 256Mi"} {
+		if !strings.Contains(string(rendered), resource) {
+			t.Fatalf("rendered manifest does not configure node-exporter resource %q", resource)
+		}
+	}
+
 	for _, metric := range []string{
 		"gantry_streaming_(requests|bytes|rejected)_total",
 		"gantry_streaming_(request_duration|time_to_first_byte)_seconds_(bucket|sum|count)",

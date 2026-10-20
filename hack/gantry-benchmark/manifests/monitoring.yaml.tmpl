@@ -72,6 +72,15 @@ spec:
             - --path.sysfs=/host/sys
             - --path.rootfs=/host/root
             - --web.listen-address=:29100
+            - --collector.disable-defaults
+            - --collector.cpu
+            - --collector.diskstats
+            - --collector.filesystem
+            - --collector.meminfo
+            - --collector.netclass
+            - --collector.netdev
+            - --collector.textfile
+            - --collector.uname
             - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/kubelet/pods/.+)($|/)
             - --collector.textfile.directory=/textfile
           ports:
@@ -79,11 +88,11 @@ spec:
               containerPort: 29100
           resources:
             requests:
-              cpu: 10m
-              memory: 24Mi
-            limits:
-              cpu: 100m
+              cpu: 50m
               memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           securityContext:
             runAsNonRoot: true
             runAsUser: 65534

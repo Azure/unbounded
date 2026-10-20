@@ -320,7 +320,7 @@ func (b *benchmark) waitForGantryMetricSettlement(
 	before gantryMetrics,
 	requirePeerActivity bool,
 ) (gantryMetrics, error) {
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(b.config.TelemetryTimeout)
 	settlement := gantryMetricSettlement{window: 20 * time.Second, requirePeerActivity: requirePeerActivity}
 
 	inFlightQuery := fmt.Sprintf(
