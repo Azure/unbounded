@@ -49,8 +49,24 @@ use std::rc::Rc;
 use std::task::Poll;
 
 mod link_setup;
+mod links;
 mod retry;
+pub use links::AuthenticatedGrant;
+pub use links::BUFFER_LEN;
+pub use links::GRANT_HEADER;
+pub use links::LinkNode;
+pub use links::Links;
+pub use links::NativeSent;
+pub use links::PendingReceive;
+pub use links::SETUP_DEADLINE;
+pub use links::SetupAdmission;
+pub use links::buffer_count;
+pub use links::grants_per_link;
+pub use links::link_key;
 use retry::NativeRetry;
+
+/// Host the node's link owner beside page crypto on its paired thread.
+pub type WithOwner = rdma_verbs::WithNative<PageCryptoEngine, rdma_verbs::Owner>;
 
 // Match discovered ports to trusted local fabric associations and publication.
 // Fabric strings are opaque labels: a GID or enumeration order is never a label.

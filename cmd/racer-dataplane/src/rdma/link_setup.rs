@@ -4,9 +4,6 @@
 //!
 //! Pure code: no verbs or HTTP state. The endpoint is carried as opaque bytes
 //! so this module does not depend on verbs-crate types.
-// Stage 3 of the implementation plan wires these into `Links`; until then only
-// tests use them.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::error::Error;
 use crate::error::Result;
@@ -123,6 +120,10 @@ pub(crate) struct LinkId(pub u64);
 impl LinkId {
     /// First 8 bytes (big-endian) of
     /// `SHA-256(domain || min(setups) || max(setups))`; symmetric in its arguments.
+    ///
+    /// Unused: the responder must name the link id before its QP endpoint
+    /// exists, so links use [`Self::for_setup`] (see the design's "Deviations").
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn derive(a: &[u8], b: &[u8]) -> Self {
         let (low, high) = if a <= b { (a, b) } else { (b, a) };
         let mut hash = Sha256::new();
@@ -131,6 +132,33 @@ impl LinkId {
         hash.update(high);
         Self(u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap()))
     }
+}
+
+impl LinkId {
+    /// First 8 bytes (big-endian) of
+    /// `SHA-256(domain || initiator setup || responder nonce)`.
+    ///
+    /// The responder picks its nonce before it creates its QP, so both sides
+    /// know the id before either posts a control message. Both inputs are in
+    /// the signed exchange: the initiator setup in the request, the nonce in
+    /// the response setup.
+    pub fn for_setup(initiator: &[u8], responder_nonce: &[u8; 16]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(LINK_ID_DOMAIN);
+        hash.update(initiator);
+        hash.update(responder_nonce);
+        Self(u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap()))
+    }
+}
+
+/// Rail named by encoded setup bytes, before the full decode.
+#[cfg_attr(not(test), allow(dead_code))] // Wired into the setup handler next.
+pub(crate) fn rail_of(bytes: &[u8]) -> Result<RailId> {
+    if bytes.len() != SETUP_LEN || !bytes.starts_with(SETUP_PREFIX) {
+        return Err(Error::InvalidRequest);
+    }
+    let b = &bytes[SETUP_PREFIX.len()..];
+    Ok(RailId(u16::from_be_bytes([b[0], b[1]])))
 }
 
 /// Outcome when an initiator in `Connecting` receives the peer's offer for the
@@ -236,6 +264,40 @@ mod tests {
         hash.update(&b);
         let expected = u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap());
         assert_eq!(LinkId::derive(&b, &a), LinkId(expected));
+    }
+
+    #[test]
+    fn setup_link_id_binds_initiator_and_responder_nonce() {
+        let a = setup(1, 1).encode();
+        let b = setup(1, 2).encode();
+        assert_eq!(
+            LinkId::for_setup(&a, &[3; 16]),
+            LinkId::for_setup(&a, &[3; 16])
+        );
+        assert_ne!(
+            LinkId::for_setup(&a, &[3; 16]),
+            LinkId::for_setup(&b, &[3; 16])
+        );
+        assert_ne!(
+            LinkId::for_setup(&a, &[3; 16]),
+            LinkId::for_setup(&a, &[4; 16])
+        );
+        let mut hash = Sha256::new();
+        hash.update(b"racer-rdma-session-v2\0");
+        hash.update(&a);
+        hash.update([3; 16]);
+        let expected = u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap());
+        assert_eq!(LinkId::for_setup(&a, &[3; 16]), LinkId(expected));
+    }
+
+    #[test]
+    fn rail_of_reads_rail_and_rejects_malformed() {
+        let bytes = setup(9, 1).encode();
+        assert_eq!(rail_of(&bytes).unwrap(), RailId(9));
+        assert!(rail_of(&bytes[1..]).is_err());
+        let mut wrong = bytes.clone();
+        wrong[0] ^= 1;
+        assert!(rail_of(&wrong).is_err());
     }
 
     #[test]
