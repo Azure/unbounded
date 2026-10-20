@@ -587,16 +587,19 @@ mod simulation {
         commit(&reactor, &volume).unwrap();
         let low = Key::new([2; 8], [0; 12], 0);
         let high = Key::new([3; 8], [0; 12], 0);
-        let removed = drive(
+        let mut removed = Vec::new();
+        let count = drive(
             &reactor,
             volume.remove_range(
                 &reactor,
                 Bound::Included(low),
                 Bound::Excluded(high),
+                |batch| removed.extend_from_slice(batch),
                 &SCOPE,
             ),
         )
         .unwrap();
+        assert_eq!(count, 20);
         assert_eq!(removed.len(), 20);
         assert!(removed.iter().all(|(k, _)| k.cache() == [2; 8]));
         assert_eq!(volume.len(), 40);
@@ -1094,6 +1097,67 @@ mod simulation {
         assert!(volume.take_evicted().is_empty());
         let rest = evict_one(&reactor, &volume, 50).expect("slot evictable again");
         assert_eq!(partial.len() + rest.len(), 3000);
+        assert!(entries(&reactor, &volume).is_empty());
+    }
+
+    /// Removal and retention paths commit at the dirty limit instead of
+    /// growing the overlay without bound.
+    #[test]
+    fn removals_respect_the_dirty_limit() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let mut options = options(Limits::UNLIMITED);
+        options.dirty_bytes = 100 * 160;
+        let limit = options.dirty_bytes;
+        let (volume, slab, _) = mount_with(&reactor, options);
+        let fill = |cache: u8| {
+            for n in 0..3000 {
+                if volume.needs_commit() {
+                    commit(&reactor, &volume).unwrap();
+                }
+                put(
+                    &reactor,
+                    &volume,
+                    &slab,
+                    Tier::Storage,
+                    key(cache, n),
+                    100,
+                    1,
+                )
+                .unwrap();
+            }
+            commit(&reactor, &volume).unwrap();
+        };
+        fill(1);
+        let mut first = None;
+        let mut most = 0;
+        let count = drive(
+            &reactor,
+            volume.remove_range(
+                &reactor,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                |_| {
+                    let dirty = volume.dirty_bytes();
+                    first.get_or_insert(dirty);
+                    most = most.max(dirty);
+                },
+                &SCOPE,
+            ),
+        )
+        .unwrap();
+        assert_eq!(count, 3000);
+        assert!(most <= first.unwrap() + limit, "{most} grew past one batch");
+        assert!(entries(&reactor, &volume).is_empty());
+        fill(2);
+        for n in 0..3000 {
+            assert!(drive(&reactor, volume.set_retain(&reactor, &key(2, n), 5, &SCOPE)).unwrap());
+            assert!(volume.dirty_bytes() <= limit + 1024);
+        }
+        for n in 0..3000 {
+            assert!(remove(&reactor, &volume, &key(2, n)).is_some());
+            assert!(volume.dirty_bytes() <= limit + 1024);
+        }
         assert!(entries(&reactor, &volume).is_empty());
     }
 

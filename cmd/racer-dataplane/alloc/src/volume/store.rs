@@ -1578,7 +1578,24 @@ impl<C: Charge> Volume<C> {
         Ok(())
     }
 
-    /// Remove `key`. Returns its value.
+    /// Commit first when the overlay is at the dirty limit, so mutation
+    /// paths keep uncommitted changes bounded by `dirty_bytes`.
+    pub(super) async fn throttle<S: Scope, B: Budget>(
+        &self,
+        reactor: &Reactor<S, B>,
+        scope: &S,
+    ) -> std::result::Result<(), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        if self.needs_commit() {
+            self.commit(reactor, scope).await?;
+        }
+        Ok(())
+    }
+
+    /// Remove `key`. Returns its value. Commits first when the dirty limit
+    /// is reached.
     pub fn remove<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
@@ -1590,6 +1607,7 @@ impl<C: Charge> Volume<C> {
     {
         let key = *key;
         Box::pin(async move {
+            self.throttle(reactor, scope).await?;
             let old = self.resolve(reactor, scope, &key).await?;
             if old.is_some() {
                 self.shared.state().set(key, IndexOp::Delete, Some(old));
@@ -1599,7 +1617,7 @@ impl<C: Charge> Volume<C> {
     }
 
     /// Remove `key` only if its value is `expected`. Returns whether it was
-    /// removed.
+    /// removed. Commits first when the dirty limit is reached.
     pub fn remove_if<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
@@ -1612,6 +1630,7 @@ impl<C: Charge> Volume<C> {
     {
         let (key, expected) = (*key, *expected);
         Box::pin(async move {
+            self.throttle(reactor, scope).await?;
             let old = self.resolve(reactor, scope, &key).await?;
             if old != Some(expected) {
                 return Ok(false);
@@ -1634,21 +1653,28 @@ impl<C: Charge> Volume<C> {
     }
 
     /// Remove every entry with a key in `(low, high)`, a batch at a time.
-    /// Returns the removed entries in key order.
+    /// Hands each batch of removed entries, in key order, to `on_removed`,
+    /// and commits between batches when the dirty limit is reached, so a
+    /// large range never holds more than `dirty_bytes` of changes. Returns
+    /// the count removed. On an error the batches already handed over stay
+    /// removed.
     pub fn remove_range<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
         low: Bound<Key>,
         high: Bound<Key>,
+        mut on_removed: impl FnMut(&[(Key, Value)]) + 'a,
         scope: &'a S,
-    ) -> Operation<'a, Vec<(Key, Value)>, S::Error>
+    ) -> Operation<'a, usize, S::Error>
     where
         S::Error: From<Error>,
     {
         Box::pin(async move {
-            let mut removed = Vec::new();
+            let mut count = 0;
             let mut cursor = low;
             loop {
+                self.throttle(reactor, scope).await?;
+                let mut removed = Vec::new();
                 let batch = self.scan_index(reactor, scope, cursor, high, 1024).await?;
                 let Some(last) = batch.last().map(|(k, _)| *k) else {
                     break;
@@ -1665,9 +1691,11 @@ impl<C: Charge> Volume<C> {
                         removed.push((key, value));
                     }
                 }
+                count += removed.len();
+                on_removed(&removed);
                 cursor = Bound::Excluded(last);
             }
-            Ok(removed)
+            Ok(count)
         })
     }
 
@@ -1687,6 +1715,7 @@ impl<C: Charge> Volume<C> {
     {
         let key = *key;
         Box::pin(async move {
+            self.throttle(reactor, scope).await?;
             let Some(old) = self.resolve(reactor, scope, &key).await? else {
                 return Ok(false);
             };

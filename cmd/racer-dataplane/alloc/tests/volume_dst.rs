@@ -500,14 +500,17 @@ impl<'r> Run<'r> {
                 let high = Key::new([cache + 1; 8], [0; 12], 0);
                 let Ok(removed) = self.run(|volume, reactor| {
                     Box::pin(async move {
+                        let mut removed = Vec::new();
                         volume
                             .remove_range(
                                 reactor,
                                 Bound::Included(low),
                                 Bound::Excluded(high),
+                                |batch| removed.extend_from_slice(batch),
                                 &SCOPE,
                             )
                             .await
+                            .map(|_| removed)
                     })
                 }) else {
                     // A read fault part way: the batches before it are removed.
