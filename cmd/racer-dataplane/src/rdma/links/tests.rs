@@ -110,9 +110,30 @@ pub(crate) fn page(
     length: u32,
     byte: u8,
 ) -> CiphertextPage {
+    page_with(admission, envelope(length), vec![byte; length as usize])
+}
+
+pub(crate) fn page_with(
+    admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+    envelope: PageEnvelope,
+    bytes: Vec<u8>,
+) -> CiphertextPage {
+    let cache = envelope.page.version.object.cache.clone();
+    BufferPool::new(admission.clone())
+        .ciphertext(
+            admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, bytes.len())
+                .unwrap(),
+            envelope,
+            bytes,
+        )
+        .unwrap()
+}
+
+pub(crate) fn envelope(length: u32) -> PageEnvelope {
     use crate::model::*;
     let cache = racer_control_wire::CacheId("cccccccc-1111-4111-8111-111111111111".into());
-    let envelope = PageEnvelope {
+    PageEnvelope {
         cipher: PageCipher::Xaes256Gcm,
         page: PageId {
             version: ObjectVersion {
@@ -128,16 +149,25 @@ pub(crate) fn page(
         nonce: Nonce([2; 24]),
         plaintext_length: length - 16,
         ciphertext_length: length,
-    };
-    BufferPool::new(admission.clone())
-        .ciphertext(
-            admission
-                .reserve(Some(&cache), ResourceClass::Ciphertext, length as usize)
-                .unwrap(),
-            envelope,
-            vec![byte; length as usize],
-        )
-        .unwrap()
+    }
+}
+
+/// Write `page` from `b` into a buffer granted by `a` over `link_up`'s link and
+/// return the received registered page. `a` then has one buffer `Owned`.
+pub(crate) fn receive_registered(
+    w: &mut World,
+    page: &CiphertextPage,
+) -> rdma_verbs::RegisteredPage {
+    let (a, b) = (w.a.links.local().clone(), w.b.links.local().clone());
+    let scope = scope();
+    let pending = drive!(w, w.a.links.grant(&b, RAIL, TransferId([9; 16]), &scope)).unwrap();
+    let header = STANDARD.decode(pending.header_value()).unwrap();
+    let grant = AuthenticatedGrant::decode(&header, RAIL, TransferId([9; 16])).unwrap();
+    drive!(w, w.b.links.send(&a, &grant, page, &scope)).unwrap();
+    match drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap() {
+        Arrival::Page(page) => page,
+        Arrival::Released => panic!("expected a page"),
+    }
 }
 
 pub(crate) fn world() -> World {
@@ -452,3 +482,5 @@ fn drain_stops_setups_and_closes_the_node() {
     pump!(w);
     assert!(w.a.owner.drained());
 }
+
+mod zero_copy;

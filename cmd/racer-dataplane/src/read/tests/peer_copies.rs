@@ -2779,3 +2779,101 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
         drop(endpoints);
     }
 }
+
+/// Wrap `copy`'s ciphertext as a received registered RDMA page on `f`'s pool.
+fn registered_copy(
+    f: &Fixture,
+    w: &mut crate::rdma::links::tests::World,
+    copy: &CiphertextCopy,
+    bytes: Vec<u8>,
+) -> CiphertextCopy {
+    let sent = crate::rdma::links::tests::page_with(
+        &w.b.admission,
+        copy.ciphertext.envelope().clone(),
+        bytes,
+    );
+    let received = crate::rdma::links::tests::receive_registered(w, &sent);
+    let admission = &f.fill.dependencies.admission;
+    let reservation = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            received.len(),
+        )
+        .unwrap();
+    let ciphertext = crate::memory::BufferPool::new(admission.clone())
+        .registered_ciphertext(reservation, copy.ciphertext.envelope().clone(), received)
+        .unwrap();
+    assert!(ciphertext.is_registered());
+    CiphertextCopy {
+        metadata: copy.metadata.clone(),
+        ciphertext,
+    }
+}
+
+fn free_buffers(w: &crate::rdma::links::tests::World) -> Option<usize> {
+    w.a.links
+        .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free)
+}
+
+#[test]
+fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
+    let mut f = fixture_with(3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    crate::rdma::links::tests::link_up(&mut w);
+    let good = encrypted_copy(&mut f);
+    // Tampered page-backed ciphertext fails authentication and frees the buffer.
+    let mut tampered = good.ciphertext.bytes().to_vec();
+    tampered[0] ^= 1;
+    let bad = registered_copy(&f, &mut w, &good, tampered);
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let decrypted = drive(
+        f.fill
+            .decrypt(&f.page, bad, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(decrypted.err(), Some(Error::CorruptRecord));
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2));
+    // Page-backed ciphertext decrypts without a copy.
+    let copy = registered_copy(&f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let result = drive(
+        f.fill
+            .decrypt(&f.page, copy, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert!(result.ciphertext.is_registered());
+    // The write queue retains a copy, not the registered buffer.
+    let admission = &f.fill.dependencies.admission;
+    let dirty = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::DirtyCiphertext,
+            19,
+        )
+        .unwrap();
+    f.fill
+        .dependencies
+        .writer
+        .enqueue(result.copy(), dirty)
+        .unwrap();
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    drop(result);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        free_buffers(&w),
+        Some(2),
+        "the queue does not pin the buffer"
+    );
+}
