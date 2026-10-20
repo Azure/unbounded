@@ -60,8 +60,58 @@ fn pages_are_contiguous_and_spill_into_new_node_slots() {
     assert!(!slots.free_page(NodeAddr::new(META_SLOT, 2)));
     assert!(slots.free_page(pages[0]));
     assert!(!slots.free_page(pages[0]));
-    assert_eq!(slots.alloc_pages(1), vec![pages[0]]);
-    assert_eq!(slots.used_bytes(0..1), u64::from(SLOT_UNITS) * 4096);
+    // A lone hole is not worth a run while a free slot exists.
+    let fresh = slots.alloc_pages(1);
+    assert_ne!(fresh[0].slot(), META_SLOT);
+    assert_eq!(fresh[0].unit(), 2);
+    assert_eq!(slots.used_bytes(0..1), (u64::from(SLOT_UNITS) - 1) * 4096);
+}
+
+#[test]
+fn page_cursor_continues_runs_across_calls() {
+    let mut slots = table();
+    let mut pages = slots.alloc_pages(3);
+    pages.extend(slots.alloc_pages(1));
+    pages.extend(slots.alloc_pages(5));
+    assert!(pages.windows(2).all(|w| w[1].0 == w[0].0 + 1));
+    // Freed pages behind the cursor are not handed out again at once.
+    assert!(slots.free_page(pages[0]));
+    assert_eq!(slots.alloc_pages(1)[0].0, pages[8].0 + 1);
+}
+
+#[test]
+fn page_cursor_moves_to_a_long_run_before_holes_or_free_slots() {
+    let mut slots = table();
+    // Fill the meta slot, then open a hole of CURSOR_RUN units and a lone one.
+    let all = slots.alloc_pages((SLOT_UNITS - 4) as usize);
+    assert!(all.iter().all(|a| a.slot() == META_SLOT));
+    for addr in &all[100..100 + CURSOR_RUN as usize] {
+        assert!(slots.free_page(*addr));
+    }
+    assert!(slots.free_page(all[10]));
+    let free = slots.usage().free_slots;
+    let run = slots.alloc_pages(CURSOR_RUN as usize);
+    assert_eq!(run, all[100..100 + CURSOR_RUN as usize].to_vec());
+    assert_eq!(slots.usage().free_slots, free);
+}
+
+#[test]
+fn page_cursor_takes_holes_when_no_slot_is_free() {
+    let mut slots = Slots::new(MIN_SLOTS, Limits::UNLIMITED).unwrap();
+    let mut taken = Vec::new();
+    loop {
+        let got = slots.alloc_pages(4096);
+        if got.is_empty() {
+            break;
+        }
+        taken.extend(got);
+    }
+    assert_eq!(slots.usage().free_slots, 0);
+    assert!(slots.free_page(taken[7]));
+    assert!(slots.free_page(taken[9]));
+    let mut again = slots.alloc_pages(3);
+    again.sort();
+    assert_eq!(again, vec![taken[7], taken[9]]);
 }
 
 #[test]

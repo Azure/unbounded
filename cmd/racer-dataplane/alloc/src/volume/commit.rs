@@ -63,8 +63,6 @@ struct Writer<'a, C: Charge, S: Scope, B: Budget> {
     seq: u64,
     kind: TreeKind,
     run: Option<Run<C>>,
-    // Allocated for leaves and not used yet, in address order.
-    spare: std::collections::VecDeque<NodeAddr>,
     inflight: Vec<WriteFuture<'a, S::Error>>,
     error: Option<S::Error>,
     pages: u64,
@@ -84,7 +82,6 @@ where
             seq,
             kind: TreeKind::Index,
             run: None,
-            spare: std::collections::VecDeque::new(),
             inflight: Vec::new(),
             error: None,
             pages: 0,
@@ -212,26 +209,13 @@ where
         self.check()
     }
 
-    /// Take the next spare leaf address, allocating a run when needed.
+    /// Take the next leaf address. Node units come from a cursor, so the
+    /// leaves continue the run the previous page started.
     fn next_leaf_addr(&mut self) -> Result<NodeAddr, S::Error> {
-        if self.spare.is_empty() {
-            let pages = self.volume.shared.state().slots.alloc_pages(RUN_PAGES);
-            if pages.is_empty() {
-                return Err(Error::Busy.into());
-            }
-            self.allocated.extend(pages.iter().copied());
-            self.spare.extend(pages);
-        }
-        Ok(self.spare.pop_front().expect("spare"))
-    }
-
-    /// Free spare leaf addresses that were never written.
-    fn return_spare(&mut self) {
-        let mut state = self.volume.shared.state();
-        for addr in self.spare.drain(..) {
-            state.slots.free_page(addr);
-            self.allocated.retain(|a| *a != addr);
-        }
+        let addr = self.volume.shared.state().slots.alloc_pages(1);
+        let addr = *addr.first().ok_or(Error::Busy)?;
+        self.allocated.push(addr);
+        Ok(addr)
     }
 }
 
@@ -651,6 +635,9 @@ impl<C: Charge> Volume<C> {
         };
         let volume_id = self.volume_id.get();
         let io = self.io(reactor, scope);
+        // Pages of a small commit land in one run.
+        let estimate = frozen.index.len() + frozen.records.len() + 8;
+        self.shared.state().slots.prepare_pages(estimate);
         let mut writer = Writer::new(self, reactor, scope, seq);
 
         // Index.
@@ -783,7 +770,6 @@ impl<C: Charge> Volume<C> {
         attempt.allocated.append(&mut writer.allocated);
         let records = records?;
         drop(record_ops);
-        writer.return_spare();
         attempt
             .allocated
             .retain(|a| self.shared.state().slots.page_used(*a));
@@ -816,7 +802,6 @@ impl<C: Charge> Volume<C> {
                 }),
         );
         base_freed.extend(retired_records.iter().copied());
-
         // Slot table and the allocation fixpoint: placing pages may claim
         // node slots, which changes the slot table, which may need pages.
         let released_slots: BTreeSet<u32> = released_pages.iter().map(|a| a.slot()).collect();

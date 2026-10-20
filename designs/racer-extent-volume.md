@@ -279,9 +279,11 @@ changes.
    reservation covers what it needs.
 5. Place new pages children first, encode them straight into run buffers,
    and write each run of up to 64 contiguous pages (256 KiB, never crossing a
-   slot) with one request. Write the bitmap of every node slot that changed to
-   the copy that is not durable, with the units this commit releases already
-   clear.
+   slot) with one request. Every page comes from the node cursor (see
+   "Metadata space"), so the leaves, inner copies, slot table pages, and
+   retired log of a small commit form one run. Write the bitmap of every node
+   slot that changed to the copy that is not durable, with the units this
+   commit releases already clear.
 6. Barrier 1: `fsync` the backing descriptors that completed a write since
    their last sync (`Slab::sync_dirty`), in parallel. This also makes every
    published record durable, because a record is published only after its
@@ -316,10 +318,17 @@ slots whose `retain_until` bound has passed.
 
 ### Metadata space
 
-Metadata pages come from the open node slot, then partly used node slots, then
-a free slot, taking the lowest free units so runs are contiguous. A node slot
-whose pages are all released returns to the free pool. Bitmap copies live at
-fixed units, so writing them needs no allocation and cannot recurse.
+Metadata pages come from a cursor that moves forward through one free run of
+a node slot, so consecutive pages (within a commit and across commits) are
+contiguous. Before a commit allocates, the cursor moves when its run holds
+fewer units than the commit is expected to write (capped at 64). A move takes
+the first run of at least 64 units among up to 64 node slots with free units
+(starting where the last search stopped), else claims a free slot as a node
+slot while at most half of all node units are free holes, else takes the
+longest run it saw. The half-holes rule trades some node space (at most
+about twice the live metadata) for contiguous runs. A node slot whose pages
+are all released returns to the free pool. Bitmap copies live at fixed
+units, so writing them needs no allocation and cannot recurse.
 
 Data allocation never claims the last free slots: it fails with `Busy` while
 the free slots do not exceed a metadata reserve, so a commit always finds
@@ -337,10 +346,9 @@ bounded the same way. With a 16 MiB dirty limit (the default for a
 64 MiB page cache) the bound tops out at about 3.4 GiB, and at about 13.6
 GiB with the dataplane's 256 MiB cache (64 MiB dirty limit). The cap is
 reached only when the trees hold that much; until then the reserve is about
-the trees' size plus the growth of one commit. `Volume::free_slots` and `reserve_free` count only the free
-slots above the reserve, so the dataplane's free-slot reserve sits on top
-of it. Bitmap copies live at
-fixed units, so writing them needs no allocation and cannot recurse.
+the trees' size plus the growth of one commit. `Volume::free_slots` and
+`reserve_free` count only the free slots above the reserve, so the
+dataplane's free-slot reserve sits on top of it.
 
 ### Tiers
 

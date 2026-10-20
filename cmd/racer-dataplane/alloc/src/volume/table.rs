@@ -42,8 +42,14 @@ const COPY: u8 = 32;
 /// Node pages a commit takes per run: 64 pages, 256 KiB.
 pub const RUN_PAGES: usize = 64;
 
+/// Free run the node cursor looks for: a few commits of pages.
+const CURSOR_RUN: u32 = 64;
+
 /// Smallest volume that keeps a spare slot for metadata runs.
 const SPARE_MIN_SLOTS: u64 = 64;
+
+/// Node slots the cursor examines when it moves.
+const CURSOR_SCAN: usize = 64;
 
 /// Upper bound on the metadata pages one commit writes when it covers at
 /// most `entries` overlay entries, the trees hold about `live` pages, and the
@@ -474,6 +480,10 @@ pub struct Slots {
     ready: Vec<Vec<u32>>,
     open: Vec<u32>,
     node_open: u32,
+    // Next unit the node cursor hands out in `node_open`.
+    node_next: u32,
+    // Where the cursor's search of node slots starts.
+    node_hand: u32,
     // Most overlay entries one commit can cover; sizes the metadata reserve.
     commit_entries: u64,
     node_partial: BTreeSet<u32>,
@@ -525,6 +535,8 @@ impl Slots {
             ready: (0..2 * CLASS_COUNT).map(|_| Vec::new()).collect(),
             open: vec![NONE; 2 * CLASS_COUNT],
             node_open: NONE,
+            node_next: 0,
+            node_hand: 0,
             commit_entries: 0,
             node_partial: BTreeSet::new(),
             hand: 1,
@@ -809,59 +821,162 @@ impl Slots {
         }
     }
 
-    /// Take up to `count` free node units, preferring long runs in the open
-    /// node slot. Claims free slots as node slots when needed. Returns fewer
+    /// Take up to `count` free node units. Units come from a cursor that
+    /// moves forward through a free run, so the pages of one commit (and of
+    /// consecutive calls) are contiguous. When the run ends the cursor moves
+    /// to the first run of at least [`CURSOR_RUN`] units in a node slot, then
+    /// to a free slot (claimed as a node slot) while less than a slot's worth
+    /// of node units is free, then to the longest run anywhere. Returns fewer
     /// when space runs out.
     pub fn alloc_pages(&mut self, count: usize) -> Vec<NodeAddr> {
         let mut out = Vec::with_capacity(count);
         while out.len() < count {
-            let slot = if self.node_open != NONE {
-                self.node_open
-            } else if self.slots[META_SLOT as usize].kind == SLOT_NODE
-                && u32::from(self.slots[META_SLOT as usize].used) < SLOT_UNITS
-                && self.node_partial.contains(&META_SLOT)
-            {
-                META_SLOT
-            } else if let Some(&slot) = self.node_partial.iter().find(|&&s| s != META_SLOT) {
-                slot
-            } else if let Some(slot) = self.claim_free() {
-                let incarnation = self.take_incarnation();
-                self.init_node(slot, incarnation);
-                self.claimed.push((slot, incarnation));
-                self.sync_used(slot);
-                slot
-            } else {
+            if !self.cursor_ready() && !self.move_cursor() {
                 break;
-            };
-            self.node_open = slot;
+            }
+            let slot = self.node_open;
             let entry = self.slots[slot as usize];
             let bitmap = self.bitmaps[entry.aux as usize]
                 .as_mut()
                 .expect("node bitmap");
-            let first = u32::from(first_page_unit(slot));
-            let mut taken = 0;
-            let mut unit = first;
-            while out.len() < count {
-                let Some(found) = first_clear(&bitmap.words, unit, SLOT_UNITS) else {
-                    break;
-                };
-                set_bit(&mut bitmap.words, found, true);
-                out.push(NodeAddr::new(slot, found as u16));
+            let mut taken = 0u16;
+            while out.len() < count
+                && self.node_next < SLOT_UNITS
+                && !get_bit(&bitmap.words, self.node_next)
+            {
+                set_bit(&mut bitmap.words, self.node_next, true);
+                out.push(NodeAddr::new(slot, self.node_next as u16));
+                self.node_next += 1;
                 taken += 1;
-                unit = found + 1;
             }
-            if taken == 0 {
-                // Full: close it.
-                self.node_partial.remove(&slot);
-                self.node_open = NONE;
-                continue;
-            }
-            self.slots[slot as usize].used += taken as u16;
+            self.slots[slot as usize].used += taken;
             self.dirty_nodes.insert(slot);
             self.sync_used(slot);
             self.refresh(slot);
         }
         out
+    }
+
+    fn cursor_ready(&self) -> bool {
+        let Some(entry) = self.slots.get(self.node_open as usize) else {
+            return false;
+        };
+        entry.kind == SLOT_NODE
+            && self.node_next < SLOT_UNITS
+            && !get_bit(
+                &self.bitmaps[entry.aux as usize]
+                    .as_ref()
+                    .expect("node bitmap")
+                    .words,
+                self.node_next,
+            )
+    }
+
+    /// Longest free run of a node slot: start and length.
+    fn longest_run(&self, slot: u32) -> (u32, u32) {
+        let entry = self.slots[slot as usize];
+        let words = &self.bitmaps[entry.aux as usize]
+            .as_ref()
+            .expect("node bitmap")
+            .words;
+        let (mut best, mut at) = ((0, 0), u32::from(first_page_unit(slot)));
+        while let Some(start) = first_clear(words, at, SLOT_UNITS) {
+            let mut end = start + 1;
+            while end < SLOT_UNITS && !get_bit(words, end) {
+                end += 1;
+            }
+            if end - start > best.1 {
+                best = (start, end - start);
+            }
+            at = end;
+        }
+        best
+    }
+
+    /// Free units left in the cursor's run.
+    fn cursor_run(&self) -> u32 {
+        if !self.cursor_ready() {
+            return 0;
+        }
+        let entry = self.slots[self.node_open as usize];
+        let words = &self.bitmaps[entry.aux as usize]
+            .as_ref()
+            .expect("node bitmap")
+            .words;
+        let mut end = self.node_next;
+        while end < SLOT_UNITS && !get_bit(words, end) {
+            end += 1;
+        }
+        end - self.node_next
+    }
+
+    /// Make sure the cursor's run holds at least `pages` units (capped at
+    /// [`CURSOR_RUN`]) when such a run can be had, so that a commit of that
+    /// many pages lands in one run. Call it before a commit allocates.
+    pub fn prepare_pages(&mut self, pages: usize) {
+        let want = (pages as u32).clamp(1, CURSOR_RUN);
+        if self.cursor_run() < want {
+            self.move_cursor();
+        }
+    }
+
+    /// Point the cursor at a new free run: the longest run among up to
+    /// [`CURSOR_SCAN`] node slots with free units (taken at once when it
+    /// reaches [`CURSOR_RUN`]), else a free slot claimed as a node slot while
+    /// at most half the node units are free (holes), else the longest run
+    /// found. False when no node unit is free and no slot can be
+    /// claimed.
+    fn move_cursor(&mut self) -> bool {
+        let start = self.node_hand;
+        let candidates: Vec<u32> = self
+            .node_partial
+            .range(start..)
+            .chain(self.node_partial.range(..start))
+            .copied()
+            .take(CURSOR_SCAN)
+            .collect();
+        let mut best = (NONE, 0, 0);
+        for slot in candidates {
+            let (start, length) = self.longest_run(slot);
+            if length > best.2 {
+                best = (slot, start, length);
+            }
+            if length >= CURSOR_RUN {
+                break;
+            }
+        }
+        if best.2 >= CURSOR_RUN {
+            self.node_hand = best.0;
+            self.node_open = best.0;
+            self.node_next = best.1;
+            return true;
+        }
+        self.node_hand = self.node_hand.wrapping_add(CURSOR_SCAN as u32);
+        // Holes of at most half the node space are tolerated before metadata
+        // stops claiming slots and fills them.
+        let free_units: u64 = self
+            .node_partial
+            .iter()
+            .map(|&s| u64::from(SLOT_UNITS - u32::from(self.slots[s as usize].used)))
+            .sum();
+        if free_units * 2 <= self.node_slots * u64::from(SLOT_UNITS)
+            && let Some(slot) = self.claim_free()
+        {
+            let incarnation = self.take_incarnation();
+            self.init_node(slot, incarnation);
+            self.claimed.push((slot, incarnation));
+            self.sync_used(slot);
+            self.node_open = slot;
+            self.node_next = u32::from(first_page_unit(slot));
+            return true;
+        }
+        if best.0 == NONE {
+            self.node_open = NONE;
+            return false;
+        }
+        self.node_open = best.0;
+        self.node_next = best.1;
+        true
     }
 
     /// Set the most overlay entries one commit can cover. Sizes the metadata
