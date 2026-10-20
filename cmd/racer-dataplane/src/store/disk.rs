@@ -473,9 +473,12 @@ impl Index {
             volume.commit(&*reactor, scope).await?;
         }
         self.reserve_stuck.set(false);
-        let (result, evicted) = volume
+        let allocated = volume
             .allocate_evicting(&*reactor, tier, length, now_unix(), EVICTION_BUDGET, scope)
-            .await?;
+            .await;
+        // A failed eviction may have removed entries before it stopped.
+        self.forget_pages(&volume.take_evicted(), true);
+        let (result, evicted) = allocated?;
         self.forget_pages(&evicted, true);
         Ok(result?)
     }
@@ -756,7 +759,10 @@ impl Index {
                     RESERVE_EVICTIONS,
                     scope,
                 )
-                .await?;
+                .await;
+            // A failed eviction may have removed entries before it stopped.
+            self.forget_pages(&volume.take_evicted(), true);
+            let evicted = evicted?;
             self.reserve_stuck
                 .set(volume.free_slots() < FREE_SLOT_RESERVE && evicted.is_empty());
             self.forget_pages(&evicted, true);
