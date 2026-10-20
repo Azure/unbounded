@@ -511,16 +511,13 @@ impl Index {
                 }
             }
         }
-        let versions: HashSet<_> = snapshot
-            .entries
-            .iter()
-            .filter(|(_, entry)| offsets.contains(&entry.location.extent.offset()))
-            .map(|(page, _)| &page.version)
-            .collect();
+        // Count exactly what `restore_holds` restores as held: entries whose
+        // offsets carry a live deadline. Cached nonmember pages of a held
+        // version are not pinned by sparse holds and must not be charged.
         let pages = snapshot
             .entries
             .iter()
-            .filter(|(page, _)| versions.contains(&page.version))
+            .filter(|(_, entry)| offsets.contains(&entry.location.extent.offset()))
             .count();
         let holds = self.holds.borrow();
         let limit = (segments.len() * holds.percent / 100)
@@ -1474,6 +1471,43 @@ mod tests {
         index
             .reserve_hold_pages(&other, &page_set(&[0]), until)
             .unwrap();
+    }
+
+    #[test]
+    fn restored_sparse_hold_counts_only_held_pages_at_capacity_edge() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(4).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (first, _) = indexed(descriptor("sparse", 3 * crate::model::PAGE_BYTES), 0);
+        let mut pages = Vec::new();
+        for number in 0..3u64 {
+            let (mut page, entry) =
+                indexed(descriptor("sparse", 3 * crate::model::PAGE_BYTES), number);
+            page.number = crate::model::PageNumber(number);
+            drop(segments.append(1024).unwrap());
+            index.publish(page.clone(), entry).unwrap();
+            pages.push(page);
+        }
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&first.version, &page_set(&[1]), until)
+            .unwrap();
+        assert_eq!(index.held_snapshot().pages, 1);
+        let mut snapshots = segments.snapshot();
+        let mut remaining = usize::MAX;
+        index
+            .snapshot_holds(&mut snapshots, &mut remaining)
+            .unwrap();
+        let image = index.snapshot().unwrap();
+        index.holds.borrow_mut().entries.clear();
+        // Three cached pages exceed the limit of two; one held page does not.
+        index.validate_restored_holds(&image, &snapshots).unwrap();
+        index.restore_holds(&snapshots).unwrap();
+        assert!(!index.is_held(&pages[0]), "nonmember stays evictable");
+        assert_eq!(index.held_page_expiry(&pages[1]), Some(until));
+        assert!(!index.is_held(&pages[2]), "nonmember stays evictable");
+        assert_eq!(index.held_snapshot().pages, 1);
     }
 
     #[test]
