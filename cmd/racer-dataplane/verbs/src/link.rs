@@ -8,9 +8,6 @@
 //!
 //! Work request ids: bits 63..56 kind, 31..0 receive slot, send slot, or tag.
 
-// The owner (stage 2e) drives this; until then only the tests do.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
     collections::{HashMap, VecDeque},
     rc::Rc,
@@ -30,7 +27,7 @@ use crate::{
 };
 
 /// A link not `Ready` this long after creation breaks.
-pub(crate) const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// After sending `Close`, break at the latest this long later.
 pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(1);
@@ -487,6 +484,7 @@ impl Link {
     }
 
     /// The first completion that broke the QP, if any.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn failure(&self) -> Option<Failure> {
         self.qp.failure()
     }
@@ -732,15 +730,24 @@ impl Link {
 
         let mut completions = Vec::new();
 
-        if self.phase != Phase::Created {
-            self.qp
-                .progress_with(|c| completions.push(c))
-                .map_err(|_| Break::Error)?;
+        let progressed = if self.phase == Phase::Created {
+            Ok(0)
+        } else {
+            self.qp.progress_with(|c| completions.push(c))
+        };
+
+        // Completions before a failed one are still valid. A `Close` among
+        // them means the peer closed first; anything else is an error.
+        for completion in completions {
+            match self.complete(pool, completion, now) {
+                Ok(()) => {}
+                Err(Break::PeerClosed) => return Err(Break::PeerClosed),
+                Err(error) if progressed.is_ok() => return Err(error),
+                Err(_) => return Err(Break::Error),
+            }
         }
 
-        for completion in completions {
-            self.complete(pool, completion, now)?;
-        }
+        progressed.map_err(|_| Break::Error)?;
 
         self.expire(pool, now)?;
 
@@ -893,10 +900,14 @@ impl Link {
                     &[][..]
                 };
 
-                Some(
-                    ControlMessage::decode(bytes, self.link_id, self.limits.buffer_len)
-                        .map_err(|_| Break::Error)?,
-                )
+                let message = ControlMessage::decode(bytes, self.link_id, self.limits.buffer_len)
+                    .map_err(|_| Break::Error)?;
+
+                if message.kind == ControlKind::Close {
+                    return Err(Break::PeerClosed);
+                }
+
+                Some(message)
             }
             opcode::RECV_RDMA_WITH_IMM => None,
             _ => return Err(Break::Error),
@@ -996,8 +1007,7 @@ impl Link {
                 self.outbox.push_back(Outgoing::Invalidate(tag));
                 self.last_used = now;
             }
-            ControlKind::Credit => {}
-            ControlKind::Close => return Err(Break::PeerClosed),
+            ControlKind::Credit | ControlKind::Close => {}
         }
 
         Ok(())

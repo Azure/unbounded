@@ -22,10 +22,6 @@
 //! | 40 | 16 | transfer id (Grant and Release, zero otherwise) |
 //! | 56 | 8 | reserved, zero |
 
-// Not used until the link layer lands (stage 2d); keep the codec compiled and
-// tested in the meantime without dead-code warnings.
-#![allow(dead_code)]
-
 /// Size of every control message on the wire.
 pub const CONTROL_LEN: usize = 64;
 /// The only supported wire version.

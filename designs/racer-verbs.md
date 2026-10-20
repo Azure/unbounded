@@ -177,6 +177,44 @@ rules"). Dropping `Op<Granted>` before the bind completes frees the buffer
 after the bind CQE and breaks nothing if the `Grant` was not yet posted. Dropping `Op<()>` for a write does not
 cancel the posted WR; the owner keeps the source until its completion.
 
+As built (`src/node.rs`, stage 2e), the API differs from the sketch above:
+
+- `node(workers) -> Result<(Vec<Client>, OwnerPort)>`; `Owner::new(port)` on
+  the native thread captures its environment (and simulation). Host it with
+  `WithNative::with_host(inner, owner)`: `WithNative<T, N = NativeService>`
+  is now generic over the `NativeHost` trait (`register_driver`,
+  `poll_budgeted`, `close`, `drained`), so `WithNative::new(inner,
+  NativePort)` keeps working for the slot path. `Owner::poll_budgeted`
+  handles up to `budget` commands, then progresses every link, runs timers,
+  and advances shutdown; completions and timers need periodic polls.
+- `Client` is `Send` (it holds only `Arc`s), not `!Send`.
+- `activate(config) -> Op<Vec<Selection>>` instead of `Result<()>`, so the
+  caller learns the selected rails. `NodeConfig::selector` is a `FnOnce`
+  returning `(rail: u16, index)` pairs (the slot path's shape), and
+  `NodeConfig` carries `mr_remote_write`.
+- The link id is the caller's: `accept(key, remote, link_id, initiator)` and
+  `connect(key, epoch, remote, link_id)` take it, because Racer derives it
+  with SHA-256 from the signed setups. `LinkState::Ready { epoch, link_id }`
+  reports it, and `LinkState::Breaking` covers closing and destroying links.
+- "Busy" is `Error::Overloaded`: Racer's error mapping is exhaustive over
+  `rdma_verbs::Error`, and `Overloaded` already means "use HTTP". `open`
+  returns it when a link or setup for the key exists, while backing off, or
+  when the rail has `max_links` links. A full command queue also returns it;
+  `Client::poll_ready` waits for room.
+- `send_buffer(rail, len, cx)` takes the rail (pools are per device) and a
+  `Context` to wait on. `buffers(rail, state)` reports pool counts.
+- `close`, `closed`, `drained`, and `reopen` follow the slot path's rules;
+  there is no `register_driver` on `Client` (each `Op` wakes its poller).
+- `break_link` never loses the request: if the queue is full it goes to a
+  shared list the owner drains.
+- Shutdown sends `Close` on ready links and breaks each one once the `Close`
+  completes or after `CLOSE_GRACE` (1 s); other links break at once. The
+  node is drained when every link is destroyed and no page or send buffer is
+  held; a leaked object keeps it from ever draining.
+- Dropping the `Owner` fails every op (`Unavailable` for link ops,
+  `Cancelled` for queued commands), destroys links (leaking what cannot be
+  destroyed), and leaks pools whose pages are still held.
+
 Removed types: `Slot`, `Lease`, `Mailbox`, `QueuePairHandle`, `Region`,
 `Window`, `Ticket`, `Transfer`, `Receive`, `QpSet`, `IoPort`, `NativePort`,
 `DeviceHandle`, and `pair(slots)`. `NativeService` is renamed `Owner`.

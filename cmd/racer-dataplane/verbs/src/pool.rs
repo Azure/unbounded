@@ -22,9 +22,6 @@
 //! quarantined, so the memory stays valid and counted for as long as anything
 //! may use it.
 
-// The owner (stage 2e) uses the full API; until then only tests do.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
     rc::Rc,
     sync::{
@@ -131,6 +128,7 @@ unsafe impl Sync for PoolShared {}
 
 impl PoolShared {
     /// Page buffer length.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn buffer_len(&self) -> usize {
         self.buffer_len
     }
@@ -234,6 +232,7 @@ pub(crate) struct Buffer {
 
 impl Buffer {
     /// Buffer index in the pool.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn index(&self) -> u32 {
         self.index
     }

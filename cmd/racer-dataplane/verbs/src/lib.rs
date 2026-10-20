@@ -44,6 +44,17 @@
 //! [`WithNative`] adds a [`NativeService`] to a `uring-runtime` service so
 //! drain and fence also finish the native side.
 //!
+//! # Persistent links
+//!
+//! The newer API replaces slots with one persistent, bidirectional QP per
+//! (peer, rail) and a node-wide pool of registered page buffers. [`node`]
+//! returns one [`Client`] per I/O worker and an [`OwnerPort`]; build the
+//! [`Owner`] on the native thread and host it with [`WithNative::with_host`].
+//! Per page, the receiver calls [`Client::grant`], the sender
+//! [`Client::write`] or [`Client::release`], and the receiver gets an
+//! [`Arrival`] holding a [`RegisteredPage`]. See `designs/racer-verbs.md`.
+//! The slot API stays until Racer has moved over.
+//!
 //! # Backends
 //!
 //! - `native`: loads `librdma_verbs.so.1`, built from `native/verbs.c`.
@@ -64,9 +75,16 @@ mod channel;
 mod control;
 mod ffi;
 mod link;
+mod node;
 mod pool;
 
+pub use channel::Op;
 pub use ffi::Endpoint;
+pub use link::{Arrival, Epoch, Granted, Source};
+pub use node::{
+    BACKOFF_MAX, BACKOFF_MIN, BACKOFF_RESET, COMMAND_QUEUE, Client, LinkKey, LinkSelector,
+    LinkState, NodeConfig, Opened, Owner, OwnerPort, SETUP_TIMEOUT, Setup, node,
+};
 pub use pool::{BufferState, RegisteredPage, SendBuffer};
 
 #[cfg(any(test, feature = "simulation"))]
@@ -223,10 +241,44 @@ pub struct NativeService {
 /// - Drain and fence: close and fully drain the native side first, even if
 ///   the scope has expired. Then run the inner one.
 /// - Close: closes both, native first.
-pub struct WithNative<T> {
+pub struct WithNative<T, N = NativeService> {
     inner: T,
 
-    native: NativeService,
+    native: N,
+}
+
+/// A native-thread service [`WithNative`] can host: the slot-path
+/// [`NativeService`] or the link [`Owner`].
+pub trait NativeHost {
+    /// Wake `waker` when the I/O side has work.
+    fn register_driver(&self, waker: &Waker);
+
+    /// Do up to `budget` steps of work.
+    fn poll_budgeted(&mut self, budget: usize) -> Result<()>;
+
+    /// Start shutdown. Does not wait.
+    fn close(&self);
+
+    /// True once shutdown finished.
+    fn drained(&self) -> bool;
+}
+
+impl NativeHost for NativeService {
+    fn register_driver(&self, waker: &Waker) {
+        NativeService::register_driver(self, waker);
+    }
+
+    fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
+        NativeService::poll_budgeted(self, budget)
+    }
+
+    fn close(&self) {
+        NativeService::close(self);
+    }
+
+    fn drained(&self) -> bool {
+        NativeService::drained(self)
+    }
 }
 
 /// A port tag on the I/O thread. Lease QPs from it.
@@ -1827,7 +1879,15 @@ impl<T> WithNative<T> {
     }
 }
 
-impl<S: Scope, T: Service<S>> Service<S> for WithNative<T>
+impl<T, N: NativeHost> WithNative<T, N> {
+    /// Wrap `inner` with an already built native host, for example an
+    /// [`Owner`]. Call on the native thread.
+    pub fn with_host(inner: T, native: N) -> Self {
+        Self { inner, native }
+    }
+}
+
+impl<S: Scope, T: Service<S>, N: NativeHost> Service<S> for WithNative<T, N>
 where
     S::Error: From<Error>,
 {
@@ -1877,7 +1937,7 @@ where
     /// Drain the native side fully, then the inner service.
     fn drain<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            self.native.close_and_fence().await?;
+            close_and_fence(&mut self.native).await?;
             self.inner.drain(scope).await
         })
     }
@@ -1891,7 +1951,7 @@ where
     /// Drain the native side fully, then fence the inner service.
     fn fence<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            self.native.close_and_fence().await?;
+            close_and_fence(&mut self.native).await?;
             self.inner.fence(scope).await
         })
     }
@@ -1902,23 +1962,21 @@ where
     }
 }
 
-impl NativeService {
-    /// Close and poll until drained. Ignores scope deadlines: the NIC must be
-    /// stopped before memory is freed.
-    async fn close_and_fence(&mut self) -> Result<()> {
-        self.close();
-        std::future::poll_fn(|cx| {
-            self.register_driver(cx.waker());
-            self.poll_budgeted(1)?;
-            if self.drained() {
-                Poll::Ready(Ok(()))
-            } else {
-                // Relies on the runtime's periodic ticks to retry.
-                Poll::Pending
-            }
-        })
-        .await
-    }
+/// Close `native` and poll it until drained. Ignores scope deadlines: the
+/// NIC must be stopped before memory is freed.
+async fn close_and_fence<N: NativeHost>(native: &mut N) -> Result<()> {
+    native.close();
+    std::future::poll_fn(|cx| {
+        native.register_driver(cx.waker());
+        native.poll_budgeted(1)?;
+        if native.drained() {
+            Poll::Ready(Ok(()))
+        } else {
+            // Relies on the runtime's periodic ticks to retry.
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// Our own `Arc` around a caller's [`Guard`].

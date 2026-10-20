@@ -19,10 +19,6 @@
 //!   [`Error::Cancelled`]. Dropping an [`Op`] makes [`Completer::complete`]
 //!   hand the value back so the owner can clean it up.
 
-// Later stages (`Client` and `Owner` in `lib.rs`) use this module. Until
-// then only the tests do.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -164,6 +160,7 @@ pub(crate) struct Owner<C> {
 
 impl<C> Owner<C> {
     /// Number of workers.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn workers(&self) -> usize {
         self.channels.len()
     }
@@ -175,6 +172,7 @@ impl<C> Owner<C> {
     /// Returns `Ready(n)` with `n > 0` if it handled anything, otherwise
     /// registers `cx` and returns `Pending`. Workers waiting for space are
     /// woken.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn poll_drain(
         &mut self,
         cx: &mut Context<'_>,
@@ -194,6 +192,17 @@ impl<C> Owner<C> {
             0 => Poll::Pending,
             handled => Poll::Ready(handled),
         }
+    }
+
+    /// Register `waker` for new commands and worker drops.
+    pub(crate) fn register(&self, waker: &std::task::Waker) {
+        self.waker.register(waker);
+    }
+
+    /// Like [`Self::poll_drain`] without registering a waker. Returns how
+    /// many commands were handled.
+    pub(crate) fn try_drain(&mut self, budget: usize, mut handle: impl FnMut(usize, C)) -> usize {
+        self.drain(budget, &mut handle)
     }
 
     fn drain(&mut self, budget: usize, handle: &mut impl FnMut(usize, C)) -> usize {
@@ -233,6 +242,7 @@ impl<C> Owner<C> {
     }
 
     /// True once worker `index` is dropped and its queue is empty.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn is_closed(&self, index: usize) -> bool {
         self.channels.get(index).is_none_or(|channel| {
             let queue = lock(&channel.queue);
