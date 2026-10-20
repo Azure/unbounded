@@ -371,6 +371,9 @@ kubectl -n racer-object-example exec racer-object-example -c app -- sh -c \
 ```
 
 The output starts with `f7ae60f92e00ec6debd23a6088c31dbd2371eca3ffa0defaefb259924204aec6`.
+This checksum is for the public Azure example only. If you use S3 or your own
+Azure container, replace `mnist` with a bucket or container in `object-buckets`
+and use a key that exists. Any other bucket returns `403`.
 Run it again. The second read comes from the cache. If the first read returns
 `503`, Racer is still starting on that node. Wait a few seconds and retry.
 
