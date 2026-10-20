@@ -85,6 +85,30 @@ spec:
               participants:
                 items:
                   properties:
+                    allocatable:
+                      additionalProperties:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      description: ResourceList is a set of (resource name, quantity)
+                        pairs.
+                      type: object
+                    capacity:
+                      additionalProperties:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      description: ResourceList is a set of (resource name, quantity)
+                        pairs.
+                      type: object
+                    index:
+                      format: int32
+                      minimum: 0
+                      type: integer
                     nodeName:
                       type: string
                     nodeUID:
@@ -94,9 +118,12 @@ spec:
                         intent and helps make sure that UIDs and names do not get conflated.
                       type: string
                   required:
+                  - index
                   - nodeName
                   - nodeUID
                   type: object
+                maxItems: 64
+                minItems: 1
                 type: array
               profile:
                 properties:
@@ -345,6 +372,38 @@ spec:
                   attempt:
                     format: int32
                     type: integer
+                  backendResources:
+                    items:
+                      properties:
+                        apiVersion:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                        participantIndexes:
+                          items:
+                            format: int32
+                            type: integer
+                          maxItems: 64
+                          minItems: 1
+                          type: array
+                        uid:
+                          description: |-
+                            UID is a type that holds unique ID values, including UUIDs.  Because we
+                            don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                            intent and helps make sure that UIDs and names do not get conflated.
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      - uid
+                      type: object
+                    maxItems: 64
+                    type: array
                   name:
                     type: string
                   outputs:

@@ -140,7 +140,7 @@ func TestAdmissionRejectsMutableRunnerImageBeforeReservation(t *testing.T) {
 	}
 }
 
-func TestParticipantSelectionRejectsUnsupportedMultiNode(t *testing.T) {
+func TestParticipantSelectionIsDeterministicAndSkipsLockedNodes(t *testing.T) {
 	t.Parallel()
 
 	scheme := testScheme(t)
@@ -154,9 +154,142 @@ func TestParticipantSelectionRejectsUnsupportedMultiNode(t *testing.T) {
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(request, peer, locked, wrong).Build()
 	r := &AdmissionReconciler{Client: kube}
 
+	participants, err := r.selectParticipants(context.Background(), request, profile)
+	if err != nil {
+		t.Fatalf("selectParticipants: %v", err)
+	}
+
+	if len(participants) != 2 ||
+		participants[0].Index != 0 ||
+		participants[0].NodeName != request.Name ||
+		participants[1].Index != 1 ||
+		participants[1].NodeName != peer.Name {
+		t.Fatalf("participants = %#v", participants)
+	}
+
+	gpu := corev1.ResourceName("nvidia.com/gpu")
+	capacity := participants[1].Capacity[gpu]
+
+	allocatable := participants[1].Allocatable[gpu]
+	if capacity.Cmp(resource.MustParse("8")) != 0 ||
+		allocatable.Cmp(resource.MustParse("8")) != 0 {
+		t.Fatalf("participant inventory = %#v", participants[1])
+	}
+}
+
+func TestParticipantSelectionRejectsInsufficientEligibleNodes(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	request := readyNode("gpu-0", "H200")
+	profile := testProfile("h200-pair", "H200")
+	profile.Spec.Participants.Count = 2
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(request).Build()
+	r := &AdmissionReconciler{Client: kube}
+
 	if _, err := r.selectParticipants(context.Background(), request, profile); err == nil ||
-		!strings.Contains(err.Error(), "multi-participant execution is not implemented") {
+		!strings.Contains(err.Error(), "requires 2 eligible unlocked participants, found 1") {
 		t.Fatalf("selectParticipants error = %v", err)
+	}
+}
+
+func TestMultiNodeAdmissionReservesEveryParticipant(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	request := readyNode("gpu-0", "H200")
+	request.Labels[RequestLabel] = "h200-pair"
+	peer := readyNode("gpu-1", "H200")
+	profile := testProfile("h200-pair", "H200")
+	profile.Spec.Participants.Count = 2
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
+		Data:       map[string]string{"payload.txt": "test payload\n"},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(request, peer, profile, source).Build()
+	r := &AdmissionReconciler{
+		Client:          kube,
+		Namespace:       "signal",
+		ScriptNamespace: "signal",
+		Now:             func() time.Time { return time.Unix(100, 0) },
+	}
+
+	if _, err := r.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: request.Name}},
+	); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var runs signalv1.CertificationRunList
+	if err := kube.List(context.Background(), &runs); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(runs.Items) != 1 || len(runs.Items[0].Spec.Participants) != 2 {
+		t.Fatalf("runs = %#v", runs.Items)
+	}
+
+	for index, name := range []string{"gpu-0", "gpu-1"} {
+		participant := runs.Items[0].Spec.Participants[index]
+		if participant.Index != int32(index) || participant.NodeName != name {
+			t.Fatalf("participant %d = %#v", index, participant)
+		}
+
+		var node corev1.Node
+		if err := kube.Get(context.Background(), client.ObjectKey{Name: name}, &node); err != nil {
+			t.Fatal(err)
+		}
+
+		if node.Annotations[ReservationLabel] != runs.Items[0].Name {
+			t.Fatalf("Node %s reservation = %q", name, node.Annotations[ReservationLabel])
+		}
+	}
+}
+
+func TestMultiNodeReservationRollsBackPartialFailure(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	first := readyNode("gpu-0", "H200")
+	second := readyNode("gpu-1", "H200")
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(first, second).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(
+				ctx context.Context,
+				c client.WithWatch,
+				obj client.Object,
+				patch client.Patch,
+				opts ...client.PatchOption,
+			) error {
+				node, ok := obj.(*corev1.Node)
+				if ok && node.Name == second.Name && node.Annotations[ReservationLabel] == "run-pair" {
+					return errors.New("reservation conflict")
+				}
+
+				return c.Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+	r := &AdmissionReconciler{Client: kube}
+	participants := []signalv1.Participant{
+		participantSnapshot(first, 0),
+		participantSnapshot(second, 1),
+	}
+
+	if err := r.reserveParticipants(context.Background(), participants, "run-pair"); err == nil {
+		t.Fatal("reserveParticipants error = nil")
+	}
+
+	var recovered corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: first.Name}, &recovered); err != nil {
+		t.Fatal(err)
+	}
+
+	if recovered.Annotations[ReservationLabel] != "" {
+		t.Fatalf("partial reservation was not rolled back: %#v", recovered.Annotations)
 	}
 }
 
@@ -248,7 +381,10 @@ func TestAdmissionRecoversOrphanedReservationAndSnapshot(t *testing.T) {
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	node.Annotations = map[string]string{ReservationLabel: "orphaned-run"}
+	peer := readyNode("gpu-1", "example-gpu")
+	peer.Annotations = map[string]string{ReservationLabel: "orphaned-run"}
 	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.Participants.Count = 2
 	source := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
 		Data:       map[string]string{"payload.txt": "test payload\n"},
@@ -265,7 +401,7 @@ func TestAdmissionRecoversOrphanedReservationAndSnapshot(t *testing.T) {
 	}
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(node, profile, source, orphanedSnapshot).
+		WithObjects(node, peer, profile, source, orphanedSnapshot).
 		Build()
 	r := &AdmissionReconciler{
 		Client:          kube,
@@ -299,13 +435,20 @@ func TestAdmissionRecoversOrphanedReservationAndSnapshot(t *testing.T) {
 		t.Fatalf("runs = %d, want recovered admission", len(runs.Items))
 	}
 
-	var recovered corev1.Node
-	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &recovered); err != nil {
-		t.Fatalf("get recovered node: %v", err)
-	}
+	for _, nodeName := range []string{node.Name, peer.Name} {
+		var recovered corev1.Node
+		if err := kube.Get(context.Background(), client.ObjectKey{Name: nodeName}, &recovered); err != nil {
+			t.Fatalf("get recovered node %s: %v", nodeName, err)
+		}
 
-	if recovered.Annotations[ReservationLabel] != runs.Items[0].Name {
-		t.Fatalf("reservation = %q, want %q", recovered.Annotations[ReservationLabel], runs.Items[0].Name)
+		if recovered.Annotations[ReservationLabel] != runs.Items[0].Name {
+			t.Fatalf(
+				"Node %s reservation = %q, want %q",
+				nodeName,
+				recovered.Annotations[ReservationLabel],
+				runs.Items[0].Name,
+			)
+		}
 	}
 }
 
@@ -447,6 +590,21 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		t.Fatalf("workflow values = %#v", values)
 	}
 
+	if values["participant-count"] != "1" || values["request-node-name"] != run.Spec.RequestNodeName {
+		t.Fatalf("workflow participant metadata = %#v", values)
+	}
+
+	var participants []signalv1.Participant
+	if err := json.Unmarshal([]byte(values["participants-json"]), &participants); err != nil {
+		t.Fatalf("decode participants: %v", err)
+	}
+
+	if len(participants) != 1 ||
+		participants[0].NodeName != run.Spec.Participants[0].NodeName ||
+		participants[0].NodeUID != run.Spec.Participants[0].NodeUID {
+		t.Fatalf("workflow participants = %#v", participants)
+	}
+
 	if values["script-configmap"] != run.Spec.Script.ConfigMapName || values["script-configmap"] == "scripts" {
 		t.Fatalf("workflow must mount the immutable snapshot, values = %#v", values)
 	}
@@ -544,6 +702,144 @@ func TestWorkflowParametersRejectMalformedEvidence(t *testing.T) {
 				t.Fatal("workflowParameters succeeded")
 			}
 		})
+	}
+}
+
+func TestBackendResourceReferencesRequireCompleteMultiNodeCoverage(t *testing.T) {
+	t.Parallel()
+
+	value := `[
+		{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","namespace":"signal","name":"node-0","uid":"uid-0","participantIndexes":[0]},
+		{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","namespace":"signal","name":"node-1","uid":"uid-1","participantIndexes":[1]}
+	]`
+
+	references, err := backendResourceReferences(value, 2)
+	if err != nil {
+		t.Fatalf("backendResourceReferences: %v", err)
+	}
+
+	if len(references) != 2 || references[1].ParticipantIndexes[0] != 1 {
+		t.Fatalf("references = %#v", references)
+	}
+
+	for name, malformed := range map[string]string{
+		"missing participant": `[{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","name":"node-0","uid":"uid-0","participantIndexes":[0]}]`,
+		"out of range":        `[{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","name":"node-0","uid":"uid-0","participantIndexes":[0,2]}]`,
+		"empty coverage":      `[{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","name":"node-0","uid":"uid-0"}]`,
+		"missing uid":         `[{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","name":"node-0","participantIndexes":[0,1]}]`,
+		"unknown field":       `[{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","name":"node-0","uid":"uid-0","participantIndexes":[0,1],"extra":true}]`,
+		"trailing value":      `[{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","name":"node-0","uid":"uid-0","participantIndexes":[0,1]}] {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := backendResourceReferences(malformed, 2); err == nil {
+				t.Fatalf("backendResourceReferences(%s) error = nil", malformed)
+			}
+		})
+	}
+}
+
+func TestMultiNodePassWithoutBackendIdentityBecomesInconclusive(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-multi")
+	run.Spec.Participants = []signalv1.Participant{
+		participantSnapshot(readyNode("gpu-0", "H200"), 0),
+		participantSnapshot(readyNode("gpu-1", "H200"), 1),
+	}
+	run.Status = signalv1.CertificationRunStatus{
+		Phase:     signalv1.RunPhaseRunning,
+		Workflow:  signalv1.WorkflowStatus{Name: "run-multi-a1", Attempt: 1},
+		StartedAt: ptrTime(metav1.NewTime(time.Unix(100, 0))),
+	}
+	snapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+	}
+	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
+	store := &memoryEvidenceStore{}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, snapshot, workflow).
+		Build()
+	r := &RunReconciler{Client: kube, Evidence: store, Now: func() time.Time { return time.Unix(200, 0) }}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Status.Phase != signalv1.RunPhaseInconclusive ||
+		got.Status.Verdict != "Inconclusive" ||
+		!strings.Contains(got.Status.Reason, "did not identify backend resources") {
+		t.Fatalf("status = %#v", got.Status)
+	}
+}
+
+func TestMultiNodePassRetainsCoveredBackendIdentities(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-multi-pass")
+	run.Spec.Participants = []signalv1.Participant{
+		participantSnapshot(readyNode("gpu-0", "H200"), 0),
+		participantSnapshot(readyNode("gpu-1", "H200"), 1),
+	}
+	run.Status = signalv1.CertificationRunStatus{
+		Phase:     signalv1.RunPhaseRunning,
+		Workflow:  signalv1.WorkflowStatus{Name: "run-multi-pass-a1", Attempt: 1},
+		StartedAt: ptrTime(metav1.NewTime(time.Unix(100, 0))),
+	}
+	snapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+	}
+	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
+
+	outputs, _, err := unstructured.NestedSlice(workflow.Object, "status", "outputs", "parameters")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outputs = append(outputs, map[string]any{
+		"name": "backend-resources",
+		"value": `[
+			{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","namespace":"signal","name":"node-0","uid":"uid-0","participantIndexes":[0]},
+			{"apiVersion":"kubeflow.org/v2beta1","kind":"MPIJob","namespace":"signal","name":"node-1","uid":"uid-1","participantIndexes":[1]}
+		]`,
+	})
+	if err := unstructured.SetNestedSlice(workflow.Object, outputs, "status", "outputs", "parameters"); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &memoryEvidenceStore{}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, snapshot, workflow).
+		Build()
+	r := &RunReconciler{Client: kube, Evidence: store, Now: func() time.Time { return time.Unix(200, 0) }}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Status.Phase != signalv1.RunPhaseSucceeded ||
+		len(got.Status.Workflow.BackendResources) != 2 ||
+		got.Status.Workflow.BackendResources[1].ParticipantIndexes[0] != 1 {
+		t.Fatalf("status = %#v", got.Status)
 	}
 }
 

@@ -45,7 +45,7 @@ type ExecutionBackend struct {
 
 type ParticipantPolicy struct {
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1
+	// +kubebuilder:validation:Maximum=64
 	Count int32 `json:"count"`
 
 	Selector metav1.LabelSelector `json:"selector"`
