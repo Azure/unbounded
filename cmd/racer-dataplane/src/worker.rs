@@ -1696,7 +1696,7 @@ mod tests {
             io_draining: AtomicUsize,
             shutdown: AtomicUsize,
             completed: AtomicUsize,
-            native: Mutex<Vec<rdma_verbs::IoPort>>,
+            native: Mutex<Vec<rdma_verbs::Client>>,
         }
         impl Observed {
             fn event(&self, worker: WorkerId, name: &'static str) {
@@ -1800,9 +1800,12 @@ mod tests {
                 }
                 let page = PageCryptoEngine::new(runtime);
                 let engine: Box<dyn Service<RequestScope>> = if self.native {
-                    let (io, native) = rdma_verbs::pair(1)?;
-                    self.observed.native.lock().unwrap().push(io);
-                    Box::new(rdma_verbs::WithNative::new(page, native))
+                    let (mut clients, port) = rdma_verbs::node(1)?;
+                    self.observed.native.lock().unwrap().push(clients.remove(0));
+                    Box::new(rdma_verbs::WithNative::with_host(
+                        page,
+                        rdma_verbs::Owner::new(port),
+                    ))
                 } else {
                     Box::new(page)
                 };
@@ -2343,7 +2346,7 @@ mod tests {
             group.drain(&scope).unwrap();
             for io in observed.native.lock().unwrap().iter() {
                 assert!(io.closed());
-                assert!(io.pool_drained());
+                assert!(io.drained());
             }
             group.shutdown(&scope).unwrap();
             group.join().unwrap();
