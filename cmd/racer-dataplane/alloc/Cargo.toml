@@ -15,3 +15,8 @@ crc64fast = "1.1.0"
 libc = "0.2"
 zeroize = "1"
 uring-runtime = { path = "../runtime" }
+
+[[bench]]
+name = "volume"
+path = "benches/volume/main.rs"
+harness = false
