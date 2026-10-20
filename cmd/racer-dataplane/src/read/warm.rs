@@ -8,6 +8,7 @@ use crate::peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse,
 use crate::runtime::RequestScope;
 use crate::security::ChargedOriginContext;
 use crate::security::OriginContext;
+use crate::store::holds::HoldPages;
 use crate::telemetry::{Metrics, WarmEvent};
 use crate::topology::Membership;
 use racer_control_wire::NodeId;
@@ -82,7 +83,7 @@ pub(crate) struct Plan {
     node: NodeId,
     membership: Arc<Membership>,
     local: Vec<u64>,
-    counts: BTreeMap<u16, usize>,
+    held: BTreeMap<u16, HoldPages>,
     remote: Vec<NodeId>,
 }
 
@@ -1050,7 +1051,7 @@ async fn plan(
         node,
         membership: membership.clone(),
         local: vec![0; words],
-        counts: BTreeMap::new(),
+        held: BTreeMap::new(),
         remote: Vec::new(),
     };
     let mut remote = std::collections::BTreeSet::new();
@@ -1074,7 +1075,10 @@ async fn plan(
                     version: version.clone(),
                     number: PageNumber(number),
                 })?;
-                *plan.counts.entry(owner.0).or_insert(0) += 1;
+                plan.held
+                    .entry(owner.0)
+                    .or_default()
+                    .insert(PageNumber(number));
             }
         }
         if number % 1024 == 1023 {
@@ -1103,7 +1107,7 @@ async fn reserve(
     let lease = plan.lease(job);
     directory.warm.grant_lease(version, &lease, target)?;
     let mut accepted = directory
-        .reserve_warm(version, &plan.counts, target, scope, fresh)
+        .reserve_warm(version, &plan.held, target, scope, fresh)
         .await?;
     if pages == 0 || plan.remote.is_empty() {
         return Ok(accepted);
@@ -1350,7 +1354,7 @@ pub(crate) async fn serve(
                 metrics.warm_event(WarmEvent::OwnerHoldRefused);
                 return Err(Error::Overloaded);
             }
-            let mut counts = BTreeMap::new();
+            let mut held = BTreeMap::new();
             for number in 0..pages {
                 scope.check()?;
                 let ranked = candidates
@@ -1366,13 +1370,15 @@ pub(crate) async fn serve(
                         version: version.clone(),
                         number: PageNumber(number),
                     })?;
-                    *counts.entry(owner.0).or_insert(0usize) += 1;
+                    held.entry(owner.0)
+                        .or_insert_with(HoldPages::default)
+                        .insert(PageNumber(number));
                 }
                 if number % 1024 == 1023 {
                     uring_runtime::drivers::yield_now().await;
                 }
             }
-            if counts.is_empty() {
+            if held.is_empty() {
                 metrics.warm_event(WarmEvent::OwnerHoldRefused);
                 return Ok(PeerResponse::StaleMembership);
             }
@@ -1383,7 +1389,7 @@ pub(crate) async fn serve(
             }
             let mut fresh = Vec::new();
             match directory
-                .reserve_warm(&version, &counts, until, scope, &mut fresh)
+                .reserve_warm(&version, &held, until, scope, &mut fresh)
                 .await
             {
                 Ok(_) => {

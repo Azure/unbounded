@@ -25,6 +25,7 @@ use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
+use crate::store::holds::HoldPages;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
@@ -78,7 +79,7 @@ pub struct WorkerDirectory {
 }
 
 enum Work {
-    Hold(ObjectVersion, usize, std::time::SystemTime),
+    Hold(ObjectVersion, HoldPages, std::time::SystemTime),
     Warm(
         PageId,
         crate::model::VersionMetadata,
@@ -454,12 +455,12 @@ impl WorkerDirectory {
             .collect()
     }
 
-    /// Reserve `counts[worker]` held pages on every local worker. Workers absent
-    /// from `counts` still renew holds over pages they already store.
+    /// Hold exactly `pages[worker]` on every local worker. Workers absent from
+    /// `pages` still renew any hold they already have for the version.
     pub(super) async fn reserve_warm(
         &self,
         version: &ObjectVersion,
-        counts: &std::collections::BTreeMap<u16, usize>,
+        pages: &std::collections::BTreeMap<u16, HoldPages>,
         until: std::time::SystemTime,
         scope: &RequestScope,
         fresh: &mut Vec<WorkerId>,
@@ -467,10 +468,10 @@ impl WorkerDirectory {
         scope.check()?;
         let mut accepted = until;
         for mailbox in &self.mailboxes {
-            let count = counts.get(&mailbox.worker.0).copied().unwrap_or(0);
+            let held = pages.get(&mailbox.worker.0).cloned().unwrap_or_default();
             let receipt = self.submit(
                 mailbox.worker,
-                Work::Hold(version.clone(), count, until),
+                Work::Hold(version.clone(), held, until),
                 scope,
                 None,
             )?;
@@ -488,10 +489,10 @@ impl WorkerDirectory {
         // All workers must honor the same expiry, including recovered longer holds.
         if accepted > until {
             for mailbox in &self.mailboxes {
-                let count = counts.get(&mailbox.worker.0).copied().unwrap_or(0);
+                let held = pages.get(&mailbox.worker.0).cloned().unwrap_or_default();
                 let receipt = self.submit(
                     mailbox.worker,
-                    Work::Hold(version.clone(), count, accepted),
+                    Work::Hold(version.clone(), held, accepted),
                     scope,
                     None,
                 )?;
@@ -922,7 +923,7 @@ async fn execute(
                 .dependencies
                 .writer
                 .index()
-                .reserve_hold(&version, pages, until)?;
+                .reserve_hold_pages(&version, &pages, until)?;
             Ok(Value::Held(
                 previous.is_none(),
                 previous.map_or(until, |old| old.max(until)),

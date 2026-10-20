@@ -1383,3 +1383,98 @@ fn owner_holds_only_primary_pages_and_shares_capacity_across_leases() {
     assert!(directory.warm.drained(WorkerId(0)));
     endpoint.uninstall().unwrap();
 }
+
+#[test]
+fn worker_hold_covers_only_primary_pages_beside_cached_nonprimary_page() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(1);
+    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = weighted(1, &[1]);
+    let (_local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let directory = f.fill.dependencies.metadata_owner.clone();
+    let index = f.fill.dependencies.writer.index().clone();
+    let version = f.page.version.clone();
+    let page = |number| PageId {
+        version: version.clone(),
+        number: PageNumber(number),
+    };
+    let worker = directory.page_owner(&page(1)).unwrap();
+    assert_eq!(directory.page_owner(&page(0)).unwrap(), worker);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    macro_rules! drive {
+        ($future:expr) => {{
+            let mut future = Box::pin($future);
+            let mut output = None;
+            for _ in 0..4096 {
+                if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                    output = Some(result);
+                    break;
+                }
+                pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+                f.reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            output.expect("request did not complete")
+        }};
+    }
+    macro_rules! persist {
+        ($page:expr) => {{
+            let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+            let result = drive!(f.fill.acquire(
+                $page,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget
+            ))
+            .unwrap();
+            let dirty = f
+                .fill
+                .dependencies
+                .admission
+                .reserve(
+                    Some(&version.object.cache),
+                    ResourceClass::DirtyCiphertext,
+                    result.ciphertext.bytes().len(),
+                )
+                .unwrap();
+            f.fill
+                .dependencies
+                .writer
+                .enqueue(result.copy(), dirty)
+                .unwrap();
+            drive!(f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
+        }};
+    }
+    // Page 0 is cached without any hold, as an ordinary read would leave it.
+    persist!(page(0));
+    assert!(index.lookup(&page(0)).unwrap().is_some());
+    // Leave room for exactly one more page, so a hold consumed by page 0 would
+    // leave no slot for page 1.
+    index.set_page_capacity(2).unwrap();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let held = std::collections::BTreeMap::from([(
+        worker.0,
+        [PageNumber(1)]
+            .into_iter()
+            .collect::<crate::store::holds::HoldPages>(),
+    )]);
+    let mut fresh = Vec::new();
+    drive!(directory.reserve_warm(&version, &held, until, &f.scope, &mut fresh)).unwrap();
+    assert!(
+        !index.is_held(&page(0)),
+        "nonprimary cached page is not pinned"
+    );
+    assert!(index.held_page_expiry(&page(0)).is_none());
+    assert!(index.is_held(&page(1)));
+    assert!(index.held_page_expiry(&page(1)).is_none());
+    persist!(page(1));
+    assert!(
+        index.held_page_expiry(&page(1)).is_some(),
+        "the primary page publishes into its own held slot"
+    );
+    assert!(index.held_page_expiry(&page(0)).is_none());
+    endpoint.uninstall().unwrap();
+}

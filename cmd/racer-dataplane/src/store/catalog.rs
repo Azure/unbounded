@@ -191,13 +191,33 @@ impl Index {
         Ok(())
     }
 
-    /// Reserve this worker's page count at HEAD, before fetching any payload.
-    /// Repeated versions share capacity; extension never shortens an existing hold.
-    /// Existing disk pages become protected atomically, or this call fails unchanged.
+    /// Hold pages `0..pages` of `version`. See [`Self::reserve_hold_pages`].
     pub fn reserve_hold(
         &self,
         version: &ObjectVersion,
         pages: usize,
+        until: std::time::SystemTime,
+    ) -> Result<()> {
+        if pages > self.page_capacity.get() {
+            return Err(Error::Overloaded);
+        }
+        self.reserve_hold_pages(
+            version,
+            &super::holds::HoldPages::prefix(pages as u64),
+            until,
+        )
+    }
+
+    /// Reserve exactly `pages` of `version` at HEAD, before fetching any payload.
+    /// The set merges with any existing hold for the version, so earlier promises
+    /// stay held and extension never shortens a deadline. Capacity is charged once
+    /// per member page; cached members count toward that charge and become
+    /// protected atomically, or this call fails unchanged. Cached pages outside
+    /// the set are not pinned.
+    pub fn reserve_hold_pages(
+        &self,
+        version: &ObjectVersion,
+        pages: &super::holds::HoldPages,
         until: std::time::SystemTime,
     ) -> Result<()> {
         let monotonic = super::holds::Holds::deadline(until)?;
@@ -208,12 +228,22 @@ impl Index {
         let mut holds = self.holds.borrow_mut();
         holds.expire();
         let segments = holds.segments.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let old = holds.entries.get(version);
+        let members = old.map_or_else(|| pages.clone(), |hold| hold.pages.union(pages));
+        // Empty sets need no disk guarantee or retained reservation entry.
+        if members.is_empty() {
+            return Ok(());
+        }
         let mut locations = HashMap::default();
-        for (page, entry) in state
-            .pages
-            .iter()
-            .filter(|(page, _)| &page.version == version)
-        {
+        let mut page = PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(0),
+        };
+        for number in members.iter() {
+            page.number = number;
+            let Some(entry) = state.pages.get(&page) else {
+                continue;
+            };
             segments
                 .validate(
                     entry.location.segment,
@@ -221,23 +251,16 @@ impl Index {
                     &entry.location.extent,
                 )
                 .map_err(|_| Error::Overloaded)?;
-            locations.insert(page.number, entry.location.clone());
+            locations.insert(number, entry.location.clone());
         }
-        let old = holds.entries.get(version);
-        let count = pages
-            .max(locations.len())
-            .max(old.map_or(0, |hold| hold.pages));
-        // Zero-page objects need no disk guarantee or retained reservation entry.
-        if count == 0 {
-            return Ok(());
-        }
+        let count = members.len();
         let total = holds
             .entries
             .values()
-            .try_fold(0usize, |sum, hold| sum.checked_add(hold.pages))
+            .try_fold(0usize, |sum, hold| sum.checked_add(hold.pages.len()))
             .ok_or(Error::Overloaded)?;
         let total = total
-            .checked_sub(old.map_or(0, |hold| hold.pages))
+            .checked_sub(old.map_or(0, |hold| hold.pages.len()))
             .and_then(|n| n.checked_add(count))
             .ok_or(Error::Overloaded)?;
         let limit = (segments.count() * holds.percent / 100)
@@ -260,7 +283,7 @@ impl Index {
             super::holds::Hold {
                 until,
                 monotonic,
-                pages: count,
+                pages: members,
                 inflight,
                 active,
                 locations,
@@ -319,9 +342,9 @@ impl Index {
             .entries
             .get(version)
             .filter(|hold| hold.live())
-            .map(|hold| hold.pages)
+            .map(|hold| hold.pages.clone())
             .ok_or(Error::Unavailable)?;
-        self.reserve_hold(version, pages, until)
+        self.reserve_hold_pages(version, &pages, until)
     }
 
     /// Release only unused capacity after a partial failure. Completed pages stay held.
@@ -332,16 +355,21 @@ impl Index {
             if hold.inflight.get() != 0 || hold.active.get() != 0 {
                 return Err(Error::Overloaded);
             }
-            hold.pages = hold.locations.len();
-            if hold.pages == 0 {
+            hold.pages = hold.locations.keys().copied().collect();
+            if hold.pages.is_empty() {
                 holds.entries.remove(version);
             }
         }
         Ok(())
     }
 
+    /// Whether `page` is a member of a live hold, published or not.
     pub fn is_held(&self, page: &PageId) -> bool {
-        self.hold_expiry(&page.version).is_some()
+        self.holds
+            .borrow()
+            .entries
+            .get(&page.version)
+            .is_some_and(|hold| hold.live() && hold.pages.contains(page.number))
     }
 
     pub(super) fn protect_hold(&self, version: &ObjectVersion) -> Result<super::holds::HoldGuard> {
@@ -378,7 +406,10 @@ impl Index {
             .entries
             .get(&page.version)
             .is_some_and(|hold| {
-                hold.live() && hold.unused() != 0 && !hold.locations.contains_key(&page.number)
+                hold.live()
+                    && hold.unused() != 0
+                    && hold.pages.contains(page.number)
+                    && !hold.locations.contains_key(&page.number)
             })
     }
 
@@ -388,7 +419,7 @@ impl Index {
         if let Some(hold) = holds
             .entries
             .get_mut(&page.version)
-            .filter(|hold| hold.live())
+            .filter(|hold| hold.live() && hold.pages.contains(page.number))
         {
             if !hold.locations.contains_key(&page.number) && hold.unused() == 0 {
                 return Err(Error::Overloaded);
@@ -450,14 +481,14 @@ impl Index {
                         .or_insert_with(|| super::holds::Hold {
                             until: *until,
                             monotonic,
-                            pages: 0,
+                            pages: super::holds::HoldPages::default(),
                             inflight: Rc::new(Cell::new(0)),
                             active: Rc::new(Cell::new(0)),
                             locations: HashMap::default(),
                         });
                 hold.until = hold.until.max(*until);
                 hold.monotonic = hold.monotonic.max(monotonic);
-                hold.pages += 1;
+                hold.pages.insert(page.number);
                 hold.locations.insert(page.number, entry.location.clone());
             }
         }
@@ -1319,6 +1350,130 @@ mod tests {
             index.reserve_hold(&other, usize::MAX, until),
             Err(Error::Overloaded)
         );
+    }
+
+    fn page_set(numbers: &[u64]) -> super::super::holds::HoldPages {
+        numbers
+            .iter()
+            .copied()
+            .map(crate::model::PageNumber)
+            .collect()
+    }
+
+    #[test]
+    fn hold_pages_sort_dedup_insert_and_union() {
+        let pages = page_set(&[5, 1, 3, 1]);
+        assert_eq!(pages, page_set(&[1, 3, 5]));
+        assert_eq!(pages.len(), 3);
+        assert!(pages.contains(crate::model::PageNumber(3)));
+        assert!(!pages.contains(crate::model::PageNumber(2)));
+        let mut grown = pages.clone();
+        grown.insert(crate::model::PageNumber(7));
+        grown.insert(crate::model::PageNumber(2));
+        grown.insert(crate::model::PageNumber(3));
+        assert_eq!(grown, page_set(&[1, 2, 3, 5, 7]));
+        assert_eq!(
+            pages.union(&page_set(&[0, 3, 9])),
+            page_set(&[0, 1, 3, 5, 9])
+        );
+        assert_eq!(pages.union(&page_set(&[])), pages);
+        assert!(super::super::holds::HoldPages::prefix(0).is_empty());
+        assert_eq!(super::super::holds::HoldPages::prefix(2), page_set(&[0, 1]));
+    }
+
+    #[test]
+    fn page_set_hold_ignores_cached_nonmember_and_charges_only_members() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(2).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (cached, entry) = indexed(descriptor("primary", 2 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(cached.clone(), entry).unwrap();
+        let mut primary = cached.clone();
+        primary.number = crate::model::PageNumber(1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&cached.version, &page_set(&[]), until)
+            .unwrap();
+        assert_eq!(
+            index.hold_expiry(&cached.version),
+            None,
+            "empty set pins nothing"
+        );
+        index
+            .reserve_hold_pages(&cached.version, &page_set(&[1]), until)
+            .unwrap();
+        assert!(!index.is_held(&cached), "cached nonmember stays evictable");
+        assert!(index.is_held(&primary));
+        assert_eq!(index.hold_unused(), 1, "the missing member keeps its slot");
+        assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
+        // Capacity 2 holds the cached page plus the reserved member slot.
+        assert!(matches!(index.reserve_page(false), Err(Error::Overloaded)));
+        let (_, mut entry) = indexed(descriptor("primary", 2 * crate::model::PAGE_BYTES), 1);
+        drop(segments.append(1024).unwrap());
+        entry.location.extent = Extent::new(1024, 512).unwrap();
+        let ticket = index.reserve_page_for(&primary, false).unwrap();
+        ticket.publish(primary.clone(), entry).unwrap();
+        assert_eq!(index.held_page_expiry(&primary), Some(until));
+        assert_eq!(index.held_page_expiry(&cached), None);
+        assert_eq!(index.hold_unused(), 0);
+        assert_eq!(index.held_snapshot().pages, 1);
+        index.release_hold(&cached.version).unwrap();
+        assert_eq!(index.held_page_expiry(&primary), Some(until));
+        assert!(!index.is_held(&cached));
+    }
+
+    #[test]
+    fn page_set_hold_counts_cached_members_and_unions_earlier_promises() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (cached, entry) = indexed(descriptor("union", 3 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(cached.clone(), entry).unwrap();
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&cached.version, &page_set(&[0, 2]), until)
+            .unwrap();
+        assert_eq!(index.held_page_expiry(&cached), Some(until));
+        assert_eq!(
+            index.hold_unused(),
+            1,
+            "the cached member covers its own charge"
+        );
+        let later = until + std::time::Duration::from_secs(30);
+        index
+            .reserve_hold_pages(&cached.version, &page_set(&[1]), later)
+            .unwrap();
+        assert_eq!(index.hold_unused(), 2, "union keeps page 2 and adds page 1");
+        for number in 0..3 {
+            let mut page = cached.clone();
+            page.number = crate::model::PageNumber(number);
+            assert!(index.is_held(&page));
+        }
+        assert_eq!(index.hold_expiry(&cached.version), Some(later));
+        index.extend_hold(&cached.version, until).unwrap();
+        assert_eq!(
+            index.hold_unused(),
+            2,
+            "extension keeps every promised page"
+        );
+        assert_eq!(index.hold_expiry(&cached.version), Some(later));
+        let mut other = descriptor("other", crate::model::PAGE_BYTES).version;
+        other.etag = crate::model::StrongEtag::test_value("other-union");
+        assert_eq!(
+            index.reserve_hold_pages(&other, &page_set(&[0]), until),
+            Err(Error::Overloaded),
+            "three members already reach the hold limit"
+        );
+        index.release_hold(&cached.version).unwrap();
+        assert_eq!(index.hold_unused(), 0);
+        assert_eq!(index.held_page_expiry(&cached), Some(later));
+        index
+            .reserve_hold_pages(&other, &page_set(&[0]), until)
+            .unwrap();
     }
 
     #[test]
