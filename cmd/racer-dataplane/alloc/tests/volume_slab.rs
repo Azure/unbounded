@@ -135,6 +135,40 @@ mod simulation {
         );
     }
 
+    /// `sync_dirty` fsyncs only descriptors that completed a write since
+    /// their last sync, keeps them dirty when the fsync fails, and makes the
+    /// writes durable once it succeeds; `sync_at` syncs one descriptor.
+    #[test]
+    fn sync_dirty_targets_written_descriptors() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let reactor = Reactor::<TestScope, ()>::new(16, ());
+        let offset = SEGMENT + 4096;
+        let slab = open(4);
+        sim.disk().sync_all().unwrap();
+        assert_eq!(slab.descriptor_count(), 1);
+        // Nothing written: no fsync is issued, so the fault stays queued.
+        sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
+        drive(&reactor, slab.sync_dirty(&reactor, &TestScope)).unwrap();
+        assert!(drive(&reactor, slab.sync_at(&reactor, offset, &TestScope)).is_err());
+        write(&slab, &reactor, offset, 5);
+        sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
+        assert!(drive(&reactor, slab.sync_dirty(&reactor, &TestScope)).is_err());
+        // Still dirty after the failure: the retry syncs it.
+        drive(&reactor, slab.sync_dirty(&reactor, &TestScope)).unwrap();
+        // Clean now: the next call issues no fsync.
+        sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
+        drive(&reactor, slab.sync_dirty(&reactor, &TestScope)).unwrap();
+        assert!(drive(&reactor, slab.sync(&reactor, &TestScope)).is_err());
+        drop(slab);
+        sim.disk().crash().unwrap();
+        let slab = open(4);
+        assert!(
+            read(&slab, &reactor, offset) == vec![5; 4096],
+            "synced write lost"
+        );
+    }
+
     /// A freshly created slab file and its directory entries survive a crash
     /// without a fixture-level sync.
     #[test]
