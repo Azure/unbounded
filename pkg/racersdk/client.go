@@ -202,6 +202,8 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 // ttl must be positive and is rounded up to whole seconds. A duration whose
 // rounded value overflows time.Duration is invalid. A zero RetainUntil means
 // Racer refused retention; metadata is still returned. Warm shares Stat's lane.
+// Pages are held on each page's primary owner in the cache cluster, which is
+// not always the local node. Reads on this node wait for warm progress.
 func (c *Client) Warm(ctx context.Context, request Request, ttl time.Duration, opts WarmOptions) (WarmResult, error) {
 	const op = "warm"
 
