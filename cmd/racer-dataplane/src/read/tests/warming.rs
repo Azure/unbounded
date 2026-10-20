@@ -1062,6 +1062,8 @@ struct Owners {
     holds: RefCell<Vec<racer_control_wire::NodeId>>,
     fills: Cell<usize>,
     releases: RefCell<Vec<racer_control_wire::NodeId>>,
+    /// Leases granted by Hold, validated on Fill as the real owner does.
+    leases: RefCell<Vec<(racer_control_wire::NodeId, [u8; 16])>>,
 }
 impl Owners {
     fn available(&self, _: &Arc<Membership>, _: &racer_control_wire::NodeId) -> bool {
@@ -1083,21 +1085,27 @@ impl Owners {
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             let destination = request.route.destination.clone();
-            let PeerOperation::Warm { action, .. } = &request.operation else {
+            let PeerOperation::Warm { action, lease, .. } = &request.operation else {
                 panic!("only warm requests expected");
             };
+            let key = (destination.clone(), *lease);
             let response = match action {
                 WarmAction::Hold { until, .. } => {
                     self.holds.borrow_mut().push(destination.clone());
                     if self.refuse_hold.as_ref() == Some(&destination) {
                         PeerResponse::Overloaded
                     } else {
+                        if !self.leases.borrow().contains(&key) {
+                            self.leases.borrow_mut().push(key);
+                        }
                         PeerResponse::Held { until: *until }
                     }
                 }
                 WarmAction::Fill { .. } => {
                     self.fills.set(self.fills.get() + 1);
-                    if self.fail_fill {
+                    if !self.leases.borrow().contains(&key) {
+                        PeerResponse::Unavailable
+                    } else if self.fail_fill {
                         PeerResponse::Overloaded
                     } else {
                         PeerResponse::Warmed
@@ -1105,6 +1113,7 @@ impl Owners {
                 }
                 WarmAction::Release => {
                     self.releases.borrow_mut().push(destination.clone());
+                    self.leases.borrow_mut().retain(|held| held != &key);
                     PeerResponse::Released
                 }
             };
@@ -1134,6 +1143,22 @@ fn remote_warm(
     Arc<crate::read::dispatch::WorkerDirectory>,
     ObjectVersion,
 ) {
+    remote_warms(shares, refuse_hold, fail_fill, 1)
+}
+
+/// Run `heads` sequential warm HEADs, each with a fresh request ID, from
+/// node(0) against scripted remote owners. Returns the last HEAD's retention.
+fn remote_warms(
+    shares: &[u32],
+    refuse_hold: Option<usize>,
+    fail_fill: bool,
+    heads: u8,
+) -> (
+    Option<std::time::SystemTime>,
+    Rc<Owners>,
+    Arc<crate::read::dispatch::WorkerDirectory>,
+    ObjectVersion,
+) {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(shares.len());
@@ -1151,6 +1176,7 @@ fn remote_warm(
         holds: RefCell::new(Vec::new()),
         fills: Cell::new(0),
         releases: RefCell::new(Vec::new()),
+        leases: RefCell::new(Vec::new()),
     });
     let requester = Requester::scripted(
         owners.clone(),
@@ -1160,39 +1186,43 @@ fn remote_warm(
     );
     let (local, mut endpoint, _publication) = coordinator(&f, &signers[0], &membership, requester);
     let directory = f.fill.dependencies.metadata_owner.clone();
-    let mut head = local.read(
-        ClientRequest {
-            kind: ReadKind::HeadPinned {
-                etag: f.page.version.etag.clone(),
-            },
-            retain: Some(Duration::from_secs(60)),
-            origin: OriginContext {
-                object: f.context.object.clone(),
-                metadata: None,
-                authorization: None,
-            },
-        },
-        &f.scope,
-    );
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut response = None;
-    for _ in 0..4096 {
-        if response.is_none()
-            && let Poll::Ready(result) = head.as_mut().poll(&mut cx)
-        {
-            response = Some(result.unwrap());
+    for n in 0..heads {
+        let scope = RequestScope::new(RequestId([0xa0 + n; 16]), f.scope.deadline.0).unwrap();
+        let mut head = local.read(
+            ClientRequest {
+                kind: ReadKind::HeadPinned {
+                    etag: f.page.version.etag.clone(),
+                },
+                retain: Some(Duration::from_secs(60)),
+                origin: OriginContext {
+                    object: f.context.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+            },
+            &scope,
+        );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        response = None;
+        for _ in 0..4096 {
+            if response.is_none()
+                && let Poll::Ready(result) = head.as_mut().poll(&mut cx)
+            {
+                response = Some(result.unwrap());
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+            if response.is_some() && directory.warm.snapshot().0 == 0 && queue.pending() == 0 {
+                break;
+            }
+            if response.is_some() && !fail_fill && refuse_hold.is_none() && queue.pending() == 0 {
+                break;
+            }
         }
-        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
-        if response.is_some() && directory.warm.snapshot().0 == 0 && queue.pending() == 0 {
-            break;
+        drop(head);
+        for _ in 0..64 {
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
         }
-        if response.is_some() && !fail_fill && refuse_hold.is_none() && queue.pending() == 0 {
-            break;
-        }
-    }
-    drop(head);
-    for _ in 0..64 {
-        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
     }
     assert_eq!(
         f.origin.calls.get(),
@@ -1222,6 +1252,25 @@ fn warm_holds_only_on_remote_primary_owners_and_requester_keeps_none() {
             number: PageNumber(number),
         }));
     }
+}
+
+#[test]
+fn rewarming_a_completed_remote_warm_fills_under_the_preserved_lease() {
+    let (until, owners, directory, version) = remote_warms(&[1, 1_000_000], None, false, 2);
+    assert!(until.is_some_and(|until| until > std::time::SystemTime::UNIX_EPOCH));
+    assert_eq!(*owners.holds.borrow(), vec![node(1), node(1)]);
+    assert_eq!(
+        owners.fills.get(),
+        16,
+        "every fill passes the owner's lease check on the first attempt"
+    );
+    assert!(owners.releases.borrow().is_empty(), "no retry exhaustion");
+    assert_eq!(
+        owners.leases.borrow().len(),
+        1,
+        "both HEADs hold one owner lease"
+    );
+    assert_eq!(directory.warm.lease_count(&version), 1, "one renewed lease");
 }
 
 #[test]

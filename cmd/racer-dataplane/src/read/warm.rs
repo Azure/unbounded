@@ -1273,7 +1273,7 @@ async fn warm_one(
             &primary,
             context,
             &page.version,
-            job.scope.request.0,
+            job.lease,
             WarmAction::Fill { page: page.number },
             &job.scope,
         )
