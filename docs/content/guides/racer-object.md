@@ -43,7 +43,7 @@ support, and the security model, see the
 - A cluster with the Unbounded operator. Install the `kubectl unbounded` plugin
   (see the [CLI reference]({{< relref "reference/cli" >}})), then run
   `kubectl unbounded install --timeout=5m`.
-- Kubernetes 1.29 or later. The sidecar is a native sidecar.
+- Kubernetes 1.30 or later. Racer uses ValidatingAdmissionPolicy.
 - Linux nodes that meet the Racer
   [node requirements]({{< relref "reference/racer" >}}#node-requirements):
   working `io_uring`, local disk, and a privileged root dataplane with hostPath
