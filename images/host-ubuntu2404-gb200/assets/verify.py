@@ -28,6 +28,8 @@ def sha256(path):
 def verify():
     kernel = os.environ["KVER"]
     driver = os.environ["NVIDIA_DRIVER_VERSION"]
+    profile = os.environ["GB200_PROFILE"]
+    module_source = os.environ["NVIDIA_MODULE_SOURCE"]
     source = os.environ["SOURCE_COMMIT"]
     require(re.fullmatch(r"[0-9a-f]{40}", source), "missing exact source commit")
     require(command("dpkg", "--print-architecture") == "arm64", "not ARM64")
@@ -69,7 +71,8 @@ def verify():
                 f"{name} is not the open kernel module",
             )
             signer = command("modinfo", "-k", kernel, "-F", "signer", name)
-            require(signer, f"{name} lacks a module signature")
+            if profile == "canonical-control":
+                require(signer, f"{name} lacks a module signature")
             modules[name]["signer"] = signer
     initrd = command("lsinitramfs", f"/boot/initrd.img-{kernel}").splitlines()
     require(
@@ -89,16 +92,24 @@ def verify():
         )
         firmware[name] = sha256(path)
     packages = command("dpkg-query", "-W", "-f=${Package}\t${Version}\t${Architecture}\n")
-    require("nvidia-dkms-" not in packages, "unexpected DKMS driver installation")
-    require(
-        re.search(
-            rf"^nvidia-utils-580-server\t{re.escape(driver)}(?:[-+~][^\t]*)?\tarm64$",
-            packages,
-            re.MULTILINE,
-        ),
-        "missing pinned NVIDIA utilities",
-    )
-    for package in ("nvidia-fabricmanager-580", "libnvidia-nscq-580"):
+    if profile == "canonical-control":
+        require("nvidia-dkms-" not in packages, "unexpected DKMS driver installation")
+        package_names = (
+            "nvidia-utils-580-server",
+            "nvidia-fabricmanager-580",
+            "libnvidia-nscq-580",
+        )
+    else:
+        require(
+            re.search(
+                rf"^nvidia-dkms-580-open\t{re.escape(driver)}(?:[-+~][^\t]*)?\tarm64$",
+                packages,
+                re.MULTILINE,
+            ),
+            "missing pinned open DKMS driver",
+        )
+        package_names = ("nvidia-utils-580", "nvidia-fabricmanager", "libnvidia-nscq")
+    for package in package_names:
         require(
             re.search(
                 rf"^{package}\t{re.escape(driver)}(?:[-+~][^\t]*)?\tarm64$",
@@ -106,6 +117,40 @@ def verify():
                 re.MULTILINE,
             ),
             f"missing pinned {package}",
+        )
+    if profile in ("agentbaker-doca", "agentbaker-doca-imex"):
+        require(
+            re.search(r"^doca-ofed\t3\.1\.0-091513\tarm64$", packages, re.MULTILINE),
+            "missing pinned DOCA-OFED",
+        )
+        require(
+            command("modinfo", "-k", kernel, "-F", "filename", "nvidia_peermem"),
+            "missing nvidia_peermem",
+        )
+    if profile == "agentbaker-doca-imex":
+        require(
+            re.search(
+                rf"^nvidia-imex\t{re.escape(driver)}(?:[-+~][^\t]*)?\tarm64$",
+                packages,
+                re.MULTILINE,
+            ),
+            "missing pinned NVIDIA IMEX",
+        )
+        parameters = Path("/etc/modprobe.d/nvidia-gb200.conf")
+        require(
+            parameters.exists()
+            and parameters.read_text().splitlines()
+            == [
+                "options nvidia NVreg_RestrictProfilingToAdminUsers=0",
+                "options nvidia NVreg_CreateImexChannel0=1",
+                "options nvidia NVreg_CoherentGPUMemoryMode=driver",
+                'options nvidia NVreg_RegistryDwords="RMBug5172204War=4"',
+            ],
+            "invalid AgentBaker NVIDIA module parameters",
+        )
+        require(
+            Path("/etc/systemd/system/multi-user.target.wants/nvidia-imex.service").is_symlink(),
+            "NVIDIA IMEX service is not enabled",
         )
     require(Path("/usr/bin/nv-fabricmanager").is_file(), "missing Fabric Manager binary")
     require(
@@ -129,35 +174,22 @@ def verify():
         == ["nvidia", "nvidia_modeset", "nvidia_uvm", "nvidia_drm"],
         "NVIDIA modules are not configured for boot",
     )
-    persistence_path = Path("/etc/systemd/system/nvidia-persistence-mode.service")
     require(
-        persistence_path.exists()
-        and "After=systemd-modules-load.service" in persistence_path.read_text()
-        and "nvidia-fabricmanager.service" in persistence_path.read_text()
-        and "ConditionPathExists" not in persistence_path.read_text()
-        and "StartLimitIntervalSec=0" in persistence_path.read_text()
-        and "ExecStart=/usr/bin/nvidia-smi -pm 1" in persistence_path.read_text()
-        and "Restart=on-failure" in persistence_path.read_text()
-        and "RestartSec=5" in persistence_path.read_text(),
-        "invalid NVIDIA persistence service",
-    )
-    require(
-        Path(
-            "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
-        ).is_symlink(),
-        "NVIDIA persistence service is not enabled",
+        not Path("/etc/systemd/system/nvidia-persistence-mode.service").exists(),
+        "unexpected NVIDIA persistence retry service",
     )
     require(not Path("/etc/ssh/ssh_host_ed25519_key").exists(), "baked-in SSH key")
     require(Path("/etc/machine-id").read_bytes() == b"", "baked-in machine ID")
     result = {
         "schema": "unbounded.gb200.host-image.v1",
         "source_commit": source,
+        "profile": profile,
         "architecture": "arm64",
         "ubuntu": "24.04",
         "kernel": kernel,
         "page_size": 65536,
         "nvidia_driver": driver,
-        "nvidia_module_source": "Ubuntu precompiled server-open",
+        "nvidia_module_source": module_source,
         "modules": modules,
         "efi_sha256": firmware,
         "bootloader_packages": Path("/usr/share/unbounded/efi-packages.tsv").read_text(),
@@ -168,7 +200,11 @@ def verify():
         },
         "qualification": "offline rootfs checks only; no physical GPU, MANA traffic or NVLink qualification",
         "secure_boot": "signed distribution binaries; platform trust/enrollment not qualified",
-        "fabric_services": "NVIDIA Fabric Manager and NSCQ installed; IMEX/NVLSM not activated",
+        "fabric_services": (
+            "NVIDIA Fabric Manager, NSCQ, and IMEX installed"
+            if profile == "agentbaker-doca-imex"
+            else "NVIDIA Fabric Manager and NSCQ installed; IMEX/NVLSM not activated"
+        ),
     }
     require(result["apt_inrelease_sha256"], "missing signed APT release provenance")
     Path("/usr/share/unbounded/image-inputs.json").write_text(json.dumps(result, indent=2) + "\n")

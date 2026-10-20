@@ -4,26 +4,38 @@ This ARM64-only image supplies `/disk/disk.img.gz` for the existing Metalman
 netboot installer. It does not replace the installer, deploy an agent, modify a
 Machine, initiate HostReplace, or reboot a host.
 
-The pinned tuple in `assets/versions.env` uses Ubuntu's NVIDIA 64K kernel
-`7.0.0-1019-nvidia-64k`, Canonical's matching precompiled **server-open**
-580.178.04 modules, matching headless server userspace, Fabric Manager, and
-the NVSwitch Configuration and Query library. MANA Ethernet (`mana`) and RDMA
-(`mana_ib`) come from that kernel, not DOCA or an unrelated NIC driver. Kernel
-and NVIDIA package versions fail closed if unavailable; there is no DKMS or
-different-kernel fallback.
+The image family provides four cumulative, pinned experiment profiles:
+
+| Image | Profile | Kernel and NVIDIA stack |
+|---|---|---|
+| `host-ubuntu2404-gb200` | `canonical-control` | Canonical 7.0 64K kernel and signed precompiled server-open 580.178.04 modules |
+| `host-ubuntu2404-gb200-agentbaker` | `agentbaker-driver` | Signed `linux-azure-nvidia` 6.14 and AgentBaker's open DKMS 580.159.04 driver |
+| `host-ubuntu2404-gb200-agentbaker-doca` | `agentbaker-doca` | AgentBaker driver profile plus DOCA-OFED 3.1.0 |
+| `host-ubuntu2404-gb200-agentbaker-doca-imex` | `agentbaker-doca-imex` | DOCA profile plus IMEX and AgentBaker's GB200 NVIDIA module parameters |
+
+Every profile includes matching Fabric Manager and NSCQ packages. MANA
+Ethernet (`mana`) and RDMA (`mana_ib`) must come from the selected kernel.
+Versions fail closed if unavailable; there is no unpinned package or
+different-kernel fallback. The profiles intentionally isolate cumulative stack
+deltas rather than changing all AgentBaker components at once.
 
 The image contains a GPT disk with an EFI partition, signed Ubuntu ARM64
 shim/GRUB binaries, and an ext4 root with at least 5 GiB additional space.
 Metalman replaces `50-cloud-init.yaml` with its MAC-matched static netplan and
 injects its NoCloud datasource. Machine IDs and SSH host keys are generated
 at first boot. The image enables Fabric Manager for the local NVSwitch fabric.
-It does not install or activate GPU Operator, DRA, IMEX, or multi-node NVLSM.
+Only the explicit IMEX profile enables IMEX. No profile installs GPU Operator,
+DRA, or multi-node NVLSM.
+
+The experiment images do not install the previous persistence-mode retry
+service. Persistence state is not a qualification gate and repeated
+`nvidia-smi -pm 1` attempts would confound idle NVLink testing.
 
 ## Build and qualification
 
-Dispatch `.github/workflows/images.yaml` with `image=host-ubuntu2404-gb200`.
-It requires `platforms=linux/arm64` (also the default for this image) and uses
-a native `ubuntu-24.04-arm` runner.
+Dispatch `.github/workflows/images.yaml` with one of the image names above.
+Every profile requires `platforms=linux/arm64` and uses a native
+`ubuntu-24.04-arm` runner.
 
 Publication follows rootfs checks and a bounded QEMU ARM64 UEFI boot check.
 The checks cover the 64K kernel, matching signed open NVIDIA module

@@ -41,21 +41,10 @@ class RootfsContractTest(unittest.TestCase):
             "/etc/modules-load.d/nvidia.conf",
             "nvidia\nnvidia_modeset\nnvidia_uvm\nnvidia_drm\n",
         )
-        self.put(
-            "/etc/systemd/system/nvidia-persistence-mode.service",
-            "[Unit]\nAfter=systemd-modules-load.service nvidia-fabricmanager.service\n"
-            "Wants=nvidia-fabricmanager.service\nStartLimitIntervalSec=0\n"
-            "[Service]\nExecStart=/usr/bin/nvidia-smi -pm 1\n"
-            "Restart=on-failure\nRestartSec=5\n",
-        )
-        enabled = self.path(
-            "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
-        )
-        enabled.parent.mkdir(parents=True, exist_ok=True)
-        enabled.symlink_to("../nvidia-persistence-mode.service")
         fabric_enabled = self.path(
             "/etc/systemd/system/multi-user.target.wants/nvidia-fabricmanager.service"
         )
+        fabric_enabled.parent.mkdir(parents=True, exist_ok=True)
         fabric_enabled.symlink_to("/lib/systemd/system/nvidia-fabricmanager.service")
         self.put("/usr/bin/nv-fabricmanager", "fabric manager fixture")
         self.put(
@@ -81,8 +70,14 @@ class RootfsContractTest(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(verify, "Path", side_effect=self.path).start()
         patch.object(verify, "command", side_effect=self.command).start()
-        patch.dict(os.environ, KVER=self.kernel, NVIDIA_DRIVER_VERSION=self.driver,
-                   SOURCE_COMMIT="a" * 40).start()
+        patch.dict(
+            os.environ,
+            KVER=self.kernel,
+            NVIDIA_DRIVER_VERSION=self.driver,
+            NVIDIA_MODULE_SOURCE="ubuntu-precompiled-server-open",
+            GB200_PROFILE="canonical-control",
+            SOURCE_COMMIT="a" * 40,
+        ).start()
 
     def path(self, name):
         return self.root / str(name).lstrip("/")
@@ -124,14 +119,32 @@ class RootfsContractTest(unittest.TestCase):
 
     def test_target_initramfs_bootstrapped_before_nvidia_postinst(self):
         source = Path(__file__).with_name("rootfs.sh").read_text()
-        phases = source.split("apt-get install -y --no-install-recommends")
-        self.assertEqual(len(phases), 3)
-        self.assertIn('"linux-image-${KVER}=${KERNEL_VERSION}"', phases[1])
-        self.assertIn('test -s "/boot/initrd.img-$KVER"', phases[1])
-        self.assertNotIn('"nvidia-kernel-common-', phases[1])
-        self.assertIn('"nvidia-kernel-common-', phases[2])
-        self.assertIn("update_initramfs=no", phases[1])
-        self.assertIn("update_initramfs=yes", phases[2])
+        kernel = source.index('"linux-image-${KVER}=${KERNEL_VERSION}"')
+        bootstrap = source.index('test -s "/boot/initrd.img-$KVER"')
+        defer = source.index("update_initramfs=no")
+        nvidia = source.index('"nvidia-kernel-common-580-server=${NVIDIA_VERSION}"')
+        restore = source.index("update_initramfs=yes")
+        self.assertLess(kernel, bootstrap)
+        self.assertLess(bootstrap, defer)
+        self.assertLess(defer, nvidia)
+        self.assertLess(nvidia, restore)
+
+    def test_profiles_pin_controlled_stack_deltas(self):
+        source = Path(__file__).with_name("rootfs.sh").read_text()
+        versions = Path(__file__).with_name("versions.env").read_text()
+        for profile in (
+            "canonical-control",
+            "agentbaker-driver",
+            "agentbaker-doca",
+            "agentbaker-doca-imex",
+        ):
+            self.assertIn(profile, source)
+        self.assertIn("AGENTBAKER_KVER=6.14.0-1009-azure-nvidia", versions)
+        self.assertIn("AGENTBAKER_KERNEL_VERSION=6.14.0-1009.9", versions)
+        self.assertIn("AGENTBAKER_NVIDIA_VERSION=580.159.04-1ubuntu1", versions)
+        self.assertIn("DOCA_VERSION=3.1.0-091513", versions)
+        self.assertIn('"nvidia-imex=${NVIDIA_VERSION}"', source)
+        self.assertIn('"doca-ofed=${DOCA_VERSION}"', source)
 
     def test_boot_uses_platform_virtio_network_device(self):
         source = Path(__file__).resolve().parents[1].joinpath("verify-boot.sh").read_text()
@@ -201,13 +214,68 @@ class RootfsContractTest(unittest.TestCase):
 
     def test_missing_nvidia_utilities_rejected(self):
         self.packages = "linux-image\t7.0\tarm64"
-        self.rejected("missing pinned NVIDIA utilities")
+        self.rejected("missing pinned nvidia-utils-580-server")
 
     def test_missing_fabric_manager_package_rejected(self):
         self.packages = self.packages.replace(
             "nvidia-fabricmanager-580\t580.178.04\tarm64\n", ""
         )
         self.rejected("missing pinned nvidia-fabricmanager-580")
+
+    def test_agentbaker_driver_profile_accepts_pinned_open_dkms(self):
+        os.environ["GB200_PROFILE"] = "agentbaker-driver"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
+        self.driver = "580.159.04"
+        self.module_version = self.driver
+        self.packages = (
+            "linux-azure-nvidia\t6.14.0-1009.9\tarm64\n"
+            "nvidia-dkms-580-open\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-utils-580\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
+        )
+        verify.verify()
+
+    def test_agentbaker_driver_profile_requires_open_dkms(self):
+        os.environ["GB200_PROFILE"] = "agentbaker-driver"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
+        self.driver = "580.159.04"
+        self.module_version = self.driver
+        self.packages = (
+            "nvidia-utils-580\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
+        )
+        self.rejected("missing pinned open DKMS driver")
+
+    def test_doca_profile_requires_doca_ofed(self):
+        os.environ["GB200_PROFILE"] = "agentbaker-doca"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
+        self.driver = "580.159.04"
+        self.module_version = self.driver
+        self.packages = (
+            "nvidia-dkms-580-open\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-utils-580\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
+        )
+        self.rejected("missing pinned DOCA-OFED")
+
+    def test_imex_profile_requires_parameters_and_service(self):
+        os.environ["GB200_PROFILE"] = "agentbaker-doca-imex"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
+        self.driver = "580.159.04"
+        self.module_version = self.driver
+        self.packages = (
+            "nvidia-dkms-580-open\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-utils-580\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64\n"
+            "doca-ofed\t3.1.0-091513\tarm64\n"
+            "nvidia-imex\t580.159.04-1ubuntu1\tarm64"
+        )
+        self.rejected("invalid AgentBaker NVIDIA module parameters")
 
     def test_missing_fabric_manager_topology_rejected(self):
         self.path(
@@ -225,19 +293,12 @@ class RootfsContractTest(unittest.TestCase):
         self.path("/etc/modules-load.d/nvidia.conf").unlink()
         self.rejected("NVIDIA modules are not configured for boot")
 
-    def test_disabled_persistence_service_rejected(self):
-        self.path(
-            "/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
-        ).unlink()
-        self.rejected("NVIDIA persistence service is not enabled")
-
-    def test_skip_prone_persistence_condition_rejected(self):
-        path = self.path("/etc/systemd/system/nvidia-persistence-mode.service")
-        path.write_text(
-            path.read_text()
-            + "ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*\n"
+    def test_persistence_retry_service_rejected(self):
+        self.put(
+            "/etc/systemd/system/nvidia-persistence-mode.service",
+            "[Service]\nExecStart=/usr/bin/nvidia-smi -pm 1\nRestart=on-failure\n",
         )
-        self.rejected("invalid NVIDIA persistence service")
+        self.rejected("unexpected NVIDIA persistence retry")
 
     def test_missing_apt_provenance_rejected(self):
         self.path("/var/lib/apt/lists/ubuntu_InRelease").unlink()

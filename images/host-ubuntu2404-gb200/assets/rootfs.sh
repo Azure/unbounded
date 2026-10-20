@@ -5,10 +5,61 @@ set -eu
 
 # shellcheck source=versions.env
 . /usr/local/lib/unbounded-image/versions.env
-export KVER NVIDIA_DRIVER_VERSION
 export DEBIAN_FRONTEND=noninteractive
 
+select_profile() {
+    GB200_PROFILE=${GB200_PROFILE:-canonical-control}
+    case "$GB200_PROFILE" in
+        canonical-control)
+            KVER=$CANONICAL_KVER
+            KERNEL_VERSION=$CANONICAL_KERNEL_VERSION
+            NVIDIA_VERSION=$CANONICAL_NVIDIA_VERSION
+            NVIDIA_DRIVER_VERSION=$CANONICAL_NVIDIA_DRIVER_VERSION
+            NVIDIA_MODULE_SOURCE=ubuntu-precompiled-server-open
+            ;;
+        agentbaker-driver|agentbaker-doca|agentbaker-doca-imex)
+            KVER=$AGENTBAKER_KVER
+            KERNEL_VERSION=$AGENTBAKER_KERNEL_VERSION
+            NVIDIA_VERSION=$AGENTBAKER_NVIDIA_VERSION
+            NVIDIA_DRIVER_VERSION=$AGENTBAKER_NVIDIA_DRIVER_VERSION
+            NVIDIA_MODULE_SOURCE=nvidia-dkms-open
+            ;;
+        *)
+            echo "unsupported GB200 profile: $GB200_PROFILE" >&2
+            exit 2
+            ;;
+    esac
+    export GB200_PROFILE KVER KERNEL_VERSION NVIDIA_VERSION \
+        NVIDIA_DRIVER_VERSION NVIDIA_MODULE_SOURCE
+}
+
+install_agentbaker_sources() {
+    mkdir -p /etc/apt/keyrings /etc/apt/sources.list.d
+    nvidia_key=/etc/apt/keyrings/nvidia.pub
+    curl -fsSL \
+        "https://raw.githubusercontent.com/Azure/AgentBaker/${AGENTBAKER_COMMIT}/parts/linux/cloud-init/artifacts/ubuntu/gb/nvidia.pub" \
+        > "$nvidia_key"
+    echo "${AGENTBAKER_NVIDIA_KEY_SHA256}  $nvidia_key" | sha256sum -c -
+    cat > /etc/apt/sources.list.d/nvidia-gb200.list <<EOF
+deb [arch=arm64 signed-by=$nvidia_key] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/ /
+EOF
+
+    add-apt-repository -y ppa:canonical-kernel-team/ppa
+}
+
+install_doca_source() {
+    doca_key=/etc/apt/keyrings/doca-net.pub
+    curl -fsSL \
+        "https://raw.githubusercontent.com/Azure/AgentBaker/${AGENTBAKER_COMMIT}/parts/linux/cloud-init/artifacts/ubuntu/gb/doca.pub" \
+        > "$doca_key"
+    echo "${AGENTBAKER_DOCA_KEY_SHA256}  $doca_key" | sha256sum -c -
+    cat > /etc/apt/sources.list.d/doca-net.list <<EOF
+deb [arch=arm64 signed-by=$doca_key] https://linux.mellanox.com/public/repo/doca/${DOCA_VERSION}/ubuntu24.04/arm64-sbsa/ ./
+EOF
+}
+
 install_packages() {
+    select_profile
     test "$(dpkg --print-architecture)" = arm64
     printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
     chmod 755 /usr/sbin/policy-rc.d
@@ -19,9 +70,24 @@ install_packages() {
         openssh-server sudo passwd ca-certificates curl tar gzip zstd \
         iproute2 iputils-ping nftables util-linux kmod procps \
         efibootmgr chrony pciutils ethtool rdma-core ibverbs-providers \
-        python3 file linux-firmware \
-        "linux-image-${KVER}=${KERNEL_VERSION}" \
-        "linux-headers-${KVER}=${KERNEL_VERSION}"
+        python3 file linux-firmware software-properties-common
+
+    case "$GB200_PROFILE" in
+        canonical-control)
+            apt-get install -y --no-install-recommends \
+                "linux-image-${KVER}=${KERNEL_VERSION}" \
+                "linux-headers-${KVER}=${KERNEL_VERSION}"
+            ;;
+        agentbaker-*)
+            install_agentbaker_sources
+            case "$GB200_PROFILE" in
+                agentbaker-doca|agentbaker-doca-imex) install_doca_source ;;
+            esac
+            apt-get update
+            apt-get install -y --no-install-recommends \
+                "linux-azure-nvidia=${KERNEL_VERSION}"
+            ;;
+    esac
 
     # NVIDIA's postinst runs update-initramfs. Bootstrap the target kernel
     # first, rather than letting it select the running builder's kernel.
@@ -32,14 +98,39 @@ install_packages() {
     sed -i 's/^update_initramfs=.*/update_initramfs=no/' \
         /etc/initramfs-tools/update-initramfs.conf
     grep -qx 'update_initramfs=no' /etc/initramfs-tools/update-initramfs.conf
-    apt-get install -y --no-install-recommends \
-        "linux-modules-nvidia-580-server-open-${KVER}=${NVIDIA_MODULES_VERSION}" \
-        "nvidia-kernel-common-580-server=${NVIDIA_VERSION}" \
-        "nvidia-headless-no-dkms-580-server-open=${NVIDIA_VERSION}" \
-        "nvidia-utils-580-server=${NVIDIA_VERSION}" \
-        "nvidia-fabricmanager-580=${NVIDIA_VERSION}" \
-        "libnvidia-nscq-580=${NVIDIA_VERSION}" \
-        nvidia-modprobe
+    case "$GB200_PROFILE" in
+        canonical-control)
+            apt-get install -y --no-install-recommends \
+                "linux-modules-nvidia-580-server-open-${KVER}=${CANONICAL_NVIDIA_MODULES_VERSION}" \
+                "nvidia-kernel-common-580-server=${NVIDIA_VERSION}" \
+                "nvidia-headless-no-dkms-580-server-open=${NVIDIA_VERSION}" \
+                "nvidia-utils-580-server=${NVIDIA_VERSION}" \
+                "nvidia-fabricmanager-580=${NVIDIA_VERSION}" \
+                "libnvidia-nscq-580=${NVIDIA_VERSION}" \
+                nvidia-modprobe
+            ;;
+        agentbaker-*)
+            case "$GB200_PROFILE" in
+                agentbaker-doca|agentbaker-doca-imex)
+                    apt-get install -y --allow-downgrades --no-install-recommends \
+                        "librdmacm-dev=${DOCA_RDMA_VERSION}" \
+                        "libibverbs-dev=${DOCA_RDMA_VERSION}" \
+                        "libibverbs1=${DOCA_RDMA_VERSION}" \
+                        "ibverbs-providers=${DOCA_RDMA_VERSION}" \
+                        "doca-ofed=${DOCA_VERSION}"
+                    ;;
+            esac
+            apt-get install -y --allow-downgrades --no-install-recommends \
+                "nvidia-driver-580-open=${NVIDIA_VERSION}" \
+                "nvidia-utils-580=${NVIDIA_VERSION}" \
+                "nvidia-fabricmanager=${NVIDIA_VERSION}" \
+                "libnvidia-nscq=${NVIDIA_VERSION}"
+            if [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
+                apt-get install -y --allow-downgrades --no-install-recommends \
+                    "nvidia-imex=${NVIDIA_VERSION}"
+            fi
+            ;;
+    esac
     sed -i 's/^update_initramfs=.*/update_initramfs=yes/' \
         /etc/initramfs-tools/update-initramfs.conf
 
@@ -70,6 +161,7 @@ install_packages() {
 }
 
 finish() {
+    select_profile
     : "${SOURCE_COMMIT:?SOURCE_COMMIT is required}"
     mkdir -p /etc/netplan /etc/initramfs-tools/conf.d /etc/modules-load.d \
         /etc/systemd/system/systemd-networkd-wait-online.service.d
@@ -103,27 +195,23 @@ nvidia_modeset
 nvidia_uvm
 nvidia_drm
 EOF
-    cat > /etc/systemd/system/nvidia-persistence-mode.service <<'EOF'
-[Unit]
-Description=Enable NVIDIA persistence mode
-Wants=nvidia-fabricmanager.service
-After=systemd-modules-load.service systemd-udev-trigger.service nvidia-fabricmanager.service
-StartLimitIntervalSec=0
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=-/usr/bin/nvidia-modprobe -u -c=0
-ExecStart=/usr/bin/nvidia-smi -pm 1
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+    if [ "$GB200_PROFILE" = agentbaker-doca ] || \
+        [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
+        printf 'nvidia_peermem\n' >> /etc/modules-load.d/nvidia.conf
+    fi
+    if [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
+        cat > /etc/modprobe.d/nvidia-gb200.conf <<'EOF'
+options nvidia NVreg_RestrictProfilingToAdminUsers=0
+options nvidia NVreg_CreateImexChannel0=1
+options nvidia NVreg_CoherentGPUMemoryMode=driver
+options nvidia NVreg_RegistryDwords="RMBug5172204War=4"
 EOF
+    fi
     systemctl enable systemd-networkd.service systemd-resolved.service \
-        ssh.service chrony.service nvidia-fabricmanager.service \
-        nvidia-persistence-mode.service
+        ssh.service chrony.service nvidia-fabricmanager.service
+    if [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
+        systemctl enable nvidia-imex.service
+    fi
     for unit in cloud-init-local.service cloud-init.service cloud-init-network.service \
         cloud-config.service cloud-final.service; do
         if [ -f "/usr/lib/systemd/system/$unit" ]; then
