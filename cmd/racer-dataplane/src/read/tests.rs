@@ -2153,6 +2153,7 @@ mod timeouts {
                 | PeerOperation::Page { mode, .. } => {
                     matches!(mode, FetchMode::CopyOnly)
                 }
+                PeerOperation::Warm { .. } => false,
             };
             let stalled = self.calls.borrow().len() < self.stalled;
             self.calls.borrow_mut().push(Call {

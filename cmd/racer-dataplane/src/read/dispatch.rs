@@ -747,6 +747,9 @@ impl WorkerDirectory {
                 crate::peer::protocol::Operation::Metadata { object, .. } => {
                     self.metadata_owner(object)?
                 }
+                crate::peer::protocol::Operation::Warm { version, .. } => {
+                    self.metadata_owner(&version.object)?
+                }
             };
             if self.is_local(owner) {
                 return self.local()?.serve_peer(request, membership, scope).await;

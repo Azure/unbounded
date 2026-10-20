@@ -281,6 +281,7 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Bootstrap { object, .. } => object,
                 PeerOperation::Page { page, .. } => &page.version.object,
                 PeerOperation::Metadata { object, .. } => object,
+                PeerOperation::Warm { version, .. } => &version.object,
             };
             if object != &request.origin.object {
                 return Err(Error::InvalidRequest);

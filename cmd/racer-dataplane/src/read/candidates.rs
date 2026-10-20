@@ -756,6 +756,7 @@ impl CandidatePolicy {
                 PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
                 PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
                 PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
+                PeerOperation::Warm { .. } => CandidateOperation::Page,
             };
             let membership = candidates.membership.version.0;
             let result = self
@@ -1505,6 +1506,7 @@ impl CandidatePolicy {
             PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
             PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
             PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
+            PeerOperation::Warm { .. } => CandidateOperation::Page,
         };
         self.observer.candidate_final(CandidateFinal {
             failure: Failure::new(Stage::CandidateExhausted, error)
@@ -1658,6 +1660,15 @@ fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
         PeerOperation::Page { page, .. } => (&page.version.object, page.number),
         PeerOperation::Metadata { object, .. } => (object, PageNumber(0)),
         PeerOperation::Bootstrap { object, .. } => (object, PageNumber(0)),
+        PeerOperation::Warm {
+            version, action, ..
+        } => (
+            &version.object,
+            match action {
+                crate::peer::protocol::WarmAction::Fill { page } => *page,
+                _ => PageNumber(0),
+            },
+        ),
     }
 }
 fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
@@ -1680,6 +1691,16 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
             object: object.clone(),
             selector: selector.clone(),
             mode,
+        },
+        // Warm actions are always acquire-mode; the probe mode is not applied.
+        PeerOperation::Warm {
+            version,
+            lease,
+            action,
+        } => PeerOperation::Warm {
+            version: version.clone(),
+            lease: *lease,
+            action: action.clone(),
         },
     }
 }
@@ -1722,6 +1743,10 @@ fn classify(
         PeerResponse::OriginRejected => Err(Error::OriginRejected),
         PeerResponse::OriginForbidden => Err(Error::OriginForbidden),
         PeerResponse::StaleMembership => Err(Error::IncompatibleMembership),
+        // Warm acknowledgements never answer a candidate data probe.
+        PeerResponse::Held { .. } | PeerResponse::Warmed | PeerResponse::Released => {
+            Err(Error::CorruptRecord)
+        }
         PeerResponse::Bootstrap {
             metadata,
             page_zero,
@@ -2668,6 +2693,7 @@ pub(super) mod tests {
                     | PeerOperation::Metadata { mode, .. } => {
                         matches!(mode, FetchMode::CopyOnly)
                     }
+                    PeerOperation::Warm { .. } => false,
                 };
                 self.calls
                     .borrow_mut()
