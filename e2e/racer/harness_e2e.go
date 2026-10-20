@@ -120,13 +120,19 @@ func (h *harness) exec(timeout time.Duration, stdin []byte, name string, args ..
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 
-	var buf bytes.Buffer
+	// Keep stderr out of successful output: callers parse stdout, and tools
+	// such as kind print notices on stderr (for example when
+	// KIND_EXPERIMENTAL_PROVIDER is set).
+	var stdout, stderr bytes.Buffer
 
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	err := cmd.Run()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-	return buf.String(), err
+	if err := cmd.Run(); err != nil {
+		return stdout.String() + stderr.String(), err
+	}
+
+	return stdout.String(), nil
 }
 
 // try runs a best-effort command and logs, rather than fails on, errors.
