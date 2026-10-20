@@ -167,7 +167,10 @@ impl PoolShared {
         self.set(index, BufferState::Free);
         lock(&self.free).push(index);
         self.owner.wake();
-        for waker in std::mem::take(&mut *lock(&self.waiters)) {
+        // Take the waiters in their own statement so the lock is released
+        // before any waker runs; a waker may reenter the pool.
+        let waiters = std::mem::take(&mut *lock(&self.waiters));
+        for waker in waiters {
             waker.wake();
         }
     }
@@ -532,6 +535,45 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Reenters the pool from `wake`: stages a buffer (registering itself
+    /// again if none is free) and returns it immediately.
+    struct Reenter {
+        shared: Arc<PoolShared>,
+        wakes: AtomicUsize,
+    }
+
+    impl Wake for Reenter {
+        fn wake(self: Arc<Self>) {
+            if self.wakes.fetch_add(1, Ordering::SeqCst) > 0 {
+                return;
+            }
+            let waker = Waker::from(self.clone());
+            let staged = self.shared.poll_stage(5, &waker);
+            assert!(matches!(staged, Some(Ok(_))), "the returned buffer is free");
+            // Dropping the staged buffer returns it and wakes again.
+        }
+    }
+
+    #[test]
+    /// A waker that reenters the pool from `wake` does not deadlock.
+    fn reentrant_wake_does_not_deadlock() {
+        let sim = Simulation::new();
+        let (pool, _charge) = pool(&sim, 1);
+        let shared = pool.shared().clone();
+        let held = shared.stage(5).unwrap();
+        let reenter = Arc::new(Reenter {
+            shared: shared.clone(),
+            wakes: AtomicUsize::new(0),
+        });
+        let waker = Waker::from(reenter.clone());
+        assert!(shared.poll_stage(5, &waker).is_none());
+        // Register a second time so the nested return also finds a waiter.
+        assert!(shared.poll_stage(5, &waker).is_none());
+        drop(held);
+        assert!(reenter.wakes.load(Ordering::SeqCst) >= 2);
+        assert_eq!(shared.count_in(BufferState::Free), 1);
     }
 
     #[test]
