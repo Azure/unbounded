@@ -1521,6 +1521,60 @@ mod socket {
     }
 
     #[test]
+    /// A scope cancelled after the completion poll must not leave wait sleeping
+    /// until its timeout while the fenced operation awaits ASYNC_CANCEL.
+    fn wait_submits_cancel_for_scope_cancelled_during_service_turn() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = Rc::new(Descriptor::from(socket));
+
+        assert_eq!(reactor.poll_budgeted(8).unwrap(), 0);
+        let mut watch = reactor.readiness(fd, libc::POLLHUP as u32, &request);
+        assert!(poll(&mut watch).is_pending());
+        reactor.wait(Duration::ZERO).unwrap();
+        request.cancel().unwrap();
+
+        reactor.wait(MAX_WAIT).unwrap();
+        {
+            let state = reactor.state.borrow();
+            let entry = state.entries.first_key_value().unwrap().1;
+            assert!(
+                !entry.completion.needs_cancel(),
+                "wait must queue ASYNC_CANCEL before sleeping"
+            );
+        }
+        assert!(drive(&reactor, watch).is_err());
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    /// Zero-duration waits keep cancellation scans in poll_budgeted.
+    fn zero_wait_does_not_scan_cancellations() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = Rc::new(Descriptor::from(socket));
+
+        let mut watch = reactor.readiness(fd, libc::POLLHUP as u32, &request);
+        assert!(poll(&mut watch).is_pending());
+        reactor.wait(Duration::ZERO).unwrap();
+        request.cancel().unwrap();
+        reactor.wait(Duration::ZERO).unwrap();
+        let state = reactor.state.borrow();
+        let entry = state.entries.first_key_value().unwrap().1;
+        assert!(entry.completion.needs_cancel());
+        drop(state);
+        assert!(drive(&reactor, watch).is_err());
+    }
+
+    #[test]
     /// Retry accept publication after SQ pressure without disturbing unrelated owners.
     fn listener_retry_recovers_from_full_sq_without_losing_owners() {
         // Cancellation SQEs also consume SQ space without new table entries.
