@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"regexp"
 	"sort"
@@ -71,9 +72,10 @@ var reservedScriptEnvironmentNames = map[string]struct{}{
 }
 
 var workflowOutputLimits = map[string]int{
-	"measurements": 16 * 1024,
-	"reason":       4 * 1024,
-	"verdict":      32,
+	"backend-resources": 16 * 1024,
+	"measurements":      16 * 1024,
+	"reason":            4 * 1024,
+	"verdict":           32,
 }
 
 var workflowGVK = schema.GroupVersionKind{
@@ -208,11 +210,8 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 			return fmt.Errorf("get orphaned script snapshot: %w", err)
 		}
 
-		before := node.DeepCopy()
-		delete(node.Annotations, ReservationLabel)
-
-		if err := r.Patch(ctx, node, client.MergeFrom(before)); err != nil {
-			return fmt.Errorf("release orphaned Project Signal reservation: %w", err)
+		if err := r.releaseOrphanedReservations(ctx, runName); err != nil {
+			return fmt.Errorf("release orphaned Project Signal reservations: %w", err)
 		}
 	}
 
@@ -370,9 +369,25 @@ func (r *AdmissionReconciler) selectParticipants(
 		return nil, fmt.Errorf("profile %s participant count must be positive", profile.Name)
 	}
 
-	if count > 1 {
-		return nil, fmt.Errorf("profile %s requests %d participants; multi-participant execution is not implemented", profile.Name, count)
+	if count > 64 {
+		return nil, fmt.Errorf("profile %s participant count must not exceed 64", profile.Name)
 	}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var authoritativeRequest corev1.Node
+	if err := reader.Get(ctx, client.ObjectKey{Name: requestNode.Name}, &authoritativeRequest); err != nil {
+		return nil, fmt.Errorf("read request node %s: %w", requestNode.Name, err)
+	}
+
+	if requestNode.UID != "" && authoritativeRequest.UID != requestNode.UID {
+		return nil, fmt.Errorf("request node %s identity changed", requestNode.Name)
+	}
+
+	requestNode = &authoritativeRequest
 
 	selector, err := metav1.LabelSelectorAsSelector(&profile.Spec.Participants.Selector)
 	if err != nil {
@@ -384,13 +399,14 @@ func (r *AdmissionReconciler) selectParticipants(
 	}
 
 	var nodes corev1.NodeList
-	if err := r.List(ctx, &nodes); err != nil {
+
+	if err := reader.List(ctx, &nodes); err != nil {
 		return nil, fmt.Errorf("list participant nodes: %w", err)
 	}
 
 	sort.Slice(nodes.Items, func(i, j int) bool { return nodes.Items[i].Name < nodes.Items[j].Name })
 
-	selected := []signalv1.Participant{{NodeName: requestNode.Name, NodeUID: requestNode.UID}}
+	selected := []signalv1.Participant{participantSnapshot(requestNode, 0)}
 
 	for i := range nodes.Items {
 		candidate := &nodes.Items[i]
@@ -406,7 +422,7 @@ func (r *AdmissionReconciler) selectParticipants(
 			continue
 		}
 
-		selected = append(selected, signalv1.Participant{NodeName: candidate.Name, NodeUID: candidate.UID})
+		selected = append(selected, participantSnapshot(candidate, int32(len(selected))))
 	}
 
 	if int32(len(selected)) != count {
@@ -414,6 +430,42 @@ func (r *AdmissionReconciler) selectParticipants(
 	}
 
 	return selected, nil
+}
+
+func (r *AdmissionReconciler) releaseOrphanedReservations(ctx context.Context, runName string) error {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var nodes corev1.NodeList
+	if err := reader.List(ctx, &nodes); err != nil {
+		return fmt.Errorf("list Nodes reserved by %s: %w", runName, err)
+	}
+
+	participants := make([]signalv1.Participant, 0)
+
+	for index := range nodes.Items {
+		node := &nodes.Items[index]
+		if node.Annotations[ReservationLabel] == runName {
+			participants = append(participants, signalv1.Participant{
+				NodeName: node.Name,
+				NodeUID:  node.UID,
+			})
+		}
+	}
+
+	return r.releaseParticipants(ctx, participants, runName)
+}
+
+func participantSnapshot(node *corev1.Node, index int32) signalv1.Participant {
+	return signalv1.Participant{
+		Index:       index,
+		NodeName:    node.Name,
+		NodeUID:     node.UID,
+		Capacity:    node.Status.Capacity.DeepCopy(),
+		Allocatable: node.Status.Allocatable.DeepCopy(),
+	}
 }
 
 func nodeEligible(node *corev1.Node, required corev1.ResourceList) bool {
@@ -737,6 +789,11 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		return nil, fmt.Errorf("encode script environment: %w", err)
 	}
 
+	participantsJSON, err := json.Marshal(run.Spec.Participants)
+	if err != nil {
+		return nil, fmt.Errorf("encode Workflow participants: %w", err)
+	}
+
 	name := fmt.Sprintf("%s-a%d", run.Name, attempt)
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workflowGVK.GroupVersion().String(),
@@ -767,6 +824,9 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 					map[string]any{"name": "run-name", "value": run.Name},
 					map[string]any{"name": "run-uid", "value": string(run.UID)},
 					map[string]any{"name": "participants", "value": strings.Join(participantNames, ",")},
+					map[string]any{"name": "participants-json", "value": string(participantsJSON)},
+					map[string]any{"name": "participant-count", "value": fmt.Sprintf("%d", len(run.Spec.Participants))},
+					map[string]any{"name": "request-node-name", "value": run.Spec.RequestNodeName},
 					map[string]any{"name": "script-configmap", "value": run.Spec.Script.ConfigMapName},
 					map[string]any{"name": "script-key", "value": run.Spec.Script.Key},
 					map[string]any{"name": "script-digest", "value": run.Spec.Script.Digest},
@@ -883,6 +943,23 @@ func (r *RunReconciler) finish(
 				finalReason = "workflow outputs rejected: " + err.Error()
 			} else {
 				run.Status.Workflow.Outputs = outputs
+
+				backendResources, backendErr := backendResourceReferences(
+					outputs["backend-resources"],
+					len(run.Spec.Participants),
+				)
+				if backendErr != nil {
+					run.Status.Verdict = "Inconclusive"
+					finalReason = "workflow backend resources rejected: " + backendErr.Error()
+				} else {
+					run.Status.Workflow.BackendResources = backendResources
+					if run.Status.Verdict == "Pass" &&
+						len(run.Spec.Participants) > 1 &&
+						len(backendResources) == 0 {
+						run.Status.Verdict = "Inconclusive"
+						finalReason = "workflow did not identify backend resources for all participants"
+					}
+				}
 			}
 		}
 
@@ -899,11 +976,11 @@ func (r *RunReconciler) finish(
 		if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
 			return ctrl.Result{}, err
 		}
-	} else {
-		executionState = run.Status.ExecutionState
-		verdict = run.Status.Verdict
-		reason = run.Status.Reason
 	}
+
+	executionState = run.Status.ExecutionState
+	verdict = run.Status.Verdict
+	reason = run.Status.Reason
 
 	evidence, err := r.evidenceDocument(ctx, run, executionState, verdict, reason)
 	if err != nil {
@@ -999,6 +1076,95 @@ func (r *RunReconciler) evidenceDocument(
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
+}
+
+func backendResourceReferences(
+	value string,
+	participantCount int,
+) ([]signalv1.BackendResourceReference, error) {
+	if participantCount < 1 || participantCount > 64 {
+		return nil, fmt.Errorf("participant count must be between 1 and 64")
+	}
+
+	if value == "" {
+		return nil, nil
+	}
+
+	var references []signalv1.BackendResourceReference
+
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&references); err != nil {
+		return nil, fmt.Errorf("decode backend-resources: %w", err)
+	}
+
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("backend-resources contains trailing JSON values")
+	}
+
+	if len(references) == 0 || len(references) > 64 {
+		return nil, fmt.Errorf("backend-resources must contain between 1 and 64 entries")
+	}
+
+	identities := make(map[string]struct{}, len(references))
+	covered := make([]bool, participantCount)
+
+	for index := range references {
+		reference := &references[index]
+		if reference.APIVersion == "" || reference.Kind == "" || reference.Name == "" || reference.UID == "" {
+			return nil, fmt.Errorf("backend-resources[%d] has an incomplete identity", index)
+		}
+
+		identity := strings.Join([]string{
+			reference.APIVersion,
+			reference.Kind,
+			reference.Namespace,
+			reference.Name,
+			string(reference.UID),
+		}, "\x00")
+		if _, exists := identities[identity]; exists {
+			return nil, fmt.Errorf("backend-resources[%d] duplicates a workload identity", index)
+		}
+
+		identities[identity] = struct{}{}
+
+		if len(reference.ParticipantIndexes) == 0 {
+			return nil, fmt.Errorf("backend-resources[%d] does not identify a participant", index)
+		}
+
+		seenIndexes := make(map[int32]struct{}, len(reference.ParticipantIndexes))
+		for _, participantIndex := range reference.ParticipantIndexes {
+			if participantIndex < 0 || int(participantIndex) >= participantCount {
+				return nil, fmt.Errorf(
+					"backend-resources[%d] participant index %d is out of range",
+					index,
+					participantIndex,
+				)
+			}
+
+			if _, exists := seenIndexes[participantIndex]; exists {
+				return nil, fmt.Errorf(
+					"backend-resources[%d] repeats participant index %d",
+					index,
+					participantIndex,
+				)
+			}
+
+			seenIndexes[participantIndex] = struct{}{}
+			covered[participantIndex] = true
+		}
+	}
+
+	if participantCount > 1 {
+		for index, isCovered := range covered {
+			if !isCovered {
+				return nil, fmt.Errorf("backend-resources does not cover participant index %d", index)
+			}
+		}
+	}
+
+	return references, nil
 }
 
 func workflowParameters(workflow *unstructured.Unstructured) (map[string]string, error) {

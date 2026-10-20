@@ -30,8 +30,23 @@ func (p RunPhase) Terminal() bool {
 }
 
 type Participant struct {
-	NodeName string    `json:"nodeName"`
-	NodeUID  types.UID `json:"nodeUID"`
+	// +kubebuilder:validation:Minimum=0
+	Index       int32               `json:"index"`
+	NodeName    string              `json:"nodeName"`
+	NodeUID     types.UID           `json:"nodeUID"`
+	Capacity    corev1.ResourceList `json:"capacity,omitempty"`
+	Allocatable corev1.ResourceList `json:"allocatable,omitempty"`
+}
+
+type BackendResourceReference struct {
+	APIVersion string    `json:"apiVersion"`
+	Kind       string    `json:"kind"`
+	Namespace  string    `json:"namespace,omitempty"`
+	Name       string    `json:"name"`
+	UID        types.UID `json:"uid"`
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	ParticipantIndexes []int32 `json:"participantIndexes,omitempty"`
 }
 
 type PinnedProfile struct {
@@ -59,7 +74,9 @@ type ScriptSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.tolerations == oldSelf.tolerations",message="tolerations are immutable"
 // +kubebuilder:validation:XValidation:rule="self.requestNodeName == oldSelf.requestNodeName",message="requestNodeName is immutable"
 type CertificationRunSpec struct {
-	Profile      PinnedProfile     `json:"profile"`
+	Profile PinnedProfile `json:"profile"`
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
 	Participants []Participant     `json:"participants"`
 	Script       ScriptSnapshot    `json:"script"`
 	Workflow     WorkflowReference `json:"workflow"`
@@ -85,6 +102,8 @@ type WorkflowStatus struct {
 	Attempt int32             `json:"attempt,omitempty"`
 	Phase   string            `json:"phase,omitempty"`
 	Outputs map[string]string `json:"outputs,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
+	BackendResources []BackendResourceReference `json:"backendResources,omitempty"`
 }
 
 type EvidenceStatus struct {

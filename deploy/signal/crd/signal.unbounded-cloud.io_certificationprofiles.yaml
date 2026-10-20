@@ -78,7 +78,7 @@ spec:
                 properties:
                   count:
                     format: int32
-                    maximum: 1
+                    maximum: 64
                     minimum: 1
                     type: integer
                   requiredResources:

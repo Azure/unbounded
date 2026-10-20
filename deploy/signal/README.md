@@ -53,7 +53,10 @@ The referenced WorkflowTemplate must accept these string parameters:
 | --- | --- |
 | `run-name` | CertificationRun name |
 | `run-uid` | CertificationRun UID |
-| `participants` | Comma-separated admitted Node names |
+| `participants` | Comma-separated admitted Node names retained for compatibility |
+| `participants-json` | Ordered JSON array of participant indexes, Node names, immutable UIDs, capacity, and allocatable resources |
+| `participant-count` | Number of atomically admitted participants |
+| `request-node-name` | Node that triggered the grouped run |
 | `script-configmap` | Immutable run-owned ConfigMap |
 | `script-key` | Selected ConfigMap key |
 | `script-digest` | SHA-256 of the selected script bytes |
@@ -79,9 +82,34 @@ The Workflow must publish only these output parameters:
 | `verdict` | 32 bytes | `Pass`, `Fail`, or `Inconclusive` |
 | `reason` | 4 KiB | Bounded diagnostic reason |
 | `measurements` | 16 KiB | Bounded measurement summary |
+| `backend-resources` | 16 KiB | Optional JSON array of backend workload identities and covered participant indexes; required for a multi-Node `Pass` |
 
 Unexpected, duplicate, malformed, or oversized outputs are rejected and the
-run remains fail-closed.
+run remains fail-closed. Each `backend-resources` entry must contain
+`apiVersion`, `kind`, `name`, `uid`, and the zero-based `participantIndexes`
+that the workload executed. `namespace` is optional. A multi-Node successful
+result must cover every admitted participant.
+
+## Multi-Node execution
+
+Participant admission is deterministic and atomic. The requesting Node is
+participant zero, additional eligible Nodes are selected by name, and a failed
+reservation rolls back every reservation already acquired. Each participant is
+bound by Node UID and an immutable capacity and allocatable snapshot in the
+CertificationRun.
+
+The participant group is a certification boundary, not necessarily one
+distributed process group. Operator WorkflowTemplates should create one
+independently pinned backend workload per participant unless a test explicitly
+requires a cross-Node world. The backend adapter owns launcher and worker
+topology, rank environment, rendezvous or SSH configuration, workload RBAC,
+deadline propagation, foreground cleanup, and result aggregation.
+
+The currently validated adapter contract uses ordinary single-Node workloads
+for Node diagnostics and `kubeflow.org/v2beta1` MPIJobs for tests that require
+an OpenMPI launcher and worker. Kubeflow Trainer v2 TrainJobs can be supplied by
+operators through the same generic interface, but require a separately managed,
+version-pinned MPI TrainingRuntime and are not installed by Project Signal.
 
 ## Render and install
 

@@ -141,16 +141,11 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if admitted {
 			activeByProfile++
 
-			var node corev1.Node
-			if getErr := r.Reader.Get(ctx, client.ObjectKey{Name: nodeName}, &node); getErr != nil {
-				return ctrl.Result{}, fmt.Errorf(
-					"get admitted participant %s for failure-domain accounting: %w",
-					nodeName,
-					getErr,
-				)
+			if policy.FailureDomainLabel != "" {
+				if err := r.accountAdmittedFailureDomains(ctx, nodeName, policy.FailureDomainLabel, activeByDomain); err != nil {
+					return ctrl.Result{}, err
+				}
 			}
-
-			activeByDomain[node.Labels[policy.FailureDomainLabel]]++
 		}
 	}
 
@@ -167,6 +162,47 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+func (r *RecurringReconciler) accountAdmittedFailureDomains(
+	ctx context.Context,
+	requestNodeName string,
+	failureDomainLabel string,
+	activeByDomain map[string]int32,
+) error {
+	var requestNode corev1.Node
+	if err := r.Reader.Get(ctx, client.ObjectKey{Name: requestNodeName}, &requestNode); err != nil {
+		return fmt.Errorf("get admitted request Node %s for failure-domain accounting: %w", requestNodeName, err)
+	}
+
+	runName := requestNode.Annotations[ReservationLabel]
+	if runName == "" {
+		return fmt.Errorf("admitted request Node %s has no reservation", requestNodeName)
+	}
+
+	var run signalv1.CertificationRun
+	if err := r.Reader.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run); err != nil {
+		return fmt.Errorf("get admitted run %s for failure-domain accounting: %w", runName, err)
+	}
+
+	for _, participant := range run.Spec.Participants {
+		var node corev1.Node
+		if err := r.Reader.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
+			return fmt.Errorf(
+				"get admitted participant %s for failure-domain accounting: %w",
+				participant.NodeName,
+				err,
+			)
+		}
+
+		if participant.NodeUID != "" && node.UID != participant.NodeUID {
+			return fmt.Errorf("admitted participant %s identity changed", participant.NodeName)
+		}
+
+		activeByDomain[node.Labels[failureDomainLabel]]++
+	}
+
+	return nil
 }
 
 func (r *RecurringReconciler) projectStatuses(ctx context.Context, profile *signalv1.CertificationProfile) error {
@@ -285,6 +321,31 @@ func (r *RecurringReconciler) evaluateNode(
 		return status, false, nil
 	}
 
+	if profile.Spec.Recurring.FailureDomainLabel != "" &&
+		profile.Spec.Recurring.MaxConcurrentPerFailureDomain > 0 {
+		participants, err := r.Admission.selectParticipants(ctx, &node, profile)
+		if err != nil {
+			return status, false, fmt.Errorf("select recurring participants: %w", err)
+		}
+
+		fits, err := r.participantsFitFailureDomainBudget(
+			ctx,
+			participants,
+			profile.Spec.Recurring.FailureDomainLabel,
+			profile.Spec.Recurring.MaxConcurrentPerFailureDomain,
+			activeByDomain,
+		)
+		if err != nil {
+			return status, false, err
+		}
+
+		if !fits {
+			status.Reason = "FailureDomainBudget"
+
+			return status, false, nil
+		}
+	}
+
 	if err := r.Admission.admitNodeWithTriggerLocked(ctx, &node, profile.Name, "recurring"); err != nil {
 		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
 			status.Reason = "AdmissionRaced"
@@ -299,6 +360,40 @@ func (r *RecurringReconciler) evaluateNode(
 	status.NextDueAt = nil
 
 	return status, true, nil
+}
+
+func (r *RecurringReconciler) participantsFitFailureDomainBudget(
+	ctx context.Context,
+	participants []signalv1.Participant,
+	failureDomainLabel string,
+	maxConcurrent int32,
+	activeByDomain map[string]int32,
+) (bool, error) {
+	prospective := make(map[string]int32)
+
+	for _, participant := range participants {
+		var node corev1.Node
+		if err := r.Reader.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
+			return false, fmt.Errorf(
+				"get selected participant %s for failure-domain accounting: %w",
+				participant.NodeName,
+				err,
+			)
+		}
+
+		if participant.NodeUID != "" && node.UID != participant.NodeUID {
+			return false, fmt.Errorf("selected participant %s identity changed", participant.NodeName)
+		}
+
+		domain := node.Labels[failureDomainLabel]
+		prospective[domain]++
+
+		if activeByDomain[domain]+prospective[domain] > maxConcurrent {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 func (r *RecurringReconciler) nodeBusy(ctx context.Context, node *corev1.Node) (bool, string, error) {

@@ -129,6 +129,65 @@ func TestRecurringFailureDomainAccountingFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRecurringMultiNodeFailureDomainBudgetAccountsWholeGroup(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	first := readyNode("gpu-0", "H200")
+	first.Labels["topology.kubernetes.io/zone"] = "zone-a"
+	second := readyNode("gpu-1", "H200")
+	second.Labels["topology.kubernetes.io/zone"] = "zone-a"
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(first, second).Build()
+	r := &RecurringReconciler{Reader: kube}
+	participants := []signalv1.Participant{
+		participantSnapshot(first, 0),
+		participantSnapshot(second, 1),
+	}
+
+	fits, err := r.participantsFitFailureDomainBudget(
+		context.Background(),
+		participants,
+		"topology.kubernetes.io/zone",
+		1,
+		map[string]int32{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fits {
+		t.Fatal("two participants in one domain exceeded the per-domain budget")
+	}
+
+	second.Labels["topology.kubernetes.io/zone"] = "zone-b"
+	if err := kube.Update(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+
+	fits, err = r.participantsFitFailureDomainBudget(
+		context.Background(),
+		participants,
+		"topology.kubernetes.io/zone",
+		1,
+		map[string]int32{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !fits {
+		t.Fatal("participants in distinct domains should fit the budget")
+	}
+}
+
 func TestRecurringDueUsesContinuousIdleAndFreshness(t *testing.T) {
 	t.Parallel()
 
