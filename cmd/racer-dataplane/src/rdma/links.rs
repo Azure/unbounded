@@ -53,6 +53,12 @@ pub fn funded_devices(registered_bytes: usize, devices: usize) -> usize {
     (buffer_count(registered_bytes) / 2).min(devices)
 }
 
+/// Truncate `publication` to the prefix a node-wide registered budget funds.
+/// Activation and snapshot refresh both use this so they agree on the rails.
+pub fn fund_publication<T>(publication: &mut Vec<T>, registered_bytes: usize) {
+    publication.truncate(funded_devices(registered_bytes, publication.len()));
+}
+
 /// Grants per link: each concurrent page to a peer already needs one HTTP connection.
 pub fn grants_per_link(connections_per_neighbor: usize) -> u32 {
     u32::try_from(connections_per_neighbor)
@@ -270,17 +276,17 @@ impl Links {
         // Racer's quota profile charges 4 KiB physical pages.
         validate_native_page_size(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
         self.client.reopen()?;
-        let fit = funded_devices(registered_bytes, publication.len());
-        if fit == 0 {
+        let eligible = publication.len();
+        fund_publication(&mut publication, registered_bytes);
+        if publication.is_empty() {
             eprintln!("racer-dataplane: RACER_REGISTERED_BYTES funds no RDMA device; using HTTP");
             return Err(Error::Unavailable);
         }
-        if publication.len() > fit {
+        if publication.len() < eligible {
             eprintln!(
-                "racer-dataplane: RACER_REGISTERED_BYTES funds {fit} of {} RDMA devices",
+                "racer-dataplane: RACER_REGISTERED_BYTES funds {} of {eligible} RDMA devices",
                 publication.len()
             );
-            publication.truncate(fit);
         }
         let pool_bytes = buffer_count(registered_bytes / publication.len()) * BUFFER_LEN;
         let guard = admission

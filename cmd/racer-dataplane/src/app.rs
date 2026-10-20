@@ -1380,19 +1380,12 @@ impl WorkerApplication {
             self.close_native();
         }
         if !self.actual_rails.is_empty() {
+            let registered = self
+                .runtime
+                .admission
+                .limit(crate::admission::ResourceClass::Registered);
             let compatible = self.native_publication().is_ok_and(|published_rails| {
-                published_rails.len() == self.actual_rails.len()
-                    && self.actual_rails.iter().all(|actual| {
-                        published_rails.iter().any(|published| {
-                            published.rail == actual.rail
-                                && published.device == actual.device
-                                && published.port == actual.port
-                                && published.gid.is_none_or(|gid| actual.gid == Some(gid))
-                                && published
-                                    .numa_node
-                                    .is_none_or(|numa| actual.numa_node == Some(numa))
-                        })
-                    })
+                native::rails_compatible(published_rails, &self.actual_rails, registered)
             });
             if !compatible {
                 self.close_native();

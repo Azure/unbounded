@@ -234,9 +234,76 @@ fn publication_capacity(links: bool) -> usize {
     if links { usize::MAX } else { 0 }
 }
 
+/// Whether active rails still match the publication activation would fund.
+/// Activation truncates the publication to the budget-funded prefix, so the
+/// comparison applies the same truncation before matching.
+pub(super) fn rails_compatible(
+    mut published: Vec<racer_control_wire::RailMapping>,
+    actual: &[racer_control_wire::RailMapping],
+    registered_bytes: usize,
+) -> bool {
+    crate::rdma::links::fund_publication(&mut published, registered_bytes);
+    published.len() == actual.len()
+        && actual.iter().all(|actual| {
+            published.iter().any(|published| {
+                published.rail == actual.rail
+                    && published.device == actual.device
+                    && published.port == actual.port
+                    && published.gid.is_none_or(|gid| actual.gid == Some(gid))
+                    && published
+                        .numa_node
+                        .is_none_or(|numa| actual.numa_node == Some(numa))
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rails_compatible_applies_registered_budget() {
+        use crate::rdma::links::BUFFER_LEN;
+        let nic = |device: &str, rail| racer_control_wire::RailMapping {
+            device: device.into(),
+            port: 1,
+            rail: RailId(rail),
+            gid: Some([1; 16]),
+            numa_node: Some(0),
+        };
+        let eligible = vec![nic("a", 1), nic("b", 2), nic("c", 3)];
+        // Budget funds two of three eligible rails: an unchanged refresh keeps links.
+        let funded = vec![nic("a", 1), nic("b", 2)];
+        assert!(rails_compatible(eligible.clone(), &funded, 4 * BUFFER_LEN));
+        // Full budget: all three rails must be active.
+        assert!(rails_compatible(
+            eligible.clone(),
+            &eligible,
+            6 * BUFFER_LEN
+        ));
+        assert!(!rails_compatible(eligible.clone(), &funded, 6 * BUFFER_LEN));
+        // A real change in a funded rail re-activates.
+        let mut moved = eligible.clone();
+        moved[1].device = "z".into();
+        assert!(!rails_compatible(moved, &funded, 4 * BUFFER_LEN));
+        let mut regid = eligible.clone();
+        regid[0].gid = Some([2; 16]);
+        assert!(!rails_compatible(regid, &funded, 4 * BUFFER_LEN));
+        // A rail removed from the snapshot re-activates.
+        assert!(!rails_compatible(
+            vec![nic("a", 1)],
+            &funded,
+            4 * BUFFER_LEN
+        ));
+        // Budget shrinking below the active set re-activates.
+        assert!(!rails_compatible(eligible.clone(), &funded, 2 * BUFFER_LEN));
+        // Budget funding nothing never matches active rails.
+        assert!(!rails_compatible(eligible.clone(), &funded, BUFFER_LEN));
+        // Changes past the funded prefix do not tear down links.
+        let mut tail = eligible;
+        tail[2].device = "y".into();
+        assert!(rails_compatible(tail, &funded, 4 * BUFFER_LEN));
+    }
     use crate::admission::ResourceClass;
     use crate::security;
     use crate::security::CryptoClient;
