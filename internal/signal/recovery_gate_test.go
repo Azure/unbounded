@@ -59,6 +59,7 @@ func TestKubernetesRecoveryGateVerifiesBoundImmutableReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	gate.now = func() time.Time { return now }
 
 	if err := gate.Verify(context.Background(), run, workflow); err != nil {
@@ -93,11 +94,14 @@ func TestKubernetesRecoveryGateRejectsUntrustedOrUnboundReceipts(t *testing.T) {
 			if err := json.Unmarshal([]byte(configMap.Data["receipt.json"]), &receipt); err != nil {
 				t.Fatal(err)
 			}
+
 			receipt["runUID"] = "attacker"
+
 			encoded, err := json.Marshal(receipt)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			configMap.Data["receipt.json"] = string(encoded)
 		},
 		"duplicate field": func(configMap *corev1.ConfigMap) {
@@ -131,6 +135,7 @@ func TestKubernetesRecoveryGateRejectsUntrustedOrUnboundReceipts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			gate.now = func() time.Time { return now }
 
 			if err := gate.Verify(context.Background(), run, workflow); err == nil {
@@ -189,9 +194,11 @@ func signedRecoveryReceipt(
 		"bundleSHA256":          hex.EncodeToString(sum[:]),
 		"patchApplied":          "YES",
 		"terminalRecordPresent": true,
+		"terminalOutcome":       "PASS",
 		"issuedAtEpoch":         now.Unix(),
 		"expiresAtEpoch":        now.Add(5 * time.Minute).Unix(),
 	}
+
 	canonical, err := json.Marshal(unsigned)
 	if err != nil {
 		t.Fatal(err)
@@ -201,6 +208,7 @@ func signedRecoveryReceipt(
 	for key, value := range unsigned {
 		receipt[key] = value
 	}
+
 	receipt["signatureBase64"] = base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, canonical))
 
 	encoded, err := json.Marshal(receipt)

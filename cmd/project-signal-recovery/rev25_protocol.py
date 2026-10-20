@@ -388,7 +388,7 @@ class Verifier:
             )
         ):
             raise Rev25Error("recovery does not match durable current latest")
-        return rev24.verify_recovery(
+        result = rev24.verify_recovery(
             binding,
             entries,
             bundle["checkpoint"],
@@ -401,3 +401,12 @@ class Verifier:
             digest,
             now_epoch,
         )
+        terminal = next(
+            (
+                entry["leaf"]["payload"]["outcome"]
+                for entry in entries
+                if entry["leaf"]["event"] == "RUN_TERMINAL"
+            ),
+            None,
+        )
+        return {**result, "terminalOutcome": terminal}

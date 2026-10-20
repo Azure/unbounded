@@ -66,8 +66,9 @@ Recovery-gated Dapple certification additionally requires:
 - a dedicated durable SQLite volume with WAL, full synchronous writes,
   retention lock, verified backup, and single-writer fencing;
 - a separately privileged observer identity that alone may run `observe`;
-- a verifier identity that opens current-latest state read-only and signs
-  short-lived recovery receipts;
+- a verifier identity that can acquire SQLite write transactions only to fence
+  current-latest reads and durably record signed receipt authorizations, but
+  cannot invoke the privileged `observe` operation;
 - a controller Secret containing only the verifier public key, rendered with
   `SIGNAL_RECOVERY_VERIFIER_SECRET=<secret-name>`;
 - exactly one admitted evidence service and three distinct witnesses with an
@@ -86,6 +87,57 @@ The GB200 sample enables this gate deliberately. Its generic identity script
 does not create a receipt, so the sample cannot certify a Node as production
 eligible until a reviewed Dapple workflow adds the verifier step and publishes
 the immutable receipt ConfigMap.
+
+### Dapple deployment acceptance
+
+The recovery gate is not deployment acceptance. Before any live Dapple read or
+mutation, reviewers must separately record all of the following:
+
+1. the exact native runner and recovery-verifier image digests;
+2. the immutable trusted authority root, ledger revision, and ledger digest;
+3. one service identity and exactly three distinct witness identities and
+   public keys, with an exact two-of-three threshold and no key reuse;
+4. service and witness endpoints, key-custody evidence, quorum reachability,
+   freshness-gossip health, persistence, retention lock, and verified backup;
+5. the durable volume identity and single-writer fencing used for ACK
+   consumption, witness statements, and current-latest observations;
+6. the bounded baseline, assigned Dapple Node UID, runtime policy, and a fresh
+   one-use transfer authority.
+
+The observer and verifier must not share operation authority. `observe` is the
+only operation allowed to advance current-latest state. Receipt-issuing
+`verify` needs transaction-capable access to the same database so it can hold
+an immediate transaction while comparing current-latest state, signing the
+receipt, and durably recording the authorization. A verifier without receipt
+arguments remains read-only. The verifier signing key must be unavailable to
+the Workflow and diagnostic runner. The controller receives only its public
+key.
+
+### Bounded Dapple validation plan
+
+After deployment acceptance is complete, the final validation phase is:
+
+1. render the manifests with immutable image digests and the verifier public-key
+   Secret, then complete server-side dry runs;
+2. deploy the controller and recovery verifier without creating a
+   `CertificationRun`;
+3. confirm durable-state restart behavior, backup restoration, exact witness
+   membership, and healthy two-of-three quorum using synthetic evidence only;
+4. accept a new bounded baseline and assign exactly one Dapple Node UID;
+5. issue a new challenge and one-use transfer authority bound to that Run,
+   Node, contract, generation, and current ledger;
+6. allow the authority observer to record the signed current-latest checkpoint;
+7. execute the guarded flow with at most one near-write GET and one conditional
+   full-spec PATCH, with no retry, fallback, extra call, or post-state GET;
+8. publish the immutable evidence bundle and signed short-lived recovery
+   receipt, then require the controller to verify it before projecting `Pass`;
+9. restart the service and each witness and repeat synthetic replay and
+   equivocation attacks to prove durable rejection;
+10. stop after the single bounded validation and preserve honest `UNKNOWN` if
+    the send or response boundary is ambiguous.
+
+Rows 05, 07, and 08 remain evidence-dependent. Row 15 is prohibited and is not
+authorized by this workflow or plan.
 
 Project Signal does not install Argo Workflows or MPI Operator. Install and
 scope those dependencies according to the target cluster's security model.

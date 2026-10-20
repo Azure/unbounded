@@ -49,6 +49,7 @@ type recoveryReceipt struct {
 	BundleSHA256          string `json:"bundleSHA256"`
 	PatchApplied          string `json:"patchApplied"`
 	TerminalRecordPresent bool   `json:"terminalRecordPresent"`
+	TerminalOutcome       string `json:"terminalOutcome"`
 	IssuedAtEpoch         int64  `json:"issuedAtEpoch"`
 	ExpiresAtEpoch        int64  `json:"expiresAtEpoch"`
 	SignatureBase64       string `json:"signatureBase64"`
@@ -115,6 +116,7 @@ func (g *KubernetesRecoveryGate) Verify(
 
 	receiptJSON := []byte(evidence.Data["receipt.json"])
 	bundleJSON := []byte(evidence.Data["bundle.json"])
+
 	if len(receiptJSON) == 0 || len(receiptJSON) > maxRecoveryReceiptBytes {
 		return fmt.Errorf("recovery receipt size is invalid")
 	}
@@ -135,7 +137,8 @@ func (g *KubernetesRecoveryGate) Verify(
 		receipt.WorkflowUID != string(workflow.GetUID()) ||
 		receipt.BundleSHA256 != hex.EncodeToString(sum[:]) ||
 		receipt.PatchApplied != "YES" ||
-		!receipt.TerminalRecordPresent {
+		!receipt.TerminalRecordPresent ||
+		receipt.TerminalOutcome != "PASS" {
 		return fmt.Errorf("recovery receipt binding mismatch")
 	}
 
@@ -164,6 +167,7 @@ func (g *KubernetesRecoveryGate) Verify(
 		"bundleSHA256":          receipt.BundleSHA256,
 		"patchApplied":          receipt.PatchApplied,
 		"terminalRecordPresent": receipt.TerminalRecordPresent,
+		"terminalOutcome":       receipt.TerminalOutcome,
 		"issuedAtEpoch":         receipt.IssuedAtEpoch,
 		"expiresAtEpoch":        receipt.ExpiresAtEpoch,
 	}
@@ -182,12 +186,14 @@ func (g *KubernetesRecoveryGate) Verify(
 
 func parseRecoveryReceipt(data []byte) (recoveryReceipt, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
+
 	token, err := decoder.Token()
 	if err != nil || token != json.Delim('{') {
 		return recoveryReceipt{}, fmt.Errorf("expected JSON object")
 	}
 
 	fields := make(map[string]json.RawMessage)
+
 	for decoder.More() {
 		token, err = decoder.Token()
 		if err != nil {
@@ -225,8 +231,10 @@ func parseRecoveryReceipt(data []byte) (recoveryReceipt, error) {
 	}
 
 	var receipt recoveryReceipt
+
 	strict := json.NewDecoder(bytes.NewReader(normalized))
 	strict.DisallowUnknownFields()
+
 	if err := strict.Decode(&receipt); err != nil {
 		return recoveryReceipt{}, err
 	}

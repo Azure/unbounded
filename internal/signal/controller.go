@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -55,14 +56,17 @@ var workflowGVK = schema.GroupVersionKind{
 
 type AdmissionReconciler struct {
 	client.Client
+	APIReader       client.Reader
 	Namespace       string
 	ScriptNamespace string
 	Recorder        recorder.EventRecorder
 	Now             func() time.Time
+	admissionMu     sync.Mutex
 }
 
 type RunReconciler struct {
 	client.Client
+	APIReader          client.Reader
 	Namespace          string
 	Evidence           EvidenceStore
 	RecoveryGate       RecoveryGate
@@ -73,6 +77,10 @@ type RunReconciler struct {
 }
 
 func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}, builder.WithPredicates(predicate.LabelChangedPredicate{})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
@@ -80,6 +88,10 @@ func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	workflow := &unstructured.Unstructured{}
 	workflow.SetGroupVersionKind(workflowGVK)
 
@@ -114,10 +126,27 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 	profileName string,
 	trigger string,
 ) error {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	return r.admitNodeWithTriggerLocked(ctx, node, profileName, trigger)
+}
+
+func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
+	ctx context.Context,
+	node *corev1.Node,
+	profileName string,
+	trigger string,
+) error {
 	if runName := node.Annotations[ReservationLabel]; runName != "" {
 		var run signalv1.CertificationRun
 
-		err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run)
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+
+		err := reader.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run)
 		if err == nil {
 			return nil
 		}
@@ -126,7 +155,38 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 			return err
 		}
 
-		return fmt.Errorf("node %s has stale Project Signal reservation %q", node.Name, runName)
+		var snapshot corev1.ConfigMap
+
+		err = reader.Get(
+			ctx,
+			client.ObjectKey{
+				Namespace: r.Namespace,
+				Name:      runName + "-scripts",
+			},
+			&snapshot,
+		)
+		if err == nil {
+			if snapshot.Labels[SnapshotRunLabel] != runName {
+				return fmt.Errorf(
+					"orphaned snapshot %s is not bound to reservation %q",
+					snapshot.Name,
+					runName,
+				)
+			}
+
+			if err := r.Delete(ctx, &snapshot); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete orphaned script snapshot: %w", err)
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get orphaned script snapshot: %w", err)
+		}
+
+		before := node.DeepCopy()
+		delete(node.Annotations, ReservationLabel)
+
+		if err := r.Patch(ctx, node, client.MergeFrom(before)); err != nil {
+			return fmt.Errorf("release orphaned Project Signal reservation: %w", err)
+		}
 	}
 
 	var profile signalv1.CertificationProfile
@@ -453,6 +513,17 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return r.cleanup(ctx, &run)
 	}
 
+	if run.Status.FinishedAt != nil {
+		return r.finish(
+			ctx,
+			&run,
+			nil,
+			run.Status.ExecutionState,
+			run.Status.Verdict,
+			run.Status.Reason,
+		)
+	}
+
 	if run.Spec.Cancel {
 		return r.cancel(ctx, &run)
 	}
@@ -464,12 +535,26 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	workflow := &unstructured.Unstructured{}
 	workflow.SetGroupVersionKind(workflowGVK)
 
-	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}, workflow); err != nil {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}, workflow); err != nil {
 		if apierrors.IsNotFound(err) {
 			return r.retryOrFinish(ctx, &run, "Error", "WorkflowMissing", "workflow disappeared before terminal status")
 		}
 
 		return ctrl.Result{}, err
+	}
+
+	if run.Status.Workflow.UID == "" ||
+		string(workflow.GetUID()) != run.Status.Workflow.UID ||
+		!metav1.IsControlledBy(workflow, &run) {
+		return ctrl.Result{}, fmt.Errorf(
+			"workflow %s identity or ownership changed; refusing concurrent retry",
+			workflow.GetName(),
+		)
 	}
 
 	phase, _, err := unstructured.NestedString(workflow.Object, "status", "phase")
@@ -657,24 +742,41 @@ func (r *RunReconciler) finish(
 	verdict string,
 	reason string,
 ) (ctrl.Result, error) {
-	if verdict == "Pass" && run.Spec.Parameters[requireRecoveryParameter] == "true" {
-		if r.RecoveryGate == nil {
-			verdict = "Inconclusive"
-			reason = "recovery gate is required but not configured"
-		} else if err := r.RecoveryGate.Verify(ctx, run, workflow); err != nil {
-			verdict = "Inconclusive"
-			reason = "recovery gate rejected evidence: " + err.Error()
+	if run.Status.FinishedAt == nil {
+		if verdict == "Pass" && run.Spec.Parameters[requireRecoveryParameter] == "true" {
+			if r.RecoveryGate == nil {
+				verdict = "Inconclusive"
+				reason = "recovery gate is required but not configured"
+			} else if err := r.RecoveryGate.Verify(ctx, run, workflow); err != nil {
+				verdict = "Inconclusive"
+				reason = "recovery gate rejected evidence: " + err.Error()
+			}
 		}
-	}
 
-	evidenceRun := run.DeepCopy()
-	if executionState == "Completed" {
-		evidenceRun.Status.Workflow.Phase = "Succeeded"
+		before := run.DeepCopy()
+		run.Status.ExecutionState = executionState
+		run.Status.Verdict = verdict
+
+		run.Status.Reason = reason
+		if executionState == "Completed" {
+			run.Status.Workflow.Phase = "Succeeded"
+		} else {
+			run.Status.Workflow.Phase = executionState
+		}
+
+		now := metav1.NewTime(r.now())
+		run.Status.FinishedAt = &now
+
+		if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
+			return ctrl.Result{}, err
+		}
 	} else {
-		evidenceRun.Status.Workflow.Phase = executionState
+		executionState = run.Status.ExecutionState
+		verdict = run.Status.Verdict
+		reason = run.Status.Reason
 	}
 
-	evidence, err := r.evidenceDocument(ctx, evidenceRun, executionState, verdict, reason)
+	evidence, err := r.evidenceDocument(ctx, run, executionState, verdict, reason)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -685,19 +787,7 @@ func (r *RunReconciler) finish(
 	}
 
 	before := run.DeepCopy()
-	run.Status.ExecutionState = executionState
-	run.Status.Verdict = verdict
-	run.Status.Reason = reason
-
 	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
-	if executionState == "Completed" {
-		run.Status.Workflow.Phase = "Succeeded"
-	} else {
-		run.Status.Workflow.Phase = executionState
-	}
-
-	now := metav1.NewTime(r.now())
-	run.Status.FinishedAt = &now
 
 	switch verdict {
 	case "Pass":
@@ -775,7 +865,7 @@ func (r *RunReconciler) evidenceDocument(
 		"verdict":        verdict,
 		"reason":         reason,
 		"startedAt":      run.Status.StartedAt,
-		"finishedAt":     r.now().UTC().Format(time.RFC3339Nano),
+		"finishedAt":     run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
@@ -936,15 +1026,41 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 
 	workflow := &unstructured.Unstructured{}
 	workflow.SetGroupVersionKind(workflowGVK)
-	workflow.SetNamespace(run.Namespace)
-	workflow.SetName(run.Status.Workflow.Name)
+
+	key := client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}
+	reader := r.APIReader
+
+	if reader == nil {
+		reader = r.Client
+	}
+
+	if err := reader.Get(ctx, key, workflow); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+
+		return false, fmt.Errorf("get Workflow before deletion: %w", err)
+	}
+
+	if run.Status.Workflow.UID == "" ||
+		string(workflow.GetUID()) != run.Status.Workflow.UID ||
+		!metav1.IsControlledBy(workflow, run) {
+		return false, fmt.Errorf("refusing to delete Workflow with changed identity or ownership")
+	}
 
 	propagation := metav1.DeletePropagationForeground
-	if err := r.Delete(ctx, workflow, client.PropagationPolicy(propagation)); err != nil && !apierrors.IsNotFound(err) {
+	uid := workflow.GetUID()
+
+	if err := r.Delete(
+		ctx,
+		workflow,
+		client.PropagationPolicy(propagation),
+		client.Preconditions{UID: &uid},
+	); err != nil && !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("delete Workflow before releasing participants: %w", err)
 	}
 
-	if err := r.Get(ctx, client.ObjectKeyFromObject(workflow), workflow); err != nil {
+	if err := reader.Get(ctx, key, workflow); err != nil {
 		if apierrors.IsNotFound(err) {
 			return true, nil
 		}

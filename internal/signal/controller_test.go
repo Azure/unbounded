@@ -13,6 +13,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -202,6 +203,74 @@ func TestAdmissionFailureMakesCreatedRunInertAndReleasesReservation(t *testing.T
 	}
 }
 
+func TestAdmissionRecoversOrphanedReservationAndSnapshot(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	node := readyNode("gpu-0", "example-gpu")
+	node.Labels[RequestLabel] = "gpu-smoke"
+	node.Annotations = map[string]string{ReservationLabel: "orphaned-run"}
+	profile := testProfile("gpu-smoke", "example-gpu")
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
+		Data:       map[string]string{"payload.txt": "test payload\n"},
+	}
+	immutable := true
+	orphanedSnapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "orphaned-run-scripts",
+			Namespace: "signal",
+			Labels:    map[string]string{SnapshotRunLabel: "orphaned-run"},
+		},
+		Immutable: &immutable,
+		Data:      map[string]string{"payload.txt": "orphaned\n"},
+	}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, profile, source, orphanedSnapshot).
+		Build()
+	r := &AdmissionReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		Namespace:       "signal",
+		ScriptNamespace: "signal",
+		Now:             func() time.Time { return time.Unix(100, 0) },
+	}
+
+	if _, err := r.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: node.Name}},
+	); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKeyFromObject(orphanedSnapshot),
+		&corev1.ConfigMap{},
+	); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphaned snapshot get error = %v, want NotFound", err)
+	}
+
+	var runs signalv1.CertificationRunList
+	if err := kube.List(context.Background(), &runs); err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+
+	if len(runs.Items) != 1 {
+		t.Fatalf("runs = %d, want recovered admission", len(runs.Items))
+	}
+
+	var recovered corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &recovered); err != nil {
+		t.Fatalf("get recovered node: %v", err)
+	}
+
+	if recovered.Annotations[ReservationLabel] != runs.Items[0].Name {
+		t.Fatalf("reservation = %q, want %q", recovered.Annotations[ReservationLabel], runs.Items[0].Name)
+	}
+}
+
 func TestDeletingRunClearsReservationAndRequest(t *testing.T) {
 	t.Parallel()
 
@@ -238,7 +307,7 @@ func TestCancellationWaitsForWorkflowDeletionBeforeReleasingNode(t *testing.T) {
 	run.Status.Workflow = signalv1.WorkflowStatus{Name: "canceling-run-a1", Attempt: 1}
 	node := readyNode(run.Spec.RequestNodeName, "A100")
 	node.Annotations = map[string]string{ReservationLabel: run.Name}
-	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Running", "", "")
+	workflow := workflowObject(run, "Running", "", "")
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&signalv1.CertificationRun{}).
@@ -440,7 +509,7 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
 		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
 	}
-	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Succeeded", "Pass", "Healthy")
+	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
 	store := &memoryEvidenceStore{}
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -523,7 +592,7 @@ func TestRecoveryGatedPassFailsClosedWithoutVerifier(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
 		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
 	}
-	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Succeeded", "Pass", "Healthy")
+	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
 	store := &memoryEvidenceStore{}
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -548,6 +617,179 @@ func TestRecoveryGatedPassFailsClosedWithoutVerifier(t *testing.T) {
 	}
 }
 
+func TestTerminalFinalizationRetriesWithIdenticalEvidence(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-retry-finalization")
+	run.Status = signalv1.CertificationRunStatus{
+		Phase:     signalv1.RunPhaseRunning,
+		Workflow:  signalv1.WorkflowStatus{Name: "run-retry-finalization-a1", Attempt: 1},
+		StartedAt: ptrTime(metav1.NewTime(time.Unix(100, 0))),
+	}
+	node := readyNode("gpu-0", "A100")
+	node.Annotations = map[string]string{ReservationLabel: run.Name}
+	snapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+	}
+	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
+	statusPatches := 0
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, node, snapshot, workflow).
+		Build()
+	kube := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourcePatch: func(
+			ctx context.Context,
+			c client.Client,
+			subResource string,
+			obj client.Object,
+			patch client.Patch,
+			opts ...client.SubResourcePatchOption,
+		) error {
+			if subResource == "status" {
+				statusPatches++
+				if statusPatches == 2 {
+					return errors.New("status patch interrupted after evidence persistence")
+				}
+			}
+
+			return c.SubResource(subResource).Patch(ctx, obj, patch, opts...)
+		},
+	})
+	store := &immutableMemoryEvidenceStore{}
+	r := &RunReconciler{
+		Client:   kube,
+		Evidence: store,
+		Now:      func() time.Time { return time.Unix(200+int64(statusPatches), 0) },
+	}
+	key := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)}
+
+	if _, err := r.Reconcile(context.Background(), key); err == nil {
+		t.Fatal("first Reconcile error = nil, want interrupted status patch")
+	}
+
+	var interrupted signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &interrupted); err != nil {
+		t.Fatalf("get interrupted run: %v", err)
+	}
+
+	beforeCancel := interrupted.DeepCopy()
+	interrupted.Spec.Cancel = true
+
+	if err := kube.Patch(context.Background(), &interrupted, client.MergeFrom(beforeCancel)); err != nil {
+		t.Fatalf("request cancellation: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), key); err != nil {
+		t.Fatalf("retry Reconcile: %v", err)
+	}
+
+	var got signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &got); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+
+	if got.Status.Phase != signalv1.RunPhaseSucceeded {
+		t.Fatalf("phase = %q, want Succeeded", got.Status.Phase)
+	}
+
+	if store.puts != 2 {
+		t.Fatalf("evidence puts = %d, want 2 identical attempts", store.puts)
+	}
+}
+
+func TestWorkflowReplacementIsRejected(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-workflow-replaced")
+	run.Status = signalv1.CertificationRunStatus{
+		Phase: signalv1.RunPhaseRunning,
+		Workflow: signalv1.WorkflowStatus{
+			Name:    "run-workflow-replaced-a1",
+			UID:     "original-workflow-uid",
+			Attempt: 1,
+		},
+	}
+	replacement := workflowObject(run, "Succeeded", "Pass", "forged")
+	replacement.SetUID("replacement-workflow-uid")
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, replacement).
+		Build()
+	r := &RunReconciler{Client: kube, Evidence: &memoryEvidenceStore{}}
+
+	if _, err := r.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)},
+	); err == nil || !strings.Contains(err.Error(), "refusing concurrent retry") {
+		t.Fatalf("Reconcile error = %v, want identity rejection", err)
+	}
+
+	var got signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &got); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+
+	if got.Status.Workflow.Attempt != 1 ||
+		got.Status.Workflow.Name != "run-workflow-replaced-a1" {
+		t.Fatalf("replacement workflow triggered a retry: %#v", got.Status.Workflow)
+	}
+
+	var workflows unstructured.UnstructuredList
+	workflows.SetGroupVersionKind(workflowGVK.GroupVersion().WithKind("WorkflowList"))
+
+	if err := kube.List(context.Background(), &workflows, client.InNamespace(run.Namespace)); err != nil {
+		t.Fatalf("list Workflows: %v", err)
+	}
+
+	if len(workflows.Items) != 1 {
+		t.Fatalf("workflows = %d, want only mismatched original name", len(workflows.Items))
+	}
+}
+
+func TestCancellationRefusesToDeleteReplacementWorkflow(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-cancel-replacement")
+	run.Spec.Cancel = true
+	run.Status = signalv1.CertificationRunStatus{
+		Phase: signalv1.RunPhaseRunning,
+		Workflow: signalv1.WorkflowStatus{
+			Name:    "run-cancel-replacement-a1",
+			UID:     "original-workflow-uid",
+			Attempt: 1,
+		},
+	}
+	replacement := workflowObject(run, "Running", "", "")
+	replacement.SetUID("replacement-workflow-uid")
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, replacement).
+		Build()
+	r := &RunReconciler{Client: kube}
+
+	if _, err := r.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)},
+	); err == nil || !strings.Contains(err.Error(), "refusing to delete Workflow") {
+		t.Fatalf("Reconcile error = %v, want identity rejection", err)
+	}
+
+	var remaining unstructured.Unstructured
+	remaining.SetGroupVersionKind(workflowGVK)
+
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(replacement), &remaining); err != nil {
+		t.Fatalf("replacement Workflow was deleted: %v", err)
+	}
+}
+
 func TestWorkflowFailureRetriesWithoutSwitchingPinnedInputs(t *testing.T) {
 	t.Parallel()
 
@@ -558,7 +800,7 @@ func TestWorkflowFailureRetriesWithoutSwitchingPinnedInputs(t *testing.T) {
 		Phase:    signalv1.RunPhaseRunning,
 		Workflow: signalv1.WorkflowStatus{Name: "run-retry-a1", Attempt: 1},
 	}
-	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Failed", "", "")
+	workflow := workflowObject(run, "Failed", "", "")
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&signalv1.CertificationRun{}).
@@ -635,6 +877,22 @@ type memoryEvidenceStore struct {
 }
 
 func (s *memoryEvidenceStore) Put(_ context.Context, path string, data []byte) (string, string, error) {
+	s.data = append([]byte(nil), data...)
+
+	return "memory://" + path, digestString(string(data)), nil
+}
+
+type immutableMemoryEvidenceStore struct {
+	data []byte
+	puts int
+}
+
+func (s *immutableMemoryEvidenceStore) Put(_ context.Context, path string, data []byte) (string, string, error) {
+	s.puts++
+	if s.data != nil && string(s.data) != string(data) {
+		return "", "", errors.New("evidence changed across retry")
+	}
+
 	s.data = append([]byte(nil), data...)
 
 	return "memory://" + path, digestString(string(data)), nil
@@ -721,11 +979,28 @@ func testRun(name string) *signalv1.CertificationRun {
 	}
 }
 
-func workflowObject(namespace, name, phase, verdict, reason string) *unstructured.Unstructured {
+func workflowObject(run *signalv1.CertificationRun, phase, verdict, reason string) *unstructured.Unstructured {
+	const workflowUID = "workflow-uid"
+
+	run.Status.Workflow.UID = workflowUID
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workflowGVK.GroupVersion().String(),
 		"kind":       workflowGVK.Kind,
-		"metadata":   map[string]any{"name": name, "namespace": namespace},
+		"metadata": map[string]any{
+			"name":      run.Status.Workflow.Name,
+			"namespace": run.Namespace,
+			"uid":       workflowUID,
+			"ownerReferences": []any{
+				map[string]any{
+					"apiVersion":         signalv1.GroupVersion.String(),
+					"kind":               "CertificationRun",
+					"name":               run.Name,
+					"uid":                string(run.UID),
+					"controller":         true,
+					"blockOwnerDeletion": true,
+				},
+			},
+		},
 		"status": map[string]any{
 			"phase":   phase,
 			"message": "test workflow message",

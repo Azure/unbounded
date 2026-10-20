@@ -117,6 +117,7 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	var recoveryGate projectsignal.RecoveryGate
+
 	if cfg.recoveryVerifierPublicKeyFile != "" {
 		var publicKey ed25519.PublicKey
 
@@ -133,6 +134,7 @@ func run(ctx context.Context, cfg config) error {
 
 	admission := &projectsignal.AdmissionReconciler{
 		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
 		Namespace:       cfg.namespace,
 		ScriptNamespace: cfg.scriptNamespace,
 		Recorder:        mgr.GetEventRecorder(controllerName),
@@ -143,6 +145,7 @@ func run(ctx context.Context, cfg config) error {
 
 	runs := &projectsignal.RunReconciler{
 		Client:            mgr.GetClient(),
+		APIReader:         mgr.GetAPIReader(),
 		Namespace:         cfg.namespace,
 		Evidence:          evidence,
 		RecoveryGate:      recoveryGate,

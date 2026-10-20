@@ -4,15 +4,130 @@
 package signal
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
+
+func TestRecurringRunBudgetsUseAuthoritativeReader(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 10, 10, 20, 0, 0, 0, time.UTC)
+	node := readyNode("gpu-0", "wrong-gpu")
+	profile := testProfile("gpu-smoke", "expected-gpu")
+	profile.Spec.Recurring = &signalv1.RecurringPolicy{
+		Enabled:                true,
+		NodeNames:              []string{node.Name},
+		MinIdleDuration:        metav1.Duration{Duration: 15 * time.Minute},
+		ValidFor:               metav1.Duration{Duration: time.Hour},
+		ExpiresAt:              metav1.NewTime(now.Add(time.Hour)),
+		FailureBackoff:         metav1.Duration{Duration: time.Minute},
+		MaxConsecutiveFailures: 3,
+		MaxConcurrent:          1,
+	}
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationProfile{}).
+		WithObjects(node, profile).
+		Build()
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		List: func(
+			context.Context,
+			client.WithWatch,
+			client.ObjectList,
+			...client.ListOption,
+		) error {
+			return errors.New("cached list must not define admission budgets")
+		},
+	})
+	r := &RecurringReconciler{
+		Client:    cached,
+		Reader:    base,
+		Namespace: "signal",
+		Admission: &AdmissionReconciler{Client: cached},
+		Now:       func() time.Time { return now },
+	}
+
+	if _, err := r.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: profile.Name}},
+	); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+}
+
+func TestRecurringFailureDomainAccountingFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 10, 10, 20, 0, 0, 0, time.UTC)
+	profile := testProfile("gpu-smoke", "expected-gpu")
+	profile.Spec.Recurring = &signalv1.RecurringPolicy{
+		Enabled:                       true,
+		NodeNames:                     []string{"gpu-0"},
+		MinIdleDuration:               metav1.Duration{Duration: 15 * time.Minute},
+		ValidFor:                      metav1.Duration{Duration: time.Hour},
+		ExpiresAt:                     metav1.NewTime(now.Add(time.Hour)),
+		FailureBackoff:                metav1.Duration{Duration: time.Minute},
+		MaxConsecutiveFailures:        3,
+		MaxConcurrent:                 1,
+		FailureDomainLabel:            "topology.kubernetes.io/zone",
+		MaxConcurrentPerFailureDomain: 1,
+	}
+	active := testRun("active")
+	active.Spec.Profile.Name = profile.Name
+	active.Spec.Participants = []signalv1.Participant{{NodeName: "missing-node", NodeUID: "missing-uid"}}
+	active.Status.Phase = signalv1.RunPhaseRunning
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationProfile{}).
+		WithObjects(profile, active).
+		Build()
+	r := &RecurringReconciler{
+		Client:    base,
+		Reader:    base,
+		Namespace: "signal",
+		Admission: &AdmissionReconciler{Client: base},
+		Now:       func() time.Time { return now },
+	}
+
+	if _, err := r.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: profile.Name}},
+	); err == nil || !strings.Contains(err.Error(), "failure-domain accounting") {
+		t.Fatalf("Reconcile error = %v, want fail-closed accounting", err)
+	}
+}
 
 func TestRecurringDueUsesContinuousIdleAndFreshness(t *testing.T) {
 	t.Parallel()

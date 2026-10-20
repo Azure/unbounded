@@ -34,6 +34,10 @@ type RecurringReconciler struct {
 }
 
 func (r *RecurringReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Reader == nil {
+		r.Reader = mgr.GetAPIReader()
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&signalv1.CertificationProfile{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
@@ -84,8 +88,15 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, r.projectStatuses(ctx, &profile)
 	}
 
+	if r.Admission == nil {
+		return ctrl.Result{}, fmt.Errorf("admission reconciler is required")
+	}
+
+	r.Admission.admissionMu.Lock()
+	defer r.Admission.admissionMu.Unlock()
+
 	var runs signalv1.CertificationRunList
-	if err := r.List(ctx, &runs, client.InNamespace(r.Namespace)); err != nil {
+	if err := r.Reader.List(ctx, &runs, client.InNamespace(r.Namespace)); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list CertificationRuns: %w", err)
 	}
 
@@ -100,7 +111,11 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			for _, participant := range run.Spec.Participants {
 				var node corev1.Node
 				if err := r.Reader.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
-					continue
+					return ctrl.Result{}, fmt.Errorf(
+						"get active participant %s for failure-domain accounting: %w",
+						participant.NodeName,
+						err,
+					)
 				}
 
 				activeByDomain[node.Labels[policy.FailureDomainLabel]]++
@@ -127,9 +142,15 @@ func (r *RecurringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			activeByProfile++
 
 			var node corev1.Node
-			if getErr := r.Reader.Get(ctx, client.ObjectKey{Name: nodeName}, &node); getErr == nil {
-				activeByDomain[node.Labels[policy.FailureDomainLabel]]++
+			if getErr := r.Reader.Get(ctx, client.ObjectKey{Name: nodeName}, &node); getErr != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"get admitted participant %s for failure-domain accounting: %w",
+					nodeName,
+					getErr,
+				)
 			}
+
+			activeByDomain[node.Labels[policy.FailureDomainLabel]]++
 		}
 	}
 
@@ -264,7 +285,7 @@ func (r *RecurringReconciler) evaluateNode(
 		return status, false, nil
 	}
 
-	if err := r.Admission.admitNodeWithTrigger(ctx, &node, profile.Name, "recurring"); err != nil {
+	if err := r.Admission.admitNodeWithTriggerLocked(ctx, &node, profile.Name, "recurring"); err != nil {
 		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
 			status.Reason = "AdmissionRaced"
 

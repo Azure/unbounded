@@ -3,6 +3,7 @@
 
 import json
 import sqlite3
+from contextlib import contextmanager
 
 
 class StateError(ValueError):
@@ -37,6 +38,10 @@ class SQLiteState:
                 latest_index INTEGER NOT NULL,
                 tree_head TEXT NOT NULL,
                 observed_at_epoch INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS receipt_authorizations (
+                authorization_id TEXT PRIMARY KEY,
+                receipt_json TEXT NOT NULL
             );
             """
         )
@@ -141,3 +146,39 @@ class SQLiteState:
             "latestTreeHead": row[1],
             "observedAtEpoch": row[2],
         }
+
+    @contextmanager
+    def receipt_transaction(self):
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            yield
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def record_receipt_authorization(self, authorization_id, receipt):
+        encoded = json.dumps(
+            receipt, sort_keys=True, separators=(",", ":")
+        )
+        row = self.connection.execute(
+            """
+            SELECT receipt_json FROM receipt_authorizations
+            WHERE authorization_id = ?
+            """,
+            (authorization_id,),
+        ).fetchone()
+        if row is not None:
+            if row[0] != encoded:
+                raise StateError(
+                    "receipt authorization already exists with different content"
+                )
+            return
+        self.connection.execute(
+            """
+            INSERT INTO receipt_authorizations(
+                authorization_id, receipt_json
+            ) VALUES (?, ?)
+            """,
+            (authorization_id, encoded),
+        )
