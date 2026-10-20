@@ -101,7 +101,8 @@ pub struct PagerStats {
 }
 
 struct Frame {
-    addr: NodeAddr,
+    // Position in `State::ring`.
+    slot: usize,
     page: Rc<TreePage>,
     credit: u8,
     // Faulted by a scan and not used since: evicted before any CLOCK victim.
@@ -205,8 +206,10 @@ impl Follower {
 }
 
 struct State {
-    map: AddrMap<usize>,
-    frames: Vec<Option<Frame>>,
+    // Frames live in the map so a hit costs one probe.
+    map: AddrMap<Frame>,
+    // CLOCK order of the cached addresses; `None` marks a free position.
+    ring: Vec<Option<NodeAddr>>,
     free: Vec<usize>,
     hand: usize,
     bytes: usize,
@@ -228,7 +231,7 @@ impl Pager {
         Rc::new(Self {
             state: RefCell::new(State {
                 map: AddrMap::default(),
-                frames: Vec::new(),
+                ring: Vec::new(),
                 free: Vec::new(),
                 hand: 0,
                 bytes: 0,
@@ -262,17 +265,17 @@ impl Pager {
     /// `priority`; scans give none.
     pub fn get(&self, addr: NodeAddr, priority: Priority) -> Option<Rc<TreePage>> {
         let mut state = self.state.borrow_mut();
-        let Some(&index) = state.map.get(&addr) else {
+        let Some(frame) = state.map.get_mut(&addr) else {
             state.stats.misses += 1;
             return None;
         };
-        state.stats.hits += 1;
-        let frame = state.frames[index].as_mut().expect("mapped frame");
         frame.credit = frame.credit.max(priority.credit());
         if priority != Priority::Scan {
             frame.probation = false;
         }
-        Some(Rc::clone(&frame.page))
+        let page = Rc::clone(&frame.page);
+        state.stats.hits += 1;
+        Some(page)
     }
 
     /// Whether `addr` is cached, without counting a hit or miss.
@@ -283,8 +286,7 @@ impl Pager {
     /// Start a fault for `addr`. See the module docs.
     pub fn begin_fault(self: &Rc<Self>, addr: NodeAddr) -> FaultRole {
         let mut state = self.state.borrow_mut();
-        if let Some(&index) = state.map.get(&addr) {
-            let frame = state.frames[index].as_ref().expect("mapped frame");
+        if let Some(frame) = state.map.get(&addr) {
             return FaultRole::Hit(Rc::clone(&frame.page));
         }
         if let Some(fault) = state.inflight.get(&addr) {
@@ -304,8 +306,7 @@ impl Pager {
     /// Cache a page written by a commit (or read by a fault).
     pub fn insert(&self, addr: NodeAddr, page: Rc<TreePage>, priority: Priority) {
         let mut state = self.state.borrow_mut();
-        if let Some(&index) = state.map.get(&addr) {
-            let frame = state.frames[index].as_mut().expect("mapped frame");
+        if let Some(frame) = state.map.get_mut(&addr) {
             frame.page = page;
             frame.credit = priority.credit();
             frame.probation = priority == Priority::Scan;
@@ -315,35 +316,38 @@ impl Pager {
             return;
         }
         state.shrink(FRAME_BYTES);
-        let frame = Frame {
-            addr,
-            page,
-            credit: priority.credit(),
-            probation: priority == Priority::Scan,
-        };
-        if frame.probation {
+        let probation = priority == Priority::Scan;
+        if probation {
             state.probation.push_back(addr);
         }
-        let index = match state.free.pop() {
-            Some(index) => {
-                state.frames[index] = Some(frame);
-                index
+        let slot = match state.free.pop() {
+            Some(slot) => {
+                state.ring[slot] = Some(addr);
+                slot
             }
             None => {
-                state.frames.push(Some(frame));
-                state.frames.len() - 1
+                state.ring.push(Some(addr));
+                state.ring.len() - 1
             }
         };
-        state.map.insert(addr, index);
+        state.map.insert(
+            addr,
+            Frame {
+                slot,
+                page,
+                credit: priority.credit(),
+                probation,
+            },
+        );
         state.bytes += FRAME_BYTES;
     }
 
     /// Drop `addr` from the cache, for example when its unit is reused.
     pub fn invalidate(&self, addr: NodeAddr) {
         let mut state = self.state.borrow_mut();
-        if let Some(index) = state.map.remove(&addr) {
-            state.frames[index] = None;
-            state.free.push(index);
+        if let Some(frame) = state.map.remove(&addr) {
+            state.ring[frame.slot] = None;
+            state.free.push(frame.slot);
             state.bytes -= FRAME_BYTES;
         }
     }
@@ -360,10 +364,9 @@ impl State {
             let Some(addr) = self.probation.pop_front() else {
                 break;
             };
-            let Some(&index) = self.map.get(&addr) else {
+            let Some(frame) = self.map.get(&addr) else {
                 continue;
             };
-            let frame = self.frames[index].as_ref().expect("mapped frame");
             if !frame.probation {
                 continue;
             }
@@ -371,19 +374,20 @@ impl State {
                 self.probation.push_back(addr);
                 continue;
             }
-            self.evict(index);
+            self.evict(addr);
         }
-        let mut steps = 2 * self.frames.len() + 1;
+        let mut steps = 2 * self.ring.len() + 1;
         while self.bytes + extra > self.budget && steps > 0 && !self.map.is_empty() {
             steps -= 1;
-            if self.hand >= self.frames.len() {
+            if self.hand >= self.ring.len() {
                 self.hand = 0;
             }
             let index = self.hand;
             self.hand += 1;
-            let Some(frame) = self.frames[index].as_mut() else {
+            let Some(addr) = self.ring[index] else {
                 continue;
             };
+            let frame = self.map.get_mut(&addr).expect("ring address is mapped");
             if Rc::strong_count(&frame.page) > 1 {
                 continue;
             }
@@ -391,22 +395,19 @@ impl State {
                 frame.credit -= 1;
                 continue;
             }
-            self.evict(index);
+            self.evict(addr);
         }
         if self.probation.len() > 2 * self.map.len() + 16 {
-            let frames = &self.frames;
             let map = &self.map;
-            self.probation.retain(|addr| {
-                map.get(addr)
-                    .is_some_and(|&i| frames[i].as_ref().is_some_and(|f| f.probation))
-            });
+            self.probation
+                .retain(|addr| map.get(addr).is_some_and(|f| f.probation));
         }
     }
 
-    fn evict(&mut self, index: usize) {
-        let frame = self.frames[index].take().expect("mapped frame");
-        self.free.push(index);
-        self.map.remove(&frame.addr);
+    fn evict(&mut self, addr: NodeAddr) {
+        let frame = self.map.remove(&addr).expect("mapped frame");
+        self.ring[frame.slot] = None;
+        self.free.push(frame.slot);
         self.bytes -= FRAME_BYTES;
         self.stats.evictions += 1;
     }
