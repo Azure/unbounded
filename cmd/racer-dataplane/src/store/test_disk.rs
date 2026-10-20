@@ -205,7 +205,7 @@ impl TestDisk {
     /// Run queued index maintenance, then commit the volume index.
     pub(crate) fn commit(&self, index: &Index) {
         let scope = scope();
-        while index.maintenance_due() {
+        while index.maintenance_queued() {
             self.drive(index.maintain(&scope, false)).unwrap();
         }
         self.drive(index.commit(&self.reactor, &scope)).unwrap();

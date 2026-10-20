@@ -472,6 +472,7 @@ impl Index {
         if volume.needs_commit() {
             volume.commit(&*reactor, scope).await?;
         }
+        self.reserve_stuck.set(false);
         let (result, evicted) = volume
             .allocate_evicting(&*reactor, tier, length, now_unix(), EVICTION_BUDGET, scope)
             .await?;
@@ -670,9 +671,20 @@ impl Index {
         }
     }
 
-    /// Whether queued maintenance waits for [`Index::maintain`].
-    pub fn maintenance_due(&self) -> bool {
+    /// Whether work is queued for [`Index::maintain`] (not counting the
+    /// free-slot reserve).
+    #[cfg(test)]
+    pub(crate) fn maintenance_queued(&self) -> bool {
         self.is_mounted() && !self.maintenance.borrow().is_empty()
+    }
+
+    /// Whether queued maintenance waits for [`Index::maintain`], or the
+    /// free-slot reserve is low and eviction may refill it.
+    pub fn maintenance_due(&self) -> bool {
+        self.volume().is_some_and(|volume| {
+            !self.maintenance.borrow().is_empty()
+                || (volume.free_slots() < FREE_SLOT_RESERVE && !self.reserve_stuck.get())
+        })
     }
 
     /// Run queued maintenance, bounded per call: invalidations, one batch of
@@ -745,6 +757,8 @@ impl Index {
                     scope,
                 )
                 .await?;
+            self.reserve_stuck
+                .set(volume.free_slots() < FREE_SLOT_RESERVE && evicted.is_empty());
             self.forget_pages(&evicted, true);
         }
         Ok(())
@@ -1212,7 +1226,7 @@ impl Index {
     /// Run maintenance until nothing is queued, for tests.
     pub(crate) fn maintain_now(&self) {
         let scope = maintenance_scope().unwrap();
-        while self.maintenance_due() {
+        while self.maintenance_queued() {
             self.block(self.maintain(&scope, false)).unwrap();
         }
     }
