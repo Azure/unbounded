@@ -211,13 +211,14 @@ impl<C> Owner<C> {
 
         while handled < budget {
             let mut progressed = false;
+            let start = self.next;
 
             for step in 0..count {
                 if handled >= budget {
                     break;
                 }
 
-                let index = (self.next + step) % count;
+                let index = (start + step) % count;
                 let channel = &self.channels[index];
                 let command = lock(&channel.queue).commands.pop_front();
 
@@ -226,11 +227,11 @@ impl<C> Owner<C> {
                     handle(index, command);
                     handled += 1;
                     progressed = true;
+                    // Resume after the last serviced worker, even if its
+                    // queue still has commands, so the budget rotates fairly
+                    // across more workers than fit in one drain.
+                    self.next = (index + 1) % count;
                 }
-            }
-
-            if count > 0 {
-                self.next = (self.next + 1) % count;
             }
 
             if !progressed {
@@ -426,6 +427,31 @@ mod tests {
 
         let _ = owner.poll_drain(&mut cx, budget, |index, command| out.push((index, command)));
         out
+    }
+
+    #[test]
+    fn drain_resumes_after_last_serviced_worker() {
+        let workers_count = 128;
+        let budget = 48;
+        let (workers, mut owner) = channels::<u32>(workers_count, 4).unwrap();
+
+        for worker in &workers {
+            assert!(worker.try_send(0).is_ok());
+            assert!(worker.try_send(1).is_ok());
+        }
+
+        let mut seen = vec![false; workers_count];
+
+        for _ in 0..workers_count.div_ceil(budget) {
+            let out = drain_all(&mut owner, budget);
+            assert_eq!(out.len(), budget);
+
+            for (index, _) in out {
+                seen[index] = true;
+            }
+        }
+
+        assert!(seen.iter().all(|&serviced| serviced));
     }
 
     #[test]
