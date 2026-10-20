@@ -55,6 +55,9 @@ spec:
           - name: reason
             valueFrom:
               parameter: "{{`{{tasks.node-health.outputs.parameters.reason}}`}}"
+          - name: recovery-receipt-configmap
+            valueFrom:
+              parameter: "{{`{{tasks.node-health.outputs.parameters.recovery-receipt-configmap}}`}}"
 
     - name: node-health
       nodeSelector:
@@ -64,7 +67,11 @@ spec:
       container:
         image: "{{`{{workflow.parameters.runner-image}}`}}"
         imagePullPolicy: IfNotPresent
-        command: ["/bin/bash", "/scripts/{{`{{workflow.parameters.script-key}}`}}"]
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            : > /results/recovery-receipt-configmap
+            exec /bin/bash "/scripts/{{`{{workflow.parameters.script-key}}`}}"
         env:
           - name: EXPECTED_GPU_PRODUCT_REGEX
             value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
@@ -90,6 +97,9 @@ spec:
           - name: reason
             valueFrom:
               path: /results/reason
+          - name: recovery-receipt-configmap
+            valueFrom:
+              path: /results/recovery-receipt-configmap
 
     - name: mpi-backend
       resource:

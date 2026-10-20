@@ -65,6 +65,7 @@ type RunReconciler struct {
 	client.Client
 	Namespace          string
 	Evidence           EvidenceStore
+	RecoveryGate       RecoveryGate
 	Now                func() time.Time
 	MaxConcurrentRuns  int
 	WorkflowAPIVersion string
@@ -505,7 +506,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			reason = "workflow completed without a verdict"
 		}
 
-		return r.finish(ctx, &run, "Completed", verdict, reason)
+		return r.finish(ctx, &run, workflow, "Completed", verdict, reason)
 	case "Failed", "Error":
 		return r.retryOrFinish(ctx, &run, phase, "Workflow"+phase, workflowMessage(workflow))
 	default:
@@ -645,16 +646,27 @@ func (r *RunReconciler) retryOrFinish(
 		return r.startAttempt(ctx, run, run.Status.Workflow.Attempt+1)
 	}
 
-	return r.finish(ctx, run, executionState, "Inconclusive", reason+": "+message)
+	return r.finish(ctx, run, nil, executionState, "Inconclusive", reason+": "+message)
 }
 
 func (r *RunReconciler) finish(
 	ctx context.Context,
 	run *signalv1.CertificationRun,
+	workflow *unstructured.Unstructured,
 	executionState string,
 	verdict string,
 	reason string,
 ) (ctrl.Result, error) {
+	if verdict == "Pass" && run.Spec.Parameters[requireRecoveryParameter] == "true" {
+		if r.RecoveryGate == nil {
+			verdict = "Inconclusive"
+			reason = "recovery gate is required but not configured"
+		} else if err := r.RecoveryGate.Verify(ctx, run, workflow); err != nil {
+			verdict = "Inconclusive"
+			reason = "recovery gate rejected evidence: " + err.Error()
+		}
+	}
+
 	evidenceRun := run.DeepCopy()
 	if executionState == "Completed" {
 		evidenceRun.Status.Workflow.Phase = "Succeeded"

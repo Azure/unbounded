@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"os"
@@ -30,12 +31,13 @@ import (
 const controllerName = "project-signal-controller"
 
 type config struct {
-	namespace         string
-	scriptNamespace   string
-	metricsAddress    string
-	probeAddress      string
-	leaderElect       bool
-	maxConcurrentRuns int
+	namespace                     string
+	scriptNamespace               string
+	metricsAddress                string
+	probeAddress                  string
+	leaderElect                   bool
+	maxConcurrentRuns             int
+	recoveryVerifierPublicKeyFile string
 }
 
 func main() {
@@ -59,6 +61,7 @@ func main() {
 	cmd.Flags().StringVar(&cfg.probeAddress, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElect, "leader-elect", true, "Enable leader election")
 	cmd.Flags().IntVar(&cfg.maxConcurrentRuns, "max-concurrent-runs", 4, "Maximum concurrent CertificationRun reconciles")
+	cmd.Flags().StringVar(&cfg.recoveryVerifierPublicKeyFile, "recovery-verifier-public-key-file", "", "Read-only file containing the base64 Ed25519 recovery verifier public key")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 
 	if err := cmd.Execute(); err != nil {
@@ -113,6 +116,21 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("argo Workflows is required but Workflow.argoproj.io/v1alpha1 is unavailable: %w", err)
 	}
 
+	var recoveryGate projectsignal.RecoveryGate
+	if cfg.recoveryVerifierPublicKeyFile != "" {
+		var publicKey ed25519.PublicKey
+
+		publicKey, err = projectsignal.LoadRecoveryVerifierPublicKey(cfg.recoveryVerifierPublicKeyFile)
+		if err != nil {
+			return err
+		}
+
+		recoveryGate, err = projectsignal.NewKubernetesRecoveryGate(mgr.GetAPIReader(), publicKey)
+		if err != nil {
+			return err
+		}
+	}
+
 	admission := &projectsignal.AdmissionReconciler{
 		Client:          mgr.GetClient(),
 		Namespace:       cfg.namespace,
@@ -127,6 +145,7 @@ func run(ctx context.Context, cfg config) error {
 		Client:            mgr.GetClient(),
 		Namespace:         cfg.namespace,
 		Evidence:          evidence,
+		RecoveryGate:      recoveryGate,
 		MaxConcurrentRuns: cfg.maxConcurrentRuns,
 		Recorder:          mgr.GetEventRecorder(controllerName),
 	}

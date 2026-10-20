@@ -99,6 +99,8 @@ PROJECT_SIGNAL_DASHBOARD_BIN=bin/project-signal-dashboard
 PROJECT_SIGNAL_DASHBOARD_CMD=./cmd/project-signal-dashboard
 SIGNAL_DASHBOARD_IMAGE ?= example.invalid/project-signal-dashboard:replace-me
 SIGNAL_NAMESPACE ?= project-signal
+SIGNAL_RECOVERY_IMAGE ?= example.invalid/project-signal-recovery:replace-me
+SIGNAL_RECOVERY_VERIFIER_SECRET ?=
 SIGNAL_RUNNER_IMAGE ?= example.invalid/gpu-runner:replace-me
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
@@ -241,7 +243,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-dashboard project-signal-dashboard-build signal-manifests image-project-signal-controller-local image-project-signal-dashboard-local image-project-signal-runner-local project-signal-runner-oci-push metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-dashboard project-signal-dashboard-build project-signal-recovery-test signal-manifests image-project-signal-controller-local image-project-signal-dashboard-local image-project-signal-recovery-local image-project-signal-runner-local project-signal-runner-oci-push metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -323,6 +325,7 @@ help: ## Show this help
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-project-signal-controller-local Build Project Signal controller image"
 	@echo "  image-project-signal-dashboard-local Build Project Signal dashboard image"
+	@echo "  image-project-signal-recovery-local Build Project Signal recovery verifier image"
 	@echo "  image-project-signal-runner-local Build Project Signal GPU runner image"
 	@echo "  project-signal-runner-oci-push  Build and push Project Signal GPU runner image"
 	@echo "  image-metalman-local             Build metalman image"
@@ -559,16 +562,22 @@ lint-actions: ## Run actionlint over .github/workflows
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests token-refresher-manifests machine-ops-manifests signal-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+test: machina-manifests token-refresher-manifests machine-ops-manifests signal-manifests project-signal-recovery-test playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests token-refresher-manifests machine-ops-manifests signal-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+test: lint machina-manifests token-refresher-manifests machine-ops-manifests signal-manifests project-signal-recovery-test playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
+
+project-signal-recovery-test: ## Run canonical rev24 and rev25 recovery regressions
+	PYTHONPATH=cmd/project-signal-recovery/reference/rev24 \
+		python3 -m unittest discover -s cmd/project-signal-recovery/reference/rev24/tests -v
+	PYTHONPATH=cmd/project-signal-recovery/reference/rev24:cmd/project-signal-recovery \
+		python3 -m unittest discover -s cmd/project-signal-recovery/tests -v
 
 e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
@@ -1118,6 +1127,15 @@ image-project-signal-dashboard-local: ## Build Project Signal dashboard image lo
 		-f ./images/project-signal-dashboard/Containerfile .
 	$(call trivy-maybe,$(SIGNAL_DASHBOARD_IMAGE))
 
+image-project-signal-recovery-local: ## Build Project Signal recovery verifier image locally
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t project-signal-recovery:$(VERSION_TAG) -t $(SIGNAL_RECOVERY_IMAGE) \
+		-f ./images/project-signal-recovery/Containerfile .
+	$(call trivy-maybe,$(SIGNAL_RECOVERY_IMAGE))
+
 image-project-signal-runner-local: ## Build Project Signal GPU runner image locally
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
@@ -1211,6 +1229,7 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set Namespace=$(SIGNAL_NAMESPACE) \
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set DashboardImage=$(SIGNAL_DASHBOARD_IMAGE) \
+		--set RecoveryVerifierSecret=$(SIGNAL_RECOVERY_VERIFIER_SECRET) \
 		--set RunnerImage=$(SIGNAL_RUNNER_IMAGE)
 	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
 	@cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/

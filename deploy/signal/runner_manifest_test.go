@@ -54,3 +54,15 @@ func TestWorkflowConfiguresEphemeralMPIHostTrust(t *testing.T) {
 	assert.NotContains(t, manifest, "StrictHostKeyChecking=no")
 	assert.NotContains(t, manifest, "StrictModes=no")
 }
+
+func TestWorkflowPublishesRecoveryReceiptGate(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("04-workflowtemplate.yaml.tmpl")
+	require.NoError(t, err)
+
+	manifest := string(content)
+	assert.Contains(t, manifest, `: > /results/recovery-receipt-configmap`)
+	assert.Contains(t, manifest, `path: /results/recovery-receipt-configmap`)
+	assert.Contains(t, manifest, "tasks.node-health.outputs.parameters.recovery-receipt-configmap")
+}

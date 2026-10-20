@@ -57,6 +57,36 @@ Controller code never contains certification script bodies.
   it against the target cluster's driver and security policy before use.
 - Exact, verified Node selector values and an explicitly approved Node list.
 
+Recovery-gated Dapple certification additionally requires:
+
+- the Project Signal recovery verifier image built from
+  `images/project-signal-recovery/Containerfile`;
+- an immutable trusted resolver file containing the canonical authority public
+  key, ledger revision, and ledger SHA-256;
+- a dedicated durable SQLite volume with WAL, full synchronous writes,
+  retention lock, verified backup, and single-writer fencing;
+- a separately privileged observer identity that alone may run `observe`;
+- a verifier identity that opens current-latest state read-only and signs
+  short-lived recovery receipts;
+- a controller Secret containing only the verifier public key, rendered with
+  `SIGNAL_RECOVERY_VERIFIER_SECRET=<secret-name>`;
+- exactly one admitted evidence service and three distinct witnesses with an
+  exact two-of-three threshold.
+
+Profiles that set `parameters.require-recovery-gate: "true"` cannot project a
+`Pass` result unless the Workflow publishes an immutable ConfigMap name in the
+`recovery-receipt-configmap` output parameter. The ConfigMap must contain
+`receipt.json` and the exact `bundle.json`; the receipt must be short-lived,
+bound to the Run UID and Workflow UID, report terminal validated success, hash
+the bundle exactly, and verify under the controller's configured verifier key.
+Missing, malformed, stale, forged, or unbound evidence becomes
+`Inconclusive`, never `Pass`.
+
+The GB200 sample enables this gate deliberately. Its generic identity script
+does not create a receipt, so the sample cannot certify a Node as production
+eligible until a reviewed Dapple workflow adds the verifier step and publishes
+the immutable receipt ConfigMap.
+
 Project Signal does not install Argo Workflows or MPI Operator. Install and
 scope those dependencies according to the target cluster's security model.
 The example API and controller currently reject participant counts greater than

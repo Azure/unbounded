@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM docker.io/library/python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c
+
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+
+LABEL org.opencontainers.image.title="Project Signal recovery verifier" \
+      org.opencontainers.image.description="Durable recovery and Dapple certification evidence gate" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_TIME}" \
+      org.opencontainers.image.source="https://github.com/Azure/unbounded"
+
+RUN pip install --no-cache-dir cryptography==46.0.2
+
+COPY cmd/project-signal-recovery /opt/project-signal-recovery
+
+WORKDIR /opt/project-signal-recovery
+
+ENTRYPOINT ["python3", "/opt/project-signal-recovery/verify.py"]

@@ -507,6 +507,47 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 	}
 }
 
+func TestRecoveryGatedPassFailsClosedWithoutVerifier(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-gated")
+	run.Spec.Parameters = map[string]string{requireRecoveryParameter: "true"}
+	run.Status = signalv1.CertificationRunStatus{
+		Phase:    signalv1.RunPhaseRunning,
+		Workflow: signalv1.WorkflowStatus{Name: "run-gated-a1", Attempt: 1},
+	}
+	node := readyNode("gpu-0", "A100")
+	node.Annotations = map[string]string{ReservationLabel: run.Name}
+	snapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+	}
+	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Succeeded", "Pass", "Healthy")
+	store := &memoryEvidenceStore{}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, node, snapshot, workflow).
+		Build()
+	r := &RunReconciler{Client: kube, Evidence: store, Now: func() time.Time { return time.Unix(200, 0) }}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("terminal Reconcile: %v", err)
+	}
+
+	var got signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &got); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+
+	if got.Status.Phase != signalv1.RunPhaseInconclusive ||
+		got.Status.Verdict != "Inconclusive" ||
+		!strings.Contains(got.Status.Reason, "recovery gate is required") {
+		t.Fatalf("status = %#v", got.Status)
+	}
+}
+
 func TestWorkflowFailureRetriesWithoutSwitchingPinnedInputs(t *testing.T) {
 	t.Parallel()
 

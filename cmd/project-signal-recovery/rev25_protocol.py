@@ -32,6 +32,25 @@ class Rev25Error(rev24.Rev24Error):
     pass
 
 
+def strict_loads(data):
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise Rev25Error(f"duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise Rev25Error(f"non-finite JSON number {value}")
+
+    return json.loads(
+        data,
+        object_pairs_hook=object_pairs,
+        parse_constant=reject_constant,
+    )
+
+
 class TrustedResolver:
     def __init__(self, root_public_key, ledger_revision, ledger_sha256):
         if type(root_public_key) is not bytes or len(root_public_key) != 32:
@@ -47,7 +66,7 @@ class TrustedResolver:
 
     @classmethod
     def from_file(cls, path):
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        value = strict_loads(Path(path).read_text(encoding="utf-8"))
         if set(value) != {
             "rootPublicKeyBase64",
             "ledgerRevision",
@@ -259,6 +278,7 @@ class Verifier:
             revision,
             digest,
         )
+        self._validate_freshness_shape(freshness, binding)
         self._validate_freshness_time(freshness, now_epoch, None)
         self._state.observe_latest(
             _stream_id(binding),
@@ -266,6 +286,37 @@ class Verifier:
             freshness["latestTreeHead"],
             freshness["observedAtEpoch"],
         )
+
+    def _validate_freshness_shape(self, freshness, binding):
+        required = {
+            "schema",
+            "ledgerRevision",
+            "ledgerSHA256",
+            "authorityRevision",
+            "authoritySHA256",
+            "runID",
+            "transferID",
+            "contractSHA256",
+            "generation",
+            "challengeNonce",
+            "latestIndex",
+            "latestTreeHead",
+            "observedAtEpoch",
+            "admissionSHA256",
+            "deploymentAcceptanceSHA256",
+        }
+        if (
+            set(freshness) != required
+            or any(freshness[name] != value for name, value in binding.items())
+        ):
+            raise Rev25Error("freshness binding mismatch")
+        for name in (
+            "challengeNonce",
+            "latestTreeHead",
+            "admissionSHA256",
+            "deploymentAcceptanceSHA256",
+        ):
+            rev24._hex(freshness[name], name)
 
     def _validate_freshness_time(self, freshness, now_epoch, challenge):
         observed = freshness.get("observedAtEpoch")
@@ -325,6 +376,7 @@ class Verifier:
             revision,
             digest,
         )
+        self._validate_freshness_shape(freshness, binding)
         self._validate_freshness_time(freshness, now_epoch, challenge)
         current = self._state.latest(_stream_id(binding))
         if any(

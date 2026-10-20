@@ -162,6 +162,25 @@ class Rev25ProtocolTests(unittest.TestCase):
         with self.assertRaises(rev25.Rev25Error):
             fixture.observe(bundle)
 
+    def test_duplicate_json_keys_and_non_finite_numbers_rejected(self):
+        for encoded in (
+            '{"binding":{},"binding":{}}',
+            '{"value":NaN}',
+            '{"value":Infinity}',
+        ):
+            with self.assertRaises(rev25.Rev25Error):
+                rev25.strict_loads(encoded)
+
+    def test_observer_cannot_cross_bind_signed_freshness(self):
+        fixture = Rev25Fixture()
+        bundle = fixture.bundle()
+        other = copy.deepcopy(bundle["binding"])
+        other["runID"] = "other-run"
+        with self.assertRaises(rev25.Rev25Error):
+            fixture.verifier.observe_latest(
+                other, bundle["freshness"], NOW
+            )
+
     def test_malformed_validated_success_rejected(self):
         mutations = (
             ("classificationSHA256", "bad"),
