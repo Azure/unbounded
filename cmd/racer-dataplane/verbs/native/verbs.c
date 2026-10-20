@@ -9,6 +9,7 @@
  * Unless noted, int results are 0 on success and pointer results are NULL
  * on failure. A failed free leaves the resource in place. */
 #include <infiniband/verbs.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -33,23 +34,40 @@ struct rdma_verbs_endpoint {
     uint16_t lid;
     uint8_t port, link_layer;
 };
-/* One completion. Mirrors `Completion` in ffi.rs. */
-struct rdma_verbs_wc { uint64_t id; uint32_t status, opcode; };
+/* One completion. Mirrors `Completion` in ffi.rs. Unless status is
+ * IBV_WC_SUCCESS, opcode is UINT32_MAX and byte_len, imm, and flags are 0.
+ * imm is in host byte order and valid only if flags & RDMA_VERBS_WC_IMM. */
+struct rdma_verbs_wc {
+    uint64_t id;
+    uint32_t status, opcode;
+    uint32_t byte_len, imm;
+    uint32_t flags, vendor_err;
+};
+#define RDMA_VERBS_WC_IMM 1u
+/* Region access sets for rdma_verbs_register. */
+enum {
+    RDMA_VERBS_MR_PAGES = 1,        /* LOCAL_WRITE | MW_BIND */
+    RDMA_VERBS_MR_CONTROL = 2,      /* LOCAL_WRITE */
+    RDMA_VERBS_MR_REMOTE_WRITE = 4, /* adds REMOTE_WRITE */
+};
 /* Catch layout drift from the Rust side at compile time. */
 _Static_assert(sizeof(struct rdma_verbs_port) == 88, "port ABI size");
 _Static_assert(offsetof(struct rdma_verbs_port, mtu) == 80, "port ABI offset");
 _Static_assert(sizeof(struct rdma_verbs_endpoint) == 32, "endpoint ABI size");
 _Static_assert(offsetof(struct rdma_verbs_endpoint, qpn) == 16, "endpoint ABI offset");
-_Static_assert(sizeof(struct rdma_verbs_wc) == 16, "completion ABI size");
-_Static_assert(IBV_WC_RDMA_WRITE == 1 && IBV_WC_BIND_MW == 5 && IBV_WC_LOCAL_INV == 6,
-               "completion opcode ABI");
+_Static_assert(sizeof(struct rdma_verbs_wc) == 32, "completion ABI size");
+_Static_assert(offsetof(struct rdma_verbs_wc, byte_len) == 16, "completion ABI offset");
+_Static_assert(offsetof(struct rdma_verbs_wc, flags) == 24, "completion ABI offset");
+_Static_assert(IBV_WC_SEND == 0 && IBV_WC_RDMA_WRITE == 1 && IBV_WC_BIND_MW == 5 &&
+               IBV_WC_LOCAL_INV == 6 && IBV_WC_RECV == 128 &&
+               IBV_WC_RECV_RDMA_WITH_IMM == 129, "completion opcode ABI");
 /* Private handles. Rust only holds pointers to these. */
 struct rdma_verbs_device { struct ibv_context *ctx; struct ibv_pd *pd; };
 struct rdma_verbs_qp { struct ibv_qp *qp; struct ibv_cq *cq; };
 struct rdma_verbs_mr { struct ibv_mr *mr; void *bytes; size_t length; };
 
 /* ABI version. Rust refuses to load any other value. */
-uint32_t rdma_verbs_abi(void) { return 1; }
+uint32_t rdma_verbs_abi(void) { return 2; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
@@ -133,17 +151,20 @@ int rdma_verbs_close(struct rdma_verbs_device *d) {
     return rc;
 }
 
-/* Create a reliable-connected QP with its own CQ, in the INIT state.
+/* Create a reliable-connected QP with its own CQ, in the INIT state. The CQ
+ * holds send_depth + recv_depth entries; both depths must be nonzero.
  * On failure, *qpn = UINT32_MAX means cleanup failed and something leaked;
  * Rust then leaks the device too. */
-void *rdma_verbs_qp(struct rdma_verbs_device *d, uint8_t port, uint32_t depth, uint32_t *qpn) {
+void *rdma_verbs_qp(struct rdma_verbs_device *d, uint8_t port, uint32_t send_depth,
+                    uint32_t recv_depth, uint32_t *qpn) {
+    if (!send_depth || !recv_depth || send_depth > INT_MAX - recv_depth) return NULL;
     struct rdma_verbs_qp *q = calloc(1, sizeof(*q));
     if (!q) return NULL;
-    q->cq = ibv_create_cq(d->ctx, depth, NULL, NULL, 0);
+    q->cq = ibv_create_cq(d->ctx, (int)(send_depth + recv_depth), NULL, NULL, 0);
     if (!q->cq) { free(q); return NULL; }
     struct ibv_qp_init_attr init = {0};
     init.send_cq = q->cq; init.recv_cq = q->cq; init.qp_type = IBV_QPT_RC;
-    init.cap.max_send_wr = depth; init.cap.max_recv_wr = 1;
+    init.cap.max_send_wr = send_depth; init.cap.max_recv_wr = recv_depth;
     init.cap.max_send_sge = 1; init.cap.max_recv_sge = 1;
     q->qp = ibv_create_qp(d->pd, &init);
     if (!q->qp) {
@@ -166,7 +187,9 @@ void *rdma_verbs_qp(struct rdma_verbs_device *d, uint8_t port, uint32_t depth, u
     *qpn = q->qp->qp_num;
     return q;
 }
-/* Move the QP to RTR then RTS, pointed at `remote`. Uses the smaller MTU. */
+/* Move the QP to RTR then RTS, pointed at `remote`. Uses the smaller MTU.
+ * rnr_retry is 0: a send or write with immediate that finds no posted
+ * receive fails with IBV_WC_RNR_RETRY_EXC_ERR instead of stalling. */
 int rdma_verbs_connect(struct rdma_verbs_qp *q, const struct rdma_verbs_endpoint *local,
                        const struct rdma_verbs_endpoint *remote) {
     struct ibv_qp_attr a = {0};
@@ -183,7 +206,7 @@ int rdma_verbs_connect(struct rdma_verbs_qp *q, const struct rdma_verbs_endpoint
     if (rc) return rc;
     memset(&a, 0, sizeof(a));
     a.qp_state = IBV_QPS_RTS; a.sq_psn = local->psn;
-    a.timeout = 14; a.retry_cnt = 3; a.rnr_retry = 3; a.max_rd_atomic = 0;
+    a.timeout = 14; a.retry_cnt = 3; a.rnr_retry = 0; a.max_rd_atomic = 0;
     return ibv_modify_qp(q->qp, &a, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
 }
@@ -207,15 +230,23 @@ int rdma_verbs_qp_free(struct rdma_verbs_qp *q) {
     if (!rc) free(q);
     return rc;
 }
-/* Allocate a zeroed, page-aligned buffer and register it for remote writes
- * and window binding. */
-void *rdma_verbs_register(struct rdma_verbs_device *d, uint32_t length) {
+/* Allocate a zeroed, page-aligned buffer and register it. `access` is exactly
+ * one of RDMA_VERBS_MR_PAGES or RDMA_VERBS_MR_CONTROL, optionally with
+ * RDMA_VERBS_MR_REMOTE_WRITE. */
+void *rdma_verbs_register(struct rdma_verbs_device *d, uint64_t length, uint32_t access) {
+    int flags = IBV_ACCESS_LOCAL_WRITE;
+    switch (access & ~(uint32_t)RDMA_VERBS_MR_REMOTE_WRITE) {
+    case RDMA_VERBS_MR_PAGES: flags |= IBV_ACCESS_MW_BIND; break;
+    case RDMA_VERBS_MR_CONTROL: break;
+    default: return NULL;
+    }
+    if (access & RDMA_VERBS_MR_REMOTE_WRITE) flags |= IBV_ACCESS_REMOTE_WRITE;
+    if (!length || length > SIZE_MAX) return NULL;
     struct rdma_verbs_mr *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
-    if (posix_memalign(&m->bytes, 4096, length)) { free(m); return NULL; }
-    memset(m->bytes, 0, length); m->length = length;
-    m->mr = ibv_reg_mr(d->pd, m->bytes, length,
-                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_MW_BIND);
+    if (posix_memalign(&m->bytes, 4096, (size_t)length)) { free(m); return NULL; }
+    memset(m->bytes, 0, (size_t)length); m->length = (size_t)length;
+    m->mr = ibv_reg_mr(d->pd, m->bytes, (size_t)length, flags);
     if (!m->mr) { free(m->bytes); free(m); return NULL; }
     return m;
 }
@@ -235,15 +266,19 @@ void *rdma_verbs_window(struct rdma_verbs_device *d, uint32_t *key) {
 }
 /* Free a memory window. */
 int rdma_verbs_window_free(struct ibv_mw *mw) { return ibv_dealloc_mw(mw); }
-/* Post a bind: let the peer write the first `length` bytes of `m` via `key`. */
+/* True if [offset, offset + length) is a nonempty range inside `m`. */
+static int in_region(const struct rdma_verbs_mr *m, uint64_t offset, uint32_t length) {
+    return length && offset <= m->length && length <= m->length - offset;
+}
+/* Post a bind: let the peer write `length` bytes of `m` at `offset` via `key`. */
 int rdma_verbs_bind(struct rdma_verbs_qp *q, struct ibv_mw *mw, struct rdma_verbs_mr *m,
-                    uint32_t key, uint64_t id, uint32_t length) {
-    if (!length || length > m->length) return EINVAL;
+                    uint32_t key, uint64_t id, uint64_t offset, uint32_t length) {
+    if (!in_region(m, offset, length)) return EINVAL;
     struct ibv_send_wr wr = {0}, *bad = NULL;
     wr.wr_id = id; wr.opcode = IBV_WR_BIND_MW; wr.send_flags = IBV_SEND_SIGNALED;
     wr.bind_mw.mw = mw; wr.bind_mw.rkey = key;
     wr.bind_mw.bind_info.mr = m->mr;
-    wr.bind_mw.bind_info.addr = (uintptr_t)m->bytes;
+    wr.bind_mw.bind_info.addr = (uintptr_t)m->bytes + offset;
     wr.bind_mw.bind_info.length = length;
     wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_WRITE;
     return ibv_post_send(q->qp, &wr, &bad);
@@ -267,6 +302,44 @@ int rdma_verbs_write(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t 
     wr.wr.rdma.remote_addr = address; wr.wr.rdma.rkey = key;
     return ibv_post_send(q->qp, &wr, &bad);
 }
+/* Post a signaled RDMA write with immediate of `length` bytes of `m` at
+ * `offset` to the peer's `address`, using its window `key`. `imm` is in host
+ * byte order; the peer's completion reports the same value. Consumes one of
+ * the peer's posted receives. */
+int rdma_verbs_write_imm(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t offset,
+                         uint32_t length, uint64_t address, uint32_t key, uint32_t imm,
+                         uint64_t id) {
+    if (!in_region(m, offset, length)) return EINVAL;
+    struct ibv_sge sge = { .addr = (uintptr_t)m->bytes + offset, .length = length,
+                           .lkey = m->mr->lkey };
+    struct ibv_send_wr wr = {0}, *bad = NULL;
+    wr.wr_id = id; wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM; wr.imm_data = htonl(imm);
+    wr.send_flags = IBV_SEND_SIGNALED; wr.sg_list = &sge; wr.num_sge = 1;
+    wr.wr.rdma.remote_addr = address; wr.wr.rdma.rkey = key;
+    return ibv_post_send(q->qp, &wr, &bad);
+}
+/* Post a signaled send of `length` bytes of `m` at `offset`. Consumes one of
+ * the peer's posted receives. */
+int rdma_verbs_send(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t offset,
+                    uint32_t length, uint64_t id) {
+    if (!in_region(m, offset, length)) return EINVAL;
+    struct ibv_sge sge = { .addr = (uintptr_t)m->bytes + offset, .length = length,
+                           .lkey = m->mr->lkey };
+    struct ibv_send_wr wr = {0}, *bad = NULL;
+    wr.wr_id = id; wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED; wr.sg_list = &sge; wr.num_sge = 1;
+    return ibv_post_send(q->qp, &wr, &bad);
+}
+/* Post a receive into `length` bytes of `m` at `offset`. */
+int rdma_verbs_post_recv(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t offset,
+                         uint32_t length, uint64_t id) {
+    if (!in_region(m, offset, length)) return EINVAL;
+    struct ibv_sge sge = { .addr = (uintptr_t)m->bytes + offset, .length = length,
+                           .lkey = m->mr->lkey };
+    struct ibv_recv_wr wr = {0}, *bad = NULL;
+    wr.wr_id = id; wr.sg_list = &sge; wr.num_sge = 1;
+    return ibv_post_recv(q->qp, &wr, &bad);
+}
 /* Read up to 32 completions. Returns the count, or negative on error. */
 int rdma_verbs_poll(struct rdma_verbs_qp *q, struct rdma_verbs_wc *out, uint32_t capacity) {
     struct ibv_wc wc[32];
@@ -274,9 +347,17 @@ int rdma_verbs_poll(struct rdma_verbs_qp *q, struct rdma_verbs_wc *out, uint32_t
     int n = ibv_poll_cq(q->cq, capacity, wc);
     if (n < 0) return n;
     for (int i = 0; i < n; ++i) {
+        memset(&out[i], 0, sizeof(out[i]));
         out[i].id = wc[i].wr_id; out[i].status = wc[i].status;
-        /* Opcode is only valid on success. */
-        out[i].opcode = wc[i].status == IBV_WC_SUCCESS ? (uint32_t)wc[i].opcode : UINT32_MAX;
+        out[i].vendor_err = wc[i].vendor_err;
+        /* Opcode, length, and immediate are only valid on success. */
+        if (wc[i].status != IBV_WC_SUCCESS) { out[i].opcode = UINT32_MAX; continue; }
+        out[i].opcode = (uint32_t)wc[i].opcode;
+        out[i].byte_len = wc[i].byte_len;
+        if (wc[i].wc_flags & IBV_WC_WITH_IMM) {
+            out[i].imm = ntohl(wc[i].imm_data);
+            out[i].flags = RDMA_VERBS_WC_IMM;
+        }
     }
     return n;
 }

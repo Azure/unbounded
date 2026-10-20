@@ -383,6 +383,9 @@ pub(super) fn api() -> Rc<Api> {
         bind,
         invalidate,
         write,
+        write_imm,
+        send,
+        post_recv,
         poll,
     })
 }
@@ -730,7 +733,13 @@ unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
 }
 
 /// Create a QP on the device's port. Writes its QPN.
-unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) -> *mut c_void {
+unsafe extern "C" fn qp(
+    device: *mut c_void,
+    port: u8,
+    _: u32,
+    _: u32,
+    qpn: *mut u32,
+) -> *mut c_void {
     let Some(h) = (unsafe { handle(device) }) else {
         return std::ptr::null_mut();
     };
@@ -916,12 +925,12 @@ unsafe extern "C" fn window_free(raw: *mut c_void) -> c_int {
 }
 
 /// Create a zeroed region with a fake wire address.
-unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
+unsafe extern "C" fn register(device: *mut c_void, length: u64, _: u32) -> *mut c_void {
     let Some(h) = (unsafe { handle(device) }) else {
         return std::ptr::null_mut();
     };
     let mut world = h.sim.world.borrow_mut();
-    if length == 0 {
+    if length == 0 || usize::try_from(length).is_err() {
         world.record(Operation::Register, h.id, None, -1, false);
         return std::ptr::null_mut();
     }
@@ -988,6 +997,7 @@ unsafe extern "C" fn bind(
     region: *mut c_void,
     key: u32,
     id: u64,
+    offset: u64,
     length: u32,
 ) -> c_int {
     let (Some(q), Some(w), Some(r)) = (unsafe { (handle(qp), handle(window), handle(region)) })
@@ -997,6 +1007,7 @@ unsafe extern "C" fn bind(
     if !Rc::ptr_eq(&q.sim.world, &w.sim.world)
         || !Rc::ptr_eq(&q.sim.world, &r.sim.world)
         || key != w.id
+        || offset != 0
     {
         q.sim
             .world
@@ -1057,6 +1068,30 @@ unsafe extern "C" fn write(
     )
 }
 
+/// Not simulated yet: reject without side effects.
+unsafe extern "C" fn write_imm(
+    _: *mut c_void,
+    _: *mut c_void,
+    _: u64,
+    _: u32,
+    _: u64,
+    _: u32,
+    _: u32,
+    _: u64,
+) -> c_int {
+    -1
+}
+
+/// Not simulated yet: reject without side effects.
+unsafe extern "C" fn send(_: *mut c_void, _: *mut c_void, _: u64, _: u32, _: u64) -> c_int {
+    -1
+}
+
+/// Not simulated yet: reject without side effects.
+unsafe extern "C" fn post_recv(_: *mut c_void, _: *mut c_void, _: u64, _: u32, _: u64) -> c_int {
+    -1
+}
+
 /// Run up to 32 queued requests in order. Stops at a delay or a failure.
 unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) -> c_int {
     let Some(q) = (unsafe { handle(qp) }) else {
@@ -1100,7 +1135,12 @@ unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) 
             *out.add(count as usize) = Completion {
                 id: pending.id,
                 status,
-                opcode: pending.action.opcode(),
+                opcode: if status == 0 {
+                    pending.action.opcode()
+                } else {
+                    u32::MAX
+                },
+                ..Completion::default()
             };
         }
         count += 1;
@@ -1160,16 +1200,17 @@ mod tests {
             id: 42,
             status: 43,
             opcode: 44,
+            ..Completion::default()
         };
         unsafe {
             assert!(handle(raw).is_none());
-            assert!(qp(raw, 1, 1, &mut output).is_null());
-            assert!(register(raw, 32).is_null());
+            assert!(qp(raw, 1, 1, 1, &mut output).is_null());
+            assert!(register(raw, 32, 5).is_null());
             assert!(window(raw, &mut output).is_null());
             assert!(bytes(raw).is_null());
             assert_eq!(connect(raw, &endpoint, &endpoint), -1);
             assert_eq!(stop(raw), -1);
-            assert_eq!(bind(raw, raw, raw, 1, 2, 3), -1);
+            assert_eq!(bind(raw, raw, raw, 1, 2, 0, 3), -1);
             assert_eq!(invalidate(raw, 1, 2), -1);
             assert_eq!(write(raw, raw, 1, 2, 3, 4), -1);
             assert_eq!(poll(raw, &mut completion, 1), -1);
@@ -1200,15 +1241,15 @@ mod tests {
             let mut output = 123;
             let mut failures = vec![
                 open(c"missing".as_ptr()),
-                qp(device, 2, 1, &mut output),
-                register(device, 0),
+                qp(device, 2, 1, 1, &mut output),
+                register(device, 0, 5),
             ];
             sim.fault(Operation::Open, Fault::Reject);
             failures.push(open(c"sim0".as_ptr()));
             sim.fault(Operation::Qp, Fault::Reject);
-            failures.push(qp(device, 1, 1, &mut output));
+            failures.push(qp(device, 1, 1, 1, &mut output));
             sim.fault(Operation::Register, Fault::Reject);
-            failures.push(register(device, 32));
+            failures.push(register(device, 32, 5));
             sim.fault(Operation::Window, Fault::Reject);
             failures.push(window(device, &mut output));
             assert_eq!(output, 123);
@@ -1245,7 +1286,7 @@ mod tests {
             sim.fault(Operation::Write, Fault::Reject);
             unsafe {
                 for (q, w, r) in [(null, w, r), (q, null, r), (q, w, null)] {
-                    assert_eq!(bind(q, w, r, window.key, 100, 17), -1);
+                    assert_eq!(bind(q, w, r, window.key, 100, 0, 17), -1);
                 }
                 for (q, r) in [(null, r), (q, null)] {
                     assert_eq!(write(q, r, target.address(), window.key, 101, 17), -1);
@@ -1283,10 +1324,10 @@ mod tests {
             events(&sim, &[(Operation::Open, 0, None, 0, false)]);
             let d = handle(device).unwrap().id;
             let mut id = 0;
-            assert!(qp(device, 2, 1, &mut id).is_null());
+            assert!(qp(device, 2, 1, 1, &mut id).is_null());
             assert_eq!(id, 0);
             events(&sim, &[(Operation::Qp, d, None, -1, false)]);
-            assert!(register(device, 0).is_null());
+            assert!(register(device, 0, 5).is_null());
             events(&sim, &[(Operation::Register, d, None, -1, false)]);
             assert_eq!(sim.live_resources(), 1);
             for operation in [
@@ -1307,11 +1348,11 @@ mod tests {
                         0
                     }
                     Operation::Qp => {
-                        assert!(qp(device, 1, 1, &mut id).is_null());
+                        assert!(qp(device, 1, 1, 1, &mut id).is_null());
                         d
                     }
                     Operation::Register => {
-                        assert!(register(device, 32).is_null());
+                        assert!(register(device, 32, 5).is_null());
                         d
                     }
                     Operation::Window => {
@@ -1343,7 +1384,7 @@ mod tests {
             let device = open(c"sim0".as_ptr());
             let d = handle(device).unwrap().id;
             let mut qpn = 0;
-            let q = qp(device, 1, 1, &mut qpn);
+            let q = qp(device, 1, 1, 1, &mut qpn);
             let local = Endpoint {
                 gid: [1; 16],
                 qpn,
@@ -1353,9 +1394,9 @@ mod tests {
                 port: 1,
                 link_layer: 2,
             };
-            let peer = qp(device, 1, 1, &mut qpn);
+            let peer = qp(device, 1, 1, 1, &mut qpn);
             let remote = Endpoint { qpn, ..local };
-            let region = register(device, 32);
+            let region = register(device, 32, 5);
             let r = handle(region).unwrap().id;
             let mut key = 0;
             let w = window(device, &mut key);
@@ -1395,7 +1436,7 @@ mod tests {
             assert!(sim.world.borrow().ready(local.qpn));
             assert_eq!(connect(q, &local, &remote), -1);
             events(&sim, &[(Operation::Connect, local.qpn, None, -1, false)]);
-            assert_eq!(bind(q, w, region, key, 7, 17), 0);
+            assert_eq!(bind(q, w, region, key, 7, 0, 17), 0);
             events(&sim, &[(Operation::Bind, local.qpn, Some(7), 0, false)]);
             for completed in [false, true] {
                 if completed {
@@ -1474,7 +1515,7 @@ mod tests {
                     (foreign_region.raw.as_ptr(), w.key),
                     (source.raw.as_ptr(), w.key + 1),
                 ] {
-                    assert_eq!(bind(q, w.raw.as_ptr(), region, key, 41, 17), -1);
+                    assert_eq!(bind(q, w.raw.as_ptr(), region, key, 41, 0, 17), -1);
                     events(&sim, &[(Operation::Bind, qpn, Some(41), -1, false)]);
                 }
                 assert_eq!(

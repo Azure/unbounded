@@ -391,6 +391,22 @@ bind, inv), 55..32 link slot, 31..0 buffer, control slot, or tag. Any CQE
 whose decoded kind, link, or index does not match an outstanding WR breaks
 the link.
 
+`imm` is passed and reported in host byte order; the adapter does the
+`htonl`/`ntohl`. `byte_len`, `imm`, and `flags` are zero unless the status
+is success.
+
+Rust wrappers (`src/ffi.rs`): `NativeQueuePair::new_with_depth`, `send`,
+`post_recv`, `write_imm`, `bind_window`, `invalidate_window`, and
+`progress_with`, plus `MemoryWindow` (reusable MW that tracks its next rkey)
+and `NativeRegion::with_access`. Ranged posts take the caller's `wr_id`,
+which must have a nonzero kind byte (`CALLER_ID_MASK`) so it never collides
+with the slot path's sequential ids while both exist. The QP still keeps a
+per-id table of outstanding WRs and breaks on any CQE that does not match
+its id, queue (send or receive), opcode, immediate flag, or receive length;
+`NativeQueuePair::failure` reports the first such CQE (for example
+`IBV_WC_RNR_RETRY_EXC_ERR`). Ranged posts do not use the slot path's
+`busy` flag; the page pool owns per-buffer state.
+
 The `_Static_assert`s and the Rust layout test cover the new struct and
 opcodes. `native/discovery_faults.c` is unchanged.
 

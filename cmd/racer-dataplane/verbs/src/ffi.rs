@@ -83,15 +83,133 @@ impl Endpoint {
     }
 }
 
-/// One finished work request from the completion queue.
+/// One finished work request from the completion queue. Matches
+/// `struct rdma_verbs_wc` in C (ABI 2).
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
 struct Completion {
     id: u64,
 
     status: u32,
 
+    /// `u32::MAX` unless `status` is 0.
     opcode: u32,
+
+    byte_len: u32,
+
+    /// Host byte order. Valid only if `flags & WC_IMM`.
+    imm: u32,
+
+    flags: u32,
+
+    vendor_err: u32,
+}
+
+/// `RDMA_VERBS_WC_IMM`: the completion carries an immediate.
+const WC_IMM: u32 = 1;
+
+/// Native adapter ABI version this crate speaks.
+#[cfg(all(feature = "native", target_os = "linux"))]
+const ABI_VERSION: u32 = 2;
+
+/// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
+pub(crate) mod opcode {
+    /// `IBV_WC_SEND`.
+    pub(crate) const SEND: u32 = 0;
+
+    /// `IBV_WC_RDMA_WRITE`. Also the send-side opcode of a write with immediate.
+    pub(crate) const RDMA_WRITE: u32 = 1;
+
+    /// `IBV_WC_BIND_MW`.
+    pub(crate) const BIND_MW: u32 = 5;
+
+    /// `IBV_WC_LOCAL_INV`.
+    pub(crate) const LOCAL_INV: u32 = 6;
+
+    /// `IBV_WC_RECV`: a peer `SEND` landed.
+    pub(crate) const RECV: u32 = 128;
+
+    /// `IBV_WC_RECV_RDMA_WITH_IMM`: a peer write with immediate landed.
+    pub(crate) const RECV_RDMA_WITH_IMM: u32 = 129;
+}
+
+/// Completion statuses (`enum ibv_wc_status`) the crate names.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
+pub(crate) mod status {
+    /// `IBV_WC_RNR_RETRY_EXC_ERR`.
+    pub(crate) const RNR_RETRY_EXC_ERR: u32 = 13;
+}
+
+/// Region access sets for `rdma_verbs_register`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Access(u32);
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
+impl Access {
+    /// Page buffers: `LOCAL_WRITE | MW_BIND`. Remote writes only via windows.
+    pub(crate) const PAGES: Self = Self(1);
+
+    /// Control slots: `LOCAL_WRITE` only.
+    pub(crate) const CONTROL: Self = Self(2);
+
+    /// Page buffers plus `REMOTE_WRITE` on the region itself. The slot path
+    /// and the `mr_remote_write` escape hatch use this.
+    pub(crate) const PAGES_REMOTE_WRITE: Self = Self(1 | 4);
+
+    /// The raw ABI value.
+    pub(crate) fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// A successful completion, as reported by
+/// [`NativeQueuePair::progress_with`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkCompletion {
+    /// The work request id the caller posted with.
+    pub(crate) id: u64,
+
+    /// One of [`opcode`].
+    pub(crate) opcode: u32,
+
+    /// Bytes received. Meaningful only for receive completions.
+    pub(crate) byte_len: u32,
+
+    /// Immediate data in host byte order, if any.
+    pub(crate) imm: Option<u32>,
+}
+
+/// The first failed completion that broke a QP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Failure {
+    /// Work request id of the failed completion.
+    pub(crate) id: u64,
+
+    /// Verbs status, for example [`status::RNR_RETRY_EXC_ERR`]. 0 means the
+    /// completion succeeded but did not match any posted work.
+    pub(crate) status: u32,
+
+    /// Provider-specific error code.
+    pub(crate) vendor_err: u32,
 }
 
 /// Build the [`Api`] function table and its symbol loader from a list of
@@ -100,6 +218,7 @@ macro_rules! native_api {
     ($($field:ident: $signature:ty),* $(,)?) => {
         /// The C adapter's functions. Every native object holds an `Rc` to it
         /// so the library stays loaded.
+        #[cfg_attr(not(test), allow(dead_code, reason = "the ranged API is used by the link layer from stage 2"))]
         struct Api {
             library: Option<NonNull<c_void>>,
 
@@ -134,7 +253,7 @@ native_api! {
 
     close: unsafe extern "C" fn(*mut c_void) -> c_int,
 
-    qp: unsafe extern "C" fn(*mut c_void, u8, u32, *mut u32) -> *mut c_void,
+    qp: unsafe extern "C" fn(*mut c_void, u8, u32, u32, *mut u32) -> *mut c_void,
 
     connect: unsafe extern "C" fn(*mut c_void, *const Endpoint, *const Endpoint) -> c_int,
 
@@ -142,7 +261,7 @@ native_api! {
 
     qp_free: unsafe extern "C" fn(*mut c_void) -> c_int,
 
-    register: unsafe extern "C" fn(*mut c_void, u32) -> *mut c_void,
+    register: unsafe extern "C" fn(*mut c_void, u64, u32) -> *mut c_void,
 
     deregister: unsafe extern "C" fn(*mut c_void) -> c_int,
 
@@ -152,11 +271,17 @@ native_api! {
 
     window_free: unsafe extern "C" fn(*mut c_void) -> c_int,
 
-    bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u64, u32) -> c_int,
+    bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u64, u64, u32) -> c_int,
 
     invalidate: unsafe extern "C" fn(*mut c_void, u32, u64) -> c_int,
 
     write: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32) -> c_int,
+
+    write_imm: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32, u32, u64) -> c_int,
+
+    send: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64) -> c_int,
+
+    post_recv: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64) -> c_int,
 
     poll: unsafe extern "C" fn(*mut c_void, *mut Completion, u32) -> c_int,
 }
@@ -175,7 +300,7 @@ impl Api {
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]
-    /// Load `librdma_verbs.so.1` and check it speaks ABI version 1.
+    /// Load `librdma_verbs.so.1` and check it speaks [`ABI_VERSION`].
     fn load() -> Result<Rc<Self>> {
         // Fixed library name, found via the normal loader path.
         unsafe {
@@ -212,7 +337,7 @@ impl Api {
             }
 
             let version = sym!("rdma_verbs_abi", unsafe extern "C" fn() -> u32);
-            if version() != 1 {
+            if version() != ABI_VERSION {
                 return Err(Error::Unavailable);
             }
             let api = Self::symbols(library)?;
@@ -372,6 +497,13 @@ fn discover_with_api(
 ///
 /// `busy` is set while the NIC may touch it. The CPU may not copy in or out
 /// while busy. Holds the slot's guard and leaks it if deregister fails.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
 
@@ -386,21 +518,43 @@ pub(crate) struct NativeRegion {
     quota: Option<Arc<GuardOwner>>,
 
     busy: Cell<bool>,
+
+    access: Access,
 }
 
 impl NativeRegion {
-    /// Allocate and register `length` bytes.
+    /// Allocate and register `length` bytes for the slot path:
+    /// [`Access::PAGES_REMOTE_WRITE`], at most `u32::MAX` bytes.
     pub(crate) fn new(
         device: Rc<NativeDevice>,
         length: usize,
         quota: Arc<GuardOwner>,
     ) -> Result<Rc<Self>> {
-        if length == 0 || length > u32::MAX as usize {
+        if length > u32::MAX as usize {
             return Err(Error::InvalidRange);
         }
-        let raw =
-            NonNull::new(unsafe { (device.api.register)(device.raw.as_ptr(), length as u32) })
-                .ok_or(Error::Unavailable)?;
+        Self::with_access(device, length, Access::PAGES_REMOTE_WRITE, quota)
+    }
+
+    /// Allocate and register `length` bytes with `access`.
+    ///
+    /// The `busy` flag, `resize`, and the copy helpers serve the slot path.
+    /// Ranged posts ([`NativeQueuePair::send`], [`NativeQueuePair::post_recv`],
+    /// [`NativeQueuePair::write_imm`], [`NativeQueuePair::bind_window`]) do not
+    /// track per-range ownership; their caller must.
+    pub(crate) fn with_access(
+        device: Rc<NativeDevice>,
+        length: usize,
+        access: Access,
+        quota: Arc<GuardOwner>,
+    ) -> Result<Rc<Self>> {
+        if length == 0 || u64::try_from(length).is_err() {
+            return Err(Error::InvalidRange);
+        }
+        let raw = NonNull::new(unsafe {
+            (device.api.register)(device.raw.as_ptr(), length as u64, access.bits())
+        })
+        .ok_or(Error::Unavailable)?;
         Ok(Rc::new(Self {
             device,
             raw,
@@ -408,7 +562,31 @@ impl NativeRegion {
             used: Cell::new(length),
             quota: Some(quota),
             busy: Cell::new(false),
+            access,
         }))
+    }
+
+    /// The start of the registered buffer, valid while `self` lives.
+    ///
+    /// The caller must not read or write any range the NIC may still access.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the stage 2 page pool uses it"))]
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        unsafe { (self.device.api.bytes)(self.raw.as_ptr()) }
+    }
+
+    /// True if `[offset, offset + length)` is a nonempty range of the region.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the ranged API is used by the link layer from stage 2"
+        )
+    )]
+    fn contains(&self, offset: u64, length: u32) -> bool {
+        length != 0
+            && offset
+                .checked_add(length.into())
+                .is_some_and(|end| end <= self.length as u64)
     }
 
     /// The address peers use to write here.
@@ -522,6 +700,88 @@ impl Drop for Window {
     }
 }
 
+/// A reusable type 2 memory window for ranged binds.
+///
+/// Each bind uses a fresh rkey (`ibv_inc_rkey` of the previous one), so a
+/// stale key from an earlier grant never matches. The window keeps the last
+/// region it was bound to alive until it is freed, because the NIC may still
+/// accept writes through it.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
+pub(crate) struct MemoryWindow {
+    device: Rc<NativeDevice>,
+
+    raw: NonNull<c_void>,
+
+    /// Key the next bind will use.
+    next_key: Cell<u32>,
+
+    region: RefCell<Option<Rc<NativeRegion>>>,
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
+impl MemoryWindow {
+    /// Allocate a window on `device`.
+    pub(crate) fn new(device: &Rc<NativeDevice>) -> Result<Rc<Self>> {
+        let mut key = 0;
+        let raw = NonNull::new(unsafe { (device.api.window)(device.raw.as_ptr(), &mut key) })
+            .ok_or(Error::Unavailable)?;
+        Ok(Rc::new(Self {
+            device: device.clone(),
+            raw,
+            next_key: Cell::new(key),
+            region: RefCell::new(None),
+        }))
+    }
+
+    /// The key the next bind will use.
+    pub(crate) fn next_key(&self) -> u32 {
+        self.next_key.get()
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
+/// `ibv_inc_rkey`: bump the low 8 key bits, keep the 24-bit index.
+pub(crate) fn inc_rkey(key: u32) -> u32 {
+    (key & 0xffff_ff00) | (key.wrapping_add(1) & 0xff)
+}
+
+impl Drop for MemoryWindow {
+    /// Free the window. On failure, leak the device and the bound region.
+    fn drop(&mut self) {
+        if unsafe { (self.device.api.window_free)(self.raw.as_ptr()) } != 0 {
+            if let Some(region) = self.region.get_mut().take() {
+                if let Some(quota) = &region.quota {
+                    quota.quarantine();
+                }
+                std::mem::forget(region);
+            }
+            std::mem::forget(self.device.clone());
+        }
+    }
+}
+
+/// Caller-chosen work request ids must set at least one of these bits, so
+/// they never collide with the ids the slot path assigns from 1 upward.
+pub(crate) const CALLER_ID_MASK: u64 = 0xff << 56;
+
 /// Where a work request's result lands.
 #[derive(Default)]
 struct TicketState {
@@ -542,14 +802,27 @@ impl Ticket {
 /// A posted work request. Keeps its region and window alive until it
 /// completes or the QP stops.
 struct Pending {
-    ticket: Ticket,
+    /// Set for slot-path work; ranged posts report through `progress_with`.
+    ticket: Option<Ticket>,
 
-    /// Expected completion opcode.
+    /// Expected completion opcode. Ignored for receives.
     opcode: u32,
 
+    /// Posted on the receive queue.
+    recv: bool,
+
+    /// Receive buffer length.
+    length: u32,
+
+    /// Slot-path region; cleared from busy on finish.
     region: Option<Rc<NativeRegion>>,
 
+    /// Ranged-post region, kept alive but not marked busy.
+    _hold: Option<Rc<NativeRegion>>,
+
     _window: Option<Rc<Window>>,
+
+    _memory_window: Option<Rc<MemoryWindow>>,
 }
 
 impl Pending {
@@ -559,7 +832,25 @@ impl Pending {
         if let Some(region) = &self.region {
             region.busy.set(false);
         }
-        self.ticket.0.result.set(Some(result));
+        if let Some(ticket) = &self.ticket {
+            ticket.0.result.set(Some(result));
+        }
+    }
+
+    /// True if a successful completion `c` is what this work should produce.
+    fn matches(&self, c: &Completion) -> bool {
+        if c.status != 0 {
+            return false;
+        }
+        if !self.recv {
+            return c.opcode == self.opcode;
+        }
+        let imm = c.flags & WC_IMM != 0;
+        match c.opcode {
+            opcode::RECV => !imm && c.byte_len <= self.length,
+            opcode::RECV_RDMA_WITH_IMM => imm,
+            _ => false,
+        }
     }
 }
 
@@ -567,6 +858,13 @@ impl Pending {
 ///
 /// Tracks posted work (up to 32) and the bound window. [`Self::stop`] is the
 /// only way to be sure the NIC is done with its memory.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
 pub(crate) struct NativeQueuePair {
     /// Keeps every QP, CQ, and probe leak charged to its slot.
     quota: Arc<GuardOwner>,
@@ -594,6 +892,19 @@ pub(crate) struct NativeQueuePair {
     /// Posted work by ID.
     pending: RefCell<BTreeMap<u64, Pending>>,
 
+    /// Send queue limit and current use.
+    send_capacity: u32,
+
+    sends: Cell<u32>,
+
+    /// Receive queue limit and current use.
+    recv_capacity: u32,
+
+    recvs: Cell<u32>,
+
+    /// The first completion that broke the QP.
+    failure: Cell<Option<Failure>>,
+
     /// Bound windows. They stay open until stop, even after the bind completes.
     windows: RefCell<Vec<Rc<Window>>>,
 
@@ -612,15 +923,33 @@ impl NativeQueuePair {
         )
     }
 
-    /// Create a QP with its slot's charge and a random starting PSN.
+    /// Create a slot-path QP with its slot's charge and a random starting
+    /// PSN: 64 send WRs (32 tracked at once) and one receive WR.
     pub(crate) fn new_charged(
         device: Rc<NativeDevice>,
         quota: Arc<GuardOwner>,
         stop_observer: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Rc<Self>> {
+        Self::create(device, quota, stop_observer, (64, 1), (32, 0))
+    }
+
+    /// Create the native QP with `depth` and track up to `capacity` WRs.
+    fn create(
+        device: Rc<NativeDevice>,
+        quota: Arc<GuardOwner>,
+        stop_observer: Arc<std::sync::atomic::AtomicBool>,
+        depth: (u32, u32),
+        capacity: (u32, u32),
+    ) -> Result<Rc<Self>> {
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
-            (device.api.qp)(device.raw.as_ptr(), device.endpoint.port, 64, &mut qpn)
+            (device.api.qp)(
+                device.raw.as_ptr(),
+                device.endpoint.port,
+                depth.0,
+                depth.1,
+                &mut qpn,
+            )
         });
         let Some(raw) = raw else {
             if qpn == u32::MAX {
@@ -661,6 +990,11 @@ impl NativeQueuePair {
             connected: Cell::new(false),
             next: Cell::new(1),
             pending: RefCell::new(BTreeMap::new()),
+            send_capacity: capacity.0,
+            sends: Cell::new(0),
+            recv_capacity: capacity.1,
+            recvs: Cell::new(0),
+            failure: Cell::new(None),
             windows: RefCell::new(Vec::new()),
             #[cfg(test)]
             expires: Cell::new(None),
@@ -733,29 +1067,59 @@ impl NativeQueuePair {
         if !self.ready() {
             return Err(Error::Unavailable);
         }
-        if self.pending.borrow().len() >= 32 {
+        if self.sends.get() >= self.send_capacity {
             return Err(Error::Overloaded);
         }
         let id = self.next.get();
-        self.next.set(id.checked_add(1).ok_or(Error::Overloaded)?);
+        if id & CALLER_ID_MASK != 0 {
+            return Err(Error::Overloaded);
+        }
+        self.next.set(id + 1);
         let ticket = Ticket(Rc::new(TicketState::default()));
-        self.pending.borrow_mut().insert(
+        self.track(
             id,
             Pending {
-                ticket: ticket.clone(),
+                ticket: Some(ticket.clone()),
                 opcode,
+                recv: false,
+                length: 0,
                 region,
+                _hold: None,
                 _window: window,
+                _memory_window: None,
             },
         );
         Ok((id, ticket))
+    }
+
+    /// Add `pending` under `id` and count it against its queue.
+    fn track(&self, id: u64, pending: Pending) {
+        let counter = if pending.recv {
+            &self.recvs
+        } else {
+            &self.sends
+        };
+        counter.set(counter.get() + 1);
+        self.pending.borrow_mut().insert(id, pending);
+    }
+
+    /// Remove the work under `id` and release its queue slot.
+    fn untrack(&self, id: u64) -> Option<Pending> {
+        let pending = self.pending.borrow_mut().remove(&id)?;
+        let counter = if pending.recv {
+            &self.recvs
+        } else {
+            &self.sends
+        };
+        counter.set(counter.get() - 1);
+        Some(pending)
     }
 
     /// Check the post result. If the post failed, nothing reached the NIC, so
     /// drop the record.
     fn submitted(&self, id: u64, rc: i32) -> Result<()> {
         if rc != 0 {
-            if let Some(pending) = self.pending.borrow_mut().remove(&id) {
+            if let Some(pending) = self.untrack(id) {
                 pending.finish(Err(Error::Io));
             }
             return Err(Error::Io);
@@ -793,6 +1157,7 @@ impl NativeQueuePair {
                 region.raw.as_ptr(),
                 key,
                 id,
+                0,
                 region.length() as u32,
             )
         };
@@ -845,6 +1210,13 @@ impl NativeQueuePair {
     /// Any failed or unexpected completion stops the QP and returns
     /// [`Error::Io`].
     pub(crate) fn progress(&self) -> Result<usize> {
+        self.progress_with(|_| {})
+    }
+
+    /// Like [`Self::progress`], and report each successful completion to
+    /// `sink` after its work is released. On a failed or unexpected
+    /// completion, [`Self::failure`] records it.
+    pub(crate) fn progress_with(&self, mut sink: impl FnMut(WorkCompletion)) -> Result<usize> {
         if self.stopped.get() {
             return Ok(0);
         }
@@ -872,13 +1244,26 @@ impl NativeQueuePair {
                 .pending
                 .borrow()
                 .get(&c.id)
-                .is_some_and(|p| c.status == 0 && p.opcode == c.opcode);
+                .is_some_and(|p| p.matches(c));
             if !valid {
+                if self.failure.get().is_none() {
+                    self.failure.set(Some(Failure {
+                        id: c.id,
+                        status: c.status,
+                        vendor_err: c.vendor_err,
+                    }));
+                }
                 self.stop()?;
                 return Err(Error::Io);
             }
-            let pending = self.pending.borrow_mut().remove(&c.id).ok_or(Error::Io)?;
+            let pending = self.untrack(c.id).ok_or(Error::Io)?;
             pending.finish(Ok(()));
+            sink(WorkCompletion {
+                id: c.id,
+                opcode: c.opcode,
+                byte_len: c.byte_len,
+                imm: (c.flags & WC_IMM != 0).then_some(c.imm),
+            });
         }
         Ok(n as usize)
     }
@@ -899,13 +1284,270 @@ impl NativeQueuePair {
         self.stop_observer
             .store(true, std::sync::atomic::Ordering::Release);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        for (_, pending) in std::mem::take(&mut *self.pending.borrow_mut()) {
+        let pending = std::mem::take(&mut *self.pending.borrow_mut());
+        self.sends.set(0);
+        self.recvs.set(0);
+        for (_, pending) in pending {
             pending.finish(Err(Error::Cancelled));
         }
         for window in self.windows.borrow_mut().drain(..) {
             window.region.busy.set(false);
         }
         Ok(())
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the ranged API is used by the link layer from stage 2"
+    )
+)]
+impl NativeQueuePair {
+    /// Create a QP with `send_depth` send and `recv_depth` receive WRs, and
+    /// a CQ for both. Both depths must be nonzero.
+    pub(crate) fn new_with_depth(
+        device: Rc<NativeDevice>,
+        quota: Arc<GuardOwner>,
+        stop_observer: Arc<std::sync::atomic::AtomicBool>,
+        send_depth: u32,
+        recv_depth: u32,
+    ) -> Result<Rc<Self>> {
+        if send_depth == 0 || recv_depth == 0 || send_depth.checked_add(recv_depth).is_none() {
+            return Err(Error::InvalidConfiguration);
+        }
+        Self::create(
+            device,
+            quota,
+            stop_observer,
+            (send_depth, recv_depth),
+            (send_depth, recv_depth),
+        )
+    }
+
+    /// Validate and record a ranged post under the caller's `id`, then run
+    /// `post`. A rejected post leaves nothing behind; the QP stays usable.
+    #[allow(clippy::too_many_arguments)]
+    fn post_ranged(
+        &self,
+        id: u64,
+        recv: bool,
+        opcode: u32,
+        region: &Rc<NativeRegion>,
+        offset: u64,
+        length: u32,
+        window: Option<Rc<MemoryWindow>>,
+        post: impl FnOnce() -> c_int,
+    ) -> Result<()> {
+        if id & CALLER_ID_MASK == 0
+            || !Rc::ptr_eq(&region.device, &self.device)
+            || !region.contains(offset, length)
+            || self.pending.borrow().contains_key(&id)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        if !self.ready() {
+            return Err(Error::Unavailable);
+        }
+        let (used, capacity) = if recv {
+            (self.recvs.get(), self.recv_capacity)
+        } else {
+            (self.sends.get(), self.send_capacity)
+        };
+        if used >= capacity {
+            return Err(Error::Overloaded);
+        }
+        self.track(
+            id,
+            Pending {
+                ticket: None,
+                opcode,
+                recv,
+                length,
+                region: None,
+                _hold: Some(region.clone()),
+                _window: None,
+                _memory_window: window,
+            },
+        );
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.submitted(id, post())
+    }
+
+    /// Post a signaled `SEND` of `length` bytes of `region` at `offset`.
+    /// Completes with [`opcode::SEND`]. Consumes one peer receive.
+    pub(crate) fn send(
+        &self,
+        id: u64,
+        region: &Rc<NativeRegion>,
+        offset: u64,
+        length: u32,
+    ) -> Result<()> {
+        self.post_ranged(
+            id,
+            false,
+            opcode::SEND,
+            region,
+            offset,
+            length,
+            None,
+            || unsafe {
+                (self.device.api.send)(self.raw.as_ptr(), region.raw.as_ptr(), offset, length, id)
+            },
+        )
+    }
+
+    /// Post a receive into `length` bytes of `region` at `offset`. Completes
+    /// with [`opcode::RECV`] (`byte_len <= length`, no immediate) or
+    /// [`opcode::RECV_RDMA_WITH_IMM`] (with an immediate).
+    pub(crate) fn post_recv(
+        &self,
+        id: u64,
+        region: &Rc<NativeRegion>,
+        offset: u64,
+        length: u32,
+    ) -> Result<()> {
+        self.post_ranged(
+            id,
+            true,
+            opcode::RECV,
+            region,
+            offset,
+            length,
+            None,
+            || unsafe {
+                (self.device.api.post_recv)(
+                    self.raw.as_ptr(),
+                    region.raw.as_ptr(),
+                    offset,
+                    length,
+                    id,
+                )
+            },
+        )
+    }
+
+    /// Post a signaled `RDMA_WRITE_WITH_IMM` of `length` bytes of `region` at
+    /// `offset` to the peer's `address` through window `key`, carrying `imm`
+    /// (host byte order). Completes with [`opcode::RDMA_WRITE`]. Consumes one
+    /// peer receive.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_imm(
+        &self,
+        id: u64,
+        region: &Rc<NativeRegion>,
+        offset: u64,
+        length: u32,
+        address: u64,
+        key: u32,
+        imm: u32,
+    ) -> Result<()> {
+        if address.checked_add(length.into()).is_none() {
+            return Err(Error::InvalidRequest);
+        }
+        self.post_ranged(
+            id,
+            false,
+            opcode::RDMA_WRITE,
+            region,
+            offset,
+            length,
+            None,
+            || unsafe {
+                (self.device.api.write_imm)(
+                    self.raw.as_ptr(),
+                    region.raw.as_ptr(),
+                    offset,
+                    length,
+                    address,
+                    key,
+                    imm,
+                    id,
+                )
+            },
+        )
+    }
+
+    /// Post a signaled bind of `window` over `length` bytes of `region` at
+    /// `offset`, with remote write access. Returns the window's new rkey.
+    /// Completes with [`opcode::BIND_MW`]. The region must be registered
+    /// with [`Access::PAGES`] (with or without remote write), and a window
+    /// stays tied to the first region it is bound to.
+    pub(crate) fn bind_window(
+        &self,
+        id: u64,
+        window: &Rc<MemoryWindow>,
+        region: &Rc<NativeRegion>,
+        offset: u64,
+        length: u32,
+    ) -> Result<u32> {
+        if !Rc::ptr_eq(&window.device, &self.device)
+            || region.access.bits() & Access::PAGES.bits() == 0
+            || window
+                .region
+                .borrow()
+                .as_ref()
+                .is_some_and(|bound| !Rc::ptr_eq(bound, region))
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let key = window.next_key.get();
+        self.post_ranged(
+            id,
+            false,
+            opcode::BIND_MW,
+            region,
+            offset,
+            length,
+            Some(window.clone()),
+            || unsafe {
+                (self.device.api.bind)(
+                    self.raw.as_ptr(),
+                    window.raw.as_ptr(),
+                    region.raw.as_ptr(),
+                    key,
+                    id,
+                    offset,
+                    length,
+                )
+            },
+        )?;
+        *window.region.borrow_mut() = Some(region.clone());
+        window.next_key.set(inc_rkey(key));
+        Ok(key)
+    }
+
+    /// Post a signaled, fenced `LOCAL_INV` of `key` on `window`. Completes
+    /// with [`opcode::LOCAL_INV`].
+    pub(crate) fn invalidate_window(
+        &self,
+        id: u64,
+        window: &Rc<MemoryWindow>,
+        key: u32,
+    ) -> Result<()> {
+        let Some(region) = window.region.borrow().clone() else {
+            return Err(Error::InvalidRequest);
+        };
+        if !Rc::ptr_eq(&window.device, &self.device) {
+            return Err(Error::InvalidRequest);
+        }
+        // Hold the region until the CQE. No data moves, so any valid range works.
+        self.post_ranged(
+            id,
+            false,
+            opcode::LOCAL_INV,
+            &region,
+            0,
+            1,
+            Some(window.clone()),
+            || unsafe { (self.device.api.invalidate)(self.raw.as_ptr(), key, id) },
+        )
+    }
+
+    /// The first completion that broke this QP, if any.
+    pub(crate) fn failure(&self) -> Option<Failure> {
+        self.failure.get()
     }
 }
 
@@ -939,7 +1581,7 @@ mod tests {
     #[test]
     #[ignore = "requires built C adapter on loader path; no RDMA hardware required"]
     fn required_native_adapter_loads_abi_and_symbols() {
-        let api = Api::load().expect("built native adapter must load with ABI 1 and all symbols");
+        let api = Api::load().expect("built native adapter must load with ABI 2 and all symbols");
         assert!(api.library.is_some(), "must load C adapter, not simulation");
     }
 
@@ -997,6 +1639,9 @@ pub(crate) mod lifetime_tests {
         post_fails: bool,
 
         poll_fails: bool,
+
+        /// Native post calls that reached the adapter (ranged path and bind).
+        posts: usize,
     }
 
     thread_local! { static FAULTS: RefCell<Faults> = RefCell::new(Faults::default()); }
@@ -1031,7 +1676,7 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Allocate a fixture queue pair with a fixed valid number.
-    unsafe extern "C" fn qp(_: *mut c_void, _: u8, _: u32, qpn: *mut u32) -> *mut c_void {
+    unsafe extern "C" fn qp(_: *mut c_void, _: u8, _: u32, _: u32, qpn: *mut u32) -> *mut c_void {
         unsafe {
             *qpn = 7;
         }
@@ -1063,7 +1708,7 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Allocate zeroed fixture memory behind an opaque region handle.
-    unsafe extern "C" fn register(_: *mut c_void, length: u32) -> *mut c_void {
+    unsafe extern "C" fn register(_: *mut c_void, length: u64, _: u32) -> *mut c_void {
         Box::into_raw(Box::new(vec![0u8; length as usize])).cast()
     }
 
@@ -1105,9 +1750,48 @@ pub(crate) mod lifetime_tests {
         _: *mut c_void,
         _: u32,
         _: u64,
+        _: u64,
         _: u32,
     ) -> c_int {
-        0
+        post_result()
+    }
+
+    /// The scripted synchronous post result.
+    fn post_result() -> c_int {
+        FAULTS.with_borrow_mut(|f| {
+            f.posts += 1;
+            if f.post_fails { 5 } else { 0 }
+        })
+    }
+
+    /// Accept or reject a write with immediate according to the fault script.
+    unsafe extern "C" fn write_imm(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: u64,
+        _: u32,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: u64,
+    ) -> c_int {
+        post_result()
+    }
+
+    /// Accept or reject a send according to the fault script.
+    unsafe extern "C" fn send(_: *mut c_void, _: *mut c_void, _: u64, _: u32, _: u64) -> c_int {
+        post_result()
+    }
+
+    /// Accept or reject a receive according to the fault script.
+    unsafe extern "C" fn post_recv(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: u64,
+        _: u32,
+        _: u64,
+    ) -> c_int {
+        post_result()
     }
 
     /// Accept invalidation whose completion is injected separately.
@@ -1175,6 +1859,9 @@ pub(crate) mod lifetime_tests {
             bind,
             invalidate,
             write,
+            write_imm,
+            send,
+            post_recv,
             poll,
         });
         let device = Rc::new(NativeDevice {
@@ -1201,7 +1888,17 @@ pub(crate) mod lifetime_tests {
 
     /// Queue a completion for the next fixture progress call.
     pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
-        FAULTS.with_borrow_mut(|f| f.cq.push_back(Completion { id, status, opcode }));
+        push(Completion {
+            id,
+            status,
+            opcode,
+            ..Completion::default()
+        });
+    }
+
+    /// Queue a full completion record for the next fixture progress call.
+    fn push(completion: Completion) {
+        FAULTS.with_borrow_mut(|f| f.cq.push_back(completion));
     }
 
     /// Enable or clear repeated terminal-fence failures.
@@ -1389,7 +2086,329 @@ pub(crate) mod lifetime_tests {
         assert_eq!(std::mem::offset_of!(Port, mtu), 80);
         assert_eq!(std::mem::size_of::<Endpoint>(), 32);
         assert_eq!(std::mem::offset_of!(Endpoint, qpn), 16);
-        assert_eq!(std::mem::size_of::<Completion>(), 16);
+        assert_eq!(std::mem::size_of::<Completion>(), 32);
+        assert_eq!(std::mem::offset_of!(Completion, status), 8);
+        assert_eq!(std::mem::offset_of!(Completion, opcode), 12);
+        assert_eq!(std::mem::offset_of!(Completion, byte_len), 16);
+        assert_eq!(std::mem::offset_of!(Completion, imm), 20);
+        assert_eq!(std::mem::offset_of!(Completion, flags), 24);
+        assert_eq!(std::mem::offset_of!(Completion, vendor_err), 28);
+        assert_eq!(std::mem::align_of::<Completion>(), 8);
+    }
+
+    /// A connected fixture QP with explicit depths and a control region.
+    fn ranged_fixture(send: u32, recv: u32) -> (Rc<NativeQueuePair>, Rc<NativeRegion>) {
+        let (qp, _, _) = fixture();
+        let device = qp.device.clone();
+        let qp = NativeQueuePair::new_with_depth(
+            device.clone(),
+            GuardOwner::new(Arc::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            send,
+            recv,
+        )
+        .unwrap();
+        qp.connect(qp.endpoint).unwrap();
+        let region = NativeRegion::with_access(device, 256, Access::PAGES, quota().0).unwrap();
+        (qp, region)
+    }
+
+    /// A caller-chosen work request id.
+    const fn wr(n: u64) -> u64 {
+        (1 << 56) | n
+    }
+
+    /// Collect successful completions from one progress call.
+    fn drain(qp: &NativeQueuePair) -> Result<Vec<WorkCompletion>> {
+        let mut out = Vec::new();
+        qp.progress_with(|c| out.push(c))?;
+        Ok(out)
+    }
+
+    #[test]
+    /// Ranged posts complete with the reported length, opcode, and immediate.
+    fn ranged_posts_report_opcode_length_and_immediate() {
+        let (qp, region) = ranged_fixture(4, 2);
+        qp.post_recv(wr(1), &region, 0, 64).unwrap();
+        qp.post_recv(wr(2), &region, 64, 64).unwrap();
+        qp.send(wr(3), &region, 128, 64).unwrap();
+        qp.write_imm(wr(4), &region, 192, 64, 4096, 71, 0xdead_beef)
+            .unwrap();
+        FAULTS.with_borrow(|f| assert_eq!(f.posts, 4));
+        push(Completion {
+            id: wr(1),
+            opcode: opcode::RECV,
+            byte_len: 64,
+            ..Completion::default()
+        });
+        push(Completion {
+            id: wr(2),
+            opcode: opcode::RECV_RDMA_WITH_IMM,
+            byte_len: 4096,
+            imm: 7,
+            flags: WC_IMM,
+            ..Completion::default()
+        });
+        push(Completion {
+            id: wr(4),
+            opcode: opcode::RDMA_WRITE,
+            ..Completion::default()
+        });
+        push(Completion {
+            id: wr(3),
+            opcode: opcode::SEND,
+            ..Completion::default()
+        });
+        let got = drain(&qp).unwrap();
+        assert_eq!(
+            got,
+            [
+                WorkCompletion {
+                    id: wr(1),
+                    opcode: opcode::RECV,
+                    byte_len: 64,
+                    imm: None,
+                },
+                WorkCompletion {
+                    id: wr(2),
+                    opcode: opcode::RECV_RDMA_WITH_IMM,
+                    byte_len: 4096,
+                    imm: Some(7),
+                },
+                WorkCompletion {
+                    id: wr(4),
+                    opcode: opcode::RDMA_WRITE,
+                    byte_len: 0,
+                    imm: None,
+                },
+                WorkCompletion {
+                    id: wr(3),
+                    opcode: opcode::SEND,
+                    byte_len: 0,
+                    imm: None,
+                },
+            ]
+        );
+        assert!(qp.ready());
+        assert_eq!(qp.failure(), None);
+        // Queue slots are released, so both queues accept work again.
+        qp.post_recv(wr(5), &region, 0, 64).unwrap();
+        qp.post_recv(wr(6), &region, 64, 64).unwrap();
+    }
+
+    #[test]
+    /// Bad ids, ranges, regions, and full queues are refused before the adapter.
+    fn ranged_posts_validate_before_reaching_the_adapter() {
+        let (qp, region) = ranged_fixture(2, 1);
+        // Slot-path id space, zero length, past the end, and offset overflow.
+        assert_eq!(qp.send(1, &region, 0, 8), Err(Error::InvalidRequest));
+        assert_eq!(qp.send(wr(1), &region, 0, 0), Err(Error::InvalidRequest));
+        assert_eq!(qp.send(wr(1), &region, 250, 8), Err(Error::InvalidRequest));
+        assert_eq!(
+            qp.post_recv(wr(1), &region, u64::MAX, 8),
+            Err(Error::InvalidRequest)
+        );
+        assert_eq!(
+            qp.write_imm(wr(1), &region, 0, 8, u64::MAX - 3, 1, 1),
+            Err(Error::InvalidRequest)
+        );
+        // A region on another device.
+        let (other, _) = ranged_fixture(1, 1);
+        let foreign =
+            NativeRegion::with_access(other.device.clone(), 64, Access::CONTROL, quota().0)
+                .unwrap();
+        assert_eq!(qp.send(wr(1), &foreign, 0, 8), Err(Error::InvalidRequest));
+        // Exactly at the end is fine; duplicate ids are not.
+        qp.send(wr(1), &region, 248, 8).unwrap();
+        assert_eq!(qp.send(wr(1), &region, 0, 8), Err(Error::InvalidRequest));
+        qp.send(wr(2), &region, 0, 8).unwrap();
+        assert_eq!(qp.send(wr(3), &region, 0, 8), Err(Error::Overloaded));
+        qp.post_recv(wr(4), &region, 0, 8).unwrap();
+        assert_eq!(qp.post_recv(wr(5), &region, 0, 8), Err(Error::Overloaded));
+        FAULTS.with_borrow(|f| assert_eq!(f.posts, 3));
+        // Zero depths are a configuration error.
+        for (send, recv) in [(0, 1), (1, 0), (u32::MAX, 1)] {
+            assert!(matches!(
+                NativeQueuePair::new_with_depth(
+                    qp.device.clone(),
+                    GuardOwner::new(Arc::new(())),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    send,
+                    recv,
+                ),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        // Not connected and stopped QPs refuse work.
+        qp.stop().unwrap();
+        assert_eq!(qp.send(wr(9), &region, 0, 8), Err(Error::Unavailable));
+    }
+
+    #[test]
+    /// A rejected post leaves no record and keeps the QP usable.
+    fn ranged_post_rejection_releases_its_slot() {
+        let (qp, region) = ranged_fixture(1, 1);
+        FAULTS.with_borrow_mut(|f| f.post_fails = true);
+        assert_eq!(qp.send(wr(1), &region, 0, 8), Err(Error::Io));
+        assert_eq!(qp.post_recv(wr(2), &region, 0, 8), Err(Error::Io));
+        FAULTS.with_borrow_mut(|f| f.post_fails = false);
+        assert!(qp.ready());
+        qp.send(wr(1), &region, 0, 8).unwrap();
+        qp.post_recv(wr(2), &region, 0, 8).unwrap();
+    }
+
+    #[test]
+    /// Wrong opcodes, missing or stray immediates, overlong receives, error
+    /// statuses, and unknown ids break the QP and record the failure.
+    fn ranged_completion_mismatches_break_the_qp() {
+        let cases = [
+            // A receive reported as a send.
+            (
+                Completion {
+                    id: wr(1),
+                    opcode: opcode::SEND,
+                    ..Completion::default()
+                },
+                0,
+            ),
+            // Write with immediate without the immediate flag.
+            (
+                Completion {
+                    id: wr(1),
+                    opcode: opcode::RECV_RDMA_WITH_IMM,
+                    ..Completion::default()
+                },
+                0,
+            ),
+            // Plain receive with an immediate.
+            (
+                Completion {
+                    id: wr(1),
+                    opcode: opcode::RECV,
+                    byte_len: 8,
+                    flags: WC_IMM,
+                    ..Completion::default()
+                },
+                0,
+            ),
+            // More bytes than the receive buffer holds.
+            (
+                Completion {
+                    id: wr(1),
+                    opcode: opcode::RECV,
+                    byte_len: 65,
+                    ..Completion::default()
+                },
+                0,
+            ),
+            // A send reported as a receive.
+            (
+                Completion {
+                    id: wr(2),
+                    opcode: opcode::RECV,
+                    ..Completion::default()
+                },
+                0,
+            ),
+            // RNR on the send.
+            (
+                Completion {
+                    id: wr(2),
+                    status: status::RNR_RETRY_EXC_ERR,
+                    opcode: u32::MAX,
+                    vendor_err: 0x88,
+                    ..Completion::default()
+                },
+                status::RNR_RETRY_EXC_ERR,
+            ),
+            // Unknown id.
+            (
+                Completion {
+                    id: wr(77),
+                    opcode: opcode::SEND,
+                    ..Completion::default()
+                },
+                0,
+            ),
+        ];
+        for (completion, expected) in cases {
+            let (qp, region) = ranged_fixture(2, 2);
+            qp.post_recv(wr(1), &region, 0, 64).unwrap();
+            qp.send(wr(2), &region, 64, 64).unwrap();
+            push(completion);
+            assert_eq!(drain(&qp), Err(Error::Io));
+            assert!(qp.stopped());
+            assert_eq!(
+                qp.failure(),
+                Some(Failure {
+                    id: completion.id,
+                    status: expected,
+                    vendor_err: completion.vendor_err,
+                })
+            );
+            // Stop released every queue slot.
+            assert_eq!((qp.sends.get(), qp.recvs.get()), (0, 0));
+        }
+    }
+
+    #[test]
+    /// Ranged binds use fresh rkeys, stay tied to one region, and hold it
+    /// until the window is freed.
+    fn memory_window_binds_with_fresh_keys_and_holds_its_region() {
+        let (qp, region) = ranged_fixture(4, 1);
+        assert_eq!(region.as_ptr(), unsafe { bytes(region.raw.as_ptr()) });
+        let window = MemoryWindow::new(&qp.device).unwrap();
+        assert_eq!(window.next_key(), 71);
+        let first = qp.bind_window(wr(1), &window, &region, 64, 32).unwrap();
+        assert_eq!(first, 71);
+        assert_eq!(window.next_key(), 72);
+        complete(wr(1), 0, opcode::BIND_MW);
+        qp.invalidate_window(wr(2), &window, first).unwrap();
+        complete(wr(2), 0, opcode::LOCAL_INV);
+        assert_eq!(drain(&qp).unwrap().len(), 2);
+        let second = qp.bind_window(wr(3), &window, &region, 0, 256).unwrap();
+        assert_ne!(first, second);
+        // Low byte wraps, index bits are kept.
+        assert_eq!(inc_rkey(0x1234_56ff), 0x1234_5600);
+        // Another region, a control region, and out-of-range binds are refused.
+        let other =
+            NativeRegion::with_access(qp.device.clone(), 256, Access::PAGES, quota().0).unwrap();
+        assert_eq!(
+            qp.bind_window(wr(4), &window, &other, 0, 8),
+            Err(Error::InvalidRequest)
+        );
+        let control =
+            NativeRegion::with_access(qp.device.clone(), 64, Access::CONTROL, quota().0).unwrap();
+        let fresh = MemoryWindow::new(&qp.device).unwrap();
+        assert_eq!(
+            qp.bind_window(wr(4), &fresh, &control, 0, 8),
+            Err(Error::InvalidRequest)
+        );
+        assert_eq!(
+            qp.bind_window(wr(4), &fresh, &region, 200, 57),
+            Err(Error::InvalidRequest)
+        );
+        // Invalidating a never-bound window is refused.
+        assert_eq!(
+            qp.invalidate_window(wr(4), &fresh, 1),
+            Err(Error::InvalidRequest)
+        );
+        // A failed post keeps the key for the next attempt.
+        FAULTS.with_borrow_mut(|f| f.post_fails = true);
+        assert_eq!(qp.bind_window(wr(4), &fresh, &region, 0, 8), Err(Error::Io));
+        FAULTS.with_borrow_mut(|f| f.post_fails = false);
+        assert_eq!(fresh.next_key(), 71);
+        qp.stop().unwrap();
+        drop(qp);
+        // The window still holds the region after the QP is gone; freeing
+        // the window frees the window before the region.
+        let weak = Rc::downgrade(&region);
+        drop(region);
+        assert!(weak.upgrade().is_some());
+        FAULTS.with_borrow_mut(|f| f.events.clear());
+        drop(window);
+        assert!(weak.upgrade().is_none());
+        FAULTS.with_borrow(|f| assert_eq!(f.events, ["mw", "mr"]));
     }
 
     #[cfg(feature = "native")]

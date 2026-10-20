@@ -10,7 +10,7 @@ static FAULTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[ignore = "requires discovery_faults.c adapter, not the production adapter"]
 fn internal_close_failures_keep_admission_and_adapter() {
     let _lock = FAULTS.lock().unwrap();
-    let api = Api::load().expect("load ABI 1 C fault adapter");
+    let api = Api::load().expect("load ABI 2 C fault adapter");
     let library = api.library.unwrap();
     let reset = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_reset".as_ptr()) };
     let count = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_count".as_ptr()) };
@@ -117,7 +117,7 @@ fn internal_close_failures_keep_admission_and_adapter() {
 #[ignore = "requires discovery_faults.c adapter, not the production adapter"]
 fn open_cleanup_failures_keep_admission_and_adapter() {
     let _lock = FAULTS.lock().unwrap();
-    let api = Api::load().expect("load ABI 1 C fault adapter");
+    let api = Api::load().expect("load ABI 2 C fault adapter");
     let library = api.library.unwrap();
     let reset = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_reset".as_ptr()) };
     let count = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_count".as_ptr()) };
