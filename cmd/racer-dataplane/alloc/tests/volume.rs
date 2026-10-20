@@ -118,6 +118,29 @@ mod simulation {
     }
 
     #[test]
+    fn commits_reuse_run_buffers_without_stale_bytes() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        let mut expected = Vec::new();
+        // Many small commits: later runs reuse buffers that hold pages of
+        // earlier commits, so any page encoded short would read back wrong.
+        for n in 0..40 {
+            let value = put(&reactor, &volume, &slab, Tier::Storage, key(3, n), 100, 0).unwrap();
+            expected.push((key(3, n), value));
+            commit(&reactor, &volume).unwrap();
+            let idle = volume.idle_run_buffers();
+            assert!((1..=4).contains(&idle), "idle {idle}");
+        }
+        crash(&sim, volume, slab);
+        let (volume, _slab, report) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        assert!(report.lost.is_empty() && !report.fell_back);
+        for (key, value) in &expected {
+            assert_eq!(get(&reactor, &volume, key), Some(*value));
+        }
+    }
+
+    #[test]
     fn mount_without_format_rejects_empty_disk() {
         let (_sim, _env) = setup();
         let reactor = TestReactor::new(64, ());

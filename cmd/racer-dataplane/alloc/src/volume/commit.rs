@@ -107,10 +107,7 @@ where
         });
         if !extends {
             self.submit().await?;
-            let buffer = self.volume.slab.allocate(
-                RUN_PAGES * UNIT_BYTES,
-                (self.volume.charge)(RUN_PAGES * UNIT_BYTES)?,
-            )?;
+            let buffer = self.volume.take_run_buffer()?;
             self.run = Some(Run {
                 start: addr,
                 filled: 0,
@@ -152,10 +149,11 @@ where
         let (reactor, scope) = (self.reactor, self.scope);
         let offset = run.start.offset();
         let buffer = run.buffer;
+        let volume = self.volume;
         self.inflight.push(Box::pin(async move {
-            slab.write_at(reactor, offset, buffer, guard, scope)
-                .await
-                .map(drop)
+            let buffer = slab.write_at(reactor, offset, buffer, guard, scope).await?;
+            volume.return_run_buffer(buffer);
+            Ok(())
         }));
         self.writes += 1;
         // Submit now, and keep the in-flight count bounded.
@@ -336,7 +334,50 @@ struct Outcome {
     count_fix: i64,
 }
 
+/// Run buffers kept on the volume between commits.
+pub(super) const RUN_BUFFER_CACHE: usize = 4;
+
 impl<C: Charge> Volume<C> {
+    /// A full-run buffer, reused when one is idle. Its bytes are stale, which
+    /// is fine: only filled pages are written and every encoder writes the
+    /// whole page.
+    fn take_run_buffer(&self) -> Result<AlignedBuffer<C>, Error> {
+        if let Some(mut buffer) = self.run_buffers.borrow_mut().pop() {
+            buffer.length = RUN_PAGES * UNIT_BYTES;
+            return Ok(buffer);
+        }
+        self.slab.allocate(
+            RUN_PAGES * UNIT_BYTES,
+            (self.charge)(RUN_PAGES * UNIT_BYTES)?,
+        )
+    }
+
+    /// Keep a completed run buffer for the next run, up to
+    /// [`RUN_BUFFER_CACHE`]. A kept buffer stays charged and live, so a
+    /// charge that requires wiping is still honored when it is finally dropped.
+    fn return_run_buffer(&self, buffer: AlignedBuffer<C>) {
+        let mut cache = self.run_buffers.borrow_mut();
+        if cache.len() < RUN_BUFFER_CACHE {
+            cache.push(buffer);
+        }
+    }
+
+    /// Bytes held, and still charged, by idle commit run buffers.
+    #[doc(hidden)]
+    pub fn idle_run_buffer_bytes(&self) -> usize {
+        self.run_buffers
+            .borrow()
+            .iter()
+            .map(|b| b.allocation().layout.size())
+            .sum()
+    }
+
+    /// Number of idle commit run buffers kept for reuse.
+    #[doc(hidden)]
+    pub fn idle_run_buffers(&self) -> usize {
+        self.run_buffers.borrow().len()
+    }
+
     /// Make every index change made before this call durable.
     ///
     /// Concurrent callers share one commit attempt. A caller whose changes

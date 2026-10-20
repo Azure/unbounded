@@ -707,6 +707,9 @@ pub struct Volume<C: Charge> {
     pub(super) signals: Rc<Signals>,
     pub(super) pager: Rc<Pager>,
     pub(super) dirty_limit: usize,
+    /// Commit run buffers kept between writes so small commits do not
+    /// allocate, zero, and free a full run each time. Each keeps its charge.
+    pub(super) run_buffers: RefCell<Vec<AlignedBuffer<C>>>,
 }
 
 /// Page source for tree code: the pager plus the I/O context of one call.
@@ -823,6 +826,7 @@ impl<C: Charge> Volume<C> {
             signals: Rc::new(Signals::default()),
             pager: Pager::new(options.metadata_cache_bytes),
             dirty_limit,
+            run_buffers: RefCell::new(Vec::new()),
         })
     }
 

@@ -2551,7 +2551,12 @@ fn incremental_ciphertext_reclamation_preserves_submitted_fence_and_remaining_qu
     drive(&f.reactor, write).unwrap();
     drive(&f.reactor, f.store.writer.drain(&request)).unwrap();
     assert_eq!(f.store.writer.index().disk_pages().len(), 2);
-    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+    // Only the volume's idle commit run buffers stay charged.
+    let volume = f.store.writer.index().volume().unwrap();
+    assert_eq!(
+        f.admission.used(ResourceClass::Ciphertext),
+        volume.idle_run_buffer_bytes()
+    );
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }
 
