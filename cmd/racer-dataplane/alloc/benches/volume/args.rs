@@ -65,6 +65,7 @@ pub struct Args {
     pub spin: u32,
     pub ring_entries: usize,
     pub verify: bool,
+    pub wipe: bool,
 }
 
 pub const USAGE: &str = "\
@@ -99,6 +100,7 @@ RUN:
   --spin N                idle executor turns before blocking in wait (default 0)
   --ring-entries N        io_uring queue entries per worker (default 1024)
   --no-verify             skip record header checks on reads
+  --wipe                  wipe buffers on release, as the unit charge does (default: no wipe, as production ciphertext)
 ";
 
 fn parse_size(text: &str) -> Result<u64, String> {
@@ -178,6 +180,7 @@ impl Args {
             spin: 0,
             ring_entries: 1024,
             verify: true,
+            wipe: false,
         };
         let mut raw = raw.into_iter();
         while let Some(flag) = raw.next() {
@@ -233,6 +236,7 @@ impl Args {
                 "--spin" => args.spin = number(value()?)? as u32,
                 "--ring-entries" => args.ring_entries = number(value()?)? as usize,
                 "--no-verify" => args.verify = false,
+                "--wipe" => args.wipe = true,
                 other => return Err(format!("unknown flag {other:?}")),
             }
         }

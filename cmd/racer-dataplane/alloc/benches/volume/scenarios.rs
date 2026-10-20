@@ -9,7 +9,7 @@ use page_alloc::volume::{
     Key, Limits, NodeAddr, SLOT_BYTES, SLOT_UNITS, Slots, Tier, Tree, UNIT_BYTES, Value, Volume,
     VolumeOptions,
 };
-use page_alloc::{AlignedBuffer, Error, Slab};
+use page_alloc::{AlignedBuffer, Charge, Error, Slab};
 
 use crate::args::{Args, Scenario};
 use crate::exec::{BenchError, BenchReactor, ExecStats, SCOPE, Task, Timers, block_on, run};
@@ -21,6 +21,25 @@ use crate::stats::{Hist, Report, ThreadUsage};
 pub const EVICTION_BUDGET: usize = 64;
 
 type Result<T> = std::result::Result<T, BenchError>;
+
+/// Buffer accounting for the benchmark. Production charges volume buffers as
+/// `ResourceClass::Ciphertext` (`src/store.rs`), which does not require a wipe
+/// on release (`src/admission.rs`), so neither does this by default. `--wipe`
+/// restores the wipe that the unit `()` charge would do.
+#[derive(Clone, Copy, Debug)]
+pub struct BenchCharge {
+    wipe: bool,
+}
+
+impl Charge for BenchCharge {
+    fn covers(&self, _bytes: usize) -> bool {
+        true
+    }
+
+    fn requires_wipe(&self) -> bool {
+        self.wipe
+    }
+}
 
 /// One unit of work every worker runs together.
 #[derive(Clone, Copy, Debug)]
@@ -152,8 +171,8 @@ impl<'a> Phase<'a> {
 
 /// A mounted volume on its slab.
 struct Mounted {
-    slab: Rc<Slab<()>>,
-    volume: Rc<Volume<()>>,
+    slab: Rc<Slab<BenchCharge>>,
+    volume: Rc<Volume<BenchCharge>>,
 }
 
 /// Hot-path counters shared by a worker's tasks.
@@ -277,7 +296,7 @@ fn round_up(bytes: u64) -> usize {
     bytes.div_ceil(UNIT_BYTES as u64) as usize * UNIT_BYTES
 }
 
-fn stamp(buffer: &mut AlignedBuffer<()>, key: &Key, generation: u64) {
+fn stamp(buffer: &mut AlignedBuffer<BenchCharge>, key: &Key, generation: u64) {
     let bytes = buffer.as_mut_slice();
     bytes[..24].copy_from_slice(&key.0);
     bytes[24..32].copy_from_slice(&generation.to_le_bytes());
@@ -326,6 +345,12 @@ impl<'a> Worker<'a> {
         })
     }
 
+    fn charge(&self) -> BenchCharge {
+        BenchCharge {
+            wipe: self.args.wipe,
+        }
+    }
+
     fn slot_count(&self) -> u64 {
         self.plan.placements.len() as u64
     }
@@ -339,7 +364,7 @@ impl<'a> Worker<'a> {
             self.plan.alignment,
         )?);
         let _ = slab.open_volume(self.slot_count())?;
-        let mut zero = slab.allocate(2 * UNIT_BYTES, ())?;
+        let mut zero = slab.allocate(2 * UNIT_BYTES, self.charge())?;
         zero.as_mut_slice().fill(0);
         let _ = block_on(
             &self.reactor,
@@ -367,7 +392,10 @@ impl<'a> Worker<'a> {
                     limits,
                     volume_id,
                     format: true,
-                    charge: Rc::new(|_| Ok(())),
+                    charge: {
+                        let charge = self.charge();
+                        Rc::new(move |_| Ok(charge))
+                    },
                 },
                 &SCOPE,
             ),
@@ -379,8 +407,8 @@ impl<'a> Worker<'a> {
     }
 
     /// A buffer of `length` bytes rounded to units, filled once.
-    fn buffer(&self, slab: &Slab<()>, length: u64) -> Result<AlignedBuffer<()>> {
-        let mut buffer = slab.allocate(round_up(length), ())?;
+    fn buffer(&self, slab: &Slab<BenchCharge>, length: u64) -> Result<AlignedBuffer<BenchCharge>> {
+        let mut buffer = slab.allocate(round_up(length), self.charge())?;
         buffer.as_mut_slice().fill(0xa5);
         Ok(buffer)
     }
@@ -406,8 +434,8 @@ impl<'a> Worker<'a> {
     /// Allocate, write, publish (and commit) until stopped.
     async fn put_lane(
         &self,
-        volume: &Volume<()>,
-        slab: &Slab<()>,
+        volume: &Volume<BenchCharge>,
+        slab: &Slab<BenchCharge>,
         hot: &RefCell<Hot>,
         config: PutConfig,
         deadline: Option<Instant>,
@@ -524,7 +552,7 @@ impl<'a> Worker<'a> {
     /// Lazy commit like the dataplane: every interval, when dirty.
     async fn commit_loop(
         &self,
-        volume: &Volume<()>,
+        volume: &Volume<BenchCharge>,
         hot: &RefCell<Hot>,
         deadline: Option<Instant>,
         active: &Cell<usize>,
@@ -591,7 +619,7 @@ impl<'a> Worker<'a> {
         self.run_tasks(tasks, stats)
     }
 
-    fn commit_now(&self, volume: &Volume<()>) -> Result<Duration> {
+    fn commit_now(&self, volume: &Volume<BenchCharge>) -> Result<Duration> {
         let start = Instant::now();
         block_on(
             &self.reactor,
@@ -601,7 +629,7 @@ impl<'a> Worker<'a> {
         Ok(start.elapsed())
     }
 
-    fn usage(&self, volume: &Volume<()>, report: &mut Report, prefix: &str) {
+    fn usage(&self, volume: &Volume<BenchCharge>, report: &mut Report, prefix: &str) {
         let usage = volume.usage();
         for (name, value) in [
             ("slots", usage.slot_count),
@@ -618,7 +646,12 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn commit_counters(&self, volume: &Volume<()>, before: (u64, u64, u64), report: &mut Report) {
+    fn commit_counters(
+        &self,
+        volume: &Volume<BenchCharge>,
+        before: (u64, u64, u64),
+        report: &mut Report,
+    ) {
         let after = volume.commit_stats();
         report.add("commit_attempts", after.attempts - before.0);
         report.add("commit_succeeded", after.succeeded - before.1);
@@ -973,7 +1006,10 @@ impl<'a> Worker<'a> {
                         limits: Limits::UNLIMITED,
                         volume_id: [0; 16],
                         format: false,
-                        charge: Rc::new(|_| Ok(())),
+                        charge: {
+                            let charge = self.charge();
+                            Rc::new(move |_| Ok(charge))
+                        },
                     },
                     &SCOPE,
                 ),
