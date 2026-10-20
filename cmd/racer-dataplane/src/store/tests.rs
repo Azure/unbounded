@@ -219,7 +219,7 @@ fn hard_hold_persist_confirms_publication_and_protects_pending() {
     let id = copy.ciphertext.envelope().page.clone();
     let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     let index = f.store.writer.index();
-    index.reserve_hold(&id.version, 1, until).unwrap();
+    index.reserve_hold_now(&id.version, 1, until).unwrap();
     f.enqueue(copy.clone()).unwrap();
     assert_eq!(f.store.writer.discard_unsubmitted(), 0);
     assert_eq!(f.store.writer.reclaim_ciphertext(None, usize::MAX), 0);
@@ -259,6 +259,10 @@ fn hold_acknowledgment_commits_extension_left_by_failed_commit() {
     .unwrap();
     drive(&f.reactor, f.store.writer.persist_held(held, &scope())).unwrap();
     let index = f.store.writer.index();
+    // Retired metadata pages drain within two more commits.
+    while index.is_dirty() {
+        drive(&f.reactor, f.store.writer.commit(&scope())).unwrap();
+    }
     assert!(!index.is_dirty());
 
     // The extension is raised in memory, but its commit fails.
@@ -317,7 +321,7 @@ fn hard_hold_page_survives_crash_but_uncommitted_cache_page_does_not() {
     f.store
         .writer
         .index()
-        .reserve_hold(&held_id.version, 1, until)
+        .reserve_hold_now(&held_id.version, 1, until)
         .unwrap();
     drive(&f.reactor, f.store.writer.persist_held(held, &scope())).unwrap();
     // A cache-tier page published after the durable acknowledgment is only
@@ -401,7 +405,7 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
         Err(Error::Unavailable)
     );
     index
-        .reserve_hold(
+        .reserve_hold_now(
             &id.version,
             1,
             uring_runtime::environment::wall_now() + Duration::from_secs(60),
@@ -435,7 +439,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
     let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-    index.reserve_hold(&id.version, 1, until).unwrap();
+    index.reserve_hold_now(&id.version, 1, until).unwrap();
     f.enqueue(copy.clone()).unwrap();
     assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
     simulation.inject("write", Fault::Delay(6)).unwrap();
@@ -499,7 +503,7 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
     index
-        .reserve_hold(
+        .reserve_hold_now(
             &id.version,
             1,
             uring_runtime::environment::wall_now() + Duration::from_secs(60),
@@ -536,7 +540,7 @@ fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
     index
-        .reserve_hold(
+        .reserve_hold_now(
             &id.version,
             1,
             uring_runtime::environment::wall_now() + Duration::from_secs(60),
@@ -665,7 +669,7 @@ fn read_io_error_on_held_storage_page_misses_without_removing_it() {
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
     let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-    index.reserve_hold(&id.version, 1, until).unwrap();
+    index.reserve_hold_now(&id.version, 1, until).unwrap();
     drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
     let value = index.lookup(&id).unwrap().unwrap();
     assert_eq!(value.tier, Tier::Storage);
@@ -700,7 +704,7 @@ fn corrupt_held_storage_record_is_removed_and_rewritten_to_storage_tier() {
         let id = copy.ciphertext.envelope().page.clone();
         let index = f.store.writer.index();
         let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-        index.reserve_hold(&id.version, 1, until).unwrap();
+        index.reserve_hold_now(&id.version, 1, until).unwrap();
         drive(
             &f.reactor,
             f.store.writer.persist_held(copy.clone(), &scope()),
@@ -1120,7 +1124,7 @@ impl Fixture {
     fn place(&self, copy: &CiphertextCopy, tier: Tier, reserve: u64) {
         let index = self.store.writer.index();
         let page = copy.ciphertext.envelope().page.clone();
-        let reservation = index.allocate(tier, reserve).unwrap();
+        let reservation = index.allocate_now(tier, reserve).unwrap();
         let generation = index.next_generation().unwrap();
         let charge = self
             .admission
@@ -1316,6 +1320,7 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
         assert_eq!(memory.publish(page.clone()), Err(Error::MissingKey));
         assert!(matches!(f.enqueue(page.copy()), Err(Error::MissingKey)));
         index.restore(snapshot).unwrap();
+        index.maintain_now();
         assert!(index.lookup(&id).unwrap().is_none());
         assert!(index.snapshot().unwrap().metadata.is_empty());
         assert_eq!(page.plaintext.bytes(), &[1; 3]);
@@ -1425,7 +1430,13 @@ fn delayed_write_keeps_its_leased_slot_through_eviction() {
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
     // Evict everything evictable while the write is in flight.
     let volume = f.store.writer.index().volume().unwrap();
-    while volume.evict_one(u64::MAX).is_some() {}
+    while drive(
+        &f.reactor,
+        volume.evict_one(&*f.reactor, u64::MAX, &scope()),
+    )
+    .unwrap()
+    .is_some()
+    {}
     drive(&f.reactor, progress).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert_eq!(f.store.writer.discarded_count(), 0);
@@ -1446,7 +1457,7 @@ fn checkpoint_infeasible_budget_does_not_disturb_an_inflight_writer() {
     let index = f.store.writer.index();
     index.publish_version(metadata.clone()).unwrap();
     index
-        .reserve_hold(
+        .reserve_hold_now(
             &metadata.version,
             1,
             uring_runtime::environment::wall_now() + Duration::from_secs(60),
@@ -2490,7 +2501,13 @@ fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
     assert!(f.admission.used(ResourceClass::DirtyCiphertext) > 0);
     // The submitted write keeps its slot leased even though queued work is gone.
     let volume = f.store.writer.index().volume().unwrap();
-    while volume.evict_one(u64::MAX).is_some() {}
+    while drive(
+        &f.reactor,
+        volume.evict_one(&*f.reactor, u64::MAX, &scope()),
+    )
+    .unwrap()
+    .is_some()
+    {}
     assert_eq!(volume.usage().records, 0);
     assert!(volume.usage().free_slots < FIXTURE_SLOTS - 1);
     drive(&f.reactor, write).unwrap();

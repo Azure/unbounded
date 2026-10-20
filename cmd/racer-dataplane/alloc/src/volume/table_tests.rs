@@ -22,8 +22,10 @@ fn new_table_has_meta_node_slot() {
         (SlotKind::Node, 4, 1)
     );
     assert_eq!(slots.usage().free_slots, SLOTS - 1);
-    let ops = slots.take_ops();
-    assert_eq!(ops[&META_SLOT].ident, Some(Ident::Node(1)));
+    assert!(
+        slots.take_ops().is_empty(),
+        "the meta summary comes with its bitmap"
+    );
     assert!(slots.take_dirty_nodes().contains(&META_SLOT));
     assert_eq!(slots.next_incarnation(), 2);
 }
@@ -220,6 +222,15 @@ fn slot_ops_merge_and_apply() {
     });
     assert_eq!(op.retain_max, Some(5));
     let summary = op.apply(None).unwrap();
+    let bitmap_only = SlotOp {
+        bitmap: Some((1, 7, 4)),
+        ..SlotOp::default()
+    };
+    let node = bitmap_only.apply(None).unwrap();
+    assert_eq!(
+        (node.kind, node.copy, node.bitmap_seq, node.incarnation),
+        (SLOT_NODE, 1, 7, 4)
+    );
     assert_eq!(
         (
             summary.kind,

@@ -68,6 +68,12 @@ pub struct Index {
     /// The mounted extent volume; `None` until `Store::open`.
     pub(super) volume: RefCell<Option<Rc<super::disk::DiskVolume>>>,
 
+    /// The worker reactor the volume's I/O runs on; set with the volume.
+    pub(super) reactor: RefCell<Option<Rc<crate::runtime::Reactor>>>,
+
+    /// Work queued by synchronous callers for `Index::maintain`.
+    pub(super) maintenance: RefCell<super::disk::Maintenance>,
+
     pub(super) holds: RefCell<super::holds::Holds>,
 
     pub(super) versions: RefCell<super::versions::VersionTable>,
@@ -176,6 +182,8 @@ impl Index {
                 counts: RefCell::new(HashMap::default()),
             }),
             volume: RefCell::new(None),
+            reactor: RefCell::new(None),
+            maintenance: RefCell::new(super::disk::Maintenance::default()),
             holds: RefCell::new(super::holds::Holds::default()),
             versions: RefCell::new(
                 super::versions::VersionTable::new(page_capacity)
@@ -571,26 +579,29 @@ mod tests {
         let held = page(&metadata, 0);
         disk.put(&index, &held, &metadata, key_id(), Tier::Cache);
         let until = until();
-        index.reserve_hold(&held.version, 2, until).unwrap();
-        index.reserve_hold(&held.version, 2, until).unwrap();
+        index.reserve_hold_now(&held.version, 2, until).unwrap();
+        index.reserve_hold_now(&held.version, 2, until).unwrap();
         index
-            .extend_hold(&held.version, until - Duration::from_secs(1))
+            .extend_hold_now(&held.version, until - Duration::from_secs(1))
             .unwrap();
         assert_eq!(index.hold_expiry(&held.version), Some(until));
         // A cache-tier page is protected only once rewritten to storage.
         assert_eq!(index.held_page_expiry(&held), None);
         assert!(!index.already_on_disk(&held).unwrap());
         let other = descriptor("other", 17).version;
-        assert_eq!(index.reserve_hold(&other, 3, until), Err(Error::Overloaded));
+        assert_eq!(
+            index.reserve_hold_now(&other, 3, until),
+            Err(Error::Overloaded)
+        );
         index.release_hold(&held.version).unwrap();
         assert_eq!(index.hold_expiry(&held.version), None);
-        index.reserve_hold(&other, 3, until).unwrap();
+        index.reserve_hold_now(&other, 3, until).unwrap();
         assert!(!index.is_held(&held));
         assert!(index.already_on_disk(&held).unwrap());
         index.release_hold(&other).unwrap();
         assert_eq!(index.hold_expiry(&other), None);
         assert_eq!(
-            index.reserve_hold(&other, usize::MAX, until),
+            index.reserve_hold_now(&other, usize::MAX, until),
             Err(Error::Overloaded)
         );
     }
@@ -602,7 +613,7 @@ mod tests {
         let metadata = descriptor("protected", 17);
         let held = page(&metadata, 0);
         let until = until();
-        index.reserve_hold(&held.version, 1, until).unwrap();
+        index.reserve_hold_now(&held.version, 1, until).unwrap();
         put_held(&disk, &index, &metadata, 0);
         let value = index.lookup(&held).unwrap().unwrap();
         assert_eq!(value.tier, Tier::Storage);
@@ -619,7 +630,7 @@ mod tests {
         // Fill every other slot with cache reservations, then ask for one more.
         let mut reservations = Vec::new();
         loop {
-            match index.allocate(Tier::Cache, SLOT_BYTES) {
+            match index.allocate_now(Tier::Cache, SLOT_BYTES) {
                 Ok(reservation) => reservations.push(reservation),
                 Err(error) => {
                     assert_eq!(error, Error::Overloaded);
@@ -642,7 +653,7 @@ mod tests {
         assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
         let mut reservations = Vec::new();
         while index.lookup(&cached).unwrap().is_some() {
-            reservations.push(index.allocate(Tier::Cache, SLOT_BYTES).unwrap());
+            reservations.push(index.allocate_now(Tier::Cache, SLOT_BYTES).unwrap());
         }
         assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
         assert_eq!(retention.snapshot().disk[0].slot_evicted_pages, 1);
@@ -656,11 +667,11 @@ mod tests {
         let disk = TestDisk::mount(&index, 8);
         let until = until();
         let first = descriptor("first", 17);
-        index.reserve_hold(&first.version, 2, until).unwrap();
+        index.reserve_hold_now(&first.version, 2, until).unwrap();
         assert_eq!(index.held_snapshot(), HeldSnapshot::default());
         put_held(&disk, &index, &first, 0);
         let second = descriptor("second", 3);
-        index.reserve_hold(&second.version, 1, until).unwrap();
+        index.reserve_hold_now(&second.version, 1, until).unwrap();
         put_held(&disk, &index, &second, 0);
         // An unheld cache page of the same size class is not counted.
         let other = descriptor("other", 5);
@@ -712,11 +723,11 @@ mod tests {
         let metadata = descriptor("partial", 17);
         let held = page(&metadata, 0);
         let until = until();
-        index.reserve_hold(&held.version, 2, until).unwrap();
+        index.reserve_hold_now(&held.version, 2, until).unwrap();
         assert_eq!(index.held_page_expiry(&held), None);
         put_held(&disk, &index, &metadata, 0);
         assert_eq!(
-            index.reserve_hold(&held.version, 5, until + Duration::from_secs(60)),
+            index.reserve_hold_now(&held.version, 5, until + Duration::from_secs(60)),
             Err(Error::Overloaded)
         );
         index.release_hold(&held.version).unwrap();
@@ -732,17 +743,17 @@ mod tests {
         let now = uring_runtime::environment::wall_now();
         // Before mount there is no slot to protect.
         assert_eq!(
-            unmounted.reserve_hold(&version, 1, now + Duration::from_secs(60)),
+            unmounted.reserve_hold_now(&version, 1, now + Duration::from_secs(60)),
             Err(Error::Overloaded)
         );
         let index = index(8);
         let _disk = TestDisk::mount(&index, 8);
         assert_eq!(
-            index.reserve_hold(&version, 1, now),
+            index.reserve_hold_now(&version, 1, now),
             Err(Error::InvalidConfiguration)
         );
         assert_eq!(
-            index.reserve_hold(
+            index.reserve_hold_now(
                 &version,
                 1,
                 now + super::super::holds::MAX_HOLD_TTL + Duration::from_secs(1)
@@ -750,7 +761,7 @@ mod tests {
             Err(Error::InvalidConfiguration)
         );
         index
-            .reserve_hold(&version, 2, now + Duration::from_secs(60))
+            .reserve_hold_now(&version, 2, now + Duration::from_secs(60))
             .unwrap();
         let page = PageId {
             version: version.clone(),
@@ -762,9 +773,10 @@ mod tests {
         index.release_hold(&version).unwrap();
         assert_eq!(index.hold_expiry(&version), None);
         index
-            .reserve_hold(&version, 1, now + Duration::from_secs(60))
+            .reserve_hold_now(&version, 1, now + Duration::from_secs(60))
             .unwrap();
         index.remove_cache(&version.object.cache);
+        index.maintain_now();
         assert_eq!(index.hold_expiry(&version), None);
     }
 
@@ -775,7 +787,7 @@ mod tests {
         let version = descriptor("ttl", 17).version;
         let now = uring_runtime::environment::wall_now();
         index
-            .reserve_hold(&version, 1, now + Duration::from_secs(60))
+            .reserve_hold_now(&version, 1, now + Duration::from_secs(60))
             .unwrap();
         let key = version_key(&version);
         index
@@ -803,11 +815,11 @@ mod tests {
         let disk = TestDisk::mount(&index, 16);
         let until = until();
         let held = descriptor("held", 2 * crate::model::PAGE_BYTES);
-        index.reserve_hold(&held.version, 2, until).unwrap();
+        index.reserve_hold_now(&held.version, 2, until).unwrap();
         put_held(&disk, &index, &held, 0);
         put_held(&disk, &index, &held, 1);
         let long = descriptor("long", 17);
-        index.reserve_hold(&long.version, 1, until).unwrap();
+        index.reserve_hold_now(&long.version, 1, until).unwrap();
         put_held(&disk, &index, &long, 0);
         let volume = index.volume().unwrap();
         let long_key = crate::store::key::volume_key(&page(&long, 0)).unwrap();
@@ -816,17 +828,29 @@ mod tests {
             .unwrap()
             .as_secs();
         // A deadline beyond the maximum TTL is clamped at mount.
-        volume.set_retain(&long_key, now + 40 * 24 * 60 * 60);
+        disk.drive(volume.set_retain(
+            &*disk.reactor,
+            &long_key,
+            now + 40 * 24 * 60 * 60,
+            &crate::store::test_disk::scope(),
+        ))
+        .unwrap();
         let expired = descriptor("expired", 17);
-        index.reserve_hold(&expired.version, 1, until).unwrap();
+        index.reserve_hold_now(&expired.version, 1, until).unwrap();
         put_held(&disk, &index, &expired, 0);
         let expired_key = crate::store::key::volume_key(&page(&expired, 0)).unwrap();
-        volume.set_retain(&expired_key, now - 1);
+        disk.drive(volume.set_retain(
+            &*disk.reactor,
+            &expired_key,
+            now - 1,
+            &crate::store::test_disk::scope(),
+        ))
+        .unwrap();
         drop(volume);
         disk.commit(&index);
         // Published after the commit, so the crash loses it.
         let lost = descriptor("lost", 17);
-        index.reserve_hold(&lost.version, 1, until).unwrap();
+        index.reserve_hold_now(&lost.version, 1, until).unwrap();
         put_held(&disk, &index, &lost, 0);
         let fresh = Index::new(WorkerId(0), 8, crate::test_support::availability());
         let _disk = disk.crash(&fresh);
@@ -850,7 +874,7 @@ mod tests {
         assert_eq!(fresh.hold_expiry(&expired.version), None);
         assert!(fresh.lookup(&page(&expired, 0)).unwrap().is_some());
         assert_eq!(fresh.hold_expiry(&lost.version), None);
-        assert!(fresh.disk_entry(&page(&lost, 0)).is_none());
+        assert!(fresh.disk_entry_now(&page(&lost, 0)).is_none());
         // Recovered holds do not block startup configuration.
         fresh.set_hold_capacity_percent(10).unwrap();
         assert_eq!(
@@ -879,8 +903,10 @@ mod tests {
         let _disk = disk.crash(&fresh);
         assert_eq!(fresh.retention().snapshot().indexed_payload_bytes, 0);
         fresh.restore(snapshot).unwrap();
+        fresh.maintain_now();
         assert_eq!(fresh.retention().snapshot().indexed_payload_bytes, 17);
         fresh.remove_cache(&metadata.version.object.cache);
+        fresh.maintain_now();
         assert_eq!(fresh.retention().snapshot().indexed_payload_bytes, 0);
     }
 
@@ -890,14 +916,14 @@ mod tests {
         let disk = TestDisk::mount(&index, 16);
         let held = descriptor("held", 17);
         let first = until();
-        assert!(!index.reserve_hold(&held.version, 1, first).unwrap());
+        assert!(!index.reserve_hold_now(&held.version, 1, first).unwrap());
         put_held(&disk, &index, &held, 0);
         disk.commit(&index);
         let second = first + Duration::from_secs(600);
-        assert!(index.extend_hold(&held.version, second).unwrap());
+        assert!(index.extend_hold_now(&held.version, second).unwrap());
         assert!(index.is_dirty());
         // Repeating the same deadline changes nothing on disk.
-        assert!(!index.extend_hold(&held.version, second).unwrap());
+        assert!(!index.extend_hold_now(&held.version, second).unwrap());
 
         // A crash before the commit rebuilds the hold from the old deadline.
         let lost = Index::new(WorkerId(0), 8, crate::test_support::availability());
@@ -906,7 +932,7 @@ mod tests {
         assert!(deadline >= first && deadline < first + Duration::from_secs(1));
 
         // After a commit the extension survives a restart.
-        assert!(lost.extend_hold(&held.version, second).unwrap());
+        assert!(lost.extend_hold_now(&held.version, second).unwrap());
         disk.commit(&lost);
         let fresh = Index::new(WorkerId(0), 8, crate::test_support::availability());
         let _disk = disk.crash(&fresh);
@@ -936,6 +962,7 @@ mod tests {
         assert_eq!(snapshot.versions.len(), 1);
         assert_eq!(snapshot.versions[0].key_ids, vec![key_id()]);
         index.restore(snapshot.clone()).unwrap();
+        index.maintain_now();
         assert_eq!(
             index.version(&resident.version).unwrap(),
             Some(metadata.clone())
@@ -943,6 +970,7 @@ mod tests {
         let value = index.lookup(&resident).unwrap().unwrap();
         index.remove_if_matches(&resident, &value);
         index.restore(snapshot).unwrap();
+        index.maintain_now();
         assert!(index.version(&resident.version).unwrap().is_none());
     }
 
@@ -959,7 +987,7 @@ mod tests {
             racer_control_wire::KeyId([99; 16]),
             Tier::Cache,
         ));
-        assert!(index.disk_entry(&resident).is_none());
+        assert!(index.disk_entry_now(&resident).is_none());
         assert!(index.lookup(&resident).unwrap().is_none());
     }
 
@@ -982,7 +1010,7 @@ mod tests {
             let key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();
             let mut metadata = descriptor("purge", 2 * crate::model::PAGE_BYTES);
             metadata.version.object.cache = cache.clone();
-            index.reserve_hold(&metadata.version, 1, until).unwrap();
+            index.reserve_hold_now(&metadata.version, 1, until).unwrap();
             let held = page(&metadata, 0);
             let ticket = index.hold_ticket(&held).unwrap();
             disk.put(&index, &held, &metadata, key_id, Tier::Storage);
@@ -992,7 +1020,7 @@ mod tests {
             pages.push((held, cached));
         }
         assert_eq!(index.disk_len(), 4);
-        assert_eq!(index.retain_caches(std::slice::from_ref(&kept)), 2);
+        assert_eq!(index.retain_caches_now(std::slice::from_ref(&kept)), 2);
         assert_eq!(index.disk_len(), 2);
         let (kept_held, kept_cached) = &pages[0];
         assert!(index.is_held(kept_held));
@@ -1000,8 +1028,8 @@ mod tests {
         assert!(index.version(&kept_held.version).unwrap().is_some());
         let (removed_held, removed_cached) = &pages[1];
         assert!(!index.is_held(removed_held));
-        assert!(index.disk_entry(removed_held).is_none());
-        assert!(index.disk_entry(removed_cached).is_none());
+        assert!(index.disk_entry_now(removed_held).is_none());
+        assert!(index.disk_entry_now(removed_cached).is_none());
         assert!(
             index
                 .snapshot()
@@ -1011,8 +1039,8 @@ mod tests {
                 .all(|entry| entry.version.object.cache == kept)
         );
         // Purging is idempotent, and no accepted cache removes everything.
-        assert_eq!(index.retain_caches(std::slice::from_ref(&kept)), 0);
-        assert_eq!(index.retain_caches(&[]), 2);
+        assert_eq!(index.retain_caches_now(std::slice::from_ref(&kept)), 0);
+        assert_eq!(index.retain_caches_now(&[]), 2);
         assert_eq!(index.disk_len(), 0);
         assert!(!index.is_held(kept_held));
     }
@@ -1055,6 +1083,7 @@ mod tests {
         assert!(index.lookup(&resident).unwrap().is_some());
         assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
         index.remove_cache(&resident.version.object.cache);
+        index.maintain_now();
         assert!(index.lookup(&resident).unwrap().is_none());
         assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
         assert_eq!(
@@ -1152,6 +1181,7 @@ mod tests {
         assert!(index.current(&m.version.object).unwrap().is_some());
         let snapshot = index.snapshot().unwrap();
         index.restore(snapshot).unwrap();
+        index.maintain_now();
         assert!(index.current(&m.version.object).unwrap().is_none());
         assert_eq!(index.version(&m.version).unwrap(), Some(m));
     }

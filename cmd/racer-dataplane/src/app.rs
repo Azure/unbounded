@@ -1349,6 +1349,7 @@ impl WorkerApplication {
             limits.queue_entries.get(),
             disk_page_entries,
         )?;
+        writer.set_metadata_cache_bytes(config.disk_metadata_cache_bytes.get());
         // Install once before Fill attaches current-membership ownership. The
         // writer, index, and volume eviction accounting all consult this same
         // worker policy.
@@ -1670,17 +1671,27 @@ impl WorkerApplication {
             return Err(error);
         }
         let now = uring_runtime::environment::now();
-        if lazy_commit_due(
-            self.last_commit,
-            now,
-            self.store.writer.index().is_dirty(),
-            self.commit_task.is_some(),
-            self.stopping,
-        ) {
+        let index = self.store.writer.index();
+        // Queued maintenance (prefetches for memory-only callers, cache
+        // removals) and a full dirty limit do not wait for the interval.
+        let urgent = (index.maintenance_due() || index.needs_commit())
+            && self.commit_task.is_none()
+            && !self.stopping;
+        if urgent
+            || lazy_commit_due(
+                self.last_commit,
+                now,
+                index.is_dirty(),
+                self.commit_task.is_some(),
+                self.stopping,
+            )
+        {
             self.last_commit = Some(now);
             let writer = self.store.writer.clone();
             let commit_scope = scope(self.timeout)?;
-            self.commit_task = Some(Box::pin(async move { writer.commit(&commit_scope).await }));
+            self.commit_task = Some(Box::pin(
+                async move { writer.maintain(&commit_scope).await },
+            ));
         }
         Ok(())
     }

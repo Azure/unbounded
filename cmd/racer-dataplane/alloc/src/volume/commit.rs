@@ -750,7 +750,7 @@ impl<C: Charge> Volume<C> {
                 changes.entry(*slot).or_default();
             }
             // Bitmaps this commit writes: the copy that is not durable.
-            let written: Vec<(u32, u8)> = {
+            let written: Vec<(u32, u8, u32)> = {
                 let state = self.shared.state();
                 let mut dirty = state.slots.dirty_nodes().clone();
                 dirty.extend(released_slots.iter().copied());
@@ -760,13 +760,13 @@ impl<C: Charge> Volume<C> {
                         state
                             .slots
                             .node_copy(slot)
-                            .map(|(copy, _, _)| (slot, 1 - copy))
+                            .map(|(copy, _, incarnation)| (slot, 1 - copy, incarnation))
                     })
                     .collect()
             };
-            for (slot, copy) in &written {
+            for (slot, copy, incarnation) in &written {
                 changes.entry(*slot).or_default().merge(&SlotOp {
-                    bitmap: Some((*copy, seq)),
+                    bitmap: Some((*copy, seq, *incarnation)),
                     ..SlotOp::default()
                 });
             }

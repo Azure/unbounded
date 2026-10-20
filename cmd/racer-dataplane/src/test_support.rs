@@ -292,6 +292,7 @@ pub mod cluster {
             peer_receive: Default::default(),
             shares: NonZeroU32::new(4).unwrap(),
             disk_page_entries: NonZeroUsize::new(65536).unwrap(),
+            disk_metadata_cache_bytes: NonZeroUsize::new(64 << 20).unwrap(),
             admission_mode: crate::config::AdmissionMode::SecondSight,
             admission_history_bytes: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
             admission_period: Duration::from_secs(60),

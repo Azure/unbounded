@@ -1585,6 +1585,18 @@ impl<C: Charge> Volume<C> {
         })
     }
 
+    /// Remove `key` if its value is `expected`, from memory only. Returns
+    /// whether it was removed; `false` also when answering needs a page read.
+    pub fn remove_cached(&self, key: &Key, expected: &Value) -> bool {
+        if self.try_get(key) != Some(Some(*expected)) {
+            return false;
+        }
+        self.shared
+            .state()
+            .set(*key, IndexOp::Delete, Some(Some(*expected)));
+        true
+    }
+
     /// Remove every entry with a key in `(low, high)`, a batch at a time.
     /// Returns the removed entries in key order.
     pub fn remove_range<'a, S: Scope, B: Budget>(

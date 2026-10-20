@@ -162,7 +162,7 @@ fn completed_extension(refuse: bool) {
     pressure.etag = crate::model::StrongEtag::test_value("pressure");
     if refuse {
         delayed_index
-            .reserve_hold(
+            .reserve_hold_now(
                 &pressure,
                 8,
                 uring_runtime::environment::wall_now() + Duration::from_secs(30),
@@ -662,7 +662,7 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
         .dependencies
         .writer
         .index()
-        .reserve_hold(
+        .reserve_hold_now(
             &other,
             7,
             uring_runtime::environment::wall_now() + Duration::from_secs(30),
@@ -1092,7 +1092,7 @@ fn warm_hold_commit_failure_releases_reserved_capacity() {
     // Raise the published page's deadline in memory so the next hold must
     // commit, then fail that commit. The HEAD has reserved all seven pages.
     index
-        .reserve_hold(
+        .reserve_hold_now(
             &f.page.version,
             1,
             uring_runtime::environment::wall_now() + Duration::from_secs(600),
@@ -1127,7 +1127,7 @@ fn warm_hold_commit_failure_releases_reserved_capacity() {
     let mut other = f.page.version.clone();
     other.etag = crate::model::StrongEtag::test_value("other-hold");
     index
-        .reserve_hold(
+        .reserve_hold_now(
             &other,
             7,
             uring_runtime::environment::wall_now() + Duration::from_secs(30),

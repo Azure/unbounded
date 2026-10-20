@@ -44,8 +44,7 @@ mod simulation {
         assert!(report.formatted);
         assert_eq!((report.seq, report.entries), (1, 0));
         assert_eq!(volume.slot_count(), SLOTS);
-        assert!(volume.is_dirty(), "the meta slot entry is not recorded yet");
-        commit(&reactor, &volume).unwrap();
+        // A fresh format has nothing to commit.
         assert!(!volume.is_dirty());
         let mut expected = Vec::new();
         for n in 0..300 {
@@ -70,7 +69,7 @@ mod simulation {
         assert!(volume.is_dirty());
         assert_eq!(volume.len(), 300);
         commit(&reactor, &volume).unwrap();
-        assert_eq!(volume.commit_stats().succeeded, 2);
+        assert_eq!(volume.commit_stats().succeeded, 1);
         // Retired pages drain within two commits; then a commit with
         // nothing to do writes nothing.
         let mut drains = 0;

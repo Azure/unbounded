@@ -250,8 +250,9 @@ pub struct SlotOp {
     /// `retain_max`.
     pub retain_set: Option<u64>,
 
-    /// Node slot: the bitmap copy and seq a commit wrote.
-    pub bitmap: Option<(u8, u64)>,
+    /// Node slot: the bitmap copy and seq a commit wrote, and the slot's
+    /// incarnation (which creates the summary if the table has none).
+    pub bitmap: Option<(u8, u64, u32)>,
 
     /// The first queued change took a slot that was free: freeing it again
     /// cancels the whole entry.
@@ -304,7 +305,15 @@ impl SlotOp {
                 incarnation,
                 ..SlotSummary::default()
             },
-            None => old?,
+            None => match (old, self.bitmap) {
+                (Some(old), _) => old,
+                (None, Some((_, _, incarnation))) => SlotSummary {
+                    kind: SLOT_NODE,
+                    incarnation,
+                    ..SlotSummary::default()
+                },
+                (None, None) => return None,
+            },
         };
         if let Some(set) = self.retain_set {
             summary.retain_until = set;
@@ -312,7 +321,7 @@ impl SlotOp {
         if let Some(max) = self.retain_max {
             summary.retain_until = summary.retain_until.max(max);
         }
-        if let Some((copy, seq)) = self.bitmap
+        if let Some((copy, seq, _)) = self.bitmap
             && summary.kind == SLOT_NODE
         {
             summary.copy = copy;
@@ -452,15 +461,9 @@ impl Slots {
     /// `InvalidConfiguration` outside `MIN_SLOTS..=MAX_SLOTS`.
     pub fn new(slot_count: u64, limits: Limits) -> Result<Self> {
         let mut table = Self::empty(slot_count, limits)?;
+        // The meta slot's summary is written with its first bitmap.
         table.init_node(META_SLOT, 1);
         table.next_incarnation = 2;
-        table.ops.insert(
-            META_SLOT,
-            SlotOp {
-                ident: Some(Ident::Node(1)),
-                ..SlotOp::default()
-            },
-        );
         table.rebuild_free();
         table.sync_used(META_SLOT);
         table.refresh(META_SLOT);

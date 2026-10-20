@@ -211,7 +211,7 @@ impl StoreReader {
             };
             let value = match self.metrics.lookup(
                 crate::telemetry::LookupTier::DiskIndex,
-                self.index.lookup(page),
+                self.index.lookup_value(page, scope).await,
             )? {
                 Some(value) => value,
                 None => return Ok(None),
@@ -297,7 +297,8 @@ impl StoreReader {
             // A concurrent retirement/removal must not resurrect a completed copy.
             if self
                 .index
-                .lookup(page)?
+                .lookup_value(page, scope)
+                .await?
                 .is_none_or(|current| current != value)
             {
                 return Ok(None);
@@ -393,6 +394,8 @@ pub struct StoreWriter {
     availability: Rc<crate::control::Availability>,
     discarded: Cell<u64>,
     closed: Cell<bool>,
+    /// Byte budget of the volume's metadata page cache, used at mount.
+    metadata_cache_bytes: Cell<usize>,
 }
 impl StoreWriter {
     pub fn retention(&self) -> Rc<crate::retention::Retention> {
@@ -427,7 +430,28 @@ impl StoreWriter {
             availability,
             discarded: Cell::new(0),
             closed: Cell::new(false),
+            metadata_cache_bytes: Cell::new(crate::store::disk::DEFAULT_METADATA_CACHE_BYTES),
         }
+    }
+    /// Startup only, before `open`: the byte budget of the volume's metadata
+    /// page cache. A mounted volume keeps its budget.
+    pub fn set_metadata_cache_bytes(&self, bytes: usize) {
+        self.metadata_cache_bytes.set(bytes.max(1));
+        if let Some(volume) = self.index.volume() {
+            volume.set_metadata_cache_bytes(bytes.max(1));
+        }
+    }
+    /// Run queued index maintenance (see `Index::maintain`), including
+    /// evictions that keep free slots ahead of allocation, then commit when
+    /// the volume is dirty. The lazy committer drives this.
+    pub fn maintain<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(async move {
+            self.index.maintain(scope, true).await?;
+            if self.index.is_dirty() {
+                self.commit(scope).await?;
+            }
+            Ok(())
+        })
     }
     pub fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
@@ -471,20 +495,23 @@ impl StoreWriter {
             let mut volume_id = [0; 16];
             getrandom::getrandom(&mut volume_id).map_err(|_| Error::Unavailable)?;
             let admission = self.admission.clone();
-            let options = VolumeOptions {
-                limits: self.index.volume_limits(slots),
+            let mut options = VolumeOptions::new(
+                self.index.volume_limits(slots),
                 volume_id,
-                format: true,
-                charge: Rc::new(move |length| {
+                true,
+                Rc::new(move |length| {
                     admission
                         .reserve_completion(None, ResourceClass::Ciphertext, length)
                         .map_err(|_| page_alloc::Error::Busy)
                 }),
-            };
+            );
+            options.metadata_cache_bytes = self.metadata_cache_bytes.get();
             let (volume, report) =
                 Volume::mount(&*self.reactor, self.slabs.clone(), options, scope).await?;
             let alignment = volume.alignment();
-            self.index.install_volume(volume, &report);
+            self.index
+                .install_volume(volume, self.reactor.clone(), &report, scope)
+                .await?;
             // Mount buffers return to the slab's idle pool still charged.
             self.slabs.reclaim_idle();
             Ok(alignment)
@@ -549,7 +576,8 @@ impl StoreWriter {
             }
             if self
                 .index
-                .lookup(&id)?
+                .lookup_value(&id, scope)
+                .await?
                 .is_some_and(|value| value.tier == Tier::Storage)
                 && self.index.held_page_expiry(&id).is_some()
             {
@@ -600,7 +628,11 @@ impl StoreWriter {
             // to the hold, so this reports `Unavailable` instead of a durable
             // held copy. The same applies when the page lost its storage-tier
             // publication for another reason, such as cache or key removal.
-            let value = self.index.lookup(&id)?.ok_or(Error::Io)?;
+            let value = self
+                .index
+                .lookup_value(&id, scope)
+                .await?
+                .ok_or(Error::Io)?;
             if value.tier != Tier::Storage || self.index.held_page_expiry(&id).is_none() {
                 return Err(Error::Unavailable);
             }
@@ -685,8 +717,10 @@ impl StoreWriter {
             return Err(Error::CorruptRecord);
         }
         // Zero denotes already on disk: no pending ticket or second write. A
-        // held page in the cache tier is rewritten to the storage tier.
-        if self.index.already_on_disk(&id)? {
+        // held page in the cache tier is rewritten to the storage tier. Only
+        // pages whose index entry is in memory are known here; the writer
+        // checks again before writing.
+        if self.index.already_on_disk_cached(&id) {
             return Ok(0);
         }
         let mut pending = self.pending.borrow_mut();
@@ -1030,7 +1064,7 @@ impl StoreWriter {
             return Ok(());
         }
         // Recovery or another publisher may have written the page since enqueue.
-        if self.index.already_on_disk(id)? {
+        if self.index.already_on_disk_async(id, scope).await? {
             return Ok(());
         }
         let alignment = self.slabs.alignment()?;
@@ -1056,7 +1090,7 @@ impl StoreWriter {
         } else {
             Tier::Cache
         };
-        let reservation = self.index.allocate(tier, disk_bytes as u64)?;
+        let reservation = self.index.allocate(tier, disk_bytes as u64, scope).await?;
         let generation = self.index.next_generation()?;
         let encoded = encode_at(page, Generation(generation), alignment, 0, buffer)?;
         let volume = self.index.volume().ok_or(Error::Unavailable)?;
@@ -1139,7 +1173,9 @@ impl StoreWriter {
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
-            self.index.reserve_hold(version, pages, until)?;
+            self.index
+                .reserve_hold(version, pages, until, scope)
+                .await?;
             self.commit(scope).await
         })
     }

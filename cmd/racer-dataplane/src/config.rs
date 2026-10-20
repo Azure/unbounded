@@ -104,6 +104,10 @@ pub struct Config {
     pub peer_receive: crate::peer::receive::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
+    /// Per-worker byte budget of the extent volume's metadata page cache.
+    /// The disk index lives on disk; this bounds how much of it stays in
+    /// memory. Cold lookups read pages from disk.
+    pub disk_metadata_cache_bytes: NonZeroUsize,
     pub admission_mode: AdmissionMode,
     /// Node-wide Bloom history, divided by final I/O worker count.
     pub admission_history_bytes: NonZeroUsize,
@@ -225,6 +229,10 @@ impl Config {
             },
             shares: nonzero_u32(raw.shares.unwrap_or(u64::from(DEFAULT_SHARES)))?,
             disk_page_entries: nonzero_usize(raw.disk_page_entries.unwrap_or(65536))?,
+            disk_metadata_cache_bytes: nonzero_usize(
+                raw.disk_metadata_cache_bytes
+                    .unwrap_or(crate::store::disk::DEFAULT_METADATA_CACHE_BYTES as u64),
+            )?,
             admission_mode: match raw.admission_mode.as_deref().unwrap_or("second-sight") {
                 "disabled" => AdmissionMode::Disabled,
                 "second-sight" => AdmissionMode::SecondSight,
@@ -415,6 +423,8 @@ impl Config {
         self.peer_receive.validate()?;
         self.peer_admission.validate()?;
         if self.disk_page_entries.get() > MAX_ENTRIES
+            || !(MIB as usize..=64 * 1024 * MIB as usize)
+                .contains(&self.disk_metadata_cache_bytes.get())
             || self.checkpoint_bytes.get() > 512 * MIB as usize
             || !(32..=512 * MIB as usize).contains(&self.admission_history_bytes.get())
             || self.admission_period < Duration::from_secs(1)
@@ -640,6 +650,7 @@ const ENV_NAMES: &[&str] = &[
     "RELAY_TRANSFERS",
     "ORIGIN_CONNECTIONS_PER_CACHE",
     "DISK_PAGE_ENTRIES",
+    "DISK_METADATA_CACHE_BYTES",
     "ADMISSION_HISTORY_BYTES",
     "CHECKPOINT_BYTES",
     "SEND_CRC_PAIR",
@@ -781,6 +792,8 @@ struct RawConfig {
     origin_connections_per_cache: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     disk_page_entries: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    disk_metadata_cache_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     admission_history_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]

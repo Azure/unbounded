@@ -4441,7 +4441,7 @@ fn corrupt_held_storage_page_is_repaired_to_storage_tier_by_fill() {
         let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
         let index = f.fill.dependencies.writer.index().clone();
         let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-        index.reserve_hold(&f.page.version, 1, until).unwrap();
+        index.reserve_hold_now(&f.page.version, 1, until).unwrap();
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
         drop(acquire(&mut f, &mut budget).unwrap());
         assert_eq!(

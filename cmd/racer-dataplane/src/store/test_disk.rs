@@ -64,16 +64,16 @@ impl TestDisk {
     /// and install it into `index`.
     pub(crate) fn remount(&self, index: &Index) {
         let admission = self.admission.clone();
-        let options = VolumeOptions {
-            limits: index.volume_limits(self.slab.capacity_bytes() / SLOT_BYTES),
-            volume_id: [7; 16],
-            format: true,
-            charge: Rc::new(move |length| {
+        let options = VolumeOptions::new(
+            index.volume_limits(self.slab.capacity_bytes() / SLOT_BYTES),
+            [7; 16],
+            true,
+            Rc::new(move |length| {
                 admission
                     .reserve_completion(None, ResourceClass::Ciphertext, length)
                     .map_err(|_| page_alloc::Error::Busy)
             }),
-        };
+        );
         let scope = scope();
         let (volume, report) = self
             .drive(Volume::mount(
@@ -83,7 +83,8 @@ impl TestDisk {
                 &scope,
             ))
             .unwrap();
-        index.install_volume(volume, &report);
+        self.drive(index.install_volume(volume, self.reactor.clone(), &report, &scope))
+            .unwrap();
     }
 
     /// Drop the volume and slab, lose every write that was not synced, and
@@ -175,7 +176,7 @@ impl TestDisk {
         tier: Tier,
         reserve: u64,
     ) -> bool {
-        let reservation = index.allocate(tier, reserve).unwrap();
+        let reservation = index.allocate_now(tier, reserve).unwrap();
         let generation = index.next_generation().unwrap();
         let charge = self
             .admission
@@ -199,9 +200,12 @@ impl TestDisk {
             .unwrap()
     }
 
-    /// Commit the volume index.
+    /// Run queued index maintenance, then commit the volume index.
     pub(crate) fn commit(&self, index: &Index) {
         let scope = scope();
+        while index.maintenance_due() {
+            self.drive(index.maintain(&scope, false)).unwrap();
+        }
         self.drive(index.commit(&self.reactor, &scope)).unwrap();
     }
 }
@@ -217,7 +221,7 @@ impl Index {
 
     /// Byte offset and length of a page's record, for corruption tests.
     pub(crate) fn record_extent(&self, page: &PageId) -> Option<(u64, u64)> {
-        self.disk_entry(page)
+        self.disk_entry_now(page)
             .map(|(_, value)| (value.offset(), u64::from(value.length)))
     }
 }

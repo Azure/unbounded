@@ -517,7 +517,12 @@ impl WorkerApplication {
             .iter()
             .map(|cache| cache.id.clone())
             .collect();
-        let purged = self.store.writer.index().retain_caches(&accepted);
+        let purged = self
+            .store
+            .writer
+            .index()
+            .retain_caches(&accepted, startup)
+            .await?;
         if purged != 0 {
             eprintln!(
                 "racer: worker {} removed {purged} disk pages of removed caches",

@@ -6,6 +6,16 @@
 //! ([`Index::install_volume`]): it is wired into readers, writers, and recovery
 //! at construction. Until the mount the disk is empty, so lookups miss and
 //! allocations fail with `Unavailable`.
+//!
+//! The volume's index lives on disk behind a bounded page cache, so lookups
+//! that miss the cache read pages. Async paths (`lookup`, `allocate`,
+//! `already_on_disk`, holds) await those reads. Synchronous callers use
+//! memory-only answers ([`Index::already_on_disk_cached`],
+//! [`Index::resident_pages_after`], [`Index::held_snapshot`]) and queue the
+//! rest as maintenance, which the lazy committer runs
+//! ([`Index::maintain`]): cache removals, record invalidations, page
+//! prefetches, the startup restore of version descriptors and residency, and
+//! a small reserve of free slots evicted ahead of allocation.
 
 use super::catalog::DiskPage;
 use super::catalog::HeldSnapshot;
@@ -41,12 +51,57 @@ pub type DiskVolume = Volume<Charge>;
 /// Slots a foreground allocation may evict before giving up with `Overloaded`.
 pub const EVICTION_BUDGET: usize = 64;
 
-/// Index entries visited per batch by full scans.
+/// Index entries visited per batch by scans.
 const SCAN_BATCH: usize = 4096;
 
 /// Slots kept out of the hold quota: the meta slot and one cache slot, so cache
 /// writes and commits can always make progress.
 const RESERVED_SLOTS: u64 = 2;
+
+/// Free slots maintenance keeps ahead of allocation, so foreground writes
+/// rarely evict.
+const FREE_SLOT_RESERVE: u64 = 2;
+
+/// Slots maintenance evicts per run to keep the reserve.
+const RESERVE_EVICTIONS: usize = 2;
+
+/// Version descriptors the startup restore handles per maintenance run.
+const RESTORE_BATCH: usize = 256;
+
+/// Most queued page prefetches and invalidations kept; more are dropped
+/// (prefetches) or retried by the reader (invalidations).
+const MAINTENANCE_QUEUE: usize = 4096;
+
+/// Default byte budget of the volume's metadata page cache per worker.
+pub const DEFAULT_METADATA_CACHE_BYTES: usize = 256 << 20;
+
+/// How long a test scope lives.
+#[cfg(test)]
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Work queued by synchronous callers for the async maintenance pass.
+#[derive(Default)]
+pub(crate) struct Maintenance {
+    /// Caches whose pages are being removed: cache hash, the first
+    /// generation not covered (newer pages are kept), and the resume cursor.
+    removals: Vec<([u8; CACHE_HASH_BYTES], u64, Option<Key>)>,
+    /// Entries to remove while they still have this generation.
+    invalidations: Vec<(Key, u64)>,
+    /// Index keys whose pages memory-only callers needed.
+    prefetch: Vec<Key>,
+    /// Version descriptors restored at startup and not yet checked against
+    /// the volume.
+    restore: Vec<VersionKey>,
+}
+
+impl Maintenance {
+    fn is_empty(&self) -> bool {
+        self.removals.is_empty()
+            && self.invalidations.is_empty()
+            && self.prefetch.is_empty()
+            && self.restore.is_empty()
+    }
+}
 
 /// Seconds since the Unix epoch, now.
 fn now_unix() -> u64 {
@@ -90,63 +145,23 @@ fn key_version(key: &Key) -> VersionKey {
     out
 }
 
+/// A scope for test wrappers.
+#[cfg(test)]
+fn maintenance_scope() -> Result<RequestScope> {
+    RequestScope::new(
+        crate::model::RequestId([0; 16]),
+        uring_runtime::environment::now() + MAINTENANCE_TIMEOUT,
+    )
+}
+
 impl Index {
-    /// Keep recovered descriptors only for versions with pages on the volume.
-    pub(super) fn restore_versions(&self, entries: Vec<VersionEntry>) {
-        let volume = self.volume();
-        let mut versions = self.versions.borrow_mut();
-        versions.clear();
-        let Some(volume) = volume else {
-            return;
-        };
-        for entry in entries {
-            let key = version_key(&entry.version);
-            if !volume.range(low(&key), high(&key), 1).is_empty() {
-                // A hash collision keeps the first entry; reads verify identity.
-                let _ = versions.insert(entry);
-            }
-        }
-        drop(versions);
-        self.restore_residents(&volume);
-    }
-
-    /// Track retention residency and indexed payload bytes of mounted pages
-    /// whose version is known, as publication does for new pages.
-    fn restore_residents(&self, volume: &DiskVolume) {
-        let versions = self.versions.borrow();
-        let mut residents = self.residents.borrow_mut();
-        let retention = self.retention();
-        let mut cursor: Option<Key> = None;
-        loop {
-            let batch = volume.next_after(cursor.as_ref(), SCAN_BATCH);
-            let Some((last, _)) = batch.last() else {
-                break;
-            };
-            cursor = Some(*last);
-            for (key, _) in batch {
-                let Some(entry) = versions.get(&key_version(&key)) else {
-                    continue;
-                };
-                let page = PageId {
-                    version: entry.version.clone(),
-                    number: PageNumber(u64::from(key.page())),
-                };
-                let Ok(payload) = entry.metadata.page_length(&page) else {
-                    continue;
-                };
-                if let std::collections::hash_map::Entry::Vacant(slot) = residents.entry(key)
-                    && let Ok(mut resident) = self.track(&page)
-                {
-                    let payload = u64::from(payload);
-                    resident.payload = Some(retention.payload(payload, true));
-                    slot.insert((resident, payload));
-                }
-            }
-        }
-    }
-
     pub(crate) fn volume(&self) -> Option<Rc<DiskVolume>> {
         self.volume.borrow().clone()
+    }
+
+    /// The mounted volume and the reactor its I/O runs on.
+    fn io(&self) -> Option<(Rc<DiskVolume>, Rc<Reactor>)> {
+        Some((self.volume()?, self.reactor.borrow().clone()?))
     }
 
     /// Whether the extent volume is mounted.
@@ -184,7 +199,17 @@ impl Index {
 
     /// Bind the mounted volume and rebuild hard holds from its live storage
     /// entries. Startup only, before requests are admitted.
-    pub(crate) fn install_volume(&self, volume: Rc<DiskVolume>, report: &MountReport) {
+    ///
+    /// Only storage slots whose retention bound has not passed can hold live
+    /// holds; their entries come from the volume's record map, so this reads
+    /// no cache-tier index pages.
+    pub(crate) async fn install_volume(
+        &self,
+        volume: Rc<DiskVolume>,
+        reactor: Rc<Reactor>,
+        report: &MountReport,
+        scope: &RequestScope,
+    ) -> Result<()> {
         if report.formatted {
             eprintln!(
                 "racer: worker {} formatted a new disk volume of {} slots",
@@ -194,19 +219,12 @@ impl Index {
         }
         if report.fell_back || report.root_lost || !report.lost.is_empty() {
             eprintln!(
-                "racer: worker {} disk index repaired: fell_back={} root_lost={} lost_ranges={} salvaged={}",
+                "racer: worker {} disk metadata repaired: fell_back={} root_lost={} lost_ranges={} rebuilt_bitmaps={}",
                 self.worker().0,
                 report.fell_back,
                 report.root_lost,
                 report.lost.len(),
-                report.salvaged
-            );
-        }
-        if !report.dropped.is_empty() {
-            eprintln!(
-                "racer: worker {} disk index dropped {} malformed entries",
-                self.worker().0,
-                report.dropped.len()
+                report.rebuilt_bitmaps
             );
         }
         let wall = uring_runtime::environment::wall_now();
@@ -215,14 +233,8 @@ impl Index {
         let ceiling = now.saturating_add(MAX_HOLD_TTL.as_secs());
         let mut entries: HashMap<VersionKey, Hold> = HashMap::default();
         let mut clamped = 0u64;
-        let mut cursor: Option<Key> = None;
-        loop {
-            let batch = volume.next_after(cursor.as_ref(), SCAN_BATCH);
-            let Some((last, _)) = batch.last() else {
-                break;
-            };
-            cursor = Some(*last);
-            for (key, value) in batch {
+        for slot in volume.retained_storage_slots(now.saturating_add(1)) {
+            for (key, value) in volume.slot_entries(&*reactor, slot, scope).await? {
                 if value.tier != Tier::Storage || value.retain_until <= now {
                     continue;
                 }
@@ -230,7 +242,9 @@ impl Index {
                 if until_secs > ceiling {
                     clamped += 1;
                     until_secs = ceiling;
-                    volume.set_retain(&key, until_secs);
+                    volume
+                        .set_retain(&*reactor, &key, until_secs, scope)
+                        .await?;
                 }
                 let until = UNIX_EPOCH + Duration::from_secs(until_secs);
                 let ttl = until.duration_since(wall).unwrap_or_default();
@@ -255,6 +269,7 @@ impl Index {
         let pages: usize = entries.values().map(|hold| hold.pages).sum();
         self.holds.borrow_mut().entries = entries;
         *self.volume.borrow_mut() = Some(volume);
+        *self.reactor.borrow_mut() = Some(reactor);
         let limit = self.hold_limit();
         if pages > limit {
             eprintln!(
@@ -263,13 +278,124 @@ impl Index {
             );
         }
         self.update_volume_limits();
+        Ok(())
+    }
+
+    /// Keep recovered descriptors; the next maintenance runs check each one
+    /// against the volume, a batch at a time, dropping versions without
+    /// pages and restoring residency for the pages of the others.
+    pub(super) fn restore_versions(&self, entries: Vec<VersionEntry>) {
+        let mut versions = self.versions.borrow_mut();
+        versions.clear();
+        let mut queued = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let key = version_key(&entry.version);
+            // A hash collision keeps the first entry; reads verify identity.
+            if versions.insert(entry).is_ok() {
+                queued.push(key);
+            }
+        }
+        drop(versions);
+        self.maintenance.borrow_mut().restore = queued;
+    }
+
+    /// Check one restored descriptor: drop it when the version has no pages
+    /// on the volume, else track retention residency of its pages.
+    async fn restore_version(
+        &self,
+        version: VersionKey,
+        volume: &DiskVolume,
+        reactor: &Reactor,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        let mut cursor = low(&version);
+        let mut found = false;
+        loop {
+            let batch = volume
+                .range(reactor, cursor, high(&version), SCAN_BATCH, scope)
+                .await?;
+            let Some((last, _)) = batch.last().copied() else {
+                break;
+            };
+            found = true;
+            cursor = Bound::Excluded(last);
+            let versions = self.versions.borrow();
+            let Some(entry) = versions.get(&version) else {
+                return Ok(());
+            };
+            let retention = self.retention();
+            let mut residents = self.residents.borrow_mut();
+            for (key, _) in batch {
+                let page = PageId {
+                    version: entry.version.clone(),
+                    number: PageNumber(u64::from(key.page())),
+                };
+                let Ok(payload) = entry.metadata.page_length(&page) else {
+                    continue;
+                };
+                if let std::collections::hash_map::Entry::Vacant(slot) = residents.entry(key)
+                    && let Ok(mut resident) = self.track(&page)
+                {
+                    let payload = u64::from(payload);
+                    resident.payload = Some(retention.payload(payload, true));
+                    slot.insert((resident, payload));
+                }
+            }
+        }
+        if !found {
+            self.versions.borrow_mut().remove(&version);
+        }
+        Ok(())
+    }
+
+    /// Whether `value` of `key` belongs to a cache removal still in progress
+    /// (it reads as absent until maintenance deletes it).
+    fn removing(&self, key: &Key, value: &Value) -> bool {
+        let cache = key.cache();
+        self.maintenance
+            .borrow()
+            .removals
+            .iter()
+            .any(|(hash, bound, _)| *hash == cache && value.generation < *bound)
     }
 
     /// Volume entry of a page, if any, ignoring key availability.
-    pub(super) fn disk_entry(&self, page: &PageId) -> Option<(Key, Value)> {
-        let key = volume_key(page)?;
-        let value = self.volume()?.get(&key)?;
-        Some((key, value))
+    pub(super) async fn disk_entry(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<(Key, Value)>> {
+        let Some(key) = volume_key(page) else {
+            return Ok(None);
+        };
+        let Some((volume, reactor)) = self.io() else {
+            return Ok(None);
+        };
+        Ok(volume
+            .get(&*reactor, &key, scope)
+            .await?
+            .filter(|value| !self.removing(&key, value))
+            .map(|value| (key, value)))
+    }
+
+    /// Volume entry of a page from memory only: `Ok(None)` when it is not on
+    /// disk, `Err(Unavailable)` when answering needs a page read.
+    fn disk_entry_cached(&self, page: &PageId) -> Result<Option<(Key, Value)>> {
+        let Some(key) = volume_key(page) else {
+            return Ok(None);
+        };
+        let Some(volume) = self.volume() else {
+            return Ok(None);
+        };
+        match volume.try_get(&key) {
+            Some(value) => Ok(value
+                .filter(|value| !self.removing(&key, value))
+                .map(|value| (key, value))),
+            None => {
+                self.queue_prefetch(key);
+                Err(Error::Unavailable)
+            }
+        }
     }
 
     /// Whether some recorded page key of the version is still available. Unknown
@@ -286,26 +412,62 @@ impl Index {
     }
 
     /// Volume value of an available page on disk.
-    pub fn lookup(&self, page: &PageId) -> Result<Option<Value>> {
+    pub async fn lookup_value(&self, page: &PageId, scope: &RequestScope) -> Result<Option<Value>> {
         Ok(self
-            .disk_entry(page)
+            .disk_entry(page, scope)
+            .await?
             .filter(|_| self.version_available(&page.version))
             .map(|(_, value)| value))
     }
 
+    /// Whether an available copy of `page` is on disk, from memory only:
+    /// `false` when that needs a page read (a prefetch is queued).
+    pub fn on_disk_cached(&self, page: &PageId) -> bool {
+        self.disk_entry_cached(page)
+            .ok()
+            .flatten()
+            .is_some_and(|_| self.version_available(&page.version))
+    }
+
     /// Whether a write of `page` would add nothing: an available copy is on
     /// disk, durable enough for any live hold on it.
-    pub(super) fn already_on_disk(&self, page: &PageId) -> Result<bool> {
+    pub(super) async fn already_on_disk_async(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<bool> {
         Ok(self
-            .lookup(page)?
+            .lookup_value(page, scope)
+            .await?
             .is_some_and(|value| value.tier == Tier::Storage || !self.is_held(page)))
     }
 
-    /// Reserve a record, evicting at most [`EVICTION_BUDGET`] slots with the
-    /// volume CLOCK. Fails with `Overloaded` when no space can be found.
-    pub(super) fn allocate(&self, tier: Tier, length: u64) -> Result<Reservation> {
-        let volume = self.volume().ok_or(Error::Unavailable)?;
-        let (result, evicted) = volume.allocate_evicting(tier, length, now_unix(), EVICTION_BUDGET);
+    /// [`Index::already_on_disk_async`] from memory only. Answers `false`
+    /// when that needs a page read (the writer checks again before writing)
+    /// and queues a prefetch.
+    pub(super) fn already_on_disk_cached(&self, page: &PageId) -> bool {
+        self.disk_entry_cached(page)
+            .ok()
+            .flatten()
+            .is_some_and(|(_, value)| {
+                self.version_available(&page.version)
+                    && (value.tier == Tier::Storage || !self.is_held(page))
+            })
+    }
+
+    /// Reserve a record, reopening partly filled slots and evicting at most
+    /// [`EVICTION_BUDGET`] slots with the volume CLOCK. Fails with
+    /// `Overloaded` when no space can be found.
+    pub(super) async fn allocate(
+        &self,
+        tier: Tier,
+        length: u64,
+        scope: &RequestScope,
+    ) -> Result<Reservation> {
+        let (volume, reactor) = self.io().ok_or(Error::Unavailable)?;
+        let (result, evicted) = volume
+            .allocate_evicting(&*reactor, tier, length, now_unix(), EVICTION_BUDGET, scope)
+            .await?;
         self.forget_pages(&evicted, true);
         Ok(result?)
     }
@@ -401,20 +563,33 @@ impl Index {
         }
     }
 
-    /// Remove `key` only while it still has `generation`, preserving replacements.
+    /// Remove `key` only while it still has `generation`, preserving
+    /// replacements. Done at once when the entry is in memory (it normally
+    /// is: the caller just read it); otherwise queued for maintenance.
     pub(super) fn remove_if_generation(&self, key: &Key, generation: u64) {
         let Some(volume) = self.volume() else {
             return;
         };
-        if let Some(value) = volume.get(key)
-            && value.generation == generation
-            && volume.remove_if(key, &value)
-        {
-            self.forget_pages(&[(*key, value)], false);
+        match volume.try_get(key) {
+            Some(Some(value)) if value.generation == generation => {
+                if volume.remove_cached(key, &value) {
+                    self.forget_pages(&[(*key, value)], false);
+                }
+            }
+            Some(_) => {}
+            None => {
+                let mut maintenance = self.maintenance.borrow_mut();
+                if maintenance.invalidations.len() < MAINTENANCE_QUEUE {
+                    maintenance.invalidations.push((*key, generation));
+                }
+            }
         }
     }
 
     /// Remove every disk page, hold, and version descriptor of one cache.
+    /// Holds and descriptors go at once, which makes the pages unavailable
+    /// to lookups; maintenance removes the index entries in batches. Pages
+    /// published after this call (with a newer generation) are kept.
     pub(super) fn remove_disk_cache(&self, cache: &CacheId) {
         let hash = cache_hash(cache);
         self.holds
@@ -423,11 +598,11 @@ impl Index {
             .retain(|version, _| version[..CACHE_HASH_BYTES] != hash[..]);
         self.versions.borrow_mut().remove_cache(&hash);
         if let Some(volume) = self.volume() {
-            let removed = volume.remove_range(
-                Bound::Included(Key::new(hash, [0; 12], 0)),
-                Bound::Included(Key::new(hash, [0xff; 12], u32::MAX)),
-            );
-            self.forget_pages(&removed, false);
+            let bound = volume.next_generation();
+            self.maintenance
+                .borrow_mut()
+                .removals
+                .push((hash, bound, None));
         }
     }
 
@@ -435,7 +610,7 @@ impl Index {
     /// `caches`. Run at startup after recovery selects the accepted cache set,
     /// since lazily committed removals may come back after a crash. Returns the
     /// count of removed entries.
-    pub fn retain_caches(&self, caches: &[CacheId]) -> usize {
+    pub async fn retain_caches(&self, caches: &[CacheId], scope: &RequestScope) -> Result<usize> {
         let allowed: HashSet<[u8; CACHE_HASH_BYTES]> = caches.iter().map(cache_hash).collect();
         self.holds
             .borrow_mut()
@@ -452,13 +627,15 @@ impl Index {
                 versions.remove(&key);
             }
         }
-        let Some(volume) = self.volume() else {
-            return 0;
+        let Some((volume, reactor)) = self.io() else {
+            return Ok(0);
         };
         let mut removed = 0;
         let mut cursor: Option<Key> = None;
         loop {
-            let batch = volume.next_after(cursor.as_ref(), SCAN_BATCH);
+            let batch = volume
+                .next_after(&*reactor, cursor.as_ref(), SCAN_BATCH, scope)
+                .await?;
             let Some((last, _)) = batch.last() else {
                 break;
             };
@@ -470,15 +647,104 @@ impl Index {
                 }
             }
             for (key, value) in &doomed {
-                volume.remove_if(key, value);
+                volume.remove_if(&*reactor, key, value, scope).await?;
             }
             removed += doomed.len();
             self.forget_pages(&doomed, false);
         }
-        removed
+        Ok(removed)
     }
 
-    /// Make every disk index change so far durable. A no-op before mount.
+    /// Queue a page prefetch for a memory-only caller.
+    fn queue_prefetch(&self, key: Key) {
+        let mut maintenance = self.maintenance.borrow_mut();
+        if maintenance.prefetch.len() < MAINTENANCE_QUEUE && !maintenance.prefetch.contains(&key) {
+            maintenance.prefetch.push(key);
+        }
+    }
+
+    /// Whether queued maintenance waits for [`Index::maintain`].
+    pub fn maintenance_due(&self) -> bool {
+        self.is_mounted() && !self.maintenance.borrow().is_empty()
+    }
+
+    /// Run queued maintenance, bounded per call: invalidations, one batch of
+    /// cache removal, one batch of the startup restore, page prefetches, and
+    /// (when `evict` is set) evictions that keep a few slots free ahead of
+    /// allocation.
+    pub async fn maintain(&self, scope: &RequestScope, evict: bool) -> Result<()> {
+        let Some((volume, reactor)) = self.io() else {
+            return Ok(());
+        };
+        let reactor = &*reactor;
+        let invalidations = std::mem::take(&mut self.maintenance.borrow_mut().invalidations);
+        for (key, generation) in invalidations {
+            if let Some(value) = volume.get(reactor, &key, scope).await?
+                && value.generation == generation
+                && volume.remove_if(reactor, &key, &value, scope).await?
+            {
+                self.forget_pages(&[(key, value)], false);
+            }
+        }
+        let removal = self.maintenance.borrow_mut().removals.first().copied();
+        if let Some((hash, bound, cursor)) = removal {
+            let low = cursor.map_or(Bound::Included(Key::new(hash, [0; 12], 0)), Bound::Excluded);
+            let batch = volume
+                .range(
+                    reactor,
+                    low,
+                    Bound::Included(Key::new(hash, [0xff; 12], u32::MAX)),
+                    SCAN_BATCH,
+                    scope,
+                )
+                .await?;
+            let mut removed = Vec::new();
+            for (key, value) in &batch {
+                if value.generation < bound && volume.remove_if(reactor, key, value, scope).await? {
+                    removed.push((*key, *value));
+                }
+            }
+            self.forget_pages(&removed, false);
+            let mut maintenance = self.maintenance.borrow_mut();
+            if let Some(entry) = maintenance.removals.iter_mut().find(|e| e.0 == hash) {
+                match batch.last() {
+                    Some((last, _)) if batch.len() == SCAN_BATCH => entry.2 = Some(*last),
+                    _ => {
+                        maintenance.removals.retain(|e| e.0 != hash);
+                    }
+                }
+            }
+        }
+        let restore: Vec<VersionKey> = {
+            let mut maintenance = self.maintenance.borrow_mut();
+            let take = maintenance.restore.len().min(RESTORE_BATCH);
+            maintenance.restore.drain(..take).collect()
+        };
+        for version in restore {
+            self.restore_version(version, &volume, reactor, scope)
+                .await?;
+        }
+        let prefetch = std::mem::take(&mut self.maintenance.borrow_mut().prefetch);
+        for key in prefetch {
+            volume.prefetch(reactor, &key, scope).await?;
+        }
+        if evict && !volume.needs_commit() {
+            let evicted = volume
+                .reserve_free(
+                    reactor,
+                    FREE_SLOT_RESERVE,
+                    now_unix(),
+                    RESERVE_EVICTIONS,
+                    scope,
+                )
+                .await?;
+            self.forget_pages(&evicted, true);
+        }
+        Ok(())
+    }
+
+    /// Make every disk index change so far durable, after running queued
+    /// invalidations, removals, and restore work. A no-op before mount.
     pub fn commit<'a>(
         &'a self,
         reactor: &'a Reactor,
@@ -489,38 +755,55 @@ impl Index {
             let Some(volume) = volume else {
                 return Ok(());
             };
+            self.maintain(scope, false).await?;
             // Callers classify failures with `is_disposable_commit_error`.
             volume.commit(reactor, scope).await
         })
     }
 
-    /// Whether the volume has commit work: index changes that are not durable
-    /// yet, or freed space that only later commits release.
+    /// Whether the volume has commit work (index changes that are not
+    /// durable yet, or freed space that only later commits release), or
+    /// maintenance is queued.
     pub fn is_dirty(&self) -> bool {
-        self.volume().is_some_and(|volume| volume.is_dirty())
+        self.volume().is_some_and(|volume| volume.is_dirty()) || self.maintenance_due()
     }
 
-    /// Entries in the volume index.
+    /// Whether uncommitted index changes reached the volume's dirty limit:
+    /// allocation waits for a commit.
+    pub fn needs_commit(&self) -> bool {
+        self.volume().is_some_and(|volume| volume.needs_commit())
+    }
+
+    /// Entries in the volume index. Exact after a commit.
     pub fn disk_len(&self) -> u64 {
         self.volume().map_or(0, |volume| volume.len())
     }
 
     /// Every page on this worker's disk whose version is known, for
-    /// diagnostics and tests. Scans the whole index.
+    /// diagnostics and tests. Scans the whole index from memory only: it
+    /// stops at the first index page that is not cached (queuing a prefetch),
+    /// so the list is complete only when the index is cached.
     pub fn disk_pages(&self) -> Vec<DiskPage> {
         let Some(volume) = self.volume() else {
             return Vec::new();
         };
-        let versions = self.versions.borrow();
         let mut pages = Vec::new();
         let mut cursor: Option<Key> = None;
         loop {
-            let batch = volume.next_after(cursor.as_ref(), SCAN_BATCH);
+            let low = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+            let Some(batch) = volume.try_range(low, Bound::Unbounded, SCAN_BATCH) else {
+                self.queue_prefetch(cursor.unwrap_or(Key::MIN));
+                break;
+            };
             let Some((last, _)) = batch.last() else {
                 break;
             };
             cursor = Some(*last);
+            let versions = self.versions.borrow();
             for (key, value) in batch {
+                if self.removing(&key, &value) {
+                    continue;
+                }
                 let Some(entry) = versions.get(&key_version(&key)) else {
                     continue;
                 };
@@ -543,12 +826,16 @@ impl Index {
 
     /// Index entries on the disk volume, including unknown versions.
     pub fn resident_page_count(&self) -> u64 {
-        self.volume().map_or(0, |volume| volume.len())
+        self.disk_len()
     }
 
     /// Walk disk pages in key order: up to `limit` index entries after
     /// `after`. Returns the last visited key (`None` once the index is
     /// exhausted) and the pages among them whose version is known.
+    ///
+    /// Memory only: when the next entries are not cached this returns
+    /// `after` unchanged and no pages, and queues a prefetch for
+    /// maintenance.
     pub fn resident_pages_after(
         &self,
         after: Option<&Key>,
@@ -557,11 +844,16 @@ impl Index {
         let Some(volume) = self.volume() else {
             return (None, Vec::new());
         };
-        let batch = volume.next_after(after, limit);
+        let low = after.map_or(Bound::Unbounded, |key| Bound::Excluded(*key));
+        let Some(batch) = volume.try_range(low, Bound::Unbounded, limit) else {
+            self.queue_prefetch(after.copied().unwrap_or(Key::MIN));
+            return (Some(after.copied().unwrap_or(Key::MIN)), Vec::new());
+        };
         let cursor = batch.last().map(|(key, _)| *key);
         let versions = self.versions.borrow();
         let pages = batch
             .into_iter()
+            .filter(|(key, value)| !self.removing(key, value))
             .filter_map(|(key, _)| {
                 versions.get(&key_version(&key)).map(|entry| PageId {
                     version: entry.version.clone(),
@@ -615,11 +907,12 @@ impl Index {
     /// returns `true`: a raise whose commit failed stays in memory, so a later
     /// call with the same deadline returns `false` while the change is still
     /// not durable. `StoreWriter::reserve_hold` does both.
-    pub fn reserve_hold(
+    pub async fn reserve_hold(
         &self,
         version: &ObjectVersion,
         pages: usize,
         until: SystemTime,
+        scope: &RequestScope,
     ) -> Result<bool> {
         let monotonic = Holds::deadline(until)?;
         if !self.available(&version.object.cache) {
@@ -627,67 +920,71 @@ impl Index {
         }
         let limit = self.hold_limit();
         let key = version_key(version);
-        let existing: Vec<(Key, Value)> = self.volume().map_or_else(Vec::new, |volume| {
-            volume
-                .range(low(&key), high(&key), usize::MAX)
+        let existing: Vec<(Key, Value)> = match self.io() {
+            Some((volume, reactor)) => volume
+                .range(&*reactor, low(&key), high(&key), usize::MAX, scope)
+                .await?
                 .into_iter()
-                .filter(|(_, value)| value.tier == Tier::Storage)
-                .collect()
-        });
-        let mut holds = self.holds.borrow_mut();
-        holds.expire();
-        let old = holds.entries.get(&key);
-        let mut published: HashSet<u32> = existing.iter().map(|(key, _)| key.page()).collect();
-        if let Some(old) = old {
-            published.extend(old.published.iter().copied());
-        }
-        let count = pages
-            .max(published.len())
-            .max(old.map_or(0, |hold| hold.pages));
-        // Zero-page objects need no disk guarantee or retained reservation entry.
-        if count == 0 {
-            return Ok(false);
-        }
-        let total = holds
-            .entries
-            .values()
-            .try_fold(0usize, |sum, hold| sum.checked_add(hold.pages))
-            .ok_or(Error::Overloaded)?;
-        let total = total
-            .checked_sub(old.map_or(0, |hold| hold.pages))
-            .and_then(|n| n.checked_add(count))
-            .ok_or(Error::Overloaded)?;
-        if total > limit {
-            return Err(Error::Overloaded);
-        }
-        let inflight = old.map_or_else(
-            || Rc::new(std::cell::Cell::new(0)),
-            |hold| hold.inflight.clone(),
-        );
-        let active = old.map_or_else(
-            || Rc::new(std::cell::Cell::new(0)),
-            |hold| hold.active.clone(),
-        );
-        let until = old.map_or(until, |hold| hold.until.max(until));
-        let monotonic = old.map_or(monotonic, |hold| hold.monotonic.max(monotonic));
-        holds.entries.insert(
-            key,
-            Hold {
-                until,
-                monotonic,
-                pages: count,
-                inflight,
-                active,
-                published,
-            },
-        );
-        drop(holds);
+                .filter(|(key, value)| value.tier == Tier::Storage && !self.removing(key, value))
+                .collect(),
+            None => Vec::new(),
+        };
+        let until = {
+            let mut holds = self.holds.borrow_mut();
+            holds.expire();
+            let old = holds.entries.get(&key);
+            let mut published: HashSet<u32> = existing.iter().map(|(key, _)| key.page()).collect();
+            if let Some(old) = old {
+                published.extend(old.published.iter().copied());
+            }
+            let count = pages
+                .max(published.len())
+                .max(old.map_or(0, |hold| hold.pages));
+            // Zero-page objects need no disk guarantee or retained reservation entry.
+            if count == 0 {
+                return Ok(false);
+            }
+            let total = holds
+                .entries
+                .values()
+                .try_fold(0usize, |sum, hold| sum.checked_add(hold.pages))
+                .ok_or(Error::Overloaded)?;
+            let total = total
+                .checked_sub(old.map_or(0, |hold| hold.pages))
+                .and_then(|n| n.checked_add(count))
+                .ok_or(Error::Overloaded)?;
+            if total > limit {
+                return Err(Error::Overloaded);
+            }
+            let inflight = old.map_or_else(
+                || Rc::new(std::cell::Cell::new(0)),
+                |hold| hold.inflight.clone(),
+            );
+            let active = old.map_or_else(
+                || Rc::new(std::cell::Cell::new(0)),
+                |hold| hold.active.clone(),
+            );
+            let until = old.map_or(until, |hold| hold.until.max(until));
+            let monotonic = old.map_or(monotonic, |hold| hold.monotonic.max(monotonic));
+            holds.entries.insert(
+                key,
+                Hold {
+                    until,
+                    monotonic,
+                    pages: count,
+                    inflight,
+                    active,
+                    published,
+                },
+            );
+            until
+        };
         let mut raised = false;
-        if let Some(volume) = self.volume() {
+        if let Some((volume, reactor)) = self.io() {
             let retain = ceil_unix(until);
             for (key, value) in existing {
                 if value.retain_until < retain {
-                    volume.set_retain(&key, retain);
+                    volume.set_retain(&*reactor, &key, retain, scope).await?;
                     raised = true;
                 }
             }
@@ -707,6 +1004,8 @@ impl Index {
 
     /// Scan only bounded hold publications, not the full index or payloads.
     /// Scratch space contains distinct slots, bounded by held publications.
+    /// Memory only: publications whose index page is not cached are skipped
+    /// and queued for prefetch, so the next snapshot counts them.
     pub fn held_snapshot(&self) -> HeldSnapshot {
         let Some(volume) = self.volume() else {
             return HeldSnapshot::default();
@@ -715,11 +1014,18 @@ impl Index {
         let versions = self.versions.borrow();
         let mut snapshot = HeldSnapshot::default();
         let mut slots = HashSet::default();
+        let mut missing = Vec::new();
         for (version, hold) in holds.entries.iter().filter(|(_, hold)| hold.live()) {
             let known = versions.get(version);
             for number in &hold.published {
-                let Some(value) = volume.get(&page_key(version, *number)) else {
-                    continue;
+                let key = page_key(version, *number);
+                let value = match volume.try_get(&key) {
+                    Some(Some(value)) if !self.removing(&key, &value) => value,
+                    Some(_) => continue,
+                    None => {
+                        missing.push(key);
+                        continue;
+                    }
                 };
                 if value.tier != Tier::Storage {
                     continue;
@@ -740,6 +1046,11 @@ impl Index {
                 slots.insert(value.slot);
             }
         }
+        drop(holds);
+        drop(versions);
+        for key in missing {
+            self.queue_prefetch(key);
+        }
         snapshot.slots = slots.len() as u64;
         snapshot
     }
@@ -747,7 +1058,12 @@ impl Index {
     /// Extend an existing reservation without adding page capacity. Returns
     /// whether a storage-tier deadline changed; see [`Index::reserve_hold`] for
     /// when that becomes durable.
-    pub fn extend_hold(&self, version: &ObjectVersion, until: SystemTime) -> Result<bool> {
+    pub async fn extend_hold(
+        &self,
+        version: &ObjectVersion,
+        until: SystemTime,
+        scope: &RequestScope,
+    ) -> Result<bool> {
         let pages = self
             .holds
             .borrow()
@@ -756,7 +1072,7 @@ impl Index {
             .filter(|hold| hold.live())
             .map(|hold| hold.pages)
             .ok_or(Error::Unavailable)?;
-        self.reserve_hold(version, pages, until)
+        self.reserve_hold(version, pages, until, scope).await
     }
 
     /// Release only unused capacity after a partial failure. Completed pages stay
@@ -817,5 +1133,80 @@ impl Index {
             })?;
         hold.inflight.set(hold.inflight.get() + 1);
         Some(HoldTicket(hold.inflight.clone()))
+    }
+}
+
+/// Synchronous wrappers for tests: they drive the worker reactor until the
+/// async call completes. Never call them from inside a task.
+#[cfg(test)]
+impl Index {
+    pub(crate) fn block<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        let reactor = self.reactor.borrow().clone();
+        let mut future = std::pin::pin!(future);
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..10_000_000 {
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+            if let Some(reactor) = &reactor {
+                reactor.poll_budgeted(64).unwrap();
+            }
+        }
+        panic!("index operation did not complete");
+    }
+
+    /// [`Index::lookup_value`] for tests.
+    pub fn lookup(&self, page: &PageId) -> Result<Option<Value>> {
+        let scope = maintenance_scope()?;
+        self.block(self.lookup_value(page, &scope))
+    }
+
+    /// [`Index::already_on_disk_async`] for tests.
+    pub(super) fn already_on_disk(&self, page: &PageId) -> Result<bool> {
+        let scope = maintenance_scope()?;
+        self.block(self.already_on_disk_async(page, &scope))
+    }
+
+    /// [`Index::disk_entry`] for tests.
+    pub(super) fn disk_entry_now(&self, page: &PageId) -> Option<(Key, Value)> {
+        let scope = maintenance_scope().ok()?;
+        self.block(self.disk_entry(page, &scope)).ok().flatten()
+    }
+
+    /// [`Index::allocate`] for tests.
+    pub(super) fn allocate_now(&self, tier: Tier, length: u64) -> Result<Reservation> {
+        let scope = maintenance_scope()?;
+        self.block(self.allocate(tier, length, &scope))
+    }
+
+    /// [`Index::reserve_hold`] for tests.
+    pub fn reserve_hold_now(
+        &self,
+        version: &ObjectVersion,
+        pages: usize,
+        until: SystemTime,
+    ) -> Result<bool> {
+        let scope = maintenance_scope()?;
+        self.block(self.reserve_hold(version, pages, until, &scope))
+    }
+
+    /// [`Index::extend_hold`] for tests.
+    pub fn extend_hold_now(&self, version: &ObjectVersion, until: SystemTime) -> Result<bool> {
+        let scope = maintenance_scope()?;
+        self.block(self.extend_hold(version, until, &scope))
+    }
+
+    /// [`Index::retain_caches`] for tests.
+    pub fn retain_caches_now(&self, caches: &[CacheId]) -> usize {
+        let scope = maintenance_scope().unwrap();
+        self.block(self.retain_caches(caches, &scope)).unwrap()
+    }
+
+    /// Run maintenance until nothing is queued, for tests.
+    pub(crate) fn maintain_now(&self) {
+        let scope = maintenance_scope().unwrap();
+        while self.maintenance_due() {
+            self.block(self.maintain(&scope, false)).unwrap();
+        }
     }
 }
