@@ -3056,6 +3056,73 @@ fn registered_fill_accepted_before_stop_persists_during_drain() {
     assert!(f.store.writer.is_idle());
 }
 
+#[test]
+fn registered_persistence_reclaims_cached_pages_through_callback() {
+    use crate::rdma::links::tests::{link_up, receive_registered, world};
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let cache = page.metadata.version.object.cache.clone();
+    let mut w = world();
+    link_up(&mut w);
+    let received = receive_registered(&mut w, &page.ciphertext);
+    let length = received.len();
+    let reservation = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+        .unwrap();
+    page.ciphertext = crate::memory::BufferPool::new(f.admission.clone())
+        .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
+        .unwrap();
+    let dirty = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::DirtyCiphertext, length)
+        .unwrap();
+    // Stand-in for reclaimable cached pages: fill the remaining Ciphertext
+    // quota so only the caller's reclamation can make room.
+    let cached = std::cell::RefCell::new(Vec::new());
+    let mut chunk = f.admission.limit(ResourceClass::Ciphertext);
+    while chunk > 0 {
+        match f
+            .admission
+            .reserve(Some(&cache), ResourceClass::Ciphertext, chunk)
+        {
+            Ok(charge) => cached.borrow_mut().push(charge),
+            Err(_) => chunk /= 2,
+        }
+    }
+    let calls = std::cell::Cell::new(0);
+    f.admission.stop();
+    let ticket = f
+        .store
+        .writer
+        .enqueue_reclaiming(page, dirty, |amount| {
+            calls.set(calls.get() + 1);
+            let reserve = || {
+                f.admission
+                    .reserve_completion(Some(&cache), ResourceClass::Ciphertext, amount)
+                    .map_err(Error::from)
+            };
+            match reserve() {
+                Err(Error::Overloaded) => {
+                    cached.borrow_mut().clear();
+                    reserve()
+                }
+                result => result,
+            }
+        })
+        .unwrap();
+    assert_ne!(ticket, 0);
+    // Both the registered copy-out and disk staging use the callback.
+    assert_eq!(calls.get(), 2);
+    assert!(cached.borrow().is_empty());
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    assert!(f.store.writer.is_idle());
+}
+
 mod records {
     use super::*;
     use crate::admission::ResourceClass;

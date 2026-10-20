@@ -599,7 +599,7 @@ impl StoreWriter {
         &self,
         mut page: CiphertextCopy,
         dirty: flow_control::Charge<AdmissionPolicy>,
-        reserve_staging: impl FnOnce(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
+        mut reserve_staging: impl FnMut(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<u64> {
         if self.closed.get() {
             return Err(Error::Unavailable);
@@ -647,10 +647,17 @@ impl StoreWriter {
         drop(pending);
         // The queue outlives the request: never pin a registered RDMA buffer.
         // The copy-out uses completion admission like disk staging, because an
-        // accepted fill must still persist after request admission stops.
+        // accepted fill must still persist after request admission stops. It goes
+        // through the caller's callback so cached pages can be reclaimed first.
         if page.ciphertext.is_registered() {
-            let cache = page.metadata.version.object.cache.clone();
-            let reservation = self.reserve_staging(page.ciphertext.bytes().len(), &cache)?;
+            let length = page.ciphertext.bytes().len();
+            let reservation = reserve_staging(length)?;
+            reservation.validate(ResourceClass::Ciphertext, length)?;
+            if !self.admission.owns(&reservation)
+                || reservation.key() != Some(&page.metadata.version.object.cache)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
             page.ciphertext = page.ciphertext.rehome(reservation)?;
         }
         let full = self.pending.borrow().len() >= self.capacity.get();

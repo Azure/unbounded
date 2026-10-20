@@ -597,8 +597,10 @@ Recorded while building stage 4a (receive-side zero-copy, done):
    `MemoryCache::publish_ciphertext`. Memory caching is optional, so it uses
    ordinary admission and stops when admission stops.
    `Writer::enqueue_reclaiming` (`src/store.rs`, after the dedup checks)
-   instead reserves the copy with `Writer::reserve_staging`, which uses
-   completion admission like disk staging. A fill that already holds an
+   instead reserves the copy through the caller's staging callback, the
+   same one used for disk staging. The callbacks in `src/read/fill.rs`
+   reclaim cached pages before failing and use completion admission, and
+   `Writer::enqueue` passes `Writer::reserve_staging`. A fill that already holds an
    accepted dirty charge still persists its page during drain. `rehome` always copies a
    registered page, even when it holds the only reference. The charge
    reserved for the copy is separate from the request's, so the page is
