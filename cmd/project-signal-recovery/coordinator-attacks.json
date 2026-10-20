@@ -1,0 +1,59 @@
+{
+  "schema": "signal.unbounded-cloud.io/rev357-coordinator-attacks/v1",
+  "provenance": {
+    "originalArtifactAvailable": false,
+    "basis": "Reconstructed from the upstream rev357 rejection requirements after searches of reachable Azure/unbounded refs, Azure/taugrid preservation commit fd5f453a93546bd0350614b3b125c2ef0ae721c2, Azure code search, and prior session history found no original coordinator artifact."
+  },
+  "coordinatorAttacks": [
+    {
+      "id": "C01",
+      "test": "test_c01_self_admitted_authority_root_rejected"
+    },
+    {
+      "id": "C02",
+      "test": "test_c02_caller_ledger_revision_rejected"
+    },
+    {
+      "id": "C03",
+      "test": "test_c03_caller_ledger_digest_rejected"
+    },
+    {
+      "id": "C04",
+      "test": "test_c04_stale_prefix_checkpoint_rejected"
+    },
+    {
+      "id": "C05",
+      "test": "test_c05_withheld_suffix_after_latest_advance_rejected"
+    },
+    {
+      "id": "C06",
+      "test": "test_c06_latest_rollback_rejected"
+    },
+    {
+      "id": "C07",
+      "test": "test_c07_same_index_fork_rejected"
+    },
+    {
+      "id": "C08",
+      "test": "test_c08_cross_stream_split_view_rejected"
+    },
+    {
+      "id": "C09",
+      "test": "test_c09_ack_replay_after_restart_rejected"
+    },
+    {
+      "id": "C10",
+      "test": "test_c10_pre_challenge_consumption_rejected"
+    }
+  ],
+  "reviewerAttacks": [
+    {
+      "id": "R01",
+      "test": "test_r01_witness_restart_equivocation_rejected"
+    },
+    {
+      "id": "R02",
+      "test": "test_r02_malformed_validated_success_rejected"
+    }
+  ]
+}

@@ -83,6 +83,19 @@ the bundle exactly, and verify under the controller's configured verifier key.
 Missing, malformed, stale, forged, or unbound evidence becomes
 `Inconclusive`, never `Pass`.
 
+The recovery regression gate consists of three separately reviewable layers:
+
+- the immutable 78-test rev24 reference corpus;
+- 18 rev25 protocol, durability, receipt, and controller integration tests;
+- `coordinator-attacks.json`, which names exactly 10 reconstructed rev357
+  coordinator attacks plus the witness-restart and malformed-success attacks
+  requested by the upstream reviewer.
+
+The original coordinator artifact was not present in any reachable upstream or
+preservation ref. The manifest records that provenance limitation instead of
+claiming byte-for-byte identity, and binds every required attack ID to an
+executable regression test.
+
 The GB200 sample enables this gate deliberately. Its generic identity script
 does not create a receipt, so the sample cannot certify a Node as production
 eligible until a reviewed Dapple workflow adds the verifier step and publishes
