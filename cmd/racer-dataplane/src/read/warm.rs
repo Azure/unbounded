@@ -108,11 +108,19 @@ pub struct WarmRegistry {
     releases: Mutex<BTreeMap<u16, ReleaseQueue>>,
     /// Live hold leases per version. Local jobs and remote requesters both hold
     /// leases; unused capacity is released only after the last lease is gone.
-    leases: Mutex<BTreeMap<ObjectVersion, BTreeMap<LeaseKey, SystemTime>>>,
+    leases: Mutex<LeaseState>,
+}
+/// Lease table plus a generation fence. Every grant stamps its version with a
+/// fresh generation; a queued release carries the generation observed when the
+/// last lease was dropped and is discarded if a newer grant has since occurred.
+#[derive(Default)]
+struct LeaseState {
+    next: u64,
+    versions: BTreeMap<ObjectVersion, (u64, BTreeMap<LeaseKey, SystemTime>)>,
 }
 /// A requester node and the warm job identifier it chose for one version.
 type LeaseKey = (NodeId, [u8; 16]);
-type ReleaseQueue = (Option<Waker>, std::collections::BTreeSet<ObjectVersion>);
+type ReleaseQueue = (Option<Waker>, BTreeMap<ObjectVersion, u64>);
 
 impl WarmRegistry {
     pub(crate) fn new(waiter_limit: usize) -> Self {
@@ -123,7 +131,7 @@ impl WarmRegistry {
             waiter_limit,
             draining: std::sync::atomic::AtomicBool::new(false),
             releases: Mutex::new(BTreeMap::new()),
-            leases: Mutex::new(BTreeMap::new()),
+            leases: Mutex::new(LeaseState::default()),
         }
     }
 
@@ -132,7 +140,10 @@ impl WarmRegistry {
     pub(crate) fn grant_lease(&self, version: &ObjectVersion, key: &LeaseKey, until: SystemTime) {
         let now = uring_runtime::environment::wall_now();
         let mut leases = self.leases.lock().unwrap();
-        let entry = leases.entry(version.clone()).or_default();
+        leases.next += 1;
+        let generation = leases.next;
+        let (stamp, entry) = leases.versions.entry(version.clone()).or_default();
+        *stamp = generation;
         entry.retain(|_, expiry| *expiry > now);
         let expiry = entry.entry(key.clone()).or_insert(until);
         *expiry = (*expiry).max(until);
@@ -143,8 +154,9 @@ impl WarmRegistry {
         self.leases
             .lock()
             .unwrap()
+            .versions
             .get(version)
-            .and_then(|entry| entry.get(key))
+            .and_then(|(_, entry)| entry.get(key))
             .is_some_and(|expiry| *expiry > now)
     }
 
@@ -159,24 +171,25 @@ impl WarmRegistry {
         let now = uring_runtime::environment::wall_now();
         let last = {
             let mut leases = self.leases.lock().unwrap();
-            match leases.get_mut(version) {
-                Some(entry) => {
+            let generation = leases.next;
+            match leases.versions.get_mut(version) {
+                Some((_, entry)) => {
                     entry.remove(key);
                     entry.retain(|_, expiry| *expiry > now);
                     if entry.is_empty() {
-                        leases.remove(version);
-                        true
+                        leases.versions.remove(version);
+                        Some(generation)
                     } else {
-                        false
+                        None
                     }
                 }
-                None => true,
+                None => Some(generation),
             }
         };
-        if last {
-            self.release(version, workers);
+        if let Some(generation) = last {
+            self.release(version, generation, workers);
         }
-        last
+        last.is_some()
     }
 
     #[cfg(test)]
@@ -184,8 +197,9 @@ impl WarmRegistry {
         self.leases
             .lock()
             .unwrap()
+            .versions
             .get(version)
-            .map_or(0, BTreeMap::len)
+            .map_or(0, |(_, entry)| entry.len())
     }
 
     /// Pages a remote primary owner holds are not stored on this node.
@@ -264,10 +278,23 @@ impl WarmRegistry {
             let mut releases = self.releases.lock().unwrap();
             let (waker, versions) = releases.entry(worker.0).or_default();
             *waker = Some(cx.waker().clone());
-            versions.iter().cloned().collect::<Vec<_>>()
+            versions
+                .iter()
+                .map(|(version, generation)| (version.clone(), *generation))
+                .collect::<Vec<_>>()
         };
-        for version in versions {
-            if let Err(error) = release(&version) {
+        for (version, generation) in versions {
+            // Check the fence and trim under the lease lock so a grant cannot
+            // interleave. Grants precede reservations, so a newer generation
+            // means a newer lease owns capacity this release must not trim.
+            let outcome = {
+                let leases = self.leases.lock().unwrap();
+                match leases.versions.get(&version) {
+                    Some((stamp, _)) if *stamp > generation => Ok(()),
+                    _ => release(&version),
+                }
+            };
+            if let Err(error) = outcome {
                 // Retry on the next worker turn, never self-wake or lose the tail.
                 return if error == Error::Overloaded {
                     Ok(())
@@ -275,25 +302,30 @@ impl WarmRegistry {
                     Err(error)
                 };
             }
-            self.releases
-                .lock()
-                .unwrap()
-                .entry(worker.0)
-                .or_default()
-                .1
-                .remove(&version);
+            // Keep a release queued for a newer generation while this one ran.
+            let mut releases = self.releases.lock().unwrap();
+            let queue = &mut releases.entry(worker.0).or_default().1;
+            if queue.get(&version) == Some(&generation) {
+                queue.remove(&version);
+            }
         }
         Ok(())
     }
 
-    fn release(&self, version: &ObjectVersion, workers: &[crate::model::WorkerId]) {
+    fn release(
+        &self,
+        version: &ObjectVersion,
+        generation: u64,
+        workers: &[crate::model::WorkerId],
+    ) {
         let wake = {
             let mut releases = self.releases.lock().unwrap();
             workers
                 .iter()
                 .filter_map(|worker| {
                     let (waker, versions) = releases.entry(worker.0).or_default();
-                    versions.insert(version.clone());
+                    let queued = versions.entry(version.clone()).or_insert(generation);
+                    *queued = (*queued).max(generation);
                     waker.clone()
                 })
                 .collect::<Vec<_>>()
@@ -428,10 +460,14 @@ impl WarmRegistry {
         });
         drop(jobs);
         // Expired leases need no release: their holds expire on their own.
-        self.leases.lock().unwrap().retain(|_, entry| {
-            entry.retain(|_, expiry| *expiry > wall);
-            !entry.is_empty()
-        });
+        self.leases
+            .lock()
+            .unwrap()
+            .versions
+            .retain(|_, (_, entry)| {
+                entry.retain(|_, expiry| *expiry > wall);
+                !entry.is_empty()
+            });
         for job in cancel {
             let _ = job.scope.cancel();
         }
@@ -1590,8 +1626,8 @@ mod tests {
     fn retryable_release_preserves_the_entire_queue_without_self_waking() {
         let registry = WarmRegistry::new(4);
         let worker = crate::model::WorkerId(0);
-        registry.release(&version("a"), &[worker]);
-        registry.release(&version("b"), &[worker]);
+        registry.release(&version("a"), 0, &[worker]);
+        registry.release(&version("b"), 0, &[worker]);
         let wakes = Arc::new(crate::test_support::WakeCounter::default());
         let waker = Waker::from(wakes.clone());
         let mut cx = Context::from_waker(&waker);
@@ -1613,6 +1649,86 @@ mod tests {
             })
             .unwrap();
         assert_eq!(released, vec![version("a"), version("b")]);
+        assert!(registry.drained(worker));
+    }
+
+    fn release_all(registry: &WarmRegistry, worker: crate::model::WorkerId) -> Vec<ObjectVersion> {
+        let waker = Waker::from(Arc::new(crate::test_support::WakeCounter::default()));
+        let mut cx = Context::from_waker(&waker);
+        let mut released = Vec::new();
+        registry
+            .poll_releases_with(worker, &mut cx, |version| {
+                released.push(version.clone());
+                Ok(())
+            })
+            .unwrap();
+        released
+    }
+
+    #[test]
+    fn release_queued_after_newer_grant_does_not_trim_new_lease() {
+        let registry = WarmRegistry::new(4);
+        let worker = crate::model::WorkerId(0);
+        let v = version("a");
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        let a = (NodeId("a".into()), [1; 16]);
+        let b = (NodeId("b".into()), [2; 16]);
+        registry.grant_lease(&v, &a, until);
+        // Simulate the enqueue race: A observes it is last, then B is granted
+        // and reserves before A's release reaches the queue.
+        let observed = {
+            let mut leases = registry.leases.lock().unwrap();
+            leases.versions.remove(&v);
+            leases.next
+        };
+        registry.grant_lease(&v, &b, until);
+        registry.release(&v, observed, &[worker]);
+        assert!(release_all(&registry, worker).is_empty());
+        assert!(registry.drained(worker), "stale release is discarded");
+        assert!(registry.has_lease(&v, &b));
+        // Dropping B, the actual last lease, still releases.
+        assert!(registry.drop_lease(&v, &b, &[worker]));
+        assert_eq!(release_all(&registry, worker), vec![v]);
+    }
+
+    #[test]
+    fn retrying_release_does_not_survive_newer_grant() {
+        let registry = WarmRegistry::new(4);
+        let worker = crate::model::WorkerId(0);
+        let v = version("a");
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        let a = (NodeId("a".into()), [1; 16]);
+        let b = (NodeId("b".into()), [2; 16]);
+        registry.grant_lease(&v, &a, until);
+        assert!(registry.drop_lease(&v, &a, &[worker]));
+        let waker = Waker::from(Arc::new(crate::test_support::WakeCounter::default()));
+        let mut cx = Context::from_waker(&waker);
+        registry
+            .poll_releases_with(worker, &mut cx, |_| Err(Error::Overloaded))
+            .unwrap();
+        assert!(!registry.drained(worker), "release is deferred");
+        registry.grant_lease(&v, &b, until);
+        assert!(release_all(&registry, worker).is_empty());
+        assert!(registry.drained(worker));
+        assert!(registry.has_lease(&v, &b));
+    }
+
+    #[test]
+    fn newer_release_queued_during_trim_is_kept() {
+        let registry = WarmRegistry::new(4);
+        let worker = crate::model::WorkerId(0);
+        let v = version("a");
+        registry.release(&v, 1, &[worker]);
+        let waker = Waker::from(Arc::new(crate::test_support::WakeCounter::default()));
+        let mut cx = Context::from_waker(&waker);
+        registry
+            .poll_releases_with(worker, &mut cx, |version| {
+                registry.release(version, 2, &[worker]);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!registry.drained(worker));
+        assert_eq!(release_all(&registry, worker), vec![v]);
         assert!(registry.drained(worker));
     }
 
