@@ -127,13 +127,22 @@ pub(crate) const LEASES_PER_JOB: usize = 64;
 pub(crate) const MAX_LEASES_PER_VERSION: usize = 64;
 
 impl LeaseState {
-    /// Drop expired leases everywhere. Versions left empty are removed; their
-    /// holds lapse by expiry, and no newer grant exists to fence.
-    fn prune(&mut self, now: SystemTime) {
-        self.versions.retain(|_, (_, entry)| {
+    /// Drop expired leases everywhere. Versions left empty are removed and
+    /// returned with the current generation, so the caller can queue the same
+    /// fenced release used on explicit drop. A shared hold keeps its longest
+    /// deadline, so unused capacity must not wait for the hold to lapse.
+    #[must_use]
+    fn prune(&mut self, now: SystemTime) -> Vec<(ObjectVersion, u64)> {
+        let generation = self.next;
+        let mut emptied = Vec::new();
+        self.versions.retain(|version, (_, entry)| {
             entry.retain(|_, expiry| *expiry > now);
+            if entry.is_empty() {
+                emptied.push((version.clone(), generation));
+            }
             !entry.is_empty()
         });
+        emptied
     }
 
     fn live(&self) -> usize {
@@ -172,26 +181,51 @@ impl WarmRegistry {
     ) -> Result<()> {
         let now = uring_runtime::environment::wall_now();
         let cap = self.config().max_jobs.saturating_mul(LEASES_PER_JOB);
-        let mut leases = self.leases.lock().unwrap();
-        let known = leases
-            .versions
-            .get(version)
-            .is_some_and(|(_, entry)| entry.get(key).is_some_and(|expiry| *expiry > now));
-        if !known {
-            leases.prune(now);
-            let per_version = leases.versions.get(version).map_or(0, |(_, e)| e.len());
-            if per_version >= MAX_LEASES_PER_VERSION || leases.live() >= cap {
-                return Err(Error::Overloaded);
+        let mut emptied = Vec::new();
+        let outcome = {
+            let mut leases = self.leases.lock().unwrap();
+            let known = leases
+                .versions
+                .get(version)
+                .is_some_and(|(_, entry)| entry.get(key).is_some_and(|expiry| *expiry > now));
+            if !known {
+                emptied = leases.prune(now);
             }
+            let per_version = leases.versions.get(version).map_or(0, |(_, e)| e.len());
+            if !known && (per_version >= MAX_LEASES_PER_VERSION || leases.live() >= cap) {
+                Err(Error::Overloaded)
+            } else {
+                leases.next += 1;
+                let generation = leases.next;
+                let (stamp, entry) = leases.versions.entry(version.clone()).or_default();
+                *stamp = generation;
+                entry.retain(|_, expiry| *expiry > now);
+                let expiry = entry.entry(key.clone()).or_insert(until);
+                *expiry = (*expiry).max(until);
+                Ok(())
+            }
+        };
+        // Queued after the new stamp: a release for this version is fenced off.
+        self.release_expired(emptied);
+        outcome
+    }
+
+    /// Queue fenced releases for versions whose last lease expired, on every
+    /// worker that polls releases. A worker that never polled holds nothing.
+    fn release_expired(&self, emptied: Vec<(ObjectVersion, u64)>) {
+        if emptied.is_empty() {
+            return;
         }
-        leases.next += 1;
-        let generation = leases.next;
-        let (stamp, entry) = leases.versions.entry(version.clone()).or_default();
-        *stamp = generation;
-        entry.retain(|_, expiry| *expiry > now);
-        let expiry = entry.entry(key.clone()).or_insert(until);
-        *expiry = (*expiry).max(until);
-        Ok(())
+        let workers = self
+            .releases
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|id| crate::model::WorkerId(*id))
+            .collect::<Vec<_>>();
+        for (version, generation) in emptied {
+            self.release(&version, generation, &workers);
+        }
     }
 
     #[cfg(test)]
@@ -535,15 +569,10 @@ impl WarmRegistry {
             !remove
         });
         drop(jobs);
-        // Expired leases need no release: their holds expire on their own.
-        self.leases
-            .lock()
-            .unwrap()
-            .versions
-            .retain(|_, (_, entry)| {
-                entry.retain(|_, expiry| *expiry > wall);
-                !entry.is_empty()
-            });
+        // A shared hold keeps its longest deadline, so release unused capacity
+        // once the last lease expires instead of waiting for the hold to lapse.
+        let emptied = self.leases.lock().unwrap().prune(wall);
+        self.release_expired(emptied);
         for job in cancel {
             let _ = job.scope.cancel();
         }
@@ -1856,6 +1885,76 @@ mod tests {
         // Dropping B, the actual last lease, still releases.
         assert!(registry.drop_lease(&v, &b, &[worker]));
         assert_eq!(release_all(&registry, worker), vec![v]);
+    }
+
+    /// Grants a long and a short lease, drops the long one, and expires the
+    /// short one in place. Returns the version and registered worker.
+    fn expire_last_lease(registry: &WarmRegistry) -> (ObjectVersion, crate::model::WorkerId) {
+        let worker = crate::model::WorkerId(0);
+        assert!(release_all(registry, worker).is_empty(), "registers worker");
+        let v = version("a");
+        let now = uring_runtime::environment::wall_now();
+        let long = (NodeId("long".into()), [1; 16]);
+        let short = (NodeId("short".into()), [2; 16]);
+        registry
+            .grant_lease(&v, &long, now + Duration::from_secs(3600))
+            .unwrap();
+        registry
+            .grant_lease(&v, &short, now + Duration::from_secs(60))
+            .unwrap();
+        assert!(!registry.drop_lease(&v, &long, &[worker]));
+        assert!(registry.drained(worker), "short lease still live");
+        *registry
+            .leases
+            .lock()
+            .unwrap()
+            .versions
+            .get_mut(&v)
+            .unwrap()
+            .1
+            .get_mut(&short)
+            .unwrap() = now - Duration::from_secs(1);
+        (v, worker)
+    }
+
+    #[test]
+    fn last_lease_expiry_releases_unused_capacity() {
+        let registry = WarmRegistry::new(4);
+        let (v, worker) = expire_last_lease(&registry);
+        registry.poll_deadlines();
+        assert_eq!(registry.lease_count(&v), 0);
+        assert_eq!(release_all(&registry, worker), vec![v]);
+        assert!(registry.drained(worker));
+    }
+
+    #[test]
+    fn prune_through_unrelated_grant_releases_unused_capacity() {
+        let registry = WarmRegistry::new(4);
+        let (v, worker) = expire_last_lease(&registry);
+        let other = (NodeId("other".into()), [3; 16]);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        registry.grant_lease(&version("b"), &other, until).unwrap();
+        assert_eq!(registry.lease_count(&v), 0);
+        assert_eq!(release_all(&registry, worker), vec![v]);
+    }
+
+    #[test]
+    fn expiry_release_does_not_trim_newer_reservation() {
+        let registry = WarmRegistry::new(4);
+        let (v, worker) = expire_last_lease(&registry);
+        let fresh = (NodeId("fresh".into()), [4; 16]);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        // The grant prunes the expired lease, queuing a release, then stamps a
+        // newer generation that fences it off.
+        registry.grant_lease(&v, &fresh, until).unwrap();
+        assert!(!registry.drained(worker));
+        assert!(release_all(&registry, worker).is_empty());
+        assert!(registry.drained(worker));
+        // Expiry with a pending release followed by a newer grant also holds.
+        registry.drop_lease(&v, &fresh, &[worker]);
+        registry.grant_lease(&v, &fresh, until).unwrap();
+        assert!(release_all(&registry, worker).is_empty());
+        assert!(registry.has_lease(&v, &fresh));
     }
 
     #[test]
