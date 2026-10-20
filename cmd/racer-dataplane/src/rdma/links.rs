@@ -63,7 +63,7 @@ pub fn fund_publication<T>(publication: &mut Vec<T>, registered_bytes: usize) {
 pub fn grants_per_link(connections_per_neighbor: usize) -> u32 {
     u32::try_from(connections_per_neighbor)
         .unwrap_or(u32::MAX)
-        .max(1)
+        .clamp(1, link_setup::MAX_GRANTS_PER_LINK)
 }
 
 /// Opaque verbs key for a peer and rail: `SHA-256(NodeId)` and the rail.
@@ -449,6 +449,7 @@ impl Links {
             let remote = rdma_verbs::Setup {
                 endpoint: rdma_verbs::Endpoint::from_bytes(&remote.endpoint)?,
                 recv_credits: remote.recv_credits,
+                grants_per_link: remote.grants_per_link,
             };
             self.wait(self.client.connect(key, epoch, remote, link_id.0), scope)
                 .await
@@ -524,6 +525,7 @@ impl Links {
                     rdma_verbs::Setup {
                         endpoint: rdma_verbs::Endpoint::from_bytes(&decoded.endpoint)?,
                         recv_credits: decoded.recv_credits,
+                        grants_per_link: decoded.grants_per_link,
                     },
                     link_id.0,
                     false,

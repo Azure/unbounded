@@ -88,6 +88,10 @@ pub struct Setup {
 
     /// Receives the peer may consume before credits come back.
     pub recv_credits: u32,
+
+    /// Max grants the sender of this setup accepts on the link. Each side
+    /// holds at most `min(local, peer)` outstanding grants.
+    pub grants_per_link: u32,
 }
 
 /// A new link's epoch and local setup.
@@ -885,7 +889,7 @@ impl Owner {
         initiator: bool,
         now: Instant,
     ) -> Result<Opened> {
-        if remote.recv_credits < 2 {
+        if remote.recv_credits < 2 || remote.grants_per_link == 0 {
             return Err(Error::InvalidRequest);
         }
 
@@ -901,7 +905,13 @@ impl Owner {
             Role::Responder
         };
         let mut link = self.create(key, role, now)?;
-        link.connect(remote.endpoint, remote.recv_credits, link_id, now)?;
+        link.connect(
+            remote.endpoint,
+            remote.recv_credits,
+            remote.grants_per_link,
+            link_id,
+            now,
+        )?;
         let opened = opened(&link);
         self.links.insert(key, link);
         self.dirty = true;
@@ -926,7 +936,13 @@ impl Owner {
             return Err(Error::InvalidRequest);
         }
 
-        let result = link.connect(remote.endpoint, remote.recv_credits, link_id, now);
+        let result = link.connect(
+            remote.endpoint,
+            remote.recv_credits,
+            remote.grants_per_link,
+            link_id,
+            now,
+        );
 
         if result.is_err() {
             self.break_link(key, Break::Error, now);
@@ -1177,6 +1193,7 @@ fn opened(link: &Link) -> Opened {
         setup: Setup {
             endpoint: link.endpoint(),
             recv_credits: link.recv_credits(),
+            grants_per_link: link.grant_limit(),
         },
     }
 }

@@ -55,7 +55,11 @@ impl Setup {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.nonce == [0; 16] || self.recv_credits == 0 || self.grants_per_link == 0 {
+        if self.nonce == [0; 16]
+            || self.recv_credits == 0
+            || self.grants_per_link == 0
+            || self.grants_per_link > MAX_GRANTS_PER_LINK
+        {
             return Err(Error::InvalidRequest);
         }
         Ok(())
@@ -95,6 +99,11 @@ impl Setup {
         Ok(setup)
     }
 }
+
+/// Largest `grants_per_link` either side sends or accepts. Each link posts
+/// `2 * grants + 4` receives and allocates `grants` windows, so larger values
+/// are nonsensical; setups above it are rejected.
+pub const MAX_GRANTS_PER_LINK: u32 = 4096;
 
 /// SHA-256 of the initiator's exact setup bytes, sent by the responder.
 pub(crate) fn binding(initiator: &[u8]) -> [u8; 32] {
@@ -242,10 +251,19 @@ mod tests {
         let max = Setup {
             rail: RailId(u16::MAX),
             recv_credits: u32::MAX,
-            grants_per_link: u32::MAX,
+            grants_per_link: MAX_GRANTS_PER_LINK,
             ..setup(0, 9)
         };
         assert_eq!(Setup::decode(&max.encode(), RailId(u16::MAX)).unwrap(), max);
+        // Grant limits above the maximum are rejected.
+        for grants in [MAX_GRANTS_PER_LINK + 1, u32::MAX] {
+            let over = Setup {
+                grants_per_link: grants,
+                ..setup(0, 9)
+            };
+            assert!(Setup::decode(&over.encode(), RailId(0)).is_err());
+            assert!(Setup::new(RailId(0), [2; 32], 8, grants).is_err());
+        }
     }
 
     #[test]

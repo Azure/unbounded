@@ -258,7 +258,10 @@ fn constants_and_keys() {
     assert_eq!(buffer_count(2 * BUFFER_LEN), 2);
     assert_eq!(grants_per_link(0), 1);
     assert_eq!(grants_per_link(16), 16);
-    assert_eq!(grants_per_link(usize::MAX), u32::MAX);
+    assert_eq!(
+        grants_per_link(usize::MAX),
+        crate::rdma::link_setup::MAX_GRANTS_PER_LINK
+    );
     let key = link_key(&node_id(1), RAIL);
     assert_eq!(key, link_key(&node_id(1), RAIL));
     assert_ne!(key, link_key(&node_id(2), RAIL));

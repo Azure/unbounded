@@ -358,6 +358,9 @@ pub(crate) struct Link {
 
     grants: BTreeMap<u32, GrantEntry>,
 
+    /// Grants we may hold: `min(local, peer)` once connected.
+    grant_cap: u32,
+
     remote: BTreeMap<u32, RemoteGrant>,
 
     waiting: BTreeMap<u32, Waiting>,
@@ -439,6 +442,7 @@ impl Link {
             next_tag: 0,
             free_slots: (recv_depth..recv_depth + send_slots).rev().collect(),
             grants: BTreeMap::new(),
+            grant_cap: limits.grants,
             remote: BTreeMap::new(),
             waiting: BTreeMap::new(),
             outbox: VecDeque::new(),
@@ -460,6 +464,11 @@ impl Link {
     /// Receives we posted for the peer.
     pub(crate) fn recv_credits(&self) -> u32 {
         self.recv_depth
+    }
+
+    /// Our local grant limit, advertised to the peer.
+    pub(crate) fn grant_limit(&self) -> u32 {
+        self.limits.grants
     }
 
     pub(crate) fn epoch(&self) -> Epoch {
@@ -490,21 +499,25 @@ impl Link {
     }
 
     /// Connect to the peer's QP. `credits` is the peer's advertised receive
-    /// count and must be at least 2. The initiator queues its hello and is
+    /// count and must be at least 2. `peer_grants` is the peer's grant
+    /// limit; we hold at most `min(local, peer_grants)` grants so the peer
+    /// never sees more than it accepts. The initiator queues its hello and is
     /// `Ready`; the responder waits for it.
     pub(crate) fn connect(
         &mut self,
         remote: Endpoint,
         credits: u32,
+        peer_grants: u32,
         link_id: u64,
         now: Instant,
     ) -> Result<()> {
-        if self.phase != Phase::Created || credits < 2 {
+        if self.phase != Phase::Created || credits < 2 || peer_grants == 0 {
             return Err(Error::InvalidRequest);
         }
 
         self.qp.connect(remote)?;
         self.credits = credits;
+        self.grant_cap = self.limits.grants.min(peer_grants);
         self.link_id = link_id;
 
         match self.role {
@@ -545,7 +558,7 @@ impl Link {
             return;
         }
 
-        if self.grants.len() >= self.limits.grants as usize {
+        if self.grants.len() >= self.grant_cap as usize {
             let _ = done.complete(Err(Error::Overloaded));
             return;
         }

@@ -46,6 +46,18 @@ fn limits() -> Limits {
 
 /// One node with a pool of `buffers` page buffers and an unconnected link.
 fn side(sim: &Simulation, n: u8, role: Role, buffers: usize, now: Instant) -> Side {
+    side_with(sim, n, role, buffers, GRANTS, now)
+}
+
+/// Like [`side`], with a local grant limit of `grants`.
+fn side_with(
+    sim: &Simulation,
+    n: u8,
+    role: Role,
+    buffers: usize,
+    grants: u32,
+    now: Instant,
+) -> Side {
     let node = sim
         .with_devices(vec![Device::new(format!("sim{n}"), [n; 16])])
         .unwrap();
@@ -56,7 +68,8 @@ fn side(sim: &Simulation, n: u8, role: Role, buffers: usize, now: Instant) -> Si
         NativeRegion::with_access(device.clone(), buffers * LEN, Access::PAGES, quota.clone())
             .unwrap();
     let pool = Pool::new(region, LEN, quota.clone()).unwrap();
-    let link = Link::new(Epoch(n.into()), role, &device, &quota, limits(), now).unwrap();
+    let limits = Limits { grants, ..limits() };
+    let link = Link::new(Epoch(n.into()), role, &device, &quota, limits, now).unwrap();
     Side {
         link,
         pool,
@@ -71,11 +84,23 @@ fn connect(sim: Simulation, ids: (u64, u64)) -> Pair {
     let mut a = side(&sim, 1, Role::Initiator, 4, now);
     let mut b = side(&sim, 2, Role::Responder, 4, now);
     b.link
-        .connect(a.link.endpoint(), a.link.recv_credits(), ids.1, now)
+        .connect(
+            a.link.endpoint(),
+            a.link.recv_credits(),
+            a.link.grant_limit(),
+            ids.1,
+            now,
+        )
         .unwrap();
     assert_eq!(b.link.phase(), Phase::Connecting);
     a.link
-        .connect(b.link.endpoint(), b.link.recv_credits(), ids.0, now)
+        .connect(
+            b.link.endpoint(),
+            b.link.recv_credits(),
+            b.link.grant_limit(),
+            ids.0,
+            now,
+        )
         .unwrap();
     assert_eq!(a.link.phase(), Phase::Ready);
     Pair { sim, a, b, now }
@@ -502,6 +527,79 @@ fn grant_and_write_requests_are_validated() {
 }
 
 #[test]
+/// Unequal grant limits: each side holds at most the smaller limit, so the
+/// side configured for more grants never breaks the other. Covers the larger
+/// limit on the initiator and on the responder.
+fn unequal_grant_limits_use_the_minimum() {
+    for (a_grants, b_grants) in [(4, 2), (2, 4)] {
+        let sim = Simulation::new();
+        let now = Instant::now();
+        let a = side_with(&sim, 1, Role::Initiator, 4, a_grants, now);
+        let b = side_with(&sim, 2, Role::Responder, 4, b_grants, now);
+        let mut p = Pair { sim, a, b, now };
+        p.b.link
+            .connect(
+                p.a.link.endpoint(),
+                p.a.link.recv_credits(),
+                p.a.link.grant_limit(),
+                ID,
+                now,
+            )
+            .unwrap();
+        p.a.link
+            .connect(
+                p.b.link.endpoint(),
+                p.b.link.recv_credits(),
+                p.b.link.grant_limit(),
+                ID,
+                now,
+            )
+            .unwrap();
+        assert_eq!(pump(&mut p), (None, None));
+        assert_eq!(p.b.link.phase(), Phase::Ready);
+        let deadline = now + 5 * SECOND;
+
+        for to_a in [true, false] {
+            let receiver = if to_a { &mut p.a } else { &mut p.b };
+            let held: Vec<_> = (0..2).map(|_| grant(receiver, 1, deadline, now)).collect();
+            assert_eq!(
+                poll(&grant(receiver, 1, deadline, now)).map(|r| r.err()),
+                Some(Some(Error::Overloaded)),
+                "third grant over the peer's limit ({a_grants}, {b_grants}, {to_a})"
+            );
+            assert_eq!(pump(&mut p), (None, None), "link stays up");
+
+            for granted in held {
+                let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+                let sender = if to_a { &mut p.b } else { &mut p.a };
+                let written = write(sender, tag, vec![9], deadline, now);
+                assert_eq!(pump(&mut p), (None, None));
+                assert_eq!(poll(&written), Some(Ok(())));
+                assert!(matches!(poll(&arrival), Some(Ok(Arrival::Page(_)))));
+            }
+        }
+
+        assert_eq!(p.a.link.phase(), Phase::Ready);
+        assert_eq!(p.b.link.phase(), Phase::Ready);
+        finish(p);
+    }
+}
+
+#[test]
+/// A peer grant limit of zero is refused at connect.
+fn zero_peer_grant_limit_is_refused() {
+    let sim = Simulation::new();
+    let now = Instant::now();
+    let mut a = side(&sim, 1, Role::Initiator, 1, now);
+    let b = side(&sim, 2, Role::Responder, 1, now);
+    assert_eq!(
+        a.link
+            .connect(b.link.endpoint(), b.link.recv_credits(), 0, ID, now),
+        Err(Error::InvalidRequest)
+    );
+}
+
+#[test]
 /// With every page buffer in use, grants and byte writes are overloaded.
 fn pool_exhaustion_is_overloaded() {
     let mut p = pair();
@@ -825,16 +923,27 @@ fn setup_timeout() {
     let mut a = side(&sim, 1, Role::Initiator, 1, now);
     let mut b = side(&sim, 2, Role::Responder, 1, now);
     b.link
-        .connect(a.link.endpoint(), a.link.recv_credits(), ID, now)
+        .connect(
+            a.link.endpoint(),
+            a.link.recv_credits(),
+            a.link.grant_limit(),
+            ID,
+            now,
+        )
         .unwrap();
     assert_eq!(
-        b.link
-            .connect(a.link.endpoint(), a.link.recv_credits(), ID, now),
+        b.link.connect(
+            a.link.endpoint(),
+            a.link.recv_credits(),
+            a.link.grant_limit(),
+            ID,
+            now
+        ),
         Err(Error::InvalidRequest),
         "connect once"
     );
     assert_eq!(
-        a.link.connect(b.link.endpoint(), 1, ID, now),
+        a.link.connect(b.link.endpoint(), 1, 1, ID, now),
         Err(Error::InvalidRequest),
         "too few credits"
     );

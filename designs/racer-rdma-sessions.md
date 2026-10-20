@@ -628,3 +628,15 @@ Recorded while building stage 5 (cleanup, done):
     tests. The ignored loopback test
     `ffi::tests::native_available_provider_write_bind_invalidate_and_fence`
     remains the only real-hardware DMA test, and it uses plain writes.
+17. `grants_per_link` is negotiated (resolves the earlier open issue that the
+    remote value was decoded but ignored). Both sides pass the peer's
+    advertised value through `rdma_verbs::Setup::grants_per_link`, and a link
+    holds at most `min(local, peer)` outstanding grants
+    (`verbs/src/link.rs`, `Link::connect` and `Link::grant`). Incoming grants
+    are still checked against the local limit, which is never below the
+    negotiated one, so a side configured for more grants can no longer break
+    a smaller peer. Receive and send depths stay sized by the local limit
+    (`2 * grants_per_link + 4` receives), which bounds the peer's traffic
+    because the peer issues at most the minimum. Setup decode rejects a
+    `grants_per_link` of 0 or above `MAX_GRANTS_PER_LINK` (4096,
+    `src/rdma/link_setup.rs`), and Racer clamps its own value to that range.

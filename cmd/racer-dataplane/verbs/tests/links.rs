@@ -395,8 +395,16 @@ fn setup_rules() {
     let setup = Setup {
         endpoint: wait(&mut w, &other).unwrap().setup.endpoint,
         recv_credits: 1,
+        grants_per_link: 2,
     };
     let bad = w.b.clients[0].accept(TO_A, setup, ID, false);
+    assert_eq!(wait(&mut w, &bad).err(), Some(Error::InvalidRequest));
+    let no_grants = Setup {
+        recv_credits: 8,
+        grants_per_link: 0,
+        ..setup
+    };
+    let bad = w.b.clients[0].accept(TO_A, no_grants, ID, false);
     assert_eq!(wait(&mut w, &bad).err(), Some(Error::InvalidRequest));
     let wrong = w.a.clients[0].connect(TO_B, Epoch(ea.0 + 50), setup, ID);
     assert_eq!(wait(&mut w, &wrong).err(), Some(Error::Unavailable));
@@ -414,6 +422,7 @@ fn setup_rules() {
     let offer = Setup {
         endpoint: setup.endpoint,
         recv_credits: 8,
+        grants_per_link: 2,
     };
     let replaced = w.b.clients[0].accept(TO_A, offer, ID + 1, false);
     let replaced = wait(&mut w, &replaced).unwrap();

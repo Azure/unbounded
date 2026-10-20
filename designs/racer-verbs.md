@@ -143,6 +143,7 @@ pub enum LinkState { Idle, Connecting(Epoch), Ready(Epoch), Backoff(Instant) }
 pub struct Setup {                       // carried in the signed HTTP setup
     pub endpoint: Endpoint,              // existing 32-byte encoding
     pub recv_credits: u32,               // receives the peer may consume
+    pub grants_per_link: u32,            // grants the sender accepts; min() is used
 }
 pub struct Opened { pub epoch: Epoch, pub setup: Setup }
 
@@ -327,7 +328,8 @@ Credits:
   `rnr_retry = 0`, so that surfaces as an error completion and breaks the link
   instead of stalling.
 
-Grant concurrency: `grants` is capped at `grants_per_link`. A peer whose
+Grant concurrency: `grants` is capped at `min(grants_per_link, peer grants_per_link)`,
+the peer limit coming from `Setup::grants_per_link`. A peer whose
 `Grant` would exceed our advertised `grants_per_link` (the sender-side table
 `remote` is full) breaks the link.
 
