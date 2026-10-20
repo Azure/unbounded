@@ -9,7 +9,7 @@ repo_root=$(cd -- "$script_dir/../.." && pwd)
 
 usage() {
   cat <<'USAGE'
-Usage: deploy.sh <plan|scale|recreate-pool|deploy|status> [config-file]
+Usage: deploy.sh <plan|scale|recreate-pool|destroy|deploy|status> [config-file]
 
 One idempotent entrypoint for the complete Gantry benchmark stack. The config
 file is a shell environment file. No credentials are stored in it.
@@ -17,6 +17,7 @@ file is a shell environment file. No credentials are stored in it.
   plan    validate inputs and print the complete deployment contract
   scale   resize the existing AKS node pool and wait for Ready nodes
   recreate-pool  delete and recreate the Artifact Streaming benchmark pool
+  destroy submit nonblocking deletion of the benchmark resource group
   deploy  create or validate every resource and leave the benchmark ready
   status  report Azure and Kubernetes readiness without mutation
 USAGE
@@ -26,7 +27,7 @@ action=${1:-plan}
 config_file=${2:-${GANTRY_BENCHMARK_DEPLOY_CONFIG:-$script_dir/deploy.env}}
 
 case "$action" in
-plan | scale | recreate-pool | deploy | status) ;;
+plan | scale | recreate-pool | destroy | deploy | status) ;;
 -h | --help | help)
   usage
   exit 0
@@ -332,6 +333,18 @@ fi
   echo "set DEPLOY_CONFIRM=$AZURE_RESOURCE_GROUP to authorize deployment" >&2
   exit 2
 }
+
+if [[ "$action" == destroy ]]; then
+  if [[ $(az group exists -n "$AZURE_RESOURCE_GROUP") == false ]]; then
+    log "resource group $AZURE_RESOURCE_GROUP is already absent"
+    exit 0
+  fi
+
+  log "submitting deletion of resource group $AZURE_RESOURCE_GROUP"
+  az group delete -n "$AZURE_RESOURCE_GROUP" --yes --no-wait --only-show-errors
+  log "resource group deletion submitted"
+  exit 0
+fi
 
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || {
   echo "deployment requires a clean Git worktree" >&2
