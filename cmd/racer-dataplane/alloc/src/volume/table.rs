@@ -1299,6 +1299,17 @@ impl Slots {
         }
     }
 
+    /// Storage data slots whose `retain_until` bound is at least `now`.
+    /// O(slots).
+    pub fn retained_storage(&self, now: u64) -> Vec<u32> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_data() && e.tier() == Tier::Storage && e.retain_until >= now)
+            .map(|(slot, _)| slot as u32)
+            .collect()
+    }
+
     /// Free slots.
     pub fn free_slots(&self) -> u64 {
         self.free_count

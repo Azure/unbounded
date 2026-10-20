@@ -632,6 +632,56 @@ mod simulation {
         assert_eq!(volume.slot_state(slot).unwrap().retain_until, 0);
     }
 
+    /// Retained storage slots and their entries are found without an index
+    /// scan.
+    #[test]
+    fn retained_storage_entries_come_from_the_record_map() {
+        let (_sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, SLOTS, Limits::UNLIMITED).unwrap();
+        let held = put(
+            &reactor,
+            &volume,
+            &slab,
+            Tier::Storage,
+            key(1, 0),
+            4096,
+            500,
+        )
+        .unwrap();
+        put(
+            &reactor,
+            &volume,
+            &slab,
+            Tier::Storage,
+            key(1, 1),
+            4096,
+            500,
+        )
+        .unwrap();
+        put(&reactor, &volume, &slab, Tier::Cache, key(2, 0), 4096, 0).unwrap();
+        put(&reactor, &volume, &slab, Tier::Storage, key(3, 0), 8192, 10).unwrap();
+        commit(&reactor, &volume).unwrap();
+        // Replaced in the overlay: only the current entry is reported.
+        put(
+            &reactor,
+            &volume,
+            &slab,
+            Tier::Storage,
+            key(1, 1),
+            4096,
+            600,
+        )
+        .unwrap();
+        assert_eq!(volume.retained_storage_slots(100), vec![held.slot]);
+        let mut found = drive(&reactor, volume.slot_entries(&reactor, held.slot, &SCOPE)).unwrap();
+        found.sort_by_key(|(k, _)| *k);
+        let keys: Vec<Key> = found.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![key(1, 0), key(1, 1)]);
+        assert_eq!(found[1].1.retain_until, 600);
+        assert!(volume.retained_storage_slots(1000).is_empty());
+    }
+
     /// Storage records freed by a remove are not reused until two commits
     /// succeed, so the older superblock never points at reused space.
     #[test]

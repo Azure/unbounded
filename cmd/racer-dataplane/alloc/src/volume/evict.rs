@@ -228,6 +228,39 @@ impl<C: Charge> Volume<C> {
         })
     }
 
+    /// Storage data slots whose `retain_until` bound is at least `now`: the
+    /// only slots that can hold entries protected at `now`. O(slots), no I/O.
+    pub fn retained_storage_slots(&self, now: u64) -> Vec<u32> {
+        self.shared.state().slots.retained_storage(now)
+    }
+
+    /// Current index entries whose record lies in `slot`, found through the
+    /// record map (no index scan).
+    pub fn slot_entries<'a, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        slot: u32,
+        scope: &'a S,
+    ) -> Operation<'a, Vec<(Key, Value)>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for (rk, desc) in self.slot_records(reactor, scope, slot).await? {
+                let (_, unit) = record_key_parts(&rk);
+                if let Some(value) = self.resolve(reactor, scope, &desc.key).await?
+                    && value.slot == slot
+                    && value.unit == unit
+                    && value.generation == desc.generation
+                {
+                    out.push((desc.key, value));
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Evict until at least `free_slots` slots are free or nothing more can
     /// be evicted, at most `max_evictions` slots. Run it ahead of allocation
     /// (for example from a timer) so foreground writes rarely evict. Returns
