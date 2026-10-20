@@ -60,6 +60,7 @@
 //! - The caller owns auth, topology, admission sizing, retries, and timeouts.
 //!
 //! Hardware-free tests: `cargo test -p rdma-verbs --features simulation`.
+mod channel;
 mod control;
 mod ffi;
 

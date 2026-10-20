@@ -70,6 +70,19 @@ two `AtomicWaker`s (one per side). Results come back
 through per-operation one-shot cells (`Op<T>`), not a queue, so a worker
 never has to drain unrelated results.
 
+Channel details (as built): `channels(workers, capacity)` returns one
+`Worker` per I/O worker and one `Owner`. `Worker::try_send` returns the
+command with `Overloaded` when the queue is full (wait with
+`Worker::poll_ready`) or `Unavailable` once the owner is gone.
+`Owner::poll_drain(cx, budget, f)` hands out up to `budget` commands,
+round-robin across workers, in send order per worker. Dropping the `Owner`
+drops queued commands; each command owns the `Completer` for its `Op`, and a
+dropped `Completer` resolves the `Op` to `Cancelled`. A dropped `Worker`
+keeps its queued commands; `Owner::is_closed` turns true once they drain.
+`Completer::complete` hands the value back if the `Op` was dropped, so the
+owner can clean it up. Polling an `Op` after it returned `Ready` gives
+`InvalidRequest`.
+
 Rationale is in `racer-rdma-sessions.md` ("Threading").
 
 ## Public API
