@@ -205,6 +205,37 @@ def verify():
         not Path("/etc/systemd/system/nvidia-persistence-mode.service").exists(),
         "unexpected NVIDIA persistence retry service",
     )
+    device_init = Path("/etc/systemd/system/nvidia-device-init.service")
+    device_init_enabled = Path(
+        "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
+    )
+    if profile == "canonical-control":
+        require(not device_init.exists(), "unexpected NVIDIA device initialization service")
+    else:
+        require(
+            device_init.exists()
+            and device_init.read_text().splitlines()
+            == [
+                "[Unit]",
+                "Description=Initialize NVIDIA GPU and NVSwitch device nodes",
+                "Before=nvidia-fabricmanager.service cloud-final.service",
+                "",
+                "[Service]",
+                "Type=oneshot",
+                "ExecStart=/usr/bin/nvidia-modprobe -c 0",
+                "ExecStart=/usr/bin/nvidia-modprobe -u",
+                "ExecStart=/usr/bin/nvidia-modprobe -s",
+                "RemainAfterExit=yes",
+                "",
+                "[Install]",
+                "WantedBy=multi-user.target",
+            ],
+            "invalid NVIDIA device initialization service",
+        )
+        require(
+            device_init_enabled.is_symlink(),
+            "NVIDIA device initialization service is not enabled",
+        )
     require(not Path("/etc/ssh/ssh_host_ed25519_key").exists(), "baked-in SSH key")
     require(Path("/etc/machine-id").read_bytes() == b"", "baked-in machine ID")
     result = {

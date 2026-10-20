@@ -125,6 +125,27 @@ class RootfsContractTest(unittest.TestCase):
             f"/lib/modules/{self.kernel}/modules.builtin",
             "kernel/drivers/net/ethernet/microsoft/mana/mana.ko\n",
         )
+        self.put(
+            "/etc/systemd/system/nvidia-device-init.service",
+            "[Unit]\n"
+            "Description=Initialize NVIDIA GPU and NVSwitch device nodes\n"
+            "Before=nvidia-fabricmanager.service cloud-final.service\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "ExecStart=/usr/bin/nvidia-modprobe -c 0\n"
+            "ExecStart=/usr/bin/nvidia-modprobe -u\n"
+            "ExecStart=/usr/bin/nvidia-modprobe -s\n"
+            "RemainAfterExit=yes\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n",
+        )
+        enabled = self.path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
+        )
+        enabled.parent.mkdir(parents=True, exist_ok=True)
+        enabled.symlink_to("/etc/systemd/system/nvidia-device-init.service")
 
     def rejected(self, message):
         with self.assertRaisesRegex(RuntimeError, message):
@@ -281,6 +302,22 @@ class RootfsContractTest(unittest.TestCase):
             "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
         )
         self.rejected("missing pinned open DKMS driver")
+
+    def test_agentbaker_device_initialization_service_is_required(self):
+        self.configure_agentbaker_kernel()
+        os.environ["GB200_PROFILE"] = "agentbaker-driver"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
+        self.driver = "580.159.04"
+        self.module_version = self.driver
+        self.packages = (
+            "nvidia-dkms-580-open\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-utils-580\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
+        )
+        self.path("/etc/systemd/system/nvidia-device-init.service").unlink()
+        self.rejected("NVIDIA device initialization service")
 
     def test_doca_profile_requires_doca_ofed(self):
         self.configure_agentbaker_kernel()

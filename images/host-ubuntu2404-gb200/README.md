@@ -15,9 +15,16 @@ The image family provides four cumulative, pinned experiment profiles:
 
 Every profile includes matching Fabric Manager and NSCQ packages. MANA
 Ethernet (`mana`) and RDMA (`mana_ib`) must come from the selected kernel.
+The AgentBaker kernel builds `mana` into the kernel and retains `mana_ib` as a
+module; the Canonical control ships both as modules.
 Versions fail closed if unavailable; there is no unpinned package or
 different-kernel fallback. The profiles intentionally isolate cumulative stack
 deltas rather than changing all AgentBaker components at once.
+
+AgentBaker normally performs GPU device initialization during node join. These
+standalone AgentBaker-derived images run `nvidia-modprobe` for the GPU, UVM,
+and NVSwitch devices before Fabric Manager and cloud-final so Unbounded's
+preflight sees the required device nodes.
 
 The image contains a GPT disk with an EFI partition, signed Ubuntu ARM64
 shim/GRUB binaries, and an ext4 root with at least 5 GiB additional space.
@@ -38,10 +45,11 @@ Every profile requires `platforms=linux/arm64` and uses a native
 `ubuntu-24.04-arm` runner.
 
 Publication follows rootfs checks and a bounded QEMU ARM64 UEFI boot check.
-The checks cover the 64K kernel, matching signed open NVIDIA module
-version/vermagic, Fabric Manager/NSCQ and GB200 topology data, MANA modules and
-initramfs inclusion, ARM64 EFI binaries, cloud-init, networkd and SSH. The
-workflow retains `image-inputs.json`, compressed-disk SHA256 and the boot log.
+The checks cover the 64K kernel, matching open NVIDIA module version/vermagic,
+the Canonical control's module signatures, Fabric Manager/NSCQ and GB200
+topology data, MANA built-in/module layout, ARM64 EFI binaries, cloud-init,
+networkd and SSH. The workflow retains `image-inputs.json`, compressed-disk
+SHA256 and the boot log.
 The OCI is tagged by source commit; activation must use its immutable registry
 digest.
 

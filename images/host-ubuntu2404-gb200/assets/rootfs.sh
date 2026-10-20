@@ -220,6 +220,23 @@ nvidia_modeset
 nvidia_uvm
 nvidia_drm
 EOF
+    if [ "$GB200_PROFILE" != canonical-control ]; then
+        cat > /etc/systemd/system/nvidia-device-init.service <<'EOF'
+[Unit]
+Description=Initialize NVIDIA GPU and NVSwitch device nodes
+Before=nvidia-fabricmanager.service cloud-final.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-modprobe -c 0
+ExecStart=/usr/bin/nvidia-modprobe -u
+ExecStart=/usr/bin/nvidia-modprobe -s
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
     if [ "$GB200_PROFILE" = agentbaker-doca ] || \
         [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
         printf 'nvidia_peermem\n' >> /etc/modules-load.d/nvidia.conf
@@ -234,6 +251,9 @@ EOF
     fi
     systemctl enable systemd-networkd.service systemd-resolved.service \
         ssh.service chrony.service nvidia-fabricmanager.service
+    if [ "$GB200_PROFILE" != canonical-control ]; then
+        systemctl enable nvidia-device-init.service
+    fi
     if [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then
         systemctl enable nvidia-imex.service
     fi
