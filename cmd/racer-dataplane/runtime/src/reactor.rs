@@ -3020,6 +3020,40 @@ pub mod ready_set {
             Ok(None)
         }
 
+        /// Report whether an index is cached or a registered descriptor is ready,
+        /// without waiting. Ready indices are cached for the next `next` call. An
+        /// outstanding idle wait owns the next wake, so this reports false.
+        pub fn has_ready(&mut self) -> Result<bool, E> {
+            if !self.ready.is_empty() {
+                return Ok(true);
+            }
+            if self.wait.is_some() {
+                return Ok(false);
+            }
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+            // SAFETY: events is writable for the bounded requested event count.
+            let count = unsafe {
+                libc::epoll_wait(
+                    self.fd.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    0,
+                )
+            };
+            if count < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    return Ok(true);
+                }
+                return Err(Error::Io.into());
+            }
+            self.ready.extend(
+                events[..count as usize]
+                    .iter()
+                    .map(|event| event.u64 as usize),
+            );
+            Ok(!self.ready.is_empty())
+        }
+
         /// Consume completed waits before propagating failure, preventing repolling.
         /// With no wait the caller can inspect the level-triggered index immediately.
         fn poll_wait(&mut self, cx: &mut Context<'_>) -> Result<Poll<()>, E> {
