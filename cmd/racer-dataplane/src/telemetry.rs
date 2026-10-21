@@ -2851,6 +2851,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OriginFill => "racer_origin_fills_total",
             Self::DirtyDiscard => "racer_dirty_discards_total",
             Self::DiskPublication => "racer_disk_publications_total",
+            Self::PersistZeroCopy => "racer_persist_zero_copy_total",
+            Self::PersistCopyFallback => "racer_persist_copy_fallback_total",
             Self::Overload => "racer_overloads_total",
             Self::CorruptMiss => "racer_corrupt_misses_total",
             Self::DiagnosticAccepted => "racer_diagnostic_accepted_total",

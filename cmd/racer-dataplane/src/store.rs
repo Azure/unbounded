@@ -690,10 +690,11 @@ impl StoreWriter {
             self.pending.borrow_mut().remove(&victim);
             self.note_discard(1);
         }
-        // Reserve the full staging capacity before queue acceptance. Thus
-        // accepted dirty copies never wait for ciphertext holders to release memory.
-        let disk_bytes = record_length(&page, self.slabs.alignment()?)?;
-        let capacity = staging_capacity(disk_bytes)?;
+        // Reserve the staging persist will need before queue acceptance. Thus
+        // accepted dirty copies never wait for ciphertext holders to release
+        // memory. Computed after any rehome above, so a registered page that
+        // became aligned only reserves its header block.
+        let capacity = staging_bytes(&page, self.slabs.alignment()?)?;
         let staging = reserve_staging(capacity)?;
         staging.validate(ResourceClass::Ciphertext, capacity)?;
         if !self.admission.owns(&staging) || staging.key() != Some(&id.version.object.cache) {
@@ -1024,7 +1025,14 @@ impl StoreWriter {
         if !self.admission.owns(&staging) {
             return Err(Error::InvalidConfiguration);
         }
-        let mut buffer = self.slabs.allocate(disk_bytes, staging)?;
+        let zero_copy = zero_copy_body(page, alignment)?.is_some();
+        // Zero-copy pages stage only the header block; enqueue reserved exactly that.
+        let staged = if zero_copy {
+            header_block_len(page, alignment)?
+        } else {
+            disk_bytes
+        };
+        let mut buffer = self.slabs.allocate(staged, staging)?;
         buffer.retain(dirty);
         let (segment, extent) = match self.segments.append(disk_bytes).map_err(Error::from) {
             Ok(append) => append,
@@ -1043,17 +1051,37 @@ impl StoreWriter {
         };
         let _publication_guard = self.index.publishing(location.segment);
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
-        let encoded = encode_at(
-            page,
-            location.generation,
-            alignment,
-            location.extent.offset(),
-            buffer,
-        )?;
-        let _ = self
-            .slabs
-            .write(&self.reactor, extent, encoded.buffer, segment, scope)
-            .await?;
+        if zero_copy {
+            if extent.length() != disk_bytes {
+                return Err(Error::InvalidConfiguration);
+            }
+            write_header(page, location.generation, alignment, buffer.bytes_mut()?)?;
+            self.metrics
+                .record(crate::telemetry::Event::PersistZeroCopy, 1);
+            let body = DiskBody {
+                page: page.ciphertext.clone(),
+                alignment,
+                length: disk_bytes - header_block_len(page, alignment)?,
+            };
+            let _ = self
+                .slabs
+                .write_vectored(&self.reactor, extent, buffer, body, segment, scope)
+                .await?;
+        } else {
+            self.metrics
+                .record(crate::telemetry::Event::PersistCopyFallback, 1);
+            let encoded = encode_at(
+                page,
+                location.generation,
+                alignment,
+                location.extent.offset(),
+                buffer,
+            )?;
+            let _ = self
+                .slabs
+                .write(&self.reactor, extent, encoded.buffer, segment, scope)
+                .await?;
+        }
         if self.allowed(page)
             && self
                 .pending
@@ -1281,6 +1309,54 @@ pub const MAX_HEADER_BYTES: usize = MAX_RAW_HEADER_BYTES + 4096;
 /// Smallest record unit; every stored `header_len` is a multiple of it.
 const MIN_RECORD_UNIT: usize = 512;
 
+/// Ciphertext body that can be written in place, without a staging copy.
+///
+/// Returns the padded body when the page already lives in direct-I/O aligned
+/// storage whose padded length matches the record body for `alignment`.
+fn zero_copy_body(page: &CiphertextCopy, alignment: Alignment) -> Result<Option<&[u8]>> {
+    Ok(disk_body_prefix(
+        &page.ciphertext,
+        alignment,
+        body_len(page, alignment)?,
+    ))
+}
+/// The first `length` bytes of the aligned padded body: the ciphertext followed
+/// only by zeros. The pool may pad to a coarser unit than the device, so a
+/// longer padded body still serves a shorter unit-aligned record body.
+fn disk_body_prefix(
+    page: &crate::memory::CiphertextPage,
+    alignment: Alignment,
+    length: usize,
+) -> Option<&[u8]> {
+    page.disk_body(alignment)
+        .filter(|body| body.len() >= length && length.is_multiple_of(alignment.length()))
+        .map(|body| &body[..length])
+}
+/// Staging bytes reserved before queue acceptance and consumed by persist.
+///
+/// Zero-copy pages only need the padded header block because the page owns
+/// its aligned body; other pages need the full encoded record.
+pub(crate) fn staging_bytes(page: &CiphertextCopy, alignment: Alignment) -> Result<usize> {
+    if zero_copy_body(page, alignment)?.is_some() {
+        staging_capacity(header_block_len(page, alignment)?)
+    } else {
+        staging_capacity(record_length(page, alignment)?)
+    }
+}
+/// Immutable, Arc-held page body handed to a vectored device write.
+struct DiskBody {
+    page: crate::memory::CiphertextPage,
+    alignment: Alignment,
+    length: usize,
+}
+// SAFETY: the Arc-held ciphertext storage is never mutated after
+// construction, so the returned slice is stable while `self` is alive.
+unsafe impl racer_platform::reactor::SharedWriteBuffer for DiskBody {
+    type Error = Error;
+    fn write_bytes(&self) -> Result<&[u8]> {
+        disk_body_prefix(&self.page, self.alignment, self.length).ok_or(Error::InvalidConfiguration)
+    }
+}
 /// Large records share capacity classes while their disk extents stay exact.
 fn staging_capacity(length: usize) -> Result<usize> {
     if length < 2 * 1024 * 1024 {
@@ -1390,14 +1466,10 @@ fn raw_layout(page: &CiphertextCopy, generation: Generation) -> Result<usize> {
     Ok(header_bytes)
 }
 /// Padded header block length; the ciphertext starts at this record offset.
-// Used by the vectored write path.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn header_block_len(page: &CiphertextCopy, alignment: Alignment) -> Result<usize> {
     Ok(layout(page, Generation(1), alignment)?.header_block)
 }
 /// Ciphertext length padded to the record unit.
-// Used by the vectored write path.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn body_len(page: &CiphertextCopy, alignment: Alignment) -> Result<usize> {
     Ok(layout(page, Generation(1), alignment)?.body_bytes)
 }
@@ -1411,8 +1483,6 @@ pub fn record_length(page: &CiphertextCopy, alignment: Alignment) -> Result<usiz
 }
 /// Write the header and its zero padding into `out`, which must be exactly
 /// `header_block_len(page, alignment)` bytes.
-// Used by the vectored write path.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_header(
     page: &CiphertextCopy,
     generation: Generation,
