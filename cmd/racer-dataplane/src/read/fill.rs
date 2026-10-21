@@ -1801,6 +1801,12 @@ impl Fill {
                 .reserve(Some(cache), ResourceClass::DirtyCiphertext, amount)
                 .map_err(Error::from)
         };
+        let page_charge = result
+            .ciphertext
+            .inner
+            .reservation()
+            .amount()
+            .max(PAGE_BYTES as usize + 16);
         let dirty = self.reserve_owned_persistence(
             id,
             ResourceClass::DirtyCiphertext,
@@ -1817,9 +1823,14 @@ impl Fill {
             .dependencies
             .writer
             .enqueue_reclaiming(result.copy(), dirty, |amount| {
-                // Ciphertext owns both the immutable page and exact padded disk
-                // staging. The one-page floor includes BOTH, even on tiny slabs.
-                let one_page = (PAGE_BYTES as usize + 16).saturating_add(amount);
+                // Ciphertext owns both the immutable page and its disk staging.
+                // The one-page floor includes BOTH, even on tiny slabs. The page
+                // term is the page's own Ciphertext charge, which for aligned
+                // pages covers the padded body pool class. `amount` is the
+                // staging request: only the padded header block when persist
+                // writes the aligned body in place, or the full padded record
+                // for the copy fallback, so the floor covers either path.
+                let one_page = page_charge.saturating_add(amount);
                 // Idle aligned buffers retain Ciphertext charges after completed
                 // writes. Release that backing before headroom rejection or any
                 // destructive queued-copy reclaim; this is one bounded pool.
