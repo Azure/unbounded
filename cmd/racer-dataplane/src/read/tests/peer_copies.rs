@@ -203,6 +203,7 @@ impl ScriptedPeers {
                             remaining_page_budget: subscription.page_budget - 1,
                             remaining_byte_budget: subscription.byte_budget
                                 - copy.ciphertext.bytes().len() as u64,
+                            flights: subscription.flights,
                         },
                         metadata: copy.metadata,
                         ciphertext: copy.ciphertext,

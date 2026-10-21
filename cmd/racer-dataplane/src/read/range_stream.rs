@@ -119,6 +119,7 @@ impl Scheduler {
                         sequence: 0,
                         page_budget: u32::MAX,
                         byte_budget: u64::from(u32::MAX) * (PAGE_BYTES + 16),
+                        flights: None,
                     },
                     expires: deadline,
                     busy: false,

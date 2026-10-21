@@ -835,6 +835,7 @@ mod scenarios {
                         demand: Demand::new(vec![PageInterval { start: 0, end: 1 }]).unwrap(),
                         page_budget: 3 - u32::from(sequence),
                         byte_budget: PAGE_BYTES + 16,
+                        flights: None,
                     },
                     mode: FetchMode::CopyOnly,
                 },
