@@ -740,3 +740,60 @@ func TestSecretWatchedMatchesReferencedCredentials(t *testing.T) {
 	require.False(t, match(secret("other", "creds")), "other namespace")
 	require.False(t, match(secret(env.Namespace, "unrelated")))
 }
+
+// kubeletExpand mirrors kubelet's $(VAR) expansion of container args: "$$"
+// becomes "$", and "$(NAME)" becomes the value of a defined variable.
+func kubeletExpand(in string, env map[string]string) string {
+	var out strings.Builder
+
+	for i := 0; i < len(in); i++ {
+		if in[i] != '$' || i+1 >= len(in) {
+			out.WriteByte(in[i])
+			continue
+		}
+
+		switch in[i+1] {
+		case '$':
+			out.WriteByte('$')
+			i++
+		case '(':
+			end := strings.IndexByte(in[i+2:], ')')
+			if end < 0 {
+				out.WriteByte(in[i])
+				continue
+			}
+
+			name := in[i+2 : i+2+end]
+			if v, ok := env[name]; ok {
+				out.WriteString(v)
+			} else {
+				out.WriteString(in[i : i+3+end])
+			}
+
+			i += 2 + end
+		default:
+			out.WriteByte(in[i])
+		}
+	}
+
+	return out.String()
+}
+
+func TestOriginEscapesContainerURLVariableReferences(t *testing.T) {
+	const url = "https://$(STORAGE_HOST)/models"
+
+	cache := originCache("cache", nil)
+	cache.Spec.Origin.Azure.ContainerURL = url
+
+	spec, err := renderOrigin(cache)
+	require.NoError(t, err)
+
+	env := map[string]string{"STORAGE_HOST": "other.blob.core.windows.net"}
+
+	var got []string
+	for _, arg := range spec.args {
+		got = append(got, kubeletExpand(arg, env))
+	}
+
+	require.Contains(t, got, "--container-url="+url)
+}
