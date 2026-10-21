@@ -118,13 +118,13 @@ impl Drop for Resident {
 /// Capacity ownership acquired before a disk SQE. Drop releases unused capacity.
 pub struct PageTicket {
     index: Rc<Index>,
-    hold: Option<Rc<Cell<usize>>>,
+    hold: Option<(Rc<super::holds::Inflight>, crate::model::PageNumber)>,
 }
 impl Drop for PageTicket {
     fn drop(&mut self) {
         self.index.reserved.set(self.index.reserved.get() - 1);
-        if let Some(inflight) = &self.hold {
-            inflight.set(inflight.get() - 1);
+        if let Some((inflight, page)) = &self.hold {
+            inflight.remove(*page);
         }
     }
 }
@@ -318,10 +318,10 @@ impl Index {
         if total > limit {
             return Err(Error::Overloaded);
         }
-        let inflight = old.map_or_else(|| Rc::new(Cell::new(0)), |hold| hold.inflight.clone());
+        let inflight = old.map_or_else(Rc::default, |hold| hold.inflight.clone());
         let active = old.map_or_else(|| Rc::new(Cell::new(0)), |hold| hold.active.clone());
         let unused = holds.unused() - old.map_or(0, super::holds::Hold::unused)
-            + count.saturating_sub(locations.len() + inflight.get());
+            + count.saturating_sub(locations.len() + inflight.within(&members));
         if state.pages.len() + self.reserved.get() + unused > self.page_capacity.get() {
             return Err(Error::Overloaded);
         }
@@ -421,7 +421,7 @@ impl Index {
     pub fn release_hold(&self, version: &ObjectVersion) -> Result<()> {
         let mut holds = self.holds.borrow_mut();
         if let Some(hold) = holds.entries.get_mut(version) {
-            if hold.inflight.get() != 0 || hold.active.get() != 0 {
+            if !hold.inflight.is_empty() || hold.active.get() != 0 {
                 return Err(Error::Overloaded);
             }
             let locations = &hold.locations;
@@ -489,7 +489,7 @@ impl Index {
             .iter()
             .filter(|page| !released.contains(*page))
             .collect();
-        if hold.pages.is_empty() && hold.inflight.get() == 0 && hold.active.get() == 0 {
+        if hold.pages.is_empty() && hold.inflight.is_empty() && hold.active.get() == 0 {
             holds.entries.remove(version);
         }
     }
@@ -639,7 +639,7 @@ impl Index {
                             pages: super::holds::HoldPages::default(),
                             holders: HashMap::default(),
                             epoch: super::holds::HoldEpoch::default(),
-                            inflight: Rc::new(Cell::new(0)),
+                            inflight: Rc::default(),
                             active: Rc::new(Cell::new(0)),
                             locations: HashMap::default(),
                         });
@@ -855,8 +855,8 @@ impl Index {
         self.reserved.set(self.reserved.get() + 1);
         let hold = held.map(|page| {
             let inflight = self.holds.borrow().entries[&page.version].inflight.clone();
-            inflight.set(inflight.get() + 1);
-            inflight
+            inflight.add(page.number);
+            (inflight, page.number)
         });
         Ok(PageTicket {
             index: self.clone(),
@@ -1858,6 +1858,51 @@ mod tests {
         index.release_hold(&cached.version).unwrap();
         assert_eq!(index.held_page_expiry(&primary), Some(until));
         assert!(!index.is_held(&cached));
+    }
+
+    /// Releasing a page while its held write is in flight returns only that
+    /// page's capacity: the write keeps the entry alive, but no longer offsets
+    /// the unused reservation of the pages still held.
+    #[test]
+    fn released_page_with_held_write_in_flight_keeps_other_members_reserved() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(4).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let version = descriptor("inflight", 2 * crate::model::PAGE_BYTES).version;
+        let at = |number| PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(number),
+        };
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let epoch = index
+            .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        assert_eq!(index.hold_unused(), 2);
+        let writing = index.reserve_page_for(&at(0), false).unwrap();
+        assert_eq!(index.hold_unused(), 1);
+        index.release_hold_pages(&version, &page_set(&[0]), epoch);
+        assert!(!index.is_held(&at(0)));
+        assert_eq!(index.hold_unused(), 1, "page 1 keeps its reservation");
+        assert_eq!(index.hold_epoch(&version), Some(epoch));
+        // Ordinary writes cannot take page 1's slot.
+        let ordinary = [
+            index.reserve_page(false).unwrap(),
+            index.reserve_page(false).unwrap(),
+        ];
+        assert!(matches!(index.reserve_page(false), Err(Error::Overloaded)));
+        let held = index.reserve_page_for(&at(1), false).unwrap();
+        assert_eq!(index.hold_unused(), 0);
+        drop((held, ordinary));
+        assert_eq!(index.hold_unused(), 1);
+        // The released page's write still owns the entry until it completes.
+        index.release_hold_pages(&version, &page_set(&[1]), epoch);
+        assert_eq!(index.hold_epoch(&version), Some(epoch));
+        assert_eq!(index.hold_unused(), 0);
+        assert_eq!(index.release_hold(&version), Err(Error::Overloaded));
+        drop(writing);
+        index.release_hold(&version).unwrap();
+        assert_eq!(index.hold_epoch(&version), None);
     }
 
     #[test]
