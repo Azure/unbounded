@@ -27,8 +27,8 @@ const testAccountURL = "https://Account.blob.core.windows.net/"
 func originCache(name string, credential *racerv1.AzureCredential) *racerv1.ClusterCache {
 	cache := cacheObject(name)
 	cache.Spec.Origin = &racerv1.ObjectOrigin{
-		Buckets: []racerv1.BucketName{"models", "data"},
-		Azure:   &racerv1.AzureOrigin{AccountURL: testAccountURL, Credential: credential},
+		Bucket: "models",
+		Azure:  &racerv1.AzureOrigin{AccountURL: testAccountURL, Credential: credential},
 	}
 
 	return cache
@@ -138,7 +138,7 @@ func TestOriginCredentialRendering(t *testing.T) {
 			tpl := ds.Spec.Template
 			require.Equal(t, originCacheValue("cache"), tpl.Labels[originCacheLabel])
 			require.Equal(t, ds.Spec.Selector.MatchLabels[originCacheLabel], tpl.Labels[originCacheLabel])
-			require.Equal(t, "https://account.blob.core.windows.net", tpl.Annotations[originIdentity])
+			require.NotContains(t, tpl.Annotations, "racer.unbounded-cloud.io/origin-identity")
 			require.NotEmpty(t, tpl.Annotations[originConfigHash])
 
 			if tc.podLabel {
@@ -160,8 +160,8 @@ func TestOriginCredentialRendering(t *testing.T) {
 			c := pod.Containers[0]
 			require.Equal(t, "mirror.test/unbounded/racer-object:v1", c.Image)
 			require.Equal(t, []string{
-				"origin", "--cache=cache", "--namespace=https://account.blob.core.windows.net", "--provider=azure",
-				"--account-url=" + testAccountURL, "--azure-credential=" + tc.mode, "--bucket=models", "--bucket=data",
+				"origin", "--cache=cache", "--bucket=models", "--provider=azure",
+				"--account-url=" + testAccountURL, "--azure-credential=" + tc.mode,
 				"--metadata-ttl=0s", "--request-timeout=1m30s", "--max-concurrent-requests=32",
 			}, c.Args)
 			require.Equal(t, tc.env, c.Env)
@@ -305,7 +305,7 @@ func TestOriginInvalidCacheIsIsolated(t *testing.T) {
 
 	// The fake client does not run CEL, modeling a cache that bypassed admission.
 	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { c.Spec.Origin.Azure.AccountURL = "https://user@host/" })
-	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.Buckets = append(c.Spec.Origin.Buckets, "more") })
+	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.MetadataTTL = &metav1.Duration{Duration: 7 * time.Second} })
 
 	plan, result := planResult(t, env)
 	require.False(t, result.Ready)
@@ -324,7 +324,7 @@ func TestOriginInvalidCacheIsIsolated(t *testing.T) {
 	require.Equal(t, bad.Spec, kept.Spec)
 
 	good, _ := liveOrigin(t, env, "good")
-	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--bucket=more")
+	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--metadata-ttl=7s")
 }
 
 func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
@@ -351,8 +351,10 @@ func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
 			o.Azure.AccountURL = "http://127.0.0.1:10000/devstoreaccount1"
 			o.Azure.Credential = &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{}}
 		}, "accountURL"},
-		{"no-buckets", func(o *racerv1.ObjectOrigin) { o.Buckets = nil }, "at least one bucket"},
-		{"bad-bucket", func(o *racerv1.ObjectOrigin) { o.Buckets = []racerv1.BucketName{"a/b"} }, "buckets"},
+		{"no-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = "" }, "spec.origin.bucket"},
+		{"slash-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = "a/b" }, "spec.origin.bucket"},
+		{"dot-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = ".." }, "spec.origin.bucket"},
+		{"long-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = racerv1.BucketName(strings.Repeat("b", 256)) }, "spec.origin.bucket"},
 		{"negative-ttl", func(o *racerv1.ObjectOrigin) { o.MetadataTTL = &metav1.Duration{Duration: -time.Second} }, "metadataTTL"},
 		{"zero-timeout", func(o *racerv1.ObjectOrigin) { o.RequestTimeout = &metav1.Duration{} }, "requestTimeout"},
 		{"zero-requests", func(o *racerv1.ObjectOrigin) { o.MaxConcurrentRequests = ptr.To(int32(0)) }, "maxConcurrentRequests"},
@@ -391,7 +393,7 @@ func TestOriginMalformedSecretRefIsIsolated(t *testing.T) {
 
 	// The fake client does not enforce the CRD pattern, modeling a cache that bypassed admission.
 	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { secretRefName("bad/name")(c.Spec.Origin) })
-	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.Buckets = append(c.Spec.Origin.Buckets, "more") })
+	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.MetadataTTL = &metav1.Duration{Duration: 7 * time.Second} })
 
 	plan, result := planResult(t, env)
 	require.Equal(t, "OriginInvalid", result.Reason)
@@ -402,7 +404,7 @@ func TestOriginMalformedSecretRefIsIsolated(t *testing.T) {
 	persist(t, env, plan)
 
 	good, _ := liveOrigin(t, env, "good")
-	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--bucket=more")
+	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--metadata-ttl=7s")
 }
 
 func TestUnmanagedOriginIsNotAdopted(t *testing.T) {
