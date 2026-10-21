@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -375,7 +376,9 @@ func TestDefaultSocketAndNetworkIsolation(t *testing.T) {
 	}
 }
 
-func TestSocketRecoveryPermissionsAndReplacement(t *testing.T) {
+func staleTestSocket(t *testing.T) string {
+	t.Helper()
+
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0o700); err != nil {
 		t.Fatal(err)
@@ -393,6 +396,12 @@ func TestSocketRecoveryPermissionsAndReplacement(t *testing.T) {
 	if err := stale.Close(); err != nil {
 		t.Fatal(err)
 	}
+
+	return path
+}
+
+func TestSocketRecoveryPermissionsAndReplacement(t *testing.T) {
+	path := staleTestSocket(t)
 
 	server, err := Listen(t.Context(), path, func() (*ipamproto.Config, error) {
 		return testConfig(t, "10.244.0.0/24"), nil
@@ -423,6 +432,141 @@ func TestSocketRecoveryPermissionsAndReplacement(t *testing.T) {
 
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("cleanup removed replacement: %v", err)
+	}
+}
+
+func TestSocketRecoveryRespectsOwnershipLock(t *testing.T) {
+	path := staleTestSocket(t)
+
+	identity, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	conf := testConfig(t, "10.244.0.0/24")
+
+	provider := func() (*ipamproto.Config, error) { return conf, nil }
+	if server, err := Listen(t.Context(), path, provider); err == nil {
+		server.Close()
+		t.Fatal("recovered a socket while another owner held its lock")
+	}
+
+	info, err := os.Lstat(path)
+	if err != nil || !os.SameFile(identity, info) {
+		t.Fatalf("contended recovery changed the stale socket: %v", err)
+	}
+
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := Listen(t.Context(), path, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	if _, err := GetConfig(t.Context(), path); err != nil {
+		t.Fatalf("recovered listener is unreachable: %v", err)
+	}
+
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := Listen(t.Context(), path, provider)
+	if err != nil {
+		t.Fatalf("shutdown retained ownership: %v", err)
+	}
+
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentStaleSocketRecovery(t *testing.T) {
+	path := staleTestSocket(t)
+	conf := testConfig(t, "10.244.0.0/24")
+	start := make(chan struct{})
+	servers := make(chan *Server, 16)
+
+	var wg sync.WaitGroup
+	for range cap(servers) {
+		wg.Go(func() {
+			<-start
+
+			server, err := Listen(t.Context(), path, func() (*ipamproto.Config, error) { return conf, nil })
+			if err == nil {
+				servers <- server
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+	close(servers)
+
+	var count int
+	for server := range servers {
+		count++
+
+		t.Cleanup(func() {
+			if err := server.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+
+	if count != 1 {
+		t.Fatalf("concurrent recovery returned %d successful listeners, want 1", count)
+	}
+
+	if _, err := GetConfig(t.Context(), path); err != nil {
+		t.Fatalf("winning listener is unreachable: %v", err)
+	}
+}
+
+func TestSocketOwnershipLockSafety(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(directory, "target")
+	if err := os.WriteFile(target, []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(directory, "socket")
+	if err := os.Symlink(target, path+".lock"); err != nil {
+		t.Fatal(err)
+	}
+
+	conf := testConfig(t, "10.244.0.0/24")
+
+	provider := func() (*ipamproto.Config, error) { return conf, nil }
+	if server, err := Listen(t.Context(), path, provider); err == nil {
+		server.Close()
+		t.Fatal("accepted a symlink as the ownership lock")
+	}
+
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unsafe ownership lock acquired a socket: %v", err)
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "preserve" {
+		t.Fatalf("ownership lock check modified target: %q, %v", data, err)
 	}
 }
 

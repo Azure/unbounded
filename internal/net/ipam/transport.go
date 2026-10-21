@@ -125,17 +125,20 @@ func GetConfig(ctx context.Context, path string) (*ipamproto.Config, error) {
 type ConfigProvider func() (*ipamproto.Config, error)
 
 type Server struct {
-	listener *net.UnixListener
-	path     string
-	identity os.FileInfo
-	mu       sync.Mutex
-	conns    map[net.Conn]struct{}
-	wg       sync.WaitGroup
-	done     chan struct{}
-	err      error
+	listener  *net.UnixListener
+	path      string
+	identity  os.FileInfo
+	ownership *os.File
+	closeOnce sync.Once
+	closeErr  error
+	mu        sync.Mutex
+	conns     map[net.Conn]struct{}
+	wg        sync.WaitGroup
+	done      chan struct{}
+	err       error
 }
 
-func Listen(ctx context.Context, path string, provider ConfigProvider) (*Server, error) {
+func Listen(ctx context.Context, path string, provider ConfigProvider) (server *Server, returnErr error) {
 	if err := ValidateSocketPath(path); err != nil {
 		return nil, err
 	}
@@ -156,6 +159,32 @@ func Listen(ctx context.Context, path string, provider ConfigProvider) (*Server,
 	stat, ok := directoryInfo.Sys().(*syscall.Stat_t)
 	if !directoryInfo.IsDir() || directoryInfo.Mode().Perm()&0o022 != 0 || !ok || stat.Uid != uint32(os.Geteuid()) {
 		return nil, fmt.Errorf("IPAM socket directory %s must be owned by the agent user and not writable by other users", filepath.Dir(path))
+	}
+
+	// Keep this file in place so all owners lock the same inode, including
+	// while recovering stale sockets and cleaning up after shutdown.
+	ownership, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open IPAM socket ownership lock: %w", err)
+	}
+	defer func() {
+		if server == nil {
+			returnErr = errors.Join(returnErr, ownership.Close())
+		}
+	}()
+
+	lockInfo, err := ownership.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	lockStat, ok := lockInfo.Sys().(*syscall.Stat_t)
+	if !lockInfo.Mode().IsRegular() || lockInfo.Mode().Perm()&0o022 != 0 || !ok || lockStat.Uid != uint32(os.Geteuid()) {
+		return nil, errors.New("IPAM socket ownership lock must be a regular file owned by the agent user and not writable by other users")
+	}
+
+	if err := syscall.Flock(int(ownership.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, fmt.Errorf("acquire IPAM socket ownership lock: %w", err)
 	}
 
 	if info, err := os.Lstat(path); err == nil {
@@ -201,9 +230,10 @@ func Listen(ctx context.Context, path string, provider ConfigProvider) (*Server,
 		return nil, errors.Join(err, listener.Close(), os.Remove(path))
 	}
 
-	server := &Server{
+	server = &Server{
 		listener: listener, path: path, identity: info,
-		conns: make(map[net.Conn]struct{}), done: make(chan struct{}),
+		ownership: ownership,
+		conns:     make(map[net.Conn]struct{}), done: make(chan struct{}),
 	}
 	server.wg.Go(func() { server.serve(provider) })
 
@@ -301,6 +331,14 @@ func (s *Server) serve(provider ConfigProvider) {
 func (s *Server) Done() <-chan struct{} { return s.done }
 
 func (s *Server) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.close() })
+
+	return s.closeErr
+}
+
+func (s *Server) close() (returnErr error) {
+	defer func() { returnErr = errors.Join(returnErr, s.ownership.Close()) }()
+
 	if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		s.mu.Lock()
 		s.err = errors.Join(s.err, err)
