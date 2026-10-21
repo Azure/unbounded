@@ -183,6 +183,23 @@ func TestHostProvideRegistersSweeperAndWithdrawRemoves(t *testing.T) {
 		}
 	}
 
+	for {
+		snapshot, err := second.provider.Stats(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if snapshot.Schedule.AvgPrefixLength >= 0 {
+			break
+		}
+
+		select {
+		case <-convergenceDeadline.C:
+			t.Fatal("sweeping provider did not come online")
+		case <-convergenceTick.C:
+		}
+	}
+
 	d := digest.MustParse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 	if err := second.Provide(ctx, d); err != nil {
 		t.Fatalf("Provide: %v", err)
@@ -195,6 +212,59 @@ func TestHostProvideRegistersSweeperAndWithdrawRemoves(t *testing.T) {
 
 	if stats.Schedule.Keys != 1 {
 		t.Fatalf("scheduled keys after Provide = %d, want 1", stats.Schedule.Keys)
+	}
+
+	if stats.Schedule.Regions == 0 {
+		t.Fatal("registered key has no periodic reprovide schedule")
+	}
+
+	c, err := DigestToCID(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	providers, err := first.d.FindProviders(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+
+	for _, provider := range providers {
+		if provider.ID == second.PeerID() {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("Provide returned before the digest was discoverable")
+	}
+
+	observeUntil := time.NewTimer(250 * time.Millisecond)
+	observeTick := time.NewTicker(5 * time.Millisecond)
+
+	defer observeUntil.Stop()
+	defer observeTick.Stop()
+
+observe:
+	for {
+		stats, err = second.provider.Stats(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if stats.Queues.PendingKeyProvides != 0 ||
+			stats.Operations.Ongoing.KeyProvides != 0 ||
+			stats.Operations.Past.KeysProvided != 0 ||
+			stats.Operations.Past.KeysFailed != 0 {
+			t.Fatal("sweeper queued or repeated the synchronous initial publication")
+		}
+
+		select {
+		case <-observeUntil.C:
+			break observe
+		case <-observeTick.C:
+		}
 	}
 
 	if err := second.Withdraw(ctx, d); err != nil {

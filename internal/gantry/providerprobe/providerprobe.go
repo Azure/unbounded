@@ -16,6 +16,8 @@ import (
 
 const DefaultConcurrency = 4
 
+const headTimeout = 2 * time.Second
+
 // Attempted records provider identities and addresses already probed during
 // one resolution. A changed address for the same peer remains eligible.
 type Attempted map[ifaces.Provider]struct{}
@@ -156,8 +158,11 @@ func first(ctx context.Context, dialer ifaces.PeerMetadataDialer, candidates <-c
 			inFlight++
 
 			go func() {
-				_, _, err := dialer.HeadFromPeer(probeCtx, provider.Addr, ref)
-				results <- result{provider: provider, usable: err == nil}
+				headCtx, cancelHead := context.WithTimeout(probeCtx, headTimeout)
+				defer cancelHead()
+
+				_, _, err := dialer.HeadFromPeer(headCtx, provider.Addr, ref)
+				results <- result{provider: provider, usable: err == nil && headCtx.Err() == nil}
 			}()
 		case probeResult := <-results:
 			inFlight--

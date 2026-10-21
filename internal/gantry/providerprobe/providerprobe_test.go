@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -206,5 +208,83 @@ func TestFirstDoesNotMarkUnstartedCandidatesAfterTimeout(t *testing.T) {
 
 	if _, found := attempted[second]; found {
 		t.Fatal("unstarted provider was added to attempted set")
+	}
+}
+
+type stalledMetadataDialer struct {
+	healthy string
+	started atomic.Int32
+	drained atomic.Int32
+}
+
+func (d *stalledMetadataDialer) HeadFromPeer(ctx context.Context, addr string, _ ifaces.OriginRef) (int64, string, error) {
+	if addr == d.healthy {
+		return 1, "application/octet-stream", nil
+	}
+
+	d.started.Add(1)
+	<-ctx.Done()
+	d.drained.Add(1)
+
+	return 0, "", ctx.Err()
+}
+
+func TestFirstReleasesBlockedProbeSlotsBeforeOverallDeadline(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("streaming=%t", streaming), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ref := ifaces.OriginRef{
+					Digest: digest.MustParse("sha256:abababababababababababababababababababababababababababababababab"),
+				}
+				providers := make([]ifaces.Provider, 0, 5)
+
+				for i := range providerprobe.DefaultConcurrency {
+					addr := fmt.Sprintf("blocked-%d:5001", i)
+					providers = append(providers, ifaces.Provider{NodeID: ifaces.NodeID(addr), Addr: addr})
+				}
+
+				healthy := ifaces.Provider{NodeID: "healthy", Addr: "healthy:5001"}
+				providers = append(providers, healthy)
+				dialer := &stalledMetadataDialer{healthy: healthy.Addr}
+				attempted := providerprobe.Attempted{}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+
+				start := time.Now()
+
+				var (
+					found  ifaces.Provider
+					usable bool
+				)
+
+				if streaming {
+					discovery := fakes.NewDHT()
+					discovery.Inject(ref.Digest, providers...)
+
+					var err error
+
+					found, usable, err = providerprobe.FirstFromDiscovery(ctx, discovery, dialer, ref, attempted, time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					found, usable = providerprobe.First(ctx, dialer, providers, ref, attempted, providerprobe.DefaultConcurrency)
+				}
+
+				if !usable || found != healthy {
+					t.Fatalf("provider = %+v, usable = %v; want the fifth provider", found, usable)
+				}
+
+				if ctx.Err() != nil || time.Since(start) >= 3*time.Second {
+					t.Fatal("blocked probes consumed the overall lookup deadline")
+				}
+
+				if dialer.started.Load() != 4 || dialer.drained.Load() != 4 || len(attempted) != 5 {
+					t.Fatalf("started/drained/attempted = %d/%d/%d, want 4/4/5",
+						dialer.started.Load(), dialer.drained.Load(), len(attempted))
+				}
+			})
+		})
 	}
 }

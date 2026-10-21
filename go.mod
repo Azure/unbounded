@@ -57,6 +57,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91
 	github.com/ipfs/go-cid v0.6.2
+	github.com/ipfs/go-datastore v0.9.2
 	github.com/lib/pq v1.12.3
 	github.com/libp2p/go-libp2p v0.49.0
 	github.com/libp2p/go-libp2p-kad-dht v0.42.2
@@ -196,7 +197,6 @@ require (
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/ipfs/boxo v0.41.0 // indirect
-	github.com/ipfs/go-datastore v0.9.2 // indirect
 	github.com/ipfs/go-libdht v0.5.0 // indirect
 	github.com/ipfs/go-log/v2 v2.9.2 // indirect
 	github.com/ipld/go-ipld-prime v0.24.0 // indirect

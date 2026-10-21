@@ -23,6 +23,8 @@ Implemented in the current change:
 - Registration changes and announced-set updates are serialized per digest
    across notifications and reconciliation, so overlapping deletion cannot
    leave periodic reprovide running outside the announced set.
+- Initial publication is synchronous; storing and scheduling the key for
+   periodic reprovide does not enqueue another initial publication.
 - Section 2: an uncapped streaming provider walk on the warm path, with an
    immediate origin failover when every advertised provider is unusable.
 - Section 3: request-scoped failed-provider exclusion during chair polling,
@@ -32,6 +34,9 @@ Implemented in the current change:
 - Busy responses are issued only after opening the requested content, and
    waiting headers require a successful HEAD to the peer that returned 429,
    rather than origin metadata.
+- Shared provider validation gives each HEAD a two-second timeout under the
+   existing caller deadline, so stalled peers cannot occupy every probe slot
+   for the entire polling window.
 
 Sections 4, 6, and 7 remain design proposals.
 
@@ -611,6 +616,10 @@ Unit and integration coverage must include:
     discovery continues after the headers are committed.
 28. Busy metadata probes omit registry credentials, reset a resume offset to
     zero, and reject unsuccessful HEAD responses.
+29. Four stalled metadata probes release their slots before the overall
+    deadline, allowing a healthy fifth provider to be verified.
+30. A successful initial announcement is immediately discoverable, registers
+    periodic reprovide, and does not queue a second initial publication.
 
 ## Open Questions
 
