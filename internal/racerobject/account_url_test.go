@@ -38,7 +38,7 @@ func TestAzureAccountURLValidation(t *testing.T) {
 		"https://::1", "https://[host]:80", "https://[::1%25eth0]:80", "https://host:80:90",
 		"https://host//", "https://host//account", "https://host/account//", "https://host/account/container", "https://host/.", "https://host/..",
 		"https://host/%2e%2e", "https://host/%2f", "https://host/account%2Fcontainer", "https://host/%61ccount", "https://host/%252f", "https://host/account%5ccontainer",
-		"https://host/account\\container", "https://host/account;param", "https://host/account name", "https://host/雪", "https://host/%00", "https://host/%zz",
+		"https://$(STORAGE_HOST)", "https://host$(X).net", "https://ho_st", "https://host/account\\container", "https://host/account;param", "https://host/account name", "https://host/雪", "https://host/%00", "https://host/%zz",
 	} {
 		for _, credential := range []string{"default", "anonymous"} {
 			err := ValidateAzureAccountURL(value, credential)

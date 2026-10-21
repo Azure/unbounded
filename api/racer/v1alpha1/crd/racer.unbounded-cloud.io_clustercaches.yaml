@@ -80,7 +80,7 @@ spec:
                             !self.contains(''@'')'
                         - message: containerURL must be an account URL followed by
                             one valid container name, such as https://account.blob.core.windows.net/models
-                          rule: self.matches('^https?://[^/]+(/[A-Za-z0-9_-]+)?/[a-z0-9]+(-[a-z0-9]+)*$')
+                          rule: self.matches('^https?://[]A-Za-z0-9.:[-]+(/[A-Za-z0-9_-]+)?/[a-z0-9]+(-[a-z0-9]+)*$')
                             && self.substring(self.lastIndexOf('/') + 1).size() >=
                             3 && self.substring(self.lastIndexOf('/') + 1).size()
                             <= 63
