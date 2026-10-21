@@ -2,7 +2,7 @@
 
 Read S3 objects and Azure block blobs through Racer. The origin holds upstream
 credentials; the sidecar serves trusted pod-local clients without authentication.
-See the [guide](../../docs/content/guides/racer-object.md) for setup, and the
+See the [Azure Blob guide](../../docs/content/guides/azure-blob-cache.md) for setup, and the
 [reference](../../docs/content/reference/racer-object.md) for flags, deployment
 requirements, request limits, and the security model.
 

@@ -7,13 +7,13 @@ description: "Flags, deployment requirements, supported requests, and the securi
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
 `racer-object` is a read-only object storage adapter for Racer. It reads from S3,
 S3-compatible stores, and Azure Blob Storage, and serves either an S3 or an Azure
 Blob API to applications. For a working setup, start with
-[Cache Object Storage with Racer]({{< relref "guides/racer-object" >}}).
+[Cache Azure Blob Storage with Racer]({{< relref "guides/azure-blob-cache" >}}).
 
 The binary has two commands:
 
