@@ -1521,6 +1521,149 @@ mod socket {
     }
 
     #[test]
+    /// A scope cancelled after the completion poll must not leave wait sleeping
+    /// until its timeout while the fenced operation awaits ASYNC_CANCEL.
+    fn wait_submits_cancel_for_scope_cancelled_during_service_turn() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = Rc::new(Descriptor::from(socket));
+
+        assert_eq!(reactor.poll_budgeted(8).unwrap(), 0);
+        let mut watch = reactor.readiness(fd, libc::POLLHUP as u32, &request);
+        assert!(poll(&mut watch).is_pending());
+        reactor.wait(Duration::ZERO).unwrap();
+        request.cancel().unwrap();
+
+        reactor.wait(MAX_WAIT).unwrap();
+        {
+            let state = reactor.state.borrow();
+            let entry = state.entries.first_key_value().unwrap().1;
+            assert!(
+                !entry.completion.needs_cancel(),
+                "wait must queue ASYNC_CANCEL before sleeping"
+            );
+        }
+        assert!(drive(&reactor, watch).is_err());
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    /// Zero-duration waits keep cancellation scans in poll_budgeted.
+    fn zero_wait_does_not_scan_cancellations() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = Rc::new(Descriptor::from(socket));
+
+        let mut watch = reactor.readiness(fd, libc::POLLHUP as u32, &request);
+        assert!(poll(&mut watch).is_pending());
+        reactor.wait(Duration::ZERO).unwrap();
+        request.cancel().unwrap();
+        reactor.wait(Duration::ZERO).unwrap();
+        let state = reactor.state.borrow();
+        let entry = state.entries.first_key_value().unwrap().1;
+        assert!(entry.completion.needs_cancel());
+        drop(state);
+        assert!(drive(&reactor, watch).is_err());
+    }
+
+    #[test]
+    /// A pending local wake makes wait return without sleeping, so the
+    /// cancellation scan is left to the next poll_budgeted turn.
+    fn local_wake_skips_wait_cancellation_scan() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let wake = reactor.waker().unwrap();
+        let request = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = Rc::new(Descriptor::from(socket));
+
+        let mut watch = reactor.readiness(fd, libc::POLLHUP as u32, &request);
+        assert!(poll(&mut watch).is_pending());
+        reactor.wait(Duration::ZERO).unwrap();
+        request.cancel().unwrap();
+        wake.wake().unwrap();
+
+        reactor.wait(MAX_WAIT).unwrap();
+        {
+            let state = reactor.state.borrow();
+            assert_eq!(state.wait_attempts, 0, "local wake must skip the sleep");
+            assert!(
+                !wake.fd.as_ref().unwrap().local.load(Ordering::Acquire),
+                "wait must still consume the local wake"
+            );
+            let entry = state.entries.first_key_value().unwrap().1;
+            assert!(
+                entry.completion.needs_cancel(),
+                "wait must not scan cancellations while a local wake is pending"
+            );
+        }
+        assert!(drive(&reactor, watch).is_err());
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[cfg(feature = "simulation")]
+    #[test]
+    /// Nonzero waits check scope deadlines in the reactor's captured clock, not
+    /// in whichever environment the caller selected before waiting.
+    fn wait_scans_cancellations_in_reactor_environment() {
+        for expired in [false, true] {
+            let sim = simulation::Simulation::new();
+            let _sim = sim.enter();
+            let reactor_clock = crate::environment::SimulationClock::new(5);
+            let caller_clock = crate::environment::SimulationClock::new(6);
+            let reactor_environment = reactor_clock.environment(0);
+            let entered = reactor_environment.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
+            reactor.init().unwrap();
+            let request =
+                RequestScope::new((), crate::environment::now() + Duration::from_secs(1)).unwrap();
+            let (fd, _peer) = sim.socket_pair();
+            let mut watch = reactor.readiness(Rc::new(fd), libc::POLLHUP as u32, &request);
+            assert!(poll(&mut watch).is_pending());
+            reactor.wait(Duration::ZERO).unwrap();
+            drop(entered);
+
+            // Expire the deadline in exactly one of the two clocks.
+            if expired {
+                reactor_clock.advance(Duration::from_secs(3600));
+            } else {
+                caller_clock.advance(Duration::from_secs(3600));
+            }
+            let caller = caller_clock.environment(0).enter();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+            drop(caller);
+
+            let state = reactor.state.borrow();
+            let entry = state.entries.first_key_value().unwrap().1;
+            assert_eq!(
+                entry.completion.needs_cancel(),
+                !expired,
+                "wait must check the deadline in the reactor's clock (expired: {expired})"
+            );
+            assert_eq!(
+                entry.cancel_reason,
+                expired.then_some(Error::DeadlineExceeded)
+            );
+            drop(state);
+
+            let _reactor = reactor_environment.enter();
+            request.cancel().unwrap();
+            assert!(drive(&reactor, watch).is_err());
+            assert_eq!(reactor.in_flight(), 0);
+        }
+    }
+
+    #[test]
     /// Retry accept publication after SQ pressure without disturbing unrelated owners.
     fn listener_retry_recovers_from_full_sq_without_losing_owners() {
         // Cancellation SQEs also consume SQ space without new table entries.

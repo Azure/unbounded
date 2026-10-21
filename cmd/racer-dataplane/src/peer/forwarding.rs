@@ -901,6 +901,26 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
     {
         return Err(Error::Unauthorized);
     }
+    if let Some(action) = match outcome.as_str() {
+        "held" => Some("hold"),
+        "warmed" => Some("fill"),
+        "released" => Some("release"),
+        _ => None,
+    } {
+        if field(request, "racer-operation")? != "warm"
+            || field(request, "racer-warm-action")? != action
+        {
+            return Err(Error::Unauthorized);
+        }
+        if outcome == "held"
+            && number(response, "racer-warm-until")? > number(request, "racer-warm-until")?
+        {
+            // An owner may shorten a hold to its own TTL cap, never extend the ask.
+            // Longer pre-existing holds are reported as the requested expiry.
+            return Err(Error::Unauthorized);
+        }
+        return Ok(());
+    }
     if outcome != "page" && outcome != "metadata" && outcome != "bootstrap" {
         return Ok(());
     }
@@ -940,7 +960,14 @@ fn response_authority(
 ) -> Result<()> {
     if matches!(
         field(response, "racer-outcome")?.as_str(),
-        "page" | "metadata" | "bootstrap" | "selected" | "not-found"
+        "page"
+            | "metadata"
+            | "bootstrap"
+            | "selected"
+            | "not-found"
+            | "held"
+            | "warmed"
+            | "released"
     ) && signer != &node_field(request, "racer-route-destination")?
     {
         return Err(Error::Unauthorized);
@@ -1970,6 +1997,276 @@ mod tests {
             };
             assert!(sender.verify_response(bad, &binding).is_err());
             sender.verify_response(reply, &binding).unwrap();
+        }
+    }
+    fn warm_request(id: u8, action: crate::peer::protocol::WarmAction) -> PeerRequest {
+        let mut request = request(id);
+        request.operation = Operation::Warm {
+            version: ObjectVersion {
+                object: request.origin.object.clone(),
+                etag: StrongEtag::parse(b"\"version\"").unwrap(),
+            },
+            lease: [id; 16],
+            action,
+        };
+        request.route.remaining_attempts = 4;
+        request.route.destination = node(1);
+        request
+    }
+    #[test]
+    fn warm_actions_round_trip_and_bind_their_acknowledgements() {
+        use crate::peer::protocol::SecurityCodec;
+        use crate::peer::protocol::WarmAction;
+        use crate::peer::protocol::decode_envelope;
+        use crate::peer::protocol::encode_envelope;
+        let signatures = network(2);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        let until = std::time::UNIX_EPOCH + Duration::from_millis(4_102_444_800_123);
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let codec =
+            SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
+        for (id, action, good, wrong) in [
+            (
+                21,
+                WarmAction::Hold { pages: 9, until },
+                PeerResponse::Held { until },
+                PeerResponse::Warmed,
+            ),
+            (
+                22,
+                WarmAction::Fill {
+                    page: PageNumber(8),
+                    length: 8 * PAGE_BYTES + 1,
+                    content_type: Some(
+                        crate::model::ContentType::parse(b"application/octet-stream").unwrap(),
+                    ),
+                },
+                PeerResponse::Warmed,
+                PeerResponse::Released,
+            ),
+            (
+                23,
+                WarmAction::Release,
+                PeerResponse::Released,
+                PeerResponse::Held { until },
+            ),
+        ] {
+            let (signed, binding) = f[0]
+                .sign_request_to(warm_request(id, action.clone()), &node(1))
+                .unwrap();
+            let scope = signed.request.origin.scope().clone();
+            let (auth, _) = decode_envelope(
+                encode_envelope(&signed.authentication, false, 0).unwrap(),
+                false,
+            )
+            .unwrap();
+            let decoded = codec.request(auth, &scope).unwrap();
+            let Operation::Warm {
+                version,
+                lease,
+                action: decoded_action,
+            } = &decoded.request.operation
+            else {
+                panic!("warm operation expected");
+            };
+            assert_eq!(version.etag, StrongEtag::parse(b"\"version\"").unwrap());
+            assert_eq!(lease, &[id; 16]);
+            assert_eq!(decoded_action, &action);
+            let admitted = f[1].verify_request(signed).unwrap();
+            let response = f[1].sign_response(admitted.binding(), good).unwrap();
+            let verified = f[0].verify_response(response, &binding).unwrap();
+            match (verified.response(), &action) {
+                (PeerResponse::Held { until: got }, WarmAction::Hold { .. }) => {
+                    assert_eq!(*got, until)
+                }
+                (PeerResponse::Warmed, WarmAction::Fill { .. })
+                | (PeerResponse::Released, WarmAction::Release) => {}
+                _ => panic!("acknowledgement changed"),
+            }
+            assert!(
+                f[1].sign_response(admitted.binding(), wrong)
+                    .ok()
+                    .is_none_or(|response| f[0].verify_response(response, &binding).is_err()),
+                "acknowledgement for another warm action accepted"
+            );
+            // Refusals stay request-bound and need no action-specific shape.
+            let response = f[1]
+                .sign_response(admitted.binding(), PeerResponse::Overloaded)
+                .unwrap();
+            f[0].verify_response(response, &binding).unwrap();
+        }
+        // An owner may shorten a hold but never report a later expiry.
+        let (signed, binding) = f[0]
+            .sign_request_to(
+                warm_request(24, WarmAction::Hold { pages: 1, until }),
+                &node(1),
+            )
+            .unwrap();
+        let admitted = f[1].verify_request(signed).unwrap();
+        let later = PeerResponse::Held {
+            until: until + Duration::from_millis(1),
+        };
+        assert!(
+            f[1].sign_response(admitted.binding(), later)
+                .ok()
+                .is_none_or(|response| f[0].verify_response(response, &binding).is_err())
+        );
+        let earlier = PeerResponse::Held {
+            until: until - Duration::from_secs(1),
+        };
+        let response = f[1].sign_response(admitted.binding(), earlier).unwrap();
+        f[0].verify_response(response, &binding).unwrap();
+        // Data acknowledgements are not valid answers to a data request.
+        let (signed, binding) = f[0].sign_request_to(request(25), &node(1)).unwrap();
+        let admitted = f[1].verify_request(signed).unwrap();
+        assert!(
+            f[1].sign_response(admitted.binding(), PeerResponse::Warmed)
+                .ok()
+                .is_none_or(|response| f[0].verify_response(response, &binding).is_err())
+        );
+    }
+    #[test]
+    fn malformed_warm_requests_are_rejected_at_encode_and_decode() {
+        use crate::peer::protocol::MAX_WARM_PAGES;
+        use crate::peer::protocol::SecurityCodec;
+        use crate::peer::protocol::WarmAction;
+        use crate::peer::protocol::request_head;
+        let until = std::time::UNIX_EPOCH + Duration::from_secs(4_102_444_800);
+        for action in [
+            WarmAction::Hold { pages: 0, until },
+            WarmAction::Hold {
+                pages: MAX_WARM_PAGES + 1,
+                until,
+            },
+            WarmAction::Hold {
+                pages: 1,
+                until: std::time::UNIX_EPOCH,
+            },
+            WarmAction::Fill {
+                page: PageNumber(MAX_WARM_PAGES),
+                length: u64::MAX,
+                content_type: None,
+            },
+            WarmAction::Fill {
+                page: PageNumber(2),
+                length: 2 * PAGE_BYTES,
+                content_type: None,
+            },
+            WarmAction::Fill {
+                page: PageNumber(0),
+                length: 0,
+                content_type: None,
+            },
+        ] {
+            assert!(
+                request_head(&warm_request(31, action.clone())).is_err(),
+                "{action:?}"
+            );
+        }
+        let signatures = network(2);
+        let sender = Forwarding::new(signatures[0].clone());
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let codec =
+            SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
+        let (signed, _) = sender
+            .sign_request_to(
+                warm_request(32, WarmAction::Hold { pages: 3, until }),
+                &node(1),
+            )
+            .unwrap();
+        let scope = signed.request.origin.scope().clone();
+        let decode = |change: &dyn Fn(&mut Vec<http1::Header>)| {
+            let mut head = clone_head(&signed.authentication.original);
+            change(&mut head.head.headers);
+            codec.request(
+                ForwardedHead {
+                    original: Arc::new(head),
+                    hops: vec![],
+                },
+                &scope,
+            )
+        };
+        assert!(decode(&|_| {}).is_ok());
+        let set = |name: &'static str, value: &'static [u8]| {
+            move |headers: &mut Vec<http1::Header>| {
+                headers.iter_mut().find(|h| h.name == name).unwrap().value = value.to_vec();
+            }
+        };
+        for (name, value) in [
+            ("racer-warm-pages", b"0".as_slice()),
+            ("racer-warm-pages", b"4294967297"),
+            ("racer-warm-pages", b"-1"),
+            ("racer-warm-until", b"0"),
+            ("racer-warm-until", b"soon"),
+            ("racer-warm-action", b"steal"),
+            ("racer-warm-lease", b"AAAA"),
+            ("racer-mode", b"copy"),
+        ] {
+            assert!(
+                decode(&set(name, value)).is_err(),
+                "accepted {name}={value:?}"
+            );
+        }
+        for name in ["racer-warm-pages", "racer-warm-until", "racer-warm-lease"] {
+            assert!(
+                decode(&|headers: &mut Vec<http1::Header>| headers.retain(|h| h.name != name))
+                    .is_err(),
+                "accepted missing {name}"
+            );
+        }
+        let (signed, _) = sender
+            .sign_request_to(
+                warm_request(
+                    33,
+                    WarmAction::Fill {
+                        page: PageNumber(1),
+                        length: PAGE_BYTES + 1,
+                        content_type: Some(
+                            crate::model::ContentType::parse(b"text/plain").unwrap(),
+                        ),
+                    },
+                ),
+                &node(1),
+            )
+            .unwrap();
+        let decode_fill = |change: &dyn Fn(&mut Vec<http1::Header>)| {
+            let mut head = clone_head(&signed.authentication.original);
+            change(&mut head.head.headers);
+            codec.request(
+                ForwardedHead {
+                    original: Arc::new(head),
+                    hops: vec![],
+                },
+                &scope,
+            )
+        };
+        assert!(decode_fill(&|_| {}).is_ok());
+        for (name, value) in [
+            ("racer-length", b"0".as_slice()),
+            ("racer-length", b"4194304"),
+            ("racer-length", b"-1"),
+            ("racer-length", b"big"),
+            ("racer-metadata-version", b"2"),
+            ("racer-content-type", b"not a type"),
+        ] {
+            assert!(
+                decode_fill(&set(name, value)).is_err(),
+                "accepted fill {name}={value:?}"
+            );
+        }
+        for name in ["racer-length", "racer-metadata-version", "racer-page"] {
+            assert!(
+                decode_fill(&|headers: &mut Vec<http1::Header>| headers.retain(|h| h.name != name))
+                    .is_err(),
+                "accepted fill missing {name}"
+            );
         }
     }
     #[test]

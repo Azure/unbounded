@@ -139,6 +139,9 @@ NET_CONTROLLER_CMD=./cmd/unbounded-net-controller
 NET_NODE_BIN=bin/unbounded-net-node
 NET_NODE_CMD=./cmd/unbounded-net-node
 
+IPAM_BIN=bin/unbounded-ipam
+IPAM_CMD=./cmd/unbounded-ipam
+
 NET_ROUTEPLAN_DEBUG_BIN=bin/unbounded-net-routeplan-debug
 NET_ROUTEPLAN_DEBUG_CMD=./cmd/unbounded-net-routeplan-debug
 
@@ -248,7 +251,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller project-signal-controller project-signal-adapter token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller project-signal-controller project-signal-adapter token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-ipam unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -307,6 +310,7 @@ help: ## Show this help
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
 	@echo "  unbounded-net-controller         Build net controller"
 	@echo "  unbounded-net-node               Build net node agent"
+	@echo "  unbounded-ipam                   Build verified local IPAM plugin"
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
@@ -874,6 +878,12 @@ unbounded-net-node-build: ## Build the unbounded-net-node binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_NODE_BIN) $(NET_NODE_CMD)
 
 unbounded-net-node: test unbounded-net-node-build ## Build the unbounded-net-node (implies test)
+
+.PHONY: unbounded-ipam unbounded-ipam-build
+unbounded-ipam-build: ## Build the unbounded-ipam CNI binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(IPAM_BIN) $(IPAM_CMD)
+
+unbounded-ipam: test unbounded-ipam-build ## Build unbounded-ipam (implies test)
 
 unbounded-net-routeplan-debug: test ## Build the routeplan debug tool (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)

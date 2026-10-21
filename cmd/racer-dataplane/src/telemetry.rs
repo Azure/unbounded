@@ -531,6 +531,51 @@ mod warm_metric_tests {
             (WarmEvent::WaitCompleted, "racer_warm_wait_completed_total"),
             (WarmEvent::WaitFallback, "racer_warm_wait_fallback_total"),
             (WarmEvent::WaitFailed, "racer_warm_wait_failed_total"),
+            (
+                WarmEvent::RemoteHoldAccepted,
+                "racer_warm_remote_hold_accepted_total",
+            ),
+            (
+                WarmEvent::RemoteHoldRefused,
+                "racer_warm_remote_hold_refused_total",
+            ),
+            (
+                WarmEvent::RemoteFillCompleted,
+                "racer_warm_remote_fill_completed_total",
+            ),
+            (
+                WarmEvent::RemoteFillRetried,
+                "racer_warm_remote_fill_retried_total",
+            ),
+            (
+                WarmEvent::RemoteFillFailed,
+                "racer_warm_remote_fill_failed_total",
+            ),
+            (
+                WarmEvent::RemoteReleaseSent,
+                "racer_warm_remote_release_sent_total",
+            ),
+            (
+                WarmEvent::RemoteReleaseFailed,
+                "racer_warm_remote_release_failed_total",
+            ),
+            (
+                WarmEvent::OwnerHoldAccepted,
+                "racer_warm_owner_hold_accepted_total",
+            ),
+            (
+                WarmEvent::OwnerHoldRefused,
+                "racer_warm_owner_hold_refused_total",
+            ),
+            (
+                WarmEvent::OwnerFillCompleted,
+                "racer_warm_owner_fill_completed_total",
+            ),
+            (
+                WarmEvent::OwnerFillFailed,
+                "racer_warm_owner_fill_failed_total",
+            ),
+            (WarmEvent::OwnerReleased, "racer_warm_owner_released_total"),
         ] {
             workers[0].warm_event(event);
             workers[1].warm_event(event);
@@ -2547,6 +2592,18 @@ pub enum WarmEvent {
     WaitCompleted,
     WaitFallback,
     WaitFailed,
+    RemoteHoldAccepted,
+    RemoteHoldRefused,
+    RemoteFillCompleted,
+    RemoteFillRetried,
+    RemoteFillFailed,
+    RemoteReleaseSent,
+    RemoteReleaseFailed,
+    OwnerHoldAccepted,
+    OwnerHoldRefused,
+    OwnerFillCompleted,
+    OwnerFillFailed,
+    OwnerReleased,
 }
 impl WarmEvent {
     fn event(self) -> Event {
@@ -2559,6 +2616,18 @@ impl WarmEvent {
             Self::WaitCompleted => Event::WarmWaitCompleted,
             Self::WaitFallback => Event::WarmWaitFallback,
             Self::WaitFailed => Event::WarmWaitFailed,
+            Self::RemoteHoldAccepted => Event::WarmRemoteHoldAccepted,
+            Self::RemoteHoldRefused => Event::WarmRemoteHoldRefused,
+            Self::RemoteFillCompleted => Event::WarmRemoteFillCompleted,
+            Self::RemoteFillRetried => Event::WarmRemoteFillRetried,
+            Self::RemoteFillFailed => Event::WarmRemoteFillFailed,
+            Self::RemoteReleaseSent => Event::WarmRemoteReleaseSent,
+            Self::RemoteReleaseFailed => Event::WarmRemoteReleaseFailed,
+            Self::OwnerHoldAccepted => Event::WarmOwnerHoldAccepted,
+            Self::OwnerHoldRefused => Event::WarmOwnerHoldRefused,
+            Self::OwnerFillCompleted => Event::WarmOwnerFillCompleted,
+            Self::OwnerFillFailed => Event::WarmOwnerFillFailed,
+            Self::OwnerReleased => Event::WarmOwnerReleased,
         }
     }
 }
@@ -2643,6 +2712,18 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::WarmWaitCompleted => "racer_warm_wait_completed_total",
             Self::WarmWaitFallback => "racer_warm_wait_fallback_total",
             Self::WarmWaitFailed => "racer_warm_wait_failed_total",
+            Self::WarmRemoteHoldAccepted => "racer_warm_remote_hold_accepted_total",
+            Self::WarmRemoteHoldRefused => "racer_warm_remote_hold_refused_total",
+            Self::WarmRemoteFillCompleted => "racer_warm_remote_fill_completed_total",
+            Self::WarmRemoteFillRetried => "racer_warm_remote_fill_retried_total",
+            Self::WarmRemoteFillFailed => "racer_warm_remote_fill_failed_total",
+            Self::WarmRemoteReleaseSent => "racer_warm_remote_release_sent_total",
+            Self::WarmRemoteReleaseFailed => "racer_warm_remote_release_failed_total",
+            Self::WarmOwnerHoldAccepted => "racer_warm_owner_hold_accepted_total",
+            Self::WarmOwnerHoldRefused => "racer_warm_owner_hold_refused_total",
+            Self::WarmOwnerFillCompleted => "racer_warm_owner_fill_completed_total",
+            Self::WarmOwnerFillFailed => "racer_warm_owner_fill_failed_total",
+            Self::WarmOwnerReleased => "racer_warm_owner_released_total",
             Self::PeerReceiveAdmitted => "racer_peer_receive_admitted_total",
             Self::PeerReceiveFull => "racer_peer_receive_full_total",
             Self::PeerReceiveTimeout => "racer_peer_receive_timeout_total",

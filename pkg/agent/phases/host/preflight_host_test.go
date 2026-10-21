@@ -327,7 +327,7 @@ func testCheckSystemdUnitActive(
 	deps := defaultHostCheckDeps()
 	deps.outputCmd = func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
 		assert.Equal(t, "systemctl", name)
-		assert.Equal(t, []string{"is-active", wantUnit}, args)
+		assert.Equal(t, []string{"show", "--property=ActiveState", "--value", wantUnit}, args)
 
 		return "active\n", nil
 	}
@@ -335,12 +335,23 @@ func testCheckSystemdUnitActive(
 	results := check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
 	assert.Equal(t, wantUnit, results[0].Target)
+	assert.Contains(t, results[0].Message, "bootstrap will disable it")
 
-	deps.outputCmd = outputWith("inactive\n", nil)
-	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
-	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+	// An inactive, failed, or missing unit, which systemctl show reports as
+	// inactive, exits 0 there, as systemctl is-active doesn't.
+	for _, state := range []string{"inactive", "failed"} {
+		deps.outputCmd = outputWith(state+"\n", nil)
+		results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+		assert.Equal(t, preflight.SeverityOK, results[0].Severity, state)
+		assert.Contains(t, results[0].Message, "is not active", state)
+	}
 
 	deps.outputCmd = outputWith("", errors.New("systemd unavailable"))
+	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "could not be determined")
+
+	deps.outputCmd = outputWith("\n", nil)
 	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
 	assert.Contains(t, results[0].Message, "could not be determined")

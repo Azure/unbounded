@@ -193,6 +193,47 @@ The configuration is written to these files on the host before the machine boots
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
 | Rollback-stable lifecycle helper | `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` |
 
+### Containerd image verification
+
+The agent configures containerd's directory-based image-verifier to look for
+executables at `/opt/containerd/image-verifier/bin` inside the worker nspawn
+machine, not inside a pod. Unbounded does not create or populate this directory.
+If it is absent or empty, the verifier allows image pulls without running any
+verification. Custom rootfs images should leave this path absent or empty unless
+they intentionally supply verifiers.
+
+To opt in, create a dedicated directory on the host containing your verifier
+executables and mount it read-only through the agent configuration:
+
+```json
+{
+  "AdditionalHostMounts": [
+    {
+      "Source": "/opt/customer/image-verifiers",
+      "Target": "/opt/containerd/image-verifier/bin",
+      "ReadOnly": true
+    }
+  ]
+}
+```
+
+The host `Source` must exist before the machine starts. Config validation does
+not check its existence, but a missing source causes startup to fail.
+Systemd-nspawn creates the destination and any missing parent directories in
+the worker rootfs at startup before mounting the source; no image modification
+is necessary. An empty mountpoint can remain after a mount is removed.
+
+Supply architecture-compatible executables that implement
+[containerd's image-verifier protocol](https://github.com/containerd/containerd/blob/v2.1.8/docs/image-verification.md),
+and ensure their interpreters, libraries, and other dependencies are available
+inside the machine. Keep unrelated files, including README files, out of the
+verifier directory. Containerd processes entries in name order, with a maximum
+of **10 verifiers** and a **10-second timeout per verifier**. Entries beyond the
+maximum are skipped with a warning, not treated as a policy denial. A verifier
+denial or execution failure prevents the verified pull from succeeding.
+This does not retroactively verify cached images or guarantee verification of
+image imports or every containerd client path.
+
 ### Customization points
 
 | Setting | File | Purpose |

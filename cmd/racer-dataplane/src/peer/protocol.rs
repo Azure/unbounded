@@ -259,6 +259,46 @@ pub enum Operation {
         selector: MetadataSelector,
         mode: FetchMode,
     },
+    /// Warm hold lifecycle sent directly to a page's primary owner. The lease
+    /// names one requester warm job; the owner scopes it by the authenticated
+    /// origin node, so distinct requesters never share or release a lease.
+    Warm {
+        version: ObjectVersion,
+        lease: [u8; 16],
+        action: WarmAction,
+    },
+}
+
+/// Largest object page count a warm hold may describe. The owner derives its
+/// own page set from this count, so the wire never carries a page list.
+pub const MAX_WARM_PAGES: u64 = 1 << 32;
+
+/// One step of the remote warm protocol. Every action is always `acquire` mode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WarmAction {
+    /// Reserve hard holds for every page of `pages` that the receiver is the
+    /// primary owner of, until the requester's wall-clock `until`.
+    Hold { pages: u64, until: SystemTime },
+    /// Fill one held page onto the owner's disk and acknowledge without payload.
+    /// `length` and `content_type` are the requester's admitted immutable
+    /// metadata; the owner refuses to acknowledge a copy that disagrees.
+    Fill {
+        page: PageNumber,
+        length: u64,
+        content_type: Option<crate::model::ContentType>,
+    },
+    /// Drop this lease. The owner frees unused capacity after its last lease.
+    Release,
+}
+
+impl WarmAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Hold { .. } => "hold",
+            Self::Fill { .. } => "fill",
+            Self::Release => "release",
+        }
+    }
 }
 /// Locally constructed operation, not evidence of authenticated ingress.
 pub struct PeerRequest {
@@ -292,6 +332,14 @@ pub enum PeerResponse {
     OriginForbidden,
     /// Authenticated peer no longer retains the requested routing epoch.
     StaleMembership,
+    /// Warm holds accepted until this wall-clock time (millisecond precision).
+    Held {
+        until: SystemTime,
+    },
+    /// The requested warm page is published on the owner's disk under its hold.
+    Warmed,
+    /// The warm lease is gone. Unused capacity is freed after the last lease.
+    Released,
 }
 /// Owned, unverified wire input/output. The original and all forwarding signatures
 /// travel with the operation, including opaque encrypted origin credentials.
@@ -479,6 +527,42 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
             }
             (id, mode)
         }
+        Operation::Warm {
+            version,
+            lease,
+            action,
+        } => {
+            push(&mut head, "racer-operation", "warm");
+            version_fields(&mut head, version)?;
+            push_binary(&mut head, "racer-warm-lease", lease);
+            push(&mut head, "racer-warm-action", action.name());
+            match action {
+                WarmAction::Hold { pages, until } => {
+                    if !(1..=MAX_WARM_PAGES).contains(pages) {
+                        return Err(Error::InvalidRequest);
+                    }
+                    push(&mut head, "racer-warm-pages", *pages);
+                    push(&mut head, "racer-warm-until", warm_until(*until)?);
+                }
+                WarmAction::Fill {
+                    page,
+                    length,
+                    content_type,
+                } => {
+                    if !warm_fill_in_range(page.0, *length) {
+                        return Err(Error::InvalidRequest);
+                    }
+                    push(&mut head, "racer-page", page.0);
+                    push(&mut head, "racer-length", *length);
+                    push(&mut head, "racer-metadata-version", 1);
+                    if let Some(content_type) = content_type {
+                        push(&mut head, "racer-content-type", content_type.as_str());
+                    }
+                }
+                WarmAction::Release => {}
+            }
+            (&version.object, &WARM_MODE)
+        }
     };
     if op_object != &request.origin.object {
         return Err(Error::InvalidRequest);
@@ -520,6 +604,70 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
     route_headers(&mut head, &request.route)?;
     Ok(head)
 }
+/// Warm operations always carry origin credentials for the owner's fill.
+const WARM_MODE: FetchMode = FetchMode::Acquire;
+
+/// Wall-clock hold expiry in whole milliseconds. Zero is never a valid expiry.
+fn warm_until(until: SystemTime) -> Result<u64> {
+    match millis(until)? {
+        0 => Err(Error::InvalidRequest),
+        value => Ok(value),
+    }
+}
+
+fn decode_warm_until(head: &MessageHead, name: &str) -> Result<SystemTime> {
+    match number(head, name)? {
+        0 => Err(Error::InvalidRequest),
+        value => std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(value))
+            .ok_or(Error::InvalidRequest),
+    }
+}
+
+/// A warm fill names an existing page of a nonempty object within the hold limit.
+fn warm_fill_in_range(page: u64, length: u64) -> bool {
+    page < MAX_WARM_PAGES
+        && page
+            .checked_mul(PAGE_BYTES)
+            .is_some_and(|start| start < length)
+}
+
+fn warm_action(head: &MessageHead) -> Result<WarmAction> {
+    Ok(match field(head, "racer-warm-action")?.as_str() {
+        "hold" => {
+            let pages = number(head, "racer-warm-pages")?;
+            if !(1..=MAX_WARM_PAGES).contains(&pages) {
+                return Err(Error::InvalidRequest);
+            }
+            WarmAction::Hold {
+                pages,
+                until: decode_warm_until(head, "racer-warm-until")?,
+            }
+        }
+        "fill" => {
+            let page = number(head, "racer-page")?;
+            let length = number(head, "racer-length")?;
+            if !warm_fill_in_range(page, length) {
+                return Err(Error::InvalidRequest);
+            }
+            let content_type = match head.unique("racer-metadata-version")? {
+                Some(b"1") => head
+                    .unique("racer-content-type")?
+                    .map(crate::model::ContentType::parse)
+                    .transpose()?,
+                _ => return Err(Error::InvalidRequest),
+            };
+            WarmAction::Fill {
+                page: PageNumber(page),
+                length,
+                content_type,
+            }
+        }
+        "release" => WarmAction::Release,
+        _ => return Err(Error::InvalidRequest),
+    })
+}
+
 fn metadata_fields(head: &mut MessageHead, metadata: &ObjectMetadata) -> Result<()> {
     version_fields(head, &metadata.version)?;
     push(head, "racer-length", metadata.length);
@@ -596,6 +744,12 @@ pub fn response_head(
         PeerResponse::OriginRejected => ("origin-rejected", 0),
         PeerResponse::OriginForbidden => ("origin-forbidden", 0),
         PeerResponse::StaleMembership => ("stale-membership", 0),
+        PeerResponse::Held { until } => {
+            push(&mut head, "racer-warm-until", warm_until(*until)?);
+            ("held", 0)
+        }
+        PeerResponse::Warmed => ("warmed", 0),
+        PeerResponse::Released => ("released", 0),
     };
     head.start = StartLine::Response {
         status: match response {
@@ -931,6 +1085,11 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
         "origin-rejected" => PeerResponse::OriginRejected,
         "origin-forbidden" => PeerResponse::OriginForbidden,
         "stale-membership" => PeerResponse::StaleMembership,
+        "held" => PeerResponse::Held {
+            until: decode_warm_until(head, "racer-warm-until")?,
+        },
+        "warmed" => PeerResponse::Warmed,
+        "released" => PeerResponse::Released,
         _ => return Err(Error::InvalidRequest),
     })
 }
@@ -1018,6 +1177,16 @@ impl SecurityCodec {
                 },
                 mode,
             },
+            "warm" => {
+                if !matches!(mode, FetchMode::Acquire) {
+                    return Err(Error::InvalidRequest);
+                }
+                Operation::Warm {
+                    version: version(head)?,
+                    lease: array(head, "racer-warm-lease")?,
+                    action: warm_action(head)?,
+                }
+            }
             _ => return Err(Error::InvalidRequest),
         };
         let original_route = route(head)?;

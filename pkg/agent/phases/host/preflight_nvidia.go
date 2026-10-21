@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/unbounded/pkg/agent/internal/nvidia"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -431,39 +432,12 @@ func (c nvidiaDriverChecker) checkDriverLibraries(ctx context.Context) []preflig
 }
 
 func (c nvidiaDriverChecker) checkNvidiaSMI(ctx context.Context) []preflight.Result {
-	nvidiaSMI, err := c.deps.lookPath("nvidia-smi")
-	if err != nil {
-		return preflight.ResultsWarning(
-			checkNvidiaDriverName,
-			"NVIDIA diagnostic tooling",
-			"nvidia-smi is not installed; skipping NVIDIA driver health query",
-		)
-	}
-
-	checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	out, err := c.deps.outputCmd(checkCtx, nvidiaSMI, "-L")
-	message := strings.TrimSpace(string(out))
-
-	if err != nil {
-		if message == "" {
-			message = "nvidia-smi could not query NVIDIA GPUs"
-		}
-
+	if err := nvidia.CheckReadiness(ctx, c.deps.lookPath, c.deps.outputCmd); err != nil {
 		return preflight.ResultsError(
 			checkNvidiaDriverName,
 			"NVIDIA diagnostic tooling",
 			"%s",
-			message,
-		)
-	}
-
-	if message == "" {
-		return preflight.ResultsError(
-			checkNvidiaDriverName,
-			"NVIDIA diagnostic tooling",
-			"nvidia-smi did not report any NVIDIA GPUs",
+			err,
 		)
 	}
 
