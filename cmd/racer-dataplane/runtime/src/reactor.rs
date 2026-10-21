@@ -1991,6 +1991,16 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         if state.simulation.is_some() {
             return Ok(());
         }
+        // Completions already posted, for example by inline issue during the
+        // submit above, end the wait without a ppoll; the next poll_budgeted
+        // reaps them. A pending remote token stays for the next sleeping wait.
+        if state
+            .ring
+            .as_mut()
+            .is_some_and(|ring| !ring.completion().is_empty())
+        {
+            return Ok(());
+        }
         let mut fds = [
             libc::pollfd {
                 fd: state.ring.as_ref().map_or(-1, AsRawFd::as_raw_fd),

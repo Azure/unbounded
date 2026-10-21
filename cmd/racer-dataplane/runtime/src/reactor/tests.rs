@@ -1324,6 +1324,46 @@ mod empty_submit_tests {
     }
 
     #[test]
+    /// Ready completions end a wait without sleeping, and remain for poll_budgeted.
+    fn wait_skips_poll_when_completions_are_ready() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let scope = scope();
+        let raw = unsafe { libc::memfd_create(c"ready-wait".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
+        let mut write = reactor.write_at(fd, 0, buffer(b"ready"), (), &scope);
+        assert!(poll(&mut write).is_pending());
+        // Submit, then wait until the CQE is visible without reaping it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        reactor.wait(Duration::ZERO).unwrap();
+        while reactor
+            .state
+            .borrow_mut()
+            .ring
+            .as_mut()
+            .unwrap()
+            .completion()
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "write never completed");
+            std::thread::yield_now();
+        }
+        let attempts = reactor.state.borrow().wait_attempts;
+        reactor.wait(MAX_WAIT).unwrap();
+        assert_eq!(reactor.state.borrow().wait_attempts, attempts);
+        assert_eq!(reactor.poll_budgeted(8).unwrap(), 1);
+        assert!(matches!(
+            poll(&mut write),
+            Poll::Ready(Ok(Completion { bytes: 5, .. }))
+        ));
+        // With nothing ready, the wait sleeps in ppoll again.
+        reactor.wait(Duration::from_millis(1)).unwrap();
+        assert_eq!(reactor.state.borrow().wait_attempts, attempts + 1);
+    }
+
+    #[test]
     fn zero_wait_propagates_submit_failure_before_skipping_poll() {
         let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
         reactor.state.borrow_mut().submit_result =
