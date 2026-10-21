@@ -53,20 +53,20 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--cache-uid` | empty | Optional ClusterCache UID, as a lowercase UUID. When set, the origin answers `503` to requests whose `Racer-Cache` header names any other UID, so an origin left from a deleted ClusterCache cannot fill a recreated one with the same name. The operator always sets it. Empty accepts every cache UID. |
-| `--bucket` | none, required | The one bucket or Azure container the origin serves. Requests for other buckets get `403`. |
+| `--bucket` | empty | S3 only, required. The one bucket the origin serves. Requests for other buckets get `403`. |
 | `--provider` | `s3` | `s3` or `azure`. |
 | `--region` | empty | S3 only. Falls back to the AWS config chain. A region is required one way or the other. |
 | `--endpoint` | empty | S3 only. HTTP or HTTPS origin for an S3-compatible store. No path, query, fragment, or credentials. |
 | `--path-style` | `true` | S3 only. Set `false` for virtual-host addressing. |
-| `--account-url` | empty | Azure only, required. For example `https://ACCOUNT.blob.core.windows.net`. |
+| `--container-url` | empty | Azure only, required. The one container the origin serves, for example `https://ACCOUNT.blob.core.windows.net/CONTAINER`. Requests for other containers get `403`. |
 | `--azure-credential` | `default` | Azure only. `default` or `anonymous`. |
 | `--metadata-ttl` | `30s` | How long upstream metadata stays valid. Zero expires immediately. |
 | `--request-timeout` | `1m` | Upstream request timeout. Must be positive. |
 | `--max-concurrent-requests` | `512` | Page requests served to Racer at once, and the size of the idle upstream connection pool. Requests beyond the limit are rejected as overloaded. 1 to 65536. |
 
-S3 and Azure flags are mutually exclusive. Setting `--region`, `--endpoint`, or
-`--path-style` with `--provider=azure` is an error, and so is setting
-`--account-url` or `--azure-credential` with `--provider=s3`.
+S3 and Azure flags are mutually exclusive. Setting `--bucket`, `--region`,
+`--endpoint`, or `--path-style` with `--provider=azure` is an error, and so is
+setting `--container-url` or `--azure-credential` with `--provider=s3`.
 
 ### Sidecar Only
 
@@ -96,11 +96,11 @@ Grant the origin read access to the objects it serves, such as `s3:GetObject`, a
 
 ### Azure Blob
 
-Set `--provider=azure` and `--account-url`. Do not set the S3 flags or AWS
+Set `--provider=azure` and `--container-url`. Do not set the S3 flags or AWS
 environment variables. Only block blobs are served.
 
 `--azure-credential=default` uses `DefaultAzureCredential`, covering environment,
-workload identity, and managed identity. With it, `--account-url` must use HTTPS.
+workload identity, and managed identity. With it, `--container-url` must use HTTPS.
 Select a user-assigned identity with the `AZURE_CLIENT_ID` environment variable;
 there is no flag for it. One option is to read that variable from an optional
 Secret, for example `racer-object-azure`, with `envFrom`.
@@ -162,9 +162,9 @@ Requirements:
   including 0, do not work.
 - **Credentials.** Supply upstream credentials to the origin pods only. See
   [Upstream Providers](#upstream-providers).
-- **Arguments.** Set `--cache` to match the sidecars, `--bucket`, and the
-  provider flags. Set `--cache-uid` to the ClusterCache UID when you recreate
-  caches under the same name.
+- **Arguments.** Set `--cache` to match the sidecars, `--bucket` for S3
+  or `--container-url` for Azure, and the provider flags. Set `--cache-uid`
+  to the ClusterCache UID when you recreate caches under the same name.
 
 The essential parts of the S3 example:
 
@@ -220,7 +220,7 @@ spec:
 ```
 
 For Azure Blob, replace the S3 arguments with `--provider=azure`,
-`--account-url`, and optionally `--azure-credential`, and replace `envFrom` with
+`--container-url`, and optionally `--azure-credential`, and replace `envFrom` with
 your Azure identity configuration.
 
 A running origin pod does not prove upstream access; only a real object read does.
@@ -424,7 +424,7 @@ provider, or account URL.
 Each cache serves one source. Do not point an existing cache at a different
 account, provider, or endpoint, or Racer can serve bytes cached from the old
 store. Create a new cache instead. A managed ClusterCache enforces this: its
-`bucket` and `accountURL` cannot change, and a new ClusterCache gets a new UID
+`azure.containerURL` cannot change, and a new ClusterCache gets a new UID
 and an empty cache. Requests cannot select origin credentials or an upstream
 endpoint.
 
@@ -507,7 +507,7 @@ Errors are XML bodies with a `Code` and `Message`. The Azure API also sets the
 | Status | S3 code | Azure code | Usual cause |
 |--------|---------|------------|-------------|
 | `400` | `InvalidArgument` | `InvalidInput` | A malformed path or range, including a listing request or a multi-range read. |
-| `403` | `AccessDenied` | `AuthorizationFailure` | Bucket is not the origin's `--bucket`, or the origin cannot read the object. |
+| `403` | `AccessDenied` | `AuthorizationFailure` | Bucket is not the origin's `--bucket` or `--container-url` container, or the origin cannot read the object. |
 | `404` | `NoSuchKey` | `BlobNotFound` | No such object upstream. |
 | `405` | `MethodNotAllowed` | `UnsupportedHttpVerb` | Anything other than `GET` or `HEAD`. |
 | `412` | `PreconditionFailed` | `ConditionNotMet` | ETag mismatch, or the version is gone. |
@@ -535,8 +535,8 @@ Consequences:
   Origin-side checks cannot authorize a cache hit.
 - Separate trust domains with separate caches, namespaces, socket mount
   permissions, and upstream access policies.
-- The origin's `--bucket` limits what the adapter fetches. Any pod attached to
-  the cache can read the whole bucket. It is not a per-user policy.
+- The origin's `--bucket` or `--container-url` limits what the adapter fetches.
+  Any pod attached to the cache can read the whole bucket or container. It is not a per-user policy.
 
 Keep credentials out of flags, images, and source control. Grant the origin only
 the object read permissions it needs, including version reads if you use them.

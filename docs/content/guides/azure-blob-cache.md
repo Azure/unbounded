@@ -43,17 +43,15 @@ metadata:
   name: racer-object
 spec:
   origin:
-    bucket: mnist
     azure:
-      accountURL: https://azureopendatastorage.blob.core.windows.net
+      containerURL: https://azureopendatastorage.blob.core.windows.net/mnist
 EOF
 ```
 
 | Field | Set it to |
 |-------|-----------|
 | `metadata.name` | Keep `racer-object`. It is the default cache name for pods. |
-| `spec.origin.bucket` | The one container pods may read. You cannot change it later. |
-| `spec.origin.azure.accountURL` | Your blob service URL, such as `https://ACCOUNT.blob.core.windows.net`. You cannot change it later. |
+| `spec.origin.azure.containerURL` | The one container pods may read, such as `https://ACCOUNT.blob.core.windows.net/CONTAINER`. You cannot change it later. |
 
 You also cannot remove `spec.origin` later. To read another container or
 account, create another ClusterCache.
@@ -82,7 +80,7 @@ webhook:
 
 ```yaml
     azure:
-      accountURL: https://ACCOUNT.blob.core.windows.net
+      containerURL: https://ACCOUNT.blob.core.windows.net/CONTAINER
       credential:
         workloadIdentity:
           clientID: 00000000-0000-0000-0000-000000000000
@@ -218,7 +216,8 @@ kubectl -n unbounded-system logs daemonset/racer-origin-racer-object
 
 Common errors:
 
-- `403`: the container in the URL is not `spec.origin.bucket`, or the identity
+- `403`: the container in the URL is not the one in
+  `spec.origin.azure.containerURL`, or the identity
   cannot read the blob.
 - `404`: the blob does not exist.
 - `501`: the client sent a header or option that is not supported.
