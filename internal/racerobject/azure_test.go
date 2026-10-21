@@ -659,6 +659,7 @@ func TestAzureOriginCancellation(t *testing.T) {
 	for _, method := range []string{http.MethodHead, http.MethodGet} {
 		t.Run(method, func(t *testing.T) {
 			entered, canceled := make(chan struct{}), make(chan struct{})
+			bodyReady := make(chan struct{})
 
 			var closes atomic.Int32
 
@@ -683,6 +684,8 @@ func TestAzureOriginCancellation(t *testing.T) {
 					response, err := client.Do(r)
 					if err == nil && r.Method == http.MethodGet {
 						response.Body = &azureTestBody{ReadCloser: response.Body, closes: &closes}
+
+						close(bodyReady)
 					}
 
 					return response, err
@@ -717,6 +720,14 @@ func TestAzureOriginCancellation(t *testing.T) {
 			case <-entered:
 			case <-time.After(5 * time.Second):
 				t.Fatal("request did not start")
+			}
+
+			if method == http.MethodGet {
+				select {
+				case <-bodyReady:
+				case <-time.After(5 * time.Second):
+					t.Fatal("response body was not wrapped")
+				}
 			}
 
 			cancel()
