@@ -334,14 +334,14 @@ type DHT interface {
 	FindProviders(ctx context.Context, d digest.Digest) ([]Provider, error)
 
 	// Provide advertises that this node holds d. Idempotent at the DHT
-	// level; refreshing is the implementation's responsibility (libp2p
-	// default 12 h refresh, 24 h TTL - the design doc).
+	// level; the discovery implementation registers successful publications
+	// with its periodic sweeping provider.
 	Provide(ctx context.Context, d digest.Digest) error
 
 	// Withdraw is a soft "stop advertising" hint sent by the advertiser
 	// when the digest is no longer present in the local content store
 	// (e.g. containerd GC'd it). libp2p has no protocol-level withdraw
-	// - existing provider records expire at the 24 h TTL - so this is
+	// - existing provider records expire at configured validity - so this is
 	// implementation-defined cooperation: at minimum the local agent
 	// MUST stop re-Providing the digest on the next refresh cycle so
 	// the stale record drains naturally. Returning a non-nil error
@@ -353,6 +353,20 @@ type DHT interface {
 	// the design doc (geometric mean of routing-table coverage, lookup-latency
 	// score, and self-test success rate).
 	Health() float64
+}
+
+// ProviderStreamer is implemented by DHTs that can yield every provider a
+// lookup finds instead of a fixed-size batch. FindProviders stops after a
+// small count, so stale records can fill the batch and hide usable providers;
+// the mirror walks a stream instead so it can skip past them.
+type ProviderStreamer interface {
+	// StreamProviders starts an uncapped provider lookup for d. The DHT query
+	// runs until it completes, lookupBudget elapses, or ctx ends. Providers it
+	// finds stay queued until read, so a slow reader neither stalls nor
+	// truncates the query. The channel closes once the query has ended and
+	// every queued provider was delivered, or as soon as ctx ends. The returned
+	// function reports a lookup failure and is valid after the channel closes.
+	StreamProviders(ctx context.Context, d digest.Digest, lookupBudget time.Duration) (<-chan Provider, func() error)
 }
 
 // ---------------------------------------------------------------------------
