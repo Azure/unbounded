@@ -648,6 +648,7 @@ func gatewayPeersEqual(a, b []gatewayPeerInfo) bool {
 			!intMapEqual(a[i].RouteDistances, b[i].RouteDistances) ||
 			!strSliceEqual(a[i].PodCIDRs, b[i].PodCIDRs) ||
 			a[i].SkipPodCIDRRoutes != b[i].SkipPodCIDRRoutes ||
+			a[i].UnmanagedCNISite != b[i].UnmanagedCNISite ||
 			a[i].TunnelProtocol != b[i].TunnelProtocol ||
 			a[i].TunnelMTU != b[i].TunnelMTU {
 			return false
