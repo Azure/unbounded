@@ -36,11 +36,12 @@ type ClusterCacheSpec struct {
 // Exactly one provider must be set. Only azure is supported today.
 // +kubebuilder:validation:XValidation:rule="has(self.azure)",message="azure is required"
 type ObjectOrigin struct {
-	// Buckets lists the buckets or containers the origin may read.
-	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=64
-	// +listType=set
-	Buckets []BucketName `json:"buckets"`
+	// Bucket names the one bucket or container the origin reads. Every pod
+	// attached to the cache sees this bucket's whole keyspace. Bucket is
+	// immutable: a different source needs a new ClusterCache, which has a new
+	// UID and therefore an empty cache.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="bucket is immutable; create a new ClusterCache for a different bucket"
+	Bucket BucketName `json:"bucket"`
 
 	// MetadataTTL bounds how long object metadata is reused before it is revalidated.
 	// It must not be negative. When unset, the racer-object default applies.
@@ -61,7 +62,7 @@ type ObjectOrigin struct {
 	// +optional
 	MaxConcurrentRequests *int32 `json:"maxConcurrentRequests,omitempty"`
 
-	// Azure reads from Azure Blob Storage. Buckets name blob containers.
+	// Azure reads from Azure Blob Storage. Bucket names a blob container.
 	// +optional
 	Azure *AzureOrigin `json:"azure,omitempty"`
 }
@@ -74,8 +75,9 @@ type ObjectOrigin struct {
 type BucketName string
 
 // AzureOrigin reads from one Azure Blob Storage account.
-// The account URL also forms the cache's upstream identity, so changing it
-// starts a new set of cache entries.
+// Cache entries do not record the account, so the account URL is immutable:
+// a different account needs a new ClusterCache, which has a new UID and
+// therefore an empty cache.
 // +kubebuilder:validation:XValidation:rule="!has(self.credential) || self.accountURL.startsWith('https://')",message="accountURL must use https when a credential is configured"
 type AzureOrigin struct {
 	// AccountURL is the blob service endpoint, for example
@@ -85,6 +87,7 @@ type AzureOrigin struct {
 	// +kubebuilder:validation:MaxLength=256
 	// +kubebuilder:validation:XValidation:rule="isURL(self) && url(self).getScheme() in ['http', 'https']",message="accountURL must be an http or https URL"
 	// +kubebuilder:validation:XValidation:rule="!self.contains('?') && !self.contains('#') && !self.contains('@')",message="accountURL must not contain credentials, a query, or a fragment"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="accountURL is immutable; create a new ClusterCache for a different account"
 	AccountURL string `json:"accountURL"`
 
 	// Credential selects how the origin authenticates. When omitted, requests are anonymous.

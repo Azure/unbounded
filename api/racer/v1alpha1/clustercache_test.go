@@ -46,7 +46,7 @@ func TestClusterCacheOriginJSONAndDeepCopy(t *testing.T) {
 	cache := &ClusterCache{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache"},
 		Spec: ClusterCacheSpec{Origin: &ObjectOrigin{
-			Buckets: []BucketName{"models"},
+			Bucket: "models",
 			Azure: &AzureOrigin{
 				AccountURL: "https://account.blob.core.windows.net",
 				Credential: &AzureCredential{Default: &AzureDefaultCredential{SecretRef: &SecretReference{Name: "azure"}}},
@@ -56,15 +56,15 @@ func TestClusterCacheOriginJSONAndDeepCopy(t *testing.T) {
 
 	data, err := json.Marshal(cache)
 	require.NoError(t, err)
-	require.JSONEq(t, `{"metadata":{"name":"cache"},"spec":{"origin":{"buckets":["models"],"azure":{"accountURL":"https://account.blob.core.windows.net","credential":{"default":{"secretRef":{"name":"azure"}}}}}}}`, string(data))
+	require.JSONEq(t, `{"metadata":{"name":"cache"},"spec":{"origin":{"bucket":"models","azure":{"accountURL":"https://account.blob.core.windows.net","credential":{"default":{"secretRef":{"name":"azure"}}}}}}}`, string(data))
 
 	decoded := &ClusterCache{}
 	require.NoError(t, json.Unmarshal(data, decoded))
 	require.Equal(t, cache, decoded)
 
 	copy := cache.DeepCopy()
-	copy.Spec.Origin.Buckets[0] = "copy"
+	copy.Spec.Origin.Bucket = "copy"
 	copy.Spec.Origin.Azure.Credential.Default.SecretRef.Name = "copy"
-	require.Equal(t, BucketName("models"), cache.Spec.Origin.Buckets[0])
+	require.Equal(t, BucketName("models"), cache.Spec.Origin.Bucket)
 	require.Equal(t, "azure", cache.Spec.Origin.Azure.Credential.Default.SecretRef.Name)
 }

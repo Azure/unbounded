@@ -55,8 +55,8 @@ spec:
                   one origin pod per dataplane node and removes it when origin is unset.
                 properties:
                   azure:
-                    description: Azure reads from Azure Blob Storage. Buckets name
-                      blob containers.
+                    description: Azure reads from Azure Blob Storage. Bucket names
+                      a blob container.
                     properties:
                       accountURL:
                         description: |-
@@ -73,6 +73,9 @@ spec:
                             or a fragment
                           rule: '!self.contains(''?'') && !self.contains(''#'') &&
                             !self.contains(''@'')'
+                        - message: accountURL is immutable; create a new ClusterCache
+                            for a different account
+                          rule: self == oldSelf
                       credential:
                         description: Credential selects how the origin authenticates.
                           When omitted, requests are anonymous.
@@ -137,23 +140,22 @@ spec:
                     x-kubernetes-validations:
                     - message: accountURL must use https when a credential is configured
                       rule: '!has(self.credential) || self.accountURL.startsWith(''https://'')'
-                  buckets:
-                    description: Buckets lists the buckets or containers the origin
-                      may read.
-                    items:
-                      description: BucketName names an object storage bucket or blob
-                        container.
-                      maxLength: 255
-                      minLength: 1
-                      pattern: ^[a-zA-Z0-9._-]+$
-                      type: string
-                      x-kubernetes-validations:
-                      - message: bucket must not be . or ..
-                        rule: self != '.' && self != '..'
-                    maxItems: 64
-                    minItems: 1
-                    type: array
-                    x-kubernetes-list-type: set
+                  bucket:
+                    description: |-
+                      Bucket names the one bucket or container the origin reads. Every pod
+                      attached to the cache sees this bucket's whole keyspace. Bucket is
+                      immutable: a different source needs a new ClusterCache, which has a new
+                      UID and therefore an empty cache.
+                    maxLength: 255
+                    minLength: 1
+                    pattern: ^[a-zA-Z0-9._-]+$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: bucket is immutable; create a new ClusterCache for
+                        a different bucket
+                      rule: self == oldSelf
+                    - message: bucket must not be . or ..
+                      rule: self != '.' && self != '..'
                   maxConcurrentRequests:
                     description: |-
                       MaxConcurrentRequests bounds concurrent upstream requests per origin pod.
@@ -179,7 +181,7 @@ spec:
                     - message: requestTimeout must be positive
                       rule: duration(self) > duration('0s')
                 required:
-                - buckets
+                - bucket
                 type: object
                 x-kubernetes-validations:
                 - message: azure is required

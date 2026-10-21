@@ -21,8 +21,8 @@ const testClientID = "00000000-0000-0000-0000-000000000001"
 
 func validOrigin() map[string]any {
 	return map[string]any{
-		"buckets": []any{"models"},
-		"azure":   map[string]any{"accountURL": "https://account.blob.core.windows.net"},
+		"bucket": "models",
+		"azure":  map[string]any{"accountURL": "https://account.blob.core.windows.net"},
 	}
 }
 
@@ -87,9 +87,12 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 			o["metadataTTL"] = "0s"
 			o["requestTimeout"] = "1m30s"
 			o["maxConcurrentRequests"] = int64(65536)
-			o["buckets"] = []any{"a", "b.c", "d_e-f", strings.Repeat("x", 255), "..."}
 		})},
 	}
+	for _, bucket := range []string{"a", "b.c", "d_e-f", strings.Repeat("x", 255), "..."} {
+		valid["bucket "+bucket] = map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = bucket })}
+	}
+
 	for name, spec := range valid {
 		t.Run("accepts "+name, func(t *testing.T) {
 			require.NoError(t, create(spec))
@@ -100,15 +103,14 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		spec    map[string]any
 		message string
 	}{
-		"no provider":       {map[string]any{"origin": map[string]any{"buckets": []any{"models"}}}, "azure is required"},
-		"no buckets":        {map[string]any{"origin": withOrigin(func(o map[string]any) { delete(o, "buckets") })}, "buckets"},
-		"empty buckets":     {map[string]any{"origin": withOrigin(func(o map[string]any) { o["buckets"] = []any{} })}, "buckets"},
-		"duplicate buckets": {map[string]any{"origin": withOrigin(func(o map[string]any) { o["buckets"] = []any{"a", "a"} })}, "Duplicate value"},
-		"bucket dot":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["buckets"] = []any{"."} })}, "bucket must not be . or .."},
-		"bucket dotdot":     {map[string]any{"origin": withOrigin(func(o map[string]any) { o["buckets"] = []any{".."} })}, "bucket must not be . or .."},
-		"bucket slash":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["buckets"] = []any{"a/b"} })}, "buckets"},
-		"bucket too long":   {map[string]any{"origin": withOrigin(func(o map[string]any) { o["buckets"] = []any{strings.Repeat("x", 256)} })}, "buckets"},
-		"too many buckets":  {map[string]any{"origin": withOrigin(func(o map[string]any) { o["buckets"] = manyBuckets(65) })}, "buckets"},
+		"no provider":       {map[string]any{"origin": map[string]any{"bucket": "models"}}, "azure is required"},
+		"no bucket":         {map[string]any{"origin": withOrigin(func(o map[string]any) { delete(o, "bucket") })}, "bucket"},
+		"empty bucket":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = "" })}, "bucket"},
+		"bucket list":       {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = []any{"a"} })}, "bucket"},
+		"bucket dot":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = "." })}, "bucket must not be . or .."},
+		"bucket dotdot":     {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = ".." })}, "bucket must not be . or .."},
+		"bucket slash":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = "a/b" })}, "bucket"},
+		"bucket too long":   {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = strings.Repeat("x", 256) })}, "bucket"},
 		"negative ttl":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["metadataTTL"] = "-1s" })}, "metadataTTL must not be negative"},
 		"zero timeout":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["requestTimeout"] = "0s" })}, "requestTimeout must be positive"},
 		"bad duration":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["requestTimeout"] = "soon" })}, "requestTimeout"},
@@ -162,7 +164,7 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: fmt.Sprintf("cache-%d", n)}, cache))
 		origin := cache.Spec.Origin
 		require.NotNil(t, origin)
-		require.Equal(t, []BucketName{"models"}, origin.Buckets)
+		require.Equal(t, BucketName("models"), origin.Bucket)
 		require.Equal(t, "10s", origin.MetadataTTL.Duration.String())
 		require.Equal(t, "2m0s", origin.RequestTimeout.Duration.String())
 		require.Equal(t, int32(32), *origin.MaxConcurrentRequests)
@@ -170,13 +172,57 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		require.Equal(t, &AzureWorkloadIdentityCredential{ClientID: testClientID, TenantID: testClientID}, origin.Azure.Credential.WorkloadIdentity)
 		require.Nil(t, origin.Azure.Credential.Default)
 	})
-}
 
-func manyBuckets(count int) []any {
-	buckets := make([]any, count)
-	for i := range buckets {
-		buckets[i] = fmt.Sprintf("bucket-%d", i)
+	update := func(t *testing.T, mutate func(origin map[string]any)) error {
+		t.Helper()
+
+		require.NoError(t, create(map[string]any{"origin": validOrigin()}))
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: fmt.Sprintf("cache-%d", n)}, obj))
+
+		origin, found, err := unstructured.NestedMap(obj.Object, "spec", "origin")
+		require.NoError(t, err)
+		require.True(t, found)
+		mutate(origin)
+		require.NoError(t, unstructured.SetNestedMap(obj.Object, origin, "spec", "origin"))
+
+		return c.Update(t.Context(), obj)
 	}
 
-	return buckets
+	immutable := map[string]struct {
+		mutate  func(map[string]any)
+		message string
+	}{
+		"bucket": {func(o map[string]any) { o["bucket"] = "other" }, "bucket is immutable"},
+		"account url": {func(o map[string]any) {
+			o["azure"].(map[string]any)["accountURL"] = "https://other.blob.core.windows.net"
+		}, "accountURL is immutable"},
+		"account url spelling": {func(o map[string]any) {
+			o["azure"].(map[string]any)["accountURL"] = "https://account.blob.core.windows.net/"
+		}, "accountURL is immutable"},
+	}
+	for name, tc := range immutable {
+		t.Run("rejects update of "+name, func(t *testing.T) {
+			err := update(t, tc.mutate)
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, tc.message)
+		})
+	}
+
+	mutable := map[string]func(map[string]any){
+		"metadataTTL":           func(o map[string]any) { o["metadataTTL"] = "5s" },
+		"requestTimeout":        func(o map[string]any) { o["requestTimeout"] = "2m0s" },
+		"maxConcurrentRequests": func(o map[string]any) { o["maxConcurrentRequests"] = int64(8) },
+		"credential": func(o map[string]any) {
+			o["azure"].(map[string]any)["credential"] = map[string]any{"default": map[string]any{}}
+		},
+		"unchanged source": func(o map[string]any) { o["bucket"] = "models" },
+	}
+	for name, mutate := range mutable {
+		t.Run("allows update of "+name, func(t *testing.T) {
+			require.NoError(t, update(t, mutate))
+		})
+	}
 }
