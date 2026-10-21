@@ -829,6 +829,7 @@ dependencies = [
 name = "racer-crypto"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "base64",
  "chacha20poly1305",
  "cipher",
@@ -839,6 +840,7 @@ dependencies = [
  "racer-control-wire",
  "racer-platform",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
