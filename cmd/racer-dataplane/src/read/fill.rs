@@ -111,6 +111,25 @@ impl DecryptSource {
         })
     }
 }
+/// Duration metrics for serial driver calls. Candidate calls are timed at their call sites.
+fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
+    match stage {
+        DriverStage::PlaintextReclaim => Some((
+            Event::FillPlaintextReclaimCount,
+            Event::FillPlaintextReclaimNs,
+        )),
+        DriverStage::PublishCall => Some((Event::FillPublishCount, Event::FillPublishNs)),
+        DriverStage::DecryptCall => Some((Event::FillDecryptCount, Event::FillDecryptNs)),
+        DriverStage::DiskReadCall => Some((Event::FillDiskReadCount, Event::FillDiskReadNs)),
+        DriverStage::OriginCall => Some((Event::FillOriginCount, Event::FillOriginNs)),
+        DriverStage::EncryptCall => Some((Event::FillEncryptCount, Event::FillEncryptNs)),
+        DriverStage::ChecksumCall => Some((Event::FillChecksumCount, Event::FillChecksumNs)),
+        DriverStage::Starting
+        | DriverStage::BetweenCalls
+        | DriverStage::CandidateCompositeCall
+        | DriverStage::WorkReturned => None,
+    }
+}
 impl Fill {
     pub(super) async fn warm_local(
         &self,
@@ -138,7 +157,25 @@ impl Fill {
             .diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.call(stage));
-        work.await
+        let start = uring_runtime::environment::now();
+        let result = work.await;
+        if let Some((count, sum)) = stage_events(stage) {
+            self.metrics.record_duration(count, sum, start);
+        }
+        result
+    }
+
+    /// Time one awaited step into a count and nanosecond sum pair.
+    async fn timed<T>(
+        &self,
+        count: Event,
+        sum: Event,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let start = uring_runtime::environment::now();
+        let result = work.await;
+        self.metrics.record_duration(count, sum, start);
+        result
     }
 
     #[cfg(test)]
@@ -912,7 +949,14 @@ impl Fill {
         let diagnostic_lifetime = DriverDiagnostic::lifetime(fill.diagnostic.clone());
         let flights = self.dependencies.flights.clone();
         let (send, mut receive) = futures::channel::oneshot::channel();
+        let submitted = uring_runtime::environment::now();
         driver_permit.submit_detached(Box::pin(async move {
+            fill.metrics.record_duration(
+                Event::FillDriverStartCount,
+                Event::FillDriverStartNs,
+                submitted,
+            );
+            let started = uring_runtime::environment::now();
             let _diagnostic_lifetime = diagnostic_lifetime;
             let _completion_guard = completion_guard;
             let mut work = Box::pin(async {
@@ -991,6 +1035,8 @@ impl Fill {
             })
             .await;
             fill.stage(DriverStage::WorkReturned);
+            fill.metrics
+                .record_duration(Event::FillDriverCount, Event::FillDriverNs, started);
             drop(work);
             operation.complete()?;
             match result {
@@ -1382,13 +1428,17 @@ impl Fill {
             return Ok(result);
         }
         let candidates = self
-            .call(
-                DriverStage::CandidateCompositeCall,
-                self.dependencies.candidates.candidates_scoped(
-                    membership,
-                    &page.version.object,
-                    page.number,
-                    scope,
+            .timed(
+                Event::FillCandidatesCount,
+                Event::FillCandidatesNs,
+                self.call(
+                    DriverStage::CandidateCompositeCall,
+                    self.dependencies.candidates.candidates_scoped(
+                        membership,
+                        &page.version.object,
+                        page.number,
+                        scope,
+                    ),
                 ),
             )
             .await?;
@@ -1410,40 +1460,55 @@ impl Fill {
             mode: FetchMode::Acquire,
         };
         let mut hedge_continuation = super::candidates::HedgeContinuation::default();
+        let hedge_start = uring_runtime::environment::now();
         if want_plaintext
             && let Some(result) = self
-                .call(
-                    DriverStage::CandidateCompositeCall,
-                    self.dependencies.candidates.hedge_page(
-                        &candidates,
-                        context,
-                        &operation,
-                        scope,
-                        budget,
-                        &self.dependencies.admission,
-                        &mut hedge_continuation,
-                        |response, child| {
-                            Box::pin(async move {
-                                let copy = response_copy(response.response(), page)?;
-                                if let Some(existing) =
-                                    self.retained_metadata(&page.version, &child).await?
-                                    && !existing.compatible(&copy.metadata.immutable())
-                                {
-                                    return Err(Error::CorruptRecord);
-                                }
-                                let result =
-                                    self.decrypt_response(page, response, None, &child).await?;
-                                // A sibling may publish while crypto runs. Recheck before
-                                // election, not only after a winner has canceled its peer.
-                                if let Some(existing) =
-                                    self.retained_metadata(&page.version, &child).await?
-                                    && !existing.compatible(&result.metadata.immutable())
-                                {
-                                    return Err(Error::CorruptRecord);
-                                }
-                                Ok(result)
-                            })
-                        },
+                .timed(
+                    Event::FillHedgeCount,
+                    Event::FillHedgeNs,
+                    self.call(
+                        DriverStage::CandidateCompositeCall,
+                        self.dependencies.candidates.hedge_page(
+                            &candidates,
+                            context,
+                            &operation,
+                            scope,
+                            budget,
+                            &self.dependencies.admission,
+                            &mut hedge_continuation,
+                            |response, child| {
+                                Box::pin(async move {
+                                    self.metrics.record_duration(
+                                        Event::FillPeerResponseCount,
+                                        Event::FillPeerResponseNs,
+                                        hedge_start,
+                                    );
+                                    let copy = response_copy(response.response(), page)?;
+                                    if let Some(existing) =
+                                        self.retained_metadata(&page.version, &child).await?
+                                        && !existing.compatible(&copy.metadata.immutable())
+                                    {
+                                        return Err(Error::CorruptRecord);
+                                    }
+                                    let result = self
+                                        .timed(
+                                            Event::FillPeerDecryptCount,
+                                            Event::FillPeerDecryptNs,
+                                            self.decrypt_response(page, response, None, &child),
+                                        )
+                                        .await?;
+                                    // A sibling may publish while crypto runs. Recheck before
+                                    // election, not only after a winner has canceled its peer.
+                                    if let Some(existing) =
+                                        self.retained_metadata(&page.version, &child).await?
+                                        && !existing.compatible(&result.metadata.immutable())
+                                    {
+                                        return Err(Error::CorruptRecord);
+                                    }
+                                    Ok(result)
+                                })
+                            },
+                        ),
                     ),
                 )
                 .await?

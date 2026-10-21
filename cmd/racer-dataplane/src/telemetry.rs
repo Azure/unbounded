@@ -2940,6 +2940,32 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaSendNs => "racer_rdma_send_nanoseconds_sum",
             Self::RdmaServeCount => "racer_rdma_serve_nanoseconds_count",
             Self::RdmaServeNs => "racer_rdma_serve_nanoseconds_sum",
+            Self::FillDriverStartCount => "racer_fill_driver_start_nanoseconds_count",
+            Self::FillDriverStartNs => "racer_fill_driver_start_nanoseconds_sum",
+            Self::FillDriverCount => "racer_fill_driver_nanoseconds_count",
+            Self::FillDriverNs => "racer_fill_driver_nanoseconds_sum",
+            Self::FillCandidatesCount => "racer_fill_candidates_nanoseconds_count",
+            Self::FillCandidatesNs => "racer_fill_candidates_nanoseconds_sum",
+            Self::FillPlaintextReclaimCount => "racer_fill_plaintext_reclaim_nanoseconds_count",
+            Self::FillPlaintextReclaimNs => "racer_fill_plaintext_reclaim_nanoseconds_sum",
+            Self::FillPeerResponseCount => "racer_fill_peer_response_nanoseconds_count",
+            Self::FillPeerResponseNs => "racer_fill_peer_response_nanoseconds_sum",
+            Self::FillPeerDecryptCount => "racer_fill_peer_decrypt_nanoseconds_count",
+            Self::FillPeerDecryptNs => "racer_fill_peer_decrypt_nanoseconds_sum",
+            Self::FillHedgeCount => "racer_fill_hedge_nanoseconds_count",
+            Self::FillHedgeNs => "racer_fill_hedge_nanoseconds_sum",
+            Self::FillPublishCount => "racer_fill_publish_nanoseconds_count",
+            Self::FillPublishNs => "racer_fill_publish_nanoseconds_sum",
+            Self::FillDecryptCount => "racer_fill_decrypt_nanoseconds_count",
+            Self::FillDecryptNs => "racer_fill_decrypt_nanoseconds_sum",
+            Self::FillDiskReadCount => "racer_fill_disk_read_nanoseconds_count",
+            Self::FillDiskReadNs => "racer_fill_disk_read_nanoseconds_sum",
+            Self::FillOriginCount => "racer_fill_origin_nanoseconds_count",
+            Self::FillOriginNs => "racer_fill_origin_nanoseconds_sum",
+            Self::FillEncryptCount => "racer_fill_encrypt_nanoseconds_count",
+            Self::FillEncryptNs => "racer_fill_encrypt_nanoseconds_sum",
+            Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
+            Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",
@@ -3283,6 +3309,12 @@ impl Metrics {
     /// Saturate instead of wrapping a long-lived Prometheus counter.
     pub fn record(&self, event: Event, amount: u64) {
         self.core.add(event, amount);
+    }
+    /// Add one observation of the time since `start` to a count and nanosecond sum pair.
+    pub fn record_duration(&self, count: Event, sum: Event, start: std::time::Instant) {
+        let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
+        self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.record(count, 1);
     }
     pub(crate) fn writer_shard(&self) -> usize {
         self.shard
