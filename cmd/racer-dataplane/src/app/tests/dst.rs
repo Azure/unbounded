@@ -1314,11 +1314,13 @@ mod scenarios {
         }
         assert!(harness.coverage.secondary_worker_turns > 0);
         assert!(harness.coverage.relay_turns > 0);
-        // Exact deterministic count under injected pressure. Delivery mode and
-        // replica selection change turn ordering, so this pins the default
-        // `spread` selection: `primary` selection loses one more opaque
-        // read (8) to the injected pressure window.
-        assert_eq!(harness.coverage.success, 9, "opaque={opaque}");
+        // Exact deterministic count under injected pressure. Delivery mode,
+        // replica selection, and receive charge sizes change turn ordering, so
+        // this pins the default `spread` selection with aligned TCP receive,
+        // which charges each body's whole pooled size class: one more read is
+        // in flight when the pressure window opens than with exact-length
+        // `Vec` staging (9).
+        assert_eq!(harness.coverage.success, 8, "opaque={opaque}");
     }
 }
 mod traffic {
