@@ -98,12 +98,19 @@ Each poll:
    for the head page, and for up to `DIRECT_AHEAD = 1` further `Missing`
    page. The head is always filled directly; pages ahead are skipped when
    another read of the version is already selecting or filling them.
-3. Send the remaining `Missing` pages to a peer as one selection demand, at
-   most `SELECTIONS = 1` per read. A node keeps at most one selection in
-   flight per version and provider (`Scheduler::contract` refuses a second
-   one with `Overloaded` until the first `Selection` drops). This becomes
-   several per provider once the peer allows several pending pages (section
-   4).
+3. Send the remaining `Missing` pages to peers as selection demands, at most
+   `SELECTIONS = 4` per read. A read always may start one selection; it
+   starts more only while some provider contract of the version has an unused
+   granted flight (`Scheduler::spare`). Each selection demands a disjoint
+   share of the selectable holes: the holes divided evenly over the selections
+   the read can start now, so a single-flight read still demands every hole
+   and lets the provider choose. A node keeps one contract per (version,
+   membership, provider). `Scheduler::contract` issues the next sequence and
+   refuses with `Overloaded` once the contract has its granted number of
+   selections in flight; dropping a `Selection` frees its flight. Each request
+   asks for `REQUESTED_FLIGHTS = 4` (section 4). The grant starts at 1, takes
+   the provider's `Selected` grant (never above the request), and drops back
+   to 1 when the provider refuses a multi-flight request.
 4. Every selected page, and every directly filled page, is offered to all open
    reads of the version whose window still wants it (fan-out).
 5. Deliver `next` when it is `Ready`, attaching it to the client as before
@@ -154,6 +161,16 @@ subscription (`Entry.pending: Option<u64>`). It becomes a bounded set.
   older peer refuses a Subscribe that carries the new field. The reader then
   marks that provider as single-flight and retries without the field. The peer
   wire `VERSION` does not change, matching how remote warm holds were added.
+
+Implemented as: the wire header `racer-subscription-flights`
+(`Subscription.flights`, `TransferGrant.flights`, both `Option<u16>` at most
+`MAX_SUBSCRIPTION_FLIGHTS = 64`); `SubscriptionLimits.max_flights_per_subscription`
+(default 8) caps the grant at `min(requested, cap)`. The requester side
+(`Candidates::subscribe_provider`) returns `ProviderSelection::{Local, Skipped,
+Refused, Selected}`. An unanswered multi-flight request (connection drop, I/O
+error or `Unavailable`) is a refusal: the provider is remembered as
+single-flight for 5 minutes (at most 1024 peers) and the contract's grant drops
+to 1.
 
 ### 5. `Racer-Ordered` is removed
 

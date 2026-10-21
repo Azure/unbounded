@@ -1118,12 +1118,14 @@ async fn execute(
             Ok(Value::Published)
         }
         Work::Select(version, selection, membership, envelope) => {
+            if selection.version != version {
+                return Err(Error::InvalidRequest);
+            }
             let context = local.open_context(envelope)?;
             let page = local
                 .fill
                 .select_subscription(
-                    version,
-                    selection.demand.clone(),
+                    &selection,
                     membership,
                     &context,
                     scope,

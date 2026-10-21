@@ -565,6 +565,17 @@ mod duplex_release {
 struct Link {
     client: Rc<Requester>,
     demands: Rc<RefCell<Vec<u64>>>,
+    stats: Rc<LinkStats>,
+}
+/// Subscribe traffic one requester node sent.
+#[derive(Default)]
+struct LinkStats {
+    /// Drop multi-flight Subscribes without a response, as a provider
+    /// predating `Subscription::flights` does.
+    old_provider: bool,
+    outstanding: Cell<usize>,
+    max_outstanding: Cell<usize>,
+    flights: RefCell<Vec<Option<u16>>>,
 }
 impl Link {
     fn direct_hedge_available(
@@ -590,11 +601,28 @@ impl Link {
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             // Direct window fills send page requests; selections send Subscribe.
-            if let PeerOperation::Subscribe { subscription, .. } = &request.operation {
-                self.demands
-                    .borrow_mut()
-                    .push(subscription.demand.page_count());
+            let PeerOperation::Subscribe { subscription, .. } = &request.operation else {
+                return self.client.request(request, membership, scope).await;
+            };
+            self.demands
+                .borrow_mut()
+                .push(subscription.demand.page_count());
+            self.stats.flights.borrow_mut().push(subscription.flights);
+            if self.stats.old_provider && subscription.flights.is_some() {
+                return Err(Error::Io);
             }
+            struct Outstanding<'a>(&'a Cell<usize>);
+            impl Drop for Outstanding<'_> {
+                fn drop(&mut self) {
+                    self.0.set(self.0.get() - 1);
+                }
+            }
+            let outstanding = self.stats.outstanding.get() + 1;
+            self.stats.outstanding.set(outstanding);
+            let _outstanding = Outstanding(&self.stats.outstanding);
+            self.stats
+                .max_outstanding
+                .set(self.stats.max_outstanding.get().max(outstanding));
             self.client.request(request, membership, scope).await
         })
     }
@@ -1116,6 +1144,49 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
 
 #[test]
 fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_order() {
+    let stats = production_range_windows(false);
+    assert!(
+        stats
+            .iter()
+            .flat_map(|stats| stats.flights.borrow().clone())
+            .any(|flights| flights == Some(crate::read::range_stream::REQUESTED_FLIGHTS))
+    );
+}
+#[test]
+fn production_range_windows_fall_back_to_single_flight_for_old_providers() {
+    let stats = production_range_windows(true);
+    assert!(!stats[0].flights.borrow().is_empty());
+    for stats in &stats {
+        let flights = stats.flights.borrow();
+        if flights.is_empty() {
+            continue;
+        }
+        // The first Subscribe asks for several flights and is dropped; every
+        // later one omits the field, and at most one is outstanding at a time.
+        assert_eq!(
+            flights[0],
+            Some(crate::read::range_stream::REQUESTED_FLIGHTS)
+        );
+        assert!(flights[1..].iter().all(Option::is_none), "{flights:?}");
+        assert!(stats.max_outstanding.get() <= 1);
+    }
+}
+/// Run three range windows on two requester nodes against provider node 2.
+/// The object and windows stay small: node 2's outbound stack is a stub, so
+/// larger windows that overload it and fall back to relayed fetches stall.
+/// Asserts in-order delivery and shared node work; returns each requester's
+/// Subscribe traffic.
+fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
+    const PAGES: u64 = 4;
+    const WINDOW: usize = 4;
+    let stats: Vec<Rc<LinkStats>> = (0..2)
+        .map(|_| {
+            Rc::new(LinkStats {
+                old_provider,
+                ..Default::default()
+            })
+        })
+        .collect();
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(3);
@@ -1143,7 +1214,9 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
         )
         .unwrap(),
     );
-    let mut fixtures: Vec<_> = (0..3).map(|_| fixture_with(4 * PAGE_BYTES, None)).collect();
+    let mut fixtures: Vec<_> = (0..3)
+        .map(|_| fixture_with(PAGES * PAGE_BYTES, None))
+        .collect();
     for fixture in &fixtures {
         fixture.reactor.init().unwrap();
     }
@@ -1191,6 +1264,7 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
                 Rc::new(Link {
                     client: requester,
                     demands: demands.clone(),
+                    stats: stats[i].clone(),
                 }),
                 Link::direct_hedge_available,
                 Link::request,
@@ -1198,7 +1272,7 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
             )
         };
         let (local, endpoint, published) =
-            coordinator_with_window(&fixtures[i], &signers[i], &membership, peers, 4);
+            coordinator_with_window(&fixtures[i], &signers[i], &membership, peers, WINDOW);
         locals.push(local);
         endpoints.push(endpoint);
         publications.push(published);
@@ -1250,8 +1324,8 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(start * PAGE_BYTES)),
-                page_credits: 4,
-                byte_credits: 4 * PAGE_BYTES,
+                page_credits: WINDOW,
+                byte_credits: WINDOW as u64 * PAGE_BYTES,
             },
             origin: OriginContext {
                 object: f.context.object.clone(),
@@ -1319,8 +1393,11 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
     // Every reader drives its own window; pages may arrive in any order but
     // each reader receives its range strictly in order.
     let mut delivered: [Vec<u64>; 3] = Default::default();
-    let ends = [4, 4, 4];
-    for _ in 0..8192 {
+    let ends = [PAGES; 3];
+    // Bounded by time, not iterations: under load, retries after a refused
+    // or failed exchange can wait on real timers.
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
         for (index, stream) in [&mut a, &mut a2, &mut b].into_iter().enumerate() {
             let page = match stream.next_slice().as_mut().poll(&mut cx) {
                 Poll::Ready(result) => result.unwrap().map(|reader| reader.slice().page),
@@ -1341,9 +1418,9 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
         }
         pump(&mut endpoints);
     }
-    assert_eq!(delivered[0], vec![0, 1, 2, 3]);
-    assert_eq!(delivered[1], vec![0, 1, 2, 3]);
-    assert_eq!(delivered[2], vec![2, 3]);
+    assert_eq!(delivered[0], (0..PAGES).collect::<Vec<_>>());
+    assert_eq!(delivered[1], (0..PAGES).collect::<Vec<_>>());
+    assert_eq!(delivered[2], (2..PAGES).collect::<Vec<_>>());
     assert!(
         demands.borrow().iter().any(|count| *count > 1),
         "the window selects holes from the provider, not fixed pages"
@@ -1355,8 +1432,8 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
             .borrow()
             .iter()
             .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        4
+            .len() as u64,
+        PAGES
     );
     for stream in [&mut a, &mut a2, &mut b] {
         assert!(
@@ -1426,6 +1503,7 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
     for endpoint in &mut endpoints {
         endpoint.uninstall().unwrap();
     }
+    stats
 }
 #[test]
 fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {

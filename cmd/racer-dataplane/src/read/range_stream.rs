@@ -42,9 +42,16 @@ use std::time::Instant;
 /// Direct fills a read keeps in flight beyond its head page.
 const DIRECT_AHEAD: usize = 1;
 
-/// Provider selections a read keeps in flight. Each provider still serves at
-/// most one selection per version from this node (see `Scheduler::contract`).
-const SELECTIONS: usize = 1;
+/// Provider selections a read keeps in flight. Beyond the first, a read only
+/// starts another while some contract of its version has an unused granted
+/// flight (see `Scheduler::spare`). Each selection demands a disjoint share of
+/// the read's selectable holes.
+const SELECTIONS: usize = 4;
+
+/// Flights requested per provider contract. A provider grants at most this
+/// many pending selections per contract, or one if it predates multi-flight.
+pub(crate) const REQUESTED_FLIGHTS: u16 = 4;
+const _: () = assert!(REQUESTED_FLIGHTS <= crate::peer::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
 
 /// Spill fills (hold plus warm fill) a read keeps in flight.
 const SPILL_FILLS: usize = 2;
@@ -67,15 +74,25 @@ struct Reader {
     waker: Option<Waker>,
 }
 
-/// A peer subscription contract and whether a selection currently uses it.
+/// One provider contract: (version, membership, provider).
+type ContractKey = (ObjectVersion, u64, racer_control_wire::NodeId);
+
+/// A peer subscription contract and the selections it has in flight.
 struct Contract {
     subscription: crate::peer::subscriptions::Subscription,
     expires: Instant,
-    busy: bool,
+    /// Selections currently using the contract.
+    inflight: u16,
+    /// Flights asked of the provider by the latest request (1 when the field
+    /// was omitted).
+    requested: u16,
+    /// Selections the provider allows pending at once: 1 until a `Selected`
+    /// grant raises it, back to 1 after a refusal.
+    granted: u16,
 }
 
 struct State {
-    contracts: BTreeMap<(ObjectVersion, u64, racer_control_wire::NodeId), Contract>,
+    contracts: BTreeMap<ContractKey, Contract>,
     sequence: u64,
     readers: BTreeMap<u64, Reader>,
 }
@@ -87,21 +104,31 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    /// Issue the next sequence of the node's contract with `provider`. A
-    /// provider serves one pending selection per contract, so a second
-    /// concurrent selection for the same version and provider is refused with
-    /// `Overloaded` until the first `Selection` is dropped.
+    /// Issue the next sequence of the node's contract with `provider` for
+    /// `selection`, asking for `requested` flights. A contract serves at most
+    /// its granted flights at once; one more concurrent selection is refused
+    /// with `Overloaded` until an earlier `Selection` is dropped.
     pub(crate) fn contract(
         &self,
-        version: ObjectVersion,
+        selection: &Selection,
         membership: racer_control_wire::MembershipVersion,
         provider: racer_control_wire::NodeId,
-        demand: crate::peer::subscriptions::Demand,
+        requested: Option<u16>,
         deadline: Instant,
     ) -> Result<(crate::peer::subscriptions::Subscription, Instant)> {
+        let mut used = selection.contract.lock().unwrap();
+        if used.is_some() {
+            return Err(Error::InvalidRequest);
+        }
+        let version = selection.version.clone();
+        let demand = selection.demand.clone();
         let mut state = self.state.lock().unwrap();
         let now = uring_runtime::environment::now();
-        state.contracts.retain(|_, contract| contract.expires > now);
+        // Expired contracts are dropped only once idle, so a late drop never
+        // releases a flight of the contract that replaced it.
+        state
+            .contracts
+            .retain(|_, contract| contract.expires > now || contract.inflight > 0);
         let key = (version.clone(), membership.0, provider);
         if !state.contracts.contains_key(&key) {
             if state.contracts.len() >= self.capacity.saturating_mul(3) {
@@ -122,12 +149,22 @@ impl Scheduler {
                         flights: None,
                     },
                     expires: deadline,
-                    busy: false,
+                    inflight: 0,
+                    requested: 1,
+                    granted: 1,
                 },
             );
         }
         let contract = state.contracts.get_mut(&key).unwrap();
-        if contract.busy {
+        // An expired contract still draining its selections takes no more;
+        // once idle it is replaced by a fresh one.
+        if contract.expires <= now && contract.inflight > 0 {
+            return Err(Error::Overloaded);
+        }
+        let requested = requested.unwrap_or(1).max(1);
+        // A single-flight request never has more than one pending selection.
+        let granted = contract.granted.min(requested);
+        if contract.inflight >= granted {
             return Err(Error::Overloaded);
         }
         contract.expires = contract.expires.min(deadline);
@@ -151,8 +188,58 @@ impl Scheduler {
         let outgoing = contract.subscription.clone();
         contract.subscription.page_budget = page_budget;
         contract.subscription.byte_budget = byte_budget;
-        contract.busy = true;
+        contract.requested = requested;
+        contract.granted = granted;
+        contract.inflight += 1;
+        *used = Some(key);
         Ok((outgoing, contract.expires))
+    }
+
+    /// Record a provider's grant for `selection`'s contract. The grant never
+    /// exceeds the flights requested.
+    pub(crate) fn granted(
+        &self,
+        selection: &Selection,
+        provider: &racer_control_wire::NodeId,
+        flights: u16,
+    ) {
+        let Some(key) = selection.contract.lock().unwrap().clone() else {
+            return;
+        };
+        if &key.2 != provider {
+            return;
+        }
+        if let Some(contract) = self.state.lock().unwrap().contracts.get_mut(&key) {
+            contract.granted = flights.clamp(1, contract.requested);
+        }
+    }
+
+    /// The provider refused a multi-flight request: one flight from now on.
+    pub(crate) fn refused(&self, selection: &Selection, provider: &racer_control_wire::NodeId) {
+        let Some(key) = selection.contract.lock().unwrap().clone() else {
+            return;
+        };
+        if &key.2 != provider {
+            return;
+        }
+        if let Some(contract) = self.state.lock().unwrap().contracts.get_mut(&key) {
+            contract.granted = 1;
+        }
+    }
+
+    /// Unused granted flights across the live contracts of `version`.
+    fn spare(&self, version: &ObjectVersion) -> usize {
+        let now = uring_runtime::environment::now();
+        self.state
+            .lock()
+            .unwrap()
+            .contracts
+            .iter()
+            .filter(|((contracted, _, _), contract)| {
+                contracted == version && contract.expires > now
+            })
+            .map(|(_, contract)| usize::from(contract.granted.saturating_sub(contract.inflight)))
+            .sum()
     }
 
     pub(crate) fn new(capacity: usize) -> Arc<Self> {
@@ -213,17 +300,10 @@ impl Scheduler {
         }
     }
 
-    /// Mark the contracts a selection with this demand used idle again.
-    pub(crate) fn finish(
-        &self,
-        version: &ObjectVersion,
-        demand: &crate::peer::subscriptions::Demand,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        for ((contracted, _, _), contract) in state.contracts.iter_mut() {
-            if contract.busy && contracted == version && &contract.subscription.demand == demand {
-                contract.busy = false;
-            }
+    /// Release the flight a dropped selection held on its contract.
+    fn release(&self, key: &ContractKey) {
+        if let Some(contract) = self.state.lock().unwrap().contracts.get_mut(key) {
+            contract.inflight = contract.inflight.saturating_sub(1);
         }
     }
 }
@@ -289,11 +369,13 @@ impl Drop for WindowLease {
 
 /// One provider selection over some window pages. The worker running it
 /// offers the selected page to every interested window, then drops it, which
-/// frees the provider contract for the next selection.
+/// frees its flight on the provider contract for the next selection.
 pub(crate) struct Selection {
-    scheduler: Arc<Scheduler>,
-    version: ObjectVersion,
+    pub(crate) scheduler: Arc<Scheduler>,
+    pub(crate) version: ObjectVersion,
     pub(crate) demand: crate::peer::subscriptions::Demand,
+    /// The contract this selection holds a flight on, once issued.
+    contract: Mutex<Option<ContractKey>>,
 }
 
 impl Selection {
@@ -320,13 +402,16 @@ impl Selection {
             scheduler: scheduler.clone(),
             version,
             demand,
+            contract: Mutex::new(None),
         }
     }
 }
 
 impl Drop for Selection {
     fn drop(&mut self) {
-        self.scheduler.finish(&self.version, &self.demand);
+        if let Some(key) = self.contract.get_mut().unwrap().take() {
+            self.scheduler.release(&key);
+        }
     }
 }
 
@@ -868,7 +953,7 @@ impl RangeStream {
             }
             index += 1;
         }
-        if self.selections.len() < SELECTIONS && self.start_selection(scope)? {
+        while self.may_select() && self.start_selection(scope)? {
             changed = true;
         }
         Ok(changed)
@@ -898,18 +983,36 @@ impl RangeStream {
         Ok(true)
     }
 
-    /// Select the remaining holes from a peer provider. Pages that another
+    /// Whether the read may start another selection: its first always, more
+    /// only while a contract of the version has an unused granted flight.
+    fn may_select(&self) -> bool {
+        self.selections.len() < SELECTIONS
+            && (self.selections.is_empty()
+                || self.directory.subscriptions.spare(&self.metadata.version) > 0)
+    }
+
+    /// The demand and pages of the next selection, if any. Pages that another
+    /// window of this version is selecting are left to that selection's
+    /// fan-out. While a warm job runs for the version, reads only fetch pages
+    /// directly, each waiting for the warm job to finish that page.
+    fn plan_selection(
+        &self,
+    ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
+        if self.directory.warm.contains(&self.metadata.version) {
+            return Ok(None);
+        }
+        let Some(lease) = self.lease.as_ref() else {
+            return Ok(None);
+        };
+        self.selection_demand(&lease.busy_elsewhere(), self.share())
+    }
+
+    /// Select the next share of the remaining holes from a peer provider. Pages that another
     /// window of this version is selecting are left to that selection's
     /// fan-out. While a warm job runs for the version, reads only fetch pages
     /// directly, each waiting for the warm job to finish that page.
     fn start_selection(&mut self, scope: &RequestScope) -> Result<bool> {
-        if self.directory.warm.contains(&self.metadata.version) {
-            return Ok(false);
-        }
-        let Some(lease) = self.lease.as_ref() else {
-            return Ok(false);
-        };
-        let Some((demand, pages)) = self.selection_demand(&lease.busy_elsewhere())? else {
+        let Some((demand, pages)) = self.plan_selection()? else {
             return Ok(false);
         };
         let Some(child) = self.budget.next_page(self.pending())? else {
@@ -919,6 +1022,7 @@ impl RangeStream {
             scheduler: self.directory.subscriptions.clone(),
             version: self.metadata.version.clone(),
             demand,
+            contract: Mutex::new(None),
         };
         let mut child_scope = scope.clone();
         child_scope.deadline.0 = child.deadline();
@@ -951,17 +1055,44 @@ impl RangeStream {
         Ok(true)
     }
 
-    /// The selectable holes of the window, excluding pages that another window
-    /// is selecting or filling, as a canonical demand of at most the wire interval limit.
+    /// Pages the next selection may demand: an even share of the selectable
+    /// holes over the selections the read can start now (its free selection
+    /// slots, bounded by the version's spare granted flights), so concurrent
+    /// selections cover disjoint parts of the window. A single-flight read
+    /// demands every selectable hole, as one selection lets the provider choose.
+    fn share(&self) -> usize {
+        let holes = self
+            .slots
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Missing { select: true }))
+            .count();
+        let free = SELECTIONS.saturating_sub(self.selections.len());
+        let spare = self.directory.subscriptions.spare(&self.metadata.version);
+        // The read's first selection may run before any spare flight exists.
+        let startable = if self.selections.is_empty() {
+            free.min(spare + 1)
+        } else {
+            free.min(spare)
+        };
+        holes.div_ceil(startable.max(1)).max(1)
+    }
+
+    /// Up to `limit` selectable holes of the window, excluding pages that
+    /// another window is selecting or filling, as a canonical demand of at
+    /// most the wire interval limit.
     fn selection_demand(
         &self,
         elsewhere: &BTreeSet<u64>,
+        limit: usize,
     ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
         use crate::peer::subscriptions::MAX_DEMAND_INTERVALS;
         use crate::peer::subscriptions::PageInterval;
         let mut intervals: Vec<PageInterval> = Vec::new();
         let mut pages = BTreeSet::new();
         for index in 0..self.slots.len() {
+            if pages.len() >= limit {
+                break;
+            }
             let number = self.page_at(index);
             if !matches!(self.slots[index], Slot::Missing { select: true })
                 || elsewhere.contains(&number)
@@ -2109,7 +2240,12 @@ pub(super) mod tests {
             assert!(stream.selections.is_empty());
             assert!(matches!(stream.slots[1], Slot::Missing { select: false }));
             // The page is no longer offered for selection, only for a direct fill.
-            assert!(stream.selection_demand(&BTreeSet::new()).unwrap().is_none());
+            assert!(
+                stream
+                    .selection_demand(&BTreeSet::new(), usize::MAX)
+                    .unwrap()
+                    .is_none()
+            );
             // Canceling the stream itself is fatal.
             scope.cancel().unwrap();
             stream.poll_prefetch(&mut cx);
@@ -2146,6 +2282,127 @@ pub(super) mod tests {
         job.stop();
     }
     #[test]
+    fn read_keeps_disjoint_selections_in_flight_up_to_spare_granted_flights() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 8);
+        let mut metadata = metadata();
+        metadata.length = 8 * PAGE_BYTES;
+        let open = || {
+            let mut stream = f.open(
+                &metadata,
+                ByteRange::From(0).resolve(metadata.length).unwrap(),
+                RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap(),
+            );
+            stream.configure_subscription(8, 8 * PAGE_BYTES).unwrap();
+            for _ in 0..8 {
+                stream.inject(Slot::Missing { select: true });
+            }
+            stream
+        };
+        // Admit selections as `admit` does, with operations that never finish
+        // in place of worker submissions.
+        let admit = |stream: &mut RangeStream| {
+            while stream.may_select() {
+                let Some((_, pages)) = stream.plan_selection().unwrap() else {
+                    break;
+                };
+                for number in &pages {
+                    *stream.slot_mut(*number).unwrap() = Slot::Selecting;
+                }
+                stream.selections.push(Pending {
+                    operation: Box::pin(std::future::pending()),
+                    pages,
+                });
+            }
+        };
+        let selected = |stream: &RangeStream| {
+            stream
+                .selections
+                .iter()
+                .map(|pending| pending.pages.clone())
+                .collect::<Vec<_>>()
+        };
+        // Before any provider grants more than one flight, a read runs one
+        // selection over every selectable hole beyond its direct fills.
+        let mut stream = open();
+        admit(&mut stream);
+        assert_eq!(selected(&stream), vec![BTreeSet::from_iter(0..8)]);
+        drop(stream);
+        // A grant of several flights on a contract of the version lets the
+        // read split its holes over several concurrent selections.
+        let scheduler = &f.streams.directory.subscriptions;
+        let provider = racer_control_wire::NodeId("provider".into());
+        let granted = Selection::for_test(
+            scheduler,
+            metadata.version.clone(),
+            crate::peer::subscriptions::Demand::new(vec![
+                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+            ])
+            .unwrap(),
+        );
+        scheduler
+            .contract(
+                &granted,
+                MembershipVersion(1),
+                provider.clone(),
+                Some(REQUESTED_FLIGHTS),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        scheduler.granted(&granted, &provider, REQUESTED_FLIGHTS);
+        drop(granted);
+        assert_eq!(scheduler.spare(&metadata.version), 4);
+        let mut stream = open();
+        admit(&mut stream);
+        let pages = selected(&stream);
+        assert_eq!(pages.len(), SELECTIONS);
+        assert_eq!(
+            pages,
+            vec![
+                BTreeSet::from([0, 1]),
+                BTreeSet::from([2, 3]),
+                BTreeSet::from([4, 5]),
+                BTreeSet::from([6, 7]),
+            ]
+        );
+        assert!(
+            stream
+                .slots
+                .iter()
+                .all(|slot| matches!(slot, Slot::Selecting))
+        );
+        drop(stream);
+        // Once the granted flights are in use, a read starts only its first
+        // selection, over every hole.
+        let held = (0..REQUESTED_FLIGHTS)
+            .map(|_| {
+                let held = Selection::for_test(
+                    scheduler,
+                    metadata.version.clone(),
+                    crate::peer::subscriptions::Demand::new(vec![
+                        crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+                    ])
+                    .unwrap(),
+                );
+                scheduler
+                    .contract(
+                        &held,
+                        MembershipVersion(1),
+                        provider.clone(),
+                        Some(REQUESTED_FLIGHTS),
+                        Instant::now() + Duration::from_secs(60),
+                    )
+                    .unwrap();
+                held
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scheduler.spare(&metadata.version), 0);
+        let mut stream = open();
+        admit(&mut stream);
+        assert_eq!(selected(&stream), vec![BTreeSet::from_iter(0..8)]);
+        drop(held);
+    }
+    #[test]
     fn selection_demand_covers_only_selectable_holes_not_selected_elsewhere() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 8);
         let mut metadata = metadata();
@@ -2165,7 +2422,7 @@ pub(super) mod tests {
             stream.inject(Slot::Missing { select: true });
         }
         let (demand, pages) = stream
-            .selection_demand(&BTreeSet::from([5]))
+            .selection_demand(&BTreeSet::from([5]), usize::MAX)
             .unwrap()
             .unwrap();
         use crate::peer::subscriptions::PageInterval;
@@ -2502,56 +2759,128 @@ pub(super) mod tests {
                 .map(|page| page.plaintext.page().number.0)
                 .collect()
         }
+        fn issue(
+            scheduler: &Arc<Scheduler>,
+            start: u64,
+            provider: &str,
+            requested: Option<u16>,
+            deadline: Instant,
+        ) -> (
+            Selection,
+            Result<(crate::peer::subscriptions::Subscription, Instant)>,
+        ) {
+            let selection = Selection::for_test(scheduler, version(), demand(start, start + 1));
+            let result = scheduler.contract(
+                &selection,
+                MembershipVersion(1),
+                NodeId(provider.into()),
+                requested,
+                deadline,
+            );
+            (selection, result)
+        }
         #[test]
-        fn contracts_never_refill_and_serve_one_selection_per_provider() {
+        fn contracts_never_refill_and_start_with_one_selection_per_provider() {
             let scheduler = Scheduler::new(4);
             let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
-            let first = Selection::for_test(&scheduler, version(), demand(0, 1));
-            let (one, _) = scheduler
-                .contract(
-                    version(),
-                    MembershipVersion(1),
-                    NodeId("provider".into()),
-                    first.demand.clone(),
-                    deadline,
-                )
-                .unwrap();
-            // A second concurrent selection from the same provider waits for
-            // the first; another provider is independent.
+            let (first, one) = issue(&scheduler, 0, "provider", Some(4), deadline);
+            let (one, _) = one.unwrap();
+            // Until the provider grants more, a second concurrent selection
+            // from the same provider waits for the first; another provider is
+            // independent.
+            let (_, second) = issue(&scheduler, 5, "provider", Some(4), deadline);
+            assert_eq!(second, Err(Error::Overloaded));
+            let (_other, other) = issue(&scheduler, 5, "other", Some(4), deadline);
+            other.unwrap();
+            // A selection holds at most one contract.
             assert_eq!(
                 scheduler.contract(
-                    version(),
-                    MembershipVersion(1),
-                    NodeId("provider".into()),
-                    demand(5, 6),
-                    deadline,
-                ),
-                Err(Error::Overloaded)
-            );
-            scheduler
-                .contract(
-                    version(),
+                    &first,
                     MembershipVersion(1),
                     NodeId("other".into()),
-                    demand(5, 6),
+                    None,
                     deadline,
-                )
-                .unwrap();
+                ),
+                Err(Error::InvalidRequest)
+            );
             drop(first);
-            let (two, expires) = scheduler
-                .contract(
-                    version(),
-                    MembershipVersion(1),
-                    NodeId("provider".into()),
-                    demand(0, 1),
-                    deadline + std::time::Duration::from_secs(30),
-                )
-                .unwrap();
+            let (_second, two) = issue(
+                &scheduler,
+                0,
+                "provider",
+                Some(4),
+                deadline + std::time::Duration::from_secs(30),
+            );
+            let (two, expires) = two.unwrap();
             assert_eq!(one.id, two.id);
+            // The refused attempt above still consumed no sequence.
             assert_eq!(two.sequence, one.sequence + 1);
             assert_eq!(two.page_budget + 1, one.page_budget);
             assert_eq!(two.byte_budget + PAGE_BYTES + 16, one.byte_budget);
             assert_eq!(expires, deadline);
+        }
+        #[test]
+        fn contract_serves_up_to_granted_flights_and_refusal_resets_to_one() {
+            let scheduler = Scheduler::new(4);
+            let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let provider = NodeId("provider".into());
+            let (first, result) = issue(&scheduler, 0, "provider", Some(3), deadline);
+            result.unwrap();
+            assert_eq!(scheduler.spare(&version()), 0);
+            // A grant above the request, or from another provider, is clamped
+            // or ignored.
+            scheduler.granted(&first, &NodeId("other".into()), 3);
+            assert_eq!(scheduler.spare(&version()), 0);
+            scheduler.granted(&first, &provider, 9);
+            assert_eq!(scheduler.spare(&version()), 2);
+            let mut held = vec![first];
+            let mut sequences = Vec::new();
+            for start in 1..3 {
+                let (selection, result) = issue(&scheduler, start, "provider", Some(3), deadline);
+                sequences.push(result.unwrap().0.sequence);
+                held.push(selection);
+            }
+            assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(scheduler.spare(&version()), 0);
+            let (_, fourth) = issue(&scheduler, 3, "provider", Some(3), deadline);
+            assert_eq!(fourth, Err(Error::Overloaded));
+            // A single-flight request is never one of several pending.
+            held.pop();
+            let (_, single) = issue(&scheduler, 3, "provider", None, deadline);
+            assert_eq!(single, Err(Error::Overloaded));
+            // A refusal drops the contract to one flight: two still pending
+            // block new ones until both finish.
+            let (selection, result) = issue(&scheduler, 3, "provider", Some(3), deadline);
+            result.unwrap();
+            scheduler.refused(&selection, &provider);
+            held.push(selection);
+            while let Some(selection) = held.pop() {
+                let (_, next) = issue(&scheduler, 4, "provider", Some(3), deadline);
+                assert_eq!(next, Err(Error::Overloaded));
+                drop(selection);
+            }
+            let (_last, last) = issue(&scheduler, 4, "provider", Some(3), deadline);
+            last.unwrap();
+        }
+        #[test]
+        fn expired_contract_drains_before_a_fresh_one_replaces_it() {
+            let scheduler = Scheduler::new(4);
+            let deadline = uring_runtime::environment::now() + std::time::Duration::from_millis(20);
+            let (first, result) = issue(&scheduler, 0, "provider", Some(2), deadline);
+            let (old, _) = result.unwrap();
+            scheduler.granted(&first, &NodeId("provider".into()), 2);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let later = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            // The expired contract never signs another request.
+            let (_, draining) = issue(&scheduler, 1, "provider", Some(2), later);
+            assert_eq!(draining, Err(Error::Overloaded));
+            assert_eq!(scheduler.spare(&version()), 0);
+            drop(first);
+            let (_fresh, fresh) = issue(&scheduler, 1, "provider", Some(2), later);
+            let (fresh, expires) = fresh.unwrap();
+            assert_ne!(fresh.id, old.id);
+            assert_eq!(fresh.sequence, 1);
+            assert_eq!(expires, later);
         }
         #[test]
         fn pending_and_delivered_share_exact_once_credit() {

@@ -865,9 +865,14 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
             ])
             .unwrap();
-            let mut work = Box::pin(f.fill.select_subscription(
+            let scheduler = crate::read::range_stream::Scheduler::new(1);
+            let selection = crate::read::range_stream::Selection::for_test(
+                &scheduler,
                 f.page.version.clone(),
                 demand,
+            );
+            let mut work = Box::pin(f.fill.select_subscription(
+                &selection,
                 f.membership.clone(),
                 &f.context,
                 &f.scope,
@@ -935,9 +940,11 @@ fn subscription_behind_remote_warm_fills_only_the_published_head() {
             end: 4,
         }])
         .unwrap();
+    let scheduler = crate::read::range_stream::Scheduler::new(1);
+    let selection =
+        crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
     let mut work = Box::pin(f.fill.select_subscription(
-        f.page.version.clone(),
-        demand,
+        &selection,
         f.membership.clone(),
         &f.context,
         &f.scope,

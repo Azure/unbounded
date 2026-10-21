@@ -223,14 +223,12 @@ impl SingleFlightPeers {
 }
 
 /// Result of one provider selection request.
-#[allow(dead_code)] // Provider and flight fields serve the unordered read path.
-#[allow(clippy::large_enum_variant)] // Moved once per selection; boxing would allocate per page.
 pub(crate) enum ProviderSelection {
     /// This node is the provider for the first demanded page; fetch locally.
     Local,
     /// No page this time: the provider missed, was overloaded or unreachable.
     /// The caller may retry with a new sequence.
-    Skipped { provider: NodeId },
+    Skipped,
     /// The provider refused a multi-flight request without a signed response,
     /// as a provider predating `Subscription::flights` does. It is now
     /// single-flight for `SINGLE_FLIGHT_TTL`, so retrying with a new sequence
@@ -241,7 +239,7 @@ pub(crate) enum ProviderSelection {
     /// pending on this contract from now on (the provider's grant, or 1).
     Selected {
         provider: NodeId,
-        response: VerifiedResponse,
+        response: Box<VerifiedResponse>,
         flights: u16,
     },
 }
@@ -449,31 +447,32 @@ impl CandidatePolicy {
     #[allow(clippy::too_many_arguments)] // Keep demand, validation, and budget inputs explicit.
     pub(crate) async fn subscribe(
         &self,
-        version: crate::model::ObjectVersion,
-        demand: crate::peer::subscriptions::Demand,
-        scheduler: &super::range_stream::Scheduler,
+        selection: &super::range_stream::Selection,
+        flights: u16,
         membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<Option<VerifiedResponse>> {
-        let first = demand
+        let first = selection
+            .demand
             .intervals()
             .first()
             .ok_or(Error::InvalidRequest)?
             .start;
         let deadline = scope.deadline.0.min(budget.deadline());
-        let selection = self
+        let scheduler = &selection.scheduler;
+        let result = self
             .subscribe_provider(
-                &version.object,
+                &selection.version.object,
                 PageNumber(first),
-                1,
-                |provider, _| {
+                flights,
+                |provider, requested| {
                     scheduler.contract(
-                        version.clone(),
+                        selection,
                         membership.version,
                         provider.clone(),
-                        demand,
+                        requested,
                         deadline,
                     )
                 },
@@ -483,9 +482,20 @@ impl CandidatePolicy {
                 budget,
             )
             .await?;
-        Ok(match selection {
-            ProviderSelection::Selected { response, .. } => Some(response),
-            _ => None,
+        Ok(match result {
+            ProviderSelection::Selected {
+                provider,
+                response,
+                flights,
+            } => {
+                scheduler.granted(selection, &provider, flights);
+                Some(*response)
+            }
+            ProviderSelection::Refused { provider } => {
+                scheduler.refused(selection, &provider);
+                None
+            }
+            ProviderSelection::Local | ProviderSelection::Skipped => None,
         })
     }
 
@@ -553,9 +563,7 @@ impl CandidatePolicy {
             subscription,
             mode: FetchMode::Acquire,
         };
-        let skipped = || ProviderSelection::Skipped {
-            provider: destination.clone(),
-        };
+        let skipped = || ProviderSelection::Skipped;
         let response = match self
             .request(
                 &membership,
@@ -605,7 +613,7 @@ impl CandidatePolicy {
                 let flights = grant.flights.unwrap_or(1);
                 Ok(ProviderSelection::Selected {
                     provider: destination.clone(),
-                    response,
+                    response: Box::new(response),
                     flights,
                 })
             }

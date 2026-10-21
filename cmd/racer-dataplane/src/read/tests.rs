@@ -2751,10 +2751,14 @@ mod timeouts {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
         };
-        let mut subscribe = Box::pin(f.policy.subscribe(
+        let selection = crate::read::range_stream::Selection::for_test(
+            &scheduler,
             version.clone(),
             demand.clone(),
-            &scheduler,
+        );
+        let mut subscribe = Box::pin(f.policy.subscribe(
+            &selection,
+            1,
             f.candidates.membership.clone(),
             &f.context,
             &f.scope,
@@ -2801,12 +2805,12 @@ mod timeouts {
         // Another selection keeps the original signed deadline and spent ceilings,
         // even though its local attempt starts later. Dropping the first
         // selection frees the provider contract for it.
-        scheduler.finish(&version, &demand);
+        drop(selection);
+        let selection = crate::read::range_stream::Selection::for_test(&scheduler, version, demand);
         assert!(
             futures::executor::block_on(f.policy.subscribe(
-                version,
-                demand,
-                &scheduler,
+                &selection,
+                1,
                 f.candidates.membership.clone(),
                 &f.context,
                 &f.scope,
@@ -2872,6 +2876,11 @@ mod timeouts {
         };
         let select = |f: &mut Fixture, flights: u16| {
             let asked = Cell::new(None);
+            let selection = crate::read::range_stream::Selection::for_test(
+                &scheduler,
+                version.clone(),
+                demand.clone(),
+            );
             let result = futures::executor::block_on(f.policy.subscribe_provider(
                 &version.object,
                 PageNumber(0),
@@ -2879,10 +2888,10 @@ mod timeouts {
                 |provider, requested| {
                     asked.set(Some(requested));
                     scheduler.contract(
-                        version.clone(),
+                        &selection,
                         f.candidates.membership.version,
                         provider.clone(),
-                        demand.clone(),
+                        requested,
                         f.scope.deadline.0,
                     )
                 },
@@ -2893,13 +2902,13 @@ mod timeouts {
             ))
             .unwrap();
             // Each request has finished; free the contract for the next.
-            scheduler.finish(&version, &demand);
+            drop(selection);
             let sent = f.peers.calls.borrow().last().unwrap().subscription.clone();
             (result, asked.get().unwrap(), sent.unwrap().flights)
         };
         // A single flight never sends the field.
         let (result, asked, sent) = select(&mut f, 1);
-        assert!(matches!(result, ProviderSelection::Skipped { .. }));
+        assert!(matches!(result, ProviderSelection::Skipped));
         assert_eq!((asked, sent), (None, None));
         let (result, asked, sent) = select(&mut f, 4);
         let ProviderSelection::Refused { provider } = result else {
@@ -2909,7 +2918,7 @@ mod timeouts {
         assert_eq!((asked, sent), (Some(4), Some(4)));
         // The provider is now single-flight: the retry omits the field.
         let (result, asked, sent) = select(&mut f, 4);
-        assert!(matches!(result, ProviderSelection::Skipped { .. }));
+        assert!(matches!(result, ProviderSelection::Skipped));
         assert_eq!((asked, sent), (None, None));
         let calls = f.peers.calls.borrow();
         assert!(
@@ -2930,13 +2939,17 @@ mod timeouts {
             crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
         ])
         .unwrap();
-        let mut subscribe = Box::pin(f.policy.subscribe(
+        let selection = crate::read::range_stream::Selection::for_test(
+            &scheduler,
             ObjectVersion {
                 object: f.context.object.clone(),
                 etag: StrongEtag::test_value("v1"),
             },
             demand,
-            &scheduler,
+        );
+        let mut subscribe = Box::pin(f.policy.subscribe(
+            &selection,
+            1,
             f.candidates.membership.clone(),
             &f.context,
             &f.scope,

@@ -162,15 +162,16 @@ impl Fill {
     }
     pub(crate) async fn select_subscription(
         &self,
-        version: crate::model::ObjectVersion,
-        demand: crate::peer::subscriptions::Demand,
+        selection: &super::range_stream::Selection,
         membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
+        let version = selection.version.clone();
         let first = crate::model::PageNumber(
-            demand
+            selection
+                .demand
                 .intervals()
                 .first()
                 .ok_or(Error::InvalidRequest)?
@@ -217,9 +218,8 @@ impl Fill {
             .dependencies
             .candidates
             .subscribe(
-                version.clone(),
-                demand,
-                &self.dependencies.metadata_owner.subscriptions,
+                selection,
+                super::range_stream::REQUESTED_FLIGHTS,
                 membership.clone(),
                 context,
                 scope,
