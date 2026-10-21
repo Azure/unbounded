@@ -649,6 +649,14 @@ impl StoreWriter {
         // The copy-out uses completion admission like disk staging, because an
         // accepted fill must still persist after request admission stops. It goes
         // through the caller's callback so cached pages can be reclaimed first.
+        if let Some(copy) = page.ciphertext.retained_copy()
+            && self.admission.owns(copy.inner.reservation())
+            && copy.inner.reservation().key() == Some(&page.metadata.version.object.cache)
+        {
+            // An earlier retaining path (the memory cache) already copied it
+            // out under this admission: share that copy.
+            page.ciphertext = copy;
+        }
         if page.ciphertext.is_registered() {
             let length = page.ciphertext.bytes().len();
             let reservation = reserve_staging(length)?;

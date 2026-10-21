@@ -94,12 +94,15 @@ pub(crate) enum CiphertextStorage {
         range: std::ops::Range<usize>,
     },
     /// A received RDMA page still in registered pool memory. Request-scoped
-    /// only: every retaining path copies it out (see `retainable`) so pool
-    /// buffers are never pinned by caches or write queues. Dropping it on any
-    /// thread returns the buffer to the pool.
+    /// only: retaining paths copy it out (see `retainable`) so pool buffers
+    /// are never pinned by caches or write queues. Dropping it on any thread
+    /// returns the buffer to the pool.
     Registered {
         page: rdma_verbs::RegisteredPage,
         reservation: flow_control::Charge<AdmissionPolicy>,
+        /// The first copy-out, shared by every later retaining path (memory
+        /// cache, disk write queue) so a page is copied out at most once.
+        retained: std::sync::OnceLock<CiphertextPage>,
     },
 }
 
@@ -223,7 +226,11 @@ impl BufferPool {
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope,
-                storage: CiphertextStorage::Registered { page, reservation },
+                storage: CiphertextStorage::Registered {
+                    page,
+                    reservation,
+                    retained: std::sync::OnceLock::new(),
+                },
             }),
         })
     }
@@ -233,6 +240,11 @@ impl BufferPool {
     pub(crate) fn retainable(&self, ciphertext: CiphertextPage) -> Result<CiphertextPage> {
         if !ciphertext.is_registered() {
             return Ok(ciphertext);
+        }
+        if let Some(copy) = ciphertext.retained_copy()
+            && self.admission.owns(copy.inner.reservation())
+        {
+            return Ok(copy);
         }
         let reservation = self.admission.reserve(
             Some(&ciphertext.envelope().page.version.object.cache),
@@ -323,6 +335,12 @@ impl VerifiedPage {
         &self.inner.bytes
     }
 }
+#[cfg(test)]
+thread_local! {
+    /// Copies of whole pages made by `CiphertextPage::rehome` on this thread.
+    pub(crate) static COPY_OUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CiphertextPage {
     /// Rehome a completed receive before retaining it in another worker's cache.
     /// Admit the new charge first. Shared transport owners keep their original
@@ -348,14 +366,34 @@ impl CiphertextPage {
         }
         let mut bytes = reservation.buffer(self.bytes().len())?;
         bytes.copy_from_slice(self.bytes());
-        Ok(Self {
+        #[cfg(test)]
+        COPY_OUTS.with(|count| count.set(count.get() + 1));
+        let copy = Self {
             inner: Arc::new(CiphertextBytes {
                 checksum: self.inner.checksum.clone(),
                 envelope: self.envelope().clone(),
                 storage: flow_control::ChargedBytes { bytes, reservation }.into(),
             }),
             provenance: self.provenance,
-        })
+        };
+        // Remember the first copy-out of a registered page so the next
+        // retaining path for the same admission shares it.
+        if let CiphertextStorage::Registered { retained, .. } = &self.inner.storage {
+            let _ = retained.set(copy.clone());
+        }
+        Ok(copy)
+    }
+    /// The owned copy an earlier retaining path made of this registered page.
+    pub(crate) fn retained_copy(&self) -> Option<Self> {
+        match &self.inner.storage {
+            CiphertextStorage::Registered { retained, .. } => {
+                retained.get().cloned().map(|mut copy| {
+                    copy.provenance = self.provenance;
+                    copy
+                })
+            }
+            _ => None,
+        }
     }
     pub fn checksum(&self) -> u64 {
         *self

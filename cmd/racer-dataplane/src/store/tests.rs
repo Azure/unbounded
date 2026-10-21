@@ -3123,6 +3123,67 @@ fn registered_persistence_reclaims_cached_pages_through_callback() {
     assert!(f.store.writer.is_idle());
 }
 
+#[test]
+fn registered_page_cached_then_persisted_is_copied_out_once() {
+    use crate::rdma::links::tests::{link_up, receive_registered, world};
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let cache = page.metadata.version.object.cache.clone();
+    let mut w = world();
+    link_up(&mut w);
+    let received = receive_registered(&mut w, &page.ciphertext);
+    let length = received.len();
+    let reservation = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+        .unwrap();
+    let pool = crate::memory::BufferPool::new(f.admission.clone());
+    page.ciphertext = pool
+        .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
+        .unwrap();
+    let copies = || crate::memory::COPY_OUTS.with(std::cell::Cell::get);
+    let before = copies();
+    // The memory cache retains first, as `publish` runs before `persist_verified`.
+    let cached = pool.retainable(page.ciphertext.clone()).unwrap();
+    assert!(!cached.is_registered());
+    assert_eq!(copies(), before + 1);
+    // A second retaining path for the same page shares that copy.
+    let again = pool.retainable(page.ciphertext.clone()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&again.inner, &cached.inner));
+    let dirty = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::DirtyCiphertext, length)
+        .unwrap();
+    let calls = std::cell::Cell::new(0);
+    f.store
+        .writer
+        .enqueue_reclaiming(page, dirty, |amount| {
+            calls.set(calls.get() + 1);
+            f.admission
+                .reserve_completion(Some(&cache), ResourceClass::Ciphertext, amount)
+                .map_err(Error::from)
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1, "disk staging only, no second copy-out");
+    assert_eq!(
+        copies(),
+        before + 1,
+        "one copy-out for cache and disk queue"
+    );
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    drop((cached, again));
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        w.a.links
+            .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free),
+        Some(2)
+    );
+}
+
 mod records {
     use super::*;
     use crate::admission::ResourceClass;
