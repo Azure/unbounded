@@ -586,14 +586,6 @@ func assignmentKey(siteName string, assignmentIndex int) string {
 	return fmt.Sprintf("%s/%d", siteName, assignmentIndex)
 }
 
-func assignmentEnabled(enabled *bool) bool {
-	if enabled == nil {
-		return true
-	}
-
-	return *enabled
-}
-
 func assignmentPriority(priority *int32) int32 {
 	if priority == nil {
 		return 100
@@ -615,7 +607,7 @@ func (sc *SiteController) collectEnabledAssignments(sites []unboundedv1alpha3.Si
 
 	for _, site := range sites {
 		for i, assignment := range site.Spec.PodCidrAssignments {
-			if !assignmentEnabled(assignment.AssignmentEnabled) {
+			if !site.Spec.PodCIDRAssignmentEnabled(assignment) {
 				continue
 			}
 
@@ -1987,13 +1979,6 @@ func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev
 		return nil
 	}
 
-	// When manageCniPlugin is false, pod CIDR assignment is disabled.
-	// The CIDRs are still used for inter-site routing but nodes are not
-	// assigned individual pod CIDRs by the controller.
-	if site.Spec.ManageCniPlugin != nil && !*site.Spec.ManageCniPlugin {
-		return nil
-	}
-
 	state := sc.selectAssignmentForNode(*site, node.Name)
 	if state == nil {
 		return nil
@@ -2569,6 +2554,15 @@ func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, no
 
 	state := sc.selectAssignmentForNode(*site, node.Name)
 	if state == nil {
+		patchData, err := siteLabelAddMergePatch(siteName)
+		if err != nil {
+			return fmt.Errorf("failed to marshal site label patch: %w", err)
+		}
+
+		if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("failed to label node without pod CIDR assignment: %w", err)
+		}
+
 		return nil
 	}
 

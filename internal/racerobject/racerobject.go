@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -31,10 +30,9 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-// Object identifies an exact upstream object within a configured namespace.
+// Object identifies an exact upstream object in the origin's bucket.
 type Object struct {
 	Schema    int    `json:"schema"`
-	Namespace string `json:"namespace"`
 	Bucket    string `json:"bucket"`
 	Key       string `json:"key"`
 	VersionID string `json:"versionId,omitempty"`
@@ -42,8 +40,8 @@ type Object struct {
 
 // NewRequest hashes canonical schema-1 JSON and carries it as origin metadata.
 // Keys and version IDs are never cleaned, decoded, or normalized.
-func NewRequest(namespace, bucket, key, versionID string) (racersdk.Request, error) {
-	object := Object{Schema: 1, Namespace: namespace, Bucket: bucket, Key: key, VersionID: versionID}
+func NewRequest(bucket, key, versionID string) (racersdk.Request, error) {
+	object := Object{Schema: 1, Bucket: bucket, Key: key, VersionID: versionID}
 	if !validObject(object) {
 		return racersdk.Request{}, racersdk.ErrInvalidRequest
 	}
@@ -58,11 +56,6 @@ func NewRequest(namespace, bucket, key, versionID string) (racersdk.Request, err
 	}
 
 	return racersdk.Request{Key: sha256.Sum256(canonical), Metadata: string(canonical)}, nil
-}
-
-func validNamespace(value string) bool {
-	return value != "" && len(value) <= 256 && utf8.ValidString(value) &&
-		strings.IndexFunc(value, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) == -1
 }
 
 func validBucket(value string) bool {
@@ -81,62 +74,27 @@ func validBucket(value string) bool {
 }
 
 func validObject(object Object) bool {
-	return object.Schema == 1 && validNamespace(object.Namespace) && validBucket(object.Bucket) &&
+	return object.Schema == 1 && validBucket(object.Bucket) &&
 		object.Key != "" && len(object.Key) <= 1024 && utf8.ValidString(object.Key) &&
 		len(object.VersionID) <= 1024 && utf8.ValidString(object.VersionID)
 }
 
-var (
-	errInvalidNamespace = errors.New("invalid namespace")
-	errInvalidBucket    = errors.New("invalid bucket")
-)
+var errInvalidBucket = errors.New("invalid bucket")
 
-// scope binds requests to one namespace and an optional bucket allowlist.
-// An empty allowlist admits every bucket.
-type scope struct {
-	namespace string
-	buckets   map[string]struct{}
-}
-
-// newScope validates and copies the configured namespace and buckets.
-func newScope(namespace string, buckets []string) (scope, error) {
-	if !validNamespace(namespace) {
-		return scope{}, errInvalidNamespace
+// ValidateBucket reports whether an origin accepts bucket, so callers that
+// render origin flags can reject it before the origin starts.
+func ValidateBucket(bucket string) error {
+	if !validBucket(bucket) {
+		return errInvalidBucket
 	}
 
-	s := scope{namespace: namespace, buckets: make(map[string]struct{}, len(buckets))}
-	for _, bucket := range buckets {
-		if !validBucket(bucket) {
-			return scope{}, errInvalidBucket
-		}
-
-		s.buckets[bucket] = struct{}{}
-	}
-
-	return s, nil
-}
-
-// ValidateOriginScope reports whether an origin accepts namespace and buckets,
-// so callers that render origin flags can reject them before the origin starts.
-func ValidateOriginScope(namespace string, buckets []string) error {
-	_, err := newScope(namespace, buckets)
-
-	return err
-}
-
-func (s scope) allows(bucket string) bool {
-	if len(s.buckets) == 0 {
-		return true
-	}
-
-	_, ok := s.buckets[bucket]
-
-	return ok
+	return nil
 }
 
 // decodeObject checks both the canonical bytes and their hash so alternate JSON
 // spellings cannot give the same upstream object a different cache identity.
-func decodeObject(request racersdk.OriginRequest, s scope) (Object, error) {
+// Objects outside the origin's bucket are forbidden.
+func decodeObject(request racersdk.OriginRequest, bucket string) (Object, error) {
 	raw := request.Metadata
 
 	var object Object
@@ -144,12 +102,12 @@ func decodeObject(request racersdk.OriginRequest, s scope) (Object, error) {
 		return Object{}, racersdk.ErrInvalidRequest
 	}
 
-	canonical, err := NewRequest(object.Namespace, object.Bucket, object.Key, object.VersionID)
+	canonical, err := NewRequest(object.Bucket, object.Key, object.VersionID)
 	if err != nil || canonical.Metadata != raw || canonical.Key != request.Key {
 		return Object{}, racersdk.ErrInvalidRequest
 	}
 
-	if object.Namespace != s.namespace || !s.allows(object.Bucket) {
+	if object.Bucket != bucket {
 		return Object{}, racersdk.ErrForbidden
 	}
 
@@ -162,10 +120,9 @@ type S3Client interface {
 	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
 
-// OriginConfig binds requests to one upstream namespace and optional buckets.
+// OriginConfig binds requests to one upstream bucket.
 type OriginConfig struct {
-	Namespace string
-	Buckets   []string
+	Bucket string
 	// MetadataTTL is an admission hint. Zero expires metadata immediately.
 	MetadataTTL time.Duration
 }
@@ -178,19 +135,18 @@ func NewOrigin(client S3Client, config OriginConfig) (racersdk.Origin, error) {
 		return nil, racersdk.ErrInvalidRequest
 	}
 
-	bound, err := newScope(config.Namespace, config.Buckets)
-	if err != nil {
+	if !validBucket(config.Bucket) {
 		return nil, racersdk.ErrInvalidRequest
 	}
 
-	origin := &objectOrigin{client: client, scope: bound, ttl: config.MetadataTTL}
+	origin := &objectOrigin{client: client, bucket: config.Bucket, ttl: config.MetadataTTL}
 
 	return origin.read, nil
 }
 
 type objectOrigin struct {
 	client S3Client
-	scope  scope
+	bucket string
 	ttl    time.Duration
 }
 
@@ -199,7 +155,7 @@ func (o *objectOrigin) read(ctx context.Context, request racersdk.OriginRequest)
 		return racersdk.Metadata{}, nil, classifyS3Error(err, false)
 	}
 
-	object, err := decodeObject(request, o.scope)
+	object, err := decodeObject(request, o.bucket)
 	if err != nil {
 		return racersdk.Metadata{}, nil, err
 	}
@@ -431,17 +387,15 @@ func s3HTTPError(code int) error {
 	}
 }
 
-// SidecarConfig selects the object namespace and optional bucket allowlist.
+// SidecarConfig selects the sidecar API. The sidecar forwards every bucket;
+// the origin enforces its single configured bucket.
 type SidecarConfig struct {
-	Namespace string
-	Buckets   []string
-	// API selects s3 (the default) or azure. Buckets names Azure containers.
+	// API selects s3 (the default) or azure. Buckets name Azure containers.
 	API string
 }
 
 type sidecar struct {
 	client *racersdk.Client
-	scope  scope
 	api    string
 }
 
@@ -463,16 +417,7 @@ func NewSidecar(client *racersdk.Client, config SidecarConfig) (http.Handler, er
 		return nil, errors.New("racer-object: invalid sidecar API")
 	}
 
-	bound, err := newScope(config.Namespace, config.Buckets)
-	if errors.Is(err, errInvalidNamespace) {
-		return nil, errors.New("racer-object: invalid sidecar namespace")
-	}
-
-	if err != nil {
-		return nil, errors.New("racer-object: invalid sidecar bucket")
-	}
-
-	return &sidecar{client: client, scope: bound, api: config.API}, nil
+	return &sidecar{client: client, api: config.API}, nil
 }
 
 func (s *sidecar) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -623,16 +568,12 @@ func (s *sidecar) requestObject(r *http.Request, parseQuery func(*http.Request) 
 	bucket, _ = url.PathUnescape(bucket) //nolint:errcheck // EscapedPath guarantees valid escapes.
 	key, _ = url.PathUnescape(key)       //nolint:errcheck // EscapedPath guarantees valid escapes.
 
-	if !s.scope.allows(bucket) {
-		return racersdk.Request{}, "", http.StatusForbidden
-	}
-
 	version, failure := parseQuery(r)
 	if failure != 0 {
 		return racersdk.Request{}, "", failure
 	}
 
-	request, err := NewRequest(s.scope.namespace, bucket, key, version)
+	request, err := NewRequest(bucket, key, version)
 	if err != nil {
 		return racersdk.Request{}, "", http.StatusBadRequest
 	}

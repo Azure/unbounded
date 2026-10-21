@@ -40,7 +40,9 @@ func TestAssignmentPrimitiveHelpers(t *testing.T) {
 		t.Fatalf("unexpected assignment key: %s", got)
 	}
 
-	if !assignmentEnabled(nil) || assignmentEnabled(ptrBool(false)) {
+	spec := unboundedv1alpha3.SiteSpec{}
+	if !spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{}) ||
+		spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{AssignmentEnabled: new(false)}) {
 		t.Fatalf("assignmentEnabled nil/false behavior mismatch")
 	}
 

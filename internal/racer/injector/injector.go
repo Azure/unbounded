@@ -22,7 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
-	"github.com/Azure/unbounded/internal/racerobject"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
@@ -37,8 +36,6 @@ const (
 	VolumeName              = "racer-object-client"
 	EnabledLabel            = "racer.unbounded-cloud.io/object-sidecar"
 	EnabledValue            = "enabled"
-	NamespaceAnnotation     = "racer.unbounded-cloud.io/object-namespace"
-	BucketsAnnotation       = "racer.unbounded-cloud.io/object-buckets"
 	CacheAnnotation         = "racer.unbounded-cloud.io/object-cache"
 	APIAnnotation           = "racer.unbounded-cloud.io/object-api"
 	ListenAnnotation        = "racer.unbounded-cloud.io/object-listen"
@@ -51,6 +48,13 @@ const (
 	defaultCache = "racer-object"
 	osLabel      = "kubernetes.io/os"
 )
+
+// removedAnnotations were used to scope the sidecar before each ClusterCache
+// mapped to exactly one bucket.
+var removedAnnotations = []string{
+	"racer.unbounded-cloud.io/object-namespace",
+	"racer.unbounded-cloud.io/object-buckets",
+}
 
 // Config configures the injected sidecar.
 type Config struct {
@@ -164,21 +168,15 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 
 type sidecarSpec struct {
 	cache     string
-	namespace string
-	buckets   []string
 	api       string
 	listen    string
 	resources corev1.ResourceRequirements
 }
 
 func (s sidecarSpec) args() []string {
-	// Kubelet expands $(VAR) in container args, and the namespace may contain
-	// "$". Write each "$" as "$$" so the sidecar gets the namespace unchanged.
-	// Cache, bucket, api, and listen values are validated and cannot contain "$".
-	args := []string{"sidecar", "--cache=" + s.cache, "--namespace=" + strings.ReplaceAll(s.namespace, "$", "$$")}
-	for _, b := range s.buckets {
-		args = append(args, "--bucket="+b)
-	}
+	// Kubelet expands $(VAR) in container args. Cache, api, and listen values
+	// are validated and cannot contain "$", so no escaping is needed.
+	args := []string{"sidecar", "--cache=" + s.cache}
 
 	if s.api != "" {
 		args = append(args, "--api="+s.api)
@@ -194,33 +192,13 @@ func (s sidecarSpec) args() []string {
 func parseAnnotations(a map[string]string) (sidecarSpec, error) {
 	var s sidecarSpec
 
-	s.namespace = a[NamespaceAnnotation]
-	if strings.TrimSpace(s.namespace) == "" {
-		return s, fmt.Errorf("annotation %s is required", NamespaceAnnotation)
-	}
-
-	// Share the origin's scope validation so every namespace an origin accepts,
-	// including the account URL of a managed Azure origin, is injectable.
-	if err := racerobject.ValidateOriginScope(s.namespace, nil); err != nil {
-		return s, fmt.Errorf("annotation %s is not a valid upstream identity", NamespaceAnnotation)
-	}
-
-	raw := a[BucketsAnnotation]
-	if strings.TrimSpace(raw) == "" {
-		return s, fmt.Errorf("annotation %s is required", BucketsAnnotation)
-	}
-
-	for b := range strings.SplitSeq(raw, ",") {
-		b = strings.TrimSpace(b)
-		if b == "" {
-			return s, fmt.Errorf("annotation %s contains an empty bucket entry", BucketsAnnotation)
+	// The sidecar serves the whole keyspace of its cache; the origin enforces
+	// the bucket. Reject the removed scope annotations so stale manifests fail
+	// loudly instead of silently widening access.
+	for _, name := range removedAnnotations {
+		if _, ok := a[name]; ok {
+			return s, fmt.Errorf("annotation %s is no longer supported; the ClusterCache origin selects the bucket", name)
 		}
-
-		if err := racerobject.ValidateOriginScope(s.namespace, []string{b}); err != nil {
-			return s, fmt.Errorf("annotation %s contains invalid bucket %q", BucketsAnnotation, b)
-		}
-
-		s.buckets = append(s.buckets, b)
 	}
 
 	s.cache = defaultCache

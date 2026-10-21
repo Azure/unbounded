@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
@@ -35,11 +36,15 @@ type nodeConfigValidatorDeps struct {
 	readFile         func(path string) ([]byte, error)
 	glob             func(pattern string) ([]string, error)
 	runForwardPolicy func(binary string) (string, error)
+	neighList        func(int, int) ([]netlink.Neigh, error)
+	linkByIndex      func(int) (netlink.Link, error)
 }
 
 var defaultNodeConfigValidatorDeps = nodeConfigValidatorDeps{
-	readFile: os.ReadFile,
-	glob:     filepath.Glob,
+	readFile:    os.ReadFile,
+	glob:        filepath.Glob,
+	neighList:   netlink.NeighList,
+	linkByIndex: netlink.LinkByIndex,
 	runForwardPolicy: func(binary string) (string, error) {
 		out, err := exec.Command(binary, "-S", "FORWARD").CombinedOutput()
 		return string(out), err
@@ -58,6 +63,8 @@ func refreshNodeConfigurationProblems(siteInformer cache.SharedIndexInformer, si
 
 	sitePodCIDRs := getLocalSitePodCIDRs(siteInformer, siteName, nodePodCIDRs)
 	configProblems := collectNodeConfigValidationErrors(sitePodCIDRs, defaultNodeConfigValidatorDeps)
+	configProblems = append(configProblems, collectNeighborOverflowWarnings(state, defaultNodeConfigValidatorDeps.readFile)...)
+	now := time.Now()
 
 	configProblemTypes := []string{
 		nodeErrorTypeConfigIPv4ForwardingDisabled,
@@ -66,6 +73,11 @@ func refreshNodeConfigurationProblems(siteInformer cache.SharedIndexInformer, si
 		nodeErrorTypeConfigIp6tablesForwardDrop,
 		nodeErrorTypeConfigRPFilterStrict,
 		nodeErrorTypeConntrackNearMax,
+		nodeErrorTypeNeighborTableFullIPv4,
+		nodeErrorTypeNeighborTableFullIPv6,
+		nodeErrorTypeNeighborTableOverflowIPv4,
+		nodeErrorTypeNeighborTableOverflowIPv6,
+		nodeErrorTypeNeighborTableCheckFailed,
 	}
 
 	configProblemTypeSet := make(map[string]struct{}, len(configProblemTypes))
@@ -78,6 +90,13 @@ func refreshNodeConfigurationProblems(siteInformer cache.SharedIndexInformer, si
 	filtered := make([]NodeError, 0, len(state.nodeErrors)+len(configProblems))
 	for _, nodeErr := range state.nodeErrors {
 		if _, isConfigProblem := configProblemTypeSet[nodeErr.Type]; isConfigProblem {
+			// Keep a sampled exhaustion event visible through the next status push.
+			if isNeighborTablePressureWarning(nodeErr.Type) &&
+				!nodeErr.Timestamp.IsZero() && now.Sub(nodeErr.Timestamp) <= time.Minute &&
+				!slices.ContainsFunc(configProblems, func(problem NodeError) bool { return problem.Type == nodeErr.Type }) {
+				filtered = append(filtered, nodeErr)
+			}
+
 			continue
 		}
 
@@ -87,7 +106,7 @@ func refreshNodeConfigurationProblems(siteInformer cache.SharedIndexInformer, si
 	state.nodeErrors = append(filtered, configProblems...)
 	state.mu.Unlock()
 
-	logNodeConfigProblemsIfDue(state, configProblems, logInterval, time.Now())
+	logNodeConfigProblemsIfDue(state, configProblems, logInterval, now)
 }
 
 // getLocalSitePodCIDRs resolves local site pod CIDR pools from Site spec and falls back to the node pod CIDRs.
@@ -177,7 +196,7 @@ func collectNodeConfigValidationErrors(sitePodCIDRs []string, deps nodeConfigVal
 		})
 	}
 
-	return problems
+	return append(problems, collectNeighborTableWarnings(deps)...)
 }
 
 // detectCIDRFamilies reports whether IPv4 and/or IPv6 CIDRs are present.

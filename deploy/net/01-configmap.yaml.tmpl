@@ -47,6 +47,10 @@ data:
       stunRecheckInterval: "{{ default "1h" .NodeSTUNRecheckInterval }}"
       cniConfDir: "{{ default "/host/etc/cni/net.d" .NodeCNIConfDir }}"
       cniConfFile: "{{ default "10-unbounded.conflist" .NodeCNIConfFile }}"
+      ipamSocketPath: "{{ default "/run/unbounded-net/ipam.sock" .NodeIPAMSocketPath }}"
+      installIPAMPlugin: {{ default "true" .NodeInstallIPAMPlugin }}
+      ipamBinDir: "{{ default "/host/opt/cni/bin" .NodeIPAMBinDir }}"
+      manageSameSitePodRoutes: {{ default "false" .NodeManageSameSitePodRoutes }}
       bridgeName: "{{ default "cbr0" .NodeBridgeName }}"
       wireGuardDir: "{{ default "/host/etc/wireguard" .NodeWireGuardDir }}"
       wireGuardPort: {{ default "51820" .NodeWireGuardPort }}

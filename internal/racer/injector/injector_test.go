@@ -21,7 +21,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
-	"github.com/Azure/unbounded/internal/racerobject"
 )
 
 const testImage = "example.com/racer-object:v1"
@@ -29,7 +28,7 @@ const testImage = "example.com/racer-object:v1"
 var testCfg = Config{Image: testImage}
 
 func newPod(annotations map[string]string) *corev1.Pod {
-	a := map[string]string{NamespaceAnnotation: "store", BucketsAnnotation: "one"}
+	a := map[string]string{}
 
 	for k, v := range annotations {
 		if v == "<delete>" {
@@ -71,23 +70,18 @@ func TestMutateSuccess(t *testing.T) {
 		wantArgs  []string
 		wantCache string
 	}{
-		{"minimal", nil, []string{"sidecar", "--cache=racer-object", "--namespace=store", "--bucket=one"}, "racer-object"},
+		{"minimal", nil, []string{"sidecar", "--cache=racer-object"}, "racer-object"},
+		{"cache only", map[string]string{CacheAnnotation: "shared"}, []string{"sidecar", "--cache=shared"}, "shared"},
 		{
 			"full s3",
-			map[string]string{BucketsAnnotation: "one,two", CacheAnnotation: "my.cache", APIAnnotation: "s3", ListenAnnotation: "127.0.0.1:9000"},
-			[]string{"sidecar", "--cache=my.cache", "--namespace=store", "--bucket=one", "--bucket=two", "--api=s3", "--listen=127.0.0.1:9000"},
+			map[string]string{CacheAnnotation: "my.cache", APIAnnotation: "s3", ListenAnnotation: "127.0.0.1:9000"},
+			[]string{"sidecar", "--cache=my.cache", "--api=s3", "--listen=127.0.0.1:9000"},
 			"my.cache",
 		},
 		{
 			"full azure ipv6",
 			map[string]string{APIAnnotation: "azure", ListenAnnotation: "[::1]:8081"},
-			[]string{"sidecar", "--cache=racer-object", "--namespace=store", "--bucket=one", "--api=azure", "--listen=[::1]:8081"},
-			"racer-object",
-		},
-		{
-			"bucket whitespace",
-			map[string]string{BucketsAnnotation: " a , b ,c "},
-			[]string{"sidecar", "--cache=racer-object", "--namespace=store", "--bucket=a", "--bucket=b", "--bucket=c"},
+			[]string{"sidecar", "--cache=racer-object", "--api=azure", "--listen=[::1]:8081"},
 			"racer-object",
 		},
 	}
@@ -154,12 +148,9 @@ func TestMutateErrors(t *testing.T) {
 		modify func(*corev1.Pod)
 		want   string
 	}{
-		{name: "missing namespace", anno: map[string]string{NamespaceAnnotation: "<delete>"}, want: NamespaceAnnotation},
-		{name: "empty namespace", anno: map[string]string{NamespaceAnnotation: ""}, want: NamespaceAnnotation},
-		{name: "missing buckets", anno: map[string]string{BucketsAnnotation: "<delete>"}, want: BucketsAnnotation},
-		{name: "empty bucket entry", anno: map[string]string{BucketsAnnotation: "a,,b"}, want: BucketsAnnotation},
-		{name: "trailing comma", anno: map[string]string{BucketsAnnotation: "a, "}, want: BucketsAnnotation},
-		{name: "invalid bucket", anno: map[string]string{BucketsAnnotation: "a/b"}, want: BucketsAnnotation},
+		{name: "removed namespace annotation", anno: map[string]string{"racer.unbounded-cloud.io/object-namespace": "store"}, want: "racer.unbounded-cloud.io/object-namespace"},
+		{name: "removed empty namespace annotation", anno: map[string]string{"racer.unbounded-cloud.io/object-namespace": ""}, want: "racer.unbounded-cloud.io/object-namespace"},
+		{name: "removed buckets annotation", anno: map[string]string{"racer.unbounded-cloud.io/object-buckets": "one"}, want: "racer.unbounded-cloud.io/object-buckets"},
 		{name: "bad api", anno: map[string]string{APIAnnotation: "gcs"}, want: APIAnnotation},
 		{name: "empty api", anno: map[string]string{APIAnnotation: ""}, want: APIAnnotation},
 		{name: "non-loopback listen", anno: map[string]string{ListenAnnotation: "0.0.0.0:8080"}, want: ListenAnnotation},
@@ -367,39 +358,23 @@ func TestKubeletExpand(t *testing.T) {
 	}
 }
 
-func TestMutateNamespaceSurvivesKubeletExpansion(t *testing.T) {
+func TestMutateArgsSurviveKubeletExpansion(t *testing.T) {
 	env := map[string]string{"KUBERNETES_SERVICE_HOST": "10.0.0.1", "X": "y"}
 
-	for _, ns := range []string{
-		"store",
-		"store$(KUBERNETES_SERVICE_HOST)",
-		"$(X)$(X)",
-		"$$(X)",
-		"a$b",
-		"$",
-		"$$",
-		"cost$$$",
-		"$(",
-		"$(UNDEFINED)",
+	for _, anno := range []map[string]string{
+		nil,
+		{CacheAnnotation: "a-b.c0", APIAnnotation: "azure", ListenAnnotation: "[::1]:8081"},
 	} {
-		t.Run(ns, func(t *testing.T) {
-			pod := newPod(map[string]string{NamespaceAnnotation: ns})
-			if err := Mutate(pod, testCfg); err != nil {
-				t.Fatal(err)
-			}
+		pod := newPod(anno)
+		if err := Mutate(pod, testCfg); err != nil {
+			t.Fatal(err)
+		}
 
-			var got string
-
-			for _, arg := range pod.Spec.InitContainers[0].Args {
-				if v, ok := strings.CutPrefix(arg, "--namespace="); ok {
-					got = kubeletExpand(v, env)
-				}
+		for _, arg := range pod.Spec.InitContainers[0].Args {
+			if got := kubeletExpand(arg, env); got != arg {
+				t.Fatalf("arg %q changed by kubelet expansion to %q", arg, got)
 			}
-
-			if got != ns {
-				t.Fatalf("namespace after kubelet expansion = %q, want %q", got, ns)
-			}
-		})
+		}
 	}
 }
 
@@ -666,33 +641,30 @@ func TestHandler(t *testing.T) {
 	})
 }
 
-// TestMutateAcceptsManagedOriginScope keeps the injector and the managed Azure
-// origin in agreement: whatever namespace and buckets an operator-managed origin
-// serves must be injectable, and whatever the origin rejects must be rejected.
-func TestMutateAcceptsManagedOriginScope(t *testing.T) {
-	identity, err := racerobject.AzureOriginIdentity("https://account.blob.core.windows.net/")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := racerobject.ValidateOriginScope(identity, []string{"models"}); err != nil {
-		t.Fatalf("origin rejects its own scope: %v", err)
-	}
-
-	pod := newPod(map[string]string{NamespaceAnnotation: identity, BucketsAnnotation: "models", CacheAnnotation: "shared"})
+// TestMutateSidecarIsBucketAgnostic keeps the injector in agreement with the
+// managed origin, which alone enforces the bucket: a pod needs only the cache
+// annotation, and the sidecar gets no bucket or namespace flags.
+func TestMutateSidecarIsBucketAgnostic(t *testing.T) {
+	pod := newPod(map[string]string{CacheAnnotation: "shared"})
 	if err := Mutate(pod, testCfg); err != nil {
-		t.Fatalf("injector rejects managed origin scope %q: %v", identity, err)
+		t.Fatalf("injector rejects cache-only pod: %v", err)
 	}
 
-	for _, tc := range []struct{ namespace, bucket string }{
-		{"store\x00", "one"},
-		{"store", "bad\x00bucket"},
-	} {
-		originErr := racerobject.ValidateOriginScope(tc.namespace, []string{tc.bucket})
-		injectErr := Mutate(newPod(map[string]string{NamespaceAnnotation: tc.namespace, BucketsAnnotation: tc.bucket}), testCfg)
+	args := pod.Spec.InitContainers[0].Args
+	if len(args) != 2 || args[0] != "sidecar" || args[1] != "--cache=shared" {
+		t.Fatalf("args = %q", args)
+	}
 
-		if (originErr == nil) != (injectErr == nil) {
-			t.Fatalf("scope %q/%q: origin err %v, injector err %v", tc.namespace, tc.bucket, originErr, injectErr)
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--namespace") || strings.HasPrefix(arg, "--bucket") {
+			t.Fatalf("sidecar got scope flag %q", arg)
+		}
+	}
+
+	for _, name := range removedAnnotations {
+		err := Mutate(newPod(map[string]string{name: "x"}), testCfg)
+		if err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("removed annotation %s: %v", name, err)
 		}
 	}
 }

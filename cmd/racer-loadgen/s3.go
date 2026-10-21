@@ -65,7 +65,7 @@ func configureS3Options(opts *options, seen map[string]bool) error {
 		return errors.New("object-count must be in [1, 512] and object-bytes must be positive")
 	}
 
-	if _, err := racerobject.NewRequest("benchmark", opts.s3.Bucket, "validation", ""); err != nil {
+	if err := racerobject.ValidateBucket(opts.s3.Bucket); err != nil {
 		return errors.New("invalid S3 bucket")
 	}
 

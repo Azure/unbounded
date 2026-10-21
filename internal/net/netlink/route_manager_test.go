@@ -551,6 +551,61 @@ func TestRouteNeedsUpdate_GatewayChanged(t *testing.T) {
 	}
 }
 
+func TestRouteNeedsUpdate_PreferredSourceChanged(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		prefix string
+		source string
+		next   string
+	}{
+		{"IPv4", "10.245.0.0/24", "10.244.3.1", "10.244.4.1"},
+		{"IPv6", "fd00:245::/64", "fd00:3::1", "fd00:4::1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
+
+			_, prefix, err := net.ParseCIDR(test.prefix)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			desired := DesiredRoute{
+				Prefix: *prefix,
+				Nexthops: []DesiredNexthop{{
+					PeerID: "peer", LinkIndex: 1,
+				}},
+			}
+
+			installed := manager.buildInstalledState(desired, desired.Nexthops)
+			if manager.routeNeedsUpdate(installed, desired, desired.Nexthops) {
+				t.Fatal("initial source-free route unexpectedly needs replacement")
+			}
+
+			for _, source := range []net.IP{net.ParseIP(test.source), net.ParseIP(test.next), nil} {
+				if test.name == "IPv4" {
+					manager.SetPreferredSourceIPs(source, nil)
+				} else {
+					manager.SetPreferredSourceIPs(nil, source)
+				}
+
+				if !manager.routeNeedsUpdate(installed, desired, desired.Nexthops) {
+					t.Fatalf("source change to %v did not require route replacement", source)
+				}
+
+				route := manager.buildKernelRoute(desired, desired.Nexthops)
+				if route == nil || !ipEqual(route.Src, source) || route.Dst.String() != test.prefix || route.LinkIndex != 1 {
+					t.Fatalf("replacement route lost source, destination, or nexthop: %v", route)
+				}
+
+				installed = manager.buildInstalledState(desired, desired.Nexthops)
+				if manager.routeNeedsUpdate(installed, desired, desired.Nexthops) {
+					t.Fatal("unchanged preferred source unnecessarily replaced the route")
+				}
+			}
+		})
+	}
+}
+
 func TestSetPreferredSourceIPs(t *testing.T) {
 	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 

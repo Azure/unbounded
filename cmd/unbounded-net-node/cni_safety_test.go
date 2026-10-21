@@ -382,7 +382,7 @@ func TestGuardedWriteCNIConfigPreservesCollisions(t *testing.T) {
 				}
 			default:
 				got, readErr := os.ReadFile(cniConfigPath(cfg))
-				if readErr != nil || !strings.Contains(string(got), "10.244.2.0/24") {
+				if readErr != nil || !strings.Contains(string(got), `"type": "unbounded-ipam"`) || strings.Contains(string(got), "10.244.2.0/24") {
 					t.Fatalf("safe bridge did not publish current configuration: %q err=%v", got, readErr)
 				}
 
