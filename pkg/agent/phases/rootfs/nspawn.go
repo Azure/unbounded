@@ -68,19 +68,30 @@ func EnsureNSpawnWorkspace(log *slog.Logger, goalState *goalstates.RootFS) phase
 func (e *ensureNSpawnWorkspace) Name() string { return "ensure-nspawn-workspace" }
 
 type ensureNSpawnConfig struct {
-	log       *slog.Logger
-	goalState *goalstates.RootFS
+	log          *slog.Logger
+	goalState    *goalstates.RootFS
+	repairHelper phases.Task
 }
 
 // EnsureNSpawnConfig returns a task that only writes the host-side
-// systemd-nspawn configuration files for a machine.
+// systemd-nspawn configuration files for a machine. When the machine's hooks
+// run the lifecycle helper and it is missing, it reinstalls the helper first,
+// so the files it writes never run a helper that isn't there.
 func EnsureNSpawnConfig(log *slog.Logger, goalState *goalstates.RootFS) phases.Task {
-	return &ensureNSpawnConfig{log: log, goalState: goalState}
+	return &ensureNSpawnConfig{
+		log:          log,
+		goalState:    goalState,
+		repairHelper: RepairNSpawnLifecycleHelper(goalState),
+	}
 }
 
 func (e *ensureNSpawnConfig) Name() string { return "ensure-nspawn-config" }
 
-func (e *ensureNSpawnConfig) Do(_ context.Context) error {
+func (e *ensureNSpawnConfig) Do(ctx context.Context) error {
+	if err := phases.ExecuteTask(ctx, e.log, e.repairHelper); err != nil {
+		return fmt.Errorf("repair nspawn lifecycle helper: %w", err)
+	}
+
 	return writeNSpawnConfigs(e.log, e.goalState)
 }
 

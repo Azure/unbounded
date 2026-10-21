@@ -48,6 +48,13 @@ func TestValidateNSpawnLifecycle(t *testing.T) {
 			lifecycle: &NSpawnLifecycleConfig{PreStartCommand: preStart, PostStartCommand: "-" + postStart},
 			wantErrs:  []string{"NSpawnLifecycle.PostStartCommand must start with the command's absolute path"},
 		},
+		"a lone semicolon would start another command": {
+			lifecycle: &NSpawnLifecycleConfig{PreStartCommand: preStart, PostStartCommand: "/usr/bin/true ; -/usr/bin/hook"},
+			wantErrs:  []string{"NSpawnLifecycle.PostStartCommand must be a single command"},
+		},
+		"a semicolon within an argument": {
+			lifecycle: &NSpawnLifecycleConfig{PreStartCommand: "/usr/bin/sh -c 'true;false'", PostStartCommand: postStart},
+		},
 		"a trailing backslash would join the next line": {
 			lifecycle: &NSpawnLifecycleConfig{PreStartCommand: preStart, PostStartCommand: postStart + ` \ `},
 			wantErrs:  []string{"NSpawnLifecycle.PostStartCommand must not end in a backslash"},

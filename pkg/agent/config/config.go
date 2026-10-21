@@ -101,9 +101,9 @@ func ValidateProvisioningFormat(format string) error {
 
 // NSpawnLifecycleConfig supplies the nspawn lifecycle hooks' commands, for an
 // application that runs the agent's nspawn-lifecycle phases another way than
-// through the lifecycle helper, such as in a container. Each is a systemd
-// command line, as in ExecStart=, starting with the command's absolute path, in
-// a unit instance named after the machine, so %i expands to the machine's name.
+// through the lifecycle helper, such as in a container. Each is a single systemd
+// command, as in ExecStart=, starting with the command's absolute path, in a
+// unit instance named after the machine, so %i expands to the machine's name.
 // Each must run its phase for that machine with the host's view of the
 // filesystem, and fail if the phase fails, as nspawn-lifecycle does.
 type NSpawnLifecycleConfig struct {
@@ -147,6 +147,9 @@ func ValidateNSpawnLifecycle(lifecycle *NSpawnLifecycleConfig) error {
 			// This also rules out systemd's prefixes, such as "-", which ignores the
 			// command's failure.
 			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must start with the command's absolute path", hook.name))
+		case slices.Contains(strings.Fields(hook.command), ";"):
+			// systemd starts another command, which may have a prefix, after a lone ";".
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must be a single command, without a lone \";\"", hook.name))
 		case strings.HasSuffix(strings.TrimRightFunc(hook.command, unicode.IsSpace), `\`):
 			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not end in a backslash, which joins the unit's next line to it", hook.name))
 		}

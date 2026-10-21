@@ -5,7 +5,9 @@ package rootfs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -470,6 +472,95 @@ func TestWriteNSpawnConfigs_RejectsInvalidLifecycleCommands(t *testing.T) {
 	require.ErrorContains(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState), "NSpawnLifecycle.PostStartCommand")
 	require.NoFileExists(t, goalState.ServiceOverrideFile)
 	require.NoFileExists(t, goalState.ConfigRegenerationFile)
+}
+
+// fakeTask is a phases.Task that runs do.
+type fakeTask struct {
+	name string
+	do   func(context.Context) error
+}
+
+func (f *fakeTask) Name() string { return f.name }
+
+func (f *fakeTask) Do(ctx context.Context) error { return f.do(ctx) }
+
+func TestEnsureNSpawnConfig_RepairsHelperBeforeWriting(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		repairErr error
+	}{
+		"the repair runs before the files are written": {},
+		"a failed repair writes no files":              {repairErr: errors.New("copy failed")},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			goalState := &goalstates.RootFS{
+				MachineDir:             filepath.Join(dir, "machines", "kube1"),
+				NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
+				ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
+				ConfigRegenerationFile: filepath.Join(dir, "unbounded-agent-regenerate-config@kube1.service"),
+			}
+			task, ok := EnsureNSpawnConfig(slog.New(slog.DiscardHandler), goalState).(*ensureNSpawnConfig)
+			require.True(t, ok)
+
+			var filesAtRepair []string
+
+			task.repairHelper = &fakeTask{name: "repair-nspawn-lifecycle-helper", do: func(context.Context) error {
+				for _, path := range []string{goalState.NSpawnConfigFile, goalState.ServiceOverrideFile, goalState.ConfigRegenerationFile} {
+					if _, err := os.Stat(path); err == nil {
+						filesAtRepair = append(filesAtRepair, path)
+					}
+				}
+
+				return tc.repairErr
+			}}
+
+			err := task.Do(context.Background())
+
+			require.Empty(t, filesAtRepair, "files written before the helper was repaired")
+
+			if tc.repairErr != nil {
+				require.ErrorIs(t, err, tc.repairErr)
+				require.NoFileExists(t, goalState.ServiceOverrideFile)
+				require.NoFileExists(t, goalState.ConfigRegenerationFile)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.FileExists(t, goalState.ServiceOverrideFile)
+			require.FileExists(t, goalState.ConfigRegenerationFile)
+		})
+	}
+}
+
+func TestEnsureNSpawnConfig_RepairsTheHelperItsHooksRun(t *testing.T) {
+	t.Parallel()
+
+	for name, lifecycle := range map[string]*config.NSpawnLifecycleConfig{
+		"hooks run the helper": nil,
+		"hooks run configured commands": {
+			PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+			PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			task, ok := EnsureNSpawnConfig(slog.New(slog.DiscardHandler), &goalstates.RootFS{NSpawnLifecycle: lifecycle}).(*ensureNSpawnConfig)
+			require.True(t, ok)
+
+			repair, ok := task.repairHelper.(*ensureNSpawnLifecycleHelper)
+			require.True(t, ok)
+			require.Equal(t, "repair-nspawn-lifecycle-helper", repair.Name())
+			require.True(t, repair.onlyIfMissing)
+			require.Equal(t, lifecycle != nil, repair.skip)
+		})
+	}
 }
 
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {

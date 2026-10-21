@@ -81,10 +81,6 @@ func (l *Lifecycle) PreStart(ctx context.Context, machineName string) error {
 		return fmt.Errorf("resolve nspawn config goal state: %w", err)
 	}
 
-	if err := l.execute(ctx, l.log, rootfs.RepairNSpawnLifecycleHelper(rootFS)); err != nil {
-		return fmt.Errorf("repair nspawn lifecycle helper for %s: %w", machineName, err)
-	}
-
 	if err := l.execute(ctx, l.log, rootfs.EnsureNSpawnConfig(l.log, rootFS)); err != nil {
 		return fmt.Errorf("regenerate nspawn config for %s: %w", machineName, err)
 	}

@@ -57,8 +57,7 @@ func TestPreStartUsesApplicationConfigLoader(t *testing.T) {
 	}
 
 	require.NoError(t, lifecycle.PreStart(context.Background(), "kube1"))
-	// The helper is repaired before the config that names it is written.
-	require.Equal(t, []string{"repair-nspawn-lifecycle-helper", "ensure-nspawn-config"}, executed)
+	require.Equal(t, []string{"ensure-nspawn-config"}, executed)
 	require.True(t, reloaded)
 }
 

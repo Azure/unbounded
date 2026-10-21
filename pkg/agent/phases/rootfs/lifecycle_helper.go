@@ -50,9 +50,9 @@ func EnsureNSpawnLifecycleHelperFor(goalState *goalstates.RootFS) phases.Task {
 }
 
 // RepairNSpawnLifecycleHelper installs the lifecycle helper if the machine's
-// hooks run it and it is missing. Pre-start runs it before writing the hooks, so
-// a host whose config stops supplying the hooks' commands, which then installs
-// no helper, gets the helper back rather than hooks that cannot run.
+// hooks run it and it is missing. EnsureNSpawnConfig runs it before writing the
+// hooks, so a host whose config stops supplying the hooks' commands, which then
+// installs no helper, gets the helper back rather than hooks that cannot run.
 func RepairNSpawnLifecycleHelper(goalState *goalstates.RootFS) phases.Task {
 	task := newEnsureNSpawnLifecycleHelper("repair-nspawn-lifecycle-helper")
 	task.skip = !goalState.UsesLifecycleHelper()
