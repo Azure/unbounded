@@ -6,12 +6,14 @@ package providerprobe_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
@@ -111,6 +113,69 @@ func TestFirstProbesDuplicateProviderOnce(t *testing.T) {
 
 	if calls := dialer.calls[provider.Addr]; calls != 1 {
 		t.Fatalf("HEAD calls = %d, want 1", calls)
+	}
+}
+
+type cappedFinder struct {
+	*fakes.DHT
+}
+
+func (d cappedFinder) FindProviders(ctx context.Context, ref digest.Digest) ([]ifaces.Provider, error) {
+	providers, err := d.DHT.FindProviders(ctx, ref)
+	return providers[:min(20, len(providers))], err
+}
+
+func TestFirstFromDiscoveryFindsProviderBeyondCappedResult(t *testing.T) {
+	d := digest.MustParse("sha256:abababababababababababababababababababababababababababababababab")
+	discovery := cappedFinder{fakes.NewDHT()}
+	dialer := &metadataDialer{errors: map[string]error{}, calls: map[string]int{}}
+
+	var providers []ifaces.Provider
+
+	for i := range 25 {
+		addr := fmt.Sprintf("stale-%d:5001", i)
+		providers = append(providers, ifaces.Provider{NodeID: ifaces.NodeID(addr), Addr: addr})
+		dialer.errors[addr] = &ifaces.ErrNotFound{Digest: d}
+	}
+
+	fresh := ifaces.Provider{NodeID: "fresh", Addr: "fresh:5001"}
+	discovery.Inject(d, append(providers, fresh)...)
+
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer test-request-credential")
+
+	provider, usable, err := providerprobe.FirstFromDiscovery(ctx, discovery, dialer,
+		ifaces.OriginRef{Digest: d}, providerprobe.Attempted{}, time.Second)
+	if err != nil || !usable || provider != fresh {
+		t.Fatalf("FirstFromDiscovery = (%+v, %v, %v), want fresh provider", provider, usable, err)
+	}
+
+	if find, stream := discovery.LookupCalls(); find != 0 || stream != 1 {
+		t.Fatalf("lookups find/stream = %d/%d, want 0/1", find, stream)
+	}
+
+	for _, auth := range dialer.auth {
+		if auth != "" {
+			t.Fatal("provider discovery forwarded request credentials")
+		}
+	}
+}
+
+type swallowedTimeoutFinder struct{}
+
+func (swallowedTimeoutFinder) FindProviders(ctx context.Context, _ digest.Digest) ([]ifaces.Provider, error) {
+	<-ctx.Done()
+	return nil, nil
+}
+
+func TestCandidatesReportsSwallowedLookupTimeout(t *testing.T) {
+	providers, lookupErr := providerprobe.Candidates(context.Background(),
+		swallowedTimeoutFinder{}, digest.Digest{}, time.Millisecond)
+	for provider := range providers {
+		t.Fatalf("unexpected provider %+v", provider)
+	}
+
+	if err := lookupErr(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lookup error = %v, want deadline exceeded", err)
 	}
 }
 

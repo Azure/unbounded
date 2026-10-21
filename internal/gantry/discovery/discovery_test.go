@@ -5,10 +5,13 @@ package discovery
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 
@@ -315,12 +318,144 @@ func TestHostStreamProvidersReportsInvalidDigest(t *testing.T) {
 	t.Cleanup(func() { _ = host.Close() })
 
 	providers, lookupErr := host.StreamProviders(ctx, digest.Digest{}, time.Second)
-
 	for provider := range providers {
 		t.Fatalf("provider = %+v, want none for an invalid digest", provider)
 	}
 
 	if lookupErr() == nil {
 		t.Fatal("lookup error = nil, want unsupported digest error")
+	}
+}
+
+func TestHostStreamProvidersReportsLookupDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	h, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: "/gantry-stream-deadline-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = h.Close() })
+
+	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+
+	providers, lookupErr := h.StreamProviders(ctx, d, time.Nanosecond)
+	for range providers {
+	}
+
+	if err := lookupErr(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lookup error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestHostStreamProvidersQueriesPastFullLocalProviderStore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const prefix = "/gantry-full-local-provider-test"
+
+	first, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: prefix,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = first.Close() })
+
+	second, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		BootstrapPeers: []string{first.Addrs()[0].String() + "/p2p/" + first.PeerID().String()},
+		ProtocolPrefix: prefix,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = second.Close() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for first.RoutingTableSize() == 0 || second.RoutingTableSize() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("DHT peers did not connect")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	d := digest.MustParse("sha256:edededededededededededededededededededededededededededededededed")
+
+	key, err := DigestToCID(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newProvider := func(ip string) peer.AddrInfo {
+		t.Helper()
+
+		private, _, err := crypto.GenerateEd25519Key(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		id, err := peer.IDFromPrivateKey(private)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return peer.AddrInfo{ID: id, Addrs: []multiaddr.Multiaddr{
+			multiaddr.StringCast("/ip4/" + ip + "/tcp/4001"),
+		}}
+	}
+	for i := range 21 {
+		provider := newProvider(fmt.Sprintf("10.200.0.%d", i+1))
+		if err := first.d.ProviderStore().AddProvider(ctx, key.Hash(), provider); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fresh := newProvider("10.200.0.250")
+	if err := second.d.ProviderStore().AddProvider(ctx, key.Hash(), fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	capped, err := first.FindProviders(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(capped) != 20 {
+		t.Fatalf("capped lookup returned %d providers, want 20 local records", len(capped))
+	}
+
+	for _, provider := range capped {
+		if string(provider.NodeID) == fresh.ID.String() {
+			t.Fatal("capped lookup unexpectedly queried the remote provider store")
+		}
+	}
+
+	providers, lookupErr := first.StreamProviders(ctx, d, 3*time.Second)
+	foundFresh := false
+
+	count := 0
+	for provider := range providers {
+		count++
+
+		if string(provider.NodeID) == fresh.ID.String() {
+			foundFresh = true
+		}
+	}
+
+	if err := lookupErr(); err != nil {
+		t.Fatalf("uncapped lookup: %v", err)
+	}
+
+	if !foundFresh || count < 22 {
+		t.Fatalf("uncapped lookup returned %d providers, found remote=%v; want all 21 local plus remote", count, foundFresh)
 	}
 }

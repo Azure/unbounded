@@ -543,11 +543,15 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 	start := time.Now()
 
 	ais, err := h.d.FindProviders(ctx, c)
+	if err == nil {
+		err = ctx.Err()
+	}
+
 	if h.monitor != nil && err == nil {
 		h.monitor.ObserveLatency(time.Since(start))
 	}
 
-	if err != nil {
+	if err != nil && len(ais) == 0 {
 		return nil, err
 	}
 
@@ -558,7 +562,7 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 		}
 	}
 
-	return out, nil
+	return out, err
 }
 
 // StreamProviders implements ifaces.ProviderStreamer.
@@ -590,6 +594,8 @@ func (h *Host) StreamProviders(ctx context.Context, d digest.Digest, lookupBudge
 	found := h.d.FindProvidersAsync(lookupCtx, c, 0)
 	start := time.Now()
 
+	var lookupErr error
+
 	go func() {
 		defer close(out)
 		defer cancelLookup()
@@ -609,12 +615,17 @@ func (h *Host) StreamProviders(ctx context.Context, d digest.Digest, lookupBudge
 
 			select {
 			case <-ctx.Done():
+				if found != nil {
+					lookupErr = lookupCtx.Err()
+				}
+
 				return
 			case ai, ok := <-found:
 				if !ok {
+					lookupErr = lookupCtx.Err()
 					found = nil
 
-					if h.monitor != nil {
+					if h.monitor != nil && lookupErr == nil {
 						h.monitor.ObserveLatency(time.Since(start))
 					}
 
@@ -630,7 +641,7 @@ func (h *Host) StreamProviders(ctx context.Context, d digest.Digest, lookupBudge
 		}
 	}()
 
-	return out, func() error { return nil }
+	return out, func() error { return lookupErr }
 }
 
 // transferProvider converts a DHT provider record into the transfer endpoint

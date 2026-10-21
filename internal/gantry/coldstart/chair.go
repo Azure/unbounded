@@ -681,14 +681,16 @@ func (r *ChairResolver) pollDHT(ctx context.Context, ref ifaces.OriginRef, expec
 	defer ticker.Stop()
 
 	for {
-		providers, err := r.opts.Discovery.FindProviders(pollCtx, ref.Digest)
-		if err == nil && len(providers) > 0 {
-			// Provider records are hints. Only a peer that currently answers HEAD
-			// for this digest can signal that chair seeding has completed.
-			provider, usable := providerprobe.First(pollCtx, r.opts.PeerMetadata, providers, ref, attempted, providerprobe.DefaultConcurrency)
-			if usable {
-				return []ifaces.Provider{provider}, nil
-			}
+		provider, usable, err := providerprobe.FirstFromDiscovery(pollCtx, r.opts.Discovery, r.opts.PeerMetadata, ref, attempted, 2*time.Second)
+		if usable {
+			return []ifaces.Provider{provider}, nil
+		}
+
+		if err != nil && pollCtx.Err() == nil {
+			r.opts.Logger.Debug("coldstart: provider lookup failed",
+				slog.String("digest", ref.Digest.String()),
+				slog.Any("err", err),
+			)
 		}
 
 		select {

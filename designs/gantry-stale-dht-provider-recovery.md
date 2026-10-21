@@ -10,8 +10,8 @@ repository and the exact `go-libp2p-kad-dht v0.42.2` source selected by
 below are relative to that module.
 
 The `6h` validity, `3h` reprovide interval, `10m` maximum reprovide delay,
-in-memory sweeping provider, bounded provider HEAD validation, and the
-uncapped warm-path provider walk are implemented. Explicit chair completion,
+in-memory sweeping provider, bounded provider HEAD validation, and uncapped
+provider discovery on warm and recovery paths are implemented. Explicit chair completion,
 cold-start deadlines, and unconditional eventual fallback remain proposed
 behavior. The timing values have not been validated by cluster measurements.
 
@@ -24,8 +24,10 @@ Implemented in the current change:
    immediate origin failover when every advertised provider is unusable.
 - Section 3: request-scoped failed-provider exclusion during chair polling,
    and one attempt per provider within a warm-path walk.
-- Section 5: bounded HEAD validation for chair polling and final
-   direct-origin-fallback recheck.
+- Section 5: uncapped discovery and bounded HEAD validation for chair polling,
+   busy metadata, and the final direct-origin-fallback recheck.
+- Busy responses are issued only after opening the requested content, and
+   waiting headers require successful peer metadata rather than origin metadata.
 
 Sections 4, 6, and 7 remain design proposals.
 
@@ -66,10 +68,11 @@ Provider sets are shuffled before the count is applied, but they are not
 ordered by publication time (`routing.go:536-626`,
 `records/providers_manager.go:317-354`).
 
-Gantry's warm path no longer uses that API; it walks an uncapped stream
-(Section 2). Chair polling, the busy-path metadata HEAD, and the
-direct-origin-fallback recheck still call `FindProviders`, and Section 5's HEAD
-validation is what keeps their capped results from reporting false success.
+Gantry's warm path, chair polling, busy-path metadata HEAD, and final
+direct-origin-fallback recheck all use the uncapped streaming API (Section 2).
+The shared `providerprobe.Candidates` helper retains a batch fallback for
+discovery implementations without streaming support, such as legacy test
+doubles; the production discovery host always supports streaming.
 
 The provider response identifies peer IDs, addresses, and a connection hint.
 It does not expose a provider timestamp, sequence, or signed expiry that Gantry
@@ -286,7 +289,7 @@ them as it streams. When the walk ends without a serve, round 0 decides:
 nothing advertised (no provider other than this node)
     -> commit headers, then cold-start
 a provider answered busy (429) or accepted without sending bytes
-    -> commit headers, wait for a serve slot
+    -> verify peer metadata, commit headers, wait for a serve slot
 providers advertised, none usable
     -> 503 without headers; fail-open containerd pulls from origin
 ```
@@ -296,6 +299,19 @@ the production setting, as unlimited. Its wall-clock bound is the client.
 containerd waits 30 seconds for response headers (`ResponseHeaderTimeout` in
 its default registry transport) before moving to the next host, which is
 origin under the shipped `hosts.toml`.
+
+Busy is a content-specific signal. The transfer endpoint first opens the
+requested digest and only then checks its serve cap, so missing content
+returns 404 even while the node is saturated. Before the mirror commits
+waiting headers, a peer must answer HEAD for that digest. A failed peer HEAD
+does not fall back to an origin HEAD: origin metadata proves only that the
+registry has content, not that a busy peer can eventually serve it.
+
+If a previously busy provider becomes known-stale, a filtered-only retry
+terminates the incomplete response instead of preserving the old capacity
+signal forever. Genuine busy and cold-start waits retain their existing
+timing behavior; a single end-to-end recovery deadline remains deferred
+(Section 6).
 
 The doubling sequence considered earlier (`20, 40, 80, ...`) is unnecessary.
 A count of zero already yields every provider the closest peers report, and
@@ -362,12 +378,12 @@ fan-in, and chair RPC scaling needs separate measurement and design work.
 
 ### 5. Validate providers at recovery boundaries
 
-One narrow operation is shared by cold-start polling and the final
-direct-origin-fallback recheck:
+Recovery paths share uncapped candidate discovery. Cold-start polling and the
+final direct-origin-fallback recheck also share bounded concurrent HEAD probing:
 
 ```text
 find usable provider(digest, excluded candidates)
-    collect bounded DHT candidates
+    stream uncapped DHT candidates within the lookup budget
     remove self and suppressed/excluded candidates
     probe candidates within a bounded budget
     return success only after a peer confirms the digest is available
@@ -532,8 +548,9 @@ Unit and integration coverage must include:
 3. A busy provider among stale records commits headers and waits for a serve
    slot.
 4. A lookup with no advertised provider commits headers before cold-start.
-5. Twenty stale providers do not make chair polling report success.
-6. Twenty stale providers do not make direct-origin-fallback recheck decline.
+5. Chair polling can find and verify a provider beyond twenty stale candidates.
+6. The final fallback recheck can find and verify a provider beyond twenty
+   stale candidates.
 7. A chair reporting `pulling` extends the wait without starting duplicate
    origin work.
 8. A chair reporting `available` becomes a usable seed without requiring its
@@ -566,6 +583,12 @@ Unit and integration coverage must include:
    controlled origin fallback even when every initial DHT candidate is stale.
 20. Concurrent requesters distribute available chair seeds rather than all
     selecting one transfer endpoint.
+21. A missing blob returns 404 even while the transfer serve cap is full.
+22. A 429 followed by a failed metadata HEAD returns a pre-header 503 without
+    using origin metadata.
+23. A busy provider becoming known-stale terminates the waiting response.
+24. A real containerd registry fetcher falls through to origin when Gantry
+    returns a stale-only pre-header 503.
 
 ## Open Questions
 

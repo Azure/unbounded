@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
@@ -59,9 +60,9 @@ const providerFailureSweepInterval = time.Minute
 
 const authenticationChallengeTimeout = 2 * time.Second
 
-// busyMetadataTimeout bounds each metadata source used to flush early response
-// headers. Peer metadata is attempted first; the origin fallback gets a
-// separate budget so an unavailable DHT cannot consume it.
+// busyMetadataTimeout bounds the metadata request used to flush waiting
+// response headers. Busy providers must supply their own metadata; only a
+// confirmed empty lookup may use origin metadata before cold-start.
 const busyMetadataTimeout = 3 * time.Second
 
 type AuthenticationChallenger interface {
@@ -1785,7 +1786,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	// re-discovery budget hunting for a provider. Any round that never reaches a
 	// peer is silent, so committed headers are what keep the client attached;
 	// cold-start sent them already unless its metadata HEAD failed.
-	_ = s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, true, logger)
+	_ = s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, false, logger)
 
 	// Keep re-discovering. A seed that just finished advertises into the DHT,
 	// so a later FindProviders can hand us a provider even though round 0 fell
@@ -1860,12 +1861,15 @@ func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d
 
 	if tryPeers {
 		size, contentType, ok = s.headFromPeers(ctx, pRef, logger)
+		if !ok {
+			logger.Debug("mirror: busy provider could not confirm content availability")
+			return false
+		}
 	}
 
 	if !ok {
-		// This HEAD only supplies size and content type for the early header
-		// flush. Bound it separately from peer metadata lookup so an
-		// unavailable DHT cannot consume the origin fallback's budget.
+		// Only a confirmed empty lookup may use origin metadata to keep the
+		// client attached while cold-start creates a source.
 		headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
 		defer cancel()
 
@@ -1899,16 +1903,31 @@ func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger
 	metadataCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
 	defer cancel()
 
-	providers, err := s.dht.FindProviders(metadataCtx, ref.Digest)
-	if err != nil || len(providers) == 0 {
-		return 0, "", false
-	}
+	providers, lookupErr := providerprobe.Candidates(metadataCtx, s.dht, ref.Digest, busyMetadataTimeout)
+	attempted := providerprobe.Attempted{}
 
-	providers, _ = s.filterProvidersForDigest(ref.Digest, providers)
+	defer func() {
+		cancel()
 
-	for index, provider := range providers {
-		if (s.maxPeerAttempts > 0 && index >= s.maxPeerAttempts) || metadataCtx.Err() != nil {
-			break
+		for range providers {
+		}
+	}()
+
+	var summary peerAttemptSummary
+
+	for provider := range providers {
+		if metadataCtx.Err() != nil {
+			return 0, "", false
+		}
+
+		if _, seen := attempted[provider]; seen {
+			continue
+		}
+
+		attempted[provider] = struct{}{}
+
+		if s.skipProvider(ref.Digest, provider, time.Now(), &summary) {
+			continue
 		}
 
 		size, contentType, err := metadataPeer.HeadFromPeer(metadataCtx, provider.Addr, ref)
@@ -1938,6 +1957,10 @@ func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger
 			slog.String("outcome", label),
 			slog.Any("err", err),
 		)
+	}
+
+	if err := lookupErr(); err != nil {
+		logger.Debug("mirror: peer metadata lookup failed", slog.Any("err", err))
 	}
 
 	return 0, "", false
@@ -1971,9 +1994,8 @@ func (s *Server) retryBusyFallback(ctx context.Context, w http.ResponseWriter, r
 			return result
 		case peerFallbackBusy:
 		case peerFallbackUnused:
-			// A provider record may briefly disappear while the busy seed is
-			// refreshing it. Preserve the last proven capacity signal rather
-			// than converting a transient empty lookup into origin bypass.
+			// A record may briefly disappear while a busy seed refreshes it.
+			// A known-stale record instead returns NoUsableProvider below.
 		default:
 			// Hard peer, protocol, auth, or local failures retain fail-open
 			// behavior. Once headers are committed, terminate the incomplete
@@ -2082,13 +2104,13 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 
 	if !allowColdStart {
 		if summary.attempted == 0 {
-			// Every provider was already known-bad. Keep waiting for a
-			// finisher rather than ending a response that is already open.
 			if recheckLocalAfterColdStart() {
 				return peerFallbackLocalHit
 			}
 
-			return peerFallbackUnused
+			// An old capacity signal must not keep a now-stale provider
+			// alive through repeated filtered-only lookups.
+			return peerFallbackNoUsableProvider
 		}
 
 		return peerFallbackExhausted
@@ -2194,7 +2216,7 @@ func (s *Server) walkProviders(ctx context.Context, w http.ResponseWriter, r *ht
 	defer cancel()
 
 	start := time.Now()
-	candidates, lookupErr := s.providerCandidates(walkCtx, d, lookupBudget)
+	candidates, lookupErr := providerprobe.Candidates(walkCtx, s.dht, d, lookupBudget)
 
 	var (
 		walk      providerWalk
@@ -2246,12 +2268,21 @@ func (s *Server) walkProviders(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 
 	walk.lookupErr = lookupErr()
+	if walk.served {
+		// Stopping discovery after a successful fetch is not a lookup error.
+		walk.lookupErr = nil
+	}
 
 	lookupDur := time.Since(start) - fetchTime
 
 	switch {
 	case walk.lookupErr != nil:
-		s.bumpDhtLookup("error", lookupDur)
+		outcome := "error"
+		if errors.Is(walk.lookupErr, context.DeadlineExceeded) {
+			outcome = "timeout"
+		}
+
+		s.bumpDhtLookup(outcome, lookupDur)
 	case walk.discovered == 0:
 		s.bumpDhtLookup("miss", lookupDur)
 	default:
@@ -2279,43 +2310,6 @@ func (s *Server) walkProviders(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 
 	return walk
-}
-
-// providerCandidates starts one provider lookup for d. It prefers an uncapped
-// stream so stale records cannot fill a fixed-size result and hide usable
-// providers; DHTs without streaming fall back to FindProviders.
-func (s *Server) providerCandidates(ctx context.Context, d digest.Digest, lookupBudget time.Duration) (<-chan ifaces.Provider, func() error) {
-	if streamer, ok := s.dht.(ifaces.ProviderStreamer); ok {
-		return streamer.StreamProviders(ctx, d, lookupBudget)
-	}
-
-	out := make(chan ifaces.Provider)
-
-	var lookupErr error
-
-	go func() {
-		defer close(out)
-
-		lookupCtx, cancel := context.WithTimeout(ctx, lookupBudget)
-		providers, err := s.dht.FindProviders(lookupCtx, d)
-
-		cancel()
-
-		if err != nil {
-			lookupErr = err
-			return
-		}
-
-		for _, provider := range providers {
-			select {
-			case out <- provider:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out, func() error { return lookupErr }
 }
 
 func (s *Server) peerFetchBudgetOrDefault() time.Duration {

@@ -939,12 +939,13 @@ func newUsableProviderRecheck(dht ifaces.DHT, peer ifaces.PeerMetadataDialer) fu
 		recheckCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 
-		providers, err := dht.FindProviders(recheckCtx, ref.Digest)
-		if err != nil || len(providers) == 0 {
-			return false
+		_, usable, err := providerprobe.FirstFromDiscovery(recheckCtx, dht, peer, ref, providerprobe.Attempted{}, 2*time.Second)
+		if err != nil {
+			slog.Debug("provider recheck lookup failed",
+				slog.String("digest", ref.Digest.String()),
+				slog.Any("err", err),
+			)
 		}
-
-		_, usable := providerprobe.First(recheckCtx, peer, providers, ref, providerprobe.Attempted{}, providerprobe.DefaultConcurrency)
 
 		return usable
 	}

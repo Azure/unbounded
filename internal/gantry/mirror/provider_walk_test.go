@@ -34,7 +34,7 @@ type walkOrigin struct {
 
 // newWalkMirror builds a mirror with the production peer-path wiring: live
 // stream-through, re-discovery enabled, and no per-round attempt cap.
-func newWalkMirror(t *testing.T, body []byte, dht *fakes.DHT, dialer ifaces.PeerDialer, coldStart mirror.ColdStartResolver) (*httptest.Server, *walkOrigin) {
+func newWalkMirror(t *testing.T, body []byte, dht ifaces.DHT, dialer ifaces.PeerDialer, coldStart mirror.ColdStartResolver) (*httptest.Server, *walkOrigin) {
 	t.Helper()
 
 	d := digestOf(body)
@@ -233,6 +233,14 @@ func (d *busyThenServeDialer) FetchFromPeer(_ context.Context, addr string, ref 
 	return io.NopCloser(bytes.NewReader(d.body)), int64(len(d.body)), "application/octet-stream", nil
 }
 
+func (d *busyThenServeDialer) HeadFromPeer(_ context.Context, addr string, ref ifaces.OriginRef) (int64, string, error) {
+	if addr != d.busyAddr {
+		return 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+	}
+
+	return int64(len(d.body)), "application/octet-stream", nil
+}
+
 func (d *busyThenServeDialer) Calls(addr string) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -289,6 +297,104 @@ func TestMirror_ProviderWalk_BusyProviderHoldsRequestDespiteStaleRecords(t *test
 
 // With nothing advertised, the request commits headers before cold-start so
 // containerd keeps waiting while a chair pulls, then serves from the chair.
+type cappedWalkDHT struct {
+	*fakes.DHT
+}
+
+func (d cappedWalkDHT) FindProviders(ctx context.Context, ref digest.Digest) ([]ifaces.Provider, error) {
+	providers, err := d.DHT.FindProviders(ctx, ref)
+	return providers[:min(20, len(providers))], err
+}
+
+func TestMirror_ProviderWalk_BusyMetadataFindsPeerBeyondTwentyStale(t *testing.T) {
+	body := []byte("the busy provider after twenty stale records owns these bytes")
+	d := digestOf(body)
+
+	const busyAddr = "busy:5001"
+
+	dialer := &busyThenServeDialer{busyAddr: busyAddr, body: body, busyCalls: 2, calls: map[string]int{}}
+	dht := cappedWalkDHT{fakes.NewDHT()}
+	dht.Inject(d, append(staleProviders(25), ifaces.Provider{NodeID: "busy", Addr: busyAddr})...)
+	srv, counts := newWalkMirror(t, body, dht, dialer, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v2/r/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, error = %v; want the busy peer's bytes", got, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if counts.heads.Load() != 0 || counts.gets.Load() != 0 {
+		t.Fatal("busy headers used origin instead of the peer's metadata")
+	}
+
+	if find, stream := dht.LookupCalls(); find != 0 || stream < 2 {
+		t.Fatalf("lookups find/stream = %d/%d; metadata must use the uncapped stream", find, stream)
+	}
+}
+
+type falseBusyDialer struct{}
+
+func (falseBusyDialer) FetchFromPeer(_ context.Context, addr string, _ ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: addr, StatusCode: http.StatusTooManyRequests}
+}
+
+func (falseBusyDialer) HeadFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (int64, string, error) {
+	return 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+}
+
+func TestMirror_ProviderWalk_FalseBusyFailsBeforeHeaders(t *testing.T) {
+	body := []byte("absent at the peer despite its 429")
+	d := digestOf(body)
+	dht := fakes.NewDHT()
+	dht.Inject(d, ifaces.Provider{NodeID: "stale", Addr: "stale:5001"})
+
+	coldStart := &stubColdStart{}
+	srv, counts := newWalkMirror(t, body, dht, falseBusyDialer{}, coldStart)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v2/r/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when HEAD disproves the capacity signal", resp.StatusCode)
+	}
+
+	if counts.heads.Load() != 0 || counts.gets.Load() != 0 {
+		t.Fatal("origin metadata must not turn a stale peer into a confirmed busy source")
+	}
+
+	if atomic.LoadInt32(&coldStart.calls) != 0 {
+		t.Fatal("false-busy provider started cold-start")
+	}
+}
+
 func TestMirror_ProviderWalk_NoProvidersCommitsHeadersThenColdStarts(t *testing.T) {
 	body := []byte("pulled by a chair during cold-start")
 	d := digestOf(body)

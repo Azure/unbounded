@@ -16,6 +16,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/coldstart"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 )
 
@@ -437,6 +438,51 @@ func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
 		if _, ok := seeds[call.ChairID]; !ok {
 			t.Fatalf("recruited backup chair %d while the seed cohort was still pulling", call.ChairID)
 		}
+	}
+}
+
+type cappedChairDiscovery struct {
+	*fakes.DHT
+}
+
+func (d cappedChairDiscovery) FindProviders(ctx context.Context, ref digest.Digest) ([]ifaces.Provider, error) {
+	providers, err := d.DHT.FindProviders(ctx, ref)
+	return providers[:min(20, len(providers))], err
+}
+
+func TestChairResolverFindsFreshProviderBeyondTwentyStale(t *testing.T) {
+	d := digest.MustParse("sha256:1414141414141414141414141414141414141414141414141414141414141414")
+	discovery := cappedChairDiscovery{fakes.NewDHT()}
+	metadata := &peerMetadataStub{failures: map[string]error{}}
+	providers := make([]ifaces.Provider, 0, 26)
+
+	for i := range 25 {
+		addr := fmt.Sprintf("stale-%d:5001", i)
+		providers = append(providers, ifaces.Provider{NodeID: ifaces.NodeID(addr), Addr: addr})
+		metadata.failures[addr] = &ifaces.ErrNotFound{Digest: d}
+	}
+
+	fresh := ifaces.Provider{NodeID: "fresh", Addr: "fresh:5001"}
+	discovery.Inject(d, append(providers, fresh)...)
+	resolver := newTestChairResolverWithMetadata(
+		&chairSnapshotStub{snapshot: fullChairSnapshot(8)},
+		&chairCoordStub{}, discovery, metadata,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	result, err := resolver.Resolve(ctx, d, ifaces.KindBlob, "registry.example.com", "repo/image", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Providers) != 1 || result.Providers[0] != fresh {
+		t.Fatalf("providers = %+v, want fresh peer", result.Providers)
+	}
+
+	if find, stream := discovery.LookupCalls(); find != 0 || stream != 1 {
+		t.Fatalf("lookups find/stream = %d/%d, want 0/1", find, stream)
 	}
 }
 

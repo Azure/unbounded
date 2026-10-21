@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -78,6 +79,39 @@ func TestNF5UsabilityRecheckDeclinesFallbackForUsableProvider(t *testing.T) {
 
 	if release != nil {
 		t.Fatal("Allow returned release after declining fallback")
+	}
+}
+
+type cappedRecheckDHT struct {
+	*fakes.DHT
+}
+
+func (d cappedRecheckDHT) FindProviders(ctx context.Context, ref digest.Digest) ([]ifaces.Provider, error) {
+	providers, err := d.DHT.FindProviders(ctx, ref)
+	return providers[:min(20, len(providers))], err
+}
+
+func TestUsabilityRecheckFindsFreshProviderBeyondTwentyStale(t *testing.T) {
+	ref := providerRecheckRef()
+	dht := cappedRecheckDHT{fakes.NewDHT()}
+	dialer := &recheckMetadataDialer{errors: map[string]error{}}
+	providers := make([]ifaces.Provider, 0, 26)
+
+	for i := range 25 {
+		addr := fmt.Sprintf("stale-%d:5001", i)
+		providers = append(providers, ifaces.Provider{NodeID: ifaces.NodeID(addr), Addr: addr})
+		dialer.errors[addr] = &ifaces.ErrNotFound{Digest: ref.Digest}
+	}
+
+	providers = append(providers, ifaces.Provider{NodeID: "fresh", Addr: "fresh:5001"})
+	dht.Inject(ref.Digest, providers...)
+
+	if !newUsableProviderRecheck(dht, dialer)(context.Background(), ref) {
+		t.Fatal("fresh provider hidden by the capped result was not found")
+	}
+
+	if find, stream := dht.LookupCalls(); find != 0 || stream != 1 {
+		t.Fatalf("lookups find/stream = %d/%d, want 0/1", find, stream)
 	}
 }
 
