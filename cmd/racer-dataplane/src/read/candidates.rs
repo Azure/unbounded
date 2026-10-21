@@ -178,7 +178,74 @@ pub struct CandidatePolicy {
     credentials: Rc<CredentialCrypto>,
     published: Arc<controlplane::Published<crate::control::Snapshot>>,
     ownership_refresh: RefCell<OwnershipRefresh>,
+    single_flight: RefCell<SingleFlightPeers>,
 }
+
+/// How long a provider stays single-flight after a refused multi-flight
+/// Subscribe. An upgraded provider is asked again after this.
+const SINGLE_FLIGHT_TTL: Duration = Duration::from_secs(300);
+
+/// Most providers remembered as single-flight. The oldest is forgotten first.
+const MAX_SINGLE_FLIGHT_PEERS: usize = 1024;
+
+/// Providers that refused `Subscription::flights`, presumably because they
+/// predate it, with when to try the field again.
+#[derive(Default)]
+struct SingleFlightPeers(std::collections::HashMap<NodeId, std::time::Instant>);
+
+impl SingleFlightPeers {
+    fn contains(&mut self, peer: &NodeId, now: std::time::Instant) -> bool {
+        match self.0.get(peer) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                self.0.remove(peer);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, peer: NodeId, now: std::time::Instant) {
+        if !self.0.contains_key(&peer) && self.0.len() >= MAX_SINGLE_FLIGHT_PEERS {
+            self.0.retain(|_, until| *until > now);
+            if self.0.len() >= MAX_SINGLE_FLIGHT_PEERS
+                && let Some(oldest) = self
+                    .0
+                    .iter()
+                    .min_by_key(|(_, until)| **until)
+                    .map(|(peer, _)| peer.clone())
+            {
+                self.0.remove(&oldest);
+            }
+        }
+        self.0.insert(peer, now + SINGLE_FLIGHT_TTL);
+    }
+}
+
+/// Result of one provider selection request.
+#[allow(dead_code)] // Provider and flight fields serve the unordered read path.
+#[allow(clippy::large_enum_variant)] // Moved once per selection; boxing would allocate per page.
+pub(crate) enum ProviderSelection {
+    /// This node is the provider for the first demanded page; fetch locally.
+    Local,
+    /// No page this time: the provider missed, was overloaded or unreachable.
+    /// The caller may retry with a new sequence.
+    Skipped { provider: NodeId },
+    /// The provider refused a multi-flight request without a signed response,
+    /// as a provider predating `Subscription::flights` does. It is now
+    /// single-flight for `SINGLE_FLIGHT_TTL`, so retrying with a new sequence
+    /// omits the field. A transport failure on a multi-flight request looks the
+    /// same and is treated the same; it only costs concurrency, never pages.
+    Refused { provider: NodeId },
+    /// One verified page. `flights` is how many selections the caller may keep
+    /// pending on this contract from now on (the provider's grant, or 1).
+    Selected {
+        provider: NodeId,
+        response: VerifiedResponse,
+        flights: u16,
+    },
+}
+
 #[derive(Default)]
 struct OwnershipRefresh {
     cursor: u64,
@@ -395,30 +462,99 @@ impl CandidatePolicy {
             .first()
             .ok_or(Error::InvalidRequest)?
             .start;
-        let rank = self
-            .candidates_scoped(
-                membership.clone(),
+        let deadline = scope.deadline.0.min(budget.deadline());
+        let selection = self
+            .subscribe_provider(
                 &version.object,
                 PageNumber(first),
+                1,
+                |provider, _| {
+                    scheduler.contract(
+                        version.clone(),
+                        membership.version,
+                        provider.clone(),
+                        demand,
+                        deadline,
+                    )
+                },
+                membership.clone(),
+                context,
                 scope,
+                budget,
             )
+            .await?;
+        Ok(match selection {
+            ProviderSelection::Selected { response, .. } => Some(response),
+            _ => None,
+        })
+    }
+
+    /// Request one selection from the provider of `first`, asking it to allow
+    /// up to `flights` selections pending at once on the caller's contract.
+    ///
+    /// `contract(provider, flights)` builds the Subscribe for the chosen
+    /// provider; `flights` is what to put in `Subscription::flights` (`None`
+    /// when `flights <= 1` or the provider is known to be single-flight). It
+    /// returns the subscription and the deadline to sign.
+    ///
+    /// Sequencing contract for concurrent selections. The provider keys one
+    /// contract by (membership, receiver node, subscription id) and allows only
+    /// one live contract per (membership, receiver node, version). Callers must:
+    ///
+    /// 1. Use one subscription id per (version, membership, provider) and run
+    ///    every concurrent selection on that contract through this method.
+    /// 2. Allocate each request's sequence and budgets atomically inside
+    ///    `contract`: the sequence strictly greater than every sequence sent
+    ///    on the contract, never reused even if the request fails, and the
+    ///    page and byte budgets debited by one page (`PAGE_BYTES + 16`) per
+    ///    allocation, never raised. The deadline never increases either.
+    /// 3. Keep at most `granted` requests outstanding on the contract, where
+    ///    `granted` starts at 1 and becomes the `flights` of the last
+    ///    `Selected` result. With more outstanding, the provider supersedes
+    ///    the oldest unselected request (a skipped selection) or refuses with
+    ///    Overloaded. Sequences may reach the provider out of order; it accepts
+    ///    a lower one once while it is within `granted` of the highest.
+    /// 4. Send the full current demand on every request. Each request selects
+    ///    only from its own demand, and the provider never selects a page the
+    ///    contract already has in flight or completed, so concurrent requests
+    ///    return distinct pages.
+    /// 5. On `Refused`, drop back to one outstanding request on that provider
+    ///    and retry with a new sequence. The provider may keep the old
+    ///    contract's budgets, so continuing the same contract is valid.
+    #[allow(clippy::too_many_arguments)] // Keep demand, validation, and budget inputs explicit.
+    pub(crate) async fn subscribe_provider(
+        &self,
+        object: &ObjectId,
+        first: PageNumber,
+        flights: u16,
+        contract: impl FnOnce(
+            &NodeId,
+            Option<u16>,
+        )
+            -> Result<(crate::peer::subscriptions::Subscription, std::time::Instant)>,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<ProviderSelection> {
+        let rank = self
+            .candidates_scoped(membership.clone(), object, first, scope)
             .await?;
         let destination = rank.ordered.first().ok_or(Error::Unavailable)?;
         if destination == &self.node {
-            return Ok(None);
+            return Ok(ProviderSelection::Local);
         }
-        let (subscription, deadline) = scheduler.contract(
-            version,
-            membership.version,
-            destination.clone(),
-            demand,
-            scope.deadline.0.min(budget.deadline()),
-        )?;
+        let requested = self.requested_flights(destination, flights);
+        let (mut subscription, deadline) = contract(destination, requested)?;
+        subscription.flights = requested;
         let mut selected_scope = scope.clone();
         selected_scope.deadline.0 = deadline;
         let operation = PeerOperation::Subscribe {
             subscription,
             mode: FetchMode::Acquire,
+        };
+        let skipped = || ProviderSelection::Skipped {
+            provider: destination.clone(),
         };
         let response = match self
             .request(
@@ -434,9 +570,19 @@ impl CandidatePolicy {
             .await
         {
             Ok(response) => response,
-            Err(Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded) => {
+            Err(error @ (Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded)) => {
                 budget.note_route_failure();
-                return Ok(None);
+                // A provider predating the field drops the exchange without a
+                // signed response; it cannot answer in a way we can tell apart.
+                if requested.is_some() && !matches!(error, Error::Overloaded) {
+                    self.single_flight
+                        .borrow_mut()
+                        .insert(destination.clone(), uring_runtime::environment::now());
+                    return Ok(ProviderSelection::Refused {
+                        provider: destination.clone(),
+                    });
+                }
+                return Ok(skipped());
             }
             Err(error) => return Err(error),
         };
@@ -456,11 +602,31 @@ impl CandidatePolicy {
                 if actual.ordered.first() != Some(destination) {
                     return Err(Error::Unauthorized);
                 }
-                Ok(Some(response))
+                let flights = grant.flights.unwrap_or(1);
+                Ok(ProviderSelection::Selected {
+                    provider: destination.clone(),
+                    response,
+                    flights,
+                })
             }
-            Some(_) => Ok(None),
+            Some(_) => Ok(skipped()),
         }
     }
+
+    /// The flight count to request from `provider`, or `None` to send the
+    /// original single-flight Subscribe.
+    fn requested_flights(&self, provider: &NodeId, flights: u16) -> Option<u16> {
+        if flights <= 1
+            || self
+                .single_flight
+                .borrow_mut()
+                .contains(provider, uring_runtime::environment::now())
+        {
+            return None;
+        }
+        Some(flights.min(crate::peer::subscriptions::MAX_SUBSCRIPTION_FLIGHTS))
+    }
+
     pub fn new(
         node: NodeId,
         placement: Rc<Placement>,
@@ -481,6 +647,7 @@ impl CandidatePolicy {
             credentials,
             published,
             ownership_refresh: RefCell::default(),
+            single_flight: RefCell::default(),
         }
     }
 
@@ -3487,5 +3654,24 @@ pub(super) mod tests {
                 Poll::Ready(Err(Error::Cancelled))
             ));
         }
+    }
+
+    #[test]
+    fn single_flight_peers_expire_and_stay_bounded() {
+        let mut peers = super::SingleFlightPeers::default();
+        let now = std::time::Instant::now();
+        let a = NodeId("a".into());
+        assert!(!peers.contains(&a, now));
+        peers.insert(a.clone(), now);
+        assert!(peers.contains(&a, now + super::SINGLE_FLIGHT_TTL / 2));
+        assert!(!peers.contains(&a, now + super::SINGLE_FLIGHT_TTL));
+        assert!(peers.0.is_empty(), "expired entries are forgotten");
+        for i in 0..super::MAX_SINGLE_FLIGHT_PEERS + 10 {
+            let at = now + std::time::Duration::from_millis(i as u64);
+            peers.insert(NodeId(i.to_string()), at);
+        }
+        assert_eq!(peers.0.len(), super::MAX_SINGLE_FLIGHT_PEERS);
+        assert!(!peers.0.contains_key(&NodeId("0".into())), "oldest evicted");
+        assert!(peers.contains(&NodeId("1033".into()), now));
     }
 }
