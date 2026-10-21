@@ -30,6 +30,9 @@ permissions:
 env:
   RUSTUP_TOOLCHAIN: "1.96.0"
   CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
+  # Line tables keep file:line backtraces in test failures, and dropping the
+  # rest of the debug info more than halves the cached target directory.
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 # Cache policy for every job below:
 #   - Only pushes save, so each job keeps one current entry instead of one per
@@ -178,7 +181,11 @@ jobs:
         run: sudo sysctl -w kernel.io_uring_disabled=0
 
       - name: Install native verbs adapter build dependencies
-        run: sudo apt-get install -y --no-install-recommends libibverbs-dev
+        # The runner image's package index is usually current enough. Refresh
+        # it only when it is not, instead of paying for an update every run.
+        run: |
+          sudo apt-get install -y --no-install-recommends libibverbs-dev ||
+            { sudo apt-get update && sudo apt-get install -y --no-install-recommends libibverbs-dev; }
 
       - name: Restore Cargo cache
         id: cache
