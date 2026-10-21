@@ -81,7 +81,6 @@ controller:
     retryPeriod: 10s
 
 node:
-  expectedNodes: 0            # Startup-only neighbor GC sizing; 0 leaves unchanged
   cniConfDir: /host/etc/cni/net.d
   cniConfFile: 10-unbounded.conflist
   bridgeName: cbr0
@@ -176,54 +175,59 @@ unless another Node or pending assignment still owns the CIDR.
 
 ### Large-cluster neighbor tables
 
-Set `node.expectedNodes` in the `config.yaml` entry of `unbounded-net-config`
-and restart the node-agent pods. The default is `0` (leave sysctls unchanged);
-`--expected-nodes` explicitly overrides the ConfigMap. Manifest rendering also
-accepts `--set NodeExpectedNodes=2000`.
+The node agent automatically sizes the IPv4 and IPv6 neighbor tables from the
+mesh endpoints it uses. No ConfigMap setting or command-line flag is required.
+Configured tunnel endpoints and currently learned WireGuard endpoints are
+included; a learned-only peer cannot be counted until its endpoint is known.
+Each reconciliation resolves the endpoints' routes and counts unique next-hop
+IP/interface pairs separately for each address family. Directly connected
+endpoints each need a neighbor entry; endpoints reached through the same router
+on the same interface share one. Live multipath next hops are included, while
+local routes, loopback, NOARP devices, and managed tunnel devices are excluded.
 
-```yaml
-node:
-  expectedNodes: 2000
-```
+The agent raises these thresholds when needed:
 
-At startup, each agent raises these IPv4 and IPv6 neighbor table thresholds as needed:
-
-| Sysctl | Minimum | For 2,000 nodes |
+| Sysctl | Minimum | For 2,000 next hops in that family |
 |--------|---------|----------------|
-| `net.ipv4.neigh.default.gc_thresh1` | 110% of expected nodes, rounded up | 2200 |
-| `net.ipv4.neigh.default.gc_thresh2` | 120% of expected nodes, rounded up | 2400 |
-| `net.ipv4.neigh.default.gc_thresh3` | 130% of expected nodes, rounded up | 2600 |
-| `net.ipv6.neigh.default.gc_thresh1` | 110% of expected nodes, rounded up | 2200 |
-| `net.ipv6.neigh.default.gc_thresh2` | 120% of expected nodes, rounded up | 2400 |
-| `net.ipv6.neigh.default.gc_thresh3` | 130% of expected nodes, rounded up | 2600 |
+| `net.ipv4.neigh.default.gc_thresh1` | 110% of IPv4 next hops, rounded up | 2200 |
+| `net.ipv4.neigh.default.gc_thresh2` | 120% of IPv4 next hops, rounded up | 2400 |
+| `net.ipv4.neigh.default.gc_thresh3` | 130% of IPv4 next hops, rounded up | 2600 |
+| `net.ipv6.neigh.default.gc_thresh1` | 110% of IPv6 next hops, rounded up | 2200 |
+| `net.ipv6.neigh.default.gc_thresh2` | 120% of IPv6 next hops, rounded up | 2400 |
+| `net.ipv6.neigh.default.gc_thresh3` | 130% of IPv6 next hops, rounded up | 2600 |
 
 Existing higher values are never reduced. Higher lower thresholds also act as
 floors for the upper thresholds to keep them ordered. The agent raises the
-hard limit first and fails startup with an explicit error if a required sysctl
-cannot be read, parsed, or raised. Values must be integers from `0` through
-`1651910497`, so all thresholds fit Linux's signed 32-bit sysctl range. IPv4
-and IPv6 values are checked independently. On hosts without the IPv6 neighbor
+hard limit first. Peer changes and periodic reconciliation recheck the routes
+even when mesh membership is unchanged. Removing peers or switching to shared
+routers never lowers existing values. A family with no resolved neighbor next
+hops is left untouched, without any sysctl reads or writes.
+
+An unexpected route lookup error, or a required sysctl that cannot be read,
+parsed, or raised, fails that reconciliation with an explicit error and is
+retried on a subsequent reconciliation. Unreachable endpoints are skipped.
+On hosts without the IPv6 neighbor
 table (`net.ipv6.neigh.default.gc_thresh1` is absent), the agent logs that IPv6
 tuning is skipped; permission errors, invalid values, and other missing
-thresholds still fail startup. A value of `0` skips all reads and writes for
-both families.
+thresholds still fail reconciliation.
 
 Despite the `default` path, Linux implements these as table-wide limits shared
 by **all interfaces**, including subsequently created ones. There is no
 `neigh/all/gc_thresh*` or per-interface `gc_thresh*` to set. IPv6 has a separate
-neighbor table sized by the same `expectedNodes` setting. See the
+neighbor table sized from its own next-hop count. See the
 [kernel IP sysctl reference](https://docs.kernel.org/networking/ip-sysctl.html)
 and [neighbor sysctl registration](https://github.com/torvalds/linux/blob/master/net/core/neighbour.c).
 
-Choose a count with growth headroom. Neighbor entries also include local pods
-and other directly connected peers, not just cluster nodes. The setting is
-reapplied when the agent restarts, including after a host reboot; it does not
-write host `/etc/sysctl.d` files or restore lower values at shutdown.
+This is a minimum for mesh traffic, not a complete host-capacity estimate.
+Neighbor entries can also include local pods and unrelated directly connected
+hosts, which are not counted here. Existing larger operator-set values are
+preserved. Sizing is reapplied after an agent restart or host reboot; the agent
+does not write host `/etc/sysctl.d` files or restore lower values at shutdown.
 
 #### Other scale-sensitive sysctls
 
 These require workload measurements, not a universal multiplier of node count,
-so `expectedNodes` does not change them:
+so automatic neighbor sizing does not change them:
 
 | Area | Sysctls | When to adjust |
 |------|---------|----------------|

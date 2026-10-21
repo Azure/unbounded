@@ -29,7 +29,6 @@ controller:
     image: registry.example/kube-proxy:v1
 node:
   nodeName: node-a
-  expectedNodes: 2000
   wireGuardPort: 51820
   statusPushEnabled: true
 `)
@@ -68,10 +67,6 @@ node:
 
 	if cfg.Node.NodeName != "node-a" {
 		t.Fatalf("unexpected node.nodeName: %q", cfg.Node.NodeName)
-	}
-
-	if cfg.Node.ExpectedNodes == nil || *cfg.Node.ExpectedNodes != 2000 {
-		t.Fatalf("unexpected node.expectedNodes: %v", cfg.Node.ExpectedNodes)
 	}
 
 	if cfg.Node.WireGuardPort == nil || *cfg.Node.WireGuardPort != 51820 {

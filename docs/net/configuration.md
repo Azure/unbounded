@@ -98,7 +98,6 @@ controller:
     resourceName: unbounded-net-controller
 
 node:
-  expectedNodes: 0
   cniConfDir: /host/etc/cni/net.d
   cniConfFile: 10-unbounded.conflist
   bridgeName: cbr0
@@ -144,7 +143,7 @@ node:
   tunnelIPFamily: IPv4
 ```
 
-For increase-only neighbor table sizing with `node.expectedNodes` and other
+For automatic, increase-only neighbor table sizing and other
 large-cluster sysctl considerations, see
 [large-cluster neighbor tables](../content/reference/networking/configuration.md#large-cluster-neighbor-tables).
 

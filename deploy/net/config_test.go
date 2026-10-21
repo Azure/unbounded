@@ -6,6 +6,7 @@ package net_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -14,13 +15,12 @@ import (
 	"github.com/Azure/unbounded/internal/net/config"
 )
 
-func TestExpectedNodesConfigMap(t *testing.T) {
+func TestAutomaticNeighborConfigMap(t *testing.T) {
 	for _, tc := range []struct {
 		name, value string
-		want        int
 	}{
 		{name: "default"},
-		{name: "configured", value: "2000", want: 2000},
+		{name: "obsolete manual input ignored", value: "2000"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -50,8 +50,12 @@ func TestExpectedNodesConfigMap(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if cfg.Node.ExpectedNodes == nil || *cfg.Node.ExpectedNodes != tc.want {
-				t.Fatalf("expectedNodes = %v, want %d", cfg.Node.ExpectedNodes, tc.want)
+			if strings.Contains(cm.Data["config.yaml"], "expectedNodes") {
+				t.Fatal("automatic sizing must not require or expose expectedNodes")
+			}
+
+			if cfg.Node.WireGuardPort == nil || *cfg.Node.WireGuardPort != 51820 {
+				t.Fatal("automatic neighbor sizing changed unrelated runtime settings")
 			}
 		})
 	}

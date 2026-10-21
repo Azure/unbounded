@@ -140,7 +140,8 @@ type wireGuardState struct {
 	// netlinkCache provides cached reads of links, addresses, and routes.
 	// When non-nil, read-path code uses the cache instead of direct netlink
 	// syscalls. Writes still go directly to netlink.
-	netlinkCache *unboundednetnetlink.NetlinkCache
+	netlinkCache    *unboundednetnetlink.NetlinkCache
+	neighborGCTuner *neighborGCTuner
 
 	// Link stats monitor for detecting incrementing error/drop counters.
 	linkStatsMonitor *linkStatsMonitor

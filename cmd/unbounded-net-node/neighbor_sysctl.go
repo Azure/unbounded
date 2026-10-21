@@ -14,30 +14,36 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const maxExpectedNeighborNodes = math.MaxInt32 * 10 / 13
+const maxNeighborCount = math.MaxInt32 * 10 / 13
 
-func neighborGCThresholds(expectedNodes int) ([3]int, error) {
-	if expectedNodes < 0 || expectedNodes > maxExpectedNeighborNodes {
-		return [3]int{}, fmt.Errorf("node.expectedNodes must be between 0 and %d", maxExpectedNeighborNodes)
+func neighborGCThresholds(neighbors int) ([3]int, error) {
+	if neighbors < 0 || neighbors > maxNeighborCount {
+		return [3]int{}, fmt.Errorf("neighbor count must be between 0 and %d", maxNeighborCount)
 	}
 
-	nodes := int64(expectedNodes)
+	count := int64(neighbors)
 
-	return [3]int{int((nodes*11 + 9) / 10), int((nodes*12 + 9) / 10), int((nodes*13 + 9) / 10)}, nil
+	return [3]int{int((count*11 + 9) / 10), int((count*12 + 9) / 10), int((count*13 + 9) / 10)}, nil
 }
 
-func applyNeighborGCThresholds(expectedNodes int, readFile func(string) ([]byte, error), writeFile func(string, []byte, os.FileMode) error) error {
-	thresholds, err := neighborGCThresholds(expectedNodes)
-	if err != nil {
-		return err
+func applyNeighborGCThresholds(counts [2]int, readFile func(string) ([]byte, error), writeFile func(string, []byte, os.FileMode) error) error {
+	var thresholds [2][3]int
+
+	for i, count := range counts {
+		var err error
+
+		thresholds[i], err = neighborGCThresholds(count)
+		if err != nil {
+			return err
+		}
 	}
 
-	if expectedNodes == 0 {
-		return nil
-	}
+	for i, family := range []string{"ipv4", "ipv6"} {
+		if counts[i] == 0 {
+			continue
+		}
 
-	for _, family := range []string{"ipv4", "ipv6"} {
-		if err := applyNeighborGCThresholdsForFamily(family, expectedNodes, thresholds, readFile, writeFile); err != nil {
+		if err := applyNeighborGCThresholdsForFamily(family, counts[i], thresholds[i], readFile, writeFile); err != nil {
 			return err
 		}
 	}
@@ -45,7 +51,7 @@ func applyNeighborGCThresholds(expectedNodes int, readFile func(string) ([]byte,
 	return nil
 }
 
-func applyNeighborGCThresholdsForFamily(family string, expectedNodes int, thresholds [3]int, readFile func(string) ([]byte, error), writeFile func(string, []byte, os.FileMode) error) error {
+func applyNeighborGCThresholdsForFamily(family string, neighbors int, thresholds [3]int, readFile func(string) ([]byte, error), writeFile func(string, []byte, os.FileMode) error) error {
 	// Linux exposes these table-wide limits only under default, not per interface.
 	prefix := "/proc/sys/net/" + family + "/neigh/default/gc_thresh"
 
@@ -88,7 +94,7 @@ func applyNeighborGCThresholdsForFamily(family string, expectedNodes int, thresh
 			return fmt.Errorf("raise %s from %d to %d: %w", path, current[i], thresholds[i], err)
 		}
 
-		klog.Infof("Raised %s from %d to %d (expected nodes: %d)", path, current[i], thresholds[i], expectedNodes)
+		klog.Infof("Raised %s from %d to %d (mesh neighbor next hops: %d)", path, current[i], thresholds[i], neighbors)
 	}
 
 	return nil

@@ -20,7 +20,6 @@ func newNodeConfigTestCommand(cfg *config) *cobra.Command {
 	flags := cmd.Flags()
 	flags.DurationVar(&cfg.InformerResyncPeriod, "informer-resync-period", 3600*time.Second, "")
 	flags.StringVar(&cfg.NodeName, "node-name", "", "")
-	flags.IntVar(&cfg.ExpectedNodes, "expected-nodes", 0, "")
 	flags.BoolVar(&cfg.STUNEnabled, "stun-enabled", defaultSTUNEnabled, "")
 	flags.StringVar(&cfg.STUNHost, "stun-host", defaultSTUNHost, "")
 	flags.IntVar(&cfg.STUNPort, "stun-port", defaultSTUNPort, "")
@@ -98,7 +97,6 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 	runtimeYAML := []byte("node:\n" +
 		"  informerResyncPeriod: 30s\n" +
 		"  nodeName: node-from-config\n" +
-		"  expectedNodes: 2000\n" +
 		"  stunEnabled: true\n" +
 		"  stunHost: stun.example.com\n" +
 		"  stunRecheckInterval: 12h\n" +
@@ -138,10 +136,6 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 
 	if cfg.InformerResyncPeriod != 30*time.Second || cfg.NodeName != "node-from-config" {
 		t.Fatalf("expected resync period and node name from runtime config, got period=%s node=%q", cfg.InformerResyncPeriod, cfg.NodeName)
-	}
-
-	if cfg.ExpectedNodes != 2000 {
-		t.Fatalf("expected node count 2000 from runtime config, got %d", cfg.ExpectedNodes)
 	}
 
 	if !cfg.STUNEnabled || cfg.STUNHost != "stun.example.com" || cfg.STUNPort != defaultSTUNPort || cfg.STUNRecheckInterval != 12*time.Hour {
@@ -205,7 +199,6 @@ func TestApplyNodeRuntimeConfigRespectsChangedFlags(t *testing.T) {
 
 	runtimeYAML := []byte("node:\n" +
 		"  nodeName: from-config\n" +
-		"  expectedNodes: 2000\n" +
 		"  healthPort: 11000\n" +
 		"  stunEnabled: false\n" +
 		"  stunHost: config.example.com\n" +
@@ -217,10 +210,6 @@ func TestApplyNodeRuntimeConfigRespectsChangedFlags(t *testing.T) {
 	}
 
 	cmd := newNodeConfigTestCommand(cfg)
-	if err := cmd.Flags().Set("expected-nodes", "3000"); err != nil {
-		t.Fatalf("failed setting expected-nodes flag: %v", err)
-	}
-
 	if err := cmd.Flags().Set("node-name", "from-flag"); err != nil {
 		t.Fatalf("failed setting node-name flag: %v", err)
 	}
@@ -246,10 +235,6 @@ func TestApplyNodeRuntimeConfigRespectsChangedFlags(t *testing.T) {
 
 	if err := applyNodeRuntimeConfig(cmd, cfg); err != nil {
 		t.Fatalf("applyNodeRuntimeConfig returned error: %v", err)
-	}
-
-	if cfg.ExpectedNodes != 3000 {
-		t.Fatalf("expected node count 3000 from flag, got %d", cfg.ExpectedNodes)
 	}
 
 	if cfg.NodeName != "from-flag" || cfg.HealthPort != 12000 {

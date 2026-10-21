@@ -71,6 +71,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		wgCollector:                   wgCollector,
 		healthFlapMaxBackoff:          cfg.HealthFlapMaxBackoff,
 		netlinkCache:                  netlinkCache,
+		neighborGCTuner:               newNeighborGCTuner(),
 		healthState:                   healthState,
 		isGatewayNode:                 isGatewayNodeFromCRDs(gatewayPoolInformer, myPubKey),
 	}
@@ -1922,6 +1923,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, peeredSites, networkPeeredSites,
 		siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 		assignmentPoolTunnelMTUs, poolTunnelMTUs, state.netlinkCache)
+
+	if state.neighborGCTuner != nil {
+		if err := state.reconcileNeighborCapacity(cfg, peers, gatewayPeers, mySiteName, peeredSites, networkPeeredSites); err != nil {
+			return fmt.Errorf("reconcile mesh neighbor capacity: %w", err)
+		}
+	}
 
 	fabricMTU := resolveCNIConfigMTU(cfg.MTU, siteTunnelMTUs[mySiteName], peers, gatewayPeers,
 		unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))

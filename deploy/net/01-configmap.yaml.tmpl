@@ -41,8 +41,6 @@ data:
         resourceName: "{{ default "unbounded-net-controller" .ControllerLeaderElectionResourceName }}"
 
     node:
-      # Startup-only IPv4/IPv6 neighbor GC floors: ceil(1.1*N), ceil(1.2*N), ceil(1.3*N); 0 disables.
-      expectedNodes: {{ default "0" .NodeExpectedNodes }}
       stunEnabled: {{ default "false" .NodeSTUNEnabled }}
       stunHost: "{{ default "" .NodeSTUNHost }}"
       stunPort: {{ default "3478" .NodeSTUNPort }}
