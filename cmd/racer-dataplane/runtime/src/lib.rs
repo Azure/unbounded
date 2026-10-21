@@ -1444,3 +1444,4 @@ mod tests {
         }
     }
 }
+// TEMP: measure warm incremental rebuild

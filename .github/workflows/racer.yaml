@@ -94,7 +94,7 @@ jobs:
       - name: TEMP cache size
         if: ${{ !cancelled() }}
         working-directory: ${{ github.workspace }}
-        run: du -sh ~/.cargo/registry bin/* bin/*/* bin/*/*/* 2>/dev/null | sort -h | tail -25 || true
+        run: du -sh bin/*/debug/* bin/*/debug/*/* 2>/dev/null | sort -h | tail -15 || true
 
       - name: Save Cargo cache
         if: ${{ !cancelled() && github.event_name != 'merge_group' && steps.cache.outputs.cache-hit != 'true' }}
@@ -155,7 +155,7 @@ jobs:
       - name: TEMP cache size
         if: ${{ !cancelled() }}
         working-directory: ${{ github.workspace }}
-        run: du -sh ~/.cargo/registry bin/* bin/*/* bin/*/*/* 2>/dev/null | sort -h | tail -25 || true
+        run: du -sh bin/*/debug/* bin/*/debug/*/* 2>/dev/null | sort -h | tail -15 || true
 
       - name: Save Cargo cache
         if: ${{ !cancelled() && github.event_name != 'merge_group' && steps.cache.outputs.cache-hit != 'true' }}
@@ -248,7 +248,7 @@ jobs:
       - name: TEMP cache size
         if: ${{ !cancelled() }}
         working-directory: ${{ github.workspace }}
-        run: du -sh ~/.cargo/registry bin/* bin/*/* bin/*/*/* 2>/dev/null | sort -h | tail -25 || true
+        run: du -sh bin/*/debug/* bin/*/debug/*/* 2>/dev/null | sort -h | tail -15 || true
 
       - name: Save Cargo cache
         if: ${{ !cancelled() && github.event_name != 'merge_group' && steps.cache.outputs.cache-hit != 'true' }}
@@ -296,7 +296,7 @@ jobs:
       - name: TEMP cache size
         if: ${{ !cancelled() }}
         working-directory: ${{ github.workspace }}
-        run: du -sh ~/.cargo/registry bin/* bin/*/* bin/*/*/* 2>/dev/null | sort -h | tail -25 || true
+        run: du -sh bin/*/debug/* bin/*/debug/*/* 2>/dev/null | sort -h | tail -15 || true
 
       - name: Save Cargo cache
         if: ${{ !cancelled() && github.event_name != 'merge_group' && steps.cache.outputs.cache-hit != 'true' }}
