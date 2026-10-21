@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
+	"github.com/Azure/unbounded/internal/signalworkload"
 )
 
 const (
@@ -232,6 +233,10 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		return fmt.Errorf("profile %s parameters: %w", profile.Name, err)
 	}
 
+	if err := signalworkload.Validate(profile.Spec.WorkloadPolicy); err != nil {
+		return fmt.Errorf("profile %s workload policy: %w", profile.Name, err)
+	}
+
 	participants, err := r.selectParticipants(ctx, node, &profile)
 	if err != nil {
 		return err
@@ -310,6 +315,7 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 			Workflow:        profile.Spec.Workflow,
 			Backend:         profile.Spec.Backend,
 			RunnerImage:     profile.Spec.RunnerImage,
+			WorkloadPolicy:  *profile.Spec.WorkloadPolicy.DeepCopy(),
 			Purpose:         profile.Spec.Purpose,
 			StagePlan:       append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
 			Parameters:      parameters,
@@ -789,6 +795,11 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		return nil, fmt.Errorf("encode script environment: %w", err)
 	}
 
+	workloadPolicyJSON, err := signalworkload.Encode(run.Spec.WorkloadPolicy)
+	if err != nil {
+		return nil, fmt.Errorf("encode workload policy: %w", err)
+	}
+
 	participantsJSON, err := json.Marshal(run.Spec.Participants)
 	if err != nil {
 		return nil, fmt.Errorf("encode Workflow participants: %w", err)
@@ -836,6 +847,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 					map[string]any{"name": "runner-image", "value": run.Spec.RunnerImage},
 					map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
 					map[string]any{"name": "script-environment", "value": string(scriptEnvironmentJSON)},
+					map[string]any{"name": "workload-policy", "value": workloadPolicyJSON},
 					map[string]any{"name": "mpi-payload-mode", "value": run.Spec.Parameters["mpi-payload-mode"]},
 					map[string]any{"name": "expected-gpu-product-regex", "value": run.Spec.Parameters["expected-gpu-product-regex"]},
 					map[string]any{"name": "expected-gpu-count", "value": run.Spec.Parameters["expected-gpu-count"]},

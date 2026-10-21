@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
+	"github.com/Azure/unbounded/internal/signalworkload"
 )
 
 const (
@@ -72,6 +73,7 @@ type Config struct {
 	Queue                 string
 	TolerationsJSON       string
 	ScriptEnvironmentJSON string
+	WorkloadPolicyJSON    string
 	GPUResourceCount      string
 	Privileged            bool
 	Attempt               int
@@ -231,16 +233,18 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		if config.Queue == "" {
 			return nil, nil, nil, errors.New("queue is required for MPIJob execution")
 		}
-
-		if errors := validation.IsDNS1123Subdomain(config.Queue); len(errors) > 0 {
-			return nil, nil, nil, fmt.Errorf("queue is invalid: %s", strings.Join(errors, ", "))
-		}
 	default:
 		return nil, nil, nil, fmt.Errorf(
 			"unsupported backend %s %s",
 			config.BackendAPIVersion,
 			config.BackendKind,
 		)
+	}
+
+	if config.Queue != "" {
+		if errors := validation.IsDNS1123Subdomain(config.Queue); len(errors) > 0 {
+			return nil, nil, nil, fmt.Errorf("queue is invalid: %s", strings.Join(errors, ", "))
+		}
 	}
 
 	if config.BackoffLimit < 0 {
@@ -253,6 +257,10 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 
 	if config.Attempt < 1 {
 		return nil, nil, nil, errors.New("attempt must be positive")
+	}
+
+	if _, err := signalworkload.Decode(config.WorkloadPolicyJSON); err != nil {
+		return nil, nil, nil, err
 	}
 
 	participants, err := ParseParticipants(
@@ -339,6 +347,20 @@ func RenderResources(
 		return nil, errors.New("gpu-resource-count must be positive for MPIJob execution")
 	}
 
+	policy, err := signalworkload.Decode(config.WorkloadPolicyJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	gpuResource := corev1.ResourceName("nvidia.com/gpu")
+	if _, exists := policy.Resources.Requests[gpuResource]; exists {
+		return nil, errors.New("workload policy must not set nvidia.com/gpu requests; use gpu-resource-count")
+	}
+
+	if _, exists := policy.Resources.Limits[gpuResource]; exists {
+		return nil, errors.New("workload policy must not set nvidia.com/gpu limits; use gpu-resource-count")
+	}
+
 	var policyEnvironment map[string]string
 	if err := decodeJSONObject(config.ScriptEnvironmentJSON, &policyEnvironment); err != nil {
 		return nil, fmt.Errorf("decode adapter policy: %w", err)
@@ -363,9 +385,27 @@ func RenderResources(
 
 		switch config.BackendKind {
 		case "Pod":
-			object = ordinaryPod(config, participant, tolerations, environment, workflow, activeDeadlineSeconds, gpuCount)
+			object = ordinaryPod(
+				config,
+				participant,
+				tolerations,
+				environment,
+				policy,
+				workflow,
+				activeDeadlineSeconds,
+				gpuCount,
+			)
 		case "MPIJob":
-			object = mpiJob(config, participant, tolerations, environment, workflow, activeDeadlineSeconds, gpuCount)
+			object = mpiJob(
+				config,
+				participant,
+				tolerations,
+				environment,
+				policy,
+				workflow,
+				activeDeadlineSeconds,
+				gpuCount,
+			)
 		default:
 			return nil, fmt.Errorf("unsupported backend kind %q", config.BackendKind)
 		}
@@ -600,12 +640,28 @@ func ordinaryPod(
 	participant signalv1.Participant,
 	tolerations []corev1.Toleration,
 	environment []corev1.EnvVar,
+	policy signalv1.WorkloadPolicy,
 	workflow metav1.OwnerReference,
 	activeDeadlineSeconds int64,
 	gpuCount int64,
 ) *corev1.Pod {
 	labels := resourceLabels(config, participant)
+	if config.Queue != "" {
+		labels = withLabel(labels, "kueue.x-k8s.io/queue-name", config.Queue)
+	}
+
 	env := workloadEnvironment(config, participant, environment)
+	container := workloadContainer(
+		config,
+		policy,
+		corev1.Container{
+			Name:    "main",
+			Image:   config.RunnerImage,
+			Command: resultCommand(),
+			Env:     env,
+		},
+		gpuCount,
+	)
 
 	pod := &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
@@ -621,20 +677,8 @@ func ordinaryPod(
 			Tolerations:                  tolerations,
 			ActiveDeadlineSeconds:        &activeDeadlineSeconds,
 			AutomountServiceAccountToken: ptr(false),
-			Containers: []corev1.Container{{
-				Name:    "main",
-				Image:   config.RunnerImage,
-				Command: resultCommand(),
-				Env:     env,
-				SecurityContext: &corev1.SecurityContext{
-					Privileged: ptr(config.Privileged),
-				},
-				Resources: corev1.ResourceRequirements{
-					Limits: gpuResources(gpuCount),
-				},
-				VolumeMounts: resultVolumeMounts(),
-			}},
-			Volumes: resultVolumes(config.ScriptConfigMap),
+			Containers:                   []corev1.Container{container},
+			Volumes:                      workloadVolumes(config.ScriptConfigMap, policy),
 		},
 	}
 
@@ -646,6 +690,7 @@ func mpiJob(
 	participant signalv1.Participant,
 	tolerations []corev1.Toleration,
 	environment []corev1.EnvVar,
+	policy signalv1.WorkloadPolicy,
 	workflow metav1.OwnerReference,
 	activeDeadlineSeconds int64,
 	gpuCount int64,
@@ -654,6 +699,17 @@ func mpiJob(
 	jobName := resourceName(config.RunName, participant.Index)
 	launcherEnv := workloadEnvironment(config, participant, environment)
 	workerEnv := workloadEnvironment(config, participant, environment)
+	worker := workloadContainer(
+		config,
+		policy,
+		corev1.Container{
+			Name:    "worker",
+			Image:   config.RunnerImage,
+			Command: resultCommand("mpi-worker"),
+			Env:     workerEnv,
+		},
+		gpuCount,
+	)
 
 	object := map[string]any{
 		"apiVersion": "kubeflow.org/v2beta1",
@@ -698,18 +754,9 @@ func mpiJob(
 						labels,
 						map[string]string{corev1.LabelHostname: participant.NodeName},
 						tolerations,
-						corev1.Container{
-							Name:      "worker",
-							Image:     config.RunnerImage,
-							Command:   resultCommand("mpi-worker"),
-							Env:       workerEnv,
-							Resources: corev1.ResourceRequirements{Limits: gpuResources(gpuCount)},
-							SecurityContext: &corev1.SecurityContext{
-								Privileged: ptr(config.Privileged),
-							},
-							VolumeMounts: resultVolumeMounts(),
-						},
+						worker,
 						config.ScriptConfigMap,
+						policy,
 					),
 				},
 			},
@@ -725,7 +772,13 @@ func podTemplate(
 	tolerations []corev1.Toleration,
 	container corev1.Container,
 	scriptConfigMap string,
+	policies ...signalv1.WorkloadPolicy,
 ) map[string]any {
+	policy := signalv1.WorkloadPolicy{}
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
+
 	template := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
 		Spec: corev1.PodSpec{
@@ -734,7 +787,7 @@ func podTemplate(
 			Tolerations:                  tolerations,
 			AutomountServiceAccountToken: ptr(false),
 			Containers:                   []corev1.Container{container},
-			Volumes:                      resultVolumes(scriptConfigMap),
+			Volumes:                      workloadVolumes(scriptConfigMap, policy),
 		},
 	}
 
@@ -782,20 +835,78 @@ func resultVolumes(scriptConfigMap string) []corev1.Volume {
 	}
 }
 
+func workloadContainer(
+	config Config,
+	policy signalv1.WorkloadPolicy,
+	container corev1.Container,
+	gpuCount int64,
+) corev1.Container {
+	container.Resources = *policy.Resources.DeepCopy()
+	if gpuCount > 0 {
+		if container.Resources.Requests == nil {
+			container.Resources.Requests = corev1.ResourceList{}
+		}
+
+		if container.Resources.Limits == nil {
+			container.Resources.Limits = corev1.ResourceList{}
+		}
+
+		gpu := *resourceQuantity(gpuCount)
+		container.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")] = gpu
+		container.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")] = gpu
+	}
+
+	if policy.SecurityContext != nil {
+		container.SecurityContext = policy.SecurityContext.DeepCopy()
+	} else if config.Privileged {
+		container.SecurityContext = &corev1.SecurityContext{Privileged: ptr(true)}
+	}
+
+	container.WorkingDir = policy.WorkingDir
+	container.VolumeMounts = append(resultVolumeMounts(), workloadVolumeMounts(policy)...)
+
+	return container
+}
+
+func workloadVolumes(scriptConfigMap string, policy signalv1.WorkloadPolicy) []corev1.Volume {
+	volumes := resultVolumes(scriptConfigMap)
+	if policy.Results != nil {
+		volumes[1].EmptyDir = policy.Results.DeepCopy()
+	}
+
+	for index := range policy.Volumes {
+		volume := &policy.Volumes[index]
+		volumes = append(volumes, corev1.Volume{
+			Name: volume.Name,
+			VolumeSource: corev1.VolumeSource{
+				HostPath:              volume.HostPath.DeepCopy(),
+				EmptyDir:              volume.EmptyDir.DeepCopy(),
+				PersistentVolumeClaim: volume.PersistentVolumeClaim.DeepCopy(),
+			},
+		})
+	}
+
+	return volumes
+}
+
+func workloadVolumeMounts(policy signalv1.WorkloadPolicy) []corev1.VolumeMount {
+	mounts := make([]corev1.VolumeMount, 0, len(policy.Volumes))
+	for index := range policy.Volumes {
+		volume := &policy.Volumes[index]
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      volume.Name,
+			MountPath: volume.MountPath,
+			ReadOnly:  volume.ReadOnly,
+		})
+	}
+
+	return mounts
+}
+
 func resultVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
 		{Name: "scripts", MountPath: "/scripts", ReadOnly: true},
 		{Name: "results", MountPath: "/results"},
-	}
-}
-
-func gpuResources(count int64) corev1.ResourceList {
-	if count == 0 {
-		return nil
-	}
-
-	return corev1.ResourceList{
-		corev1.ResourceName("nvidia.com/gpu"): *resourceQuantity(count),
 	}
 }
 

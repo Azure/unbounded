@@ -10,8 +10,10 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -70,6 +72,29 @@ func TestRenderOrdinaryPodsPerParticipant(t *testing.T) {
 		if automount {
 			t.Fatalf("resource %d automounts a service account token", index)
 		}
+	}
+}
+
+func TestRenderOrdinaryPodWithKueueQueue(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	config.BackendAPIVersion = "v1"
+	config.BackendKind = "Pod"
+	config.Queue = "certification"
+
+	participants, tolerations, environment, err := ValidateConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if queue := resources[0].GetLabels()["kueue.x-k8s.io/queue-name"]; queue != "certification" {
+		t.Fatalf("Pod queue label = %q", queue)
 	}
 }
 
@@ -221,6 +246,167 @@ func TestRenderMPIJobUsesExplicitLifecycleOverrides(t *testing.T) {
 
 	if backoff != 2 || ttl != 7200 {
 		t.Fatalf("run policy backoff=%d ttl=%d", backoff, ttl)
+	}
+}
+
+func TestRenderWorkloadPolicyOnParticipantContainers(t *testing.T) {
+	t.Parallel()
+
+	policy := signalv1.WorkloadPolicy{
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("8"),
+				corev1.ResourceMemory:           resource.MustParse("32Gi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("8"),
+				corev1.ResourceMemory:           resource.MustParse("32Gi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser: ptr(int64(0)),
+			Capabilities: &corev1.Capabilities{
+				Add: []corev1.Capability{"IPC_LOCK"},
+			},
+		},
+		WorkingDir: "/opt/diagnostic",
+		Results:    &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
+		Volumes: []signalv1.WorkloadVolume{
+			{
+				Name:      "host-proc",
+				MountPath: "/host/proc",
+				ReadOnly:  true,
+				HostPath:  &corev1.HostPathVolumeSource{Path: "/proc"},
+			},
+			{
+				Name:      "work",
+				MountPath: "/work",
+				EmptyDir:  &corev1.EmptyDirVolumeSource{SizeLimit: quantity("8Gi")},
+			},
+		},
+	}
+
+	policyJSON, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := testConfig()
+	config.BackendAPIVersion = "v1"
+	config.BackendKind = "Pod"
+	config.Queue = ""
+	config.GPUResourceCount = "8"
+	config.WorkloadPolicyJSON = string(policyJSON)
+
+	participants, tolerations, environment, err := ValidateConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var pod corev1.Pod
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(resources[0].Object, &pod); err != nil {
+		t.Fatal(err)
+	}
+
+	container := pod.Spec.Containers[0]
+
+	gpuLimit := container.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
+	if container.WorkingDir != "/opt/diagnostic" ||
+		container.Resources.Requests.Cpu().String() != "8" ||
+		container.Resources.Limits.Memory().String() != "32Gi" ||
+		gpuLimit.String() != "8" ||
+		container.SecurityContext == nil ||
+		container.SecurityContext.RunAsUser == nil ||
+		*container.SecurityContext.RunAsUser != 0 ||
+		len(container.SecurityContext.Capabilities.Add) != 1 {
+		t.Fatalf("participant container = %#v", container)
+	}
+
+	if len(pod.Spec.Volumes) != 4 ||
+		pod.Spec.Volumes[1].EmptyDir.SizeLimit.String() != "2Gi" ||
+		pod.Spec.Volumes[2].HostPath.Path != "/proc" ||
+		pod.Spec.Volumes[3].EmptyDir.SizeLimit.String() != "8Gi" {
+		t.Fatalf("participant volumes = %#v", pod.Spec.Volumes)
+	}
+}
+
+func TestMPIWorkloadPolicyDoesNotLeakOntoLauncher(t *testing.T) {
+	t.Parallel()
+
+	policyJSON := `{
+			"resources":{"requests":{"cpu":"4"},"limits":{"cpu":"4"}},
+			"volumes":[{"name":"host-device","mountPath":"/dev/infiniband","hostPath":{"path":"/dev/infiniband"}}]
+		}`
+	config := testConfig()
+	config.WorkloadPolicyJSON = policyJSON
+
+	participants, tolerations, environment, err := ValidateConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := json.Marshal(resources[0].Object)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var job struct {
+		Spec struct {
+			MPIReplicaSpecs map[string]struct {
+				Template corev1.PodTemplateSpec `json:"template"`
+			} `json:"mpiReplicaSpecs"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(content, &job); err != nil {
+		t.Fatal(err)
+	}
+
+	launcher := job.Spec.MPIReplicaSpecs["Launcher"].Template.Spec
+	worker := job.Spec.MPIReplicaSpecs["Worker"].Template.Spec
+
+	if len(launcher.Volumes) != 2 || len(launcher.Containers[0].VolumeMounts) != 2 {
+		t.Fatalf("launcher received participant policy: %#v", launcher)
+	}
+
+	if len(worker.Volumes) != 3 ||
+		worker.Volumes[2].HostPath.Path != "/dev/infiniband" ||
+		worker.Containers[0].Resources.Requests.Cpu().String() != "4" {
+		t.Fatalf("worker policy = %#v", worker)
+	}
+}
+
+func TestRenderRejectsGPUResourceInWorkloadPolicy(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	config.WorkloadPolicyJSON = `{"resources":{"limits":{"nvidia.com/gpu":"2"}}}`
+
+	participants, tolerations, environment, err := ValidateConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RenderResources(
+		config,
+		participants,
+		tolerations,
+		environment,
+		testWorkflowOwner(),
+		900,
+	); err == nil || !strings.Contains(err.Error(), "gpu-resource-count") {
+		t.Fatalf("RenderResources error = %v", err)
 	}
 }
 
@@ -420,6 +606,7 @@ func TestBackendResourceRequiresMatchingParticipantLabel(t *testing.T) {
 		testParticipants()[0],
 		nil,
 		nil,
+		signalv1.WorkloadPolicy{},
 		testWorkflowOwner(),
 		900,
 		0,
@@ -552,4 +739,10 @@ func testWorkflowOwner() metav1.OwnerReference {
 		UID:        types.UID("workflow-uid"),
 		Controller: &controller,
 	}
+}
+
+func quantity(value string) *resource.Quantity {
+	result := resource.MustParse(value)
+
+	return &result
 }

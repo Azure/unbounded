@@ -53,12 +53,32 @@ type ParticipantPolicy struct {
 	RequiredResources corev1.ResourceList `json:"requiredResources,omitempty"`
 }
 
+type WorkloadVolume struct {
+	Name      string `json:"name"`
+	MountPath string `json:"mountPath"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
+
+	HostPath              *corev1.HostPathVolumeSource              `json:"hostPath,omitempty"`
+	EmptyDir              *corev1.EmptyDirVolumeSource              `json:"emptyDir,omitempty"`
+	PersistentVolumeClaim *corev1.PersistentVolumeClaimVolumeSource `json:"persistentVolumeClaim,omitempty"`
+}
+
+type WorkloadPolicy struct {
+	Resources       corev1.ResourceRequirements  `json:"resources,omitempty"`
+	SecurityContext *corev1.SecurityContext      `json:"securityContext,omitempty"`
+	WorkingDir      string                       `json:"workingDir,omitempty"`
+	Results         *corev1.EmptyDirVolumeSource `json:"results,omitempty"`
+	// +kubebuilder:validation:MaxItems=16
+	Volumes []WorkloadVolume `json:"volumes,omitempty"`
+}
+
 type CertificationProfileSpec struct {
-	Participants ParticipantPolicy `json:"participants"`
-	Script       ScriptReference   `json:"script"`
-	Workflow     WorkflowReference `json:"workflow"`
-	Backend      ExecutionBackend  `json:"backend"`
-	RunnerImage  string            `json:"runnerImage"`
+	Participants   ParticipantPolicy `json:"participants"`
+	Script         ScriptReference   `json:"script"`
+	Workflow       WorkflowReference `json:"workflow"`
+	Backend        ExecutionBackend  `json:"backend"`
+	RunnerImage    string            `json:"runnerImage"`
+	WorkloadPolicy WorkloadPolicy    `json:"workloadPolicy,omitempty"`
 	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
 	Purpose      CertificationPurpose `json:"purpose,omitempty"`
 	StagePlan    []CertificationStage `json:"stagePlan,omitempty"`

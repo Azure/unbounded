@@ -63,6 +63,7 @@ func main() {
 	flags.StringVar(&cfg.Queue, "queue", "", "Kueue LocalQueue name")
 	flags.StringVar(&cfg.TolerationsJSON, "tolerations", "[]", "JSON-encoded Pod tolerations")
 	flags.StringVar(&cfg.ScriptEnvironmentJSON, "script-environment", "{}", "JSON-encoded script environment")
+	flags.StringVar(&cfg.WorkloadPolicyJSON, "workload-policy", "{}", "JSON-encoded participant workload policy")
 	flags.StringVar(&cfg.GPUResourceCount, "gpu-resource-count", "0", "GPU resource limit per participant")
 	flags.BoolVar(&cfg.Privileged, "privileged", false, "Run the participant workload with a privileged security context")
 	flags.IntVar(&cfg.Attempt, "attempt", 0, "One-based Workflow attempt number")

@@ -65,6 +65,7 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 		"backend-api-version",
 		"backend-kind",
 		"queue",
+		"workload-policy",
 	} {
 		if !strings.Contains(manifest, required) {
 			t.Fatalf("adapter WorkflowTemplate does not contain %q", required)

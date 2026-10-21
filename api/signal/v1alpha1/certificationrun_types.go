@@ -67,6 +67,7 @@ type ScriptSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.workflow == oldSelf.workflow",message="workflow is immutable"
 // +kubebuilder:validation:XValidation:rule="self.backend == oldSelf.backend",message="backend is immutable"
 // +kubebuilder:validation:XValidation:rule="self.runnerImage == oldSelf.runnerImage",message="runnerImage is immutable"
+// +kubebuilder:validation:XValidation:rule="self.workloadPolicy == oldSelf.workloadPolicy",message="workloadPolicy is immutable"
 // +kubebuilder:validation:XValidation:rule="self.parameters == oldSelf.parameters",message="parameters are immutable"
 // +kubebuilder:validation:XValidation:rule="self.evidencePath == oldSelf.evidencePath",message="evidencePath is immutable"
 // +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
@@ -77,11 +78,12 @@ type CertificationRunSpec struct {
 	Profile PinnedProfile `json:"profile"`
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=64
-	Participants []Participant     `json:"participants"`
-	Script       ScriptSnapshot    `json:"script"`
-	Workflow     WorkflowReference `json:"workflow"`
-	Backend      ExecutionBackend  `json:"backend"`
-	RunnerImage  string            `json:"runnerImage"`
+	Participants   []Participant     `json:"participants"`
+	Script         ScriptSnapshot    `json:"script"`
+	Workflow       WorkflowReference `json:"workflow"`
+	Backend        ExecutionBackend  `json:"backend"`
+	RunnerImage    string            `json:"runnerImage"`
+	WorkloadPolicy WorkloadPolicy    `json:"workloadPolicy,omitempty"`
 	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="purpose is immutable"
 	Purpose CertificationPurpose `json:"purpose,omitempty"`
