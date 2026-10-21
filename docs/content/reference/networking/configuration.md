@@ -186,24 +186,32 @@ node:
   expectedNodes: 2000
 ```
 
-At startup, each agent raises these IPv4 neighbor table thresholds as needed:
+At startup, each agent raises these IPv4 and IPv6 neighbor table thresholds as needed:
 
 | Sysctl | Minimum | For 2,000 nodes |
 |--------|---------|----------------|
 | `net.ipv4.neigh.default.gc_thresh1` | 110% of expected nodes, rounded up | 2200 |
 | `net.ipv4.neigh.default.gc_thresh2` | 120% of expected nodes, rounded up | 2400 |
 | `net.ipv4.neigh.default.gc_thresh3` | 130% of expected nodes, rounded up | 2600 |
+| `net.ipv6.neigh.default.gc_thresh1` | 110% of expected nodes, rounded up | 2200 |
+| `net.ipv6.neigh.default.gc_thresh2` | 120% of expected nodes, rounded up | 2400 |
+| `net.ipv6.neigh.default.gc_thresh3` | 130% of expected nodes, rounded up | 2600 |
 
 Existing higher values are never reduced. Higher lower thresholds also act as
 floors for the upper thresholds to keep them ordered. The agent raises the
 hard limit first and fails startup with an explicit error if a required sysctl
 cannot be read, parsed, or raised. Values must be integers from `0` through
-`1651910497`, so all thresholds fit Linux's signed 32-bit sysctl range.
+`1651910497`, so all thresholds fit Linux's signed 32-bit sysctl range. IPv4
+and IPv6 values are checked independently. On hosts without the IPv6 neighbor
+table (`net.ipv6.neigh.default.gc_thresh1` is absent), the agent logs that IPv6
+tuning is skipped; permission errors, invalid values, and other missing
+thresholds still fail startup. A value of `0` skips all reads and writes for
+both families.
 
 Despite the `default` path, Linux implements these as table-wide limits shared
 by **all interfaces**, including subsequently created ones. There is no
 `neigh/all/gc_thresh*` or per-interface `gc_thresh*` to set. IPv6 has a separate
-neighbor table and is not changed by this IPv4 setting. See the
+neighbor table sized by the same `expectedNodes` setting. See the
 [kernel IP sysctl reference](https://docs.kernel.org/networking/ip-sysctl.html)
 and [neighbor sysctl registration](https://github.com/torvalds/linux/blob/master/net/core/neighbour.c).
 
@@ -219,12 +227,19 @@ so `expectedNodes` does not change them:
 
 | Area | Sysctls | When to adjust |
 |------|---------|----------------|
-| IPv6 neighbors | `net.ipv6.neigh.default.gc_thresh1/2/3` | Size separately when using IPv6 neighbors or underlay; inspect neighbor counts and table-overflow messages. |
 | Connection tracking | `net.netfilter.nf_conntrack_max`, `net.netfilter.nf_conntrack_buckets` | Increase for concurrent tracked flows and provision memory and hash buckets together. Check `nf_conntrack_count`, table-full messages, and insertion failures. The node agent already warns at 80% usage. Coordinate with kube-proxy, which can manage conntrack settings. |
 | Receive processing | `net.core.netdev_max_backlog`, `net.core.netdev_budget`, `net.core.netdev_budget_usecs` | Investigate `/proc/net/softnet_stat` drops and budget exhaustion before increasing queue or CPU-processing budgets. More queueing can increase latency. |
 | Socket buffers | `net.core.rmem_max`, `net.core.wmem_max`, `net.ipv4.udp_mem` | Tune for measured UDP/tunnel receive drops and memory pressure. Larger maximums alone do not enlarge an application's socket buffers. |
 | TCP connection bursts | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog` | Increase for measured listen/SYN queue overflow, with a matching application listen backlog. |
 | Fragment reassembly | `net.ipv4.ipfrag_high_thresh`, `net.ipv6.ip6frag_high_thresh` | Consider only if fragmentation counters show reassembly pressure; correct tunnel MTU first rather than masking fragmentation with memory. |
+
+Fragment reassembly thresholds are **memory limits in bytes**, not fragment
+or node counts. The corresponding retention timeouts are
+`net.ipv4.ipfrag_time` and `net.ipv6.ip6frag_time`, in seconds. Longer timeouts
+retain incomplete datagrams longer and can increase memory pressure. Inspect
+`IpReasmFails`/`IpReasmTimeout` and `Ip6ReasmFails`/`Ip6ReasmTimeout` when
+diagnosing reassembly loss. `net.ipv4.ipfrag_low_thresh` is obsolete on modern
+kernels; it is not an additional capacity knob to increase.
 
 Do not tune `net.ipv4.route.max_size`: Linux no longer uses the IPv4 route
 cache. IPv6 `route.max_size` is also deprecated on modern kernels. Do not

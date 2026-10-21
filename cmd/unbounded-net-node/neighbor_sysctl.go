@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -35,8 +36,18 @@ func applyNeighborGCThresholds(expectedNodes int, readFile func(string) ([]byte,
 		return nil
 	}
 
+	for _, family := range []string{"ipv4", "ipv6"} {
+		if err := applyNeighborGCThresholdsForFamily(family, expectedNodes, thresholds, readFile, writeFile); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func applyNeighborGCThresholdsForFamily(family string, expectedNodes int, thresholds [3]int, readFile func(string) ([]byte, error), writeFile func(string, []byte, os.FileMode) error) error {
 	// Linux exposes these table-wide limits only under default, not per interface.
-	const prefix = "/proc/sys/net/ipv4/neigh/default/gc_thresh"
+	prefix := "/proc/sys/net/" + family + "/neigh/default/gc_thresh"
 
 	var current [3]int
 
@@ -45,6 +56,11 @@ func applyNeighborGCThresholds(expectedNodes int, readFile func(string) ([]byte,
 
 		data, err := readFile(path)
 		if err != nil {
+			if family == "ipv6" && i == 0 && errors.Is(err, os.ErrNotExist) {
+				klog.Infof("Skipping IPv6 neighbor GC tuning: %s is unavailable", path)
+				return nil
+			}
+
 			return fmt.Errorf("read %s: %w", path, err)
 		}
 
