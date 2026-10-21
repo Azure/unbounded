@@ -1273,6 +1273,12 @@ impl<C: Charge> DetachedBuffer<C> {
         self.allocation.layout.size()
     }
 
+    /// Borrow the allocation's accounting owner.
+    #[must_use]
+    pub fn charge(&self) -> &C {
+        &self.allocation.charge
+    }
+
     /// Borrow the requested bytes, which may hold stale data until written.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
