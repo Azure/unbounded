@@ -9,6 +9,11 @@
 //
 // The unbounded agent manages the per-node containerd wiring, so the operator
 // installs only the Gantry workload and its Kubernetes configuration.
+//
+// When ClusterCache/gantry exists, the operator switches an installation it
+// reconciles to the Racer backend: Gantry then serves registry content
+// through Racer and runs only where the Racer dataplane runs. The cache never
+// installs Gantry by itself.
 package gantry
 
 import (
@@ -31,8 +36,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 const (
@@ -169,12 +176,29 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		dependsOn = append(dependsOn, configOp.Ref())
 	}
 
-	objects, err := decodeManifests(env, applyMutator(env.Config.Image(imageRepository), configHash))
+	// ClusterCache/gantry only reconfigures a Gantry installation the operator
+	// already reconciles; it never installs Gantry on its own.
+	racerRequested, racerPlacement, err := racerMode(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
+	objects, err := decodeManifests(env, applyMutator(env.Config.Image(imageRepository), configHash, racerPlacement))
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	result := component.Reconciled()
+
 	for _, obj := range objects {
+		agent := obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName
+		if agent && racerRequested && racerPlacement == nil {
+			// Leave the agent as it is until the dataplane placement is known.
+			result = racerPending()
+
+			continue
+		}
+
 		kind := component.OpApply
 		if obj.GetKind() == "Lease" && strings.HasPrefix(obj.GetName(), "gantry-chair-") {
 			kind = component.OpCreateIfAbsent
@@ -187,14 +211,14 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 			DependsOn: dependsOn,
 		}
 
-		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
+		if agent {
 			op.Overridable = true
 		}
 
 		plan.Add(op)
 	}
 
-	return plan, component.Reconciled(), nil
+	return plan, result, nil
 }
 
 // SetupWatches reconciles Gantry on changes to its active resources and when
@@ -205,10 +229,12 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// ConfigMap edit.
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
+	// The racer-dataplane DaemonSet supplies the agent placement in Racer mode.
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
+		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, workload.DataplaneDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
+	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(racerCachePredicate()))
 	b.Watches(&schedulingv1.PriorityClass{}, env.RequestSingleton(),
 		builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetName() == priorityClassName
@@ -332,8 +358,9 @@ func legacyCleanupOperations(componentName, namespace string) []component.Operat
 // applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,
 // stamps the operator-derived agent image onto the agent DaemonSet, and stamps
 // the config payload hash on its pod template so a config change rolls the
-// DaemonSet. Only the agent's own container is re-imaged.
-func applyMutator(agentImage, configHash string) func(*unstructured.Unstructured) error {
+// DaemonSet. Only the agent's own container is re-imaged. A non-nil
+// racerPlacement switches the agent to the Racer backend.
+func applyMutator(agentImage, configHash string, racerPlacement *workload.NodePlacement) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
@@ -350,6 +377,12 @@ func applyMutator(agentImage, configHash string) func(*unstructured.Unstructured
 		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
 			if err := component.SetNamedContainerImage(obj, agentContainerName, agentImage); err != nil {
 				return fmt.Errorf("set gantry agent image: %w", err)
+			}
+
+			if racerPlacement != nil {
+				if err := applyRacerMode(obj, racerPlacement); err != nil {
+					return fmt.Errorf("configure gantry Racer backend: %w", err)
+				}
 			}
 
 			return stampConfigHash(obj, configHashAnnotation, configHash)
