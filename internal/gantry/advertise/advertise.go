@@ -9,7 +9,7 @@
 // - The local containerd content store is the source of truth for
 // "what we can serve to peers".
 // - The DHT is a hint layer: provider records say "this node might
-// have this digest", subject to ≤24 h TTL and eventual consistency.
+// have this digest", subject to configured validity and eventual consistency.
 // - This package owns the local "announced set" - the digests we
 // currently believe are present-and-advertised - and reconciles it
 // against an inventory source (typically containerdstore.Inventory)
@@ -27,10 +27,9 @@
 // longer keep it alive.
 //
 // The announced set is local rebuildable state - it is NOT persisted
-// across process restarts. On startup the first reconcile pass
-// re-Provides every present digest, which is the same operation
-// libp2p performs internally on its 12 h refresh schedule, so the
-// extra cost is bounded by inventory size.
+// across process restarts. On startup the first reconcile pass registers every
+// present digest with discovery's sweeping provider. The sweeper owns periodic
+// refresh for the rest of the process lifetime.
 package advertise
 
 import (
