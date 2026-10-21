@@ -29,10 +29,10 @@ the public DGX GB200 1.3.10 host software matrix. That DGX release is not an
 OEM firmware authorization for this rack; the profile exists only to test
 whether the later 580.178.04 Blackwell NVLink/GSP changes are involved.
 
-AgentBaker normally performs GPU device initialization during node join. These
-standalone AgentBaker-derived images run `nvidia-modprobe` for the GPU, UVM,
-and NVSwitch devices before Fabric Manager and cloud-final so Unbounded's
-preflight sees the required device nodes.
+The open DKMS profiles run a bounded `nvidia-modprobe` initialization and wait
+for the GPU, UVM, and NVSwitch control device nodes before Fabric Manager and
+cloud-final. This prevents node bootstrap from racing asynchronous device-node
+creation while still failing closed if the required nodes never appear.
 
 The image contains a GPT disk with an EFI partition, signed Ubuntu ARM64
 shim/GRUB binaries, and an ext4 root with at least 5 GiB additional space.

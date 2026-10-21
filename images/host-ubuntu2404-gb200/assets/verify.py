@@ -222,8 +222,13 @@ def verify():
     device_init_enabled = Path(
         "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
     )
+    device_init_script = Path("/usr/local/sbin/unbounded-nvidia-device-init")
     if module_source == "ubuntu-precompiled-server-open":
         require(not device_init.exists(), "unexpected NVIDIA device initialization service")
+        require(
+            not device_init_script.exists(),
+            "unexpected NVIDIA device initialization script",
+        )
     else:
         require(
             device_init.exists()
@@ -235,15 +240,49 @@ def verify():
                 "",
                 "[Service]",
                 "Type=oneshot",
-                "ExecStart=/usr/bin/nvidia-modprobe -c 0",
-                "ExecStart=/usr/bin/nvidia-modprobe -u",
-                "ExecStart=/usr/bin/nvidia-modprobe -s",
+                "ExecStart=/usr/local/sbin/unbounded-nvidia-device-init",
                 "RemainAfterExit=yes",
                 "",
                 "[Install]",
                 "WantedBy=multi-user.target",
             ],
             "invalid NVIDIA device initialization service",
+        )
+        require(
+            device_init_script.exists()
+            and device_init_script.read_text().splitlines()
+            == [
+                "#!/bin/sh",
+                "set -eu",
+                "",
+                "/usr/bin/nvidia-modprobe -c 0",
+                "",
+                "attempt=0",
+                'while [ "$attempt" -lt 30 ]; do',
+                "    /usr/bin/nvidia-modprobe -u",
+                "    /usr/bin/nvidia-modprobe -s",
+                "    missing=",
+                "    for path in \\",
+                "        /dev/nvidiactl \\",
+                "        /dev/nvidia0 \\",
+                "        /dev/nvidia-uvm \\",
+                "        /dev/nvidia-uvm-tools \\",
+                "        /dev/nvidia-nvswitchctl; do",
+                '        if [ ! -e "$path" ]; then',
+                '            missing="$missing $path"',
+                "        fi",
+                "    done",
+                '    if [ -z "$missing" ]; then',
+                "        exit 0",
+                "    fi",
+                "    attempt=$((attempt + 1))",
+                "    sleep 1",
+                "done",
+                "",
+                'echo "missing NVIDIA device nodes after initialization:$missing" >&2',
+                "exit 1",
+            ],
+            "invalid NVIDIA device initialization script",
         )
         require(
             device_init_enabled.is_symlink(),

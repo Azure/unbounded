@@ -113,6 +113,59 @@ class RootfsContractTest(unittest.TestCase):
             }[field]
         self.fail(f"unexpected command: {args}")
 
+    def configure_nvidia_device_init(self):
+        self.put(
+            "/usr/local/sbin/unbounded-nvidia-device-init",
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "\n"
+            "/usr/bin/nvidia-modprobe -c 0\n"
+            "\n"
+            "attempt=0\n"
+            'while [ "$attempt" -lt 30 ]; do\n'
+            "    /usr/bin/nvidia-modprobe -u\n"
+            "    /usr/bin/nvidia-modprobe -s\n"
+            "    missing=\n"
+            "    for path in \\\n"
+            "        /dev/nvidiactl \\\n"
+            "        /dev/nvidia0 \\\n"
+            "        /dev/nvidia-uvm \\\n"
+            "        /dev/nvidia-uvm-tools \\\n"
+            "        /dev/nvidia-nvswitchctl; do\n"
+            '        if [ ! -e "$path" ]; then\n'
+            '            missing="$missing $path"\n'
+            "        fi\n"
+            "    done\n"
+            '    if [ -z "$missing" ]; then\n'
+            "        exit 0\n"
+            "    fi\n"
+            "    attempt=$((attempt + 1))\n"
+            "    sleep 1\n"
+            "done\n"
+            "\n"
+            'echo "missing NVIDIA device nodes after initialization:$missing" >&2\n'
+            "exit 1\n",
+        )
+        self.put(
+            "/etc/systemd/system/nvidia-device-init.service",
+            "[Unit]\n"
+            "Description=Initialize NVIDIA GPU and NVSwitch device nodes\n"
+            "Before=nvidia-fabricmanager.service cloud-final.service\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "ExecStart=/usr/local/sbin/unbounded-nvidia-device-init\n"
+            "RemainAfterExit=yes\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n",
+        )
+        enabled = self.path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
+        )
+        enabled.parent.mkdir(parents=True, exist_ok=True)
+        enabled.symlink_to("/etc/systemd/system/nvidia-device-init.service")
+
     def configure_agentbaker_kernel(self):
         self.mana_builtin = True
         self.put(
@@ -125,27 +178,7 @@ class RootfsContractTest(unittest.TestCase):
             f"/lib/modules/{self.kernel}/modules.builtin",
             "kernel/drivers/net/ethernet/microsoft/mana/mana.ko\n",
         )
-        self.put(
-            "/etc/systemd/system/nvidia-device-init.service",
-            "[Unit]\n"
-            "Description=Initialize NVIDIA GPU and NVSwitch device nodes\n"
-            "Before=nvidia-fabricmanager.service cloud-final.service\n"
-            "\n"
-            "[Service]\n"
-            "Type=oneshot\n"
-            "ExecStart=/usr/bin/nvidia-modprobe -c 0\n"
-            "ExecStart=/usr/bin/nvidia-modprobe -u\n"
-            "ExecStart=/usr/bin/nvidia-modprobe -s\n"
-            "RemainAfterExit=yes\n"
-            "\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n",
-        )
-        enabled = self.path(
-            "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
-        )
-        enabled.parent.mkdir(parents=True, exist_ok=True)
-        enabled.symlink_to("/etc/systemd/system/nvidia-device-init.service")
+        self.configure_nvidia_device_init()
 
     def rejected(self, message):
         with self.assertRaisesRegex(RuntimeError, message):
@@ -310,27 +343,7 @@ class RootfsContractTest(unittest.TestCase):
             "nvidia-fabricmanager\t580.167.08-1ubuntu1\tarm64\n"
             "libnvidia-nscq\t580.167.08-1ubuntu1\tarm64"
         )
-        self.put(
-            "/etc/systemd/system/nvidia-device-init.service",
-            "[Unit]\n"
-            "Description=Initialize NVIDIA GPU and NVSwitch device nodes\n"
-            "Before=nvidia-fabricmanager.service cloud-final.service\n"
-            "\n"
-            "[Service]\n"
-            "Type=oneshot\n"
-            "ExecStart=/usr/bin/nvidia-modprobe -c 0\n"
-            "ExecStart=/usr/bin/nvidia-modprobe -u\n"
-            "ExecStart=/usr/bin/nvidia-modprobe -s\n"
-            "RemainAfterExit=yes\n"
-            "\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n",
-        )
-        enabled = self.path(
-            "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
-        )
-        enabled.parent.mkdir(parents=True, exist_ok=True)
-        enabled.symlink_to("/etc/systemd/system/nvidia-device-init.service")
+        self.configure_nvidia_device_init()
         verify.verify()
 
     def test_agentbaker_driver_profile_requires_open_dkms(self):
@@ -362,6 +375,22 @@ class RootfsContractTest(unittest.TestCase):
         )
         self.path("/etc/systemd/system/nvidia-device-init.service").unlink()
         self.rejected("NVIDIA device initialization service")
+
+    def test_agentbaker_device_initialization_wait_is_required(self):
+        self.configure_agentbaker_kernel()
+        os.environ["GB200_PROFILE"] = "agentbaker-driver"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
+        self.driver = "580.159.04"
+        self.module_version = self.driver
+        self.packages = (
+            "nvidia-dkms-580-open\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-utils-580\t580.159.04-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
+        )
+        self.path("/usr/local/sbin/unbounded-nvidia-device-init").unlink()
+        self.rejected("NVIDIA device initialization script")
 
     def test_doca_profile_requires_doca_ofed(self):
         self.configure_agentbaker_kernel()

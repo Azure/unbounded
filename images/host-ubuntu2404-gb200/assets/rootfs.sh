@@ -239,6 +239,38 @@ nvidia_uvm
 nvidia_drm
 EOF
     if [ "$NVIDIA_MODULE_SOURCE" = nvidia-dkms-open ]; then
+        cat > /usr/local/sbin/unbounded-nvidia-device-init <<'EOF'
+#!/bin/sh
+set -eu
+
+/usr/bin/nvidia-modprobe -c 0
+
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+    /usr/bin/nvidia-modprobe -u
+    /usr/bin/nvidia-modprobe -s
+    missing=
+    for path in \
+        /dev/nvidiactl \
+        /dev/nvidia0 \
+        /dev/nvidia-uvm \
+        /dev/nvidia-uvm-tools \
+        /dev/nvidia-nvswitchctl; do
+        if [ ! -e "$path" ]; then
+            missing="$missing $path"
+        fi
+    done
+    if [ -z "$missing" ]; then
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+echo "missing NVIDIA device nodes after initialization:$missing" >&2
+exit 1
+EOF
+        chmod 755 /usr/local/sbin/unbounded-nvidia-device-init
         cat > /etc/systemd/system/nvidia-device-init.service <<'EOF'
 [Unit]
 Description=Initialize NVIDIA GPU and NVSwitch device nodes
@@ -246,9 +278,7 @@ Before=nvidia-fabricmanager.service cloud-final.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/nvidia-modprobe -c 0
-ExecStart=/usr/bin/nvidia-modprobe -u
-ExecStart=/usr/bin/nvidia-modprobe -s
+ExecStart=/usr/local/sbin/unbounded-nvidia-device-init
 RemainAfterExit=yes
 
 [Install]
