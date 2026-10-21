@@ -31,6 +31,19 @@ def verify():
     profile = os.environ["GB200_PROFILE"]
     module_source = os.environ["NVIDIA_MODULE_SOURCE"]
     source = os.environ["SOURCE_COMMIT"]
+    profile_module_sources = {
+        "canonical-control": "ubuntu-precompiled-server-open",
+        "canonical-nvidia-580167": "nvidia-dkms-open",
+        "agentbaker-driver": "nvidia-dkms-open",
+        "agentbaker-doca": "nvidia-dkms-open",
+        "agentbaker-doca-imex": "nvidia-dkms-open",
+    }
+    require(profile in profile_module_sources, f"unsupported GB200 profile: {profile}")
+    require(
+        module_source == profile_module_sources[profile],
+        f"unexpected NVIDIA module source for {profile}: {module_source}",
+    )
+    canonical_kernel = profile in ("canonical-control", "canonical-nvidia-580167")
     require(re.fullmatch(r"[0-9a-f]{40}", source), "missing exact source commit")
     require(command("dpkg", "--print-architecture") == "arm64", "not ARM64")
     # Canonical's signed NVIDIA package also ships an empty shared kernel/ directory.
@@ -58,7 +71,7 @@ def verify():
     )
     mana_setting = (
         "CONFIG_MICROSOFT_MANA=m"
-        if profile == "canonical-control"
+        if canonical_kernel
         else "CONFIG_MICROSOFT_MANA=y"
     )
     require(mana_setting in config.splitlines(), f"missing kernel setting: {mana_setting}")
@@ -69,7 +82,7 @@ def verify():
     modules = {}
     for name in ("mana", "mana_ib", "nvidia", "nvidia_uvm"):
         filename = command("modinfo", "-k", kernel, "-F", "filename", name)
-        if name == "mana" and profile != "canonical-control":
+        if name == "mana" and not canonical_kernel:
             require(filename == "(builtin)", "MANA Ethernet driver is not built into the kernel")
             builtins = Path(f"/lib/modules/{kernel}/modules.builtin")
             require(
@@ -95,11 +108,11 @@ def verify():
                 f"{name} is not the open kernel module",
             )
             signer = command("modinfo", "-k", kernel, "-F", "signer", name)
-            if profile == "canonical-control":
+            if module_source == "ubuntu-precompiled-server-open":
                 require(signer, f"{name} lacks a module signature")
             modules[name]["signer"] = signer
     initrd = command("lsinitramfs", f"/boot/initrd.img-{kernel}").splitlines()
-    if profile == "canonical-control":
+    if canonical_kernel:
         require(
             any(re.search(r"/mana\.ko(?:\.(?:zst|xz|gz))?$", p) for p in initrd),
             "MANA is absent from the initramfs",
@@ -117,7 +130,7 @@ def verify():
         )
         firmware[name] = sha256(path)
     packages = command("dpkg-query", "-W", "-f=${Package}\t${Version}\t${Architecture}\n")
-    if profile == "canonical-control":
+    if module_source == "ubuntu-precompiled-server-open":
         require("nvidia-dkms-" not in packages, "unexpected DKMS driver installation")
         package_names = (
             "nvidia-utils-580-server",
@@ -209,7 +222,7 @@ def verify():
     device_init_enabled = Path(
         "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
     )
-    if profile == "canonical-control":
+    if module_source == "ubuntu-precompiled-server-open":
         require(not device_init.exists(), "unexpected NVIDIA device initialization service")
     else:
         require(
@@ -257,7 +270,11 @@ def verify():
             p.name: sha256(p) for p in sorted(Path("/var/lib/apt/lists").glob("*_InRelease"))
         },
         "qualification": "offline rootfs checks only; no physical GPU, MANA traffic or NVLink qualification",
-        "secure_boot": "signed distribution binaries; platform trust/enrollment not qualified",
+        "secure_boot": (
+            "signed distribution modules; platform trust/enrollment not qualified"
+            if module_source == "ubuntu-precompiled-server-open"
+            else "DKMS module signing and platform trust/enrollment not qualified"
+        ),
         "fabric_services": (
             "NVIDIA Fabric Manager, NSCQ, and IMEX installed"
             if profile == "agentbaker-doca-imex"

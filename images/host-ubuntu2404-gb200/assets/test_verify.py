@@ -176,11 +176,13 @@ class RootfsContractTest(unittest.TestCase):
         versions = Path(__file__).with_name("versions.env").read_text()
         for profile in (
             "canonical-control",
+            "canonical-nvidia-580167",
             "agentbaker-driver",
             "agentbaker-doca",
             "agentbaker-doca-imex",
         ):
             self.assertIn(profile, source)
+        self.assertIn("NVIDIA_REFERENCE_VERSION=580.167.08-1ubuntu1", versions)
         self.assertIn("AGENTBAKER_KVER=6.14.0-1009-azure-nvidia", versions)
         self.assertIn("AGENTBAKER_KERNEL_VERSION=6.14.0-1009.9", versions)
         self.assertIn("AGENTBAKER_NVIDIA_VERSION=580.159.04-1ubuntu1", versions)
@@ -274,6 +276,10 @@ class RootfsContractTest(unittest.TestCase):
         )
         self.rejected("missing pinned nvidia-fabricmanager-580")
 
+    def test_profile_module_source_mismatch_rejected(self):
+        os.environ["GB200_PROFILE"] = "canonical-nvidia-580167"
+        self.rejected("unexpected NVIDIA module source")
+
     def test_agentbaker_driver_profile_accepts_pinned_open_dkms(self):
         self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-driver"
@@ -290,9 +296,47 @@ class RootfsContractTest(unittest.TestCase):
         )
         verify.verify()
 
+    def test_canonical_reference_driver_accepts_pinned_open_dkms(self):
+        os.environ["GB200_PROFILE"] = "canonical-nvidia-580167"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
+        os.environ["NVIDIA_DRIVER_VERSION"] = "580.167.08"
+        self.driver = "580.167.08"
+        self.module_version = self.driver
+        self.signer = ""
+        self.packages = (
+            "linux-image\t7.0.0-1019.19~24.04.2\tarm64\n"
+            "nvidia-dkms-580-open\t580.167.08-1ubuntu1\tarm64\n"
+            "nvidia-utils-580\t580.167.08-1ubuntu1\tarm64\n"
+            "nvidia-fabricmanager\t580.167.08-1ubuntu1\tarm64\n"
+            "libnvidia-nscq\t580.167.08-1ubuntu1\tarm64"
+        )
+        self.put(
+            "/etc/systemd/system/nvidia-device-init.service",
+            "[Unit]\n"
+            "Description=Initialize NVIDIA GPU and NVSwitch device nodes\n"
+            "Before=nvidia-fabricmanager.service cloud-final.service\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "ExecStart=/usr/bin/nvidia-modprobe -c 0\n"
+            "ExecStart=/usr/bin/nvidia-modprobe -u\n"
+            "ExecStart=/usr/bin/nvidia-modprobe -s\n"
+            "RemainAfterExit=yes\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n",
+        )
+        enabled = self.path(
+            "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
+        )
+        enabled.parent.mkdir(parents=True, exist_ok=True)
+        enabled.symlink_to("/etc/systemd/system/nvidia-device-init.service")
+        verify.verify()
+
     def test_agentbaker_driver_profile_requires_open_dkms(self):
         self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-driver"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
         self.driver = "580.159.04"
         self.module_version = self.driver
@@ -322,6 +366,7 @@ class RootfsContractTest(unittest.TestCase):
     def test_doca_profile_requires_doca_ofed(self):
         self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-doca"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
         self.driver = "580.159.04"
         self.module_version = self.driver
@@ -356,6 +401,7 @@ class RootfsContractTest(unittest.TestCase):
     def test_imex_profile_requires_parameters_and_service(self):
         self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-doca-imex"
+        os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
         os.environ["NVIDIA_DRIVER_VERSION"] = "580.159.04"
         self.driver = "580.159.04"
         self.module_version = self.driver

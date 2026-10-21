@@ -17,6 +17,13 @@ select_profile() {
             NVIDIA_DRIVER_VERSION=$CANONICAL_NVIDIA_DRIVER_VERSION
             NVIDIA_MODULE_SOURCE=ubuntu-precompiled-server-open
             ;;
+        canonical-nvidia-580167)
+            KVER=$CANONICAL_KVER
+            KERNEL_VERSION=$CANONICAL_KERNEL_VERSION
+            NVIDIA_VERSION=$NVIDIA_REFERENCE_VERSION
+            NVIDIA_DRIVER_VERSION=$NVIDIA_REFERENCE_DRIVER_VERSION
+            NVIDIA_MODULE_SOURCE=nvidia-dkms-open
+            ;;
         agentbaker-driver|agentbaker-doca|agentbaker-doca-imex)
             KVER=$AGENTBAKER_KVER
             KERNEL_VERSION=$AGENTBAKER_KERNEL_VERSION
@@ -33,7 +40,7 @@ select_profile() {
         NVIDIA_DRIVER_VERSION NVIDIA_MODULE_SOURCE
 }
 
-install_agentbaker_sources() {
+install_nvidia_source() {
     mkdir -p /etc/apt/keyrings /etc/apt/sources.list.d
     nvidia_key=/etc/apt/keyrings/nvidia.pub
     curl -fsSL \
@@ -43,7 +50,10 @@ install_agentbaker_sources() {
     cat > /etc/apt/sources.list.d/nvidia-gb200.list <<EOF
 deb [arch=arm64 signed-by=$nvidia_key] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/ /
 EOF
+}
 
+install_agentbaker_sources() {
+    install_nvidia_source
     add-apt-repository -y ppa:canonical-kernel-team/ppa
 }
 
@@ -78,6 +88,14 @@ install_packages() {
                 "linux-image-${KVER}=${KERNEL_VERSION}" \
                 "linux-headers-${KVER}=${KERNEL_VERSION}"
             ;;
+        canonical-nvidia-580167)
+            install_nvidia_source
+            apt-get update
+            apt-get install -y --no-install-recommends \
+                "linux-image-${KVER}=${KERNEL_VERSION}" \
+                "linux-headers-${KVER}=${KERNEL_VERSION}" \
+                gcc-13
+            ;;
         agentbaker-*)
             install_agentbaker_sources
             case "$GB200_PROFILE" in
@@ -110,7 +128,7 @@ install_packages() {
                 "libnvidia-nscq-580=${NVIDIA_VERSION}" \
                 nvidia-modprobe
             ;;
-        agentbaker-*)
+        canonical-nvidia-580167|agentbaker-*)
             case "$GB200_PROFILE" in
                 agentbaker-doca|agentbaker-doca-imex)
                     apt-get install -y --allow-downgrades --no-install-recommends \
@@ -220,7 +238,7 @@ nvidia_modeset
 nvidia_uvm
 nvidia_drm
 EOF
-    if [ "$GB200_PROFILE" != canonical-control ]; then
+    if [ "$NVIDIA_MODULE_SOURCE" = nvidia-dkms-open ]; then
         cat > /etc/systemd/system/nvidia-device-init.service <<'EOF'
 [Unit]
 Description=Initialize NVIDIA GPU and NVSwitch device nodes
@@ -251,7 +269,7 @@ EOF
     fi
     systemctl enable systemd-networkd.service systemd-resolved.service \
         ssh.service chrony.service nvidia-fabricmanager.service
-    if [ "$GB200_PROFILE" != canonical-control ]; then
+    if [ "$NVIDIA_MODULE_SOURCE" = nvidia-dkms-open ]; then
         systemctl enable nvidia-device-init.service
     fi
     if [ "$GB200_PROFILE" = agentbaker-doca-imex ]; then

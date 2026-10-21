@@ -4,11 +4,12 @@ This ARM64-only image supplies `/disk/disk.img.gz` for the existing Metalman
 netboot installer. It does not replace the installer, deploy an agent, modify a
 Machine, initiate HostReplace, or reboot a host.
 
-The image family provides four cumulative, pinned experiment profiles:
+The image family provides five pinned experiment profiles:
 
 | Image | Profile | Kernel and NVIDIA stack |
 |---|---|---|
 | `host-ubuntu2404-gb200` | `canonical-control` | Canonical 7.0 64K kernel and signed precompiled server-open 580.178.04 modules |
+| `host-ubuntu2404-gb200-nvidia-580167` | `canonical-nvidia-580167` | Canonical control kernel with matched NVIDIA repository open DKMS driver, GSP, Fabric Manager, and NSCQ 580.167.08 |
 | `host-ubuntu2404-gb200-agentbaker` | `agentbaker-driver` | Signed `linux-azure-nvidia` 6.14 and AgentBaker's open DKMS 580.159.04 driver |
 | `host-ubuntu2404-gb200-agentbaker-doca` | `agentbaker-doca` | AgentBaker driver profile plus DOCA-OFED 3.1.0 |
 | `host-ubuntu2404-gb200-agentbaker-doca-imex` | `agentbaker-doca-imex` | DOCA profile plus IMEX and AgentBaker's GB200 NVIDIA module parameters |
@@ -20,6 +21,13 @@ module; the Canonical control ships both as modules.
 Versions fail closed if unavailable; there is no unpinned package or
 different-kernel fallback. The profiles intentionally isolate cumulative stack
 deltas rather than changing all AgentBaker components at once.
+
+The 580.167.08 profile is a driver-only diagnostic relative to the Canonical
+control: it retains the same Ubuntu release, 7.0.0-1019 64K kernel, MANA
+drivers, boot path, and services. NVIDIA lists 580.167.08 with CUDA 13.0.2 in
+the public DGX GB200 1.3.10 host software matrix. That DGX release is not an
+OEM firmware authorization for this rack; the profile exists only to test
+whether the later 580.178.04 Blackwell NVLink/GSP changes are involved.
 
 AgentBaker normally performs GPU device initialization during node join. These
 standalone AgentBaker-derived images run `nvidia-modprobe` for the GPU, UVM,
