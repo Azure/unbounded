@@ -125,11 +125,15 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
     assert!(!copy.is_registered());
     assert_ne!(copy.bytes().as_ptr(), pointer);
     assert_eq!(copy.bytes(), page.ciphertext.bytes());
+    // The registered charge is released; the aligned copy is charged for its
+    // zero-padded length.
+    let length = page.ciphertext.bytes().len();
     assert_eq!(
         admission.used(ResourceClass::Ciphertext),
-        used,
+        used - length + length.next_multiple_of(4096),
         "charge moved"
     );
+    assert!(copy.is_disk_aligned(crate::memory::default_disk_alignment()));
     pump!(w);
     assert_eq!(free(&w), Some(2));
     // An exclusive registered page still copies on rehome.

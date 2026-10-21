@@ -562,7 +562,6 @@ impl BufferPool {
     /// reservation from this admission for the page's cache covering the full
     /// capacity. Freezing zero-fills the pad. A known `checksum` is cached
     /// eagerly; it must be the CRC-64 of the ciphertext bytes.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired into TCP receive next.
     pub(crate) fn aligned_ciphertext_page(
         &self,
         buffer: CiphertextBuffer,

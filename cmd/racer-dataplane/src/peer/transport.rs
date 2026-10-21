@@ -486,11 +486,24 @@ impl Transfers {
     async fn read_ciphertext(
         &self,
         connection: ConnectionLease,
+        cache: Option<&racer_control_wire::CacheId>,
         length: usize,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, WireBuffer)> {
-        let (admission, _) = &self.wire;
-        let buffer = WireBuffer::new(admission, length)?;
+        let (admission, codec) = &self.wire;
+        // Page bodies land in aligned storage charged to their cache.
+        let buffer = match cache {
+            Some(cache) if length != 0 => {
+                let buffers = codec.buffers();
+                let reservation = admission.reserve(
+                    Some(cache),
+                    ResourceClass::Ciphertext,
+                    buffers.aligned_capacity(length)?,
+                )?;
+                WireBuffer::aligned(buffers, reservation, length)?
+            }
+            _ => WireBuffer::new(admission, length)?,
+        };
         let read = self.io.read_body_exact(connection, buffer, scope).await?;
         Ok((read.lease, read.buffer))
     }
@@ -600,10 +613,20 @@ impl Transfers {
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
         scope.check()?;
-        let (mut connection, buffer) = self.read_ciphertext(connection, length, scope).await?;
-        let (bytes, _reservation) = buffer.into_parts();
+        let cache = super::protocol::page_descriptor(&authentication.original.head)
+            .ok()
+            .map(|(metadata, _)| metadata.version.object.cache);
+        let (mut connection, buffer) = self
+            .read_ciphertext(connection, cache.as_ref(), length, scope)
+            .await?;
         let (_, codec) = &self.wire;
-        let response = codec.response(authentication, bytes, scope)?;
+        let response = match buffer.into_body() {
+            // Unkeyed staging is recharged to the page's cache by the decoder.
+            super::protocol::ResponseBody::Owned { bytes, .. } => {
+                codec.response(authentication, bytes, scope)?
+            }
+            body => codec.response_body(authentication, body, scope)?,
+        };
         validate_body_length(&response.response, length)?;
         connection.finish_exchange()?;
         Ok(response)
@@ -814,8 +837,28 @@ impl Transfers {
 /// Stable, quota-owned transport staging. Never contains plaintext page data.
 /// Construction normalizes capacity before pointer extraction; Vec backing then
 /// stays fixed while ownership moves through reactor completion closures.
-pub(crate) struct WireBuffer(flow_control::ChargedBuffer<AdmissionPolicy>);
+///
+/// Page bodies use [`WireBuffer::Aligned`] storage from the receiving worker's
+/// pool so the decoded page can be persisted without a copy.
+pub(crate) enum WireBuffer {
+    Owned(flow_control::ChargedBuffer<AdmissionPolicy>),
+    Aligned(crate::memory::CiphertextBuffer),
+}
 impl WireBuffer {
+    /// Aligned page-body staging charged to a Ciphertext `reservation` that
+    /// covers [`crate::memory::BufferPool::aligned_capacity`] of `length`.
+    pub(crate) fn aligned(
+        buffers: &crate::memory::BufferPool,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        length: usize,
+    ) -> Result<Self> {
+        if length > crate::model::PAGE_BYTES as usize + 16 {
+            return Err(Error::InvalidRequest);
+        }
+        buffers
+            .aligned_ciphertext(reservation, length)
+            .map(Self::Aligned)
+    }
     pub(crate) fn new(
         admission: &flow_control::Quotas<AdmissionPolicy>,
         length: usize,
@@ -824,11 +867,12 @@ impl WireBuffer {
             return Err(Error::InvalidRequest);
         }
         let reservation = admission.reserve(None, ResourceClass::Ciphertext, length)?;
-        Ok(Self(flow_control::ChargedBuffer::unpooled(
+        Ok(Self::Owned(flow_control::ChargedBuffer::unpooled(
             reservation,
             length,
         )?))
     }
+    #[cfg(test)]
     pub(crate) fn reserved(
         reservation: flow_control::Charge<AdmissionPolicy>,
         length: usize,
@@ -837,24 +881,51 @@ impl WireBuffer {
         if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
-        Ok(Self(flow_control::ChargedBuffer::unpooled(
+        Ok(Self::Owned(flow_control::ChargedBuffer::unpooled(
             reservation,
             length,
         )?))
     }
+    /// Hand the completed receive to the response decoder with its charge.
+    pub(crate) fn into_body(self) -> super::protocol::ResponseBody {
+        match self {
+            Self::Owned(buffer) => {
+                let (bytes, reservation) = buffer.into_parts();
+                super::protocol::ResponseBody::Owned {
+                    bytes: bytes.into_vec(),
+                    reservation: Some(reservation),
+                }
+            }
+            Self::Aligned(buffer) => super::protocol::ResponseBody::Aligned(buffer),
+        }
+    }
+    /// Split vector staging; aligned staging has no `Vec` form.
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (Vec<u8>, flow_control::Charge<AdmissionPolicy>) {
-        let (bytes, reservation) = self.0.into_parts();
-        (bytes.into_vec(), reservation)
+        match self {
+            Self::Owned(buffer) => {
+                let (bytes, reservation) = buffer.into_parts();
+                (bytes.into_vec(), reservation)
+            }
+            Self::Aligned(_) => panic!("aligned wire buffer"),
+        }
     }
 }
-// SAFETY: ChargedBuffer owns stable, exclusive backing and its complete reservation.
+// SAFETY: both variants own stable, exclusive backing and their complete
+// reservation until dropped.
 unsafe impl IoBuffer for WireBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
-        Ok(self.0.bytes())
+        match self {
+            Self::Owned(buffer) => Ok(buffer.bytes()),
+            Self::Aligned(buffer) => buffer.bytes(),
+        }
     }
     fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-        Ok(self.0.bytes_mut())
+        match self {
+            Self::Owned(buffer) => Ok(buffer.bytes_mut()),
+            Self::Aligned(buffer) => buffer.bytes_mut(),
+        }
     }
 }
 
@@ -1149,7 +1220,7 @@ impl Transfers {
             if let Some(timing) = timing.as_deref_mut() {
                 timing.begin();
             }
-            let (mut connection, body, staging_reservation) = self
+            let (mut connection, body) = self
                 .receive_http_body(
                     received.connection,
                     length,
@@ -1167,7 +1238,7 @@ impl Transfers {
             let response = observer.result(
                 Stage::PeerDecode,
                 scope,
-                codec.response_reserved(authentication, body, staging_reservation, scope),
+                codec.response_body(authentication, body, scope),
             )?;
             validate_body_length(&response.response, length)?;
             connection.finish_exchange()?;
@@ -1186,29 +1257,32 @@ impl Transfers {
         peer_admission: &Option<std::sync::Arc<super::Permit>>,
         failure: &Rc<std::cell::Cell<bool>>,
         scope: &RequestScope,
-    ) -> Result<(
-        ConnectionLease,
-        Vec<u8>,
-        Option<flow_control::Charge<AdmissionPolicy>>,
-    )> {
-        let (admission, _) = &self.wire;
+    ) -> Result<(ConnectionLease, super::protocol::ResponseBody)> {
+        let (admission, codec) = &self.wire;
         let observer = admission.policy().observer();
-        let (body, staging_reservation) = if length == 0 {
-            (Vec::new(), None)
+        let body = if length == 0 {
+            super::protocol::ResponseBody::Owned {
+                bytes: Vec::new(),
+                reservation: None,
+            }
         } else {
             let cache = &request.request.origin.object.cache;
+            let buffers = codec.buffers();
+            // Charge the whole pooled size class of the aligned body.
+            let capacity = buffers.aligned_capacity(length)?;
             let mut reservation = admission
-                .reserve(Some(cache), ResourceClass::Ciphertext, length)
+                .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
                 .map_err(Error::from);
             if matches!(reservation, Err(Error::Overloaded))
                 && let Some(reclaim) = &self.reclaim
             {
-                reclaim(cache, length);
+                reclaim(cache, capacity);
                 reservation = admission
-                    .reserve(Some(cache), ResourceClass::Ciphertext, length)
+                    .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
                     .map_err(Error::from);
             }
-            let mut buffer = WireBuffer::reserved(
+            let mut buffer = WireBuffer::aligned(
+                buffers,
                 observer.result(Stage::PeerReceiveAdmission, scope, reservation)?,
                 length,
             )?;
@@ -1282,10 +1356,9 @@ impl Transfers {
                 connection = completion.lease;
                 buffer = completion.buffer;
             }
-            let (bytes, reservation) = buffer.into_parts();
-            (bytes, Some(reservation))
+            buffer.into_body()
         };
-        Ok((connection, body, staging_reservation))
+        Ok((connection, body))
     }
 }
 
@@ -1966,7 +2039,7 @@ mod tests {
                         let arrival = std::future::poll_fn(|cx| pending.poll_arrival(cx)).await;
                         released.set(matches!(arrival, Ok(rdma_verbs::Arrival::Released)));
                         let (mut connection, body) = receiver
-                            .read_ciphertext(received.connection, length, &scope)
+                            .read_ciphertext(received.connection, None, length, &scope)
                             .await?;
                         connection.finish_exchange()?;
                         return receiver

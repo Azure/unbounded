@@ -366,7 +366,11 @@ mod materialized_pairing {
             },
             || {
                 if prefixes.get() == 2
-                    && admissions[1].used(ResourceClass::Ciphertext) == 2 * pages[0].bytes().len()
+                    && admissions[1].used(ResourceClass::Ciphertext)
+                        == 2 * page_alloc::buffer_capacity(
+                            pages[0].bytes().len().next_multiple_of(4096),
+                        )
+                        .unwrap()
                 {
                     overlapped.set(true);
                 }

@@ -1255,9 +1255,13 @@ mod encrypted_http {
                     if attempt == 0 {
                         prefix_sent.set(true);
                         // Do not let cancellation race ahead of receive admission:
-                        // the partial exchange must own a full ciphertext allocation.
+                        // the partial exchange must own a full aligned ciphertext
+                        // allocation, charged for its whole pooled size class.
                         futures::future::poll_fn(|_| {
-                            if admissions[0].used(ResourceClass::Ciphertext) == length + 16 {
+                            if admissions[0].used(ResourceClass::Ciphertext)
+                                == page_alloc::buffer_capacity((length + 16).next_multiple_of(4096))
+                                    .unwrap()
+                            {
                                 Poll::Ready(())
                             } else {
                                 Poll::Pending
@@ -1326,6 +1330,8 @@ mod encrypted_http {
                     ciphertext.bytes(),
                     pages[if attempt == 3 { 1 } else { index }].bytes()
                 );
+                // TCP receive lands in a zero-padded, disk-aligned body.
+                assert!(ciphertext.is_disk_aligned(crate::memory::default_disk_alignment()));
                 let pointer = ciphertext.bytes().as_ptr();
                 if let Some(previous) = reused {
                     assert_eq!(
