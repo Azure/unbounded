@@ -129,6 +129,56 @@ unsafe impl IoBuf for &'static str {
     }
 }
 
+/// A list of [`IoBuf`] segments the kernel may gather from while the runtime
+/// owns it, for vectored writes ([`Reactor::writev_at`](crate::Reactor::writev_at)).
+///
+/// # Safety
+///
+/// Implementors guarantee that, for every `index < segment_count()`,
+/// [`segment`](IoBufs::segment) returns a pointer and length satisfying the
+/// [`IoBuf`] contract: the bytes stay valid, initialized, and unchanged while
+/// the value is moved and owned by the runtime, and repeated calls return the
+/// same values.
+pub unsafe trait IoBufs: 'static {
+    /// Number of segments.
+    fn segment_count(&self) -> usize;
+
+    /// Pointer and initialized length of segment `index`.
+    ///
+    /// # Panics
+    ///
+    /// May panic if `index >= segment_count()`.
+    fn segment(&self, index: usize) -> (*const u8, usize);
+}
+
+// SAFETY: each element upholds the `IoBuf` contract, and the pair forwards it.
+unsafe impl<A: IoBuf, B: IoBuf> IoBufs for (A, B) {
+    fn segment_count(&self) -> usize {
+        2
+    }
+
+    fn segment(&self, index: usize) -> (*const u8, usize) {
+        match index {
+            0 => (self.0.stable_ptr(), self.0.bytes_init()),
+            1 => (self.1.stable_ptr(), self.1.bytes_init()),
+            _ => panic!("segment index {index} out of range for a pair"),
+        }
+    }
+}
+
+// SAFETY: each element upholds the `IoBuf` contract; moving the Vec moves
+// neither its allocation nor the elements' own buffers.
+unsafe impl<T: IoBuf> IoBufs for Vec<T> {
+    fn segment_count(&self) -> usize {
+        self.len()
+    }
+
+    fn segment(&self, index: usize) -> (*const u8, usize) {
+        let buf = &self[index];
+        (buf.stable_ptr(), buf.bytes_init())
+    }
+}
+
 /// The outcome of an operation that borrowed a buffer, together with the
 /// buffer itself.
 ///
@@ -235,6 +285,19 @@ mod tests {
         let (result, buf) = failed.into_parts();
         assert!(result.unwrap_err().is_canceled());
         assert_eq!(buf, b"x");
+    }
+
+    #[test]
+    fn io_bufs_segments() {
+        let pair: (Vec<u8>, &'static [u8]) = (vec![1, 2], b"xyz");
+        assert_eq!(pair.segment_count(), 2);
+        assert_eq!(pair.segment(0), (pair.0.as_ptr(), 2));
+        assert_eq!(pair.segment(1), (pair.1.as_ptr(), 3));
+        let list: Vec<&'static [u8]> = vec![b"a", b"", b"bc"];
+        assert_eq!(list.segment_count(), 3);
+        assert_eq!(list.segment(2).1, 2);
+        let panic = std::panic::catch_unwind(|| pair.segment(2));
+        assert!(panic.is_err());
     }
 
     type Result<T> = std::result::Result<T, Error>;

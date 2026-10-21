@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use crate::backend::{KernelTimespec, Op, OpKind, OpenHow, PushHints};
 use crate::{
-    Backend, BufResult, Error, ErrorKind, IoBuf, IoBufMut, Result, Scope, SockAddr, SocketAddress,
+    Backend, BufResult, Error, ErrorKind, IoBuf, IoBufMut, IoBufs, Result, Scope, SockAddr,
+    SocketAddress,
 };
 
 use super::Reactor;
@@ -356,6 +357,16 @@ pub struct WriteAt<B: Backend, Buf> {
     buf: Buf,
 }
 
+/// Positioned vectored write; see [`Reactor::writev_at`].
+pub struct WritevAt<B: Backend, Bufs> {
+    fd: B::Fd,
+    offset: u64,
+    bufs: Bufs,
+    /// The kernel-visible segment array, built once in `prepare`. A `Vec`
+    /// rather than a `Box` so that moving it keeps derived pointers valid.
+    iovecs: Vec<libc::iovec>,
+}
+
 /// Socket receive; see [`Reactor::recv`].
 pub struct SocketRecv<B: Backend, Buf> {
     fd: B::Fd,
@@ -368,7 +379,7 @@ pub struct SocketSend<B: Backend, Buf> {
     buf: Buf,
 }
 
-sealed!(buffered: ReadAt, WriteAt, SocketRecv, SocketSend);
+sealed!(buffered: ReadAt, WriteAt, WritevAt, SocketRecv, SocketSend);
 
 /// One-shot readiness poll; see [`Reactor::readiness`].
 pub struct Readiness<B: Backend> {
@@ -500,6 +511,53 @@ impl<B: Backend, Buf: IoBuf> OpSpec<B> for WriteAt<B, Buf> {
 
     fn finish<E: From<Error>>(self, result: Result<u32, E>) -> Self::Output<E> {
         BufResult::new(result.map(|n| n as usize), self.buf)
+    }
+}
+
+/// Maximum segments per vectored write (Linux `UIO_MAXIOV`).
+const MAX_IOVECS: usize = 1024;
+
+impl<B: Backend, Bufs: IoBufs> OpSpec<B> for WritevAt<B, Bufs> {
+    type Output<E> = BufResult<usize, Bufs, E>;
+    const KIND: OpKind = OpKind::Writev;
+
+    fn prepare(&mut self) -> Result<()> {
+        check_offset(self.offset)?;
+        let count = self.bufs.segment_count();
+        if count > MAX_IOVECS {
+            return Err(Error::new(ErrorKind::InvalidInput)
+                .with_context("vectored write exceeds UIO_MAXIOV segments"));
+        }
+        let mut total = 0usize;
+        self.iovecs = (0..count)
+            .map(|index| {
+                let (base, len) = self.bufs.segment(index);
+                total = total.saturating_add(len);
+                libc::iovec {
+                    iov_base: base.cast_mut().cast(),
+                    iov_len: len,
+                }
+            })
+            .collect();
+        if total > i32::MAX as usize {
+            return Err(Error::new(ErrorKind::InvalidInput)
+                .with_context("vectored write exceeds i32::MAX bytes"));
+        }
+        Ok(())
+    }
+
+    fn op(&mut self) -> Op<'_, B::Fd> {
+        Op::Writev {
+            fd: &self.fd,
+            offset: self.offset,
+            iovecs: self.iovecs.as_ptr(),
+            // `prepare` bounds the count by MAX_IOVECS.
+            count: clamp_len(self.iovecs.len()),
+        }
+    }
+
+    fn finish<E: From<Error>>(self, result: Result<u32, E>) -> Self::Output<E> {
+        BufResult::new(result.map(|n| n as usize), self.bufs)
     }
 }
 
@@ -800,6 +858,31 @@ impl<B: Backend> Reactor<B> {
             fd: fd.clone(),
             offset,
             buf,
+        };
+        Operation::new(self, data, scope, ())
+    }
+
+    /// Gather the initialized bytes of every segment of `bufs` and write them
+    /// contiguously at `offset` (`pwritev`).
+    ///
+    /// The segments and the kernel-visible iovec array stay owned by the
+    /// operation until the kernel is done, with the same cancellation, drop,
+    /// and offload semantics as [`write_at`](Self::write_at). Resolves to the
+    /// number of bytes written; short writes are returned as is. Offsets
+    /// above `i64::MAX`, more than 1024 segments, or more than `i32::MAX`
+    /// total bytes fail with [`ErrorKind::InvalidInput`].
+    pub fn writev_at<Bufs: IoBufs, S: Scope>(
+        &self,
+        fd: &B::Fd,
+        offset: u64,
+        bufs: Bufs,
+        scope: &S,
+    ) -> Operation<'_, B, WritevAt<B, Bufs>, S> {
+        let data = WritevAt {
+            fd: fd.clone(),
+            offset,
+            bufs,
+            iovecs: Vec::new(),
         };
         Operation::new(self, data, scope, ())
     }

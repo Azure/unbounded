@@ -104,7 +104,7 @@ pub mod time;
 pub mod uring;
 
 pub use backend::{Backend, Host};
-pub use buf::{BufResult, IoBuf, IoBufMut};
+pub use buf::{BufResult, IoBuf, IoBufMut, IoBufs};
 pub use cancel::{CancelRegistration, CancelToken, Canceled};
 pub use clock::{Clock, Entropy, SystemClock, SystemEntropy};
 pub use error::{Error, ErrorKind, Result};

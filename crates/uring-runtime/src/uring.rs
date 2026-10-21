@@ -354,6 +354,14 @@ impl Backend for Uring {
             } => opcode::Write::new(fd(file), buf, len)
                 .offset(offset)
                 .build(),
+            Op::Writev {
+                fd: file,
+                offset,
+                iovecs,
+                count,
+            } => opcode::Writev::new(fd(file), iovecs, count)
+                .offset(offset)
+                .build(),
             Op::Recv {
                 fd: socket,
                 buf,
@@ -568,6 +576,7 @@ impl Backend for Uring {
             OpKind::Nop => opcode::Nop::CODE,
             OpKind::Read => opcode::Read::CODE,
             OpKind::Write => opcode::Write::CODE,
+            OpKind::Writev => opcode::Writev::CODE,
             OpKind::Recv => opcode::Recv::CODE,
             OpKind::Send => opcode::Send::CODE,
             OpKind::PollAdd => opcode::PollAdd::CODE,

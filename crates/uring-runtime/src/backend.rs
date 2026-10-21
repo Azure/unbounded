@@ -262,6 +262,20 @@ pub enum Op<'a, Fd> {
         /// Bytes to write.
         len: u32,
     },
+    /// `pwritev(fd, iovecs, count, offset)`: gather `count` segments and
+    /// write them contiguously. An offset of `u64::MAX` uses and advances the
+    /// file position.
+    Writev {
+        /// Destination descriptor.
+        fd: &'a Fd,
+        /// File offset.
+        offset: u64,
+        /// Segment array, valid for `count` entries, each valid for
+        /// `iov_len` readable bytes.
+        iovecs: *const libc::iovec,
+        /// Number of segments.
+        count: u32,
+    },
     /// `recv(fd, buf, len, flags)`.
     Recv {
         /// Socket.
@@ -389,6 +403,8 @@ pub enum OpKind {
     Read,
     /// [`Op::Write`].
     Write,
+    /// [`Op::Writev`].
+    Writev,
     /// [`Op::Recv`].
     Recv,
     /// [`Op::Send`].
@@ -419,10 +435,11 @@ pub enum OpKind {
 
 impl OpKind {
     /// Every kind, in declaration order.
-    pub const ALL: [OpKind; 16] = [
+    pub const ALL: [OpKind; 17] = [
         Self::Nop,
         Self::Read,
         Self::Write,
+        Self::Writev,
         Self::Recv,
         Self::Send,
         Self::PollAdd,
@@ -446,6 +463,7 @@ impl<Fd> Op<'_, Fd> {
             Self::Nop => OpKind::Nop,
             Self::Read { .. } => OpKind::Read,
             Self::Write { .. } => OpKind::Write,
+            Self::Writev { .. } => OpKind::Writev,
             Self::Recv { .. } => OpKind::Recv,
             Self::Send { .. } => OpKind::Send,
             Self::PollAdd { .. } => OpKind::PollAdd,
@@ -792,6 +810,12 @@ mod tests {
                 offset: 0,
                 buf: std::ptr::null(),
                 len: 0,
+            },
+            Op::Writev {
+                fd: &fd,
+                offset: 0,
+                iovecs: std::ptr::null(),
+                count: 0,
             },
             Op::Recv {
                 fd: &fd,

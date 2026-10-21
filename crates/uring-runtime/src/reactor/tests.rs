@@ -28,6 +28,8 @@ struct Pushed {
     user_data: u64,
     kind: OpKind,
     buf: Option<(*mut u8, u32)>,
+    /// The bytes a vectored write gathers, captured at push.
+    gathered: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -164,10 +166,27 @@ impl Backend for Mock {
             }
             _ => None,
         };
+        let gathered = match *op {
+            Op::Writev { iovecs, count, .. } => {
+                // SAFETY: the reactor keeps `count` iovecs and their bytes
+                // valid until the completion is popped.
+                let iovecs = unsafe { std::slice::from_raw_parts(iovecs, count as usize) };
+                let mut bytes = Vec::new();
+                for iov in iovecs {
+                    // SAFETY: as above, each segment is valid for `iov_len`.
+                    bytes.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(iov.iov_base.cast::<u8>(), iov.iov_len)
+                    });
+                }
+                Some(bytes)
+            }
+            _ => None,
+        };
         state.queued.push(Pushed {
             user_data,
             kind: op.kind(),
             buf,
+            gathered,
         });
         Ok(())
     }
@@ -561,6 +580,83 @@ fn failed_scope_returns_inputs_without_submitting() {
     reactor.poll(1).unwrap();
     assert!(mock.pending().is_empty());
     assert_eq!(observed.get(), 0, "scope failures are not rejections");
+}
+
+#[test]
+fn writev_gathers_segments_and_returns_them() {
+    let (reactor, mock) = reactor();
+    let fd: MockFd = Rc::new(3);
+    let mut write = reactor.writev_at(&fd, 7, (vec![1u8, 2], b"xyz".as_slice()), &Unscoped);
+    assert!(poll_noop(&mut write).is_pending());
+    reactor.poll(0).unwrap();
+    let op = mock.only_pending();
+    assert_eq!(op.kind, OpKind::Writev);
+    assert_eq!(op.gathered.as_deref(), Some(&[1, 2, b'x', b'y', b'z'][..]));
+    mock.complete(op.user_data, 3);
+    reactor.poll(8).unwrap();
+    let BufResult { result, buf } = ready(poll_noop(&mut write));
+    assert_eq!(result.unwrap(), 3, "short writes are reported as is");
+    assert_eq!(buf, (vec![1, 2], b"xyz".as_slice()));
+    assert_eq!(reactor.in_flight(), 0);
+}
+
+#[test]
+fn writev_error_returns_buffers() {
+    let (reactor, mock) = reactor();
+    let segments: Vec<Vec<u8>> = vec![vec![1], vec![], vec![2, 3]];
+    let mut write = reactor.writev_at(&Rc::new(3), 0, segments, &Unscoped);
+    assert!(poll_noop(&mut write).is_pending());
+    reactor.poll(0).unwrap();
+    let op = mock.only_pending();
+    assert_eq!(op.gathered.as_deref(), Some(&[1, 2, 3][..]));
+    mock.complete(op.user_data, -libc::EIO);
+    reactor.poll(8).unwrap();
+    let BufResult { result, buf } = ready(poll_noop(&mut write));
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+    assert_eq!(buf, [vec![1], vec![], vec![2, 3]]);
+}
+
+#[test]
+fn writev_rejects_invalid_input_before_submission() {
+    let (reactor, mock) = reactor();
+    let fd: MockFd = Rc::new(3);
+    let mut offset = reactor.writev_at(&fd, 1 << 63, (vec![1u8], vec![2u8]), &Unscoped);
+    let outcome = ready(poll_noop(&mut offset));
+    assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(outcome.buf, (vec![1], vec![2]));
+    let many: Vec<&'static [u8]> = vec![b"x"; 1025];
+    let mut many = reactor.writev_at(&fd, 0, many, &Unscoped);
+    let outcome = ready(poll_noop(&mut many));
+    assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(outcome.buf.len(), 1025);
+    reactor.poll(1).unwrap();
+    assert!(mock.pending().is_empty());
+}
+
+#[test]
+fn dropped_writev_keeps_segments_until_both_completions() {
+    let (reactor, mock) = reactor();
+    let (header, header_dropped) = Tracked::new(4);
+    let (body, body_dropped) = Tracked::new(4);
+    let mut write = reactor
+        .writev_at(&Rc::new(1), 0, (header, body), &Unscoped)
+        .offload();
+    assert!(poll_noop(&mut write).is_pending());
+    assert_eq!(
+        mock.state.borrow().hints,
+        [(OpKind::Writev, PushHints::new().with_offload(true))]
+    );
+    reactor.poll(0).unwrap();
+    let op = mock.only_pending();
+    drop(write);
+    reactor.poll(0).unwrap();
+    mock.complete(op.user_data, 0);
+    reactor.poll(8).unwrap();
+    assert!(!header_dropped.get() && !body_dropped.get());
+    mock.complete_cancel(op.user_data, -libc::EALREADY);
+    reactor.poll(8).unwrap();
+    assert!(header_dropped.get() && body_dropped.get());
+    assert_eq!(reactor.in_flight(), 0);
 }
 
 #[test]

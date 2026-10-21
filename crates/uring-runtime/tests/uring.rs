@@ -268,6 +268,43 @@ fn memfd() -> Fd {
 }
 
 #[test]
+fn vectored_file_write() {
+    let Some(reactor) = reactor() else { return };
+    let file = memfd();
+    let written = block_on(
+        &reactor,
+        reactor.writev_at(&file, 3, (b"head".as_slice(), vec![1u8, 2, 3]), &Unscoped),
+    );
+    assert_eq!(written.result.unwrap(), 7);
+    assert_eq!(written.buf.1, [1, 2, 3]);
+    let read = block_on(
+        &reactor,
+        reactor.read_at(&file, 0, Vec::with_capacity(16), &Unscoped),
+    );
+    assert_eq!(read.buf, b"\0\0\0head\x01\x02\x03");
+    let written = block_on(
+        &reactor,
+        reactor
+            .writev_at(&file, 0, vec![b"ab".as_slice(), b"".as_slice()], &Unscoped)
+            .offload(),
+    );
+    assert_eq!(written.result.unwrap(), 2);
+    let read_only = block_on(
+        &reactor,
+        reactor.writev_at(
+            &Fd::from(std::fs::File::open("/dev/null").unwrap()),
+            0,
+            (b"x".as_slice(), b"y".as_slice()),
+            &Unscoped,
+        ),
+    );
+    assert_eq!(
+        read_only.result.unwrap_err().raw_os_error(),
+        Some(libc::EBADF)
+    );
+}
+
+#[test]
 fn positioned_file_io() {
     let Some(reactor) = reactor() else { return };
     let file = memfd();

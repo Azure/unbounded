@@ -170,7 +170,7 @@ pub use admission::{Rejection, RejectionReason, Reservation};
 pub use fence::Fence;
 pub use ops::{
     Accept, Fsync, Leased, MkDirAt, Nop, OpSpec, OpenAt2, Operation, ReadAt, Readiness, RenameAt,
-    SleepUntil, SocketRecv, SocketSend, Statx, UnlinkAt, WriteAt,
+    SleepUntil, SocketRecv, SocketSend, Statx, UnlinkAt, WriteAt, WritevAt,
 };
 
 use admission::{Partition, ReservationShared};
