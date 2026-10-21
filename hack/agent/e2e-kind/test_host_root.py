@@ -174,7 +174,8 @@ class TestHostRootStates(unittest.TestCase):
         units = unit_dir or bin_dir
         unit = (f"ExecStart={units}/unbounded-agent-current daemon\n"
                 f"ExecStart={units}/unbounded-agent-daemon-recovery.sh\n"
-                f"ExecStartPost={units}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1\n")
+                f"ExecStartPost=-{units}/unbounded-agent-nspawn-lifecycle "
+                "nspawn-lifecycle post-start kube1\n")
         with patch.object(e2e, "host_root_state", return_value=state), \
                 patch.object(e2e, "read_daemon_current_target", return_value=f"{bin_dir}/unbounded-agent-blue"), \
                 patch.object(e2e, "present_on_host", return_value=[]), \
@@ -198,7 +199,8 @@ class TestHostRootStates(unittest.TestCase):
         bin_dir = e2e.DAEMON_BIN_DIR
         complete = (f"ExecStart={bin_dir}/unbounded-agent-current daemon\n"
                     f"ExecStart={bin_dir}/unbounded-agent-daemon-recovery.sh\n"
-                    f"ExecStartPost={bin_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1\n")
+                    f"ExecStartPost=-{bin_dir}/unbounded-agent-nspawn-lifecycle "
+                    "nspawn-lifecycle post-start kube1\n")
         for missing in complete.splitlines():
             units = complete.replace(missing + "\n", "")
             with self.subTest(missing=missing), patch.object(e2e, "ssh_capture", return_value=units):

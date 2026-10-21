@@ -45,7 +45,10 @@ RestartSec=10s
 ExecStartPre=-/usr/bin/machinectl terminate kube2
 ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube2
 ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube2 || /usr/bin/mount -t bpf bpf /run/bpffs/kube2'
-ExecStartPost=/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube2
+# NVIDIA reconciliation failures must not fail the nspawn unit. The lifecycle
+# hook restores containerd and kubelet before returning an error so the node
+# remains observable while the host-side failure is reported in the journal.
+ExecStartPost=-/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube2
 Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
 Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
 
