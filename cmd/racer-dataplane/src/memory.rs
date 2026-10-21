@@ -846,7 +846,11 @@ impl CiphertextPage {
         self.inner.checksum.get().copied()
     }
     pub(crate) fn verify_checksum(&self) -> Result<()> {
-        let actual = racer_crypto::crc64(self.bytes());
+        self.verify_computed_checksum(racer_crypto::crc64(self.bytes()))
+    }
+    /// Verify a checksum the caller computed over exactly [`Self::bytes`],
+    /// with the same effect as [`Self::verify_checksum`].
+    pub(crate) fn verify_computed_checksum(&self, actual: u64) -> Result<()> {
         if self
             .inner
             .checksum

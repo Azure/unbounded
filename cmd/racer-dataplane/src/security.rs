@@ -518,6 +518,66 @@ impl PageCryptoEngine {
         CryptoOutcome::Completed(CryptoOutput::Staged(buffer))
     }
 
+    /// Decrypt with one read of the ciphertext for both its CRC and the AEAD
+    /// copy, when every check that the unfused path runs after the CRC would
+    /// pass. Returns `None` without side effects otherwise, so the caller's
+    /// unfused path reports exactly the error it always has.
+    ///
+    /// The unfused path scans the ciphertext for its CRC, then copies it into
+    /// plaintext storage for in-place AEAD: two reads of a page that, after an
+    /// RDMA receive, is no longer in cache. Here each chunk is checksummed
+    /// right after it is copied, while it is still cache resident.
+    fn open_fused(
+        key: &racer_crypto::identity::KeyLease,
+        ciphertext: &CiphertextPage,
+        plaintext: &flow_control::Charge<AdmissionPolicy>,
+        permit: &mut CryptoPermit,
+        scope: &RequestScope,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let envelope = ciphertext.envelope();
+        let length = envelope.plaintext_length as usize;
+        if key.cache() != &envelope.page.version.object.cache
+            || key.id() != envelope.key_id
+            || ciphertext.bytes().len() != envelope.ciphertext_length as usize
+            || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
+            || plaintext
+                .validate(ResourceClass::Plaintext, length)
+                .is_err()
+            || plaintext.key() != Some(&envelope.page.version.object.cache)
+        {
+            return Ok(None);
+        }
+        let Ok(aad) = page_aad(envelope) else {
+            return Ok(None);
+        };
+        let Ok(storage) = plaintext.buffer(length) else {
+            return Ok(None);
+        };
+        let mut bytes = Zeroizing::new(storage);
+        let (_, tag) = ciphertext.bytes().split_at(length);
+        let checksum = racer_crypto::copy_prefix_crc64(ciphertext.bytes(), &mut bytes)
+            .map_err(|_| Error::CorruptRecord)?;
+        ciphertext
+            .verify_computed_checksum(checksum)
+            .inspect_err(|_| {
+                permit.rejected(IntegrityRejection::Crc);
+            })?;
+        key.open_page_in_place(
+            &envelope.page.version.object.cache,
+            envelope.key_id,
+            &envelope.nonce.0,
+            &aad,
+            &mut bytes,
+            tag,
+        )
+        .map_err(|_| {
+            permit.rejected(IntegrityRejection::Aead);
+            permit.aead_failure = Some(capture_aead_failure(ciphertext, &aad, scope.request));
+            Error::CorruptRecord
+        })?;
+        Ok(Some(bytes))
+    }
+
     /// Borrow every quota owner until crypto and the final cancellation check succeed.
     fn prepare(
         input: &mut CryptoInput,
@@ -618,42 +678,48 @@ impl PageCryptoEngine {
                 plaintext,
             } => {
                 let envelope = ciphertext.envelope();
-                ciphertext.verify_checksum().inspect_err(|_| {
-                    permit.rejected(IntegrityRejection::Crc);
-                })?;
-                if key.cache() != &envelope.page.version.object.cache || key.id() != envelope.key_id
-                {
-                    return Err(Error::MissingKey);
+                if let Some(bytes) = Self::open_fused(key, ciphertext, plaintext, permit, scope)? {
+                    (envelope.clone(), bytes)
+                } else {
+                    ciphertext.verify_checksum().inspect_err(|_| {
+                        permit.rejected(IntegrityRejection::Crc);
+                    })?;
+                    if key.cache() != &envelope.page.version.object.cache
+                        || key.id() != envelope.key_id
+                    {
+                        return Err(Error::MissingKey);
+                    }
+                    let aad = page_aad(envelope)?;
+                    let length = envelope.plaintext_length as usize;
+                    if ciphertext.bytes().len() != envelope.ciphertext_length as usize
+                        || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
+                    {
+                        return Err(Error::CorruptRecord);
+                    }
+                    plaintext
+                        .validate(ResourceClass::Plaintext, envelope.plaintext_length as usize)?;
+                    if plaintext.key() != Some(&envelope.page.version.object.cache) {
+                        return Err(Error::InvalidConfiguration);
+                    }
+                    // Decryption allocates only plaintext-length storage,
+                    // never an uncharged tag-sized tail under plaintext admission.
+                    let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
+                    key.open_page(
+                        &envelope.page.version.object.cache,
+                        envelope.key_id,
+                        &envelope.nonce.0,
+                        &aad,
+                        ciphertext.bytes(),
+                        &mut bytes,
+                    )
+                    .map_err(|_| {
+                        permit.rejected(IntegrityRejection::Aead);
+                        permit.aead_failure =
+                            Some(capture_aead_failure(ciphertext, &aad, scope.request));
+                        Error::CorruptRecord
+                    })?;
+                    (envelope.clone(), bytes)
                 }
-                let aad = page_aad(envelope)?;
-                let length = envelope.plaintext_length as usize;
-                if ciphertext.bytes().len() != envelope.ciphertext_length as usize
-                    || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
-                {
-                    return Err(Error::CorruptRecord);
-                }
-                plaintext.validate(ResourceClass::Plaintext, envelope.plaintext_length as usize)?;
-                if plaintext.key() != Some(&envelope.page.version.object.cache) {
-                    return Err(Error::InvalidConfiguration);
-                }
-                // Decryption allocates only plaintext-length storage,
-                // never an uncharged tag-sized tail under plaintext admission.
-                let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
-                key.open_page(
-                    &envelope.page.version.object.cache,
-                    envelope.key_id,
-                    &envelope.nonce.0,
-                    &aad,
-                    ciphertext.bytes(),
-                    &mut bytes,
-                )
-                .map_err(|_| {
-                    permit.rejected(IntegrityRejection::Aead);
-                    permit.aead_failure =
-                        Some(capture_aead_failure(ciphertext, &aad, scope.request));
-                    Error::CorruptRecord
-                })?;
-                (envelope.clone(), bytes)
             }
         };
         scope.check().inspect_err(|error| {
