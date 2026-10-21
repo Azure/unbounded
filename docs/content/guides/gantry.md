@@ -374,8 +374,10 @@ DaemonSet in `unbounded-system`:
 
 The operator waits for `racer-dataplane` to exist before it makes these
 changes. The cache does not install Gantry. If no Site enables Gantry, the
-`gantry` cache is a plain Racer cache. Workload overrides on the `gantry`
-DaemonSet still apply on top of these changes.
+`gantry` cache is a plain Racer cache. The exception is a Gantry install the
+operator already manages. It stays in place after every Site turns Gantry off,
+and it still switches to Racer when the `gantry` cache exists. Workload
+overrides on the `gantry` DaemonSet still apply on top of these changes.
 
 ### Configure Upstream Registries
 
