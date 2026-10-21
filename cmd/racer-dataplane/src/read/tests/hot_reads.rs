@@ -682,7 +682,7 @@ pub(super) fn coordinator(
 }
 
 #[test]
-fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
+fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(1);
@@ -691,7 +691,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
         coordinator(&f, &signers[0], &membership, NoPeer::requester());
-    let open = |_ordered: bool, credits, start| {
+    let open = |credits, start| {
         let request = ClientRequest {
             retain: None,
             kind: ReadKind::Subscription {
@@ -717,9 +717,9 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     };
     // A one-byte first slice plus a whole page exceeds the byte credit despite
     // two available page slots. No page-one work may start yet.
-    let mut a = open(true, 2, PAGE_BYTES - 1);
-    let mut slow = open(true, 1, PAGE_BYTES - 1);
-    let mut unordered = open(false, 1, PAGE_BYTES - 1);
+    let mut a = open(2, PAGE_BYTES - 1);
+    let mut slow = open(1, PAGE_BYTES - 1);
+    let mut third = open(1, PAGE_BYTES - 1);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
         pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
@@ -728,18 +728,18 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     for _ in 0..32 {
         assert!(a.next_slice().as_mut().poll(&mut cx).is_pending());
         assert!(slow.next_slice().as_mut().poll(&mut cx).is_pending());
-        assert!(unordered.next_slice().as_mut().poll(&mut cx).is_pending());
+        assert!(third.next_slice().as_mut().poll(&mut cx).is_pending());
         pump(&mut endpoint);
     }
     assert_eq!(
         &*f.origin.started_pages.borrow(),
         &[0],
-        "same-page ordered work singleflights and unordered waits"
+        "same-page work singleflights across readers"
     );
     f.origin.blocked_pages.borrow_mut().clear();
     let mut first = None;
     let mut slow_first = None;
-    let mut unordered_first = None;
+    let mut third_first = None;
     for _ in 0..1024 {
         if first.is_none()
             && let Poll::Ready(result) = a.next_slice().as_mut().poll(&mut cx)
@@ -751,22 +751,22 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
         {
             slow_first = result.unwrap();
         }
-        if unordered_first.is_none()
-            && let Poll::Ready(result) = unordered.next_slice().as_mut().poll(&mut cx)
+        if third_first.is_none()
+            && let Poll::Ready(result) = third.next_slice().as_mut().poll(&mut cx)
         {
-            unordered_first = result.unwrap();
+            third_first = result.unwrap();
         }
-        if first.is_some() && slow_first.is_some() && unordered_first.is_some() {
+        if first.is_some() && slow_first.is_some() && third_first.is_some() {
             break;
         }
         pump(&mut endpoint);
     }
     assert_eq!(first.as_ref().unwrap().slice().length, 1);
-    assert!(slow_first.is_some() && unordered_first.is_some());
+    assert!(slow_first.is_some() && third_first.is_some());
     assert_eq!(
         f.origin.calls.get(),
         1,
-        "mixed reader reuses verified fixed-page result"
+        "every reader reuses the verified page result"
     );
     drop(first);
     a.release_page(PageNumber(0), 1).unwrap();
@@ -795,7 +795,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     assert_eq!(second.slice().page, PageNumber(1));
     drop(second);
     a.release_page(PageNumber(1), PAGE_BYTES as u32).unwrap();
-    drop((a, slow, unordered, slow_first, unordered_first));
+    drop((a, slow, third, slow_first, third_first));
     for _ in 0..32 {
         pump(&mut endpoint);
     }
@@ -803,7 +803,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
 }
 
 #[test]
-fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
+fn fetch_window_is_not_an_unreleased_credit_ceiling() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     // Full-page batch, then a one-byte boundary with byte credit just below
@@ -913,7 +913,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
 }
 
 #[test]
-fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
+fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for mode in ["success", "cancel", "drop", "failure"] {
@@ -945,21 +945,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             crate::read::ReadPayload::Stream(stream) => stream,
             crate::read::ReadPayload::Empty => panic!("expected a nonempty read stream"),
         };
-        let mut unordered = f
-            .fill
-            .dependencies
-            .metadata_owner
-            .subscriptions
-            .register(
-                f.page.version.clone(),
-                ByteRange::From(0)
-                    .resolve(f.origin.metadata.length)
-                    .unwrap(),
-                1,
-                PAGE_BYTES,
-                false,
-            )
-            .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1005,7 +990,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
         );
         assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
         assert_eq!(stream.buffered_pages(), 2);
-        assert!(unordered.poll_next(&mut cx).is_pending());
         if mode == "cancel" || mode == "drop" {
             if mode == "cancel" {
                 futures::executor::block_on(stream.cancel()).unwrap();
@@ -1015,17 +999,15 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
                 pump(&mut endpoint);
             }
             assert!(
-                unordered.poll_next(&mut cx).is_pending(),
+                queue.pending() > 0,
                 "canceled waiter is not actual origin completion"
             );
             f.origin.blocked_pages.borrow_mut().clear();
             for _ in 0..1024 {
                 pump(&mut endpoint);
             }
-            assert!(matches!(
-                unordered.poll_next(&mut cx),
-                Poll::Ready(Ok(crate::read::range_stream::Next::Select(_)))
-            ));
+            assert_eq!(queue.pending(), 0, "accepted head work drains its fence");
+            assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
         } else if mode == "failure" {
             f.origin.version_unavailable.set(true);
             f.origin.blocked_pages.borrow_mut().clear();
@@ -1069,16 +1051,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             stream
                 .release_page(PageNumber(0), PAGE_BYTES as u32)
                 .unwrap();
-            // The waiting unordered ticket must get its turn before ordered
-            // prefetch can refill, even though this stream still has credit.
-            stream.poll_prefetch(&mut cx);
-            assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
-            let Poll::Ready(Ok(crate::read::range_stream::Next::Select(selection))) =
-                unordered.poll_next(&mut cx)
-            else {
-                panic!("unordered turn after the fixed batch completes")
-            };
-            drop(selection);
             let delivery = Delivery::new(f.reactor.clone(), Duration::from_secs(30));
             let (socket, _stalled_client) = std::os::unix::net::UnixStream::pair().unwrap();
             let mut connection =
@@ -1120,7 +1092,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             );
             drop((stream, write, third));
         }
-        drop(unordered);
         for _ in 0..32 {
             pump(&mut endpoint);
         }

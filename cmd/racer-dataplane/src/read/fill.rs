@@ -183,23 +183,25 @@ impl Fill {
         if version.object != context.object {
             return Err(Error::InvalidRequest);
         }
-        let demand = match self
+        match self
             .dependencies
             .metadata_owner
             .warmed_page(&head, scope)
             .await?
         {
             super::dispatch::Warmed::Local(page) => return Ok(*page),
-            super::dispatch::Warmed::Unwarmed => demand,
-            // Warm completes pages in any order and only the head is known to
-            // be complete, so the provider may only select that page.
-            super::dispatch::Warmed::Remote => crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval {
-                    start: first.0,
-                    end: first.0.checked_add(1).ok_or(Error::InvalidRequest)?,
-                },
-            ])?,
-        };
+            super::dispatch::Warmed::Unwarmed => {}
+            // A warm job holds the head on a remote owner. Fill only that page
+            // through the normal path, which reaches the held copy, rather
+            // than selecting pages the warm job may not have finished.
+            super::dispatch::Warmed::Remote => {
+                return self
+                    .dependencies
+                    .metadata_owner
+                    .acquire_unobserved(head, membership, context, scope, budget)
+                    .await;
+            }
+        }
         // A new or credit-starved subscriber can lag behind provider completion.
         // Reuse its verified local head before asking for another node transfer.
         // The stable page owner rechecks current cache/key admission.
@@ -619,9 +621,7 @@ impl Fill {
     ) -> Operation<'a, PageResult> {
         Box::pin(async move {
             match self
-                .acquire_with_prefetch(
-                    page, membership, context, scope, budget, None, true, None, true,
-                )
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, true, true)
                 .await?
             {
                 AcquiredPage::Plaintext(page) => Ok(page),
@@ -639,9 +639,7 @@ impl Fill {
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
         match self
-            .acquire_with_prefetch(
-                page, membership, context, scope, budget, None, true, None, false,
-            )
+            .acquire_with_prefetch(page, membership, context, scope, budget, None, true, false)
             .await?
         {
             AcquiredPage::Plaintext(page) => Ok(page),
@@ -664,34 +662,6 @@ impl Fill {
             .await
     }
 
-    pub(crate) async fn acquire_ordered(
-        &self,
-        page: PageId,
-        membership: std::sync::Arc<crate::topology::Membership>,
-        context: &OriginContext,
-        scope: &RequestScope,
-        budget: &mut AcquisitionBudget,
-        guard: std::sync::Arc<super::range_stream::FixedAcquisition>,
-    ) -> Result<PageResult> {
-        match self
-            .acquire_with_prefetch(
-                page,
-                membership,
-                context,
-                scope,
-                budget,
-                None,
-                true,
-                Some(guard),
-                true,
-            )
-            .await?
-        {
-            AcquiredPage::Plaintext(page) => Ok(page),
-            AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
-        }
-    }
-
     pub fn acquire_ciphertext<'a>(
         &'a self,
         page: PageId,
@@ -702,9 +672,7 @@ impl Fill {
     ) -> Operation<'a, crate::memory::CiphertextCopy> {
         Box::pin(async move {
             Ok(self
-                .acquire_with_prefetch(
-                    page, membership, context, scope, budget, None, false, None, true,
-                )
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, false, true)
                 .await?
                 .copy())
         })
@@ -735,7 +703,6 @@ impl Fill {
                     budget,
                     Some(origin),
                     true,
-                    None,
                     false,
                 )
                 .await?
@@ -757,7 +724,6 @@ impl Fill {
         budget: &'a mut AcquisitionBudget,
         mut prefetch: Option<crate::origin::OriginPage>,
         plaintext: bool,
-        guard: Option<std::sync::Arc<super::range_stream::FixedAcquisition>>,
         observe: bool,
     ) -> Operation<'a, AcquiredPage> {
         Box::pin(async move {
@@ -850,7 +816,6 @@ impl Fill {
                             &mut waiter,
                             &mut prefetch,
                             plaintext,
-                            guard.clone(),
                             observation,
                         )
                         .await?;
@@ -861,8 +826,8 @@ impl Fill {
     }
 
     /// Transfer elected work to the worker driver. The caller only waits for its
-    /// remaining budget; dropping that wait cannot release accepted work or the
-    /// ordered-selection guard before the operation completes.
+    /// remaining budget; dropping that wait cannot release accepted work before
+    /// the operation completes.
     // Keep the reader's latched observation explicit at the driver handoff rather
     // than re-observing retries or coupling it to the flight's ownership guards.
     #[allow(clippy::too_many_arguments)]
@@ -873,7 +838,6 @@ impl Fill {
         waiter: &mut AcquisitionWaiter<'_>,
         prefetch: &mut Option<crate::origin::OriginPage>,
         plaintext: bool,
-        completion_guard: Option<Arc<super::range_stream::FixedAcquisition>>,
         observation: crate::retention::Observation,
     ) -> Result<()> {
         use std::future::Future;
@@ -911,7 +875,6 @@ impl Fill {
         let (send, mut receive) = futures::channel::oneshot::channel();
         driver_permit.submit_detached(Box::pin(async move {
             let _diagnostic_lifetime = diagnostic_lifetime;
-            let _completion_guard = completion_guard;
             let mut work = Box::pin(async {
                 if let Some(copy) = ready {
                     if !plaintext {

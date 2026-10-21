@@ -208,7 +208,7 @@ impl Coordinator {
                         membership,
                         scope.clone(),
                     )?;
-                    body.configure_subscription(page_credits, byte_credits, true)?;
+                    body.configure_subscription(page_credits, byte_credits)?;
                     Ok(ReadResponse {
                         retain_until: None,
                         metadata,

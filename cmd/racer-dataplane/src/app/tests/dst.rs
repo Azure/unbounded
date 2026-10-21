@@ -1311,11 +1311,11 @@ mod scenarios {
         }
         assert!(harness.coverage.secondary_worker_turns > 0);
         assert!(harness.coverage.relay_turns > 0);
-        // Exact deterministic count under injected pressure. Delivery mode and
-        // replica selection change turn ordering, so this pins the default
-        // `spread` selection: `primary` selection loses one more opaque
-        // read (8) to the injected pressure window.
-        assert_eq!(harness.coverage.success, 9, "opaque={opaque}");
+        // Exact deterministic count under injected pressure. Delivery mode,
+        // replica selection and the read window's memory probes change turn
+        // ordering, so this pins the default `spread` selection with the
+        // out-of-order fetch window.
+        assert_eq!(harness.coverage.success, 10, "opaque={opaque}");
     }
 }
 mod traffic {

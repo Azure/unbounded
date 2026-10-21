@@ -506,16 +506,9 @@ impl WarmRegistry {
         }
     }
 
-    #[cfg(test)]
+    /// Admit or join the warm job for `version`. Reads never own the version
+    /// exclusively, so admission does not depend on active provider selections.
     pub(super) fn begin(&self, version: &ObjectVersion) -> Result<(Arc<Job>, bool)> {
-        self.begin_selected(version, false)
-    }
-
-    pub(super) fn begin_selected(
-        &self,
-        version: &ObjectVersion,
-        selecting: bool,
-    ) -> Result<(Arc<Job>, bool)> {
         use std::sync::atomic::Ordering;
         if self.draining.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
@@ -546,9 +539,6 @@ impl WarmRegistry {
             }
             previous_until = progress.until;
             lease = Some(job.lease);
-        }
-        if selecting {
-            return Err(Error::Overloaded);
         }
         if (!jobs.contains_key(version) && jobs.len() >= config.max_jobs)
             || self
@@ -899,9 +889,7 @@ pub(crate) async fn admit(
         .checked_add(ttl.min(config.max_ttl))
         .ok_or(Error::InvalidRequest)?;
     let permit = uring_runtime::drivers::reserve()?;
-    let (job, fresh) = directory
-        .subscriptions
-        .admit_warm(&metadata.version, &directory.warm)?;
+    let (job, fresh) = directory.warm.begin(&metadata.version)?;
     let (send, receive) = futures::channel::oneshot::channel();
     permit.submit_detached(Box::pin(async move {
         let mut guard = JobGuard {
@@ -2491,7 +2479,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_completed_job_cannot_replace_active_provider_selection() {
+    fn warm_admission_is_not_refused_while_reads_select() {
         let registry = WarmRegistry::new(4);
         let version = version("a");
         let (job, _) = registry.begin(&version).unwrap();
@@ -2501,23 +2489,15 @@ mod tests {
             p.until = Some(SystemTime::UNIX_EPOCH);
         });
         let scheduler = super::super::range_stream::Scheduler::new(4);
-        let range = crate::model::ByteRange::From(0).resolve(3).unwrap();
-        let mut demand = scheduler
-            .register(version.clone(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let Poll::Ready(Ok(super::super::range_stream::Next::Select(selection))) =
-            demand.poll_next(&mut cx)
-        else {
-            panic!("selection");
-        };
-        assert!(matches!(
-            scheduler.admit_warm(&version, &registry),
-            Err(Error::Overloaded)
-        ));
-        assert_eq!(registry.snapshot().0, 0);
+        let demand = crate::peer::subscriptions::Demand::new(vec![
+            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+        ])
+        .unwrap();
+        let selection =
+            super::super::range_stream::Selection::for_test(&scheduler, version.clone(), demand);
+        // Reads hold no exclusive selection, so an expired job is replaced.
+        assert!(registry.begin(&version).unwrap().1);
         drop(selection);
-        assert!(scheduler.admit_warm(&version, &registry).unwrap().1);
     }
 
     #[test]

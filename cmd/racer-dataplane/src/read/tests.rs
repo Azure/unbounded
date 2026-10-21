@@ -2788,7 +2788,9 @@ mod timeouts {
             .validate(&f.context.object, PageNumber(0))
             .unwrap();
         // Another selection keeps the original signed deadline and spent ceilings,
-        // even though its local attempt starts later.
+        // even though its local attempt starts later. Dropping the first
+        // selection frees the provider contract for it.
+        scheduler.finish(&version, &demand);
         assert!(
             futures::executor::block_on(f.policy.subscribe(
                 version,

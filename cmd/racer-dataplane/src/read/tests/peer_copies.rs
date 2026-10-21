@@ -907,7 +907,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
 }
 
 #[test]
-fn subscription_behind_remote_warm_selects_only_published_pages() {
+fn subscription_behind_remote_warm_fills_only_the_published_head() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
@@ -974,15 +974,9 @@ fn subscription_behind_remote_warm_selects_only_published_pages() {
         b"abc"
     );
     assert_eq!(peers.calls.borrow().len(), 1);
-    assert_eq!(
-        *peers.demands.borrow(),
-        vec![
-            crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-            ])
-            .unwrap()
-        ],
-        "the unpublished tail is not offered to the provider"
+    assert!(
+        peers.demands.borrow().is_empty(),
+        "no selection is offered while warm holds the head remotely"
     );
     assert_eq!(f.origin.calls.get(), 0);
     drop(job);

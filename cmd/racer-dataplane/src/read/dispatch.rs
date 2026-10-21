@@ -110,11 +110,11 @@ enum Work {
         PeerOriginContext,
     ),
     AcquireUnobserved(PageId, Arc<crate::topology::Membership>, PeerOriginContext),
-    Ordered(
+    /// One read window page: the warm hold first, then ordinary Fill.
+    Fetch(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
         PeerOriginContext,
-        Arc<super::range_stream::FixedAcquisition>,
     ),
     Publish(VersionMetadata),
     Retained(ObjectVersion),
@@ -698,12 +698,12 @@ impl WorkerDirectory {
             _ => Err(Error::StaleFlight),
         }
     }
-    /// Always enqueue, including local ingress. The command and elected Fill
-    /// driver, rather than the detachable receipt, own mixed-mode exclusion.
-    pub(crate) fn start_ordered_page(
+    /// Fetch one read window page on its owner. Always enqueue, including local
+    /// ingress, so the owner's worker keeps accepted work fenced after the
+    /// caller detaches.
+    pub(crate) fn start_page(
         &self,
         page: PageId,
-        guard: super::range_stream::FixedAcquisition,
         membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
@@ -715,12 +715,7 @@ impl WorkerDirectory {
         let owner = self.page_owner(&page)?;
         let receipt = self.submit(
             owner,
-            Work::Ordered(
-                page,
-                membership,
-                self.seal(context, scope)?,
-                Arc::new(guard),
-            ),
+            Work::Fetch(page, membership, self.seal(context, scope)?),
             scope,
             Some(budget),
         )?;
@@ -1068,7 +1063,7 @@ async fn execute(
                 .await
                 .map(Value::Page)
         }
-        Work::Ordered(page, membership, envelope, guard) => {
+        Work::Fetch(page, membership, envelope) => {
             if let Warmed::Local(result) =
                 local.streams.directory().warmed_page(&page, scope).await?
             {
@@ -1077,13 +1072,12 @@ async fn execute(
             let context = local.open_context(envelope)?;
             local
                 .fill
-                .acquire_ordered(
+                .acquire(
                     page,
                     membership,
                     &context,
                     scope,
                     budget.ok_or(Error::StaleFlight)?,
-                    guard,
                 )
                 .await
                 .map(Value::Page)
@@ -1254,7 +1248,7 @@ mod tests {
         assert_eq!(directory.warm.snapshot(), (0, 0));
     }
     #[test]
-    fn ordered_and_unordered_commands_wait_behind_unstarted_warm_pages() {
+    fn fetch_and_select_commands_wait_behind_unstarted_warm_pages() {
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let (local, _fixture) = crate::read::tests::admission_coordinator();
@@ -1273,45 +1267,36 @@ mod tests {
             crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
                 .unwrap(),
         );
-        let range = crate::model::ByteRange::From(8 * crate::model::PAGE_BYTES)
-            .resolve(10 * crate::model::PAGE_BYTES)
-            .unwrap();
-        for ordered in [true, false] {
-            let mut demand = directory
-                .subscriptions
-                .register(
-                    version.clone(),
-                    range,
-                    2,
-                    2 * crate::model::PAGE_BYTES,
-                    ordered,
-                )
-                .unwrap();
+        for fetch in [true, false] {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             let envelope = local
                 .credentials
                 .seal(&context, AttemptId([3; 16]), &caller)
                 .unwrap();
-            let work = if ordered {
-                let Poll::Ready(Ok(Some((number, guard)))) = demand.poll_ordered(&mut cx) else {
-                    panic!("ordered credit");
-                };
-                Work::Ordered(
+            let work = if fetch {
+                Work::Fetch(
                     PageId {
                         version: version.clone(),
-                        number,
+                        number: crate::model::PageNumber(8),
                     },
                     membership.clone(),
                     envelope,
-                    Arc::new(guard),
                 )
             } else {
-                let Poll::Ready(Ok(super::super::range_stream::Next::Select(selection))) =
-                    demand.poll_next(&mut cx)
-                else {
-                    panic!("selection credit");
-                };
-                Work::Select(version.clone(), selection, membership.clone(), envelope)
+                let demand = crate::peer::subscriptions::Demand::new(vec![
+                    crate::peer::subscriptions::PageInterval { start: 8, end: 10 },
+                ])
+                .unwrap();
+                Work::Select(
+                    version.clone(),
+                    super::super::range_stream::Selection::for_test(
+                        &directory.subscriptions,
+                        version.clone(),
+                        demand,
+                    ),
+                    membership.clone(),
+                    envelope,
+                )
             };
             let mut budget = super::super::default_budget(&caller);
             let mut command = Box::pin(execute(&local, work, &caller, Some(&mut budget)));
