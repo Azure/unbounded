@@ -134,7 +134,14 @@ func renderOrigin(cache *racerv1.ClusterCache) (originSpec, error) {
 		return originSpec{}, fmt.Errorf("spec.origin.bucket: %w", err)
 	}
 
-	out.args = []string{"origin", "--cache=" + cache.Name, "--bucket=" + bucket, "--provider=azure", "--account-url=" + origin.Azure.AccountURL, "--azure-credential=" + credential}
+	// The socket path is name-based, so bind the origin to this ClusterCache
+	// UID: an origin left from a deleted cache with the same name then refuses
+	// requests for the recreated one instead of filling it.
+	if cache.UID == "" {
+		return originSpec{}, errors.New("metadata.uid is required")
+	}
+
+	out.args = []string{"origin", "--cache=" + cache.Name, "--cache-uid=" + string(cache.UID), "--bucket=" + bucket, "--provider=azure", "--account-url=" + origin.Azure.AccountURL, "--azure-credential=" + credential}
 
 	if origin.MetadataTTL != nil {
 		if origin.MetadataTTL.Duration < 0 {

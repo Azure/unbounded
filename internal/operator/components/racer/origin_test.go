@@ -160,7 +160,7 @@ func TestOriginCredentialRendering(t *testing.T) {
 			c := pod.Containers[0]
 			require.Equal(t, "mirror.test/unbounded/racer-object:v1", c.Image)
 			require.Equal(t, []string{
-				"origin", "--cache=cache", "--bucket=models", "--provider=azure",
+				"origin", "--cache=cache", "--cache-uid=" + string(cache.UID), "--bucket=models", "--provider=azure",
 				"--account-url=" + testAccountURL, "--azure-credential=" + tc.mode,
 				"--metadata-ttl=0s", "--request-timeout=1m30s", "--max-concurrent-requests=32",
 			}, c.Args)
@@ -182,6 +182,29 @@ func TestOriginCredentialRendering(t *testing.T) {
 	}
 }
 
+func TestOriginCacheUIDBindsRecreatedCache(t *testing.T) {
+	old := originCache("cache", nil)
+	recreated := originCache("cache", nil)
+	require.NotEqual(t, old.UID, recreated.UID)
+
+	oldSpec, err := renderOrigin(old)
+	require.NoError(t, err)
+	newSpec, err := renderOrigin(recreated)
+	require.NoError(t, err)
+	require.Contains(t, oldSpec.args, "--cache-uid="+string(old.UID))
+	require.Contains(t, newSpec.args, "--cache-uid="+string(recreated.UID))
+
+	oldHash, err := oldSpec.hash()
+	require.NoError(t, err)
+	newHash, err := newSpec.hash()
+	require.NoError(t, err)
+	require.NotEqual(t, oldHash, newHash)
+
+	old.UID = ""
+	_, err = renderOrigin(old)
+	require.ErrorContains(t, err, "metadata.uid is required")
+}
+
 func TestOriginOptionalFlagsOmittedWhenUnset(t *testing.T) {
 	spec, err := renderOrigin(originCache("cache", nil))
 	require.NoError(t, err)
@@ -195,7 +218,9 @@ func TestOriginOptionalFlagsOmittedWhenUnset(t *testing.T) {
 
 func TestOriginConfigHashTracksCredentialIdentity(t *testing.T) {
 	wi := func(client, tenant string) string {
-		spec, err := renderOrigin(originCache("cache", &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{ClientID: client, TenantID: tenant}}))
+		cache := originCache("cache", &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{ClientID: client, TenantID: tenant}})
+		cache.UID = "00000000-0000-4000-8000-000000000001"
+		spec, err := renderOrigin(cache)
 		require.NoError(t, err)
 		require.Empty(t, spec.env)
 

@@ -118,6 +118,25 @@ func TestCacheFlag(t *testing.T) {
 	}
 }
 
+func TestCacheUIDFlag(t *testing.T) {
+	o, err := parseOptions([]string{"origin", "--bucket=bucket"}, io.Discard)
+	if err != nil || o.cacheUID != "" {
+		t.Fatalf("default cache UID: options=%+v err=%v", o, err)
+	}
+
+	const uid = "00000000-0000-4000-8000-00000000000a"
+
+	o, err = parseOptions([]string{"origin", "--bucket=bucket", "--cache-uid=" + uid}, io.Discard)
+	if err != nil || o.cacheUID != uid {
+		t.Fatalf("cache UID: options=%+v err=%v", o, err)
+	}
+
+	_, err = parseOptions([]string{"origin", "--bucket=bucket", "--cache-uid=bad"}, io.Discard)
+	if err == nil || err.Error() != "invalid --cache-uid" {
+		t.Fatalf("invalid cache UID: %v", err)
+	}
+}
+
 func TestOptionsErrors(t *testing.T) {
 	for _, args := range [][]string{
 		nil,
@@ -146,6 +165,9 @@ func TestOptionsErrors(t *testing.T) {
 		{"sidecar", "--max-connections=0"},
 		{"sidecar", "--max-connections=-1"},
 		{"sidecar", "--max-concurrent-requests=512"},
+		{"origin", "--bucket=bucket", "--cache-uid=not-a-uid"},
+		{"origin", "--bucket=bucket", "--cache-uid=00000000-0000-4000-8000-00000000000A"},
+		{"sidecar", "--cache-uid=00000000-0000-4000-8000-00000000000a"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := parseOptions(args, io.Discard); err == nil {
