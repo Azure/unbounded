@@ -1,0 +1,307 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Racer
+
+# Racer runs as its own workflow so pushes to main can refresh the Cargo
+# caches. GitHub only lets pull requests and merge queue runs restore caches
+# from their own ref or the default branch, and ci.yaml does not run on main.
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    branches:
+      - main
+      - release-*
+  merge_group:
+    types:
+      - checks_requested
+  workflow_dispatch:
+
+concurrency:
+  group: racer-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.96.0"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
+
+# Cache policy for every job below:
+#   - Only pushes save, so each job keeps one current entry instead of one per
+#     pull request commit. Pull requests and the merge queue restore from main.
+#   - The key hashes the dataplane sources, so a push that does not touch them
+#     hits the existing entry and skips the save.
+#   - Restores fall back only within the same Cargo.lock, which keeps stale
+#     dependency artifacts from piling up in the cache.
+#   - The target directory, including incremental state, is cached because
+#     workspace crates dominate build time.
+
+jobs:
+  lint:
+    name: Racer Rust Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: cmd/racer-dataplane
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-lint-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
+          restore-keys: racer-lint-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy runtime
+        run: |
+          cargo clippy --locked -p uring-runtime --all-targets --all-features -- -D warnings
+          cargo clippy --locked -p uring-runtime --all-targets --no-default-features -- -D warnings
+
+      # Keep allocator invocations separate from runtime/workspace builds:
+      # runtime test features must not enable simulation in the production
+      # allocator gate. Clippy also type-checks every allocator target.
+      - name: Clippy allocator
+        run: |
+          cargo clippy --locked -p page-alloc --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked -p page-alloc --all-targets --no-default-features --features simulation -- -D warnings
+
+      - name: Clippy verbs feature combinations
+        run: |
+          for features in "" simulation native native,simulation; do
+            echo "::group::rdma-verbs features: ${features:-none}"
+            cargo clippy --locked -p rdma-verbs --all-targets --no-default-features --features "$features" -- -D warnings
+            echo "::endgroup::"
+          done
+
+      - name: Save Cargo cache
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  test:
+    name: Racer Rust Test (${{ matrix.features }} features)
+    # Real io_uring and direct I/O need a VM rather than a seccomp-restricted container.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: default
+            flags: ""
+          - features: all
+            flags: --all-features
+    env:
+      FEATURES: ${{ matrix.flags }}
+    defaults:
+      run:
+        working-directory: cmd/racer-dataplane
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Enable io_uring
+        run: sudo sysctl -w kernel.io_uring_disabled=0
+
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-test-${{ matrix.features }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
+          restore-keys: racer-test-${{ matrix.features }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+
+      # Building separately keeps compile and test time apart in the logs.
+      - name: Build tests
+        run: cargo test --locked --workspace $FEATURES --no-run
+
+      - name: Test
+        run: cargo test --locked --workspace $FEATURES
+
+      - name: Save Cargo cache
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  # Per-crate feature sets that the workspace builds above cannot exercise,
+  # because Cargo unifies features across the workspace.
+  feature-gates:
+    name: Racer Rust Feature Gates
+    # Real io_uring and direct I/O need a VM rather than a seccomp-restricted container.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: cmd/racer-dataplane
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Enable io_uring
+        run: sudo sysctl -w kernel.io_uring_disabled=0
+
+      - name: Install native verbs adapter build dependencies
+        run: sudo apt-get install -y --no-install-recommends libibverbs-dev
+
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-feature-gates-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
+          restore-keys: racer-feature-gates-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+
+      - name: Runtime production real I/O (no simulation)
+        env:
+          RUNTIME_REQUIRE_IO_URING: "1"
+        run: cargo test --locked -p uring-runtime --no-default-features
+
+      # Keep allocator invocations separate from runtime/workspace tests: runtime
+      # test features must not enable simulation in the production allocator gate.
+      - name: Allocator production real I/O (no simulation)
+        env:
+          PAGE_ALLOC_REQUIRE_REAL_IO: "1"
+        run: cargo test --locked -p page-alloc --no-default-features
+
+      - name: Allocator simulation
+        run: cargo test --locked -p page-alloc --no-default-features --features simulation
+
+      # Rust loads the adapter dynamically, so Cargo cannot compile-check its C ABI.
+      - name: Compile native C adapters (not hardware validation)
+        run: |
+          sh "$GITHUB_WORKSPACE/images/racer-dataplane/build-native.sh" verbs/native/verbs.c "$GITHUB_WORKSPACE/bin/racer-verbs-native/librdma_verbs.so.1"
+          sh "$GITHUB_WORKSPACE/images/racer-dataplane/build-native.sh" verbs/native/discovery_faults.c "$GITHUB_WORKSPACE/bin/racer-verbs-faults/librdma_verbs.so.1"
+
+      # Explicit zero-port and active-provider tests remain ignored. A hosted
+      # runner does not establish RDMA hardware or DMA/fencing correctness.
+      - name: Verbs without RDMA hardware
+        env:
+          RUST_TEST_THREADS: "1"
+        run: |
+          for features in "" simulation native native,simulation; do
+            echo "::group::rdma-verbs features: ${features:-none}"
+            verbs=(cargo test --locked -p rdma-verbs --no-default-features --features "$features")
+            if [[ $features == native* ]]; then
+              # Require the native adapter's ABI and symbols, then the C discovery
+              # and open cleanup fault paths, each in its own process.
+              LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-native" "${verbs[@]}" --lib ffi::tests::required_native_adapter_loads_abi_and_symbols -- --exact --ignored
+              for fault in internal_close_failures_keep_admission_and_adapter open_cleanup_failures_keep_admission_and_adapter; do
+                LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" "${verbs[@]}" --lib "ffi::discovery_fault_tests::$fault" -- --exact --ignored
+              done
+              LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-native" "${verbs[@]}"
+            else
+              "${verbs[@]}"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Save Cargo cache
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  miri:
+    name: Racer Runtime Miri
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Keep in sync with TOOLCHAIN in hack/scripts/runtime-miri.py.
+      RUSTUP_TOOLCHAIN: nightly-2025-11-21
+      RUNTIME_MIRI_TARGET_DIR: ${{ github.workspace }}/bin/racer-miri-cargo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Miri
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component miri,rust-src
+
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/miri
+            bin/racer-miri-cargo
+          key: racer-miri-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml', 'hack/scripts/runtime-miri.py') }}
+          restore-keys: racer-miri-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+
+      - name: Prepare Miri sysroot
+        run: cargo miri setup
+
+      - name: Run exact pure runtime tests
+        run: python3 hack/scripts/runtime-miri.py all
+
+      - name: Save Cargo cache
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/miri
+            bin/racer-miri-cargo
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  envtest:
+    name: Racer API Server Integration Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Provision envtest and run controller API-server race tests
+        run: make racer-envtest-ci

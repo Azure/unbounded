@@ -46,7 +46,7 @@ func TestRacerEnvtestCIContract(t *testing.T) {
 	require.Contains(t, provision, "use $(ENVTEST_K8S_VERSION)")
 	require.Contains(t, provision, `$(MAKE) racer-envtest KUBEBUILDER_ASSETS="$$assets"`)
 
-	workflow, err := os.ReadFile("../../.github/workflows/ci.yaml")
+	workflow, err := os.ReadFile("../../.github/workflows/racer.yaml")
 	require.NoError(t, err)
 
 	var ci struct {
@@ -60,9 +60,9 @@ func TestRacerEnvtestCIContract(t *testing.T) {
 	require.NoError(t, yaml.Unmarshal(workflow, &ci))
 
 	var commands []string
-	for _, step := range ci.Jobs["racer-envtest"].Steps {
+	for _, step := range ci.Jobs["envtest"].Steps {
 		commands = append(commands, step.Run)
 	}
 
-	require.Contains(t, commands, "timeout --signal=TERM --kill-after=10s 300s make racer-envtest-ci")
+	require.Contains(t, commands, "make racer-envtest-ci")
 }
