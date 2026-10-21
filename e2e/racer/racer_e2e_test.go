@@ -46,7 +46,7 @@ metadata:
   name: %s
 spec:
   origin:
-    buckets: [%s]
+    bucket: %s
     azure:
       accountURL: %s
 `, cacheName, bucket, accountURL))
@@ -123,15 +123,13 @@ metadata:
     app: fetch
     racer.unbounded-cloud.io/object-sidecar: enabled
   annotations:
-    racer.unbounded-cloud.io/object-namespace: %[2]q
-    racer.unbounded-cloud.io/object-buckets: %[3]s
-    racer.unbounded-cloud.io/object-cache: %[4]s
-    racer.unbounded-cloud.io/object-api: %[5]s
+    racer.unbounded-cloud.io/object-cache: %[2]s
+    racer.unbounded-cloud.io/object-api: %[3]s
 spec:
   restartPolicy: Never
   containers:
   - name: app
     image: curlimages/curl:8.11.1
-    command: ["sh", "-c", %[6]q]
-`, ns, accountURL, bucket, cacheName, api, script)
+    command: ["sh", "-c", %[4]q]
+`, ns, cacheName, api, script)
 }
