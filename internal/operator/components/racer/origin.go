@@ -125,13 +125,8 @@ func renderOrigin(cache *racerv1.ClusterCache) (originSpec, error) {
 		}
 	}
 
-	if err := racerobject.ValidateAzureAccountURL(origin.Azure.AccountURL, credential); err != nil {
-		return originSpec{}, fmt.Errorf("spec.origin.azure.accountURL: %w", err)
-	}
-
-	bucket := string(origin.Bucket)
-	if err := racerobject.ValidateBucket(bucket); err != nil {
-		return originSpec{}, fmt.Errorf("spec.origin.bucket: %w", err)
+	if _, _, err := racerobject.ParseAzureContainerURL(origin.Azure.ContainerURL, credential); err != nil {
+		return originSpec{}, fmt.Errorf("spec.origin.azure.containerURL: %w", err)
 	}
 
 	// The socket path is name-based, so bind the origin to this ClusterCache
@@ -141,7 +136,7 @@ func renderOrigin(cache *racerv1.ClusterCache) (originSpec, error) {
 		return originSpec{}, errors.New("metadata.uid is required")
 	}
 
-	out.args = []string{"origin", "--cache=" + cache.Name, "--cache-uid=" + string(cache.UID), "--bucket=" + bucket, "--provider=azure", "--account-url=" + origin.Azure.AccountURL, "--azure-credential=" + credential}
+	out.args = []string{"origin", "--cache=" + cache.Name, "--cache-uid=" + string(cache.UID), "--provider=azure", "--container-url=" + origin.Azure.ContainerURL, "--azure-credential=" + credential}
 
 	if origin.MetadataTTL != nil {
 		if origin.MetadataTTL.Duration < 0 {
