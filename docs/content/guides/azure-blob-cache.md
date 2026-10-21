@@ -43,7 +43,7 @@ metadata:
   name: racer-object
 spec:
   origin:
-    buckets: [mnist]
+    bucket: mnist
     azure:
       accountURL: https://azureopendatastorage.blob.core.windows.net
 EOF
@@ -52,8 +52,10 @@ EOF
 | Field | Set it to |
 |-------|-----------|
 | `metadata.name` | Keep `racer-object`. It is the default cache name for pods. |
-| `spec.origin.buckets` | The containers pods may read. |
-| `spec.origin.azure.accountURL` | Your blob service URL, such as `https://ACCOUNT.blob.core.windows.net`. |
+| `spec.origin.bucket` | The one container pods may read. You cannot change it later. |
+| `spec.origin.azure.accountURL` | Your blob service URL, such as `https://ACCOUNT.blob.core.windows.net`. You cannot change it later. |
+
+To read another container or account, create another ClusterCache.
 
 Wait for the cache to start:
 
@@ -127,7 +129,7 @@ For all fields, see
 
 ## 2. Deploy an Application
 
-To use the cache, add one label and three annotations to your pod:
+To use the cache, add one label and one annotation to your pod:
 
 ```bash
 kubectl create namespace racer-object-example
@@ -140,8 +142,6 @@ metadata:
     racer.unbounded-cloud.io/object-sidecar: enabled
   annotations:
     racer.unbounded-cloud.io/object-api: azure
-    racer.unbounded-cloud.io/object-namespace: https://azureopendatastorage.blob.core.windows.net
-    racer.unbounded-cloud.io/object-buckets: mnist
 spec:
   containers:
     - name: app
@@ -153,8 +153,9 @@ EOF
 | Annotation | Set it to |
 |------------|-----------|
 | `object-api` | `azure`, so pods use the Azure Blob API. |
-| `object-namespace` | The `accountURL` from step 1, with a lowercase scheme and host and no trailing slash. |
-| `object-buckets` | The containers this pod reads, comma-separated. Each must be in `spec.origin.buckets`. |
+
+The pod uses the `racer-object` cache by default. To use another cache, set
+`racer.unbounded-cloud.io/object-cache` to its name.
 
 For a Deployment, StatefulSet, or Job, put the label and annotations on the pod
 template. Changes apply only to new pods, so restart existing workloads after you
@@ -179,7 +180,7 @@ The URL form is `http://127.0.0.1:8080/CONTAINER/BLOB`, with no account name.
 
 {{< callout type="warning" >}}
 The local endpoint does not check credentials. Any process in the pod can read
-any blob in the pod's `object-buckets`. Do not expose it outside the pod.
+any blob in the cache's container. Do not expose it outside the pod.
 {{< /callout >}}
 
 ## Using the Azure SDK
@@ -216,8 +217,7 @@ kubectl -n unbounded-system logs daemonset/racer-origin-racer-object
 
 Common errors:
 
-- `403`: the container is not in `object-buckets` or `spec.origin.buckets`, the
-  `object-namespace` annotation does not match `accountURL`, or the identity
+- `403`: the container in the URL is not `spec.origin.bucket`, or the identity
   cannot read the blob.
 - `404`: the blob does not exist.
 - `501`: the client sent a header or option that is not supported.

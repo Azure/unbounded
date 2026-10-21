@@ -59,7 +59,7 @@ metadata:
   name: artifacts
 spec:
   origin:
-    buckets: [models]
+    bucket: models
     azure:
       accountURL: https://account.blob.core.windows.net
       credential:
@@ -69,11 +69,11 @@ spec:
 
 | Field | Meaning |
 |-------|---------|
-| `buckets` | Required. 1 to 64 blob container names the origin may read |
+| `bucket` | Required. The one blob container the origin may read. 1 to 255 characters from `[a-zA-Z0-9._-]`, not `.` or `..`. Immutable |
 | `metadataTTL` | Optional. How long object metadata is reused; not negative |
 | `requestTimeout` | Optional. Limit for each upstream request; positive |
 | `maxConcurrentRequests` | Optional. Upstream requests per origin pod, 1 to 65536 |
-| `azure.accountURL` | Required. Blob account URL; `http` or `https`, no credentials, query, or fragment |
+| `azure.accountURL` | Required. Blob account URL; `http` or `https`, no credentials, query, or fragment. Immutable |
 | `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
 | `azure.credential.default` | `DefaultAzureCredential`. Optional `clientID` for a user-assigned managed identity, or `secretRef` to a Secret in the operator namespace whose keys become environment variables |
 | `azure.credential.workloadIdentity` | Microsoft Entra Workload ID. Requires `clientID`, optional `tenantID`. The cluster must run the Azure Workload Identity webhook, and the identity must trust the origin ServiceAccount |
@@ -86,15 +86,14 @@ image pull secrets from the `racer-dataplane` DaemonSet, and waits until that
 DaemonSet exists. The origin runs as UID and GID 65532 and serves
 `/run/racer/<cache>/origin/socket`, which the dataplane creates.
 
-The origin's cache namespace is the account URL with a lowercase scheme and host,
-no default port, and no trailing slash, for example
-`https://account.blob.core.windows.net`. Sidecars must use the same values:
+Each ClusterCache maps to one container. You cannot change `bucket` or
+`azure.accountURL` after creation. To read a different source, create a new
+ClusterCache. It gets a new UID, so it starts with an empty cache. A pod that
+reads two containers needs two ClusterCaches and two sidecars.
 
-| Sidecar annotation | Value |
-|--------------------|-------|
-| `racer.unbounded-cloud.io/object-namespace` | The normalized account URL |
-| `racer.unbounded-cloud.io/object-cache` | The ClusterCache name |
-| `racer.unbounded-cloud.io/object-buckets` | A subset of `spec.origin.buckets` |
+Sidecars attach with `racer.unbounded-cloud.io/object-cache: <ClusterCache name>`.
+They can read any blob in the cache's container. The origin rejects requests
+for any other container with `403`.
 
 If the spec is not valid, the operator skips that origin and reports
 `OriginInvalid`. It reports `OriginPending` while the dataplane DaemonSet is
