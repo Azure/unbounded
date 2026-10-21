@@ -273,6 +273,62 @@ func TestCallerRangeCaseVariantsCannotAllocate(t *testing.T) {
 	}
 }
 
+func TestCallerIPAMCaseAliasesCannotAllocate(t *testing.T) {
+	for _, field := range []string{"IPAM", "Ipam", "iPaM"} {
+		t.Run(field, func(t *testing.T) {
+			called := make(chan struct{}, 1)
+			path := startTestServer(t, func() (*ipamproto.Config, error) {
+				called <- struct{}{}
+				return testConfig(t, "10.244.0.0/24"), nil
+			})
+			callerDataDir := t.TempDir()
+			printed := false
+			plugin := Plugin{
+				DataDir: t.TempDir(),
+				printResult: func(types.Result, string) error {
+					printed = true
+					return nil
+				},
+			}
+			args := testArgs(t, path, "net", "pod")
+
+			var input map[string]json.RawMessage
+			if err := json.Unmarshal(args.StdinData, &input); err != nil {
+				t.Fatal(err)
+			}
+
+			input[field] = json.RawMessage(fmt.Sprintf(`{"subnet":"10.99.0.0/24","dataDir":%q}`, callerDataDir))
+
+			data, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			args.StdinData = data
+			if err := plugin.Add(args); err == nil || !strings.Contains(err.Error(), "unsupported top-level IPAM alias") {
+				t.Fatalf("caller IPAM alias was not rejected: %v", err)
+			}
+
+			select {
+			case <-called:
+				t.Fatal("rejected input reached agent")
+			default:
+			}
+
+			if printed {
+				t.Fatal("rejected input produced a result")
+			}
+
+			for _, directory := range []string{plugin.DataDir, callerDataDir} {
+				entries, err := os.ReadDir(directory)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("rejected input created reservations in %s: %v, %v", directory, entries, err)
+				}
+			}
+		})
+	}
+}
+
 func TestResultFailureRollsBack(t *testing.T) {
 	conf := testConfig(t, "10.244.0.0/24")
 	path := startTestServer(t, func() (*ipamproto.Config, error) { return conf, nil })

@@ -49,6 +49,12 @@ func parseInput(args *skel.CmdArgs) (map[string]json.RawMessage, string, string,
 		return nil, "", "", fmt.Errorf("parse CNI input: %w", err)
 	}
 
+	for field := range input {
+		if field != "ipam" && strings.EqualFold(field, "ipam") {
+			return nil, "", "", fmt.Errorf("unsupported top-level IPAM alias %q; use ipam", field)
+		}
+	}
+
 	var name string
 	if err := json.Unmarshal(input["name"], &name); err != nil || !networkNamePattern.MatchString(name) {
 		return nil, "", "", errors.New("invalid CNI network name")
