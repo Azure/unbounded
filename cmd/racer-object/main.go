@@ -58,7 +58,7 @@ type options struct {
 	bucket          bucketFlag
 	provider        string
 	api             string
-	accountURL      string
+	containerURL    string
 	azureCredential string
 	region          string
 	endpoint        string
@@ -129,9 +129,9 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
 		fs.StringVar(&o.cacheUID, "cache-uid", "", "Optional ClusterCache UID (lowercase UUID) this origin serves; when set, requests for any other or no cache UID are refused so a leftover origin cannot fill a recreated cache with the same name")
-		fs.Var(&o.bucket, "bucket", "Required bucket/container (S3 bucket or Azure container) served by this origin; requests for any other bucket are forbidden")
+		fs.Var(&o.bucket, "bucket", "S3 bucket served by this origin; required for s3 and rejected for azure. Requests for any other bucket are forbidden")
 		fs.StringVar(&o.provider, "provider", "s3", "Upstream provider: s3 or azure")
-		fs.StringVar(&o.accountURL, "account-url", "", "Azure account HTTP(S) URL; required for azure, without credentials or query")
+		fs.StringVar(&o.containerURL, "container-url", "", "Azure Blob container URL (https://ACCOUNT.blob.core.windows.net/CONTAINER); required for azure, without credentials or query. Requests for any other container are forbidden")
 		fs.StringVar(&o.azureCredential, "azure-credential", "default", "Azure credential: default or anonymous; default requires HTTPS and uses the Azure credential chain (AZURE_CLIENT_ID and related environment variables)")
 		fs.StringVar(&o.region, "region", "", "AWS region (defaults to AWS configuration and environment)")
 		fs.StringVar(&o.endpoint, "endpoint", "", "Optional HTTP(S) upstream origin, without a path or credentials")
@@ -171,18 +171,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	closeResource(validationClient)
 
-	if o.mode == "origin" {
-		if o.bucket == "" {
-			return o, errors.New("--bucket is required")
-		}
-
-		if err := racerobject.ValidateBucket(string(o.bucket)); err != nil {
-			return o, errors.New("invalid --bucket")
-		}
-
-		if o.cacheUID != "" && !cacheUIDPattern.MatchString(o.cacheUID) {
-			return o, errors.New("invalid --cache-uid")
-		}
+	if o.mode == "origin" && o.cacheUID != "" && !cacheUIDPattern.MatchString(o.cacheUID) {
+		return o, errors.New("invalid --cache-uid")
 	}
 
 	if o.requestTimeout <= 0 {
@@ -194,7 +184,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 			return o, errors.New("--max-concurrent-requests must be between 1 and 65536")
 		}
 
-		if err := validateProviderOptions(o, fs); err != nil {
+		if err := validateProviderOptions(&o, fs); err != nil {
 			return o, err
 		}
 
