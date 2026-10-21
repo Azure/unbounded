@@ -61,9 +61,8 @@ metadata:
   name: artifacts
 spec:
   origin:
-    bucket: models
     azure:
-      accountURL: https://account.blob.core.windows.net
+      containerURL: https://account.blob.core.windows.net/models
       credential:
         workloadIdentity:
           clientID: 00000000-0000-0000-0000-000000000000
@@ -71,11 +70,10 @@ spec:
 
 | Field | Meaning |
 |-------|---------|
-| `bucket` | Required. The one blob container the origin may read. 1 to 255 characters from `[a-zA-Z0-9._-]`, not `.` or `..`. Immutable |
 | `metadataTTL` | Optional. How long object metadata is reused; not negative |
 | `requestTimeout` | Optional. Limit for each upstream request; positive |
 | `maxConcurrentRequests` | Optional. Upstream requests per origin pod, 1 to 65536 |
-| `azure.accountURL` | Required. Blob account URL; `http` or `https`, no credentials, query, or fragment. Immutable |
+| `azure.containerURL` | Required. The one blob container the origin may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
 | `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
 | `azure.credential.default` | `DefaultAzureCredential`. Optional `clientID` for a user-assigned managed identity, or `secretRef` to a Secret in the operator namespace whose keys become environment variables |
 | `azure.credential.workloadIdentity` | Microsoft Entra Workload ID. Requires `clientID`, optional `tenantID`. The cluster must run the Azure Workload Identity webhook, and the identity must trust the origin ServiceAccount |
@@ -88,8 +86,8 @@ image pull secrets from the `racer-dataplane` DaemonSet, and waits until that
 DaemonSet exists. The origin runs as UID and GID 65532 and serves
 `/run/racer/<cache>/origin/socket`, which the dataplane creates.
 
-Each ClusterCache maps to one container. You cannot change `bucket` or
-`azure.accountURL` after creation. To read a different source, create a new
+Each ClusterCache maps to one container. You cannot change
+`azure.containerURL` after creation. To read a different source, create a new
 ClusterCache. It gets a new UID, so it starts with an empty cache. A pod that
 reads two containers needs two ClusterCaches and two sidecars.
 
