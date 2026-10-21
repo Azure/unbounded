@@ -277,6 +277,31 @@ fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
 }
 
 #[test]
+fn detach_registered_shares_an_earlier_retained_copy() {
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let baseline = admission.used(ResourceClass::Ciphertext);
+    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let before = crate::memory::registered_copy_outs();
+    // A retaining path copies the page out first and the registered page
+    // remembers that copy.
+    let retained = pool.retainable(ciphertext.clone()).unwrap();
+    assert!(!retained.is_registered());
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
+    // Detaching afterwards shares it instead of copying again, and releases
+    // the unused reservation.
+    let charge = aligned_charge(&pool, &admission, &ciphertext);
+    let detached = pool.detach_registered(ciphertext, charge).unwrap();
+    assert!(Arc::ptr_eq(&detached.inner, &retained.inner));
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
+    pump!(w);
+    assert_eq!(free(&w), Some(2), "registered buffer returned");
+    drop((detached, retained));
+    pool.reclaim_idle_buffers();
+    assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
+}
+
+#[test]
 fn detach_registered_returns_the_buffer_to_the_worker_pool() {
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
