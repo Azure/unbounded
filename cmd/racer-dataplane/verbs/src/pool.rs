@@ -26,7 +26,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     task::Waker,
 };
@@ -118,6 +118,10 @@ pub(crate) struct PoolShared {
 
     /// Clients waiting for a free buffer in [`PoolShared::poll_stage`].
     waiters: Mutex<Vec<Waker>>,
+
+    /// The device has an implicit on-demand paging region, so the owner
+    /// writes [`crate::Source::Bytes`] straight from the caller's memory.
+    zero_copy: AtomicBool,
 }
 
 // SAFETY: `base` is only dereferenced through `RegisteredPage` and
@@ -131,6 +135,11 @@ impl PoolShared {
     #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn buffer_len(&self) -> usize {
         self.buffer_len
+    }
+
+    /// True if [`crate::Source::Bytes`] writes go out without a copy.
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.zero_copy.load(Ordering::Acquire)
     }
 
     /// Number of page buffers.
@@ -278,6 +287,10 @@ pub(crate) struct Pool {
     /// `None` only during drop.
     region: Option<Rc<NativeRegion>>,
 
+    /// The device's implicit on-demand paging region, if any: the local key
+    /// for zero-copy write sources.
+    implicit: Option<Rc<NativeRegion>>,
+
     quota: Arc<GuardOwner>,
 }
 
@@ -316,8 +329,10 @@ impl Pool {
                 free: Mutex::new((0..count as u32).rev().collect()),
                 owner: AtomicWaker::new(),
                 waiters: Mutex::new(Vec::new()),
+                zero_copy: AtomicBool::new(false),
             }),
             region: Some(region),
+            implicit: None,
             quota,
         })
     }
@@ -330,6 +345,19 @@ impl Pool {
     /// The registered region.
     pub(crate) fn region(&self) -> &Rc<NativeRegion> {
         self.region.as_ref().unwrap()
+    }
+
+    /// Use `implicit` (from [`NativeRegion::implicit`]) for zero-copy
+    /// [`crate::Source::Bytes`] writes.
+    pub(crate) fn set_implicit(&mut self, implicit: Rc<NativeRegion>) {
+        debug_assert!(implicit.is_implicit());
+        self.implicit = Some(implicit);
+        self.shared.zero_copy.store(true, Ordering::Release);
+    }
+
+    /// The implicit on-demand paging region, if the device has one.
+    pub(crate) fn implicit(&self) -> Option<&Rc<NativeRegion>> {
+        self.implicit.as_ref()
     }
 
     /// Byte offset of `buffer` in the region.
@@ -420,6 +448,7 @@ impl Drop for Pool {
             self.quota.quarantine();
             std::mem::forget(self.quota.clone());
             std::mem::forget(self.region.take());
+            std::mem::forget(self.implicit.take());
         }
     }
 }

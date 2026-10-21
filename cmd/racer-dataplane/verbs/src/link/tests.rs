@@ -998,3 +998,165 @@ fn failed_destroy_quarantines_then_frees_or_leaks() {
         finish(p);
     }
 }
+
+/// Give `side` an implicit on-demand paging region: zero-copy writes.
+fn odp(side: &mut Side) {
+    let implicit = NativeRegion::implicit(side.device.clone(), side.quota.clone()).unwrap();
+    side.pool.set_implicit(implicit);
+    assert!(side.pool.shared().zero_copy());
+}
+
+/// Grant `len` bytes on `a`, then write `source` from `b` (zero-copy), with
+/// the write held in flight by a delay. Returns the write and arrival ops.
+fn direct_write(p: &mut Pair, source: &Arc<Vec<u8>>) -> (Op<()>, Op<Arrival>) {
+    odp(&mut p.b);
+    let (now, deadline) = (p.now, p.now + 5 * SECOND);
+    let granted = grant(&mut p.a, source.len() as u32, deadline, now);
+    assert_eq!(pump(p), (None, None));
+    let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+    p.sim.fault(Operation::WriteImm, Fault::Delay(1_000_000));
+    let (written, done) = op();
+    p.b.link.write(
+        &p.b.pool,
+        tag,
+        Source::Bytes(source.clone()),
+        deadline,
+        done,
+        now,
+    );
+    assert_eq!(pump(p), (None, None));
+    assert_eq!(poll(&written), None, "held in flight");
+    (written, arrival)
+}
+
+#[test]
+/// A zero-copy write takes no pool buffer and holds its source until the
+/// completion, then lets go.
+fn zero_copy_write_reads_in_place_and_holds_the_source_until_completion() {
+    let mut p = pair();
+    odp(&mut p.b);
+    let source = Arc::new(vec![0x6b; 100]);
+    let (now, deadline) = (p.now, p.now + 5 * SECOND);
+    let granted = grant(&mut p.a, 100, deadline, now);
+    assert_eq!(pump(&mut p), (None, None));
+    let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+    p.sim.fault(Operation::WriteImm, Fault::Delay(3));
+    let (written, done) = op();
+    p.b.link.write(
+        &p.b.pool,
+        tag,
+        Source::Bytes(source.clone()),
+        deadline,
+        done,
+        now,
+    );
+    // Queued and posted: the owner holds the source, and no buffer is staged.
+    p.b.link.poll(&p.b.pool, now).unwrap();
+    assert_eq!(Arc::strong_count(&source), 2);
+    assert_eq!(free(&p.b), 4, "no send buffer");
+    assert_eq!(pump(&mut p), (None, None));
+    assert_eq!(poll(&written), Some(Ok(())));
+    assert_eq!(Arc::strong_count(&source), 1, "released on completion");
+    match poll(&arrival).unwrap().unwrap() {
+        Arrival::Page(page) => assert_eq!(page.bytes(), &source[..]),
+        Arrival::Released => panic!("expected a page"),
+    }
+    finish(p);
+}
+
+#[test]
+/// A broken link holds an in-flight zero-copy source until the QP is
+/// destroyed, retrying a failed destroy; a leak never frees it.
+fn zero_copy_source_outlives_the_qp_or_leaks() {
+    for leak in [false, true] {
+        let mut p = pair();
+        let source = Arc::new(vec![0x3c; 64]);
+        let (written, _arrival) = direct_write(&mut p, &source);
+        assert_eq!(Arc::strong_count(&source), 2);
+        let qpn = p.b.link.endpoint().qpn;
+        p.sim.reject(Operation::Stop, Some(qpn), true);
+        assert!(!p.b.link.destroy(&p.b.pool));
+        assert_eq!(poll(&written), Some(Err(Error::Unavailable)));
+        assert_eq!(
+            Arc::strong_count(&source),
+            2,
+            "the NIC may still read it before the QP is gone"
+        );
+        if leak {
+            p.b.link.leak(&p.b.pool);
+            drop(p);
+            assert_eq!(Arc::strong_count(&source), 2, "leaked, never freed");
+            continue;
+        }
+        p.sim.reject(Operation::Stop, Some(qpn), false);
+        assert!(p.b.link.destroy(&p.b.pool));
+        assert_eq!(Arc::strong_count(&source), 1);
+        assert!(p.a.link.destroy(&p.a.pool));
+    }
+}
+
+#[test]
+/// A write still waiting in the outbox at its deadline drops its zero-copy
+/// source without a fence: it never reached the NIC.
+fn unposted_zero_copy_write_expires_and_drops_its_source() {
+    let mut p = pair();
+    odp(&mut p.b);
+    let source = Arc::new(vec![1; 16]);
+    let now = p.now;
+    let (written, done) = op();
+    // No grant yet: the write waits, then its deadline passes.
+    p.b.link.write(
+        &p.b.pool,
+        9,
+        Source::Bytes(source.clone()),
+        now + SECOND,
+        done,
+        now,
+    );
+    assert_eq!(Arc::strong_count(&source), 2);
+    p.now += 2 * SECOND;
+    assert_eq!(pump(&mut p), (None, None));
+    assert_eq!(poll(&written), Some(Err(Error::DeadlineExceeded)));
+    assert_eq!(Arc::strong_count(&source), 1);
+    finish(p);
+}
+
+#[test]
+/// Without implicit ODP no region is made and writes copy into a buffer;
+/// the implicit region is never a receive target or window.
+fn implicit_region_is_optional_and_send_only() {
+    let p = pair();
+    p.sim.implicit_odp(false);
+    assert!(NativeRegion::implicit(p.b.device.clone(), p.b.quota.clone()).is_none());
+    assert!(!p.b.pool.shared().zero_copy());
+    p.sim.implicit_odp(true);
+    let implicit = NativeRegion::implicit(p.b.device.clone(), p.b.quota.clone()).unwrap();
+    assert!(implicit.is_implicit());
+    let qp = NativeQueuePair::new_with_depth(
+        p.b.device.clone(),
+        p.b.quota.clone(),
+        Arc::new(AtomicBool::new(false)),
+        4,
+        4,
+    )
+    .unwrap();
+    let bytes = [0u8; 8];
+    let id = (1 << 56) | 1;
+    assert_eq!(
+        qp.post_recv(id, &implicit, bytes.as_ptr() as u64, 8),
+        Err(Error::InvalidRequest)
+    );
+    let control =
+        NativeRegion::with_access(p.b.device.clone(), 64, Access::CONTROL, p.b.quota.clone())
+            .unwrap();
+    assert_eq!(
+        qp.post_recv(id, &control, 0, 8),
+        Ok(()),
+        "same post, normal region"
+    );
+    assert!(qp.stop().is_ok());
+    drop(qp);
+    drop(control);
+    drop(implicit);
+    finish(p);
+}

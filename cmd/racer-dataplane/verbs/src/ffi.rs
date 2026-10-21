@@ -110,7 +110,7 @@ const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
 #[cfg(all(feature = "native", target_os = "linux"))]
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 
 /// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
 pub(crate) mod opcode {
@@ -160,6 +160,10 @@ impl Access {
     /// Page buffers plus `REMOTE_WRITE` on the region itself. The
     /// `mr_remote_write` escape hatch uses this.
     pub(crate) const PAGES_REMOTE_WRITE: Self = Self(1 | 4);
+
+    /// Marks an implicit ODP region from `rdma_verbs_register_implicit`.
+    /// Never passed to `rdma_verbs_register`; only a local write source.
+    pub(crate) const IMPLICIT: Self = Self(8);
 
     /// The raw ABI value.
     pub(crate) fn bits(self) -> u32 {
@@ -248,6 +252,8 @@ native_api! {
     qp_free: unsafe extern "C" fn(*mut c_void) -> c_int,
 
     register: unsafe extern "C" fn(*mut c_void, u64, u32) -> *mut c_void,
+
+    register_implicit: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
 
     deregister: unsafe extern "C" fn(*mut c_void) -> c_int,
 
@@ -547,6 +553,31 @@ impl NativeRegion {
             busy: Cell::new(false),
             access,
         }))
+    }
+
+    /// Register the whole process address space as one implicit on-demand
+    /// paging MR, for zero-copy write sources. `None` if the device lacks
+    /// implicit ODP for RC writes.
+    ///
+    /// The region owns no bytes: an `offset` is a virtual address, and
+    /// [`Self::as_ptr`] is null. Callers must keep the source memory alive
+    /// and unmodified until the post's completion or the QP's destruction.
+    pub(crate) fn implicit(device: Rc<NativeDevice>, quota: Arc<GuardOwner>) -> Option<Rc<Self>> {
+        let raw = NonNull::new(unsafe { (device.api.register_implicit)(device.raw.as_ptr()) })?;
+        Some(Rc::new(Self {
+            device,
+            raw,
+            length: usize::MAX,
+            used: Cell::new(usize::MAX),
+            quota: Some(quota),
+            busy: Cell::new(false),
+            access: Access::IMPLICIT,
+        }))
+    }
+
+    /// True for an implicit address-space region from [`Self::implicit`].
+    pub(crate) fn is_implicit(&self) -> bool {
+        self.access == Access::IMPLICIT
     }
 
     /// The start of the registered buffer, valid while `self` lives.
@@ -1256,6 +1287,7 @@ impl NativeQueuePair {
         post: impl FnOnce() -> c_int,
     ) -> Result<()> {
         if id & CALLER_ID_MASK == 0
+            || (region.is_implicit() && (recv || opcode != opcode::RDMA_WRITE))
             || !Rc::ptr_eq(&region.device, &self.device)
             || !region.contains(offset, length)
             || self.pending.borrow().contains_key(&id)
@@ -1598,6 +1630,11 @@ pub(crate) mod lifetime_tests {
         0
     }
 
+    /// The fixture device has no implicit ODP.
+    unsafe extern "C" fn register_implicit(_: *mut c_void) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
     /// Allocate a fixture queue pair with a fixed valid number.
     unsafe extern "C" fn qp(_: *mut c_void, _: u8, _: u32, _: u32, qpn: *mut u32) -> *mut c_void {
         unsafe {
@@ -1775,6 +1812,7 @@ pub(crate) mod lifetime_tests {
             stop,
             qp_free,
             register,
+            register_implicit,
             deregister,
             bytes,
             window,

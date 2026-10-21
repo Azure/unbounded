@@ -67,7 +67,7 @@ struct rdma_verbs_qp { struct ibv_qp *qp; struct ibv_cq *cq; };
 struct rdma_verbs_mr { struct ibv_mr *mr; void *bytes; size_t length; };
 
 /* ABI version. Rust refuses to load any other value. */
-uint32_t rdma_verbs_abi(void) { return 2; }
+uint32_t rdma_verbs_abi(void) { return 3; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
@@ -255,6 +255,29 @@ int rdma_verbs_deregister(struct rdma_verbs_mr *m) {
     int rc = ibv_dereg_mr(m->mr);
     if (!rc) { free(m->bytes); free(m); }
     return rc;
+}
+/* Register the whole address space of this process as one implicit
+ * on-demand-paging (ODP) MR, for zero-copy write sources. The NIC resolves
+ * pages on use and the kernel keeps the mapping coherent with munmap and
+ * reuse, so any live process memory can be a local SGE without a per-buffer
+ * registration. Returns NULL if the device lacks implicit ODP for RC writes.
+ * `bytes` is NULL and `length` SIZE_MAX, so an `offset` is a virtual address.
+ * Local read only; the region is never a receive target or window. */
+void *rdma_verbs_register_implicit(struct rdma_verbs_device *d) {
+    struct ibv_device_attr_ex attr;
+    memset(&attr, 0, sizeof(attr));
+    if (ibv_query_device_ex(d->ctx, NULL, &attr)) return NULL;
+    if (!(attr.odp_caps.general_caps & IBV_ODP_SUPPORT) ||
+        !(attr.odp_caps.general_caps & IBV_ODP_SUPPORT_IMPLICIT) ||
+        !(attr.odp_caps.per_transport_caps.rc_odp_caps & IBV_ODP_SUPPORT_WRITE)) return NULL;
+    struct rdma_verbs_mr *m = calloc(1, sizeof(*m));
+    if (!m) return NULL;
+    m->mr = ibv_reg_mr(d->pd, NULL, SIZE_MAX, IBV_ACCESS_ON_DEMAND);
+    /* Some providers require local write on any ODP MR. */
+    if (!m->mr) m->mr = ibv_reg_mr(d->pd, NULL, SIZE_MAX, IBV_ACCESS_ON_DEMAND | IBV_ACCESS_LOCAL_WRITE);
+    if (!m->mr) { free(m); return NULL; }
+    m->bytes = NULL; m->length = SIZE_MAX;
+    return m;
 }
 /* The buffer behind a registered region. */
 void *rdma_verbs_bytes(struct rdma_verbs_mr *m) { return m->bytes; }

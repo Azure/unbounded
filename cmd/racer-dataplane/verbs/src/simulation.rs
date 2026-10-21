@@ -192,6 +192,9 @@ struct World {
     /// Fail binds on regions registered without remote write.
     require_mr_remote_write: bool,
 
+    /// Devices report no implicit on-demand paging.
+    no_implicit_odp: bool,
+
     trace: Vec<Event>,
 
     sequence: u64,
@@ -295,6 +298,10 @@ const MR_CONTROL: u32 = 2;
 
 /// `RDMA_VERBS_MR_REMOTE_WRITE`.
 const MR_REMOTE_WRITE: u32 = 4;
+
+/// An implicit on-demand paging region over this process's address space.
+/// Offsets are virtual addresses; it is only a local write or send source.
+const MR_IMPLICIT: u32 = 8;
 
 /// Verbs completion statuses the fabric produces.
 mod wc {
@@ -490,6 +497,12 @@ impl Simulation {
         self.world.borrow_mut().require_mr_remote_write = enabled;
     }
 
+    /// Choose whether devices support implicit on-demand paging, the
+    /// zero-copy write source. On by default.
+    pub fn implicit_odp(&self, enabled: bool) {
+        self.world.borrow_mut().no_implicit_odp = !enabled;
+    }
+
     /// Copy of the trace so far.
     pub fn trace(&self) -> Vec<Event> {
         self.world.borrow().trace.clone()
@@ -543,6 +556,7 @@ pub(super) fn api() -> Rc<Api> {
         stop,
         qp_free,
         register,
+        register_implicit,
         deregister,
         bytes,
         window,
@@ -796,6 +810,10 @@ impl World {
             self.resources.get(&qp),
             Some(Resource::Qp { stopped: false, .. })
         ) && self.device(recv.region) == self.device(qp)
+            && !matches!(
+                self.resources.get(&recv.region),
+                Some(Resource::Region { access, .. }) if access & MR_IMPLICIT != 0
+            )
             && self.region_fits(recv.region, recv.offset, recv.length);
         if !valid || fault == Some(Fault::Reject) {
             self.record(Operation::PostRecv, qp, Some(recv.id), -1, false);
@@ -810,6 +828,14 @@ impl World {
 
     /// True if `[offset, offset + length)` is a nonempty range of the region.
     fn region_fits(&self, region: u32, offset: u64, length: u32) -> bool {
+        if let Some(Resource::Region { access, .. }) = self.resources.get(&region)
+            && access & MR_IMPLICIT != 0
+        {
+            return length > 0
+                && offset
+                    .checked_add(length.into())
+                    .is_some_and(|end| usize::try_from(end).is_ok());
+        }
         matches!(
             self.resources.get(&region),
             Some(Resource::Region { bytes, .. }) if length > 0
@@ -840,6 +866,15 @@ impl World {
     /// A copy of `length` bytes of a region at `offset`.
     fn read(&self, region: u32, offset: u64, length: u32) -> Option<Vec<u8>> {
         match self.resources.get(&region) {
+            // SAFETY: an implicit region's offset is a live virtual address.
+            // The verbs owner holds the source until this work completes or
+            // the QP is destroyed, exactly as the NIC requires.
+            Some(Resource::Region { access, .. }) if access & MR_IMPLICIT != 0 => Some(
+                unsafe {
+                    std::slice::from_raw_parts(offset as usize as *const u8, length as usize)
+                }
+                .to_vec(),
+            ),
             Some(Resource::Region { bytes, .. }) => bytes
                 .get(offset as usize..offset as usize + length as usize)
                 .map(<[u8]>::to_vec),
@@ -1372,6 +1407,37 @@ unsafe extern "C" fn register(device: *mut c_void, length: u64, access: u32) -> 
             bytes: vec![0; length as usize].into_boxed_slice(),
             address,
             access,
+        },
+    );
+    h.sim
+        .world
+        .borrow_mut()
+        .record(Operation::Register, h.id, None, 0, false);
+    raw
+}
+
+/// Register an implicit on-demand paging region, unless turned off with
+/// [`Simulation::implicit_odp`]. Traced and faulted as `Register`.
+unsafe extern "C" fn register_implicit(device: *mut c_void) -> *mut c_void {
+    let Some(h) = (unsafe { handle(device) }) else {
+        return std::ptr::null_mut();
+    };
+    let mut world = h.sim.world.borrow_mut();
+    if world.no_implicit_odp || !matches!(world.resources.get(&h.id), Some(Resource::Device(_))) {
+        world.record(Operation::Register, h.id, None, -1, false);
+        return std::ptr::null_mut();
+    }
+    if world.rejected(Operation::Register, h.id) {
+        return std::ptr::null_mut();
+    }
+    drop(world);
+    let raw = allocate(
+        &h.sim,
+        Resource::Region {
+            device: h.id,
+            bytes: Box::default(),
+            address: 0,
+            access: MR_IMPLICIT,
         },
     );
     h.sim

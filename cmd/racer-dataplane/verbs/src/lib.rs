@@ -26,6 +26,16 @@
 //!
 //! See `designs/racer-verbs.md`.
 //!
+//! # Zero-copy sends
+//!
+//! With [`NodeConfig::zero_copy`], each device also gets one implicit
+//! on-demand paging (ODP) MR over the whole address space. A
+//! [`Source::Bytes`] write then posts the caller's memory directly as its
+//! SGE; the owner holds the source `Arc` until the send completion, or until
+//! the QP is destroyed if the link breaks, and leaks it if destroy fails.
+//! Devices without implicit ODP for RC writes copy into a page buffer
+//! instead. [`Client::zero_copy`] reports which applies per rail.
+//!
 //! # Stopping is the only fence
 //!
 //! A timeout or an invalidate does not stop the NIC from writing memory. Only

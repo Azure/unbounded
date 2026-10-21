@@ -70,7 +70,11 @@ pub enum Arrival {
 
 /// Bytes to write into a peer's grant.
 pub enum Source {
-    /// The owner copies into a free page buffer on its thread.
+    /// Caller memory. With an implicit on-demand paging region on the
+    /// link's device ([`crate::Client::zero_copy`]) the NIC reads it in place
+    /// and the owner holds the `Arc` until the write completes or the QP is
+    /// destroyed; the bytes must not change meanwhile. Otherwise the owner
+    /// copies into a free page buffer on its thread.
     Bytes(Arc<dyn AsRef<[u8]> + Send + Sync>),
 
     /// Already staged in a page buffer of the link's device.
@@ -254,7 +258,7 @@ enum Outgoing {
     Write {
         tag: u32,
 
-        buffer: Buffer,
+        buffer: Payload,
 
         len: u32,
 
@@ -294,6 +298,26 @@ impl Outgoing {
     }
 }
 
+/// What a queued or posted write reads from.
+enum Payload {
+    /// A pool page buffer in `Sending`.
+    Buffer(Buffer),
+
+    /// Caller memory read through the device's implicit region. Held until
+    /// the write completes or the QP is destroyed.
+    Direct(Arc<dyn AsRef<[u8]> + Send + Sync>),
+}
+
+impl Payload {
+    /// Return the payload once the NIC no longer reads it.
+    fn release(self, pool: &Pool) {
+        match self {
+            Self::Buffer(buffer) => pool.release(buffer),
+            Self::Direct(_) => {}
+        }
+    }
+}
+
 /// Posted send-queue work.
 enum InFlight {
     Control {
@@ -305,7 +329,7 @@ enum InFlight {
     },
 
     Write {
-        buffer: Buffer,
+        buffer: Payload,
 
         done: Completer<()>,
     },
@@ -371,6 +395,10 @@ pub(crate) struct Link {
 
     /// Buffers held until the QP is destroyed.
     quarantine: Vec<Buffer>,
+
+    /// Zero-copy sources of failed posted writes, held until the QP is
+    /// destroyed: the NIC may still read them.
+    held: Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>,
 
     created: Instant,
 
@@ -448,6 +476,7 @@ impl Link {
             outbox: VecDeque::new(),
             inflight: BTreeMap::new(),
             quarantine: Vec::new(),
+            held: Vec::new(),
             created: now,
             ready_since: None,
             last_used: now,
@@ -658,6 +687,18 @@ impl Link {
         }
 
         let staged = match source {
+            Source::Bytes(bytes) if pool.implicit().is_some() => {
+                self.remote.remove(&tag);
+                self.outbox.push_back(Outgoing::Write {
+                    tag,
+                    buffer: Payload::Direct(bytes),
+                    len: len as u32,
+                    remote,
+                    deadline,
+                    done,
+                });
+                return;
+            }
             Source::Bytes(bytes) => {
                 let Some(mut staged) = pool.shared().stage(len) else {
                     let _ = done.complete(Err(Error::Overloaded));
@@ -680,7 +721,7 @@ impl Link {
         self.remote.remove(&tag);
         self.outbox.push_back(Outgoing::Write {
             tag,
-            buffer,
+            buffer: Payload::Buffer(buffer),
             len: len as u32,
             remote,
             deadline,
@@ -815,7 +856,7 @@ impl Link {
                 }
             }
             InFlight::Write { buffer, done } => {
-                pool.release(buffer);
+                buffer.release(pool);
                 let _ = done.complete(Ok(()));
             }
             InFlight::Bind(tag) => {
@@ -1078,7 +1119,7 @@ impl Link {
                     done,
                     ..
                 } if now >= deadline => {
-                    pool.release(buffer);
+                    buffer.release(pool);
                     self.remote.insert(tag, remote);
                     let _ = done.complete(Err(Error::DeadlineExceeded));
                 }
@@ -1155,19 +1196,34 @@ impl Link {
                 done,
                 ..
             } => {
-                let posted = self.qp.write_imm(
-                    wr(WRITE, tag),
-                    pool.region(),
-                    pool.offset(&buffer),
-                    len,
-                    remote.addr,
-                    remote.rkey,
-                    tag,
-                );
+                let posted = match &buffer {
+                    Payload::Buffer(staged) => self.qp.write_imm(
+                        wr(WRITE, tag),
+                        pool.region(),
+                        pool.offset(staged),
+                        len,
+                        remote.addr,
+                        remote.rkey,
+                        tag,
+                    ),
+                    Payload::Direct(bytes) => match pool.implicit() {
+                        // The implicit region's offset is the virtual address.
+                        Some(implicit) => self.qp.write_imm(
+                            wr(WRITE, tag),
+                            implicit,
+                            (**bytes).as_ref().as_ptr() as u64,
+                            len,
+                            remote.addr,
+                            remote.rkey,
+                            tag,
+                        ),
+                        None => Err(Error::Io),
+                    },
+                };
 
                 if let Err(error) = posted {
                     // Nothing reached the NIC.
-                    pool.release(buffer);
+                    buffer.release(pool);
                     let _ = done.complete(Err(error));
                     return Err(error);
                 }
@@ -1313,6 +1369,7 @@ impl Link {
             pool.release(buffer);
         }
 
+        self.held.clear();
         true
     }
 
@@ -1326,6 +1383,9 @@ impl Link {
         for buffer in self.quarantine.drain(..) {
             pool.leak(buffer);
         }
+
+        // The NIC may still read these: never free them.
+        std::mem::forget(std::mem::take(&mut self.held));
     }
 
     fn fail_all(&mut self, pool: &Pool) {
@@ -1353,8 +1413,10 @@ impl Link {
         for outgoing in self.outbox.drain(..) {
             match outgoing {
                 Outgoing::Write { buffer, done, .. } => {
-                    // Not posted: no NIC access, but keep it uniform.
-                    quarantine.push(buffer);
+                    // Not posted: no NIC access, but keep buffers uniform.
+                    if let Payload::Buffer(buffer) = buffer {
+                        quarantine.push(buffer);
+                    }
                     let _ = done.complete(Err(Error::Unavailable));
                 }
                 Outgoing::Release { done, .. } => {
@@ -1367,7 +1429,10 @@ impl Link {
         for (_, inflight) in std::mem::take(&mut self.inflight) {
             match inflight {
                 InFlight::Write { buffer, done } => {
-                    quarantine.push(buffer);
+                    match buffer {
+                        Payload::Buffer(buffer) => quarantine.push(buffer),
+                        Payload::Direct(bytes) => self.held.push(bytes),
+                    }
                     let _ = done.complete(Err(Error::Unavailable));
                 }
                 InFlight::Control {

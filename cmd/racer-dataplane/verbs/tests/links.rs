@@ -82,6 +82,7 @@ fn config(charge: &Arc<AtomicUsize>) -> NodeConfig {
         grants_per_link: 2,
         idle: Duration::from_secs(120),
         mr_remote_write: false,
+        zero_copy: false,
         guard: Arc::new(Charge(charge.clone())),
     }
 }

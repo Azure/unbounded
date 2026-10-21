@@ -132,6 +132,11 @@ pub struct NodeConfig {
     /// hatch, see "Least access").
     pub mr_remote_write: bool,
 
+    /// Register one implicit on-demand paging region per device so
+    /// [`Source::Bytes`] writes go out without a copy. Devices without
+    /// implicit ODP fall back to copying; see [`Client::zero_copy`].
+    pub zero_copy: bool,
+
     /// Charged for every native object of this activation; leaks with any
     /// leaked object.
     pub guard: Guard,
@@ -435,6 +440,18 @@ impl Client {
         };
 
         pool.try_stage(len)
+    }
+
+    /// True if [`Source::Bytes`] writes on `rail` go out without a copy (the
+    /// device has an implicit on-demand paging region). `false` for an
+    /// unknown rail or while the pool table is busy.
+    pub fn zero_copy(&self, rail: u16) -> bool {
+        self.shared
+            .pools
+            .try_read()
+            .ok()
+            .and_then(|pools| pools.get(&rail).map(|pool| pool.zero_copy()))
+            .unwrap_or(false)
     }
 
     /// Page buffers of `rail` in `state`, for diagnostics.
@@ -821,7 +838,12 @@ impl Owner {
                 access,
                 quota.clone(),
             )?;
-            let pool = Pool::new(region, config.buffer_len, quota.clone())?;
+            let mut pool = Pool::new(region, config.buffer_len, quota.clone())?;
+            if config.zero_copy
+                && let Some(implicit) = NativeRegion::implicit(device.clone(), quota.clone())
+            {
+                pool.set_implicit(implicit);
+            }
             built.insert(selection.tag as u16, DeviceState { pool, device });
         }
 
