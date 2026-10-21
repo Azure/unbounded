@@ -52,6 +52,7 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `--cache-uid` | empty | Optional ClusterCache UID, as a lowercase UUID. When set, the origin answers `503` to requests whose `Racer-Cache` header names any other UID, so an origin left from a deleted ClusterCache cannot fill a recreated one with the same name. The operator always sets it. Empty accepts every cache UID. |
 | `--bucket` | none, required | The one bucket or Azure container the origin serves. Requests for other buckets get `403`. |
 | `--provider` | `s3` | `s3` or `azure`. |
 | `--region` | empty | S3 only. Falls back to the AWS config chain. A region is required one way or the other. |
@@ -162,7 +163,8 @@ Requirements:
 - **Credentials.** Supply upstream credentials to the origin pods only. See
   [Upstream Providers](#upstream-providers).
 - **Arguments.** Set `--cache` to match the sidecars, `--bucket`, and the
-  provider flags.
+  provider flags. Set `--cache-uid` to the ClusterCache UID when you recreate
+  caches under the same name.
 
 The essential parts of the S3 example:
 
