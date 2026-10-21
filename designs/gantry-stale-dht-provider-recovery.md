@@ -20,6 +20,9 @@ behavior. The timing values have not been validated by cluster measurements.
 Implemented in the current change:
 
 - Section 1: configured provider validity and in-memory sweeping reprovide.
+- Registration changes and announced-set updates are serialized per digest
+   across notifications and reconciliation, so overlapping deletion cannot
+   leave periodic reprovide running outside the announced set.
 - Section 2: an uncapped streaming provider walk on the warm path, with an
    immediate origin failover when every advertised provider is unusable.
 - Section 3: request-scoped failed-provider exclusion during chair polling,
