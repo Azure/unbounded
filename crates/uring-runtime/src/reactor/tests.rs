@@ -129,7 +129,10 @@ fn mock() -> (Mock, Handle) {
     )
 }
 
-impl Backend for Mock {
+// SAFETY: tests fill read buffers with `Handle::fill` before reporting
+// success, except where a test checks that an oversized result is rejected
+// without being trusted.
+unsafe impl Backend for Mock {
     type Fd = MockFd;
     type Clock = SystemClock;
     type Entropy = SystemEntropy;
@@ -431,6 +434,50 @@ fn read_returns_bytes_and_buffer() {
     assert_eq!(buf, b"abc");
     drop(read);
     assert_eq!(Rc::strong_count(&fd), 1);
+}
+
+#[test]
+fn oversized_read_results_fail_without_extending_the_buffer() {
+    let (reactor, mock) = reactor();
+    let fd: MockFd = Rc::new(3);
+    let waker = Waker::from(Arc::new(Counter::default()));
+    let mut read = reactor.read_at(&fd, 0, Vec::with_capacity(4), &Unscoped);
+    let mut recv = reactor.recv(&fd, Vec::with_capacity(4), &Unscoped);
+    assert!(poll(&mut read, &waker).is_pending());
+    assert!(poll(&mut recv, &waker).is_pending());
+    reactor.poll(16).unwrap();
+    for op in mock.pending() {
+        assert_eq!(op.buf.unwrap().1, 4);
+        // The backend claims one byte more than the buffer holds.
+        mock.complete(op.user_data, 5);
+    }
+    assert_eq!(reactor.poll(16).unwrap(), 2);
+    for outcome in [
+        ready(poll(&mut read, &waker)),
+        ready(poll(&mut recv, &waker)),
+    ] {
+        let BufResult { result, buf } = outcome;
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert!(buf.is_empty(), "no unwritten byte is marked initialized");
+        assert_eq!(buf.capacity(), 4);
+    }
+}
+
+#[test]
+fn full_read_results_are_accepted() {
+    let (reactor, mock) = reactor();
+    let fd: MockFd = Rc::new(3);
+    let waker = Waker::from(Arc::new(Counter::default()));
+    let mut recv = reactor.recv(&fd, Vec::with_capacity(4), &Unscoped);
+    assert!(poll(&mut recv, &waker).is_pending());
+    reactor.poll(16).unwrap();
+    let op = mock.only_pending();
+    mock.fill(&op, b"full");
+    mock.complete(op.user_data, 4);
+    assert_eq!(reactor.poll(16).unwrap(), 1);
+    let BufResult { result, buf } = ready(poll(&mut recv, &waker));
+    assert_eq!(result.unwrap(), 4);
+    assert_eq!(buf, b"full");
 }
 
 #[test]

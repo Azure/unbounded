@@ -325,6 +325,21 @@ fn clamp_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
 
+/// Check a read or receive result against the buffer it filled.
+///
+/// A backend that reports more bytes than the operation described broke its
+/// contract. Failing the operation with `EIO` keeps the buffer's initialized
+/// length within its capacity.
+fn filled<E: From<Error>>(n: u32, total: usize) -> Result<usize, E> {
+    let n = n as usize;
+    if n > total.min(u32::MAX as usize) {
+        return Err(Error::from_errno(libc::EIO)
+            .with_context("backend reported more bytes than the buffer holds")
+            .into());
+    }
+    Ok(n)
+}
+
 fn check_offset(offset: u64) -> Result<()> {
     if offset > i64::MAX as u64 {
         return Err(
@@ -482,11 +497,13 @@ impl<B: Backend, Buf: IoBufMut> OpSpec<B> for ReadAt<B, Buf> {
     }
 
     fn finish<E: From<Error>>(mut self, result: Result<u32, E>) -> Self::Output<E> {
-        let result = result.map(|n| {
-            // SAFETY: the backend reported `n` bytes written from the start of
-            // the buffer, and `n <= bytes_total`.
-            unsafe { self.buf.set_init(n as usize) };
-            n as usize
+        let result = result.and_then(|n| {
+            let n = filled(n, self.buf.bytes_total())?;
+            // SAFETY: the `Backend` contract guarantees that a successful read
+            // wrote its `n` result bytes from the start of the buffer, and
+            // `filled` checked that `n <= bytes_total`.
+            unsafe { self.buf.set_init(n) };
+            Ok(n)
         });
         BufResult::new(result, self.buf)
     }
@@ -576,11 +593,13 @@ impl<B: Backend, Buf: IoBufMut> OpSpec<B> for SocketRecv<B, Buf> {
     }
 
     fn finish<E: From<Error>>(mut self, result: Result<u32, E>) -> Self::Output<E> {
-        let result = result.map(|n| {
-            // SAFETY: the backend reported `n` bytes received into the start
-            // of the buffer, and `n <= bytes_total`.
-            unsafe { self.buf.set_init(n as usize) };
-            n as usize
+        let result = result.and_then(|n| {
+            let n = filled(n, self.buf.bytes_total())?;
+            // SAFETY: the `Backend` contract guarantees that a successful
+            // receive wrote its `n` result bytes from the start of the buffer,
+            // and `filled` checked that `n <= bytes_total`.
+            unsafe { self.buf.set_init(n) };
+            Ok(n)
         });
         BufResult::new(result, self.buf)
     }

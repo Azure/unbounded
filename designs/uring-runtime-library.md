@@ -158,7 +158,7 @@ code already had (`simulation::Driver::{push, cancel, submit, pop}`), lifted
 into a public trait.
 
 ```rust
-pub trait Backend: 'static {
+pub unsafe trait Backend: 'static {
     type Fd: Clone + Debug + 'static;        // Uring: `Fd`, simulator: `SimFd`
     type Clock: Clock + Clone;
     type Entropy: Entropy;
@@ -191,7 +191,11 @@ writes the absolute `CLOCK_MONOTONIC` time into the reactor-owned `timespec`
 (uring). Building an `Op` is safe; `push` is `unsafe`: every pointer and
 referent must stay valid and unaliased until the completion for `user_data`
 has been popped, so a backend may hand them to the kernel or keep them and
-complete later. `OpKind` mirrors the variants plus `Cancel`.
+complete later. Implementing the trait is also `unsafe`: a successful `Read`
+or `Recv` result must count bytes the backend actually wrote from the start of
+`buf`, at most `len`, because the reactor marks them initialized. The reactor
+still fails an oversized result with `EIO` instead of trusting it.
+`OpKind` mirrors the variants plus `Cancel`.
 The reactor always calls `push_with`. `PushHints` (`#[non_exhaustive]`,
 `Default`, `with_offload`) carries execution hints that never change an
 operation's result: `offload` asks for execution in a kernel worker instead
@@ -543,7 +547,8 @@ listeners, datagrams, pipes, readiness, partitions), `fault` (`Fault`,
   calls and fixtures match `Sync` targets. Knobs: `reject_submissions`
   (push returns `PushError::Full`), `set_stream_capacity`, `set_max_chunk`,
   `set_cancel_first`; test hooks `SimBackend::{inject_completion,
-  reorder_completions, queued_completions, in_flight}`.
+  reorder_completions, queued_completions, in_flight}`. `inject_completion`
+  accepts only error results, since a success would claim a filled buffer.
 - Disk: `World::disk() -> Disk { sync, sync_all, crash, crash_under, read,
   corrupt }`; file fsync persists data and length, directory fsync persists
   its immediate entries. Reported owner, link count and umask are

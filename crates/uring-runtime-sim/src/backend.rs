@@ -756,12 +756,18 @@ impl SimBackend {
         self.completed.iter().copied().collect()
     }
 
-    /// Test hook: queue an arbitrary completion. If an operation with this
-    /// `user_data` is in flight, it is retired first (its memory is no
+    /// Test hook: queue an arbitrary failed completion. If an operation with
+    /// this `user_data` is in flight, it is retired first (its memory is no
     /// longer touched) without producing its own completion.
     ///
-    /// Fails with `ENOSPC` when [`MAX_INJECTED`] completions are queued.
+    /// Only errors (`result < 0`) can be injected: a success claims that the
+    /// operation's buffer was filled, and the reactor would expose bytes that
+    /// were never written. Fails with `EINVAL` for a non-negative `result`
+    /// and with `ENOSPC` when [`MAX_INJECTED`] completions are queued.
     pub fn inject_completion(&mut self, user_data: u64, result: i32) -> Result<()> {
+        if result >= 0 {
+            return Err(errno(libc::EINVAL));
+        }
         if self.completed.len() >= MAX_INJECTED {
             return Err(errno(libc::ENOSPC));
         }
@@ -836,7 +842,10 @@ impl SimBackend {
     }
 }
 
-impl Backend for SimBackend {
+// SAFETY: reads and receives execute against the simulated world, which
+// copies exactly the reported number of bytes, bounded by `len`, into the
+// operation's buffer. Injected completions are always errors.
+unsafe impl Backend for SimBackend {
     type Fd = SimFd;
     type Clock = SimClock;
     type Entropy = SimEntropy;

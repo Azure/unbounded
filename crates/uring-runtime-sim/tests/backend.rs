@@ -220,6 +220,40 @@ fn cancel_orders_and_fences() {
 }
 
 #[test]
+fn inject_completion_rejects_success_results() {
+    let (world, _, mut backend) = setup();
+    let (fd, _peer) = world.socket_pair().unwrap();
+    let mut buf = [0u8; 8];
+    let recv = Op::Recv {
+        fd: &fd,
+        buf: buf.as_mut_ptr(),
+        len: buf.len() as u32,
+        flags: 0,
+    };
+    push(&mut backend, 1, &recv);
+    for result in [0, 1, i32::MAX] {
+        assert_eq!(
+            backend
+                .inject_completion(1, result)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL),
+            "a success would claim bytes were written into the buffer"
+        );
+    }
+    assert_eq!(
+        backend.in_flight(),
+        1,
+        "a rejected injection retires nothing"
+    );
+    assert!(backend.queued_completions().is_empty());
+    backend.inject_completion(1, -libc::EIO).unwrap();
+    assert_eq!(backend.in_flight(), 0);
+    assert_eq!(backend.pop().unwrap().result, -libc::EIO);
+    assert_eq!(buf, [0; 8], "nothing was written into the buffer");
+}
+
+#[test]
 fn scheduling_hooks_reject_inject_and_reorder() {
     let (world, _, mut backend) = setup();
     let (fd, _peer) = world.socket_pair().unwrap();

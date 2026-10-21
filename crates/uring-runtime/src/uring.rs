@@ -276,7 +276,9 @@ fn build_ring(sq: u32, cq: u32) -> Result<(IoUring, bool, bool)> {
     unreachable!("the last attempt returns")
 }
 
-impl Backend for Uring {
+// SAFETY: the kernel writes exactly the reported number of bytes, at most
+// `len`, into the buffer of a successful read or receive.
+unsafe impl Backend for Uring {
     type Fd = Fd;
     type Clock = SystemClock;
     type Entropy = SystemEntropy;

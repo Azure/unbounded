@@ -276,7 +276,11 @@ fn translate<'a, F>(
     })
 }
 
-impl Backend for RacerBackend {
+// SAFETY: the kernel ring and the simulator uphold the contract. The
+// test-only scripted backend may report reads it never performed, which is
+// sound here because this adapter only reads into fully initialized regions
+// and the reactor rejects results longer than the buffer.
+unsafe impl Backend for RacerBackend {
     type Fd = Rc<Descriptor>;
     type Clock = RacerClock;
     type Entropy = RacerEntropy;

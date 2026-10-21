@@ -16,6 +16,10 @@
 //! [`Backend::pop`]. A backend may therefore hand the pointers to the kernel,
 //! or (like a simulator) keep them and complete the operation later.
 //!
+//! The trait itself is `unsafe` to implement: the reactor trusts a successful
+//! read or receive result to count bytes the backend actually wrote into the
+//! operation's buffer, so a backend must never report more.
+//!
 //! # Example: a minimal backend
 //!
 //! ```
@@ -30,7 +34,8 @@
 //! #[derive(Default)]
 //! struct Immediate(VecDeque<CompletionEntry>);
 //!
-//! impl Backend for Immediate {
+//! // SAFETY: `Immediate` only completes `Nop`, which references no memory.
+//! unsafe impl Backend for Immediate {
 //!     type Fd = i32;
 //!     type Clock = SystemClock;
 //!     type Entropy = SystemEntropy;
@@ -488,7 +493,16 @@ impl<Fd> Op<'_, Fd> {
 /// [`submit`](Backend::submit) (start queued work),
 /// [`pop`](Backend::pop) (reap) and [`wait`](Backend::wait) (block).
 /// Every accepted push and cancel produces exactly one completion.
-pub trait Backend: 'static {
+///
+/// # Safety
+///
+/// The reactor trusts completion results to describe what happened to the
+/// memory an operation referenced. An implementation must ensure that every
+/// successful (`result >= 0`) completion popped for an [`Op::Read`] or
+/// [`Op::Recv`] reports a byte count no greater than the operation's `len`,
+/// and that exactly that many bytes were written from the start of `buf`.
+/// The reactor marks those bytes initialized and hands them to safe code.
+pub unsafe trait Backend: 'static {
     /// The descriptor type ([`Fd`](crate::Fd) for the kernel backend).
     type Fd: Clone + fmt::Debug + 'static;
     /// The time source. Must be cheap to clone (see [`clock`](crate::clock)).
@@ -639,7 +653,8 @@ mod tests {
         done: VecDeque<CompletionEntry>,
     }
 
-    impl Backend for Deferred {
+    // SAFETY: `Deferred` fills each read buffer before reporting its length.
+    unsafe impl Backend for Deferred {
         type Fd = u32;
         type Clock = SystemClock;
         type Entropy = SystemEntropy;
