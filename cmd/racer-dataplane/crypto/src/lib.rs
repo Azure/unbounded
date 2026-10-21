@@ -223,24 +223,36 @@ impl PageCipher {
             return Err(Error(()));
         }
         let (ciphertext, tag) = sealed.split_at(length);
+        // ring has no out-of-place open, so decrypt a copy in place.
+        out.copy_from_slice(ciphertext);
+        self.open_in_place(nonce, aad, out, tag)
+    }
+
+    /// Open `inout`, which already holds the ciphertext body, in place against
+    /// the separate `tag`. Any failure zeroes `inout`, since a failed tag check
+    /// leaves unauthenticated plaintext behind.
+    pub(crate) fn open_in_place(
+        &self,
+        nonce: &[u8; 24],
+        aad: &[u8],
+        inout: &mut [u8],
+        tag: &[u8],
+    ) -> Result<(), Error> {
         let result = (|| {
             let tag = ring::aead::Tag::try_from(tag).map_err(|_| Error(()))?;
             let key = self.derive(nonce)?;
-            // ring has no out-of-place open, so decrypt a copy in place. A
-            // failed tag check leaves unauthenticated plaintext, wiped below.
-            out.copy_from_slice(ciphertext);
             key.open_in_place_separate_tag(
                 Self::gcm_nonce(nonce),
                 ring::aead::Aad::from(aad),
                 tag,
-                out,
+                inout,
                 0..,
             )
             .map(|_| ())
             .map_err(|_| Error(()))
         })();
         if result.is_err() {
-            out.fill(0);
+            inout.fill(0);
         }
         result
     }
@@ -369,6 +381,30 @@ pub fn crc64(bytes: &[u8]) -> u64 {
     let mut digest = crc64fast::Digest::new();
     digest.write(bytes);
     digest.sum64()
+}
+
+/// Bytes copied and then checksummed while they are still cache resident.
+const COPY_CRC_CHUNK: usize = 128 * 1024;
+
+/// Copy the leading `out.len()` bytes of `input` into `out` and return the
+/// CRC-64/XZ of all of `input`, reading `input` from memory only once.
+///
+/// Each chunk is checksummed from `out` right after it is copied, while it is
+/// still in cache, so this costs about one pass instead of a copy plus a
+/// separate checksum scan. Fails without touching `out` when `out` is longer
+/// than `input`.
+pub fn copy_prefix_crc64(input: &[u8], out: &mut [u8]) -> Result<u64, Error> {
+    let (prefix, rest) = input.split_at_checked(out.len()).ok_or(Error(()))?;
+    let mut digest = crc64fast::Digest::new();
+    for (from, to) in prefix
+        .chunks(COPY_CRC_CHUNK)
+        .zip(out.chunks_mut(COPY_CRC_CHUNK))
+    {
+        to.copy_from_slice(from);
+        digest.write(to);
+    }
+    digest.write(rest);
+    Ok(digest.sum64())
 }
 
 pub mod identity {
@@ -1024,6 +1060,27 @@ pub mod identity {
             self.secret
                 .page_cipher
                 .open(nonce, aad, input, out)
+                .map_err(|_| Error::CorruptRecord)
+        }
+
+        /// Open a page whose ciphertext body the caller already copied into
+        /// `inout`, against its separate `tag`. Binding errors leave `inout`
+        /// untouched; any other failure zeroes it.
+        // Keep borrowed buffer and expected-identity arguments explicit at this boundary.
+        #[allow(clippy::too_many_arguments)]
+        pub fn open_page_in_place(
+            &self,
+            cache: &CacheId,
+            id: KeyId,
+            nonce: &[u8; 24],
+            aad: &[u8],
+            inout: &mut [u8],
+            tag: &[u8],
+        ) -> Result<()> {
+            self.bound_material(cache, id, KeyPurpose::Page)?;
+            self.secret
+                .page_cipher
+                .open_in_place(nonce, aad, inout, tag)
                 .map_err(|_| Error::CorruptRecord)
         }
 

@@ -1,6 +1,8 @@
 //! Public-API workflows, standard vectors, rejection checks, and CRC reference tests.
 
-use racer_crypto::{SigningKey, TAG_LEN, VerifyingKey, crc64, ct_eq, hmac_sha256, open, seal};
+use racer_crypto::{
+    SigningKey, TAG_LEN, VerifyingKey, copy_prefix_crc64, crc64, ct_eq, hmac_sha256, open, seal,
+};
 
 /// The identity module keeps its public types and classified errors beside primitives.
 #[test]
@@ -605,6 +607,31 @@ fn random_bytes(length: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Fused copy and checksum copies exactly the prefix and sums all of the input,
+/// across chunk boundaries, empty prefixes, and tails.
+#[test]
+fn copy_prefix_crc64_copies_prefix_and_sums_whole_input() {
+    let chunk = 128 * 1024;
+    for (length, prefix) in [
+        (0, 0),
+        (19, 0),
+        (19, 3),
+        (19, 19),
+        (chunk - 1, chunk - 17),
+        (chunk + TAG_LEN, chunk),
+        (3 * chunk + 5 + TAG_LEN, 3 * chunk + 5),
+    ] {
+        let input = random_bytes(length);
+        let mut out = vec![0xa5; prefix];
+        let checksum = copy_prefix_crc64(&input, &mut out).unwrap();
+        assert_eq!(checksum, crc64(&input), "length={length} prefix={prefix}");
+        assert_eq!(out, input[..prefix], "length={length} prefix={prefix}");
+    }
+    let mut long = vec![0xa5; 20];
+    assert!(copy_prefix_crc64(&[1; 19], &mut long).is_err());
+    assert!(long.iter().all(|byte| *byte == 0xa5));
+}
+
 /// Require dispatched and table-based CRC implementations to match the oracle.
 fn assert_equivalent(bytes: &[u8]) {
     let expected = reference(bytes);
@@ -936,6 +963,31 @@ mod identity_workflows {
             Err(Error::CorruptRecord)
         );
         assert_eq!(out, [0; 3]);
+
+        // In-place open takes the body already copied out and the tag apart.
+        let (body, tag) = sealed.split_at(3);
+        let mut inout = [0; 3];
+        inout.copy_from_slice(body);
+        page.open_page_in_place(&cache, page.id(), &[1; 24], b"aad", &mut inout, tag)
+            .unwrap();
+        assert_eq!(&inout, b"abc");
+        inout.copy_from_slice(body);
+        assert_eq!(
+            page.open_page_in_place(&cache, credentials.id(), &[1; 24], b"aad", &mut inout, tag),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(inout, body);
+        assert_eq!(
+            page.open_page_in_place(&cache, page.id(), &[1; 24], b"bad", &mut inout, tag),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(inout, [0; 3]);
+        inout.copy_from_slice(body);
+        assert_eq!(
+            page.open_page_in_place(&cache, page.id(), &[1; 24], b"aad", &mut inout, &tag[1..]),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(inout, [0; 3]);
         let original = sealed;
         assert_eq!(
             credentials.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
