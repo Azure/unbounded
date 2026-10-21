@@ -115,6 +115,56 @@ func TestCNISubprocessVersionsAndUnsupportedCommands(t *testing.T) {
 	}
 }
 
+func TestCNISubprocessRequestedIPs(t *testing.T) {
+	conf := testConfig(t, "10.244.2.0/24")
+	path := startTestServer(t, func() (*ipamproto.Config, error) { return conf, nil })
+
+	for _, field := range []string{"runtimeConfig", "RuntimeConfig", "args", "ARGS"} {
+		for _, value := range []string{`null`, `"10.244.2.9"`} {
+			t.Run(field+"/"+value, func(t *testing.T) {
+				args := testArgs(t, path, "net", "pod")
+
+				var input map[string]json.RawMessage
+				if err := json.Unmarshal(args.StdinData, &input); err != nil {
+					t.Fatal(err)
+				}
+
+				options := `{"IPS":[` + value + `]}`
+				if strings.EqualFold(field, "args") {
+					options = `{"CNI":` + options + `}`
+				}
+
+				input[field] = json.RawMessage(options)
+
+				data, err := json.Marshal(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				directory := t.TempDir()
+
+				output, err := runCNIInput(t, "ADD", data, directory, "pod")
+				if value != "null" {
+					if err != nil || !json.Valid(output) || !strings.Contains(string(output), "10.244.2.9/24") {
+						t.Fatalf("valid requested IP failed: %s, %v", output, err)
+					}
+
+					return
+				}
+
+				if err == nil || !json.Valid(output) || !strings.Contains(string(output), "requested IP list must not contain null") {
+					t.Fatalf("null requested IP did not return a structured CNI error: %s, %v", output, err)
+				}
+
+				entries, err := os.ReadDir(directory)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("null requested IP created reservations: %v, %v", entries, err)
+				}
+			})
+		}
+	}
+}
+
 func TestCNISubprocessRebootRace(t *testing.T) {
 	dir := t.TempDir()
 

@@ -122,6 +122,22 @@ func (p Plugin) Add(args *skel.CmdArgs) (returnErr error) {
 		return err
 	}
 
+	var network allocator.Net
+	if err := json.Unmarshal(data, &network); err != nil {
+		return err
+	}
+
+	requestedIPs := network.RuntimeConfig.IPs
+	if network.Args != nil && network.Args.A != nil {
+		requestedIPs = append(requestedIPs, network.Args.A.IPs...)
+	}
+
+	for _, address := range requestedIPs {
+		if address == nil {
+			return errors.New("requested IP list must not contain null entries")
+		}
+	}
+
 	conf, confVersion, err := allocator.LoadIPAMConfig(data, args.Args)
 	if err != nil {
 		return err
