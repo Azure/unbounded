@@ -577,8 +577,8 @@ mod faults {
 
         pub(super) fn crash_pending_write(&mut self) {
             self.update(7);
-            self.sim.inject("write", Fault::Delay(64)).unwrap();
-            *self.coverage.injected.entry("write".into()).or_default() += 1;
+            self.sim.inject("writev", Fault::Delay(64)).unwrap();
+            *self.coverage.injected.entry("writev".into()).or_default() += 1;
             let mut client = self.request(7, false, false);
             let mut completed = false;
             let mut victim = None;
@@ -1610,9 +1610,9 @@ mod traffic {
                 }
                 Action::DelayedWrite => {
                     self.sim
-                        .inject("write", Fault::Delay(3 + self.rng.pick(8)))
+                        .inject("writev", Fault::Delay(3 + self.rng.pick(8)))
                         .unwrap();
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
+                    *self.coverage.injected.entry("writev".into()).or_default() += 1;
                     self.update(3);
                     let client = self.request(3, false, false);
                     self.exchange(client, false);
@@ -1659,8 +1659,8 @@ mod traffic {
                     self.coverage.action("old-pin");
                 }
                 Action::FailedDirtyWrite => {
-                    self.sim.inject("write", Fault::Errno(libc::EIO)).unwrap();
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
+                    self.sim.inject("writev", Fault::Errno(libc::EIO)).unwrap();
+                    *self.coverage.injected.entry("writev".into()).or_default() += 1;
                     self.update(4);
                     let client = self.request(4, false, false);
                     self.exchange(client, false);
