@@ -505,7 +505,7 @@ mod completion {
     fn finish_releases_slot_and_waker_borrow_before_result_destruction() {
         /// Observe signal borrow availability while the completion result is destroyed.
         struct Probe {
-            signal: Rc<Signal>,
+            signal: Rc<dyn Delivery<Probe, Error>>,
 
             drops: Rc<Cell<usize>>,
         }
@@ -513,7 +513,14 @@ mod completion {
         impl Drop for Probe {
             /// Verify the notification borrow ended before this application callback.
             fn drop(&mut self) {
-                assert!(self.signal.waker.try_borrow_mut().unwrap().is_none());
+                assert!(
+                    self.signal
+                        .signal()
+                        .waker
+                        .try_borrow_mut()
+                        .unwrap()
+                        .is_none()
+                );
                 self.drops.set(self.drops.get() + 1);
             }
         }
@@ -521,7 +528,7 @@ mod completion {
             let Some(reactor) = kernel_reactor(1) else {
                 return;
             };
-            let signal = Rc::new(RefCell::new(None::<Rc<Signal>>));
+            let signal = Rc::new(RefCell::new(None::<Rc<dyn Delivery<Probe, Error>>>));
             let finish_signal = signal.clone();
             let drops = Rc::new(Cell::new(0));
             let finish_drops = drops.clone();
@@ -547,10 +554,10 @@ mod completion {
                     },
                 )
                 .unwrap();
-            *signal.borrow_mut() = Some(waiting.signal.clone());
+            *signal.borrow_mut() = Some(waiting.delivery.clone());
             let counter = Arc::new(Count::default());
-            *waiting.signal.waker.borrow_mut() = Some(Waker::from(counter.clone()));
-            let reply = waiting.reply.clone();
+            *waiting.delivery.signal().waker.borrow_mut() = Some(Waker::from(counter.clone()));
+            let reply = waiting.delivery.clone();
             let mut waiting = Some(waiting);
             if abandoned {
                 drop(waiting.take());
@@ -563,8 +570,8 @@ mod completion {
             }
             assert_eq!(drops.get(), usize::from(abandoned));
             assert_eq!(counter.0.load(Ordering::Relaxed), usize::from(!abandoned));
-            assert_eq!(reply.borrow().result.is_some(), !abandoned);
-            drop(reply.borrow_mut().result.take());
+            assert_eq!(reply.reply().borrow().result.is_some(), !abandoned);
+            drop(reply.reply().borrow_mut().result.take());
             assert_eq!(drops.get(), 1);
         }
     }
@@ -622,12 +629,7 @@ mod completion {
             reactor.state.borrow_mut().entries.insert(
                 IoId(1),
                 Entry {
-                    finish: Box::new(|_| None),
-                    signal: Rc::new(Signal {
-                        abandoned: Cell::new(false),
-                        waker: RefCell::new(None),
-                    }),
-                    scope: Rc::new(scope()),
+                    pending: synthetic(scope(), |_| None),
                     completion: CompletionState::Pending {
                         kind: CompletionKind::Value,
                         cancellation: CancellationFence::Pending,
@@ -689,12 +691,7 @@ mod completion {
         reactor.state.borrow_mut().entries.insert(
             IoId(1),
             Entry {
-                finish: Box::new(|_| None),
-                signal: Rc::new(Signal {
-                    abandoned: Cell::new(false),
-                    waker: RefCell::new(None),
-                }),
-                scope: Rc::new(scope()),
+                pending: synthetic(scope(), |_| None),
                 completion: CompletionState::new(CompletionKind::Value),
                 cancel_reason: None,
             },
@@ -791,35 +788,37 @@ mod completion {
                 buffer: Buffer(vec![0; 32], drops.clone()),
                 lease: Lease(drops.clone()),
             };
-            let signal = Rc::new(Signal {
-                abandoned: Cell::new(false),
-                waker: RefCell::new(None),
-            });
             let reservation: Rc<Charge> = Rc::new(Box::new(
                 reactor
                     .admission
                     .reserve(None, ResourceClass::RequestContext, 64)
                     .unwrap(),
             ));
-            let reply = Rc::new(RefCell::new(Reply::<(), Error> {
-                _slot: None,
-                result: None,
-                _reservation: reservation.clone(),
-            }));
+            let submitted = Rc::new(Submitted {
+                scope: scope(),
+                signal: Signal {
+                    abandoned: Cell::new(false),
+                    waker: RefCell::new(None),
+                },
+                reply: RefCell::new(Reply::<(), Error> {
+                    _slot: None,
+                    result: None,
+                    _reservation: Reservation::Shared(reservation.clone()),
+                }),
+                slot: Cell::new(None),
+                finish: Cell::new(Some(move |result: Result<KernelResult>| {
+                    drop((owned, reservation));
+                    assert!(matches!(result, Err(Error::Cancelled)));
+                    Ok(())
+                })),
+            });
             let waiting = Waiting {
-                reply: reply.clone(),
-                signal: signal.clone(),
+                delivery: submitted.clone(),
             };
             reactor.state.borrow_mut().entries.insert(
                 IoId(1),
                 Entry {
-                    finish: Box::new(move |result| {
-                        drop((owned, reservation));
-                        assert!(matches!(result, Err(Error::Cancelled)));
-                        None
-                    }),
-                    scope: Rc::new(scope()),
-                    signal,
+                    pending: submitted,
                     completion: CompletionState::Pending {
                         kind: CompletionKind::Value,
                         cancellation: CancellationFence::Pending,
@@ -828,7 +827,6 @@ mod completion {
                 },
             );
             drop(waiting);
-            drop(reply);
             assert_eq!(drops.get(), 0);
             let (first, second) = if cancel_first {
                 ((1 | CANCEL_BIT, 0), (1, -libc::ECANCELED))
@@ -871,14 +869,9 @@ mod completion {
         reactor.state.borrow_mut().entries.insert(
             IoId(1),
             Entry {
-                finish: Box::new(|result| {
+                pending: synthetic_abandoned(scope(), |result| {
                     assert!(matches!(result, Err(Error::Cancelled)));
                     None
-                }),
-                scope: Rc::new(scope()),
-                signal: Rc::new(Signal {
-                    abandoned: Cell::new(true),
-                    waker: RefCell::new(None),
                 }),
                 completion: CompletionState::Pending {
                     kind: CompletionKind::Descriptor,
@@ -923,15 +916,10 @@ mod completion {
             reactor.state.borrow_mut().entries.insert(
                 IoId(1),
                 Entry {
-                    finish: Box::new(move |result| {
+                    pending: synthetic(scope(), move |result| {
                         output.set(Some(result.and_then(KernelResult::value)));
                         drop(lease);
                         None
-                    }),
-                    scope: Rc::new(scope()),
-                    signal: Rc::new(Signal {
-                        abandoned: Cell::new(false),
-                        waker: RefCell::new(None),
                     }),
                     completion: CompletionState::new(CompletionKind::Value),
                     cancel_reason: None,
@@ -2306,6 +2294,60 @@ fn submission_classifies_transient_and_fatal_errors() {
     );
 }
 
+/// A synthetic submission whose callback produces its own notification.
+struct Synthetic<F> {
+    scope: RequestScope,
+
+    signal: Signal,
+
+    finish: Cell<Option<F>>,
+}
+
+impl<F: FnOnce(Result<KernelResult>) -> Option<Waker>> Pending<RequestScope> for Synthetic<F> {
+    /// Borrow the synthetic scope.
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+
+    /// Borrow the synthetic signal.
+    fn signal(&self) -> &Signal {
+        &self.signal
+    }
+
+    /// Run the callback once.
+    fn finish(&self, result: Result<KernelResult>) -> Option<Waker> {
+        (self
+            .finish
+            .take()
+            .expect("synthetic submission finishes once"))(result)
+    }
+}
+
+/// Build a synthetic submission whose delivery is still awaited.
+fn synthetic(
+    scope: RequestScope,
+    finish: impl FnOnce(Result<KernelResult>) -> Option<Waker> + 'static,
+) -> Rc<dyn Pending<RequestScope>> {
+    Rc::new(Synthetic {
+        scope,
+        signal: Signal {
+            abandoned: Cell::new(false),
+            waker: RefCell::new(None),
+        },
+        finish: Cell::new(Some(finish)),
+    })
+}
+
+/// Build a synthetic submission whose waiting future was dropped.
+fn synthetic_abandoned(
+    scope: RequestScope,
+    finish: impl FnOnce(Result<KernelResult>) -> Option<Waker> + 'static,
+) -> Rc<dyn Pending<RequestScope>> {
+    let pending = synthetic(scope, finish);
+    pending.signal().abandoned.set(true);
+    pending
+}
+
 /// Build a nonzero queue ceiling for a regression's admitted operation count.
 fn limits(capacity: usize) -> Limits {
     Limits {
@@ -3057,15 +3099,25 @@ mod reentrancy_panics_and_shutdown {
             .entries
             .insert(IoId(1), entry(|_| None));
         let weak = Rc::downgrade(&reactor);
-        let signal = Rc::new(Signal {
-            abandoned: Cell::new(false),
-            waker: RefCell::new(None),
+        let delivery = Rc::new(Submitted {
+            scope: scope(),
+            signal: Signal {
+                abandoned: Cell::new(false),
+                waker: RefCell::new(None),
+            },
+            reply: RefCell::new(Reply::<(), Error> {
+                _slot: None,
+                result: None,
+                _reservation: Reservation::Owned(Box::new(())),
+            }),
+            slot: Cell::new(None),
+            finish: Cell::new(Some(|_: Result<KernelResult>| Ok::<(), Error>(()))),
         });
-        let observed = signal.clone();
+        let observed = delivery.clone();
         WAKER_CALLBACK.with(|probe| {
             *probe.borrow_mut() = Some(Box::new(move || {
                 assert!(weak.upgrade().unwrap().state.try_borrow_mut().is_ok());
-                assert!(observed.waker.try_borrow_mut().is_ok());
+                assert!(observed.signal.waker.try_borrow_mut().is_ok());
             }))
         });
         let waker = callback_waker();
@@ -3074,12 +3126,7 @@ mod reentrancy_panics_and_shutdown {
         assert!(fence.as_mut().poll(&mut cx).is_pending());
         assert!(fence.as_mut().poll(&mut cx).is_pending());
         drop(fence);
-        let reply = Rc::new(RefCell::new(Reply::<(), Error> {
-            _slot: None,
-            result: None,
-            _reservation: Rc::new(Box::new(())),
-        }));
-        let mut waiting = Waiting { reply, signal };
+        let mut waiting = Waiting { delivery };
         assert!(Pin::new(&mut waiting).poll(&mut cx).is_pending());
         assert!(Pin::new(&mut waiting).poll(&mut cx).is_pending());
         drop(waiting);
@@ -3094,12 +3141,7 @@ mod reentrancy_panics_and_shutdown {
         finish: impl FnOnce(Result<KernelResult>) -> Option<Waker> + 'static,
     ) -> Entry<RequestScope> {
         Entry {
-            finish: Box::new(finish),
-            signal: Rc::new(Signal {
-                abandoned: Cell::new(false),
-                waker: RefCell::new(None),
-            }),
-            scope: Rc::new(scope()),
+            pending: synthetic(scope(), finish),
             completion: CompletionState::new(CompletionKind::Value),
             cancel_reason: None,
         }
@@ -3280,10 +3322,13 @@ mod reentrancy_panics_and_shutdown {
         for id in 1..=3 {
             let mut pending = entry(|_| None);
             if id == 3 {
-                pending.scope = Rc::new(RequestScope {
-                    deadline: Deadline(Instant::now()),
-                    ..scope()
-                });
+                pending.pending = synthetic(
+                    RequestScope {
+                        deadline: Deadline(Instant::now()),
+                        ..scope()
+                    },
+                    |_| None,
+                );
             }
             reactor.state.borrow_mut().entries.insert(IoId(id), pending);
         }
