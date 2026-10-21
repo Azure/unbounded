@@ -1852,3 +1852,39 @@ fn read_spill_hold_refused_falls_back_to_memory_window() {
     }
     endpoint.uninstall().unwrap();
 }
+
+#[test]
+fn read_spill_fill_failure_stops_spill_without_retrying() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let (mut f, _local, mut endpoint, mut stream) = spill_reader(3, 1);
+    // The head stays blocked while every origin fill fails, so only the spill
+    // path can reach page 1.
+    f.origin.blocked_pages.borrow_mut().insert(0);
+    f.origin.version_unavailable.set(true);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..256 {
+        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    let spilled = f
+        .origin
+        .started_pages
+        .borrow()
+        .iter()
+        .filter(|&&number| number == 1)
+        .count();
+    assert_eq!(spilled, 1, "a failed spill fill is not retried");
+    assert_eq!(
+        holders(&f, 1),
+        0,
+        "the failed spill page's hold is released"
+    );
+    f.origin.blocked_pages.borrow_mut().clear();
+    futures::executor::block_on(stream.cancel()).unwrap();
+    drop(stream);
+    for _ in 0..256 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    endpoint.uninstall().unwrap();
+}

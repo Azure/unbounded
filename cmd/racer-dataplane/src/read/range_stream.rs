@@ -1227,6 +1227,11 @@ impl RangeStream {
                     if let Some(epoch) = spill.held.remove(number) {
                         release.push((PageNumber(*number), epoch));
                     }
+                    // A failed spill fill (origin refusal, version change, no
+                    // disk) would likely fail again, and each retry takes a
+                    // fresh warm budget. Stop spilling: the page is fetched
+                    // through the window like any other.
+                    spill.refused = true;
                     false
                 }
                 Spilling::Spilled => true,

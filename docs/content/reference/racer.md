@@ -306,8 +306,8 @@ them in any order:
 - Pages that arrive early wait in memory until their turn. If
   `RACER_RANGE_SPILL_PAGES` is above zero, a read can also fetch pages past the
   window to local disk under a short hold. Each hold is released after its page
-  is sent or the read ends. If a hold is refused, the read uses its memory
-  window only.
+  is sent or the read ends. If a hold is refused or a page fails to spill, the
+  read stops spilling and uses its memory window only.
 - Reads of the same version on one node share page fetches.
 
 The window is `RACER_RANGE_WINDOW_PAGES` pages, also limited by the client's

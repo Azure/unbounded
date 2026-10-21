@@ -145,7 +145,8 @@ pages beyond its window on local disk. For pages in
 - Release the holder (`Work::Release`) once after delivery, and every remaining
   holder on cancel or drop. A hold still pending at that point is released
   once its completion shows it applied. Hold expiry is the backstop.
-- If a hold is refused, the read keeps only its memory window.
+- If a hold is refused or a spill fill fails, the read stops spilling and keeps
+  only its memory window; the failed page is fetched normally.
 - No spill while a warm job covers the version.
 
 ### 4. Peer protocol: several pages in flight per subscription
