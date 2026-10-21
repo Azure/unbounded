@@ -36,6 +36,47 @@ func TestSiteResourceAndAddToScheme(t *testing.T) {
 	}
 }
 
+func TestPodCIDRAssignmentEnabled(t *testing.T) {
+	settings := []struct {
+		name  string
+		value *bool
+	}{
+		{"omitted", nil},
+		{"true", new(true)},
+		{"false", new(false)},
+	}
+	for _, manage := range settings {
+		for _, assignment := range settings {
+			t.Run(manage.name+"/"+assignment.name, func(t *testing.T) {
+				spec := SiteSpec{ManageCniPlugin: manage.value}
+				rule := unboundednetv1alpha1.PodCidrAssignment{AssignmentEnabled: assignment.value}
+
+				want := assignment.name == "true" || (assignment.name == "omitted" && manage.name != "false")
+				if got := spec.PodCIDRAssignmentEnabled(rule); got != want {
+					t.Fatalf("effective assignment enabled = %v, want %v", got, want)
+				}
+
+				if rule.AssignmentEnabled != assignment.value {
+					t.Fatal("resolution mutated the assignment setting")
+				}
+			})
+		}
+	}
+
+	spec := SiteSpec{}
+	rule := unboundednetv1alpha1.PodCidrAssignment{}
+
+	spec.ManageCniPlugin = new(false)
+	if spec.PodCIDRAssignmentEnabled(rule) {
+		t.Fatal("omitted assignment did not inherit changed CNI setting")
+	}
+
+	spec.ManageCniPlugin = new(true)
+	if !spec.PodCIDRAssignmentEnabled(rule) || rule.AssignmentEnabled != nil {
+		t.Fatal("inherited default was persisted instead of resolved")
+	}
+}
+
 func TestDeepCopySiteAndList(t *testing.T) {
 	enabled := true
 	priority := int32(10)

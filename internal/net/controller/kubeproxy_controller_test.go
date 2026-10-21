@@ -116,6 +116,46 @@ func TestSiteKubeProxyClusterCIDR(t *testing.T) {
 	if !ok || got != "100.125.0.0/16,fd00:1::/64" {
 		t.Fatalf("siteKubeProxyClusterCIDR() = %q,%v", got, ok)
 	}
+
+	site.Spec.ManageCniPlugin = new(false)
+	if got, ok := siteKubeProxyClusterCIDR(site); !ok || got != "100.125.0.0/16,fd00:1::/64" {
+		t.Fatalf("unmanaged omitted assignment lost cluster CIDRs: %q, %v", got, ok)
+	}
+
+	site.Spec.PodCidrAssignments[1].AssignmentEnabled = new(true)
+	if got, ok := siteKubeProxyClusterCIDR(site); !ok || got != "100.125.0.0/16,fd00:1::/64" {
+		t.Fatalf("explicit unmanaged assignment lost cluster CIDRs: %q, %v", got, ok)
+	}
+}
+
+func TestEnsureDaemonSetForUnmanagedSite(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "external"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			ManageCniPlugin: new(false),
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+				CidrBlocks: []string{"10.244.0.0/16", "fd00:244::/48"},
+			}},
+		},
+	}
+	clientset := k8sfake.NewClientset()
+
+	c := &ManagedKubeProxyController{
+		clientset: clientset,
+		options:   ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v1"},
+	}
+	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := clientset.AppsV1().DaemonSets("unbounded-net").Get(t.Context(), managedKubeProxyDaemonSetName(site.Name), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unmanaged Site has no kube-proxy DaemonSet: %v", err)
+	}
+
+	if got := ds.Spec.Template.Spec.Containers[0].Command[3]; got != "--cluster-cidr=10.244.0.0/16,fd00:244::/48" {
+		t.Fatalf("unexpected cluster-cidr arg: %s", got)
+	}
 }
 
 func TestDaemonSetForSite(t *testing.T) {

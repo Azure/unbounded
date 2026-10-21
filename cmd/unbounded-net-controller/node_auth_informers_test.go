@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -129,7 +130,27 @@ func TestNodeAuthInformersScopeAndLifecycle(t *testing.T) {
 	otherSA := sa.DeepCopy()
 	otherSA.Namespace = "other"
 	client := k8sfake.NewClientset(pod, sa, unlabeled, otherPod, otherSA)
+	podWatchStarted := make(chan struct{}, 1)
+	watchReactor := client.WatchReactionChain[0]
+	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		handled, stream, err := watchReactor.React(action)
+		if handled && err == nil {
+			select {
+			case podWatchStarted <- struct{}{}:
+			default:
+			}
+		}
+
+		return handled, stream, err
+	})
 	caches, stop := startNodeAuthTestCaches(t, client)
+
+	// The fake tracker cannot replay deletions between the initial list and watch registration.
+	select {
+	case <-podWatchStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pod watch did not start")
+	}
 
 	if _, err := caches.pods.Lister().Pods(pod.Namespace).Get(pod.Name); err != nil {
 		t.Fatal(err)
