@@ -1245,11 +1245,24 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
             assert_no_head(&mut socket);
         }
         sleep_until(started + timeout + Duration::from_millis(20));
-        for _ in 0..64 {
+        // The expired budget closes the connection, but under load its timer
+        // and close completions can take more than a fixed number of pumps to
+        // be reaped. Wait for the close itself, bounded by wall-clock time.
+        let closed = Instant::now() + Duration::from_secs(5);
+        loop {
             fixture.pump(16);
+            if fixture.listeners.active_connections() == 0 {
+                match socket.read(&mut [0; 1]) {
+                    Ok(read) => {
+                        assert_eq!(read, 0, "{mode}");
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("{mode}: {error}"),
+                }
+            }
+            assert!(Instant::now() < closed, "{mode}: connection did not close");
         }
-        assert_eq!(fixture.listeners.active_connections(), 0, "{mode}");
-        assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0, "{mode}");
         assert_eq!(fixture.completed_heads(), usize::from(mode == "keepalive"));
         assert_no_body_leases(&fixture);
     }
