@@ -51,8 +51,8 @@ type NvidiaHost struct {
 	// was provisioned. Discovery refreshes must preserve this value.
 	Required bool
 
-	// UseCDIRuntime selects CDI injection for Azure Linux NVIDIA workloads.
-	// Ubuntu retains the toolkit's existing automatic runtime mode.
+	// UseCDIRuntime selects CDI injection when the host's NVIDIA runtime must
+	// consume the generated driver-root CDI specification.
 	UseCDIRuntime bool
 
 	// GPUDevicePaths lists NVIDIA GPU device paths discovered on the host
@@ -211,9 +211,13 @@ func useNVIDIACDIRuntime(osRelease map[string]string) bool {
 	}
 
 	id := normalizeOSReleaseID(osRelease["ID"])
+	versionID := osRelease["VERSION_ID"]
 
-	return (id == "azurelinux" || id == "azlinux") &&
-		strings.HasPrefix(osRelease["VERSION_ID"], "3")
+	if (id == "azurelinux" || id == "azlinux") && strings.HasPrefix(versionID, "3") {
+		return true
+	}
+
+	return id == "ubuntu" && versionID == "24.04"
 }
 
 const (

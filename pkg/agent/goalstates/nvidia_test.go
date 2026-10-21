@@ -122,7 +122,7 @@ func TestResolveNvidiaHostForPreflightDefersReadiness(t *testing.T) {
 	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
 }
 
-func TestAzureLinuxUsesNVIDIACDIRuntime(t *testing.T) {
+func TestSupportedNVIDIAHostsUseCDIRuntime(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -149,9 +149,15 @@ VARIANT_ID=azurecontainerlinux
 VERSION_ID="3.0.20260809"`,
 		},
 		{
-			name: "Ubuntu",
+			name: "Ubuntu 24.04",
 			osRelease: `ID=ubuntu
 VERSION_ID="24.04"`,
+			want: true,
+		},
+		{
+			name: "Ubuntu 22.04",
+			osRelease: `ID=ubuntu
+VERSION_ID="22.04"`,
 		},
 		{
 			name: "Fedora compatibility fallback",

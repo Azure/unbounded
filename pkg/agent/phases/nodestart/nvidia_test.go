@@ -47,8 +47,8 @@ func TestConfigureNVIDIAContainerRuntime(t *testing.T) {
 		wantErr string
 		wantRun bool
 	}{
-		{name: "Azure Linux uses CDI", enabled: true, wantRun: true},
-		{name: "Ubuntu remains automatic", enabled: false},
+		{name: "selected host uses CDI", enabled: true, wantRun: true},
+		{name: "unselected host remains automatic", enabled: false},
 		{
 			name:    "configuration failure is explicit",
 			enabled: true,
