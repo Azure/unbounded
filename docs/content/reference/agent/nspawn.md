@@ -161,6 +161,22 @@ fail the nspawn start and are retried through systemd. On the host,
 steps by restarting the managed nspawn unit. Managed `NodeReboot` operations
 invoke the same reconcile flow.
 
+An application that embeds the agent can run the hooks' phases another way,
+such as in a container, by setting `NSpawnLifecycle` in the agent config. Its
+`PreStartCommand` and `PostStartCommand` replace the helper's commands in the
+units. Each is a systemd command line, in which `%i` is the machine's name, and
+must run its `nspawn-lifecycle` phase for that machine and fail when the phase
+fails. The agent then doesn't install the lifecycle helper:
+
+```json
+{
+  "NSpawnLifecycle": {
+    "PreStartCommand": "/usr/bin/systemctl start app-nspawn-pre-start@%i.service",
+    "PostStartCommand": "/usr/bin/systemctl start app-nspawn-post-start@%i.service"
+  }
+}
+```
+
 Each lifecycle refresh discovers NVIDIA devices and driver libraries from the
 current host. On a node provisioned with the NVIDIA-capable rootfs, complete GPU
 discovery runs post-start rewiring, while incomplete driver state causes the
@@ -191,7 +207,7 @@ The configuration is written to these files on the host before the machine boots
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
-| Rollback-stable lifecycle helper | `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` |
+| Rollback-stable lifecycle helper, unless `NSpawnLifecycle` is set | `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` |
 
 ### Containerd image verification
 
@@ -387,7 +403,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
-| `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback. On a host installed by a release before `/opt/unbounded/agent`, that directory is a link to `/usr/local` until the agent moves the files; see [Where the agent installs]({{< relref "guides/agent#where-the-agent-installs" >}}). |
+| `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback, unless `NSpawnLifecycle` is set. On a host installed by a release before `/opt/unbounded/agent`, that directory is a link to `/usr/local` until the agent moves the files; see [Where the agent installs]({{< relref "guides/agent#where-the-agent-installs" >}}). |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

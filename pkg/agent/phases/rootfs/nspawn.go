@@ -89,7 +89,7 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 		return fmt.Errorf("bootstrap machine directory %s: %w", e.goalState.MachineDir, err)
 	}
 
-	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper()); err != nil {
+	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelperFor(e.goalState)); err != nil {
 		return fmt.Errorf("install nspawn lifecycle helper: %w", err)
 	}
 
@@ -130,7 +130,9 @@ type nspawnTemplateData struct {
 	AMDGPUDevicePaths      []string
 	AMDSysFSPaths          []string
 	ConfigRegenerationUnit string
-	AgentBinaryPath        string
+	// PreStartCommand and PostStartCommand are the lifecycle hooks' commands.
+	PreStartCommand  string
+	PostStartCommand string
 }
 
 // TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
@@ -167,8 +169,8 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              goalstates.ResolveHostPaths().NSpawnLifecycleBinary,
 	}
+	templateData.PreStartCommand, templateData.PostStartCommand = nspawnLifecycleCommands(goalState, machineName)
 
 	if len(hostDevicePaths) > 0 {
 		log.Info("host devices detected, configuring nspawn bind-mounts",
@@ -230,6 +232,18 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	}
 
 	return nil
+}
+
+// nspawnLifecycleCommands returns the configured lifecycle hook commands, or
+// the lifecycle helper's for the machine.
+func nspawnLifecycleCommands(goalState *goalstates.RootFS, machineName string) (preStart, postStart string) {
+	if !goalState.UsesLifecycleHelper() {
+		return goalState.NSpawnLifecycle.PreStartCommand, goalState.NSpawnLifecycle.PostStartCommand
+	}
+
+	helper := goalstates.ResolveHostPaths().NSpawnLifecycleBinary
+
+	return helper + " nspawn-lifecycle pre-start " + machineName, helper + " nspawn-lifecycle post-start " + machineName
 }
 
 func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {

@@ -66,6 +66,11 @@ type AgentConfig struct {
 	// required.
 	AdditionalHostMounts []AdditionalHostMount `json:"AdditionalHostMounts,omitempty"`
 
+	// NSpawnLifecycle supplies the commands the machine's systemd hooks run
+	// before and after it starts, in place of the lifecycle helper, which the
+	// agent then does not install on the host. Nil runs the helper.
+	NSpawnLifecycle *NSpawnLifecycleConfig `json:"NSpawnLifecycle,omitempty"`
+
 	// OfflineArtifacts points to a complete offline binary artifact source.
 	// When set, it takes precedence over download overrides. Source is rendered
 	// as a strict Go template using the cluster Kubernetes version, then
@@ -92,6 +97,43 @@ func ValidateProvisioningFormat(format string) error {
 	default:
 		return fmt.Errorf("ProvisioningFormat must be %q or %q", ProvisioningFormatCloudInit, ProvisioningFormatIgnition)
 	}
+}
+
+// NSpawnLifecycleConfig supplies the nspawn lifecycle hooks' commands, for an
+// application that runs the agent's nspawn-lifecycle phases another way than
+// through the lifecycle helper, such as in a container. Each is a systemd
+// command line, as in ExecStart=, in a unit instance named after the machine,
+// so %i expands to the machine's name. Each must run its phase for that machine
+// and fail if the phase fails, as nspawn-lifecycle does.
+type NSpawnLifecycleConfig struct {
+	// PreStartCommand runs the pre-start phase, which regenerates the
+	// machine's host-side config before it starts.
+	PreStartCommand string `json:"PreStartCommand"`
+	// PostStartCommand runs the post-start phase once the machine has started.
+	PostStartCommand string `json:"PostStartCommand"`
+}
+
+// ValidateNSpawnLifecycle checks that configured lifecycle hook commands are
+// present and safe to render into systemd units. Nil is valid.
+func ValidateNSpawnLifecycle(lifecycle *NSpawnLifecycleConfig) error {
+	if lifecycle == nil {
+		return nil
+	}
+
+	var errs []error
+
+	for _, hook := range []struct{ name, command string }{
+		{"PreStartCommand", lifecycle.PreStartCommand},
+		{"PostStartCommand", lifecycle.PostStartCommand},
+	} {
+		if strings.TrimSpace(hook.command) == "" {
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s is required", hook.name))
+		} else if strings.IndexFunc(hook.command, unicode.IsControl) >= 0 {
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not contain control characters", hook.name))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -235,6 +277,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateAdditionalHostMounts(a.AdditionalHostMounts); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateNSpawnLifecycle(a.NSpawnLifecycle); err != nil {
 		errs = append(errs, err)
 	}
 

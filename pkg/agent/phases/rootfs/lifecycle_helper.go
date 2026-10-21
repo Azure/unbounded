@@ -15,24 +15,41 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
-type ensureNSpawnLifecycleHelper struct{}
+type ensureNSpawnLifecycleHelper struct {
+	skip    bool
+	install func(sourcePath, targetPath string) error
+}
 
 // EnsureNSpawnLifecycleHelper installs a rollback-stable lifecycle command helper.
 // Agent rollback changes the daemon's current symlink but leaves this helper in
 // place so already-generated nspawn hooks remain executable.
 func EnsureNSpawnLifecycleHelper() phases.Task {
-	return &ensureNSpawnLifecycleHelper{}
+	return &ensureNSpawnLifecycleHelper{install: installNSpawnLifecycleHelper}
+}
+
+// EnsureNSpawnLifecycleHelperFor is EnsureNSpawnLifecycleHelper for a machine.
+// It installs nothing when the machine's hooks run configured commands instead
+// of the helper.
+func EnsureNSpawnLifecycleHelperFor(goalState *goalstates.RootFS) phases.Task {
+	return &ensureNSpawnLifecycleHelper{
+		skip:    !goalState.UsesLifecycleHelper(),
+		install: installNSpawnLifecycleHelper,
+	}
 }
 
 func (e *ensureNSpawnLifecycleHelper) Name() string { return "ensure-nspawn-lifecycle-helper" }
 
 func (e *ensureNSpawnLifecycleHelper) Do(_ context.Context) error {
+	if e.skip {
+		return nil
+	}
+
 	sourcePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve running agent executable: %w", err)
 	}
 
-	return installNSpawnLifecycleHelper(sourcePath, goalstates.ResolveHostPaths().NSpawnLifecycleBinary)
+	return e.install(sourcePath, goalstates.ResolveHostPaths().NSpawnLifecycleBinary)
 }
 
 func installNSpawnLifecycleHelper(sourcePath, targetPath string) (retErr error) {

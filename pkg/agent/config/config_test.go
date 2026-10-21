@@ -253,6 +253,24 @@ func TestAgentConfig_Validate(t *testing.T) {
 			wantErr: "AdditionalHostMounts[0].Source",
 		},
 		{
+			name: "nspawn lifecycle commands",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NSpawnLifecycle = &NSpawnLifecycleConfig{
+					PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+					PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+				}
+			},
+		},
+		{
+			name: "nspawn lifecycle without post-start command",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NSpawnLifecycle = &NSpawnLifecycleConfig{
+					PreStartCommand: "/usr/bin/systemctl start app-pre-start@%i.service",
+				}
+			},
+			wantErr: "NSpawnLifecycle.PostStartCommand",
+		},
+		{
 			name: "additional host mount unclean target",
 			mutate: func(cfg *AgentConfig) {
 				cfg.AdditionalHostMounts = []AdditionalHostMount{{

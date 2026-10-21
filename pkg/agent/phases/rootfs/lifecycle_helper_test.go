@@ -4,11 +4,15 @@
 package rootfs
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func TestInstallNSpawnLifecycleHelperPreservesExistingTargetOnCopyFailure(t *testing.T) {
@@ -58,4 +62,44 @@ func TestInstallNSpawnLifecycleHelper(t *testing.T) {
 	data, err = os.ReadFile(target)
 	require.NoError(t, err)
 	require.Equal(t, []byte("new-agent"), data)
+}
+
+func TestEnsureNSpawnLifecycleHelperFor(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		lifecycle   *config.NSpawnLifecycleConfig
+		wantInstall bool
+	}{
+		"hooks run the helper": {wantInstall: true},
+		"hooks run configured commands": {
+			lifecycle: &config.NSpawnLifecycleConfig{
+				PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+				PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+			},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			task, ok := EnsureNSpawnLifecycleHelperFor(&goalstates.RootFS{NSpawnLifecycle: tc.lifecycle}).(*ensureNSpawnLifecycleHelper)
+			require.True(t, ok)
+
+			var targets []string
+
+			task.install = func(_, targetPath string) error {
+				targets = append(targets, targetPath)
+
+				return nil
+			}
+			require.NoError(t, task.Do(context.Background()))
+
+			if tc.wantInstall {
+				require.Equal(t, []string{goalstates.ResolveHostPaths().NSpawnLifecycleBinary}, targets)
+			} else {
+				require.Empty(t, targets)
+			}
+		})
+	}
 }

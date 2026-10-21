@@ -58,6 +58,10 @@ func resolveNSpawnConfig(
 		return nil, err
 	}
 
+	if err := config.ValidateNSpawnLifecycle(cfg.NSpawnLifecycle); err != nil {
+		return nil, err
+	}
+
 	additionalHostMounts, err := resolveAdditionalHostMounts(cfg.AdditionalHostMounts)
 	if err != nil {
 		return nil, err
@@ -95,6 +99,7 @@ func resolveNSpawnConfig(
 		AMD:                    ResolveAMDHost(),
 		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
 		AdditionalHostMounts:   additionalHostMounts,
+		NSpawnLifecycle:        cfg.NSpawnLifecycle,
 	}, nil
 }
 
@@ -194,6 +199,7 @@ func resolveMachine(
 		AMD:                    amd,
 		HostDevices:            nspawnConfig.HostDevices,
 		AdditionalHostMounts:   nspawnConfig.AdditionalHostMounts,
+		NSpawnLifecycle:        nspawnConfig.NSpawnLifecycle,
 	}
 
 	containerd := ResolveContainerd(ContainerdOptions{
