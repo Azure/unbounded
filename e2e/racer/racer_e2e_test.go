@@ -13,18 +13,18 @@ import (
 )
 
 const (
-	accountURL = "https://azureopendatastorage.blob.core.windows.net"
-	bucket     = "mnist"
-	blobKey    = "t10k-labels-idx1-ubyte.gz"
-	blobSHA256 = "f7ae60f92e00ec6debd23a6088c31dbd2371eca3ffa0defaefb259924204aec6"
-	cacheName  = "e2e-cache"
+	containerURL = "https://azureopendatastorage.blob.core.windows.net/" + bucket
+	bucket       = "mnist"
+	blobKey      = "t10k-labels-idx1-ubyte.gz"
+	blobSHA256   = "f7ae60f92e00ec6debd23a6088c31dbd2371eca3ffa0defaefb259924204aec6"
+	cacheName    = "e2e-cache"
 )
 
 // TestObjectCacheFromAzureOrigin installs Racer through the operator from a
 // ClusterCache with an anonymous Azure origin, then reads a public blob
 // through the injected racer-object sidecar using both the S3 and Azure APIs.
 func TestObjectCacheFromAzureOrigin(t *testing.T) {
-	requireAzureEgress(t, accountURL+"/"+bucket+"/"+blobKey)
+	requireAzureEgress(t, containerURL+"/"+blobKey)
 
 	h := newHarness(t)
 	h.setup()
@@ -46,10 +46,9 @@ metadata:
   name: %s
 spec:
   origin:
-    buckets: [%s]
     azure:
-      accountURL: %s
-`, cacheName, bucket, accountURL))
+      containerURL: %s
+`, cacheName, containerURL))
 
 	// Cap dataplane threads for kind: automatic sizing scales with host cores.
 	// The operator seeds this ConfigMap once and preserves administrator edits,
@@ -123,15 +122,13 @@ metadata:
     app: fetch
     racer.unbounded-cloud.io/object-sidecar: enabled
   annotations:
-    racer.unbounded-cloud.io/object-namespace: %[2]q
-    racer.unbounded-cloud.io/object-buckets: %[3]s
-    racer.unbounded-cloud.io/object-cache: %[4]s
-    racer.unbounded-cloud.io/object-api: %[5]s
+    racer.unbounded-cloud.io/object-cache: %[2]s
+    racer.unbounded-cloud.io/object-api: %[3]s
 spec:
   restartPolicy: Never
   containers:
   - name: app
     image: curlimages/curl:8.11.1
-    command: ["sh", "-c", %[6]q]
-`, ns, accountURL, bucket, cacheName, api, script)
+    command: ["sh", "-c", %[4]q]
+`, ns, cacheName, api, script)
 }

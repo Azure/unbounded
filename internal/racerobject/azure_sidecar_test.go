@@ -30,7 +30,7 @@ func azureSidecarTestHandler(t *testing.T, origin racersdk.Origin) http.Handler 
 	t.Helper()
 	client := racersdktest.NewClient(t, origin)
 
-	h, err := NewSidecar(client, SidecarConfig{API: "azure", Namespace: "test", Buckets: []string{"bucket"}})
+	h, err := NewSidecar(client, SidecarConfig{API: "azure"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,8 +169,6 @@ func TestAzureSidecarRejectedRequests(t *testing.T) {
 		{"/bucket", 400},
 		{"/bucket/", 400},
 		{"/bucket%2Fblob", 400},
-		{"/other/blob", 403},
-		{"/account/bucket/blob", 403},
 		{"/bucket/%FF", 400},
 		{"/bucket/blob?versionid=", 400},
 		{"/bucket/blob?versionid=a&versionid=b", 400},
@@ -255,7 +253,7 @@ func assertAzureSidecarError(t *testing.T, w *httptest.ResponseRecorder, method 
 func TestAzureSidecarExactIdentity(t *testing.T) {
 	for _, key := range []string{"a//b/../c", "/leading", "./relative", "a%2Fb", "a+b c", "雪/☃", "trailing/", "a?b#c"} {
 		t.Run(key, func(t *testing.T) {
-			want, err := NewRequest("test", "bucket", key, "version+/%")
+			want, err := NewRequest("bucket", key, "version+/%")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -319,7 +317,7 @@ func TestAzureSidecarSDKFailures(t *testing.T) {
 func TestAzureSidecarRealSDK(t *testing.T) {
 	const key, version = "a//b/../c%2F +雪", "version+/%"
 
-	want, err := NewRequest("test", "bucket", key, version)
+	want, err := NewRequest("bucket", key, version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +470,7 @@ func TestAzureSidecarEmptyAndAbort(t *testing.T) {
 func TestSidecarAPIConfig(t *testing.T) {
 	client := racersdktest.NewClient(t, sidecarTestOrigin(t, "data", `"v"`, nil))
 	for _, api := range []string{"", "s3", "azure", "Azure", "unknown"} {
-		h, err := NewSidecar(client, SidecarConfig{Namespace: "test", API: api})
+		h, err := NewSidecar(client, SidecarConfig{API: api})
 		if api == "Azure" || api == "unknown" {
 			if err == nil {
 				t.Fatal("accepted API", api)
@@ -497,7 +495,7 @@ func TestAzureSidecarScopeAndPlumbing(t *testing.T) {
 
 	origin := sidecarTestOrigin(t, "data", `"v"`, &calls)
 
-	want, err := NewRequest("account-scope", "bucket", "blob", "")
+	want, err := NewRequest("bucket", "blob", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,14 +507,11 @@ func TestAzureSidecarScopeAndPlumbing(t *testing.T) {
 
 		return origin(ctx, r)
 	})
-	buckets := []string{"bucket"}
 
-	h, err := NewSidecar(client, SidecarConfig{API: "azure", Namespace: "account-scope", Buckets: buckets})
+	h, err := NewSidecar(client, SidecarConfig{API: "azure"})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	buckets[0] = "other"
 
 	headers := http.Header{}
 	for _, name := range []string{"Authorization", "x-ms-version", "x-ms-date", "x-ms-client-request-id", "x-ms-useragent", "User-Agent"} {
@@ -526,14 +521,6 @@ func TestAzureSidecarScopeAndPlumbing(t *testing.T) {
 	w := sidecarTestRequest(h, "GET", "/bucket/blob?timeout=001", headers)
 	if w.Code != 200 || w.Header().Get("x-ms-version-id") != "" {
 		t.Fatalf("plumbing rejected or version invented: %d %v", w.Code, w.Header())
-	}
-
-	before := calls.Load()
-	w = sidecarTestRequest(h, "GET", "/other/blob", nil)
-	assertAzureSidecarError(t, w, "GET", 403, "AuthorizationFailure")
-
-	if calls.Load() != before {
-		t.Fatal("allowlist was not copied")
 	}
 }
 
