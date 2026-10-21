@@ -16,10 +16,10 @@ import (
 // Azurite-style URLs may carry one simple account path segment.
 func ValidateAzureAccountURL(value, credential string) error {
 	if credential != "default" && credential != "anonymous" {
-		return errors.New("--azure-credential must be default or anonymous")
+		return errors.New("azure credential must be default or anonymous")
 	}
 
-	invalid := errors.New("--account-url must be an HTTP(S) account URL without credentials, query, fragment, or more than one simple path segment")
+	invalid := errors.New("account URL must be an HTTP(S) URL without credentials, query, fragment, or more than one simple path segment")
 
 	u, err := url.Parse(value)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
@@ -37,7 +37,7 @@ func ValidateAzureAccountURL(value, credential string) error {
 	if port := u.Port(); port != "" {
 		n, err := strconv.Atoi(port)
 		if err != nil || n < 1 || n > 65535 {
-			return errors.New("invalid --account-url port")
+			return errors.New("invalid account URL port")
 		}
 	}
 	// Only plain account names are allowed in an Azurite path prefix.
@@ -49,7 +49,7 @@ func ValidateAzureAccountURL(value, credential string) error {
 	}
 
 	if credential == "default" && u.Scheme != "https" {
-		return errors.New("--account-url requires HTTPS with --azure-credential=default")
+		return errors.New("the default Azure credential requires HTTPS")
 	}
 
 	return nil

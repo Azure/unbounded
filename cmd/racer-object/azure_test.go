@@ -25,11 +25,11 @@ func TestProviderOptions(t *testing.T) {
 	for _, provider := range []string{"s3", "azure"} {
 		args := []string{"origin", "--bucket=bucket", "--provider=" + provider}
 		if provider == "azure" {
-			args = append(args, "--account-url=https://account.blob.core.windows.net")
+			args = []string{"origin", "--provider=azure", "--container-url=https://account.blob.core.windows.net/bucket"}
 		}
 
 		o, err := parseOptions(args, io.Discard)
-		if err != nil || o.provider != provider || o.azureCredential != "default" {
+		if err != nil || o.provider != provider || o.azureCredential != "default" || o.bucket != "bucket" {
 			t.Fatalf("provider %s: %+v, %v", provider, o, err)
 		}
 	}
@@ -39,8 +39,8 @@ func TestProviderOptions(t *testing.T) {
 		t.Fatalf("S3 default: %+v, %v", o, err)
 	}
 
-	o, err = parseOptions([]string{"origin", "--provider=azure", "--account-url=http://localhost:10000/devstoreaccount1", "--azure-credential=anonymous", "--bucket=container", "--metadata-ttl=2s", "--request-timeout=3s"}, io.Discard)
-	if err != nil || o.azureCredential != "anonymous" || o.accountURL != "http://localhost:10000/devstoreaccount1" ||
+	o, err = parseOptions([]string{"origin", "--provider=azure", "--container-url=http://localhost:10000/devstoreaccount1/container", "--azure-credential=anonymous", "--metadata-ttl=2s", "--request-timeout=3s"}, io.Discard)
+	if err != nil || o.azureCredential != "anonymous" || o.containerURL != "http://localhost:10000/devstoreaccount1/container" ||
 		o.bucket != "container" || o.metadataTTL != 2*time.Second || o.requestTimeout != 3*time.Second {
 		t.Fatalf("Azure options: %+v, %v", o, err)
 	}
@@ -64,31 +64,42 @@ func TestProviderOptions(t *testing.T) {
 
 func TestProviderFlagConflicts(t *testing.T) {
 	for _, extra := range [][]string{
-		{"--provider=azure", "--account-url=https://account", "--region="},
-		{"--provider=azure", "--account-url=https://account", "--endpoint="},
-		{"--provider=azure", "--account-url=https://account", "--path-style=true"},
-		{"--provider=azure", "--account-url=https://account", "--path-style=false"},
-		{"--account-url="},
-		{"--azure-credential=default"},
-		{"--provider=s3", "--azure-credential=anonymous"},
+		{"--provider=azure", "--container-url=https://account/bucket", "--region="},
+		{"--provider=azure", "--container-url=https://account/bucket", "--endpoint="},
+		{"--provider=azure", "--container-url=https://account/bucket", "--path-style=true"},
+		{"--provider=azure", "--container-url=https://account/bucket", "--path-style=false"},
+		{"--provider=azure", "--container-url=https://account/bucket", "--bucket=bucket"},
+		{"--provider=azure", "--container-url=https://account/bucket", "--bucket="},
+		{"--bucket=bucket", "--container-url="},
+		{"--bucket=bucket", "--container-url=https://account/bucket"},
+		{"--bucket=bucket", "--azure-credential=default"},
+		{"--bucket=bucket", "--provider=s3", "--azure-credential=anonymous"},
 		{"--provider=azure"},
-		{"--provider=azure", "--account-url=https://account", "--azure-credential="},
-		{"--provider=azure", "--account-url=https://account", "--azure-credential=shared-key"},
-		{"--provider=azure", "--account-url=https://account", "--azure-credential=sas"},
-		{"--provider="},
-		{"--provider=Azure"},
-		{"--provider=other"},
-		{"--api=azure"},
+		{"--provider=azure", "--container-url="},
+		{"--provider=azure", "--container-url=https://account"},
+		{"--provider=azure", "--container-url=https://account/"},
+		{"--provider=azure", "--container-url=https://account/Bucket"},
+		{"--provider=azure", "--container-url=https://account/bucket/"},
+		{"--provider=azure", "--container-url=https://account/a/b/c"},
+		{"--provider=azure", "--container-url=http://account/bucket"},
+		{"--provider=azure", "--container-url=https://account/bucket", "--azure-credential="},
+		{"--provider=azure", "--container-url=https://account/bucket", "--azure-credential=shared-key"},
+		{"--provider=azure", "--container-url=https://account/bucket", "--azure-credential=sas"},
+		{"--bucket=bucket", "--provider="},
+		{"--bucket=bucket", "--provider=Azure"},
+		{"--bucket=bucket", "--provider=other"},
+		{"--bucket=bucket", "--api=azure"},
+		{},
 	} {
 		t.Run(strings.Join(extra, " "), func(t *testing.T) {
-			args := append([]string{"origin", "--bucket=bucket"}, extra...)
+			args := append([]string{"origin"}, extra...)
 			if _, err := parseOptions(args, io.Discard); err == nil {
 				t.Fatal("accepted invalid flags")
 			}
 		})
 	}
 
-	for _, extra := range []string{"--api=", "--api=Azure", "--api=other", "--provider=azure", "--account-url=", "--azure-credential=default"} {
+	for _, extra := range []string{"--api=", "--api=Azure", "--api=other", "--provider=azure", "--container-url=", "--azure-credential=default"} {
 		if _, err := parseOptions([]string{"sidecar", extra}, io.Discard); err == nil {
 			t.Errorf("accepted %s", extra)
 		}
@@ -97,7 +108,7 @@ func TestProviderFlagConflicts(t *testing.T) {
 
 func TestAzureCacheOptions(t *testing.T) {
 	for _, args := range [][]string{
-		{"origin", "--bucket=bucket", "--provider=azure", "--account-url=https://account.blob.core.windows.net"},
+		{"origin", "--provider=azure", "--container-url=https://account.blob.core.windows.net/bucket"},
 		{"sidecar", "--api=azure"},
 	} {
 		t.Run(args[0], func(t *testing.T) {
@@ -114,14 +125,14 @@ func TestAzureHelpAndRedaction(t *testing.T) {
 		var output bytes.Buffer
 
 		_, err := parseOptions([]string{mode, "--help"}, &output)
-		if !errors.Is(err, flag.ErrHelp) || strings.Contains(output.String(), "bucket/container") != (mode == "origin") ||
+		if !errors.Is(err, flag.ErrHelp) || strings.Contains(output.String(), "-container-url") != (mode == "origin") ||
 			strings.Contains(output.String(), "-namespace") {
 			t.Fatalf("help: %q, %v", output.String(), err)
 		}
 
 		flags := []string{"-api"}
 		if mode == "origin" {
-			flags = []string{"-provider", "-account-url", "-azure-credential"}
+			flags = []string{"-provider", "-bucket", "-container-url", "-azure-credential"}
 		}
 
 		for _, name := range flags {
@@ -131,10 +142,10 @@ func TestAzureHelpAndRedaction(t *testing.T) {
 		}
 	}
 
-	for _, extra := range []string{"--account-url=https://account?sig=private-token", "--azure-credential=private-token", "--provider=private-token"} {
+	for _, extra := range []string{"--container-url=https://account/bucket?sig=private-token", "--container-url=https://private-token@account/bucket", "--azure-credential=private-token", "--provider=private-token"} {
 		var output bytes.Buffer
 
-		err := run(t.Context(), []string{"origin", "--bucket=bucket", "--provider=azure", extra}, &output)
+		err := run(t.Context(), []string{"origin", "--provider=azure", extra}, &output)
 		if err == nil || strings.Contains(err.Error()+output.String(), "private-token") {
 			t.Fatalf("invalid argument accepted or leaked: %v", err)
 		}
@@ -166,7 +177,7 @@ func TestCreateAzureOriginAnonymous(t *testing.T) {
 	}))
 	defer server.Close()
 
-	o, err := parseOptions([]string{"origin", "--provider=azure", "--azure-credential=anonymous", "--account-url=" + server.URL + "/devstoreaccount1", "--bucket=container", "--metadata-ttl=2s"}, io.Discard)
+	o, err := parseOptions([]string{"origin", "--provider=azure", "--azure-credential=anonymous", "--container-url=" + server.URL + "/devstoreaccount1/container", "--metadata-ttl=2s"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +225,7 @@ func TestAzureDefaultCredentialConstruction(t *testing.T) {
 
 	t.Setenv("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001")
 
-	o := options{provider: "azure", bucket: "bucket", accountURL: "https://account.blob.core.windows.net", azureCredential: "default", requestTimeout: 2 * time.Second, maxRequests: 7}
+	o := options{provider: "azure", bucket: "bucket", containerURL: "https://account.blob.core.windows.net/bucket", azureCredential: "default", requestTimeout: 2 * time.Second, maxRequests: 7}
 
 	clientOptions := originAzureClientOptions(o)
 	if clientOptions.Transport.(*http.Client).Timeout != 2*time.Second || clientOptions.Telemetry.ApplicationID != "racer-object" {

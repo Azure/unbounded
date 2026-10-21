@@ -9,14 +9,16 @@ requirements, request limits, and the security model.
 ## Example
 
 Use the same `--cache` on the origin and sidecar. Each cache serves exactly one
-bucket or container: the origin takes `--bucket` and forbids requests for any
-other bucket, and the sidecar forwards `/<bucket>/<key>` requests unchanged.
+bucket or container: an S3 origin takes `--bucket`, an Azure origin takes
+`--container-url`, and the origin forbids requests for any other bucket or
+container. The sidecar forwards `/<bucket>/<key>` requests unchanged.
 This pairs an Azure Blob origin with the Azure Blob client API:
 
 ```sh
 racer-object origin --cache=racer-object \
-  --provider=azure --account-url=https://ACCOUNT.blob.core.windows.net \
-  --azure-credential=default --bucket=example-container
+  --provider=azure \
+  --container-url=https://ACCOUNT.blob.core.windows.net/example-container \
+  --azure-credential=default
 racer-object sidecar --cache=racer-object \
   --api=azure --listen=127.0.0.1:8080
 ```
