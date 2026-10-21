@@ -37,8 +37,9 @@ func TestPolicyRoundTripPreservesBoundedExecutionSettings(t *testing.T) {
 				Drop: []corev1.Capability{"NET_RAW"},
 			},
 		},
-		WorkingDir: "/opt/diagnostic",
-		Results:    &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
+		WorkingDir:  "/opt/diagnostic",
+		HostNetwork: true,
+		Results:     &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
 		Volumes: []signalv1.WorkloadVolume{
 			{
 				Name:      "host-proc",
@@ -70,6 +71,7 @@ func TestPolicyRoundTripPreservesBoundedExecutionSettings(t *testing.T) {
 	}
 
 	if got.WorkingDir != policy.WorkingDir ||
+		!got.HostNetwork ||
 		got.Resources.Limits.Cpu().Cmp(*policy.Resources.Limits.Cpu()) != 0 ||
 		len(got.Volumes) != 3 ||
 		got.Volumes[0].HostPath.Path != "/proc" ||
@@ -136,6 +138,23 @@ func TestDecodeRejectsOversizedPolicy(t *testing.T) {
 	policy := signalv1.WorkloadPolicy{WorkingDir: "/" + strings.Repeat("a", MaxPolicyBytes)}
 	if _, err := Encode(policy); err == nil {
 		t.Fatal("Encode accepted oversized policy")
+	}
+}
+
+func TestDecodeRejectsMalformedHostNetworkPolicy(t *testing.T) {
+	t.Parallel()
+
+	for name, content := range map[string]string{
+		"wrong type":    `{"hostNetwork":"true"}`,
+		"unknown field": `{"hostNetworking":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := Decode(content); err == nil {
+				t.Fatal("Decode accepted malformed host network policy")
+			}
+		})
 	}
 }
 

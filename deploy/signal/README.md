@@ -200,6 +200,7 @@ workloadPolicy:
     privileged: false
     capabilities:
       add: [IPC_LOCK]
+  hostNetwork: true
   workingDir: /opt/diagnostic
   results:
     sizeLimit: 2Gi
@@ -226,6 +227,13 @@ sets equal requests and limits on the participant container. Kubernetes
 admission and operator policy still decide whether a capability, host path,
 device, PVC, or privileged context is allowed; technical rendering is not
 authorization.
+
+`hostNetwork: true` is an explicit participant policy for diagnostics that must
+observe the selected Node's network namespace, such as physical NIC inventory.
+The adapter sets `dnsPolicy: ClusterFirstWithHostNet` with it. For MPIJobs this
+applies only to the Node-pinned worker; the unpinned launcher remains outside
+the host network namespace. Omitting the field keeps Kubernetes' default Pod
+networking.
 
 `gpu-resource-count` remains an operator-supplied profile parameter. It may be
 zero for Pod diagnostics and must be positive for MPIJobs. The MPIJob policy is

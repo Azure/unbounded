@@ -72,6 +72,15 @@ func TestRenderOrdinaryPodsPerParticipant(t *testing.T) {
 		if automount {
 			t.Fatalf("resource %d automounts a service account token", index)
 		}
+
+		hostNetwork, _, err := unstructured.NestedBool(resource.Object, "spec", "hostNetwork")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if hostNetwork {
+			t.Fatalf("resource %d unexpectedly uses the host network", index)
+		}
 	}
 }
 
@@ -271,8 +280,9 @@ func TestRenderWorkloadPolicyOnParticipantContainers(t *testing.T) {
 				Add: []corev1.Capability{"IPC_LOCK"},
 			},
 		},
-		WorkingDir: "/opt/diagnostic",
-		Results:    &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
+		HostNetwork: true,
+		WorkingDir:  "/opt/diagnostic",
+		Results:     &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
 		Volumes: []signalv1.WorkloadVolume{
 			{
 				Name:      "host-proc",
@@ -318,7 +328,9 @@ func TestRenderWorkloadPolicyOnParticipantContainers(t *testing.T) {
 	container := pod.Spec.Containers[0]
 
 	gpuLimit := container.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
-	if container.WorkingDir != "/opt/diagnostic" ||
+	if !pod.Spec.HostNetwork ||
+		pod.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet ||
+		container.WorkingDir != "/opt/diagnostic" ||
 		container.Resources.Requests.Cpu().String() != "8" ||
 		container.Resources.Limits.Memory().String() != "32Gi" ||
 		gpuLimit.String() != "8" ||
@@ -341,6 +353,7 @@ func TestMPIWorkloadPolicyDoesNotLeakOntoLauncher(t *testing.T) {
 	t.Parallel()
 
 	policyJSON := `{
+			"hostNetwork":true,
 			"resources":{"requests":{"cpu":"4"},"limits":{"cpu":"4"}},
 			"volumes":[{"name":"host-device","mountPath":"/dev/infiniband","hostPath":{"path":"/dev/infiniband"}}]
 		}`
@@ -376,11 +389,16 @@ func TestMPIWorkloadPolicyDoesNotLeakOntoLauncher(t *testing.T) {
 	launcher := job.Spec.MPIReplicaSpecs["Launcher"].Template.Spec
 	worker := job.Spec.MPIReplicaSpecs["Worker"].Template.Spec
 
-	if len(launcher.Volumes) != 2 || len(launcher.Containers[0].VolumeMounts) != 2 {
+	if launcher.HostNetwork ||
+		launcher.DNSPolicy == corev1.DNSClusterFirstWithHostNet ||
+		len(launcher.Volumes) != 2 ||
+		len(launcher.Containers[0].VolumeMounts) != 2 {
 		t.Fatalf("launcher received participant policy: %#v", launcher)
 	}
 
-	if len(worker.Volumes) != 3 ||
+	if !worker.HostNetwork ||
+		worker.DNSPolicy != corev1.DNSClusterFirstWithHostNet ||
+		len(worker.Volumes) != 3 ||
 		worker.Volumes[2].HostPath.Path != "/dev/infiniband" ||
 		worker.Containers[0].Resources.Requests.Cpu().String() != "4" {
 		t.Fatalf("worker policy = %#v", worker)

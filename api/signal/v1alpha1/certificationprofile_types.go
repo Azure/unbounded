@@ -66,6 +66,7 @@ type WorkloadVolume struct {
 type WorkloadPolicy struct {
 	Resources       corev1.ResourceRequirements  `json:"resources,omitempty"`
 	SecurityContext *corev1.SecurityContext      `json:"securityContext,omitempty"`
+	HostNetwork     bool                         `json:"hostNetwork,omitempty"`
 	WorkingDir      string                       `json:"workingDir,omitempty"`
 	Results         *corev1.EmptyDirVolumeSource `json:"results,omitempty"`
 	// +kubebuilder:validation:MaxItems=16

@@ -39,6 +39,7 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
 		},
+		HostNetwork: true,
 		Volumes: []signalv1.WorkloadVolume{{
 			Name:      "work",
 			MountPath: "/work",
@@ -86,7 +87,8 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 		t.Fatalf("purpose = %q, want %q", run.Spec.Purpose, signalv1.PurposeQuickCertification)
 	}
 
-	if run.Spec.WorkloadPolicy.Resources.Limits.Cpu().String() != "8" ||
+	if !run.Spec.WorkloadPolicy.HostNetwork ||
+		run.Spec.WorkloadPolicy.Resources.Limits.Cpu().String() != "8" ||
 		len(run.Spec.WorkloadPolicy.Volumes) != 1 ||
 		run.Spec.WorkloadPolicy.Volumes[0].EmptyDir.SizeLimit.String() != "8Gi" {
 		t.Fatalf("workload policy = %#v, want immutable profile policy", run.Spec.WorkloadPolicy)
@@ -612,6 +614,7 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
 		},
+		HostNetwork: true,
 		Volumes: []signalv1.WorkloadVolume{{
 			Name:      "work",
 			MountPath: "/work",
@@ -704,7 +707,8 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		t.Fatalf("decode workload policy: %v", err)
 	}
 
-	if policy.Resources.Requests.Cpu().String() != "4" ||
+	if !policy.HostNetwork ||
+		policy.Resources.Requests.Cpu().String() != "4" ||
 		policy.Resources.Limits.Cpu().String() != "8" ||
 		len(policy.Volumes) != 1 ||
 		policy.Volumes[0].EmptyDir.SizeLimit.String() != "8Gi" {
