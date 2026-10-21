@@ -265,7 +265,8 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
             plaintext,
             ciphertext: admission
                 .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
-                .unwrap(),
+                .unwrap()
+                .into(),
         },
         lease,
         &scope,

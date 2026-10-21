@@ -299,7 +299,8 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
                 plaintext,
                 ciphertext: admission
                     .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             }
         } else {
             let plaintext = vec![0xa7; length];

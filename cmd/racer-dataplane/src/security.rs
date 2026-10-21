@@ -5,6 +5,7 @@ use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::memory::BufferPool;
 use crate::memory::CiphertextBytes;
 use crate::memory::CiphertextPage;
 use crate::memory::PlaintextBuffer;
@@ -242,6 +243,7 @@ pub(crate) fn capture_aead_failure(
 pub struct PageCrypto {
     keys: Rc<Keyring>,
     client: Rc<CryptoClient>,
+    buffers: Option<BufferPool>,
 }
 impl PageCrypto {
     pub(crate) async fn sample_send(
@@ -299,7 +301,21 @@ impl PageCrypto {
     /// I/O-local facade. Only owned page inputs and an immutable key lease cross
     /// to the engine; this Rc graph and its futures stay on I/O.
     pub fn new(keys: Rc<Keyring>, client: Rc<CryptoClient>) -> Self {
-        Self { keys, client }
+        Self {
+            keys,
+            client,
+            buffers: None,
+        }
+    }
+    /// Seal page ciphertext directly into this worker's aligned pool.
+    ///
+    /// The I/O thread checks the buffer out before submission, so a crypto
+    /// thread shared by several workers always fills, and the page later
+    /// returns, storage owned by the requesting worker.
+    #[must_use]
+    pub fn with_buffers(mut self, buffers: BufferPool) -> Self {
+        self.buffers = Some(buffers);
+        self
     }
     /// Authenticate the entire page before constructing a publishable lease.
     /// Futures stay on I/O, even though inputs/completions are Send:
@@ -358,6 +374,21 @@ impl PageCrypto {
             let key = self
                 .keys
                 .active(&page.version.object.cache, KeyPurpose::Page)?;
+            let ciphertext = match &self.buffers {
+                Some(buffers) => {
+                    use racer_platform::reactor::IoBuffer;
+                    let length = plaintext
+                        .bytes()?
+                        .len()
+                        .checked_add(TAG_LEN)
+                        .ok_or(Error::InvalidRequest)?;
+                    match buffers.encryption_output(ciphertext, length)? {
+                        Ok(buffer) => EncryptOutput::Aligned(Box::new(buffer)),
+                        Err(reservation) => EncryptOutput::Unaligned(reservation),
+                    }
+                }
+                None => EncryptOutput::Unaligned(ciphertext),
+            };
             match self
                 .client
                 .execute(
@@ -430,8 +461,9 @@ impl PageCryptoEngine {
             }
             input => input,
         };
+        let mut input = input;
         let prepared = Self::prepare(
-            &input,
+            &mut input,
             key.as_ref().expect("page job key"),
             &scope,
             &mut permit,
@@ -488,7 +520,7 @@ impl PageCryptoEngine {
 
     /// Borrow every quota owner until crypto and the final cancellation check succeed.
     fn prepare(
-        input: &CryptoInput,
+        input: &mut CryptoInput,
         key: &racer_crypto::identity::KeyLease,
         scope: &RequestScope,
         permit: &mut CryptoPermit,
@@ -537,24 +569,48 @@ impl PageCryptoEngine {
                     ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
                 };
                 let aad = page_aad(&envelope)?;
-                ciphertext.validate(
-                    ResourceClass::Ciphertext,
-                    envelope.ciphertext_length as usize,
-                )?;
-                if ciphertext.key() != Some(&page.version.object.cache) {
+                let charge = match &*ciphertext {
+                    EncryptOutput::Unaligned(reservation) => {
+                        reservation.validate(
+                            ResourceClass::Ciphertext,
+                            envelope.ciphertext_length as usize,
+                        )?;
+                        reservation
+                    }
+                    EncryptOutput::Aligned(buffer) => {
+                        buffer
+                            .charge()
+                            .validate(ResourceClass::Ciphertext, buffer.capacity())?;
+                        buffer.charge()
+                    }
+                };
+                if charge.key() != Some(&page.version.object.cache) {
                     return Err(Error::InvalidConfiguration);
                 }
-                let mut bytes =
-                    Zeroizing::new(ciphertext.buffer(envelope.ciphertext_length as usize)?);
-                // Input remains immutable until the final cancellation check.
-                // Admission supplies initialized output, including the tag tail.
-                key.seal_page(
-                    &page.version.object.cache,
-                    &envelope.nonce.0,
-                    &aad,
-                    raw,
-                    &mut bytes,
-                )?;
+                let mut bytes = Zeroizing::new(Vec::new());
+                let cache = &page.version.object.cache;
+                let output = match ciphertext {
+                    EncryptOutput::Unaligned(reservation) => {
+                        bytes = Zeroizing::new(
+                            reservation.buffer(envelope.ciphertext_length as usize)?,
+                        );
+                        &mut bytes[..]
+                    }
+                    EncryptOutput::Aligned(buffer) => {
+                        if buffer.len() != envelope.ciphertext_length as usize {
+                            return Err(Error::InvalidConfiguration);
+                        }
+                        buffer.as_mut_slice()
+                    }
+                };
+                // Plaintext input remains immutable until the final cancellation
+                // check. AEAD output is erased if sealing fails part way, since
+                // pooled ciphertext storage is recycled without a wipe.
+                if let Err(error) = key.seal_page(cache, &envelope.nonce.0, &aad, raw, &mut *output)
+                {
+                    output.fill(0);
+                    return Err(error.into());
+                }
                 (envelope, bytes)
             }
             CryptoInput::Decrypt {
@@ -621,12 +677,9 @@ impl PageCryptoEngine {
             CryptoInput::Encrypt {
                 page,
                 plaintext,
-                mut ciphertext,
+                ciphertext,
             } => {
                 let (plain, reservation) = plaintext.into_parts();
-                ciphertext
-                    .shrink(bytes.capacity())
-                    .expect("validated crypto capacity");
                 let plain = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
                         page,
@@ -636,17 +689,28 @@ impl PageCryptoEngine {
                         },
                     }),
                 };
-                let encrypted = CiphertextPage {
-                    provenance: None,
-                    inner: Arc::new(CiphertextBytes {
-                        checksum: std::sync::OnceLock::from(racer_crypto::crc64(&bytes)),
-                        envelope,
-                        storage: flow_control::ChargedBytes {
-                            bytes: std::mem::take(&mut *bytes),
-                            reservation: ciphertext,
+                let encrypted = match ciphertext {
+                    EncryptOutput::Unaligned(mut reservation) => {
+                        reservation
+                            .shrink(bytes.capacity())
+                            .expect("validated crypto capacity");
+                        CiphertextPage {
+                            provenance: None,
+                            inner: Arc::new(CiphertextBytes {
+                                checksum: std::sync::OnceLock::from(racer_crypto::crc64(&bytes)),
+                                envelope,
+                                storage: flow_control::ChargedBytes {
+                                    bytes: std::mem::take(&mut *bytes),
+                                    reservation,
+                                }
+                                .into(),
+                            }),
                         }
-                        .into(),
-                    }),
+                    }
+                    EncryptOutput::Aligned(buffer) => {
+                        let checksum = racer_crypto::crc64(buffer.as_slice());
+                        CiphertextPage::from_aligned(*buffer, envelope, Some(checksum))
+                    }
                 };
                 CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
             }
@@ -1058,7 +1122,7 @@ pub enum CryptoInput {
     Encrypt {
         page: PageId,
         plaintext: PlaintextBuffer,
-        ciphertext: flow_control::Charge<AdmissionPolicy>,
+        ciphertext: EncryptOutput,
     },
     /// Copy cached ciphertext into a registered RDMA send buffer
     /// (`designs/racer-rdma-sessions.md`, "Zero-copy").
@@ -1066,6 +1130,19 @@ pub enum CryptoInput {
         ciphertext: CiphertextPage,
         buffer: rdma_verbs::SendBuffer,
     },
+}
+/// Where AEAD output is written.
+pub enum EncryptOutput {
+    /// A fresh `Vec` charged to this Ciphertext reservation.
+    Unaligned(flow_control::Charge<AdmissionPolicy>),
+    /// Aligned storage checked out of the requesting worker's pool, already
+    /// charged; the page is held as disk-aligned ciphertext.
+    Aligned(Box<crate::memory::CiphertextBuffer>),
+}
+impl From<flow_control::Charge<AdmissionPolicy>> for EncryptOutput {
+    fn from(reservation: flow_control::Charge<AdmissionPolicy>) -> Self {
+        Self::Unaligned(reservation)
+    }
 }
 pub enum CryptoOutput {
     EnvelopeVerified(Box<crate::peer::forwarding::EnvelopeOutput>),
@@ -3151,7 +3228,8 @@ mod tests {
                             plaintext: plain,
                             ciphertext: admission
                                 .reserve(Some(cache), ResourceClass::Ciphertext, size + 16)
-                                .unwrap(),
+                                .unwrap()
+                                .into(),
                         }
                     } else {
                         // Fresh received allocation/checksum state, as on disk/peer ingress.
@@ -3266,7 +3344,8 @@ mod tests {
                         .unwrap(),
                     ciphertext: admission
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
-                        .unwrap(),
+                        .unwrap()
+                        .into(),
                 }
             }
 
@@ -3559,7 +3638,8 @@ mod tests {
                     plaintext,
                     ciphertext: admission
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
-                        .unwrap(),
+                        .unwrap()
+                        .into(),
                 };
                 let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
                 let client = CryptoClient::new(io);
@@ -3655,7 +3735,7 @@ mod tests {
                     CryptoInput::Encrypt {
                         page,
                         plaintext,
-                        ciphertext,
+                        ciphertext: ciphertext.into(),
                     },
                     key(),
                     &scope,
@@ -4153,6 +4233,121 @@ mod tests {
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
     }
+    /// Two I/O workers sharing one crypto thread each get disk-aligned,
+    /// zero-padded ciphertext from, and returned to, their own pool.
+    #[test]
+    fn encryption_seals_into_requesting_worker_aligned_pool() {
+        use crate::admission::AdmissionPolicy;
+        use crate::memory::BufferPool;
+        let keys = Rc::new(crate::test_support::security::keys());
+        let page = envelope().page;
+        let cache = page.version.object.cache.clone();
+        let alignment = crate::memory::default_disk_alignment();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut holders = Vec::new();
+        let mut engines = Vec::new();
+        for worker in 0..2 {
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            )));
+            let pool = BufferPool::new(admission.clone());
+            let (io, port) = pair(WorkerId(worker), 1, NonZeroUsize::new(1).unwrap());
+            let crypto = PageCrypto::new(keys.clone(), Rc::new(CryptoClient::new(io)))
+                .with_buffers(pool.clone());
+            holders.push((admission, pool, crypto));
+            // One crypto thread (this one) drives both workers' queues.
+            engines.push(PageCryptoEngine::new(CryptoRuntime { port }));
+        }
+        let scope = RequestScope::new(
+            RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut futures = Vec::new();
+        for (index, (admission, pool, crypto)) in holders.iter().enumerate() {
+            let length = 5000 + index;
+            let mut plaintext = pool
+                .plaintext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                        .unwrap(),
+                    length,
+                )
+                .unwrap();
+            {
+                use racer_platform::reactor::IoBuffer;
+                plaintext.bytes_mut().unwrap().fill(index as u8 + 1);
+            }
+            // Fill reserves the exact ciphertext length; the pool upgrades it.
+            let reservation = admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
+                .unwrap();
+            let mut future = crypto.encrypt(page.clone(), plaintext, reservation, &scope);
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            futures.push(future);
+        }
+        let mut done: Vec<_> = futures.iter().map(|_| None).collect();
+        for _ in 0..16 {
+            for engine in &mut engines {
+                engine.poll(&mut cx, 4).unwrap();
+            }
+            for (_, _, crypto) in &holders {
+                crypto.client.poll_budgeted(4).unwrap();
+            }
+            for (slot, future) in done.iter_mut().zip(&mut futures) {
+                if slot.is_none()
+                    && let Poll::Ready(result) = future.as_mut().poll(&mut cx)
+                {
+                    *slot = Some(result.unwrap());
+                }
+            }
+        }
+        drop(futures);
+        let results: Vec<_> = done
+            .into_iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let (clear, cipher) = slot.expect("encryption completes");
+                (index, clear, cipher)
+            })
+            .collect();
+        for (index, clear, cipher) in &results {
+            let length = 5000 + index;
+            assert_eq!(clear.bytes().len(), length);
+            assert_eq!(cipher.bytes().len(), length + 16);
+            assert_eq!(
+                cipher.cached_checksum(),
+                Some(racer_crypto::crc64(cipher.bytes()))
+            );
+            let body = cipher
+                .disk_body(alignment)
+                .expect("disk-aligned ciphertext");
+            assert!(cipher.is_disk_aligned(alignment));
+            assert_eq!(body.as_ptr(), cipher.bytes().as_ptr());
+            assert_eq!(body.len(), (length + 16).next_multiple_of(4096));
+            assert!(body[length + 16..].iter().all(|byte| *byte == 0));
+            let mut decrypted = vec![0; length];
+            racer_crypto::open(
+                &[7; 32],
+                &cipher.envelope().nonce.0,
+                &page_aad(cipher.envelope()).unwrap(),
+                cipher.bytes(),
+                &mut decrypted,
+            )
+            .unwrap();
+            assert!(decrypted.iter().all(|byte| *byte == *index as u8 + 1));
+        }
+        for (_, pool, _) in &holders {
+            assert_eq!(pool.aligned_stats().idle_buffers, 0);
+        }
+        drop(results);
+        for (admission, pool, _) in &holders {
+            // Each page returned to the pool of the worker that requested it,
+            // and idle storage keeps no Ciphertext admission.
+            assert_eq!(pool.aligned_stats().idle_buffers, 1);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+    }
     #[test]
     fn encryption_preserves_staging_and_charges_on_failure() {
         use crate::admission::AdmissionPolicy;
@@ -4217,7 +4412,7 @@ mod tests {
                     CryptoInput::Encrypt {
                         page: page.clone(),
                         plaintext,
-                        ciphertext
+                        ciphertext: ciphertext.into()
                     },
                     keys.active(cache, KeyPurpose::Page).unwrap(),
                     scope
@@ -4266,6 +4461,9 @@ mod tests {
                     );
                     assert_eq!(plaintext.bytes().unwrap().as_ptr(), pointer);
                     assert_eq!(plaintext.bytes().unwrap(), b"hello");
+                    let EncryptOutput::Unaligned(ciphertext) = ciphertext else {
+                        panic!("unaligned output");
+                    };
                     assert_eq!(ciphertext.amount(), if undersized { 20 } else { 21 });
                 }
                 _ => panic!("wrong outcome"),

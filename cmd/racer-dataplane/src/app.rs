@@ -803,7 +803,6 @@ impl WorkerApplication {
             runtime.crypto.clone(),
         ));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
-        let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
         let is_sampler = worker == node.control_worker;
         let node_pressure = node.pressure.clone();
         let control = if worker == node.control_worker {
@@ -835,8 +834,20 @@ impl WorkerApplication {
             admission.clone(),
             crate::model::PAGE_BYTES + 16,
         ));
-        let buffers = BufferPool::new(admission.clone());
+        // Aligned ciphertext matches this worker's store devices so pages can
+        // be written without copying; file-backed slabs use the 4 KiB default.
+        let buffers = BufferPool::with_alignment(
+            admission.clone(),
+            node.devices
+                .as_ref()
+                .map_or_else(crate::memory::default_disk_alignment, |plan| {
+                    plan.workers[worker.0 as usize].alignment
+                }),
+        );
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
+        let crypto = Rc::new(
+            PageCrypto::new(keys.clone(), runtime.crypto.clone()).with_buffers(buffers.clone()),
+        );
         let pipes = Rc::new(new_pipe_pool(admission.clone()));
         let delivery = Rc::new(
             Delivery::new(reactor.clone(), config.reader_stall_timeout)
@@ -1364,7 +1375,7 @@ impl WorkerApplication {
                 if released < bytes {
                     writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
                 }
-                admission.reclaim_buffers();
+                memory.buffers().reclaim_idle_buffers();
             }
         }
     }
@@ -1520,7 +1531,7 @@ impl WorkerApplication {
         self.constrain_pools(actions.constrain_pools);
         if transition.reclaim {
             if actions.reclaim_idle_buffers {
-                self.runtime.admission.reclaim_buffers();
+                self.memory.buffers().reclaim_idle_buffers();
                 // Constrained maintenance releases idle staging immediately.
                 self.maintain_pools(now);
             }
@@ -1549,7 +1560,7 @@ impl WorkerApplication {
                 break;
             }
         }
-        self.runtime.admission.reclaim_buffers();
+        self.memory.buffers().reclaim_idle_buffers();
     }
 
     /// Publish this worker's staging pool and, on the sampling worker, the

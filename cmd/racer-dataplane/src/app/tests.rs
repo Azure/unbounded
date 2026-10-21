@@ -3358,7 +3358,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         crate::security::CryptoInput::Encrypt {
             page,
             plaintext,
-            ciphertext,
+            ciphertext: ciphertext.into(),
         },
         worker
             .keys

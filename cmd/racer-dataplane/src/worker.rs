@@ -1856,7 +1856,8 @@ mod tests {
                         .runtime
                         .admission
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
-                        .unwrap(),
+                        .unwrap()
+                        .into(),
                 }
             }
         }
