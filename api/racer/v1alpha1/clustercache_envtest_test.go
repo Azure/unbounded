@@ -21,8 +21,7 @@ const testClientID = "00000000-0000-0000-0000-000000000001"
 
 func validOrigin() map[string]any {
 	return map[string]any{
-		"bucket": "models",
-		"azure":  map[string]any{"accountURL": "https://account.blob.core.windows.net"},
+		"azure": map[string]any{"containerURL": "https://account.blob.core.windows.net/models"},
 	}
 }
 
@@ -77,7 +76,7 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"empty spec": {},
 		"anonymous":  {"origin": validOrigin()},
 		"anonymous http azurite": {"origin": withOrigin(func(o map[string]any) {
-			o["azure"] = map[string]any{"accountURL": "http://localhost:10000/devstoreaccount1"}
+			o["azure"] = map[string]any{"containerURL": "http://localhost:10000/devstoreaccount1/models"}
 		})},
 		"default":           {"origin": azureCredential(map[string]any{"default": map[string]any{}})},
 		"default client":    {"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID}})},
@@ -89,8 +88,14 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 			o["maxConcurrentRequests"] = int64(65536)
 		})},
 	}
-	for _, bucket := range []string{"a", "b.c", "d_e-f", strings.Repeat("x", 255), "..."} {
-		valid["bucket "+bucket] = map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = bucket })}
+	for _, url := range []string{
+		"https://account.blob.core.windows.net/abc",
+		"https://account.blob.core.windows.net/a-b-1",
+		"https://account.blob.core.windows.net:443/models",
+		"https://account.blob.core.windows.net/" + strings.Repeat("x", 63),
+		"https://[::1]/account/models",
+	} {
+		valid["container url "+url] = map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": url} })}
 	}
 
 	for name, spec := range valid {
@@ -103,36 +108,52 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		spec    map[string]any
 		message string
 	}{
-		"no provider":       {map[string]any{"origin": map[string]any{"bucket": "models"}}, "azure is required"},
-		"no bucket":         {map[string]any{"origin": withOrigin(func(o map[string]any) { delete(o, "bucket") })}, "bucket"},
-		"empty bucket":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = "" })}, "bucket"},
-		"bucket list":       {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = []any{"a"} })}, "bucket"},
-		"bucket dot":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = "." })}, "bucket must not be . or .."},
-		"bucket dotdot":     {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = ".." })}, "bucket must not be . or .."},
-		"bucket slash":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = "a/b" })}, "bucket"},
-		"bucket too long":   {map[string]any{"origin": withOrigin(func(o map[string]any) { o["bucket"] = strings.Repeat("x", 256) })}, "bucket"},
-		"negative ttl":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["metadataTTL"] = "-1s" })}, "metadataTTL must not be negative"},
-		"zero timeout":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["requestTimeout"] = "0s" })}, "requestTimeout must be positive"},
-		"bad duration":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["requestTimeout"] = "soon" })}, "requestTimeout"},
-		"zero concurrency":  {map[string]any{"origin": withOrigin(func(o map[string]any) { o["maxConcurrentRequests"] = int64(0) })}, "maxConcurrentRequests"},
-		"large concurrency": {map[string]any{"origin": withOrigin(func(o map[string]any) { o["maxConcurrentRequests"] = int64(65537) })}, "maxConcurrentRequests"},
-		"no account url":    {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{} })}, "accountURL"},
-		"not a url":         {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"accountURL": "account"} })}, "accountURL must be an http or https URL"},
-		"ftp url":           {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"accountURL": "ftp://account"} })}, "accountURL must be an http or https URL"},
-		"url query":         {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"accountURL": "https://account?sig=x"} })}, "must not contain credentials"},
-		"url fragment":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"accountURL": "https://account#x"} })}, "must not contain credentials"},
-		"url userinfo":      {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"accountURL": "https://user@account"} })}, "must not contain credentials"},
+		"no provider":         {map[string]any{"origin": map[string]any{}}, "azure is required"},
+		"negative ttl":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["metadataTTL"] = "-1s" })}, "metadataTTL must not be negative"},
+		"zero timeout":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["requestTimeout"] = "0s" })}, "requestTimeout must be positive"},
+		"bad duration":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["requestTimeout"] = "soon" })}, "requestTimeout"},
+		"zero concurrency":    {map[string]any{"origin": withOrigin(func(o map[string]any) { o["maxConcurrentRequests"] = int64(0) })}, "maxConcurrentRequests"},
+		"large concurrency":   {map[string]any{"origin": withOrigin(func(o map[string]any) { o["maxConcurrentRequests"] = int64(65537) })}, "maxConcurrentRequests"},
+		"no container url":    {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{} })}, "containerURL"},
+		"empty container url": {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": ""} })}, "containerURL"},
+		"not a url":           {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "account"} })}, "containerURL must be an http or https URL"},
+		"ftp url":             {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "ftp://account/models"} })}, "containerURL must be an http or https URL"},
+		"url query":           {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/models?sig=x"} })}, "must not contain credentials"},
+		"url fragment":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/models#x"} })}, "must not contain credentials"},
+		"url userinfo":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://user@account/models"} })}, "must not contain credentials"},
+		"account only": {map[string]any{"origin": withOrigin(func(o map[string]any) {
+			o["azure"] = map[string]any{"containerURL": "https://account.blob.core.windows.net"}
+		})}, "one valid container name"},
+		"trailing slash": {map[string]any{"origin": withOrigin(func(o map[string]any) {
+			o["azure"] = map[string]any{"containerURL": "https://account.blob.core.windows.net/"}
+		})}, "one valid container name"},
+		"container trailing slash": {map[string]any{"origin": withOrigin(func(o map[string]any) {
+			o["azure"] = map[string]any{"containerURL": "https://account.blob.core.windows.net/models/"}
+		})}, "one valid container name"},
+		"blob path": {map[string]any{"origin": withOrigin(func(o map[string]any) {
+			o["azure"] = map[string]any{"containerURL": "https://account/devstoreaccount1/models/key"}
+		})}, "one valid container name"},
+		"uppercase container": {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/Models"} })}, "one valid container name"},
+		"short container":     {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/ab"} })}, "one valid container name"},
+		"long container": {map[string]any{"origin": withOrigin(func(o map[string]any) {
+			o["azure"] = map[string]any{"containerURL": "https://account/" + strings.Repeat("x", 64)}
+		})}, "one valid container name"},
+		"leading hyphen":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/-abc"} })}, "one valid container name"},
+		"double hyphen":         {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/a--b"} })}, "one valid container name"},
+		"dot container":         {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/a.b"} })}, "one valid container name"},
+		"escaped container":     {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/%61bc"} })}, "one valid container name"},
+		"empty account segment": {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account//models"} })}, "one valid container name"},
 		"url too long": {map[string]any{"origin": withOrigin(func(o map[string]any) {
-			o["azure"] = map[string]any{"accountURL": "https://" + strings.Repeat("a", 250)}
-		})}, "accountURL"},
+			o["azure"] = map[string]any{"containerURL": "https://" + strings.Repeat("a", 310) + "/models"}
+		})}, "containerURL"},
 		"empty credential": {map[string]any{"origin": azureCredential(map[string]any{})}, "exactly one of default or workloadIdentity is required"},
 		"two credentials":  {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{}, "workloadIdentity": map[string]any{"clientID": testClientID}})}, "exactly one of default or workloadIdentity is required"},
 		"http default": {map[string]any{"origin": withOrigin(func(o map[string]any) {
-			o["azure"] = map[string]any{"accountURL": "http://account", "credential": map[string]any{"default": map[string]any{}}}
-		})}, "accountURL must use https"},
+			o["azure"] = map[string]any{"containerURL": "http://account/models", "credential": map[string]any{"default": map[string]any{}}}
+		})}, "containerURL must use https"},
 		"http workload": {map[string]any{"origin": withOrigin(func(o map[string]any) {
-			o["azure"] = map[string]any{"accountURL": "http://account", "credential": map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID}}}
-		})}, "accountURL must use https"},
+			o["azure"] = map[string]any{"containerURL": "http://account/models", "credential": map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID}}}
+		})}, "containerURL must use https"},
 		"client and secret":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID, "secretRef": map[string]any{"name": "azure"}}})}, "clientID and secretRef are mutually exclusive"},
 		"malformed secret name": {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "bad/name"}}})}, "name"},
 		"empty secret name":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": ""}}})}, "name"},
@@ -154,8 +175,8 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 			o["requestTimeout"] = "2m0s"
 			o["maxConcurrentRequests"] = int64(32)
 			o["azure"] = map[string]any{
-				"accountURL": "https://account.blob.core.windows.net",
-				"credential": map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": testClientID}},
+				"containerURL": "https://account.blob.core.windows.net/models",
+				"credential":   map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": testClientID}},
 			}
 		})}
 		require.NoError(t, create(spec))
@@ -164,11 +185,10 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: fmt.Sprintf("cache-%d", n)}, cache))
 		origin := cache.Spec.Origin
 		require.NotNil(t, origin)
-		require.Equal(t, BucketName("models"), origin.Bucket)
 		require.Equal(t, "10s", origin.MetadataTTL.Duration.String())
 		require.Equal(t, "2m0s", origin.RequestTimeout.Duration.String())
 		require.Equal(t, int32(32), *origin.MaxConcurrentRequests)
-		require.Equal(t, "https://account.blob.core.windows.net", origin.Azure.AccountURL)
+		require.Equal(t, "https://account.blob.core.windows.net/models", origin.Azure.ContainerURL)
 		require.Equal(t, &AzureWorkloadIdentityCredential{ClientID: testClientID, TenantID: testClientID}, origin.Azure.Credential.WorkloadIdentity)
 		require.Nil(t, origin.Azure.Credential.Default)
 	})
@@ -195,13 +215,15 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		mutate  func(map[string]any)
 		message string
 	}{
-		"bucket": {func(o map[string]any) { o["bucket"] = "other" }, "bucket is immutable"},
-		"account url": {func(o map[string]any) {
-			o["azure"].(map[string]any)["accountURL"] = "https://other.blob.core.windows.net"
-		}, "accountURL is immutable"},
-		"account url spelling": {func(o map[string]any) {
-			o["azure"].(map[string]any)["accountURL"] = "https://account.blob.core.windows.net/"
-		}, "accountURL is immutable"},
+		"container": {func(o map[string]any) {
+			o["azure"].(map[string]any)["containerURL"] = "https://account.blob.core.windows.net/other"
+		}, "containerURL is immutable"},
+		"account": {func(o map[string]any) {
+			o["azure"].(map[string]any)["containerURL"] = "https://other.blob.core.windows.net/models"
+		}, "containerURL is immutable"},
+		"container url spelling": {func(o map[string]any) {
+			o["azure"].(map[string]any)["containerURL"] = "https://account.blob.core.windows.net:443/models"
+		}, "containerURL is immutable"},
 	}
 	for name, tc := range immutable {
 		t.Run("rejects update of "+name, func(t *testing.T) {
@@ -256,17 +278,17 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 			}))
 
 			// The removal never landed, so a re-add with another account is an
-			// ordinary in-place change and hits the accountURL rule.
+			// ordinary in-place change and hits the containerURL rule.
 			obj := &unstructured.Unstructured{}
 			obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
 			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: fmt.Sprintf("cache-%d", n)}, obj))
 			_, found, err := unstructured.NestedMap(obj.Object, "spec", "origin")
 			require.NoError(t, err)
 			require.True(t, found)
-			require.NoError(t, unstructured.SetNestedField(obj.Object, "https://other.blob.core.windows.net", "spec", "origin", "azure", "accountURL"))
+			require.NoError(t, unstructured.SetNestedField(obj.Object, "https://other.blob.core.windows.net/models", "spec", "origin", "azure", "containerURL"))
 			err = c.Update(t.Context(), obj)
 			require.True(t, apierrors.IsInvalid(err), "%v", err)
-			require.ErrorContains(t, err, "accountURL is immutable")
+			require.ErrorContains(t, err, "containerURL is immutable")
 		}
 	})
 
@@ -283,7 +305,9 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"credential": func(o map[string]any) {
 			o["azure"].(map[string]any)["credential"] = map[string]any{"default": map[string]any{}}
 		},
-		"unchanged source": func(o map[string]any) { o["bucket"] = "models" },
+		"unchanged source": func(o map[string]any) {
+			o["azure"].(map[string]any)["containerURL"] = "https://account.blob.core.windows.net/models"
+		},
 	}
 	for name, mutate := range mutable {
 		t.Run("allows update of "+name, func(t *testing.T) {

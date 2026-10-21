@@ -42,13 +42,6 @@ type ClusterCacheSpec struct {
 // Exactly one provider must be set. Only azure is supported today.
 // +kubebuilder:validation:XValidation:rule="has(self.azure)",message="azure is required"
 type ObjectOrigin struct {
-	// Bucket names the one bucket or container the origin reads. Every pod
-	// attached to the cache sees this bucket's whole keyspace. Bucket is
-	// immutable: a different source needs a new ClusterCache, which has a new
-	// UID and therefore an empty cache.
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="bucket is immutable; create a new ClusterCache for a different bucket"
-	Bucket BucketName `json:"bucket"`
-
 	// MetadataTTL bounds how long object metadata is reused before it is revalidated.
 	// It must not be negative. When unset, the racer-object default applies.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="metadataTTL must not be negative"
@@ -68,33 +61,29 @@ type ObjectOrigin struct {
 	// +optional
 	MaxConcurrentRequests *int32 `json:"maxConcurrentRequests,omitempty"`
 
-	// Azure reads from Azure Blob Storage. Bucket names a blob container.
+	// Azure reads one Azure Blob Storage container.
 	// +optional
 	Azure *AzureOrigin `json:"azure,omitempty"`
 }
 
-// BucketName names an object storage bucket or blob container.
-// +kubebuilder:validation:MinLength=1
-// +kubebuilder:validation:MaxLength=255
-// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9._-]+$`
-// +kubebuilder:validation:XValidation:rule="self != '.' && self != '..'",message="bucket must not be . or .."
-type BucketName string
-
-// AzureOrigin reads from one Azure Blob Storage account.
-// Cache entries do not record the account, so the account URL is immutable:
-// a different account needs a new ClusterCache, which has a new UID and
-// therefore an empty cache.
-// +kubebuilder:validation:XValidation:rule="!has(self.credential) || self.accountURL.startsWith('https://')",message="accountURL must use https when a credential is configured"
+// AzureOrigin reads one Azure Blob Storage container. Every pod attached to
+// the cache sees the container's whole keyspace. Cache entries do not record
+// the account or container, so the container URL is immutable: a different
+// source needs a new ClusterCache, which has a new UID and therefore an empty
+// cache.
+// +kubebuilder:validation:XValidation:rule="!has(self.credential) || self.containerURL.startsWith('https://')",message="containerURL must use https when a credential is configured"
 type AzureOrigin struct {
-	// AccountURL is the blob service endpoint, for example
-	// https://account.blob.core.windows.net. Azurite-style URLs may carry one
-	// account path segment.
+	// ContainerURL is the blob container URL, for example
+	// https://account.blob.core.windows.net/models. The last path segment is
+	// the container name. Azurite-style URLs may carry one account path
+	// segment before it, for example http://127.0.0.1:10000/account/models.
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=256
-	// +kubebuilder:validation:XValidation:rule="isURL(self) && url(self).getScheme() in ['http', 'https']",message="accountURL must be an http or https URL"
-	// +kubebuilder:validation:XValidation:rule="!self.contains('?') && !self.contains('#') && !self.contains('@')",message="accountURL must not contain credentials, a query, or a fragment"
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="accountURL is immutable; create a new ClusterCache for a different account"
-	AccountURL string `json:"accountURL"`
+	// +kubebuilder:validation:MaxLength=320
+	// +kubebuilder:validation:XValidation:rule="isURL(self) && url(self).getScheme() in ['http', 'https']",message="containerURL must be an http or https URL"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('?') && !self.contains('#') && !self.contains('@')",message="containerURL must not contain credentials, a query, or a fragment"
+	// +kubebuilder:validation:XValidation:rule="self.matches('^https?://[^/]+(/[A-Za-z0-9_-]+)?/[a-z0-9]+(-[a-z0-9]+)*$') && self.substring(self.lastIndexOf('/') + 1).size() >= 3 && self.substring(self.lastIndexOf('/') + 1).size() <= 63",message="containerURL must be an account URL followed by one valid container name, such as https://account.blob.core.windows.net/models"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="containerURL is immutable; create a new ClusterCache for a different container"
+	ContainerURL string `json:"containerURL"`
 
 	// Credential selects how the origin authenticates. When omitted, requests are anonymous.
 	// +optional

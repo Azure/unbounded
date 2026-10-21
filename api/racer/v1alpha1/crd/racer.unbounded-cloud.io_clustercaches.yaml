@@ -60,26 +60,32 @@ spec:
                   cannot be removed later; leave it unset to deploy your own origin.
                 properties:
                   azure:
-                    description: Azure reads from Azure Blob Storage. Bucket names
-                      a blob container.
+                    description: Azure reads one Azure Blob Storage container.
                     properties:
-                      accountURL:
+                      containerURL:
                         description: |-
-                          AccountURL is the blob service endpoint, for example
-                          https://account.blob.core.windows.net. Azurite-style URLs may carry one
-                          account path segment.
-                        maxLength: 256
+                          ContainerURL is the blob container URL, for example
+                          https://account.blob.core.windows.net/models. The last path segment is
+                          the container name. Azurite-style URLs may carry one account path
+                          segment before it, for example http://127.0.0.1:10000/account/models.
+                        maxLength: 320
                         minLength: 1
                         type: string
                         x-kubernetes-validations:
-                        - message: accountURL must be an http or https URL
+                        - message: containerURL must be an http or https URL
                           rule: isURL(self) && url(self).getScheme() in ['http', 'https']
-                        - message: accountURL must not contain credentials, a query,
+                        - message: containerURL must not contain credentials, a query,
                             or a fragment
                           rule: '!self.contains(''?'') && !self.contains(''#'') &&
                             !self.contains(''@'')'
-                        - message: accountURL is immutable; create a new ClusterCache
-                            for a different account
+                        - message: containerURL must be an account URL followed by
+                            one valid container name, such as https://account.blob.core.windows.net/models
+                          rule: self.matches('^https?://[^/]+(/[A-Za-z0-9_-]+)?/[a-z0-9]+(-[a-z0-9]+)*$')
+                            && self.substring(self.lastIndexOf('/') + 1).size() >=
+                            3 && self.substring(self.lastIndexOf('/') + 1).size()
+                            <= 63
+                        - message: containerURL is immutable; create a new ClusterCache
+                            for a different container
                           rule: self == oldSelf
                       credential:
                         description: Credential selects how the origin authenticates.
@@ -140,27 +146,11 @@ spec:
                           rule: '[has(self.default), has(self.workloadIdentity)].filter(x,
                             x).size() == 1'
                     required:
-                    - accountURL
+                    - containerURL
                     type: object
                     x-kubernetes-validations:
-                    - message: accountURL must use https when a credential is configured
-                      rule: '!has(self.credential) || self.accountURL.startsWith(''https://'')'
-                  bucket:
-                    description: |-
-                      Bucket names the one bucket or container the origin reads. Every pod
-                      attached to the cache sees this bucket's whole keyspace. Bucket is
-                      immutable: a different source needs a new ClusterCache, which has a new
-                      UID and therefore an empty cache.
-                    maxLength: 255
-                    minLength: 1
-                    pattern: ^[a-zA-Z0-9._-]+$
-                    type: string
-                    x-kubernetes-validations:
-                    - message: bucket is immutable; create a new ClusterCache for
-                        a different bucket
-                      rule: self == oldSelf
-                    - message: bucket must not be . or ..
-                      rule: self != '.' && self != '..'
+                    - message: containerURL must use https when a credential is configured
+                      rule: '!has(self.credential) || self.containerURL.startsWith(''https://'')'
                   maxConcurrentRequests:
                     description: |-
                       MaxConcurrentRequests bounds concurrent upstream requests per origin pod.
@@ -185,8 +175,6 @@ spec:
                     x-kubernetes-validations:
                     - message: requestTimeout must be positive
                       rule: duration(self) > duration('0s')
-                required:
-                - bucket
                 type: object
                 x-kubernetes-validations:
                 - message: azure is required
