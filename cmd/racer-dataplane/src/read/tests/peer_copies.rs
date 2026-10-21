@@ -948,7 +948,7 @@ fn subscription_behind_remote_warm_selects_only_published_pages() {
     }
     assert!(
         peers.calls.borrow().is_empty(),
-        "no page before the frontier"
+        "no page before warm completes it"
     );
     crate::read::warm::WarmRegistry::publish_through(&job, 1);
     let mut result = None;

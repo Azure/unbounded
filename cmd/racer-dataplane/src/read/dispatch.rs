@@ -171,7 +171,8 @@ pub(super) enum Warmed {
     /// No warm job covers the version, or the job was abandoned.
     Unwarmed,
     /// Warm has published the page on a remote primary owner. Only this page
-    /// may be filled; later pages can still be behind the warm frontier.
+    /// may be filled; warm completes pages in any order, so later pages may
+    /// still be pending.
     Remote,
     /// Warm has published the page locally and this is its held copy.
     Local(Box<PageResult>),
@@ -531,8 +532,8 @@ impl WorkerDirectory {
             WarmWait::Unwarmed => return Ok(Warmed::Unwarmed),
             // Pages held by a remote primary owner are read through normal Fill,
             // which routes to that owner's held copy under the usual topology.
-            // Only this page has passed the frontier, so callers must not widen
-            // the fill beyond it.
+            // Only this page is known to be complete; warm finishes pages in any
+            // order, so callers must not widen the fill beyond it.
             WarmWait::Remote => return Ok(Warmed::Remote),
             WarmWait::Local => {}
         }

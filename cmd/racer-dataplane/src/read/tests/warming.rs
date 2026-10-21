@@ -180,7 +180,7 @@ fn completed_extension(refuse: bool) {
         get.as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
             .is_pending(),
-        "old frontier must be hidden"
+        "old completions must be hidden"
     );
     let mut accepted = None;
     let mut delivered = false;
@@ -279,7 +279,7 @@ impl Peer {
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             // Remote warm holds and releases answer immediately; fills and page
-            // reads share the gate so tests can observe the warm frontier.
+            // reads share the gate so tests can observe warm completion.
             let (number, reply) = match &request.operation {
                 PeerOperation::Page { page, .. } => (Some(page.number.0), None),
                 PeerOperation::Warm { action, .. } => match action {
@@ -343,9 +343,9 @@ impl Peer {
 }
 
 #[test]
-fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
+fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_completion() {
     // node(1) is the primary owner of every page: it holds and fills them, and
-    // the requester keeps none of them, yet GETs still wait on the frontier.
+    // the requester keeps none of them, yet GETs still wait for their page to complete.
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(2);

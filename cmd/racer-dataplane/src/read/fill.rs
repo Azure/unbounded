@@ -191,8 +191,8 @@ impl Fill {
         {
             super::dispatch::Warmed::Local(page) => return Ok(*page),
             super::dispatch::Warmed::Unwarmed => demand,
-            // Later demanded pages may still be ahead of the warm frontier, so
-            // the provider may only select the page that warm has published.
+            // Warm completes pages in any order and only the head is known to
+            // be complete, so the provider may only select that page.
             super::dispatch::Warmed::Remote => crate::peer::subscriptions::Demand::new(vec![
                 crate::peer::subscriptions::PageInterval {
                     start: first.0,
