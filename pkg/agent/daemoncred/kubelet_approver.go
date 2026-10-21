@@ -131,12 +131,12 @@ func (a *KubeletClientCSRApprover) Evaluate(ctx context.Context, csr *certificat
 		}
 	}
 
-	credentialIDs := csr.Spec.Extra[CredentialIDExtraKey]
-	if len(credentialIDs) != 1 || strings.TrimSpace(credentialIDs[0]) == "" {
+	credentialID, credentialValid := singleCredentialID(csr)
+	if !credentialValid {
 		return Deny("requester must carry exactly one non-empty %s", CredentialIDExtraKey), nil
 	}
 
-	allowed, reason, err := a.opts.AuthorizeNode(ctx, csr, nodeName, credentialIDs[0])
+	allowed, reason, err := a.opts.AuthorizeNode(ctx, csr, nodeName, credentialID)
 	if errors.Is(err, ErrUnknownCredential) {
 		return CSRDecision{Ignore: true}, nil
 	}
@@ -150,4 +150,13 @@ func (a *KubeletClientCSRApprover) Evaluate(ctx context.Context, csr *certificat
 	}
 
 	return Approve("approved kubelet client certificate for attested node %q", nodeName), nil
+}
+
+func singleCredentialID(csr *certificatesv1.CertificateSigningRequest) (string, bool) {
+	credentialIDs := csr.Spec.Extra[CredentialIDExtraKey]
+	if len(credentialIDs) != 1 || strings.TrimSpace(credentialIDs[0]) == "" {
+		return "", false
+	}
+
+	return credentialIDs[0], true
 }
