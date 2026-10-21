@@ -909,19 +909,21 @@ impl RangeStream {
     /// Start a direct fill for the head page, up to `DIRECT_AHEAD` more holes,
     /// and provider selections for the remaining holes.
     fn admit(&mut self, scope: &RequestScope) -> Result<bool> {
-        // A failed page stops admission until it reaches the client.
-        if self
+        // A failed page stops admission at and after it until it reaches the
+        // client. Pages before it are still filled, or the stream could never
+        // deliver them and so never surface the error.
+        let failed = self
             .slots
             .iter()
-            .any(|slot| matches!(slot, Slot::Ready(Err(_))))
-        {
-            return Ok(false);
-        }
+            .position(|slot| matches!(slot, Slot::Ready(Err(_))));
+        let limit = failed.unwrap_or(self.slots.len());
         let mut changed = false;
-        if matches!(
-            self.slots.front(),
-            Some(Slot::Missing { .. } | Slot::Selecting)
-        ) {
+        if limit > 0
+            && matches!(
+                self.slots.front(),
+                Some(Slot::Missing { .. } | Slot::Selecting)
+            )
+        {
             if !self.start_fetch(0, scope)? {
                 return Ok(changed);
             }
@@ -943,7 +945,7 @@ impl RangeStream {
             .map(WindowLease::busy_elsewhere)
             .unwrap_or_default();
         let mut index = 1;
-        while ahead < DIRECT_AHEAD && index < self.slots.len() {
+        while ahead < DIRECT_AHEAD && index < limit {
             if matches!(self.slots[index], Slot::Missing { .. })
                 && !elsewhere.contains(&self.page_at(index))
             {
@@ -955,7 +957,9 @@ impl RangeStream {
             }
             index += 1;
         }
-        while self.may_select() && self.start_selection(scope)? {
+        // Earlier holes behind a failure are filled directly: each becomes the
+        // head in turn, so no new selection is needed to reach the error.
+        while failed.is_none() && self.may_select() && self.start_selection(scope)? {
             changed = true;
         }
         Ok(changed)
@@ -2086,6 +2090,53 @@ pub(super) mod tests {
         futures::executor::block_on(stream.cancel()).unwrap();
         assert!(dropped.get());
         assert_eq!(remaining_credits(&stream.budget), (0, 0));
+    }
+    #[test]
+    fn later_failure_still_fills_earlier_pages_and_surfaces_in_order() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        // The head probe misses only after the later page has already failed.
+        let gate = Rc::new(std::cell::Cell::new(false));
+        let opened = gated(gate.clone());
+        stream.inject(Slot::Probing(Box::pin(async move {
+            opened.await;
+            Ok(None)
+        })));
+        let budget = stream.budget.next_page(false).unwrap().unwrap();
+        stream.inject(Slot::Fetching(Box::pin(async move {
+            Ok((Err(Error::VersionUnavailable), budget))
+        })));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            stream.slots[1],
+            Slot::Ready(Err(Error::VersionUnavailable))
+        ));
+        gate.set(true);
+        stream.poll_prefetch(&mut cx);
+        // The missed head gets a direct fill despite the later failure (this
+        // fixture has no worker, so starting it may fail at once), and nothing
+        // is admitted at or past the failed page.
+        assert!(
+            matches!(stream.slots[0], Slot::Fetching(_) | Slot::Ready(Err(_))),
+            "the head must not be left without work"
+        );
+        assert!(matches!(
+            stream.slots[1],
+            Slot::Ready(Err(Error::VersionUnavailable))
+        ));
+        assert!(stream.selections.is_empty());
+        // Once the head arrives it is delivered, then the failure ends the stream.
+        stream.slots[0] = Slot::Ready(Ok(page_result(&f.admission, &metadata(), 0)));
+        let Poll::Ready(Ok(Some(reader))) = stream.next_slice().as_mut().poll(&mut cx) else {
+            panic!("head deliverable");
+        };
+        assert_eq!(reader.slice().page, PageNumber(0));
+        assert!(matches!(
+            stream.next_slice().as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::VersionUnavailable))
+        ));
     }
     #[test]
     fn memory_hits_in_window_deliver_without_fetching_earlier_pages() {

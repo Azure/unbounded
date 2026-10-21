@@ -116,8 +116,10 @@ Each poll:
 5. Deliver `next` when it is `Ready`, attaching it to the client as before
    (`Delivery::attach`).
 
-Errors: a failed direct fill stays in its slot, stops further admission and
-ends the stream when it reaches the head, as before. A failed selection,
+Errors: a failed direct fill stays in its slot and ends the stream when it
+reaches the head, as before. Pages after it are not admitted, and no new
+selections start, but earlier holes are still filled directly so the error can
+reach the head. A failed selection,
 including its own child deadline, returns its pages to direct fills only. The
 stream's own cancellation and deadline are always fatal.
 
