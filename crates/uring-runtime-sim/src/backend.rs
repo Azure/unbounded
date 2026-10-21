@@ -118,6 +118,13 @@ enum Owned {
         buf: *const u8,
         len: usize,
     },
+    /// A vectored write; segments are gathered at execution time.
+    Writev {
+        fd: SimFd,
+        offset: u64,
+        iovecs: *const libc::iovec,
+        count: usize,
+    },
     Recv {
         fd: SimFd,
         buf: *mut u8,
@@ -211,6 +218,23 @@ unsafe fn slice<'a>(buf: *const u8, len: usize) -> Result<&'a [u8]> {
     Ok(unsafe { std::slice::from_raw_parts(buf, len) })
 }
 
+/// Build an iovec slice from a raw operation array.
+///
+/// # Safety
+///
+/// `iovecs` must be valid for `count` entries, as guaranteed by
+/// `Backend::push`.
+unsafe fn iovec_slice<'a>(iovecs: *const libc::iovec, count: usize) -> Result<&'a [libc::iovec]> {
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if iovecs.is_null() {
+        return Err(errno(libc::EFAULT));
+    }
+    // SAFETY: the caller guarantees validity for `count` entries.
+    Ok(unsafe { std::slice::from_raw_parts(iovecs, count) })
+}
+
 /// Mutable counterpart of [`slice`].
 ///
 /// # Safety
@@ -257,6 +281,17 @@ impl Owned {
                 offset,
                 buf,
                 len: len as usize,
+            },
+            Op::Writev {
+                fd,
+                offset,
+                iovecs,
+                count,
+            } => Self::Writev {
+                fd: fd.clone(),
+                offset,
+                iovecs,
+                count: count as usize,
             },
             Op::Recv {
                 fd,
@@ -348,7 +383,10 @@ impl Owned {
         let dir = |fd: &Option<SimFd>| fd.as_ref().and_then(id);
         let at = |d: &Option<SimFd>, path: &Path| state.at_path(dir(d), path, false).ok();
         match self {
-            Self::Read { fd, .. } | Self::Write { fd, .. } | Self::Fsync { fd } => id(fd)
+            Self::Read { fd, .. }
+            | Self::Write { fd, .. }
+            | Self::Writev { fd, .. }
+            | Self::Fsync { fd } => id(fd)
                 .and_then(|id| state.watched_path(id))
                 .into_iter()
                 .collect(),
@@ -384,9 +422,11 @@ impl Owned {
     fn waits(&self) -> bool {
         match self {
             Self::Recv { flags, .. } | Self::Send { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
-            Self::Read { .. } | Self::Write { .. } | Self::Poll { .. } | Self::Accept { .. } => {
-                true
-            }
+            Self::Read { .. }
+            | Self::Write { .. }
+            | Self::Writev { .. }
+            | Self::Poll { .. }
+            | Self::Accept { .. } => true,
             Self::Connect { .. } | Self::Timeout { .. } => true,
             _ => false,
         }
@@ -429,6 +469,37 @@ impl Owned {
                 let id = id(fd)?;
                 // SAFETY: `push`'s contract keeps `buf` valid.
                 let buf = unsafe { slice(*buf, *len) }?;
+                count(match state.resources.get(&id) {
+                    Some(Resource::File(_)) => state.file_write(id, *offset, buf, limit)?,
+                    Some(Resource::Pipe(_)) => state.pipe_write(id, buf, limit)?,
+                    Some(Resource::Stream(_) | Resource::Datagram(_)) => {
+                        state.send(id, buf, limit)?
+                    }
+                    Some(Resource::Listener(_)) => return Err(errno(libc::EINVAL)),
+                    None => return Err(errno(libc::EBADF)),
+                })
+            }
+            Self::Writev {
+                fd,
+                offset,
+                iovecs,
+                count: segments,
+            } => {
+                let id = id(fd)?;
+                if *segments > 1024 {
+                    return Err(errno(libc::EINVAL));
+                }
+                // SAFETY: `push`'s contract keeps the iovec array valid for
+                // `count` entries.
+                let iovecs = unsafe { iovec_slice(*iovecs, *segments) }?;
+                let mut gathered = Vec::new();
+                for iov in iovecs {
+                    // SAFETY: `push`'s contract keeps each segment valid.
+                    gathered.extend_from_slice(unsafe {
+                        slice(iov.iov_base.cast::<u8>().cast_const(), iov.iov_len)
+                    }?);
+                }
+                let buf = gathered.as_slice();
                 count(match state.resources.get(&id) {
                     Some(Resource::File(_)) => state.file_write(id, *offset, buf, limit)?,
                     Some(Resource::Pipe(_)) => state.pipe_write(id, buf, limit)?,

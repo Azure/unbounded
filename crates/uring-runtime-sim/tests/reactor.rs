@@ -199,6 +199,52 @@ fn files_open_write_read_through_reactor() {
 }
 
 #[test]
+fn vectored_writes_gather_segments_and_honor_short_and_error_faults() {
+    let (world, _clock, reactor) = setup();
+    world.create_dir_all("/data").unwrap();
+    let path = CString::new("/data/file").unwrap();
+    let file = run(
+        &reactor,
+        reactor.open_at2(
+            None,
+            &path,
+            how(libc::O_CREAT | libc::O_RDWR, 0o600),
+            &Unscoped,
+        ),
+    )
+    .unwrap();
+    let wrote = run(
+        &reactor,
+        reactor.writev_at(&file, 2, (b"hd".to_vec(), b"body".to_vec()), &Unscoped),
+    );
+    assert_eq!(wrote.result.unwrap(), 6);
+    assert_eq!(wrote.buf, (b"hd".to_vec(), b"body".to_vec()));
+    assert_eq!(world.read_file("/data/file").unwrap(), b"\0\0hdbody");
+
+    // A short write spans the segment boundary, like the kernel.
+    world
+        .inject(FaultTarget::Op(OpKind::Writev), Fault::Short(3))
+        .unwrap();
+    let wrote = run(
+        &reactor,
+        reactor.writev_at(&file, 0, (b"XY".to_vec(), b"Z!".to_vec()), &Unscoped),
+    );
+    assert_eq!(wrote.result.unwrap(), 3, "the reactor never retries");
+    assert_eq!(world.read_file("/data/file").unwrap(), b"XYZdbody");
+
+    world
+        .inject(FaultTarget::Op(OpKind::Writev), Fault::Errno(libc::EIO))
+        .unwrap();
+    let failed = run(
+        &reactor,
+        reactor.writev_at(&file, 0, vec![b"q".to_vec()], &Unscoped),
+    );
+    assert_eq!(failed.result.unwrap_err().raw_os_error(), Some(libc::EIO));
+    assert_eq!(failed.buf, [b"q".to_vec()]);
+    assert_eq!(world.read_file("/data/file").unwrap(), b"XYZdbody");
+}
+
+#[test]
 fn cancellation_of_a_blocked_recv_in_both_completion_orders() {
     for cancel_first in [true, false] {
         let (world, _clock, reactor) = setup();
