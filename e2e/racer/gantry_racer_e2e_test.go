@@ -207,24 +207,38 @@ func (h *harness) checkGantryRacerSpec() {
 
 type gantryPod struct{ name, node, ip string }
 
-// gantryPods lists the running Gantry agent Pods.
+// gantryPods lists the Gantry agent Pods once the DaemonSet has settled.
+// A rollout can finish while an old Pod is still terminating, for example on
+// a node that the Racer placement no longer selects, so wait until every
+// listed Pod is live, has an IP, and the count matches the desired count.
 func (h *harness) gantryPods() []gantryPod {
 	h.t.Helper()
 
-	out := h.kubectl("-n", operatorNamespace, "get", "pods", "-l", "app.kubernetes.io/name=gantry", "-o",
-		`jsonpath={range .items[*]}{.metadata.name} {.spec.nodeName} {.status.podIP}{"\n"}{end}`)
-
 	var pods []gantryPod
 
-	for line := range strings.Lines(out) {
-		if fields := strings.Fields(line); len(fields) == 3 {
+	h.waitFor("Gantry Pods to settle", 2*time.Minute, func() (bool, string) {
+		desired := strings.TrimSpace(h.kubectl("-n", operatorNamespace, "get", "daemonset", "gantry", "-o",
+			"jsonpath={.status.desiredNumberScheduled}"))
+		out := h.kubectl("-n", operatorNamespace, "get", "pods", "-l", "app.kubernetes.io/name=gantry", "-o",
+			`jsonpath={range .items[*]}{.metadata.name} {.spec.nodeName} {.status.podIP} {.metadata.deletionTimestamp}{"\n"}{end}`)
+
+		pods = nil
+
+		for line := range strings.Lines(out) {
+			fields := strings.Fields(line)
+			if len(fields) != 3 {
+				return false, "waiting for Pods without IPs or still terminating:\n" + out
+			}
+
 			pods = append(pods, gantryPod{name: fields[0], node: fields[1], ip: fields[2]})
 		}
-	}
 
-	if len(pods) == 0 {
-		h.t.Fatalf("no Gantry Pods with IPs:\n%s", out)
-	}
+		if len(pods) == 0 || strconv.Itoa(len(pods)) != desired {
+			return false, fmt.Sprintf("have %d Pods, want %s:\n%s", len(pods), desired, out)
+		}
+
+		return true, ""
+	})
 
 	return pods
 }
