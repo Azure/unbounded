@@ -267,7 +267,8 @@ pub struct Charge<P: Policy> {
 
     // Backing adopted from the recycler when this charge's admission needed the
     // bytes that held it. Reusing it avoids unmapping and remapping a page.
-    spare: Mutex<Option<Vec<u8>>>,
+    // Boxed so charges without adopted backing grow by one pointer only.
+    spare: Option<Box<Mutex<Vec<u8>>>>,
 }
 
 impl<P: Policy> page_alloc::Charge for Charge<P> {
@@ -380,7 +381,7 @@ impl<P: Policy> SharedQuotas<P> {
             local: None,
             buffers: Weak::new(),
             stopped: self.stopped.clone(),
-            spare: Mutex::new(None),
+            spare: None,
         })
     }
 }
@@ -494,25 +495,34 @@ impl<P: Policy> Charge<P> {
 
     /// Take adopted backing that fits `length` under the same rules as a pooled entry.
     fn take_spare(&self, length: usize) -> Option<Vec<u8>> {
-        let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
-        let fits = spare.as_ref().is_some_and(|bytes| {
-            bytes.capacity() >= length
-                && bytes.capacity() <= self.amount
-                && (page_alloc::buffer_capacity(bytes.capacity())
-                    == page_alloc::buffer_capacity(length)
-                    || bytes.capacity() - length < 64 * 1024)
-        });
-        if fits { spare.take() } else { None }
+        let mut spare = self
+            .spare
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capacity = spare.capacity();
+        let fits = capacity >= length
+            && capacity <= self.amount
+            && (page_alloc::buffer_capacity(capacity) == page_alloc::buffer_capacity(length)
+                || capacity - length < 64 * 1024);
+        // An empty Vec left behind never fits again because length is nonzero.
+        if fits && length > 0 {
+            Some(std::mem::take(&mut *spare))
+        } else {
+            None
+        }
     }
 
     /// Drop adopted backing that this charge no longer admits in full.
     fn trim_spare(&mut self) {
-        let spare = self.spare.get_mut().unwrap_or_else(|e| e.into_inner());
-        if spare
-            .as_ref()
-            .is_some_and(|bytes| bytes.capacity() > self.amount)
+        if let Some(spare) = &mut self.spare
+            && spare
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .capacity()
+                > self.amount
         {
-            drop(spare.take());
+            self.spare = None;
         }
     }
 
@@ -591,7 +601,7 @@ impl<P: Policy> Charge<P> {
             local: self.local.clone(),
             buffers,
             stopped: self.stopped.clone(),
-            spare: Mutex::new(None),
+            spare: None,
         }
     }
 
@@ -877,7 +887,7 @@ impl<P: Policy> Quotas<P> {
             // than unmapping it and mapping a fresh one for the same bytes.
             let mut charge = self.reserve_inner(key, class, amount, mode)?;
             if let Some(bytes) = adopted.filter(|bytes| bytes.capacity() <= charge.amount) {
-                *charge.spare.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(bytes);
+                charge.spare = Some(Box::new(Mutex::new(bytes)));
             }
             return Ok(charge);
         }
@@ -1005,7 +1015,7 @@ impl<P: Policy> Quotas<P> {
             local,
             buffers: Arc::downgrade(&self.buffers),
             stopped: self.stopped.clone(),
-            spare: Mutex::new(None),
+            spare: None,
         };
         // Policy and key callbacks may stop admission. Drop the completed owner
         // to roll back both counters while preserving completion and drain work.
