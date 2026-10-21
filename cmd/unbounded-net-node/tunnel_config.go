@@ -45,10 +45,7 @@ func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPee
 		return nil
 	}
 
-	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers, state.manageCniPlugin || cfg.ManageSameSitePodRoutes)
-	for _, cidr := range extraSupernets {
-		supernets[cidr] = true
-	}
+	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers, extraSupernets, state.manageCniPlugin || cfg.ManageSameSitePodRoutes)
 
 	supernets = excludeLocalSupernets(supernets, meshPeers, state.siteRouting.localCIDRs)
 
@@ -611,7 +608,7 @@ func resolveTunnelPeerTarget(protocol string, geneveIfIdx, ipipIfIdx, vxlanIfIdx
 // allGatewayPeers includes ALL gateway peers (GENEVE, VXLAN, and WG) so that
 // cross-site supernet routes are created regardless of the tunnel protocol
 // used for the gateway link.
-func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers, allGatewayPeers []gatewayPeerInfo, manageLocalPodRoutes bool) map[string]bool {
+func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers, allGatewayPeers []gatewayPeerInfo, extraSupernets []string, manageLocalPodRoutes bool) map[string]bool {
 	supernets := make(map[string]bool)
 	// Site pod CIDR assignment pools (supernets covering all node podCIDRs).
 	if manageLocalPodRoutes {
@@ -629,6 +626,16 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 	for _, gwPeer := range allGatewayPeers {
 		for _, cidr := range gwPeer.RoutedCidrs {
 			supernets[cidr] = true
+		}
+	}
+
+	for _, cidr := range extraSupernets {
+		supernets[cidr] = true
+	}
+
+	if !manageLocalPodRoutes {
+		for _, cidr := range state.sitePodCIDRPools {
+			delete(supernets, cidr)
 		}
 	}
 	// Remove the local node's own podCIDRs (those are handled by the bridge directly).
@@ -662,12 +669,20 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 	}
 
 	for _, peer := range meshPeers {
+		if peer.SkipPodCIDRRoutes {
+			continue
+		}
+
 		for _, cidr := range peer.PodCIDRs {
 			addIfUncovered(cidr)
 		}
 	}
 
 	for _, gwPeer := range gatewayPeers {
+		if gwPeer.SkipPodCIDRRoutes {
+			continue
+		}
+
 		for _, cidr := range gwPeer.PodCIDRs {
 			addIfUncovered(cidr)
 		}

@@ -145,7 +145,7 @@ func TestUpdateWireGuardFromSlices_SitePodCIDRPoolChanges(t *testing.T) {
 				configureCalls++
 
 				gotPools = append([]string(nil), state.sitePodCIDRPools...)
-				gotSupernets = collectSupernets(state, peers, gatewayPeers, gatewayPeers, true)
+				gotSupernets = collectSupernets(state, peers, gatewayPeers, gatewayPeers, nil, true)
 
 				return configureErr
 			}
