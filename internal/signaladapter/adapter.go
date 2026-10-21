@@ -908,7 +908,7 @@ func stringMapAny(values map[string]string) map[string]any {
 	return result
 }
 
-func withLabel(values map[string]string, key string, value string) map[string]string {
+func withLabel(values map[string]string, key, value string) map[string]string {
 	result := maps.Clone(values)
 	result[key] = value
 
