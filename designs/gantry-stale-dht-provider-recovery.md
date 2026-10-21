@@ -25,9 +25,10 @@ Implemented in the current change:
 - Section 3: request-scoped failed-provider exclusion during chair polling,
    and one attempt per provider within a warm-path walk.
 - Section 5: uncapped discovery and bounded HEAD validation for chair polling,
-   busy metadata, and the final direct-origin-fallback recheck.
+   metadata lookups, and the final direct-origin-fallback recheck.
 - Busy responses are issued only after opening the requested content, and
-   waiting headers require successful peer metadata rather than origin metadata.
+   waiting headers require a successful HEAD to the peer that returned 429,
+   rather than origin metadata.
 
 Sections 4, 6, and 7 remain design proposals.
 
@@ -68,8 +69,9 @@ Provider sets are shuffled before the count is applied, but they are not
 ordered by publication time (`routing.go:536-626`,
 `records/providers_manager.go:317-354`).
 
-Gantry's warm path, chair polling, busy-path metadata HEAD, and final
+Gantry's warm path, chair polling, metadata lookups, and final
 direct-origin-fallback recheck all use the uncapped streaming API (Section 2).
+Busy candidates are verified directly at the address that returned 429.
 The shared `providerprobe.Candidates` helper retains a batch fallback for
 discovery implementations without streaming support, such as legacy test
 doubles; the production discovery host always supports streaming.
@@ -282,14 +284,17 @@ queued, so slow fetch attempts do not truncate it.
 The mirror (`walkProviders` in `internal/gantry/mirror/mirror.go`) tries each
 provider the stream yields once, skipping this node and providers already in
 the stale, suspicious, or unavailable windows, and stops at the first that
-serves. The walk commits no response headers; a provider that answers commits
-them as it streams. When the walk ends without a serve, round 0 decides:
+serves. A successful GET commits headers as it streams. A 429 instead triggers
+a bounded HEAD to that same provider. A successful HEAD commits waiting headers
+immediately, before slower later candidates, while the walk continues looking
+for a provider with a free serve slot. When the walk ends without a serve,
+round 0 decides:
 
 ```text
 nothing advertised (no provider other than this node)
     -> commit headers, then cold-start
-a provider answered busy (429) or accepted without sending bytes
-    -> verify peer metadata, commit headers, wait for a serve slot
+a provider passed busy metadata validation or accepted without sending bytes
+    -> retain the committed headers, wait for a serve slot
 providers advertised, none usable
     -> 503 without headers; fail-open containerd pulls from origin
 ```
@@ -303,9 +308,16 @@ origin under the shipped `hosts.toml`.
 Busy is a content-specific signal. The transfer endpoint first opens the
 requested digest and only then checks its serve cap, so missing content
 returns 404 even while the node is saturated. Before the mirror commits
-waiting headers, a peer must answer HEAD for that digest. A failed peer HEAD
+waiting headers, the peer that returned 429 must answer HEAD for that digest.
+A failed peer HEAD
 does not fall back to an origin HEAD: origin metadata proves only that the
 registry has content, not that a busy peer can eventually serve it.
+
+A confirmed busy provider remains usable even if another candidate fails or
+the lookup reaches its deadline after yielding partial results. A failed
+metadata HEAD, including a HEAD that itself returns 429, cannot preserve a
+busy signal. Metadata checks do not forward request-scoped registry credentials,
+and resume attempts verify the whole digest rather than a byte range.
 
 If a previously busy provider becomes known-stale, a filtered-only retry
 terminates the incomplete response instead of preserving the old capacity
@@ -589,6 +601,13 @@ Unit and integration coverage must include:
 23. A busy provider becoming known-stale terminates the waiting response.
 24. A real containerd registry fetcher falls through to origin when Gantry
     returns a stale-only pre-header 503.
+25. A partial lookup error does not discard a freshly confirmed busy peer on
+    a retry round.
+26. An unrelated peer's 503 does not override another peer's verified busy signal.
+27. Busy waiting headers arrive before a later blocked fetch completes, and
+    discovery continues after the headers are committed.
+28. Busy metadata probes omit registry credentials, reset a resume offset to
+    zero, and reject unsuccessful HEAD responses.
 
 ## Open Questions
 

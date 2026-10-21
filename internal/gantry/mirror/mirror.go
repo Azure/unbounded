@@ -1702,7 +1702,16 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 }
 
 func (s peerAttemptSummary) capacityConstrained() bool {
-	return s.attempted > 0 && (s.busy > 0 || s.noProgress > 0) &&
+	if s.attempted == 0 {
+		return false
+	}
+
+	// Busy attempts have already passed a content-specific metadata HEAD.
+	if s.busy > 0 {
+		return true
+	}
+
+	return s.noProgress > 0 &&
 		s.digestMismatch == 0 &&
 		s.authOrConfig == 0 &&
 		s.peerServerError == 0 &&
@@ -1752,10 +1761,6 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	firstResult := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, stream, &retryAfter, logger)
 	if firstResult == peerFallbackBusy {
-		if !s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, true, logger) {
-			return peerFallbackExhausted
-		}
-
 		return s.retryBusyFallback(ctx, w, r, d, kind, upstream, repo, stream, backoff, retryAfter, logger)
 	}
 
@@ -1786,7 +1791,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	// re-discovery budget hunting for a provider. Any round that never reaches a
 	// peer is silent, so committed headers are what keep the client attached;
 	// cold-start sent them already unless its metadata HEAD failed.
-	_ = s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, false, logger)
+	_ = s.beginColdStartResponse(ctx, w, d, kind, upstream, repo, stream, logger)
 
 	// Keep re-discovering. A seed that just finished advertises into the DHT,
 	// so a later FindProviders can hand us a provider even though round 0 fell
@@ -1823,10 +1828,6 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		case peerFallbackLocalHit:
 			return peerFallbackLocalHit
 		case peerFallbackBusy:
-			if !s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, true, logger) {
-				return peerFallbackExhausted
-			}
-
 			return s.retryBusyFallback(ctx, w, r, d, kind, upstream, repo, stream, backoff, retryAfter, logger)
 		}
 	}
@@ -1838,10 +1839,9 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	return firstResult
 }
 
-// beginBusyResponse commits response headers before any peer has streamed
-// bytes, so containerd keeps waiting instead of timing out to origin. Size and
-// content type come from a peer HEAD when tryPeers is set, else from origin.
-func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, tryPeers bool, logger *slog.Logger) bool {
+// beginColdStartResponse uses origin metadata to keep containerd attached
+// while cold-start creates a source.
+func (s *Server) beginColdStartResponse(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, logger *slog.Logger) bool {
 	if stream == nil || stream.started {
 		return true
 	}
@@ -1853,45 +1853,78 @@ func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d
 		Kind:       kind,
 	}
 
-	var (
-		size        int64
-		contentType string
-		ok          bool
-	)
+	headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
+	defer cancel()
 
-	if tryPeers {
-		size, contentType, ok = s.headFromPeers(ctx, pRef, logger)
-		if !ok {
-			logger.Debug("mirror: busy provider could not confirm content availability")
-			return false
-		}
-	}
-
-	if !ok {
-		// Only a confirmed empty lookup may use origin metadata to keep the
-		// client attached while cold-start creates a source.
-		headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
-		defer cancel()
-
-		var err error
-
-		size, contentType, err = s.origin.Head(headCtx, pRef)
-		if err != nil {
-			logger.Debug("mirror: capacity metadata HEAD failed", slog.Any("err", err))
-
-			return false
-		}
+	size, contentType, err := s.origin.Head(headCtx, pRef)
+	if err != nil {
+		logger.Debug("mirror: cold-start metadata HEAD failed", slog.Any("err", err))
+		return false
 	}
 
 	if err := stream.begin(w, d, size, kind, contentType); err != nil {
-		logger.Warn("mirror: capacity response headers failed", slog.Any("err", err))
+		logger.Warn("mirror: cold-start response headers failed", slog.Any("err", err))
 
 		return false
 	}
 
-	logger.Debug("mirror: capacity response headers flushed", slog.Int64("size", size))
+	logger.Debug("mirror: cold-start response headers flushed", slog.Int64("size", size))
 
 	return true
+}
+
+func (s *Server) confirmBusyProvider(ctx context.Context, w http.ResponseWriter, ref ifaces.OriginRef, provider ifaces.Provider, stream *livePeerStream, logger *slog.Logger) peerFetchOutcomeKind {
+	metadataPeer, ok := s.peer.(ifaces.PeerMetadataDialer)
+	if !ok {
+		logger.Debug("mirror: busy provider does not support metadata HEAD", slog.String("peer", provider.Addr))
+		return peerFetchOutcomeProtocolError
+	}
+
+	metadataCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
+	defer cancel()
+
+	metadataCtx = registryauth.WithoutAuthorization(metadataCtx)
+	ref.Offset = 0
+
+	size, contentType, err := metadataPeer.HeadFromPeer(metadataCtx, provider.Addr, ref)
+	if err != nil {
+		outcome, label := classifyPeerFetchError(err)
+		if outcome == peerFetchOutcomeBusy {
+			outcome, label = peerFetchOutcomeProtocolError, "protocol_error"
+		}
+
+		if ctx.Err() == nil {
+			switch outcome {
+			case peerFetchOutcomeStaleProvider:
+				s.markProviderStale(ref.Digest, provider)
+			case peerFetchOutcomeUnavailable:
+				s.markProviderUnavailable(provider)
+			}
+		}
+
+		logger.Debug("mirror: busy provider metadata HEAD failed",
+			slog.String("peer", provider.Addr),
+			slog.String("outcome", label),
+			slog.Any("err", err),
+		)
+
+		return outcome
+	}
+
+	if stream != nil {
+		if err := stream.begin(w, ref.Digest, size, ref.Kind, contentType); err != nil {
+			logger.Warn("mirror: busy provider response headers failed",
+				slog.String("peer", provider.Addr),
+				slog.Any("err", err),
+			)
+
+			return peerFetchOutcomeProtocolError
+		}
+	}
+
+	logger.Debug("mirror: busy provider confirmed", slog.String("peer", provider.Addr), slog.Int64("size", size))
+
+	return peerFetchOutcomeBusy
 }
 
 func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger *slog.Logger) (int64, string, bool) {
@@ -1902,6 +1935,8 @@ func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger
 
 	metadataCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
 	defer cancel()
+
+	metadataCtx = registryauth.WithoutAuthorization(metadataCtx)
 
 	providers, lookupErr := providerprobe.Candidates(metadataCtx, s.dht, ref.Digest, busyMetadataTimeout)
 	attempted := providerprobe.Attempted{}
@@ -2075,7 +2110,7 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 	if walk.lookupErr != nil {
 		logger.Debug("mirror: provider lookup error", slog.Any("err", walk.lookupErr))
 
-		if !allowColdStart {
+		if !allowColdStart && walk.discovered == 0 {
 			return peerFallbackExhausted
 		}
 	}
@@ -2149,7 +2184,7 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 // stay reachable as HTTP errors.
 func (s *Server) coldStartRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, afterLookupErr bool, stream *livePeerStream, retryAfter *time.Duration, recheckLocal func() bool, logger *slog.Logger) peerFallbackResult {
 	if s.peerRediscoverBudget > 0 {
-		_ = s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, false, logger)
+		_ = s.beginColdStartResponse(ctx, w, d, kind, upstream, repo, stream, logger)
 	}
 
 	csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, afterLookupErr, false, peerAttemptSummary{}, logger)
@@ -2376,6 +2411,10 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			slog.String("outcome", label),
 			slog.Any("err", err),
 		)
+
+		if outcome == peerFetchOutcomeBusy {
+			outcome = s.confirmBusyProvider(pCtx, w, pRef, p, stream, logger)
+		}
 
 		return peerAttemptResult{outcome: outcome, retryAfter: retryAfter}
 	}

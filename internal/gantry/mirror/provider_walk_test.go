@@ -295,6 +295,206 @@ func TestMirror_ProviderWalk_BusyProviderHoldsRequestDespiteStaleRecords(t *test
 	}
 }
 
+type partialWalkDHT struct {
+	*fakes.DHT
+}
+
+func (d partialWalkDHT) StreamProviders(ctx context.Context, ref digest.Digest, budget time.Duration) (<-chan ifaces.Provider, func() error) {
+	providers, _ := d.DHT.StreamProviders(ctx, ref, budget)
+	return providers, func() error { return context.DeadlineExceeded }
+}
+
+func TestMirror_ProviderWalk_PartialLookupPreservesBusyPeerOnRetry(t *testing.T) {
+	body := []byte("a partial lookup still found a provider that can serve")
+	d := digestOf(body)
+
+	const busyAddr = "busy:5001"
+
+	dht := partialWalkDHT{fakes.NewDHT()}
+	dht.Inject(d, ifaces.Provider{NodeID: "busy", Addr: busyAddr})
+	dialer := &busyThenServeDialer{busyAddr: busyAddr, body: body, busyCalls: 2, calls: map[string]int{}}
+	srv, counts := newWalkMirror(t, body, dht, dialer, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v2/r/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Equal(got, body) || resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %q, error = %v; want the busy provider's bytes", resp.StatusCode, got, err)
+	}
+
+	if calls := dialer.Calls(busyAddr); calls != 3 {
+		t.Fatalf("busy provider calls = %d, want two 429s followed by a serve", calls)
+	}
+
+	if counts.heads.Load() != 0 || counts.gets.Load() != 0 {
+		t.Fatal("partial lookup sent peer recovery traffic to origin")
+	}
+}
+
+type busyWithFailingPeer struct {
+	*busyThenServeDialer
+	onHead func()
+}
+
+func (d busyWithFailingPeer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	if addr != d.busyAddr {
+		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: addr, StatusCode: http.StatusServiceUnavailable}
+	}
+
+	return d.busyThenServeDialer.FetchFromPeer(ctx, addr, ref)
+}
+
+func (d busyWithFailingPeer) HeadFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (int64, string, error) {
+	size, contentType, err := d.busyThenServeDialer.HeadFromPeer(ctx, addr, ref)
+	if err == nil {
+		d.onHead()
+	}
+
+	return size, contentType, err
+}
+
+func TestMirror_ProviderWalk_ConfirmedBusySurvivesOtherPeerServerFailure(t *testing.T) {
+	body := []byte("an unrelated 503 does not discard the confirmed busy provider")
+	d := digestOf(body)
+
+	const busyAddr = "busy:5001"
+
+	provider := ifaces.Provider{NodeID: "busy", Addr: busyAddr}
+	dht := fakes.NewDHT()
+	dht.Inject(d, provider)
+
+	dialer := busyWithFailingPeer{
+		busyThenServeDialer: &busyThenServeDialer{busyAddr: busyAddr, body: body, busyCalls: 2, calls: map[string]int{}},
+		onHead: func() {
+			dht.Inject(d, provider, ifaces.Provider{NodeID: "failed", Addr: "failed:5001"})
+		},
+	}
+	srv, counts := newWalkMirror(t, body, dht, dialer, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v2/r/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Equal(got, body) || resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %q, error = %v; want the busy provider's bytes", resp.StatusCode, got, err)
+	}
+
+	if calls := dialer.Calls(busyAddr); calls != 3 {
+		t.Fatalf("busy provider calls = %d, want two 429s followed by a serve", calls)
+	}
+
+	if counts.heads.Load() != 0 || counts.gets.Load() != 0 {
+		t.Fatal("an unrelated peer failure sent the busy request to origin")
+	}
+}
+
+type busyBeforeSlowPeer struct {
+	*busyThenServeDialer
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (d busyBeforeSlowPeer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	if addr == d.busyAddr {
+		return d.busyThenServeDialer.FetchFromPeer(ctx, addr, ref)
+	}
+
+	close(d.entered)
+
+	select {
+	case <-d.release:
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+	case <-ctx.Done():
+		return nil, 0, "", ctx.Err()
+	}
+}
+
+func TestMirror_ProviderWalk_BusyHeadersPrecedeSlowLaterCandidates(t *testing.T) {
+	body := []byte("busy headers must not wait for later unreachable providers")
+	d := digestOf(body)
+
+	const busyAddr = "busy:5001"
+
+	release := make(chan struct{})
+
+	var releaseOnce sync.Once
+
+	releaseSlowPeer := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseSlowPeer()
+
+	dialer := busyBeforeSlowPeer{
+		busyThenServeDialer: &busyThenServeDialer{busyAddr: busyAddr, body: body, busyCalls: 1, calls: map[string]int{}},
+		entered:             make(chan struct{}),
+		release:             release,
+	}
+	dht := fakes.NewDHT()
+	dht.Inject(d, ifaces.Provider{NodeID: "busy", Addr: busyAddr}, ifaces.Provider{NodeID: "slow", Addr: "slow:5001"})
+	srv, counts := newWalkMirror(t, body, dht, dialer, nil)
+
+	transport := &http.Transport{ResponseHeaderTimeout: time.Second}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{Transport: transport}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v2/r/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("busy headers were delayed by a later provider: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want waiting headers", resp.StatusCode)
+	}
+
+	select {
+	case <-dialer.entered:
+	case <-ctx.Done():
+		t.Fatal("provider walk stopped instead of continuing after busy headers")
+	}
+
+	releaseSlowPeer()
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, error = %v; want the busy provider's bytes", got, err)
+	}
+
+	if counts.heads.Load() != 0 || counts.gets.Load() != 0 {
+		t.Fatal("busy headers or body used origin instead of the confirmed peer")
+	}
+}
+
 // With nothing advertised, the request commits headers before cold-start so
 // containerd keeps waiting while a chair pulls, then serves from the chair.
 type cappedWalkDHT struct {
@@ -344,8 +544,8 @@ func TestMirror_ProviderWalk_BusyMetadataFindsPeerBeyondTwentyStale(t *testing.T
 		t.Fatal("busy headers used origin instead of the peer's metadata")
 	}
 
-	if find, stream := dht.LookupCalls(); find != 0 || stream < 2 {
-		t.Fatalf("lookups find/stream = %d/%d; metadata must use the uncapped stream", find, stream)
+	if find, stream := dht.LookupCalls(); find != 0 || stream != 3 {
+		t.Fatalf("lookups find/stream = %d/%d; want three uncapped walks (two busy rounds, then a serve)", find, stream)
 	}
 }
 
