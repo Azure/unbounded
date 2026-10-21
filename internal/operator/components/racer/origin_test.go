@@ -22,13 +22,12 @@ import (
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
-const testAccountURL = "https://Account.blob.core.windows.net/"
+const testContainerURL = "https://Account.blob.core.windows.net/models"
 
 func originCache(name string, credential *racerv1.AzureCredential) *racerv1.ClusterCache {
 	cache := cacheObject(name)
 	cache.Spec.Origin = &racerv1.ObjectOrigin{
-		Bucket: "models",
-		Azure:  &racerv1.AzureOrigin{AccountURL: testAccountURL, Credential: credential},
+		Azure: &racerv1.AzureOrigin{ContainerURL: testContainerURL, Credential: credential},
 	}
 
 	return cache
@@ -160,8 +159,8 @@ func TestOriginCredentialRendering(t *testing.T) {
 			c := pod.Containers[0]
 			require.Equal(t, "mirror.test/unbounded/racer-object:v1", c.Image)
 			require.Equal(t, []string{
-				"origin", "--cache=cache", "--cache-uid=" + string(cache.UID), "--bucket=models", "--provider=azure",
-				"--account-url=" + testAccountURL, "--azure-credential=" + tc.mode,
+				"origin", "--cache=cache", "--cache-uid=" + string(cache.UID), "--provider=azure",
+				"--container-url=" + testContainerURL, "--azure-credential=" + tc.mode,
 				"--metadata-ttl=0s", "--request-timeout=1m30s", "--max-concurrent-requests=32",
 			}, c.Args)
 			require.Equal(t, tc.env, c.Env)
@@ -329,7 +328,7 @@ func TestOriginInvalidCacheIsIsolated(t *testing.T) {
 	bad, _ := liveOrigin(t, env, "bad")
 
 	// The fake client does not run CEL, modeling a cache that bypassed admission.
-	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { c.Spec.Origin.Azure.AccountURL = "https://user@host/" })
+	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { c.Spec.Origin.Azure.ContainerURL = "https://user@host/models" })
 	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.MetadataTTL = &metav1.Duration{Duration: 7 * time.Second} })
 
 	plan, result := planResult(t, env)
@@ -350,6 +349,10 @@ func TestOriginInvalidCacheIsIsolated(t *testing.T) {
 
 	good, _ := liveOrigin(t, env, "good")
 	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--metadata-ttl=7s")
+}
+
+func containerURL(value string) func(*racerv1.ObjectOrigin) {
+	return func(o *racerv1.ObjectOrigin) { o.Azure.ContainerURL = value }
 }
 
 func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
@@ -373,13 +376,15 @@ func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
 			o.Azure.Credential = &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{}}
 		}, "clientID is required"},
 		{"default-http", func(o *racerv1.ObjectOrigin) {
-			o.Azure.AccountURL = "http://127.0.0.1:10000/devstoreaccount1"
+			o.Azure.ContainerURL = "http://127.0.0.1:10000/devstoreaccount1/models"
 			o.Azure.Credential = &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{}}
-		}, "accountURL"},
-		{"no-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = "" }, "spec.origin.bucket"},
-		{"slash-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = "a/b" }, "spec.origin.bucket"},
-		{"dot-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = ".." }, "spec.origin.bucket"},
-		{"long-bucket", func(o *racerv1.ObjectOrigin) { o.Bucket = racerv1.BucketName(strings.Repeat("b", 256)) }, "spec.origin.bucket"},
+		}, "containerURL"},
+		{"empty-container-url", containerURL(""), "spec.origin.azure.containerURL"},
+		{"account-only", containerURL("https://account.blob.core.windows.net"), "spec.origin.azure.containerURL"},
+		{"trailing-slash", containerURL("https://account.blob.core.windows.net/models/"), "spec.origin.azure.containerURL"},
+		{"blob-path", containerURL("https://account.blob.core.windows.net/account/models/blob"), "spec.origin.azure.containerURL"},
+		{"bad-container", containerURL("https://account.blob.core.windows.net/a_b"), "spec.origin.azure.containerURL"},
+		{"long-container", containerURL("https://account.blob.core.windows.net/" + strings.Repeat("b", 64)), "spec.origin.azure.containerURL"},
 		{"negative-ttl", func(o *racerv1.ObjectOrigin) { o.MetadataTTL = &metav1.Duration{Duration: -time.Second} }, "metadataTTL"},
 		{"zero-timeout", func(o *racerv1.ObjectOrigin) { o.RequestTimeout = &metav1.Duration{} }, "requestTimeout"},
 		{"zero-requests", func(o *racerv1.ObjectOrigin) { o.MaxConcurrentRequests = ptr.To(int32(0)) }, "maxConcurrentRequests"},
