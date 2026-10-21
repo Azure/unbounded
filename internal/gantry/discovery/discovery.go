@@ -45,9 +45,12 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p-kad-dht/provider"
+	"github.com/libp2p/go-libp2p-kad-dht/provider/keystore"
 	"github.com/libp2p/go-libp2p-kad-dht/records"
 	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -175,10 +178,11 @@ func FromConfig(c *config.Config) Options {
 
 // Host wraps a libp2p host + kad-dht and implements ifaces.DHT.
 type Host struct {
-	logger   *slog.Logger
-	h        host.Host
-	d        *dht.IpfsDHT
-	provider *provider.SweepingProvider
+	logger       *slog.Logger
+	h            host.Host
+	d            *dht.IpfsDHT
+	provider     *provider.SweepingProvider
+	providerKeys keystore.Keystore
 
 	// transferPort is the conventional peer-transfer port suffixed to
 	// FindProviders results' IP. Captured from Options at New so
@@ -333,7 +337,7 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		logger.Warn("dht bootstrap kickoff returned err", slog.Any("err", err))
 	}
 
-	reprovider, err := newSweepingProvider(d, opts)
+	reprovider, providerKeys, err := newSweepingProvider(d, opts)
 	if err != nil {
 		_ = d.Close() //nolint:errcheck // best-effort constructor rollback
 		_ = h.Close() //nolint:errcheck // best-effort constructor rollback
@@ -342,10 +346,11 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 	}
 
 	host := &Host{
-		logger:   logger,
-		h:        h,
-		d:        d,
-		provider: reprovider,
+		logger:       logger,
+		h:            h,
+		d:            d,
+		provider:     reprovider,
+		providerKeys: providerKeys,
 	}
 
 	host.transferPort = opts.TransferPort
@@ -380,7 +385,7 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 	return host, nil
 }
 
-func newSweepingProvider(d *dht.IpfsDHT, opts Options) (*provider.SweepingProvider, error) {
+func newSweepingProvider(d *dht.IpfsDHT, opts Options) (*provider.SweepingProvider, keystore.Keystore, error) {
 	reprovideInterval := opts.ReprovideInterval
 	if reprovideInterval <= 0 {
 		reprovideInterval = DefaultReprovideInterval
@@ -391,7 +396,15 @@ func newSweepingProvider(d *dht.IpfsDHT, opts Options) (*provider.SweepingProvid
 		maxReprovideDelay = DefaultMaxReprovideDelay
 	}
 
-	return provider.New(
+	keys, err := keystore.NewKeystore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	reprovider, err := provider.New(
+		provider.WithKeystore(keys),
+		// Every registered key has already been published synchronously.
+		provider.WithSkipBootstrapReprovide(true),
 		provider.WithHost(d.Host()),
 		provider.WithReplicationFactor(d.BucketSize()),
 		provider.WithSelfAddrs(d.FilteredAddrs),
@@ -403,6 +416,11 @@ func newSweepingProvider(d *dht.IpfsDHT, opts Options) (*provider.SweepingProvid
 		provider.WithReprovideInterval(reprovideInterval),
 		provider.WithMaxReprovideDelay(maxReprovideDelay),
 	)
+	if err != nil {
+		return nil, nil, errors.Join(err, keys.Close())
+	}
+
+	return reprovider, keys, nil
 }
 
 // Close tears down the DHT and libp2p host. Safe to call multiple times.
@@ -422,6 +440,12 @@ func (h *Host) Close() error {
 
 		if h.provider != nil {
 			if cerr := h.provider.Close(); cerr != nil {
+				err = errors.Join(err, cerr)
+			}
+		}
+
+		if h.providerKeys != nil {
+			if cerr := h.providerKeys.Close(); cerr != nil {
 				err = errors.Join(err, cerr)
 			}
 		}
@@ -507,7 +531,13 @@ func (h *Host) Provide(ctx context.Context, d digest.Digest) error {
 		return nil
 	}
 
-	return h.provider.StartProviding(false, c.Hash())
+	// Finish registration after a successful publication, even if the caller
+	// cancels, so the advertiser can track every key retained by the sweeper.
+	if _, err := h.providerKeys.Put(context.WithoutCancel(ctx), c.Hash()); err != nil {
+		return err
+	}
+
+	return h.provider.AddToSchedule(c.Hash())
 }
 
 // Withdraw stops periodic reprovide. Existing remote records drain through
