@@ -74,11 +74,35 @@ impl<B: Backend> Future for Fence<'_, B> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let this = &mut *self;
-        let state = this.reactor.state.borrow();
-        let done = match &mut this.target {
-            Target::Failed(error) => {
-                return Poll::Ready(Err(error.take().expect("fence polled after completion")));
+        if let Target::Failed(error) = &mut this.target {
+            return Poll::Ready(Err(error.take().expect("fence polled after completion")));
+        }
+        {
+            let state = this.reactor.state.borrow();
+            if let Some(ready) = this.target.check(&state) {
+                return Poll::Ready(ready);
             }
+            if state.fence_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                return Poll::Pending;
+            }
+        }
+        // Clone outside the borrow: a waker's clone may re-enter the reactor
+        // and reap the final completion, so check again before registering.
+        let waker = cx.waker().clone();
+        let mut state = this.reactor.state.borrow_mut();
+        if let Some(ready) = this.target.check(&state) {
+            return Poll::Ready(ready);
+        }
+        state.fence_waiters.push(waker);
+        Poll::Pending
+    }
+}
+
+impl Target {
+    /// Returns the fence's result if it is resolved under `state`.
+    fn check<B: Backend>(&mut self, state: &super::State<B>) -> Option<Result<()>> {
+        let done = match self {
+            Target::Failed(_) => unreachable!("failed fences resolve before checking"),
             Target::All => state.in_flight == 0,
             Target::Keys(keys) => {
                 keys.retain(|key| state.table.get(*key).is_some_and(Entry::in_flight));
@@ -86,19 +110,9 @@ impl<B: Backend> Future for Fence<'_, B> {
             }
         };
         if done {
-            return Poll::Ready(Ok(()));
+            return Some(Ok(()));
         }
-        if let Some(error) = &state.failure {
-            return Poll::Ready(Err(error.clone()));
-        }
-        if state.fence_waiters.iter().any(|w| w.will_wake(cx.waker())) {
-            return Poll::Pending;
-        }
-        drop(state);
-        // Clone outside the borrow: a waker's clone may re-enter the reactor.
-        let waker = cx.waker().clone();
-        this.reactor.state.borrow_mut().fence_waiters.push(waker);
-        Poll::Pending
+        state.failure.as_ref().map(|error| Err(error.clone()))
     }
 }
 

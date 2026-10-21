@@ -1361,6 +1361,51 @@ fn drain_closes_admission_and_fences_everything() {
     assert!(format!("{drain:?}").contains("remaining"));
 }
 
+/// A hook a reentrant waker runs, once, when it is cloned.
+type CloneHook<'a> = RefCell<Option<Box<dyn FnOnce() + 'a>>>;
+
+/// A waker whose clone runs `hook` once. The returned waker borrows `hook`.
+fn clone_hook_waker(hook: &CloneHook<'_>) -> Waker {
+    fn clone(data: *const ()) -> RawWaker {
+        // SAFETY: `data` is the `CloneHook` the test keeps alive while the
+        // waker and its clones exist.
+        let hook = unsafe { &*data.cast::<CloneHook<'_>>() };
+        let run = hook.borrow_mut().take();
+        if let Some(run) = run {
+            run();
+        }
+        RawWaker::new(data, &VTABLE)
+    }
+    fn noop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    let data = std::ptr::from_ref(hook).cast::<()>();
+    // SAFETY: the vtable functions uphold the `RawWaker` contract and never
+    // dereference `data` beyond the hook's lifetime in these tests.
+    unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
+}
+
+#[test]
+fn fence_rechecks_after_a_reentrant_waker_clone_reaps_the_last_completion() {
+    let (reactor, mock) = reactor();
+    let mut op = reactor.nop(&Unscoped);
+    assert!(poll_noop(&mut op).is_pending());
+    reactor.poll(0).unwrap();
+    let pending = mock.only_pending();
+    let mut drain = reactor.drain();
+    reactor.poll(0).unwrap();
+    mock.complete(pending.user_data, -libc::ECANCELED);
+    mock.complete_cancel(pending.user_data, 0);
+    let hook: CloneHook<'_> = RefCell::new(Some(Box::new(|| {
+        reactor.poll(8).unwrap();
+    })));
+    let waker = clone_hook_waker(&hook);
+    assert_eq!(drain.remaining(), 1);
+    ready(poll(&mut drain, &waker)).unwrap();
+    assert!(hook.borrow().is_none(), "the clone reentered the reactor");
+    drop(waker);
+    assert!(ready(poll_noop(&mut op)).unwrap_err().is_canceled());
+}
+
 #[test]
 fn fence_matching_selects_by_scope_type_and_predicate() {
     let (reactor, mock) = reactor();
