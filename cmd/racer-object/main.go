@@ -32,19 +32,25 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-type bucketsFlag []string
+// bucketFlag accepts exactly one value so a repeated --bucket fails instead
+// of silently replacing the first.
+type bucketFlag string
 
-func (b *bucketsFlag) String() string { return strings.Join(*b, ",") }
-func (b *bucketsFlag) Set(value string) error {
-	*b = append(*b, value)
+func (b *bucketFlag) String() string { return string(*b) }
+func (b *bucketFlag) Set(value string) error {
+	if *b != "" {
+		return errors.New("--bucket may be set only once")
+	}
+
+	*b = bucketFlag(value)
+
 	return nil
 }
 
 type options struct {
 	mode            string
 	cache           string
-	namespace       string
-	buckets         bucketsFlag
+	bucket          bucketFlag
 	provider        string
 	api             string
 	accountURL      string
@@ -113,12 +119,11 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		helpErr = writeHelp(output, "Usage: racer-object "+o.mode+" [flags]\n"+defaults.String())
 	}
 	cache := fs.String("cache", "racer-object", "Racer cache name (ClusterCache)")
-	fs.StringVar(&o.namespace, "namespace", "", "Required stable upstream identity; use the same value in origin and sidecar")
-	fs.Var(&o.buckets, "bucket", "Allowed bucket/container (repeatable; omitted allows all buckets/containers)")
 	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
 
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
+		fs.Var(&o.bucket, "bucket", "Required bucket/container (S3 bucket or Azure container) served by this origin; requests for any other bucket are forbidden")
 		fs.StringVar(&o.provider, "provider", "s3", "Upstream provider: s3 or azure")
 		fs.StringVar(&o.accountURL, "account-url", "", "Azure account HTTP(S) URL; required for azure, without credentials or query")
 		fs.StringVar(&o.azureCredential, "azure-credential", "default", "Azure credential: default or anonymous; default requires HTTPS and uses the Azure credential chain (AZURE_CLIENT_ID and related environment variables)")
@@ -160,12 +165,12 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	closeResource(validationClient)
 
-	if _, err := racerobject.NewRequest(o.namespace, "validation", "validation", ""); err != nil {
-		return o, errors.New("--namespace must be a valid stable upstream identity")
-	}
+	if o.mode == "origin" {
+		if o.bucket == "" {
+			return o, errors.New("--bucket is required")
+		}
 
-	for _, bucket := range o.buckets {
-		if _, err := racerobject.NewRequest(o.namespace, bucket, "validation", ""); err != nil {
+		if err := racerobject.ValidateBucket(string(o.bucket)); err != nil {
 			return o, errors.New("invalid --bucket")
 		}
 	}
@@ -328,7 +333,7 @@ func originHTTPClient(o options) *http.Client {
 
 func createOrigin(ctx context.Context, o options) (racersdk.Origin, error) {
 	originConfig := racerobject.OriginConfig{
-		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,
+		Bucket: string(o.bucket), MetadataTTL: o.metadataTTL,
 	}
 	if o.provider == "azure" {
 		client, err := originAzureClient(o)
@@ -476,7 +481,7 @@ func runSidecar(ctx context.Context, o options) error {
 }
 
 func createSidecar(client *racersdk.Client, o options) (http.Handler, error) {
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets, API: o.api})
+	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{API: o.api})
 	if err != nil {
 		return nil, errors.New("could not configure sidecar")
 	}

@@ -23,7 +23,7 @@ import (
 
 func TestProviderOptions(t *testing.T) {
 	for _, provider := range []string{"s3", "azure"} {
-		args := []string{"origin", "--namespace=store", "--provider=" + provider}
+		args := []string{"origin", "--bucket=bucket", "--provider=" + provider}
 		if provider == "azure" {
 			args = append(args, "--account-url=https://account.blob.core.windows.net")
 		}
@@ -34,19 +34,19 @@ func TestProviderOptions(t *testing.T) {
 		}
 	}
 
-	o, err := parseOptions([]string{"origin", "--namespace=store"}, io.Discard)
+	o, err := parseOptions([]string{"origin", "--bucket=bucket"}, io.Discard)
 	if err != nil || o.provider != "s3" {
 		t.Fatalf("S3 default: %+v, %v", o, err)
 	}
 
-	o, err = parseOptions([]string{"origin", "--namespace=store", "--provider=azure", "--account-url=http://localhost:10000/devstoreaccount1", "--azure-credential=anonymous", "--bucket=container", "--metadata-ttl=2s", "--request-timeout=3s"}, io.Discard)
+	o, err = parseOptions([]string{"origin", "--provider=azure", "--account-url=http://localhost:10000/devstoreaccount1", "--azure-credential=anonymous", "--bucket=container", "--metadata-ttl=2s", "--request-timeout=3s"}, io.Discard)
 	if err != nil || o.azureCredential != "anonymous" || o.accountURL != "http://localhost:10000/devstoreaccount1" ||
-		len(o.buckets) != 1 || o.buckets[0] != "container" || o.metadataTTL != 2*time.Second || o.requestTimeout != 3*time.Second {
+		o.bucket != "container" || o.metadataTTL != 2*time.Second || o.requestTimeout != 3*time.Second {
 		t.Fatalf("Azure options: %+v, %v", o, err)
 	}
 
 	for _, api := range []string{"", "s3", "azure"} {
-		args := []string{"sidecar", "--namespace=store"}
+		args := []string{"sidecar"}
 
 		want := api
 		if api == "" {
@@ -81,7 +81,7 @@ func TestProviderFlagConflicts(t *testing.T) {
 		{"--api=azure"},
 	} {
 		t.Run(strings.Join(extra, " "), func(t *testing.T) {
-			args := append([]string{"origin", "--namespace=store"}, extra...)
+			args := append([]string{"origin", "--bucket=bucket"}, extra...)
 			if _, err := parseOptions(args, io.Discard); err == nil {
 				t.Fatal("accepted invalid flags")
 			}
@@ -89,7 +89,7 @@ func TestProviderFlagConflicts(t *testing.T) {
 	}
 
 	for _, extra := range []string{"--api=", "--api=Azure", "--api=other", "--provider=azure", "--account-url=", "--azure-credential=default"} {
-		if _, err := parseOptions([]string{"sidecar", "--namespace=store", extra}, io.Discard); err == nil {
+		if _, err := parseOptions([]string{"sidecar", extra}, io.Discard); err == nil {
 			t.Errorf("accepted %s", extra)
 		}
 	}
@@ -97,8 +97,8 @@ func TestProviderFlagConflicts(t *testing.T) {
 
 func TestAzureCacheOptions(t *testing.T) {
 	for _, args := range [][]string{
-		{"origin", "--namespace=store", "--provider=azure", "--account-url=https://account.blob.core.windows.net"},
-		{"sidecar", "--namespace=store", "--api=azure"},
+		{"origin", "--bucket=bucket", "--provider=azure", "--account-url=https://account.blob.core.windows.net"},
+		{"sidecar", "--api=azure"},
 	} {
 		t.Run(args[0], func(t *testing.T) {
 			o, err := parseOptions(append(args, "--cache=azure-test"), io.Discard)
@@ -114,7 +114,8 @@ func TestAzureHelpAndRedaction(t *testing.T) {
 		var output bytes.Buffer
 
 		_, err := parseOptions([]string{mode, "--help"}, &output)
-		if !errors.Is(err, flag.ErrHelp) || !strings.Contains(output.String(), "bucket/container") {
+		if !errors.Is(err, flag.ErrHelp) || strings.Contains(output.String(), "bucket/container") != (mode == "origin") ||
+			strings.Contains(output.String(), "-namespace") {
 			t.Fatalf("help: %q, %v", output.String(), err)
 		}
 
@@ -133,7 +134,7 @@ func TestAzureHelpAndRedaction(t *testing.T) {
 	for _, extra := range []string{"--account-url=https://account?sig=private-token", "--azure-credential=private-token", "--provider=private-token"} {
 		var output bytes.Buffer
 
-		err := run(t.Context(), []string{"origin", "--namespace=store", "--provider=azure", extra}, &output)
+		err := run(t.Context(), []string{"origin", "--bucket=bucket", "--provider=azure", extra}, &output)
 		if err == nil || strings.Contains(err.Error()+output.String(), "private-token") {
 			t.Fatalf("invalid argument accepted or leaked: %v", err)
 		}
@@ -165,7 +166,7 @@ func TestCreateAzureOriginAnonymous(t *testing.T) {
 	}))
 	defer server.Close()
 
-	o, err := parseOptions([]string{"origin", "--namespace=store", "--provider=azure", "--azure-credential=anonymous", "--account-url=" + server.URL + "/devstoreaccount1", "--bucket=container", "--metadata-ttl=2s"}, io.Discard)
+	o, err := parseOptions([]string{"origin", "--provider=azure", "--azure-credential=anonymous", "--account-url=" + server.URL + "/devstoreaccount1", "--bucket=container", "--metadata-ttl=2s"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +176,7 @@ func TestCreateAzureOriginAnonymous(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	request, err := racerobject.NewRequest("store", "container", "key", "")
+	request, err := racerobject.NewRequest("container", "key", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +192,7 @@ func TestCreateAzureOriginAnonymous(t *testing.T) {
 		t.Fatalf("Azure origin: %+v, body=%v, err=%v, calls=%d", metadata, body, err, calls.Load())
 	}
 
-	request, err = racerobject.NewRequest("store", "other", "key", "")
+	request, err = racerobject.NewRequest("other", "key", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func TestAzureDefaultCredentialConstruction(t *testing.T) {
 
 	t.Setenv("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001")
 
-	o := options{provider: "azure", namespace: "store", accountURL: "https://account.blob.core.windows.net", azureCredential: "default", requestTimeout: 2 * time.Second, maxRequests: 7}
+	o := options{provider: "azure", bucket: "bucket", accountURL: "https://account.blob.core.windows.net", azureCredential: "default", requestTimeout: 2 * time.Second, maxRequests: 7}
 
 	clientOptions := originAzureClientOptions(o)
 	if clientOptions.Transport.(*http.Client).Timeout != 2*time.Second || clientOptions.Telemetry.ApplicationID != "racer-object" {
@@ -245,7 +246,7 @@ func TestCreateOriginS3Selection(t *testing.T) {
 		t.Setenv(key, value)
 	}
 
-	o, err := parseOptions([]string{"origin", "--namespace=store"}, io.Discard)
+	o, err := parseOptions([]string{"origin", "--bucket=bucket"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +269,7 @@ func TestCreateSidecarAPISelection(t *testing.T) {
 	defer client.Close()
 
 	for _, api := range []string{"s3", "azure"} {
-		o, err := parseOptions([]string{"sidecar", "--namespace=store", "--api=" + api}, io.Discard)
+		o, err := parseOptions([]string{"sidecar", "--api=" + api}, io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}

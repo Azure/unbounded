@@ -8,21 +8,24 @@ requirements, request limits, and the security model.
 
 ## Example
 
-Use the same `--cache`, `--namespace`, and `--bucket` on the origin and sidecar.
+Use the same `--cache` on the origin and sidecar. Each cache serves exactly one
+bucket or container: the origin takes `--bucket` and forbids requests for any
+other bucket, and the sidecar forwards `/<bucket>/<key>` requests unchanged.
 This pairs an Azure Blob origin with the Azure Blob client API:
 
 ```sh
-racer-object origin --cache=racer-object --namespace=example-azure-store \
+racer-object origin --cache=racer-object \
   --provider=azure --account-url=https://ACCOUNT.blob.core.windows.net \
   --azure-credential=default --bucket=example-container
-racer-object sidecar --cache=racer-object --namespace=example-azure-store \
-  --api=azure --bucket=example-container --listen=127.0.0.1:8080
+racer-object sidecar --cache=racer-object \
+  --api=azure --listen=127.0.0.1:8080
 ```
 
 Run these as separate processes with their Racer sockets mounted. The origin
 provider (`--provider`) and sidecar API (`--api`) are independent; both default
-to `s3`. **Change `--namespace` when changing account, provider, or endpoint**;
-the cache key does not include them. Manifests for both are in
+to `s3`. **Use a new cache when changing bucket, account, provider, or endpoint**;
+the cache key includes only the bucket, key, and version, so reusing a cache
+can serve stale data. Manifests for both are in
 [`deploy/racer-object`](../../deploy/racer-object).
 
 ## Diagnostics

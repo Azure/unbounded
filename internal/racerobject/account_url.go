@@ -54,25 +54,3 @@ func ValidateAzureAccountURL(value, credential string) error {
 
 	return nil
 }
-
-// AzureOriginIdentity returns the stable upstream identity for an Azure account URL.
-// It lowercases the scheme and host, drops the default port, and trims one trailing
-// slash so that equivalent spellings of the same account share cache entries.
-// The URL must already pass ValidateAzureAccountURL.
-func AzureOriginIdentity(accountURL string) (string, error) {
-	u, err := url.Parse(accountURL)
-	if err != nil {
-		return "", errors.New("invalid account URL")
-	}
-
-	scheme := strings.ToLower(u.Scheme)
-	host := strings.ToLower(u.Host)
-
-	if port := u.Port(); (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
-		host = strings.TrimSuffix(host, ":"+port)
-	}
-
-	path := strings.TrimSuffix(u.EscapedPath(), "/")
-
-	return scheme + "://" + host + path, nil
-}

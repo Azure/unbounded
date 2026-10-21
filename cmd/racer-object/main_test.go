@@ -39,15 +39,25 @@ func TestHelpOutputFailure(t *testing.T) {
 	}
 }
 
+// modeArgs returns the minimal valid arguments for mode followed by extra.
+func modeArgs(mode string, extra ...string) []string {
+	args := []string{mode}
+	if mode == "origin" {
+		args = append(args, "--bucket=bucket")
+	}
+
+	return append(args, extra...)
+}
+
 func TestOptionsDefaults(t *testing.T) {
 	for _, mode := range []string{"origin", "sidecar"} {
 		t.Run(mode, func(t *testing.T) {
-			o, err := parseOptions([]string{mode, "--namespace", "store"}, io.Discard)
+			o, err := parseOptions(modeArgs(mode), io.Discard)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			if o.cache != "racer-object" || o.namespace != "store" || len(o.buckets) != 0 {
+			if o.cache != "racer-object" || (mode == "origin") != (o.bucket == "bucket") {
 				t.Fatalf("unexpected shared defaults: %+v", o)
 			}
 
@@ -61,21 +71,21 @@ func TestOptionsDefaults(t *testing.T) {
 		})
 	}
 
-	o, err := parseOptions([]string{"origin", "--namespace=store", "--bucket=one", "--bucket=two", "--cache=custom", "--metadata-ttl=0", "--path-style=false", "--region=us-west-2", "--endpoint=https://s3.example/", "--request-timeout=2s"}, io.Discard)
+	o, err := parseOptions([]string{"origin", "--bucket=one", "--cache=custom", "--metadata-ttl=0", "--path-style=false", "--region=us-west-2", "--endpoint=https://s3.example/", "--request-timeout=2s"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if strings.Join(o.buckets, ",") != "one,two" || o.cache != "custom" || o.metadataTTL != 0 || o.pathStyle || o.region != "us-west-2" || o.requestTimeout != 2*time.Second {
+	if o.bucket != "one" || o.cache != "custom" || o.metadataTTL != 0 || o.pathStyle || o.region != "us-west-2" || o.requestTimeout != 2*time.Second {
 		t.Fatalf("flags not applied: %+v", o)
 	}
 
-	o, err = parseOptions([]string{"origin", "--namespace=store", "--max-concurrent-requests=1"}, io.Discard)
+	o, err = parseOptions([]string{"origin", "--bucket=bucket", "--max-concurrent-requests=1"}, io.Discard)
 	if err != nil || o.maxRequests != 1 {
 		t.Fatalf("origin concurrency not applied: %+v, %v", o, err)
 	}
 
-	o, err = parseOptions([]string{"sidecar", "--namespace=store", "--max-connections=65536"}, io.Discard)
+	o, err = parseOptions([]string{"sidecar", "--max-connections=65536"}, io.Discard)
 	if err != nil || o.maxConnections != 65536 {
 		t.Fatalf("sidecar connections not applied: %+v, %v", o, err)
 	}
@@ -85,14 +95,14 @@ func TestCacheFlag(t *testing.T) {
 	for _, mode := range []string{"origin", "sidecar"} {
 		t.Run(mode, func(t *testing.T) {
 			for _, name := range []string{"custom", "a-b.c0", strings.Repeat("a", 63) + "." + strings.Repeat("b", 18)} {
-				o, err := parseOptions([]string{mode, "--namespace=store", "--cache=" + name}, io.Discard)
+				o, err := parseOptions(modeArgs(mode, "--cache="+name), io.Discard)
 				if err != nil || o.cache != name {
 					t.Fatalf("valid cache %q: options=%+v err=%v", name, o, err)
 				}
 			}
 
 			for _, name := range []string{"", "../bad", "Upper", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 19)} {
-				_, err := parseOptions([]string{mode, "--namespace=store", "--cache=" + name}, io.Discard)
+				_, err := parseOptions(modeArgs(mode, "--cache="+name), io.Discard)
 				if err == nil || err.Error() != "invalid --cache" {
 					t.Fatalf("invalid cache %q: %v", name, err)
 				}
@@ -113,25 +123,29 @@ func TestOptionsErrors(t *testing.T) {
 		nil,
 		{"unknown"},
 		{"origin"},
-		{"sidecar"},
-		{"origin", "--namespace=has space"},
-		{"sidecar", "--namespace=store", "--cache=../bad"},
-		{"origin", "--namespace=store", "--bucket="},
-		{"sidecar", "--namespace=store", "--bucket=../bad"},
-		{"origin", "--namespace=store", "--request-timeout=0"},
-		{"sidecar", "--namespace=store", "--request-timeout=-1s"},
-		{"origin", "--namespace=store", "--metadata-ttl=-1s"},
-		{"origin", "--namespace=store", "--metadata-ttl=bad"},
-		{"origin", "--namespace=store", "--listen=127.0.0.1:0"},
-		{"sidecar", "--namespace=store", "--region=us-east-1"},
-		{"sidecar", "--namespace=store", "extra"},
-		{"sidecar", "--namespace=store", "--listen=0.0.0.0:8080"},
-		{"origin", "--namespace=store", "--max-concurrent-requests=0"},
-		{"origin", "--namespace=store", "--max-concurrent-requests=65537"},
-		{"origin", "--namespace=store", "--max-connections=128"},
-		{"sidecar", "--namespace=store", "--max-connections=0"},
-		{"sidecar", "--namespace=store", "--max-connections=-1"},
-		{"sidecar", "--namespace=store", "--max-concurrent-requests=512"},
+		{"origin", "--bucket=has space"},
+		{"origin", "--bucket=a/b"},
+		{"origin", "--bucket=one", "--bucket=two"},
+		{"origin", "--bucket=bucket", "--namespace=store"},
+		{"sidecar", "--namespace=store"},
+		{"sidecar", "--bucket=bucket"},
+		{"sidecar", "--cache=../bad"},
+		{"origin", "--bucket="},
+		{"sidecar", "--bucket=../bad"},
+		{"origin", "--bucket=bucket", "--request-timeout=0"},
+		{"sidecar", "--request-timeout=-1s"},
+		{"origin", "--bucket=bucket", "--metadata-ttl=-1s"},
+		{"origin", "--bucket=bucket", "--metadata-ttl=bad"},
+		{"origin", "--bucket=bucket", "--listen=127.0.0.1:0"},
+		{"sidecar", "--region=us-east-1"},
+		{"sidecar", "extra"},
+		{"sidecar", "--listen=0.0.0.0:8080"},
+		{"origin", "--bucket=bucket", "--max-concurrent-requests=0"},
+		{"origin", "--bucket=bucket", "--max-concurrent-requests=65537"},
+		{"origin", "--bucket=bucket", "--max-connections=128"},
+		{"sidecar", "--max-connections=0"},
+		{"sidecar", "--max-connections=-1"},
+		{"sidecar", "--max-concurrent-requests=512"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := parseOptions(args, io.Discard); err == nil {
@@ -158,9 +172,9 @@ func TestHelpVersionAndRedaction(t *testing.T) {
 	}
 
 	for _, args := range [][]string{
-		{"origin", "--namespace=store", "--endpoint=https://private-token@upstream/"},
-		{"origin", "--namespace=store", "--request-timeout=private-token"},
-		{"sidecar", "--namespace=store", "--private-token"},
+		{"origin", "--bucket=bucket", "--endpoint=https://private-token@upstream/"},
+		{"origin", "--bucket=bucket", "--request-timeout=private-token"},
+		{"sidecar", "--private-token"},
 	} {
 		var output bytes.Buffer
 
@@ -450,7 +464,7 @@ func TestSidecarLoopbackAndShutdown(t *testing.T) {
 	}
 	defer client.Close()
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: "store"})
+	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +577,7 @@ func TestSidecarListenerErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := run(ctx, []string{"sidecar", "--namespace=store"}, io.Discard); err != nil {
+	if err := run(ctx, []string{"sidecar"}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -601,7 +615,7 @@ func TestSidecarShutdownReleasesSDKStream(t *testing.T) {
 		return metadata, body, nil
 	})
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: "store"})
+	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
