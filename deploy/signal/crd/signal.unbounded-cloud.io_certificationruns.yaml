@@ -246,6 +246,8 @@ spec:
                 type: object
               workloadPolicy:
                 properties:
+                  hostNetwork:
+                    type: boolean
                   resources:
                     description: ResourceRequirements describes the compute resource
                       requirements.

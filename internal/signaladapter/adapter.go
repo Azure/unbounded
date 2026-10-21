@@ -681,6 +681,7 @@ func ordinaryPod(
 			Volumes:                      workloadVolumes(config.ScriptConfigMap, policy),
 		},
 	}
+	applyPodPolicy(&pod.Spec, policy)
 
 	return pod
 }
@@ -790,6 +791,7 @@ func podTemplate(
 			Volumes:                      workloadVolumes(scriptConfigMap, policy),
 		},
 	}
+	applyPodPolicy(&template.Spec, policy)
 
 	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&template)
 	if err != nil {
@@ -797,6 +799,15 @@ func podTemplate(
 	}
 
 	return content
+}
+
+func applyPodPolicy(spec *corev1.PodSpec, policy signalv1.WorkloadPolicy) {
+	if !policy.HostNetwork {
+		return
+	}
+
+	spec.HostNetwork = true
+	spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 }
 
 func workloadEnvironment(
