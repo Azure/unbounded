@@ -559,6 +559,11 @@ impl Subscriptions {
                     if entry.subscription.version != subscription.version {
                         return Err(Error::InvalidRequest);
                     }
+                    // The allowance follows the newest request only: it never
+                    // rises, an in-order newer request may lower it, and a late
+                    // older request leaves it alone (newer intent wins). The
+                    // late request's own grant is still capped at what it
+                    // asked for when the response is built.
                     entry.reserve(Entry::reservation(&subscription, deadline))?;
                     // Fund the late request from the allowance a newer ceiling
                     // excluded for it. The replay bit below makes this once.
@@ -861,9 +866,13 @@ impl State {
                     deadline: entry.deadline.min(reservation.deadline),
                     remaining_page_budget: reservation.page_budget - 1,
                     remaining_byte_budget: remaining,
-                    flights: reservation
-                        .flights
-                        .map(|_| entry.flights.try_into().expect("bounded flights")),
+                    // Never grant more than this request asked for; the
+                    // requester rejects a larger count as unauthorized.
+                    flights: reservation.flights.map(|requested| {
+                        u16::try_from(entry.flights)
+                            .expect("bounded flights")
+                            .min(requested)
+                    }),
                 };
                 let completed = include_page(&entry.completed, key.page.number.0);
                 let count = self.completed_intervals - entry.completed.len() + completed.len();
@@ -1519,6 +1528,47 @@ mod tests {
             Selection::Leader { work, waiter } => (work, waiter),
             Selection::Follower(_) => panic!("expected a leader"),
         }
+    }
+
+    /// Mirror of the requester check in `forwarding::response_matches`.
+    fn requester_accepts(requested: Option<u16>, granted: Option<u16>) -> bool {
+        granted.is_some() == requested.is_some() && granted <= requested
+    }
+
+    #[test]
+    fn late_selection_grant_is_capped_at_its_own_request() {
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        let (_newest, _newest_waiter) = leader(schedule(&scheduler, multi(1, 5, 3), "a"));
+        let late = multi(1, 4, 1);
+        let (work, mut waiter) = leader(schedule(&scheduler, late.clone(), "a"));
+        let _admission = complete(work);
+        let grant = waiter.try_result(2).unwrap().unwrap().grant;
+        assert_eq!(grant.sequence, 4);
+        assert_eq!(grant.flights, Some(1));
+        assert!(requester_accepts(late.flights, grant.flights));
+        let key = EntryKey {
+            membership: MembershipVersion(1),
+            receiver: NodeId("a".into()),
+            id: [1; 16],
+        };
+        // A late older request does not lower the newest request's allowance.
+        assert_eq!(scheduler.state.lock().unwrap().entries[&key].flights, 3);
+    }
+
+    #[test]
+    fn late_single_flight_request_gets_no_flight_grant() {
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        let (_newest, _newest_waiter) = leader(schedule(&scheduler, multi(1, 5, 3), "a"));
+        let mut late = multi(1, 4, 1);
+        late.flights = None;
+        let (work, mut waiter) = leader(schedule(&scheduler, late.clone(), "a"));
+        let _admission = complete(work);
+        let grant = waiter.try_result(2).unwrap().unwrap().grant;
+        assert_eq!(grant.sequence, 4);
+        assert_eq!(grant.flights, None);
+        assert!(requester_accepts(late.flights, grant.flights));
+        assert!(!requester_accepts(Some(1), Some(3)));
+        assert!(!requester_accepts(None, Some(1)));
     }
 
     #[test]
