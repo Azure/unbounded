@@ -755,6 +755,7 @@ func kubeletExpand(in string, env map[string]string) string {
 		switch in[i+1] {
 		case '$':
 			out.WriteByte('$')
+
 			i++
 		case '(':
 			end := strings.IndexByte(in[i+2:], ')')
