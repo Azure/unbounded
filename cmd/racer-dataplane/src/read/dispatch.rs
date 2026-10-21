@@ -81,6 +81,8 @@ pub struct WorkerDirectory {
 
 enum Work {
     Hold(ObjectVersion, HoldPages, std::time::SystemTime),
+    /// Drop one holder from each page of this worker's hold for the version.
+    Release(ObjectVersion, HoldPages),
     Warm(
         PageId,
         crate::model::VersionMetadata,
@@ -506,6 +508,41 @@ impl WorkerDirectory {
         Ok(accepted)
     }
 
+    /// Drop one holder from `pages[worker]` on each listed local worker. Pages
+    /// whose last holder leaves become evictable. Workers absent from `pages`
+    /// are untouched. Pair with one `Work::Hold` per page set.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the per-read fetch job in a later change")
+    )]
+    pub(super) async fn release_hold_pages(
+        &self,
+        version: &ObjectVersion,
+        pages: &std::collections::BTreeMap<u16, HoldPages>,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        scope.check()?;
+        for (worker, held) in pages {
+            if held.is_empty() {
+                continue;
+            }
+            let receipt = self.submit(
+                WorkerId(*worker),
+                Work::Release(version.clone(), held.clone()),
+                scope,
+                None,
+            )?;
+            match std::future::poll_fn(|cx| receipt.poll_completion(cx))
+                .await?
+                .value?
+            {
+                Value::Published => {}
+                _ => return Err(Error::StaleFlight),
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn warm_page(
         &self,
         page: PageId,
@@ -929,6 +966,15 @@ async fn execute(
                 previous.is_none(),
                 previous.map_or(until, |old| old.max(until)),
             ))
+        }
+        Work::Release(version, pages) => {
+            local
+                .fill
+                .dependencies
+                .writer
+                .index()
+                .release_hold_pages(&version, &pages);
+            Ok(Value::Published)
         }
         Work::WarmLocal(page) => local.fill.warm_local(&page, scope).await.map(Value::Page),
         Work::Warm(page, metadata, membership, envelope) => {

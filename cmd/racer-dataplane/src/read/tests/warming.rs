@@ -1547,3 +1547,102 @@ fn worker_hold_covers_only_primary_pages_beside_cached_nonprimary_page() {
     assert!(index.held_page_expiry(&page(0)).is_none());
     endpoint.uninstall().unwrap();
 }
+
+#[test]
+fn release_hold_pages_drops_one_holder_on_each_listed_worker() {
+    let clock = uring_runtime::environment::SimulationClock::new(211);
+    let _environment = clock.environment(0).enter();
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(1);
+    let mut fixtures = [
+        fixture_with(PAGE_BYTES + 7, None),
+        fixture_with(PAGE_BYTES + 7, None),
+    ];
+    let membership =
+        Arc::new(Membership::validate(racer_control_wire::MembershipVersion(1), vec![]).unwrap());
+    let mut locals = Vec::new();
+    for f in &fixtures {
+        f.reactor.init().unwrap();
+        let (local, _endpoint, _) = coordinator(f, &signers[0], &membership, NoPeer::requester());
+        locals.push(local);
+    }
+    let workers = vec![WorkerId(0), WorkerId(1)];
+    let directory = Arc::new(
+        crate::read::dispatch::WorkerDirectory::new(
+            Arc::new(crate::read::dispatch::WorkerMap::new(workers.clone()).unwrap()),
+            workers,
+            16,
+        )
+        .unwrap(),
+    );
+    directory.test_observation_mailbox();
+    let version = fixtures[0].origin.metadata.version.clone();
+    let scope = RequestScope::new(
+        RequestId([43; 16]),
+        uring_runtime::environment::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    let pages = |numbers: &[u64]| -> crate::store::holds::HoldPages {
+        numbers.iter().copied().map(PageNumber).collect()
+    };
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut commands: Vec<Operation<'static, ()>> = Vec::new();
+    let mut run = |operation: &mut std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<()>> + '_>,
+    >| {
+        for _ in 0..256 {
+            if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+                return result;
+            }
+            queue.poll(&mut cx, 64);
+            for (i, local) in locals.iter().enumerate() {
+                if let Some(command) =
+                    directory.test_warm_command(WorkerId(i as u16), local.clone())
+                {
+                    commands.push(command);
+                }
+            }
+            commands.retain_mut(|command| command.as_mut().poll(&mut cx).is_pending());
+            for f in &mut fixtures {
+                uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+            }
+        }
+        panic!("operation did not complete");
+    };
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(30);
+    let held = std::collections::BTreeMap::from([(0, pages(&[0, 1])), (1, pages(&[0, 1]))]);
+    for _ in 0..2 {
+        let mut reserve: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> =
+            Box::pin(async {
+                directory
+                    .reserve_warm(&version, &held, until, &scope, &mut Vec::new())
+                    .await
+                    .map(drop)
+            });
+        run(&mut reserve).unwrap();
+    }
+    let release = std::collections::BTreeMap::from([(1, pages(&[0]))]);
+    let page = |number| PageId {
+        version: version.clone(),
+        number: PageNumber(number),
+    };
+    let holders = |worker: usize, number| {
+        locals[worker]
+            .fill
+            .dependencies
+            .writer
+            .index()
+            .hold_holders(&page(number))
+    };
+    assert_eq!((holders(0, 0), holders(1, 0)), (2, 2));
+    for remaining in [1, 0] {
+        let mut releasing: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> =
+            Box::pin(directory.release_hold_pages(&version, &release, &scope));
+        run(&mut releasing).unwrap();
+        assert_eq!(holders(1, 0), remaining);
+        assert_eq!(holders(1, 1), 2, "unlisted pages keep their holders");
+        assert_eq!(holders(0, 0), 2, "unlisted workers are untouched");
+    }
+    assert!(!locals[1].fill.dependencies.writer.index().is_held(&page(0)));
+}

@@ -419,6 +419,8 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     )
     .unwrap();
     assert_eq!(index.hold_expiry(&id.version), Some(until));
+    // Holder identities are not persisted: a restored page has one holder.
+    assert_eq!(index.hold_holders(&id), 1);
     let mut image = checkpoint::decode(&bytes).unwrap();
     for segment in &mut image.shards[0].segments {
         for (_, deadline) in &mut segment.retained_records {

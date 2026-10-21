@@ -214,11 +214,26 @@ impl Index {
     /// per member page; cached members count toward that charge and become
     /// protected atomically, or this call fails unchanged. Cached pages outside
     /// the set are not pinned.
+    ///
+    /// Each call adds one holder to every page in `pages`. A holder that wants to
+    /// give pages back individually pairs each call with
+    /// [`Self::release_hold_pages`]; holders that never do (warm jobs) rely on
+    /// [`Self::release_hold`] and expiry instead.
     pub fn reserve_hold_pages(
         &self,
         version: &ObjectVersion,
         pages: &super::holds::HoldPages,
         until: std::time::SystemTime,
+    ) -> Result<()> {
+        self.reserve_hold_inner(version, pages, until, true)
+    }
+
+    fn reserve_hold_inner(
+        &self,
+        version: &ObjectVersion,
+        pages: &super::holds::HoldPages,
+        until: std::time::SystemTime,
+        add_holder: bool,
     ) -> Result<()> {
         let monotonic = super::holds::Holds::deadline(until)?;
         if !self.available(&version.object.cache) {
@@ -276,6 +291,13 @@ impl Index {
         if state.pages.len() + self.reserved.get() + unused > self.page_capacity.get() {
             return Err(Error::Overloaded);
         }
+        let mut holders = old.map_or_else(HashMap::default, |hold| hold.holders.clone());
+        if add_holder {
+            for number in pages.iter() {
+                let holder = holders.entry(number).or_insert(0);
+                *holder = holder.checked_add(1).ok_or(Error::Overloaded)?;
+            }
+        }
         let until = old.map_or(until, |hold| hold.until.max(until));
         let monotonic = old.map_or(monotonic, |hold| hold.monotonic.max(monotonic));
         holds.entries.insert(
@@ -284,6 +306,7 @@ impl Index {
                 until,
                 monotonic,
                 pages: members,
+                holders,
                 inflight,
                 active,
                 locations,
@@ -344,11 +367,14 @@ impl Index {
             .filter(|hold| hold.live())
             .map(|hold| hold.pages.clone())
             .ok_or(Error::Unavailable)?;
-        self.reserve_hold_pages(version, &pages, until)
+        // Extension renews the deadline only; it adds no holders.
+        self.reserve_hold_inner(version, &pages, until, false)
     }
 
     /// Release only unused capacity after a partial failure. Completed pages stay held.
     /// Call after this version's persistence futures and pending writes have finished.
+    /// Every unpublished member leaves the hold regardless of its holder count;
+    /// published members keep their counts.
     pub fn release_hold(&self, version: &ObjectVersion) -> Result<()> {
         let mut holds = self.holds.borrow_mut();
         if let Some(hold) = holds.entries.get_mut(version) {
@@ -356,11 +382,60 @@ impl Index {
                 return Err(Error::Overloaded);
             }
             hold.pages = hold.locations.keys().copied().collect();
+            let locations = &hold.locations;
+            hold.holders.retain(|page, _| locations.contains_key(page));
             if hold.pages.is_empty() {
                 holds.entries.remove(version);
             }
         }
         Ok(())
+    }
+
+    /// Drop one holder from each of `pages`. A page whose count reaches zero
+    /// leaves the hold, returns its charged capacity and becomes evictable like
+    /// any other cached page. Pages that are not members are ignored, so a
+    /// release after expiry or [`Self::release_hold`] is a no-op. Releasing a
+    /// page whose held write is still in flight is allowed; that write then
+    /// publishes as an ordinary cached page.
+    pub fn release_hold_pages(&self, version: &ObjectVersion, pages: &super::holds::HoldPages) {
+        let mut holds = self.holds.borrow_mut();
+        let Some(hold) = holds.entries.get_mut(version) else {
+            return;
+        };
+        let mut released = Vec::new();
+        for number in pages.iter() {
+            if let Some(holder) = hold.holders.get_mut(&number) {
+                *holder -= 1;
+                if *holder == 0 {
+                    hold.holders.remove(&number);
+                    hold.locations.remove(&number);
+                    released.push(number);
+                }
+            }
+        }
+        if released.is_empty() {
+            return;
+        }
+        let released: super::holds::HoldPages = released.into_iter().collect();
+        hold.pages = hold
+            .pages
+            .iter()
+            .filter(|page| !released.contains(*page))
+            .collect();
+        if hold.pages.is_empty() && hold.inflight.get() == 0 && hold.active.get() == 0 {
+            holds.entries.remove(version);
+        }
+    }
+
+    /// Holder count of `page` in a live hold, or zero when it is not held.
+    pub fn hold_holders(&self, page: &PageId) -> u32 {
+        self.holds
+            .borrow()
+            .entries
+            .get(&page.version)
+            .filter(|hold| hold.live())
+            .and_then(|hold| hold.holders.get(&page.number).copied())
+            .unwrap_or(0)
     }
 
     /// Whether `page` is a member of a live hold, published or not.
@@ -485,6 +560,7 @@ impl Index {
                             until: *until,
                             monotonic,
                             pages: super::holds::HoldPages::default(),
+                            holders: HashMap::default(),
                             inflight: Rc::new(Cell::new(0)),
                             active: Rc::new(Cell::new(0)),
                             locations: HashMap::default(),
@@ -501,6 +577,9 @@ impl Index {
         for (version, pages) in members {
             if let Some(hold) = versions.get_mut(&version) {
                 hold.pages = pages.into_iter().collect();
+                // Holder identities do not survive restart; each restored page
+                // keeps one holder until expiry or `release_hold_pages`.
+                hold.holders = super::holds::Hold::single_holders(&hold.pages);
             }
         }
         self.holds.borrow_mut().entries = versions;
@@ -1366,6 +1445,87 @@ mod tests {
             .copied()
             .map(crate::model::PageNumber)
             .collect()
+    }
+
+    #[test]
+    fn hold_page_holders_share_and_release_individual_pages() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let at = |number| PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(number),
+        };
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        // A warm holds 0..3 and a read independently holds 0 and 2.
+        index
+            .reserve_hold_pages(&version, &page_set(&[0, 1, 2]), until)
+            .unwrap();
+        index
+            .reserve_hold_pages(&version, &page_set(&[0, 2]), until)
+            .unwrap();
+        assert_eq!(index.hold_holders(&at(0)), 2);
+        assert_eq!(index.hold_holders(&at(1)), 1);
+        assert_eq!(index.hold_holders(&at(2)), 2);
+        // Extension renews only; it adds no holders.
+        index.extend_hold(&version, until).unwrap();
+        assert_eq!(index.hold_holders(&at(0)), 2);
+        let other = descriptor("other", 17).version;
+        assert_eq!(index.reserve_hold(&other, 2, until), Err(Error::Overloaded));
+        // The read's release leaves the shared pages held by the warm.
+        index.release_hold_pages(&version, &page_set(&[0, 2]));
+        assert!(index.is_held(&at(0)));
+        assert!(index.is_held(&at(2)));
+        assert_eq!(index.hold_holders(&at(0)), 1);
+        assert!(index.victim(&index.state.borrow()).is_none());
+        // Releasing the last holder makes the published page evictable and
+        // returns its capacity; unknown pages are ignored.
+        index.release_hold_pages(&version, &page_set(&[0, 1, 9]));
+        assert!(!index.is_held(&at(0)));
+        assert!(!index.is_held(&at(1)));
+        assert_eq!(index.held_page_expiry(&at(0)), None);
+        assert_eq!(index.hold_holders(&at(0)), 0);
+        assert_eq!(index.victim(&index.state.borrow()), Some(page.clone()));
+        assert!(index.is_held(&at(2)));
+        index.reserve_hold(&other, 2, until).unwrap();
+        // The last page leaving removes the whole hold.
+        index.release_hold_pages(&version, &page_set(&[2]));
+        assert_eq!(index.hold_expiry(&version), None);
+        index.release_hold_pages(&version, &page_set(&[2]));
+        assert_eq!(index.hold_expiry(&version), None);
+    }
+
+    #[test]
+    fn whole_hold_release_drops_unpublished_pages_and_keeps_published_counts() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let mut unpublished = page.clone();
+        unpublished.number = crate::model::PageNumber(1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&page.version, &page_set(&[0, 1]), until)
+            .unwrap();
+        index
+            .reserve_hold_pages(&page.version, &page_set(&[0, 1]), until)
+            .unwrap();
+        index.release_hold(&page.version).unwrap();
+        assert!(!index.is_held(&unpublished));
+        assert_eq!(index.hold_holders(&unpublished), 0);
+        assert_eq!(index.hold_holders(&page), 2);
+        index.release_hold_pages(&page.version, &page_set(&[0, 1]));
+        assert!(index.is_held(&page));
+        index.release_hold_pages(&page.version, &page_set(&[0]));
+        assert_eq!(index.hold_expiry(&page.version), None);
     }
 
     #[test]

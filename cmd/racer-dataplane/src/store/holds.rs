@@ -87,12 +87,21 @@ pub(super) struct Hold {
     pub monotonic: Instant,
     /// Pages this worker promised to retain. Capacity is charged per member.
     pub pages: HoldPages,
+    /// Holder count per member page; the keys are exactly `pages`. Each
+    /// `reserve_hold_pages` adds one per requested page and each
+    /// `release_hold_pages` removes one. Not persisted: restored pages start at one.
+    pub holders: HashMap<PageNumber, u32>,
     pub inflight: Rc<Cell<usize>>,
     pub active: Rc<Cell<usize>>,
     pub locations: HashMap<PageNumber, RecordLocation>,
 }
 
 impl Hold {
+    /// Counts of one for every page, used when no holder history is known.
+    pub fn single_holders(pages: &HoldPages) -> HashMap<PageNumber, u32> {
+        pages.iter().map(|page| (page, 1)).collect()
+    }
+
     pub fn live(&self) -> bool {
         uring_runtime::environment::wall_now() < self.until
             || uring_runtime::environment::now() < self.monotonic
