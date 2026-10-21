@@ -28,6 +28,16 @@ func ValidateAzureAccountURL(value, credential string) error {
 		return invalid
 	}
 
+	// Hosts are DNS names, IPv4 addresses, or bracketed IPv6 literals with an
+	// optional port. Rejecting other bytes keeps values such as "$(VAR)" out of
+	// rendered Kubernetes args.
+	if strings.IndexFunc(u.Host, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') &&
+			r != '-' && r != '.' && r != ':' && r != '[' && r != ']'
+	}) != -1 {
+		return invalid
+	}
+
 	if strings.Contains(u.Hostname(), ":") || strings.HasPrefix(u.Host, "[") {
 		if !strings.HasPrefix(u.Host, "[") || net.ParseIP(u.Hostname()) == nil {
 			return invalid

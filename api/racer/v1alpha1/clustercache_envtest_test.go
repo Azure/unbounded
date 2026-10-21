@@ -138,11 +138,13 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"long container": {map[string]any{"origin": withOrigin(func(o map[string]any) {
 			o["azure"] = map[string]any{"containerURL": "https://account/" + strings.Repeat("x", 64)}
 		})}, "one valid container name"},
-		"leading hyphen":        {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/-abc"} })}, "one valid container name"},
-		"double hyphen":         {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/a--b"} })}, "one valid container name"},
-		"dot container":         {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/a.b"} })}, "one valid container name"},
-		"escaped container":     {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/%61bc"} })}, "one valid container name"},
-		"empty account segment": {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account//models"} })}, "one valid container name"},
+		"leading hyphen":          {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/-abc"} })}, "one valid container name"},
+		"double hyphen":           {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/a--b"} })}, "one valid container name"},
+		"dot container":           {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/a.b"} })}, "one valid container name"},
+		"escaped container":       {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account/%61bc"} })}, "one valid container name"},
+		"variable reference host": {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://$(STORAGE_HOST)/models"} })}, "one valid container name"},
+		"underscore host":         {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://acc_ount/models"} })}, "one valid container name"},
+		"empty account segment":   {map[string]any{"origin": withOrigin(func(o map[string]any) { o["azure"] = map[string]any{"containerURL": "https://account//models"} })}, "one valid container name"},
 		"url too long": {map[string]any{"origin": withOrigin(func(o map[string]any) {
 			o["azure"] = map[string]any{"containerURL": "https://" + strings.Repeat("a", 310) + "/models"}
 		})}, "containerURL"},

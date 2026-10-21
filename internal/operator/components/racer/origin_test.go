@@ -785,15 +785,17 @@ func TestOriginEscapesContainerURLVariableReferences(t *testing.T) {
 	cache := originCache("cache", nil)
 	cache.Spec.Origin.Azure.ContainerURL = url
 
-	spec, err := renderOrigin(cache)
-	require.NoError(t, err)
+	_, err := renderOrigin(cache)
+	require.ErrorContains(t, err, "spec.origin.azure.containerURL")
 
+	// Validation rejects the host, but the arg is still escaped as defense in
+	// depth: after kubelet expansion it must stay literal.
 	env := map[string]string{"STORAGE_HOST": "other.blob.core.windows.net"}
+	require.Equal(t, "--container-url="+url, kubeletExpand("--container-url="+escapeKubeArg(url), env))
+	require.Equal(t, "$$(A)$$$$", escapeKubeArg("$(A)$$"))
+	require.Equal(t, "$(A)$$", kubeletExpand(escapeKubeArg("$(A)$$"), map[string]string{"A": "x"}))
 
-	var got []string
-	for _, arg := range spec.args {
-		got = append(got, kubeletExpand(arg, env))
-	}
-
-	require.Contains(t, got, "--container-url="+url)
+	spec, err := renderOrigin(originCache("cache", nil))
+	require.NoError(t, err)
+	require.Contains(t, spec.args, "--container-url="+testContainerURL)
 }
