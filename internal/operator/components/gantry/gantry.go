@@ -178,7 +178,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 
 	// ClusterCache/gantry only reconfigures a Gantry installation the operator
 	// already reconciles; it never installs Gantry on its own.
-	racerRequested, racerPlacement, err := racerMode(ctx, env)
+	racerRequested, racerConflict, racerPlacement, err := racerMode(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
@@ -189,6 +189,10 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	}
 
 	result := component.Reconciled()
+	if racerConflict {
+		// The agent is still applied, in default mode.
+		result = racerOriginConflict()
+	}
 
 	for _, obj := range objects {
 		agent := obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName

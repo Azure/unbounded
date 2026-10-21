@@ -4,6 +4,7 @@
 package gantry
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -354,5 +355,81 @@ func TestRacerCachePredicate(t *testing.T) {
 
 	if !p.Update(event.UpdateEvent{ObjectOld: cache, ObjectNew: deleting}) {
 		t.Fatal("ClusterCache/gantry deletion start did not reconcile Gantry")
+	}
+}
+
+func racerCacheWithOrigin() *racerv1.ClusterCache {
+	cache := racerCache()
+	cache.Spec.Origin = &racerv1.ObjectOrigin{Azure: &racerv1.AzureOrigin{ContainerURL: "https://account.blob.core.windows.net/models"}}
+
+	return cache
+}
+
+func TestPlanWithRacerCacheOriginKeepsDefaultMode(t *testing.T) {
+	env := testEnv(t, racerCacheWithOrigin(), racerDataplane())
+
+	plan, res := planGantry(t, env, *siteWithGantry("edge", nil))
+	if res.Ready || res.Reason != reasonRacerOriginConflict {
+		t.Fatalf("result = %+v, want %s", res, reasonRacerOriginConflict)
+	}
+
+	if !strings.Contains(res.Message, "spec.origin") {
+		t.Fatalf("message = %q, want it to name spec.origin", res.Message)
+	}
+
+	ds, _ := agentDaemonSet(t, plan)
+	if _, ok := racerEnv(agentContainer(t, ds)); ok {
+		t.Fatal("ClusterCache/gantry with an origin switched Gantry to the Racer backend")
+	}
+
+	if ds.Spec.Template.Spec.NodeSelector["pool"] == "cache" {
+		t.Fatal("placement copied from racer-dataplane despite the origin conflict")
+	}
+
+	for _, volume := range ds.Spec.Template.Spec.Volumes {
+		if volume.Name == racerOriginVolume || volume.Name == racerClientVolume {
+			t.Fatalf("volume %s mounted despite the origin conflict", volume.Name)
+		}
+	}
+}
+
+func TestPlanWithRacerCacheOriginWithoutDataplane(t *testing.T) {
+	env := testEnv(t, racerCacheWithOrigin())
+
+	plan, res := planGantry(t, env, *siteWithGantry("edge", nil))
+	if res.Reason != reasonRacerOriginConflict {
+		t.Fatalf("result = %+v, want %s", res, reasonRacerOriginConflict)
+	}
+
+	if _, ok := agentOperation(t, plan); !ok {
+		t.Fatal("agent DaemonSet not applied in default mode during the origin conflict")
+	}
+}
+
+func TestRacerCachePredicateOriginChange(t *testing.T) {
+	p := racerCachePredicate()
+
+	plain := racerCache()
+	plain.Generation = 1
+	withOrigin := racerCacheWithOrigin()
+	withOrigin.Generation = 2
+
+	if !p.Update(event.UpdateEvent{ObjectOld: plain, ObjectNew: withOrigin}) {
+		t.Fatal("adding spec.origin to ClusterCache/gantry did not reconcile Gantry")
+	}
+
+	removed := plain.DeepCopy()
+	removed.Generation = 3
+
+	if !p.Update(event.UpdateEvent{ObjectOld: withOrigin, ObjectNew: removed}) {
+		t.Fatal("removing spec.origin from ClusterCache/gantry did not reconcile Gantry")
+	}
+
+	other := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "other", Generation: 1}}
+	otherNew := other.DeepCopy()
+	otherNew.Generation = 2
+
+	if p.Update(event.UpdateEvent{ObjectOld: other, ObjectNew: otherNew}) {
+		t.Fatal("a spec change on another ClusterCache reconciled Gantry")
 	}
 }
