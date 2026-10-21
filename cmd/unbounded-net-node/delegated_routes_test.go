@@ -25,7 +25,7 @@ func TestUnmanagedGatewayPoolsDoNotAttractThirdPartyTraffic(t *testing.T) {
 		"local": {Spec: unboundedv1alpha3.SiteSpec{
 			ManageCniPlugin: new(false),
 			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
-				CidrBlocks: []string{"10.244.0.0/16", "fd00:244::/48"},
+				CidrBlocks: []string{"10.244.0.0/16", "fd00:0244::/48"},
 			}},
 		}},
 		"remote": {Spec: unboundedv1alpha3.SiteSpec{
@@ -41,15 +41,16 @@ func TestUnmanagedGatewayPoolsDoNotAttractThirdPartyTraffic(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	routing.gatewaySupernets = append(routing.gatewaySupernets, "fd00:244::/48")
 	state := &wireGuardState{
-		sitePodCIDRPools: []string{"10.244.0.0/16", "fd00:244::/48"},
+		sitePodCIDRPools: []string{"10.244.0.0/16", "fd00:0244::/48"},
 		sitePodCIDRs:     routing.gatewaySupernets,
 	}
 
 	gateways := []gatewayPeerInfo{{RoutedCidrs: routing.gatewaySupernets}}
 	for _, managed := range []bool{false, true} {
 		supernets := collectSupernets(state, nil, gateways, gateways, routing.gatewaySupernets, managed)
-		for _, cidr := range []string{"10.244.0.0/16", "fd00:244::/48"} {
+		for _, cidr := range []string{"10.244.0.0/16", "fd00:0244::/48", "fd00:244::/48"} {
 			if supernets[cidr] != managed {
 				t.Fatalf("gateway local pool routing with management=%v: %v", managed, supernets)
 			}

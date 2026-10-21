@@ -634,8 +634,11 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 	}
 
 	if !manageLocalPodRoutes {
-		for _, cidr := range state.sitePodCIDRPools {
-			delete(supernets, cidr)
+		localPools := buildNormalizedCIDRSet(state.sitePodCIDRPools)
+		for cidr := range supernets {
+			if _, local := localPools[normalizeCIDR(cidr)]; local {
+				delete(supernets, cidr)
+			}
 		}
 	}
 	// Remove the local node's own podCIDRs (those are handled by the bridge directly).
