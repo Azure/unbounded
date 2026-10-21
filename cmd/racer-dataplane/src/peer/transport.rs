@@ -322,7 +322,7 @@ impl Transfers {
         }
         binding.response = envelope_digest(&response.authentication)?;
         let previous = signed_digest(&accept.signed)?;
-        // `Links::send` stages the ciphertext on the crypto thread when it can.
+        // `Links::send` writes the page in place, or stages a copy without ODP.
         let sent = links
             .send(peer, &grant, ciphertext, &native_scope(scope))
             .await;
@@ -412,6 +412,7 @@ impl Transfers {
                 .head,
         )?;
         if links.ready(&peer, rail).is_none() {
+            links.record_http_fallback();
             return Ok(None);
         }
         let binding = Binding::request(
@@ -425,7 +426,10 @@ impl Transfers {
             .await
         {
             Ok(pending) => pending,
-            Err(error) if native_failure(error, scope) => return Ok(None),
+            Err(error) if native_failure(error, scope) => {
+                links.record_http_fallback();
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let accept = binding.sign(
@@ -533,6 +537,9 @@ impl Transfers {
             return Err(Error::Unauthorized);
         }
         if phase == Phase::Finish {
+            if let Some(links) = &self.links {
+                links.record_http_fallback();
+            }
             // The owner keeps the tag until the sender's release arrives.
             drop(pending);
             return self

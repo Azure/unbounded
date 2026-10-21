@@ -176,8 +176,19 @@ pub(crate) fn world() -> World {
 
 /// Two activated nodes named `ids`, on the simulated clock if `simulated`,
 /// else on the real clock (for tests over real sockets).
-pub(crate) fn world_for([id_a, id_b]: [NodeId; 2], simulated: bool) -> World {
+pub(crate) fn world_for(ids: [NodeId; 2], simulated: bool) -> World {
+    world_with(ids, simulated, true)
+}
+
+/// Two simulated nodes whose devices lack implicit on-demand paging, so
+/// every send copies.
+pub(crate) fn copy_world() -> World {
+    world_with([node_id(1), node_id(2)], true, false)
+}
+
+fn world_with([id_a, id_b]: [NodeId; 2], simulated: bool, odp: bool) -> World {
     let sim = Simulation::new();
+    sim.implicit_odp(odp);
     let clock = SimulationClock::new(7);
     let environment = clock.environment(1);
     let a = node(&sim, 1, id_a, simulated.then_some(&environment));
@@ -680,7 +691,7 @@ mod staged {
 
     #[test]
     fn send_stages_on_the_crypto_thread_and_returns_the_buffer() {
-        let mut w = world();
+        let mut w = copy_world();
         link_up(&mut w);
         let (mut w, crypto, mut port) = stager(w);
         for (transfer, byte) in [(3, 0x5a), (4, 0xa5)] {
@@ -704,7 +715,7 @@ mod staged {
 
     #[test]
     fn exhausted_pool_leaves_the_copy_to_the_owner() {
-        let mut w = world();
+        let mut w = copy_world();
         link_up(&mut w);
         let (mut w, crypto, mut port) = stager(w);
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -735,7 +746,7 @@ mod staged {
 
     #[test]
     fn stopped_stager_returns_the_buffer_and_falls_back() {
-        let mut w = world();
+        let mut w = copy_world();
         link_up(&mut w);
         let (mut w, crypto, port) = stager(w);
         drop(port);
@@ -753,7 +764,7 @@ mod staged {
 
     #[test]
     fn cancelled_stage_returns_the_buffer_and_releases_nothing() {
-        let mut w = world();
+        let mut w = copy_world();
         link_up(&mut w);
         let (mut w, crypto, mut port) = stager(w);
         let (pending, grant) = granted(&mut w, 3);
@@ -786,7 +797,7 @@ mod staged {
 
     #[test]
     fn cancelled_after_the_write_lands_breaks_the_epoch() {
-        let mut w = world();
+        let mut w = copy_world();
         link_up(&mut w);
         let (pending, grant) = granted(&mut w, 3);
         let page = page(&w.b.admission.clone(), 35, 0x5a);
@@ -814,7 +825,7 @@ mod staged {
 
     #[test]
     fn unadmitted_release_breaks_the_epoch() {
-        let mut w = world();
+        let mut w = copy_world();
         link_up(&mut w);
         let (pending, grant) = granted(&mut w, 3);
         let to = node_id(1);
@@ -843,5 +854,161 @@ mod staged {
             "release fell back to a break"
         );
         drop(pending);
+    }
+}
+
+/// Sender-side zero-copy: with implicit on-demand paging the page is written in
+/// place, no pool buffer is staged, and the metrics name the path taken.
+mod send_in_place {
+    use super::*;
+    use crate::telemetry::{Event, Metrics};
+
+    /// `w` with `metrics` attached to both nodes' links.
+    fn metered(w: World) -> (World, Metrics, Metrics) {
+        let (ma, mb) = (Metrics::default(), Metrics::default());
+        let World {
+            _sim,
+            clock,
+            _environment,
+            a,
+            b,
+        } = w;
+        let a = Node {
+            links: Rc::new(
+                Rc::into_inner(a.links)
+                    .expect("unshared links")
+                    .with_metrics(ma.clone()),
+            ),
+            ..a
+        };
+        let b = Node {
+            links: Rc::new(
+                Rc::into_inner(b.links)
+                    .expect("unshared links")
+                    .with_metrics(mb.clone()),
+            ),
+            ..b
+        };
+        (
+            World {
+                _sim,
+                clock,
+                _environment,
+                a,
+                b,
+            },
+            ma,
+            mb,
+        )
+    }
+
+    /// Grant on `a`, send `page` from `b`, and return what `a` received.
+    fn transfer(w: &mut World, page: &CiphertextPage) -> Vec<u8> {
+        receive_registered(w, page).bytes().to_vec()
+    }
+
+    #[test]
+    fn odp_send_writes_the_page_in_place_and_counts_it() {
+        let mut w = world();
+        link_up(&mut w);
+        let (mut w, _, mb) = metered(w);
+        assert!(w.b.links.zero_copy(RAIL));
+        let page = page(&w.b.admission.clone(), 35, 0x5a);
+        let received = transfer(&mut w, &page);
+        assert_eq!(received, page.bytes());
+        assert_eq!(w.b.links.staging.get(), (0, 0), "nothing staged");
+        assert_eq!(mb.count(Event::RdmaPagesSentZeroCopy), 1);
+        assert_eq!(mb.count(Event::RdmaPagesSentCopy), 0);
+        assert_eq!(mb.count(Event::RdmaSentBytes), 35);
+        pump!(w);
+        assert_eq!(w.b.links.buffers(RAIL, BufferState::Free), Some(2));
+        assert_eq!(w.a.links.buffers(RAIL, BufferState::Free), Some(2));
+    }
+
+    #[test]
+    fn page_dropped_by_the_caller_stays_alive_until_the_completion() {
+        let mut w = world();
+        link_up(&mut w);
+        let scope = scope();
+        let pending = drive!(
+            w,
+            w.a.links
+                .grant(&node_id(2), RAIL, TransferId([3; 16]), &scope)
+        )
+        .unwrap();
+        let header = STANDARD.decode(pending.header_value()).unwrap();
+        let grant = AuthenticatedGrant::decode(&header, RAIL, TransferId([3; 16])).unwrap();
+        let page = page(&w.b.admission.clone(), 35, 0xc3);
+        let used = w.b.admission.used(ResourceClass::Ciphertext);
+        let links = w.b.links.clone();
+        let to = node_id(1);
+        let mut send = Box::pin(links.send(&to, &grant, &page, &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+        // The caller lets go; the owner's queued write still holds the page.
+        drop(send);
+        drop(page);
+        assert_eq!(
+            w.b.admission.used(ResourceClass::Ciphertext),
+            used,
+            "the queued write pins the page and its charge"
+        );
+        let arrival = drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap();
+        match arrival {
+            Arrival::Page(page) => assert_eq!(page.bytes(), &[0xc3; 35][..]),
+            Arrival::Released => panic!("expected a page"),
+        }
+        pump!(w);
+        assert!(
+            w.b.admission.used(ResourceClass::Ciphertext) < used,
+            "the completion released the page"
+        );
+    }
+
+    #[test]
+    fn without_odp_every_send_copies_and_counts_the_fallback() {
+        let mut w = copy_world();
+        link_up(&mut w);
+        let (mut w, _, mb) = metered(w);
+        assert!(!w.b.links.zero_copy(RAIL));
+        let page = page(&w.b.admission.clone(), 35, 0x5a);
+        let received = transfer(&mut w, &page);
+        assert_eq!(received, page.bytes());
+        assert_eq!(mb.count(Event::RdmaPagesSentZeroCopy), 0);
+        assert_eq!(mb.count(Event::RdmaPagesSentCopy), 1);
+        assert_eq!(mb.count(Event::RdmaSentBytes), 35);
+    }
+
+    #[test]
+    fn zero_copy_can_be_refused_by_configuration() {
+        let sim = Simulation::new();
+        let clock = SimulationClock::new(7);
+        let environment = clock.environment(1);
+        let mut a = node(&sim, 1, node_id(1), Some(&environment));
+        let mut b = node(&sim, 2, node_id(2), Some(&environment));
+        let _guard = environment.enter();
+        a.links = Rc::new(
+            Rc::into_inner(a.links)
+                .expect("unshared links")
+                .with_zero_copy(false),
+        );
+        let scope = scope();
+        let admission = a.admission.clone();
+        drive(
+            &mut a.owner,
+            &mut b.owner,
+            a.links
+                .activate(vec![mapping(1)], &admission, 2 * BUFFER_LEN, &scope),
+        )
+        .unwrap();
+        assert!(!a.links.zero_copy(RAIL));
+    }
+
+    #[test]
+    fn http_fallback_is_counted() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.record_http_fallback();
+        assert_eq!(ma.count(Event::RdmaHttpFallback), 1);
     }
 }
