@@ -75,6 +75,7 @@ type config struct {
 	KubeconfigPath                string
 	ApiserverURL                  string // Override Kubernetes API server URL (empty = use default)
 	NodeName                      string
+	ExpectedNodes                 int
 	STUNEnabled                   bool
 	STUNHost                      string
 	STUNPort                      int
@@ -290,6 +291,7 @@ then annotates the node with the public key.`,
 	flags.StringVar(&cfg.KubeconfigPath, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not specified)")
 	flags.StringVar(&cfg.ApiserverURL, "apiserver-url", "", "Override Kubernetes API server URL (empty = use default from kubeconfig or in-cluster config)")
 	flags.StringVar(&cfg.NodeName, "node-name", os.Getenv("NODE_NAME"), "Name of this node (defaults to NODE_NAME env var)")
+	flags.IntVar(&cfg.ExpectedNodes, "expected-nodes", 0, "Expected node count for increase-only IPv4 neighbor GC thresholds (0 leaves sysctls unchanged)")
 	flags.BoolVar(&cfg.STUNEnabled, "stun-enabled", defaultSTUNEnabled, "Discover the node's public IP with STUN when no override or provider ExternalIP exists")
 	flags.StringVar(&cfg.STUNHost, "stun-host", defaultSTUNHost, "STUN server host used for public IP discovery (required when enabled)")
 	flags.IntVar(&cfg.STUNPort, "stun-port", defaultSTUNPort, "STUN server port used for public IP discovery")
@@ -367,6 +369,14 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 
 	flags := cmd.Flags()
 	nodeCfg := runtimeCfg.Node
+
+	if !flags.Changed("expected-nodes") && nodeCfg.ExpectedNodes != nil {
+		cfg.ExpectedNodes = *nodeCfg.ExpectedNodes
+	}
+
+	if _, err := neighborGCThresholds(cfg.ExpectedNodes); err != nil {
+		return err
+	}
 
 	if !flags.Changed("status-detail-mode") && nodeCfg.StatusDetailMode != "" {
 		cfg.StatusDetailMode = nodeCfg.StatusDetailMode
@@ -698,6 +708,10 @@ func run(cfg *config) error {
 	}
 
 	klog.Infof("Running on node: %s", cfg.NodeName)
+
+	if err := applyNeighborGCThresholds(cfg.ExpectedNodes, os.ReadFile, os.WriteFile); err != nil {
+		return fmt.Errorf("configure IPv4 neighbor GC thresholds: %w", err)
+	}
 
 	if cfg.EnablePolicyRouting {
 		klog.Info("Policy-based routing on gateway interfaces is enabled")

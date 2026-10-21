@@ -62,6 +62,7 @@ type ControllerLeaderElectionYAML struct {
 
 // NodeRuntimeConfig contains node-agent runtime settings.
 type NodeRuntimeConfig struct {
+	ExpectedNodes        *int   `yaml:"expectedNodes"`
 	InformerResyncPeriod string `yaml:"informerResyncPeriod"`
 	NodeName             string `yaml:"nodeName"`
 	STUNEnabled          *bool  `yaml:"stunEnabled"`
