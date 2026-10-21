@@ -620,6 +620,9 @@ Unit and integration coverage must include:
     deadline, allowing a healthy fifth provider to be verified.
 30. A successful initial announcement is immediately discoverable, registers
     periodic reprovide, and does not queue a second initial publication.
+31. A real remote DHT store retains a live provider across three configured
+    validity windows through periodic refresh, then expires the record after
+    withdrawal without network lookups recaching it.
 
 ## Open Questions
 

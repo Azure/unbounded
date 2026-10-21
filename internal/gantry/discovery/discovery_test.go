@@ -137,14 +137,12 @@ func TestHostPersistsIdentity(t *testing.T) {
 	}
 }
 
-func TestHostProvideRegistersSweeperAndWithdrawRemoves(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+func newConnectedProviderPair(t *testing.T, ctx context.Context, opts Options) (*Host, *Host) {
+	t.Helper()
 
-	first, err := New(ctx, Options{
-		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
-		ProtocolPrefix: "/gantry-provider-lifecycle-test",
-	})
+	opts.ListenAddrs = []string{"/ip4/127.0.0.1/tcp/0"}
+
+	first, err := New(ctx, opts)
 	if err != nil {
 		t.Fatalf("first New: %v", err)
 	}
@@ -158,11 +156,9 @@ func TestHostProvideRegistersSweeperAndWithdrawRemoves(t *testing.T) {
 
 	bootstrap := first.Addrs()[0].Encapsulate(p2p).String()
 
-	second, err := New(ctx, Options{
-		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
-		BootstrapPeers: []string{bootstrap},
-		ProtocolPrefix: "/gantry-provider-lifecycle-test",
-	})
+	opts.BootstrapPeers = []string{bootstrap}
+
+	second, err := New(ctx, opts)
 	if err != nil {
 		t.Fatalf("second New: %v", err)
 	}
@@ -199,6 +195,15 @@ func TestHostProvideRegistersSweeperAndWithdrawRemoves(t *testing.T) {
 		case <-convergenceTick.C:
 		}
 	}
+
+	return first, second
+}
+
+func TestHostProvideRegistersSweeperAndWithdrawRemoves(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	first, second := newConnectedProviderPair(t, ctx, Options{ProtocolPrefix: "/gantry-provider-lifecycle-test"})
 
 	d := digest.MustParse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 	if err := second.Provide(ctx, d); err != nil {
@@ -279,6 +284,102 @@ observe:
 	if stats.Schedule.Keys != 0 {
 		t.Fatalf("scheduled keys after Withdraw = %d, want 0", stats.Schedule.Keys)
 	}
+}
+
+func TestHostReprovideRefreshesAndWithdrawExpiresRemoteRecord(t *testing.T) {
+	const (
+		validity = 2 * time.Second
+		refresh  = 200 * time.Millisecond
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	observer, publisher := newConnectedProviderPair(t, ctx, Options{
+		ProtocolPrefix:    "/gantry-provider-expiration-test",
+		ProviderValidity:  validity,
+		ReprovideInterval: refresh,
+		MaxReprovideDelay: 50 * time.Millisecond,
+	})
+	d := digest.MustParse("sha256:dededededededededededededededededededededededededededededededede")
+
+	key, err := DigestToCID(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteHasProvider := func() bool {
+		t.Helper()
+		// A network lookup could rediscover and recache the provider,
+		// obscuring whether periodic publication or expiration worked.
+		providers, err := observer.d.ProviderStore().GetProviders(ctx, key.Hash())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, provider := range providers {
+			if provider.ID == publisher.PeerID() {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+
+	waitForRemote := func(present bool, limit time.Duration) {
+		t.Helper()
+
+		deadline := time.NewTimer(limit)
+		defer deadline.Stop()
+
+		for remoteHasProvider() != present {
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-deadline.C:
+				t.Fatalf("remote provider presence did not become %v", present)
+			case <-tick.C:
+			}
+		}
+	}
+
+	if err := publisher.Provide(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForRemote(true, validity)
+
+	observe := func(present bool, duration time.Duration) {
+		t.Helper()
+
+		deadline := time.NewTimer(duration)
+		defer deadline.Stop()
+
+		for {
+			if remoteHasProvider() != present {
+				t.Fatalf("remote provider presence changed while expecting %v", present)
+			}
+
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-deadline.C:
+				return
+			case <-tick.C:
+			}
+		}
+	}
+	observe(true, 3*validity)
+
+	if err := publisher.Withdraw(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForRemote(false, 3*validity)
+	observe(false, 2*refresh)
 }
 
 func TestTransferAddrWithPortSkipsLoopback(t *testing.T) {
