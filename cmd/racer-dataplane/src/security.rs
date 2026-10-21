@@ -3831,7 +3831,7 @@ mod tests {
         assert!(
             racer_crypto::open(&[7; 32], &descriptor.nonce.0, &aad, &sealed, &mut out).is_err()
         );
-        assert_eq!(out, [0xa5; 5]);
+        assert_eq!(out, [0; 5]);
     }
 
     #[test]
@@ -4087,11 +4087,11 @@ mod tests {
                 _ => input[5] ^= 1,
             }
             let retained = input;
-            // A nonzero sentinel proves authentication precedes any output write,
-            // rather than merely observing the zero-initialized production buffer.
+            // A nonzero sentinel proves a failed open wipes the output rather
+            // than merely observing the zero-initialized production buffer.
             let mut output = [0xa5; 5];
             assert!(racer_crypto::open(&[7; 32], &nonce, &aad, &input, &mut output).is_err());
-            assert_eq!(output, [0xa5; 5]);
+            assert_eq!(output, [0; 5]);
             assert_eq!(input, retained);
         }
     }

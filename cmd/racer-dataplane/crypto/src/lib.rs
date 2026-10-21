@@ -30,7 +30,6 @@ use ed25519_dalek::{
     pkcs8::{DecodePrivateKey, EncodePrivateKey},
 };
 use sha2::{Digest, Sha256};
-use xaes_256_gcm::Xaes256Gcm;
 use zeroize::Zeroizing;
 
 /// Opaque failure of a cryptographic operation or input validation.
@@ -114,6 +113,7 @@ impl std::error::Error for Error {}
 /// The caller must never reuse a nonce with the same key.
 /// No allocation or plaintext staging copy is performed.
 /// Uses XAES-256-GCM as specified at <https://c2sp.org/XAES-256-GCM>.
+/// A malformed output length leaves output untouched; any later error zeroes it.
 pub fn seal(
     key: &[u8; 32],
     nonce: &[u8; 24],
@@ -121,7 +121,129 @@ pub fn seal(
     plaintext: &[u8],
     out: &mut [u8],
 ) -> Result<(), Error> {
-    seal_with(&Xaes256Gcm::new(key.into()), nonce, aad, plaintext, out)
+    PageCipher::new(key).seal(nonce, aad, plaintext, out)
+}
+
+/// XAES-256-GCM (<https://c2sp.org/XAES-256-GCM>) with the per-key state cached.
+///
+/// Only the master AES-256 key schedule and the CMAC subkey K1 are retained.
+/// Each call derives the per-nonce AES-256-GCM key and runs the bulk AEAD
+/// through ring, whose AES-GCM uses AES-NI/VAES and carry-less multiply.
+/// The output is byte-identical to the reference construction.
+pub(crate) struct PageCipher {
+    // aes is built with its zeroize feature, so the schedule is wiped on drop.
+    aes: aes::Aes256,
+    k1: Zeroizing<[u8; 16]>,
+}
+
+impl PageCipher {
+    pub(crate) fn new(key: &[u8; 32]) -> Self {
+        use aes::cipher::{BlockCipherEncrypt, KeyInit};
+        let aes = aes::Aes256::new(key.into());
+        let mut l = Zeroizing::new([0u8; 16]);
+        aes.encrypt_block((&mut *l).into());
+        // CMAC subkey: K1 = L << 1, reduced by 0x87 when the MSB of L is set.
+        let mut k1 = Zeroizing::new([0u8; 16]);
+        for i in 0..16 {
+            let carry = if i < 15 { l[i + 1] >> 7 } else { 0 };
+            k1[i] = (l[i] << 1) | carry;
+        }
+        k1[15] ^= 0x87 & 0u8.wrapping_sub(l[0] >> 7);
+        Self { aes, k1 }
+    }
+
+    /// Derive the per-nonce AES-256-GCM key Kx from the first 12 nonce bytes.
+    fn derive(&self, nonce: &[u8; 24]) -> Result<ring::aead::LessSafeKey, Error> {
+        use aes::cipher::BlockCipherEncrypt;
+        let mut kx = Zeroizing::new([0u8; 32]);
+        for (index, half) in kx.chunks_exact_mut(16).enumerate() {
+            half[1] = index as u8 + 1;
+            half[2] = b'X';
+            half[4..].copy_from_slice(&nonce[..12]);
+            for (byte, k1) in half.iter_mut().zip(self.k1.iter()) {
+                *byte ^= k1;
+            }
+            self.aes
+                .encrypt_block(half.try_into().map_err(|_| Error(()))?);
+        }
+        let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &kx[..])
+            .map_err(|_| Error(()))?;
+        Ok(ring::aead::LessSafeKey::new(key))
+    }
+
+    fn gcm_nonce(nonce: &[u8; 24]) -> ring::aead::Nonce {
+        let mut tail = [0u8; 12];
+        tail.copy_from_slice(&nonce[12..]);
+        ring::aead::Nonce::assume_unique_for_key(tail)
+    }
+
+    /// See [`seal`]. A wrong output length leaves `out` untouched; any later
+    /// error zeroes it.
+    pub(crate) fn seal(
+        &self,
+        nonce: &[u8; 24],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        if plaintext.len().checked_add(TAG_LEN) != Some(out.len()) {
+            return Err(Error(()));
+        }
+        let result = (|| {
+            let key = self.derive(nonce)?;
+            let (ciphertext, tag_out) = out.split_at_mut(plaintext.len());
+            ciphertext.copy_from_slice(plaintext);
+            let tag = key
+                .seal_in_place_separate_tag(
+                    Self::gcm_nonce(nonce),
+                    ring::aead::Aad::from(aad),
+                    ciphertext,
+                )
+                .map_err(|_| Error(()))?;
+            tag_out.copy_from_slice(tag.as_ref());
+            Ok(())
+        })();
+        if result.is_err() {
+            out.fill(0);
+        }
+        result
+    }
+
+    /// See [`open`]. A wrong input or output length leaves `out` untouched;
+    /// authentication or any later failure zeroes it.
+    pub(crate) fn open(
+        &self,
+        nonce: &[u8; 24],
+        aad: &[u8],
+        sealed: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let length = sealed.len().checked_sub(TAG_LEN).ok_or(Error(()))?;
+        if out.len() != length {
+            return Err(Error(()));
+        }
+        let (ciphertext, tag) = sealed.split_at(length);
+        let result = (|| {
+            let tag = ring::aead::Tag::try_from(tag).map_err(|_| Error(()))?;
+            let key = self.derive(nonce)?;
+            // ring has no out-of-place open, so decrypt a copy in place. A
+            // failed tag check leaves unauthenticated plaintext, wiped below.
+            out.copy_from_slice(ciphertext);
+            key.open_in_place_separate_tag(
+                Self::gcm_nonce(nonce),
+                ring::aead::Aad::from(aad),
+                tag,
+                out,
+                0..,
+            )
+            .map(|_| ())
+            .map_err(|_| Error(()))
+        })();
+        if result.is_err() {
+            out.fill(0);
+        }
+        result
+    }
 }
 
 fn seal_with<C>(
@@ -147,8 +269,11 @@ where
 }
 
 /// Open ciphertext followed by tag into exactly `sealed.len() - TAG_LEN` bytes.
-/// Every error leaves output untouched, including malformed input/output lengths.
-/// Authentication precedes decryption; no allocation or plaintext staging copy is performed.
+/// Malformed input/output lengths return an error with output untouched.
+/// Every other error, including authentication failure, zeroes the whole output:
+/// the ciphertext is decrypted in place in `out` while the tag is checked, so
+/// callers must not rely on prior contents of `out` surviving a failed open.
+/// No allocation or separate staging buffer is used.
 pub fn open(
     key: &[u8; 32],
     nonce: &[u8; 24],
@@ -156,7 +281,7 @@ pub fn open(
     sealed: &[u8],
     out: &mut [u8],
 ) -> Result<(), Error> {
-    open_with(&Xaes256Gcm::new(key.into()), nonce, aad, sealed, out)
+    PageCipher::new(key).open(nonce, aad, sealed, out)
 }
 
 fn open_with<C>(
@@ -833,14 +958,13 @@ pub mod identity {
     struct Secret {
         material: Zeroizing<[u8; 32]>,
         // XAES caches the master AES schedule and CMAC K1, not per-nonce GCM keys.
-        page_cipher: crate::Xaes256Gcm,
+        page_cipher: crate::PageCipher,
     }
 
     impl Secret {
         fn new(material: Zeroizing<[u8; 32]>) -> Self {
-            use chacha20poly1305::KeyInit;
             Self {
-                page_cipher: crate::Xaes256Gcm::new((&*material).into()),
+                page_cipher: crate::PageCipher::new(&material),
                 material,
             }
         }
@@ -877,11 +1001,14 @@ pub mod identity {
             out: &mut [u8],
         ) -> Result<()> {
             self.bound_material(cache, self.id(), KeyPurpose::Page)?;
-            crate::seal_with(&self.secret.page_cipher, nonce, aad, input, out)
+            self.secret
+                .page_cipher
+                .seal(nonce, aad, input, out)
                 .map_err(|_| Error::CorruptRecord)
         }
 
-        /// Authenticate before writing caller output; an error leaves output untouched.
+        /// Open a page. Binding and length errors leave output untouched;
+        /// authentication failure zeroes it (see [`crate::open`]).
         // Keep borrowed buffer and expected-identity arguments explicit at this boundary.
         #[allow(clippy::too_many_arguments)]
         pub fn open_page(
@@ -894,7 +1021,9 @@ pub mod identity {
             out: &mut [u8],
         ) -> Result<()> {
             self.bound_material(cache, id, KeyPurpose::Page)?;
-            crate::open_with(&self.secret.page_cipher, nonce, aad, input, out)
+            self.secret
+                .page_cipher
+                .open(nonce, aad, input, out)
                 .map_err(|_| Error::CorruptRecord)
         }
 
