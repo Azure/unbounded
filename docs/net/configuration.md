@@ -708,6 +708,10 @@ agent user and must not be writable by other users. The agent requires an
 existing installation directory rather than creating a container-local binary
 directory. Ensure that directory is actually backed by the host mount.
 
+The agent retains a `<socketPath>.lock` file beside the socket. An exclusive
+lock protects stale-socket recovery and shutdown cleanup across processes.
+The file remains after shutdown; do not remove it while an agent is running.
+
 For a third-party CNI, set `manageCniPlugin: false` on the Site and delegate
 IPAM to `unbounded-ipam`. Set `assignmentEnabled: true` on each desired
 `spec.podCidrAssignments` rule to have Unbounded allocate Node PodCIDRs, or use
