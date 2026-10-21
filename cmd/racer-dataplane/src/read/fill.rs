@@ -310,11 +310,14 @@ impl Fill {
                     self.reserve_with_reclamation(
                         &page.version.object.cache,
                         ResourceClass::Ciphertext,
-                        copy.ciphertext.inner.capacity(),
+                        self.selected_capacity(&copy.ciphertext),
                     )
                 },
             )?;
-            copy.ciphertext = copy.ciphertext.rehome(reservation)?;
+            copy.ciphertext = self
+                .dependencies
+                .buffers
+                .rehome_aligned(copy.ciphertext, reservation)?;
         }
         let reservation =
             self.observe_reservation(scope, &page, FillAdmissionSite::SelectedPlaintext, || {
@@ -1647,6 +1650,56 @@ impl Fill {
             })
     }
 
+    /// Charge for rehoming selected ciphertext. Pages that must be copied
+    /// (registered or shared) are charged the pooled aligned size class so the
+    /// copy lands in this worker's pool; exclusive pages move in place under a
+    /// charge for their current capacity.
+    fn selected_capacity(&self, ciphertext: &crate::memory::CiphertextPage) -> usize {
+        let capacity = ciphertext.inner.capacity();
+        if !ciphertext.is_registered() && Arc::strong_count(&ciphertext.inner) == 1 {
+            return capacity;
+        }
+        self.dependencies
+            .buffers
+            .aligned_capacity(ciphertext.bytes().len())
+            .map_or(capacity, |aligned| aligned.max(capacity))
+    }
+
+    /// Copy an authenticated registered RDMA page once into pooled aligned
+    /// storage before it is published and persisted, so the memory cache and
+    /// the store share one page and the RDMA buffer returns to its pool.
+    ///
+    /// Copy-out admission is optional: when it is refused even after
+    /// reclamation, the registered page is kept and the memory cache and
+    /// store copy it out under their own admission as before.
+    fn detach_registered(
+        &self,
+        ciphertext: crate::memory::CiphertextPage,
+    ) -> crate::memory::CiphertextPage {
+        if !ciphertext.is_registered() {
+            return ciphertext;
+        }
+        let buffers = &self.dependencies.buffers;
+        let Ok(capacity) = buffers.aligned_capacity(ciphertext.bytes().len()) else {
+            return ciphertext;
+        };
+        let cache = ciphertext.envelope().page.version.object.cache.clone();
+        let Ok(reservation) =
+            self.reserve_with_reclamation(&cache, ResourceClass::Ciphertext, capacity)
+        else {
+            return ciphertext;
+        };
+        // Keep a handle so a failed copy falls back to the registered page.
+        let fallback = ciphertext.clone();
+        match buffers.detach_registered(ciphertext, reservation) {
+            Ok(detached) => {
+                drop(fallback);
+                detached
+            }
+            Err(_) => fallback,
+        }
+    }
+
     pub(super) async fn decrypt(
         &self,
         page: &PageId,
@@ -1670,7 +1723,7 @@ impl Fill {
             let result = PageResult {
                 metadata: copy.metadata,
                 plaintext,
-                ciphertext: copy.ciphertext,
+                ciphertext: self.detach_registered(copy.ciphertext),
             };
             result.validate_for(page)?;
             Ok(result)
