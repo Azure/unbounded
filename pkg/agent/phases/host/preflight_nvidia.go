@@ -114,9 +114,11 @@ func (c nvidiaDriverChecker) Check(ctx context.Context) []preflight.Result {
 
 	findings = append(findings, c.checkPCIDriver(devices)...)
 	findings = append(findings, c.checkKernelModules(ctx)...)
-	findings = append(findings, c.checkDeviceNodes(deviceNodes)...)
 	findings = append(findings, c.checkDriverLibraries(ctx)...)
 	findings = append(findings, c.checkNvidiaSMI(ctx)...)
+	// Driver health queries can materialize lazy nodes such as nvidia-uvm.
+	// Discover them again before treating the device-node view as authoritative.
+	findings = append(findings, c.checkDeviceNodes(c.discoverDeviceNodes())...)
 	findings = append(findings, c.checkServices(ctx)...)
 
 	if len(findings) == 0 {

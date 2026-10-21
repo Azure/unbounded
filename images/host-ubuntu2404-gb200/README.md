@@ -29,10 +29,11 @@ the public DGX GB200 1.3.10 host software matrix. That DGX release is not an
 OEM firmware authorization for this rack; the profile exists only to test
 whether the later 580.178.04 Blackwell NVLink/GSP changes are involved.
 
-The open DKMS profiles run a bounded `nvidia-modprobe` initialization and wait
-for the GPU, UVM, and NVSwitch control device nodes before Fabric Manager and
-cloud-final. This prevents node bootstrap from racing asynchronous device-node
-creation while still failing closed if the required nodes never appear.
+The image does not install a custom device-node wait service. Physical GB200
+boot evidence shows that Fabric Manager creates the NVSwitch control node and
+that the UVM nodes can materialize during the first successful driver health
+query. Consumers must run their driver health query before taking the
+authoritative device-node snapshot.
 
 The image contains a GPT disk with an EFI partition, signed Ubuntu ARM64
 shim/GRUB binaries, and an ext4 root with at least 5 GiB additional space.

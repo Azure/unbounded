@@ -223,83 +223,15 @@ def verify():
         "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
     )
     device_init_script = Path("/usr/local/sbin/unbounded-nvidia-device-init")
-    if module_source == "ubuntu-precompiled-server-open":
-        require(not device_init.exists(), "unexpected NVIDIA device initialization service")
-        require(
-            not device_init_script.exists(),
-            "unexpected NVIDIA device initialization script",
-        )
-    else:
-        require(
-            device_init.exists()
-            and device_init.read_text().splitlines()
-            == [
-                "[Unit]",
-                "Description=Initialize NVIDIA GPU and NVSwitch device nodes",
-                "Before=nvidia-fabricmanager.service cloud-final.service",
-                "",
-                "[Service]",
-                "Type=oneshot",
-                "ExecStart=/usr/local/sbin/unbounded-nvidia-device-init",
-                "RemainAfterExit=yes",
-                "",
-                "[Install]",
-                "WantedBy=multi-user.target",
-            ],
-            "invalid NVIDIA device initialization service",
-        )
-        require(
-            device_init_script.exists()
-            and device_init_script.read_text().splitlines()
-            == [
-                "#!/bin/sh",
-                "set -eu",
-                "",
-                "has_nvidia=",
-                "for vendor in /sys/bus/pci/devices/*/vendor; do",
-                '    if [ -f "$vendor" ] && [ "$(cat "$vendor")" = 0x10de ]; then',
-                "        has_nvidia=1",
-                "        break",
-                "    fi",
-                "done",
-                'if [ -z "$has_nvidia" ]; then',
-                "    exit 0",
-                "fi",
-                "",
-                "/usr/bin/nvidia-modprobe -c 0",
-                "/usr/bin/nvidia-modprobe -u",
-                "/usr/bin/nvidia-modprobe -s",
-                "/usr/bin/udevadm settle --timeout=30 || true",
-                "",
-                "attempt=0",
-                'while [ "$attempt" -lt 60 ]; do',
-                "    missing=",
-                "    for path in \\",
-                "        /dev/nvidiactl \\",
-                "        /dev/nvidia0 \\",
-                "        /dev/nvidia-uvm \\",
-                "        /dev/nvidia-uvm-tools \\",
-                "        /dev/nvidia-nvswitchctl; do",
-                '        if [ ! -e "$path" ]; then',
-                '            missing="$missing $path"',
-                "        fi",
-                "    done",
-                '    if [ -z "$missing" ]; then',
-                "        exit 0",
-                "    fi",
-                "    attempt=$((attempt + 1))",
-                "    sleep 1",
-                "done",
-                "",
-                'echo "missing NVIDIA device nodes after initialization:$missing" >&2',
-                "exit 1",
-            ],
-            "invalid NVIDIA device initialization script",
-        )
-        require(
-            device_init_enabled.is_symlink(),
-            "NVIDIA device initialization service is not enabled",
-        )
+    require(not device_init.exists(), "unexpected NVIDIA device initialization service")
+    require(
+        not device_init_enabled.is_symlink(),
+        "unexpected enabled NVIDIA device initialization service",
+    )
+    require(
+        not device_init_script.exists(),
+        "unexpected NVIDIA device initialization script",
+    )
     require(not Path("/etc/ssh/ssh_host_ed25519_key").exists(), "baked-in SSH key")
     require(Path("/etc/machine-id").read_bytes() == b"", "baked-in machine ID")
     result = {

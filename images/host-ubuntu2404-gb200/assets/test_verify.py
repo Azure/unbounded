@@ -113,71 +113,6 @@ class RootfsContractTest(unittest.TestCase):
             }[field]
         self.fail(f"unexpected command: {args}")
 
-    def configure_nvidia_device_init(self):
-        self.put(
-            "/usr/local/sbin/unbounded-nvidia-device-init",
-            "#!/bin/sh\n"
-            "set -eu\n"
-            "\n"
-            "has_nvidia=\n"
-            "for vendor in /sys/bus/pci/devices/*/vendor; do\n"
-            '    if [ -f "$vendor" ] && [ "$(cat "$vendor")" = 0x10de ]; then\n'
-            "        has_nvidia=1\n"
-            "        break\n"
-            "    fi\n"
-            "done\n"
-            'if [ -z "$has_nvidia" ]; then\n'
-            "    exit 0\n"
-            "fi\n"
-            "\n"
-            "/usr/bin/nvidia-modprobe -c 0\n"
-            "/usr/bin/nvidia-modprobe -u\n"
-            "/usr/bin/nvidia-modprobe -s\n"
-            "/usr/bin/udevadm settle --timeout=30 || true\n"
-            "\n"
-            "attempt=0\n"
-            'while [ "$attempt" -lt 60 ]; do\n'
-            "    missing=\n"
-            "    for path in \\\n"
-            "        /dev/nvidiactl \\\n"
-            "        /dev/nvidia0 \\\n"
-            "        /dev/nvidia-uvm \\\n"
-            "        /dev/nvidia-uvm-tools \\\n"
-            "        /dev/nvidia-nvswitchctl; do\n"
-            '        if [ ! -e "$path" ]; then\n'
-            '            missing="$missing $path"\n'
-            "        fi\n"
-            "    done\n"
-            '    if [ -z "$missing" ]; then\n'
-            "        exit 0\n"
-            "    fi\n"
-            "    attempt=$((attempt + 1))\n"
-            "    sleep 1\n"
-            "done\n"
-            "\n"
-            'echo "missing NVIDIA device nodes after initialization:$missing" >&2\n'
-            "exit 1\n",
-        )
-        self.put(
-            "/etc/systemd/system/nvidia-device-init.service",
-            "[Unit]\n"
-            "Description=Initialize NVIDIA GPU and NVSwitch device nodes\n"
-            "Before=nvidia-fabricmanager.service cloud-final.service\n"
-            "\n"
-            "[Service]\n"
-            "Type=oneshot\n"
-            "ExecStart=/usr/local/sbin/unbounded-nvidia-device-init\n"
-            "RemainAfterExit=yes\n"
-            "\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n",
-        )
-        enabled = self.path(
-            "/etc/systemd/system/multi-user.target.wants/nvidia-device-init.service"
-        )
-        enabled.parent.mkdir(parents=True, exist_ok=True)
-        enabled.symlink_to("/etc/systemd/system/nvidia-device-init.service")
-
     def configure_agentbaker_kernel(self):
         self.mana_builtin = True
         self.put(
@@ -190,7 +125,6 @@ class RootfsContractTest(unittest.TestCase):
             f"/lib/modules/{self.kernel}/modules.builtin",
             "kernel/drivers/net/ethernet/microsoft/mana/mana.ko\n",
         )
-        self.configure_nvidia_device_init()
 
     def rejected(self, message):
         with self.assertRaisesRegex(RuntimeError, message):
@@ -355,7 +289,6 @@ class RootfsContractTest(unittest.TestCase):
             "nvidia-fabricmanager\t580.167.08-1ubuntu1\tarm64\n"
             "libnvidia-nscq\t580.167.08-1ubuntu1\tarm64"
         )
-        self.configure_nvidia_device_init()
         verify.verify()
 
     def test_agentbaker_driver_profile_requires_open_dkms(self):
@@ -372,7 +305,7 @@ class RootfsContractTest(unittest.TestCase):
         )
         self.rejected("missing pinned open DKMS driver")
 
-    def test_agentbaker_device_initialization_service_is_required(self):
+    def test_agentbaker_rejects_legacy_device_initialization_service(self):
         self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-driver"
         os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
@@ -385,10 +318,13 @@ class RootfsContractTest(unittest.TestCase):
             "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
             "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
         )
-        self.path("/etc/systemd/system/nvidia-device-init.service").unlink()
-        self.rejected("NVIDIA device initialization service")
+        self.put(
+            "/etc/systemd/system/nvidia-device-init.service",
+            "[Service]\nExecStart=/usr/local/sbin/unbounded-nvidia-device-init\n",
+        )
+        self.rejected("unexpected NVIDIA device initialization service")
 
-    def test_agentbaker_device_initialization_wait_is_required(self):
+    def test_agentbaker_rejects_legacy_device_initialization_script(self):
         self.configure_agentbaker_kernel()
         os.environ["GB200_PROFILE"] = "agentbaker-driver"
         os.environ["NVIDIA_MODULE_SOURCE"] = "nvidia-dkms-open"
@@ -401,8 +337,8 @@ class RootfsContractTest(unittest.TestCase):
             "nvidia-fabricmanager\t580.159.04-1ubuntu1\tarm64\n"
             "libnvidia-nscq\t580.159.04-1ubuntu1\tarm64"
         )
-        self.path("/usr/local/sbin/unbounded-nvidia-device-init").unlink()
-        self.rejected("NVIDIA device initialization script")
+        self.put("/usr/local/sbin/unbounded-nvidia-device-init", "#!/bin/sh\n")
+        self.rejected("unexpected NVIDIA device initialization script")
 
     def test_doca_profile_requires_doca_ofed(self):
         self.configure_agentbaker_kernel()
