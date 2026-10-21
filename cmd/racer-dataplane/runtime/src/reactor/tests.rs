@@ -3405,3 +3405,364 @@ mod reentrancy_panics_and_shutdown {
         assert!(matches!(poll(&mut receive), Poll::Ready(Ok(_))));
     }
 }
+
+mod vectored {
+    //! Zero-copy vectored positioned writes on the host ring and in simulation.
+    use super::*;
+
+    /// Immutable body storage shared with other owners.
+    struct SharedBody(Rc<Vec<u8>>);
+
+    // SAFETY: no owner mutates or resizes the shared Vec, so its bytes are stable.
+    unsafe impl SendBuffer for SharedBody {
+        /// Runtime errors accepted by the test reactor's scope.
+        type Error = Error;
+
+        /// Borrow the shared bytes without copying them.
+        fn send_bytes(&self) -> Result<&[u8]> {
+            Ok(&self.0)
+        }
+    }
+
+    /// Body storage that rejects access before any submission.
+    struct RejectingBody;
+
+    // SAFETY: never yields a region.
+    unsafe impl SharedWriteBuffer for RejectingBody {
+        /// Runtime errors accepted by the test reactor's scope.
+        type Error = Error;
+
+        /// Refuse access like a body whose allocation was revoked.
+        fn write_bytes(&self) -> Result<&[u8]> {
+            Err(Error::Unavailable)
+        }
+    }
+
+    #[test]
+    /// Write header then shared body at an offset, returning both owners and the lease.
+    fn real_vectored_file_write_returns_owners_and_errors() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let scope = scope();
+        let baseline = reactor.admission.used(ResourceClass::RequestContext);
+        // Anonymous memory-backed regular file avoids filesystem fixture side effects.
+        let raw = unsafe { libc::memfd_create(c"vectored-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
+        let body = Rc::new(b"world".to_vec());
+        let header = buffer(b"hello ");
+        let header_ptr = header.0.as_ptr();
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at(fd.clone(), 2, header, SharedBody(body.clone()), 7u8, &scope),
+        )
+        .unwrap();
+        assert_eq!((written.bytes, written.lease), (11, 7));
+        assert_eq!(written.header.0.as_ptr(), header_ptr);
+        assert!(Rc::ptr_eq(&written.body.0, &body));
+        // An empty header still writes the body.
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at(fd.clone(), 0, buffer(b""), buffer(b"<>"), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(written.bytes, 2);
+        let read = drive(
+            &reactor,
+            reactor.read_at(fd, 0, buffer(&[9; 16]), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(read.bytes, 13);
+        assert_eq!(&read.buffer.0[..13], b"<>hello world");
+        // The read end of a pipe is not writable.
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read_end = Rc::new(unsafe { Descriptor::from_raw_fd(pipe[0]) });
+        let _write_end = unsafe { Descriptor::from_raw_fd(pipe[1]) };
+        let drops = Rc::new(Cell::new(0));
+        let error = drive(
+            &reactor,
+            reactor.write_vectored_at(
+                read_end,
+                0,
+                Buffer(vec![1], drops.clone()),
+                Buffer(vec![2], drops.clone()),
+                Lease(drops.clone()),
+                &scope,
+            ),
+        )
+        .err();
+        assert_eq!(error, Some(Error::Os(libc::EBADF)));
+        assert_eq!(drops.get(), 3, "failed writes release every owner once");
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(
+            reactor.admission.used(ResourceClass::RequestContext),
+            baseline
+        );
+    }
+
+    #[test]
+    /// Reject sentinel offsets and inaccessible owners before publishing kernel work.
+    fn vectored_write_rejects_invalid_input_before_publication() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let request = scope();
+        let (fd, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = Rc::new(Descriptor::from(fd));
+        for offset in [i64::MAX as u64 + 1, u64::MAX] {
+            let drops = Rc::new(Cell::new(0));
+            assert!(matches!(
+                drive(
+                    &reactor,
+                    reactor.write_vectored_at(
+                        fd.clone(),
+                        offset,
+                        Buffer(vec![0], drops.clone()),
+                        Buffer(vec![0], drops.clone()),
+                        Lease(drops.clone()),
+                        &request
+                    )
+                ),
+                Err(Error::InvalidInput)
+            ));
+            assert_eq!(drops.get(), 3);
+        }
+        assert!(matches!(
+            drive(
+                &reactor,
+                reactor.write_vectored_at(fd, 0, buffer(b"x"), RejectingBody, (), &request)
+            ),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[cfg(feature = "simulation")]
+    mod simulated {
+        use super::*;
+        use simulation::{Fault, Simulation};
+
+        /// Count accepted submissions of one operation kind in the simulation trace.
+        fn submissions(sim: &Simulation, name: &str) -> usize {
+            sim.trace()
+                .iter()
+                .filter(|event| event.operation == format!("submit:{name}"))
+                .count()
+        }
+
+        /// Open a fresh simulated regular file with extra open flags.
+        fn file(sim: &Simulation, name: &str, flags: i32) -> Rc<Descriptor> {
+            Rc::new(
+                sim.open(
+                    None,
+                    std::path::Path::new(name),
+                    libc::O_CREAT | libc::O_RDWR | flags,
+                )
+                .unwrap(),
+            )
+        }
+
+        #[test]
+        /// Gather both segments, retry zero progress, report short progress once,
+        /// and keep both owners and the lease until completion.
+        fn vectored_write_gathers_retries_and_reports_short_progress() {
+            for errno in [libc::EINTR, libc::EAGAIN] {
+                let sim = Simulation::new();
+                let _environment = sim.enter();
+                let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+                let request = scope();
+                let file = file(&sim, "/vectored", 0);
+                let drops = Rc::new(Cell::new(0));
+                let written = drive(
+                    &reactor,
+                    reactor.write_vectored_at(
+                        file.clone(),
+                        1,
+                        Buffer(b"HD".to_vec(), drops.clone()),
+                        Buffer(b"body".to_vec(), drops.clone()),
+                        Lease(drops.clone()),
+                        &request,
+                    ),
+                )
+                .unwrap();
+                assert_eq!(written.bytes, 6);
+                assert_eq!(
+                    (&written.header.0[..], &written.body.0[..]),
+                    (&b"HD"[..], &b"body"[..])
+                );
+                drop(written);
+                assert_eq!(drops.get(), 3);
+
+                sim.inject("writev", Fault::Errno(errno)).unwrap();
+                sim.inject("writev", Fault::Short(3)).unwrap();
+                let drops = Rc::new(Cell::new(0));
+                let mut operation = reactor.write_vectored_at(
+                    file.clone(),
+                    0,
+                    Buffer(b"xy".to_vec(), drops.clone()),
+                    Buffer(b"zw".to_vec(), drops.clone()),
+                    Lease(drops.clone()),
+                    &request,
+                );
+                assert!(poll(&mut operation).is_pending());
+                for _ in 0..2 {
+                    reactor.poll_budgeted(1).unwrap();
+                }
+                assert_eq!(drops.get(), 0, "transient CQE retains owners before repoll");
+                let written = drive(&reactor, operation).unwrap();
+                assert_eq!(written.bytes, 3, "short progress crosses into the body");
+                assert_eq!(drops.get(), 0);
+                assert_eq!(submissions(&sim, "writev"), 3);
+                assert_eq!(
+                    submissions(&sim, "poll"),
+                    usize::from(errno == libc::EAGAIN)
+                );
+                drop(written);
+                assert_eq!(drops.get(), 3);
+                let read = drive(
+                    &reactor,
+                    reactor.read_at(file, 0, buffer(&[0; 7]), (), &request),
+                )
+                .unwrap();
+                assert_eq!(&read.buffer.0, b"xyzbody");
+                assert_eq!(reactor.in_flight(), 0);
+            }
+        }
+
+        #[test]
+        /// Surface device errors after releasing owners, and keep "write" faults
+        /// from matching vectored writes.
+        fn vectored_write_errors_release_owners_and_faults_are_distinct() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+            let request = scope();
+            let file = file(&sim, "/vectored-error", 0);
+            sim.inject("writev", Fault::Errno(libc::EIO)).unwrap();
+            let drops = Rc::new(Cell::new(0));
+            let result = drive(
+                &reactor,
+                reactor.write_vectored_at(
+                    file.clone(),
+                    0,
+                    Buffer(vec![1], drops.clone()),
+                    Buffer(vec![2], drops.clone()),
+                    Lease(drops.clone()),
+                    &request,
+                ),
+            );
+            assert!(matches!(result, Err(Error::Os(libc::EIO))));
+            assert_eq!(drops.get(), 3);
+            sim.inject("write", Fault::Errno(libc::EIO)).unwrap();
+            let written = drive(
+                &reactor,
+                reactor.write_vectored_at(
+                    file.clone(),
+                    0,
+                    buffer(b"a"),
+                    buffer(b"b"),
+                    (),
+                    &request,
+                ),
+            )
+            .unwrap();
+            assert_eq!(written.bytes, 2);
+            assert!(matches!(
+                drive(
+                    &reactor,
+                    reactor.write_at(file, 0, buffer(b"c"), (), &request)
+                ),
+                Err(Error::Os(libc::EIO))
+            ));
+            assert_eq!(reactor.in_flight(), 0);
+        }
+
+        /// A window of a larger allocation, used to place segments at chosen alignments.
+        struct Window {
+            storage: Vec<u8>,
+            start: usize,
+            len: usize,
+        }
+
+        impl Window {
+            /// Expose `len` bytes starting `skew` bytes past a 4096-byte boundary.
+            fn new(len: usize, skew: usize, fill: u8) -> Self {
+                let storage = vec![fill; len + skew + 4096];
+                let start = storage.as_ptr().align_offset(4096) + skew;
+                Self {
+                    storage,
+                    start,
+                    len,
+                }
+            }
+        }
+
+        // SAFETY: the private Vec is never resized, so the window is stable.
+        unsafe impl IoBuffer for Window {
+            /// Runtime errors accepted by the test reactor's scope.
+            type Error = Error;
+
+            /// Borrow the window immutably.
+            fn bytes(&self) -> Result<&[u8]> {
+                Ok(&self.storage[self.start..self.start + self.len])
+            }
+
+            /// Borrow the same window exclusively.
+            fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+                Ok(&mut self.storage[self.start..self.start + self.len])
+            }
+        }
+
+        #[test]
+        /// Direct I/O checks alignment for each segment, not the gathered total.
+        fn vectored_direct_write_checks_every_segment() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+            let request = scope();
+            let file = file(&sim, "/vectored-direct", libc::O_DIRECT);
+            let written = drive(
+                &reactor,
+                reactor.write_vectored_at(
+                    file.clone(),
+                    4096,
+                    Window::new(4096, 0, b'h'),
+                    Window::new(8192, 0, b'b'),
+                    (),
+                    &request,
+                ),
+            )
+            .unwrap();
+            assert_eq!(written.bytes, 12288);
+            // Header length, body pointer, body length, then the shared offset.
+            for (offset, header, body) in [
+                (0, Window::new(2048, 0, 0), Window::new(6144, 0, 0)),
+                (0, Window::new(4096, 0, 0), Window::new(4096, 512, 0)),
+                (0, Window::new(4096, 0, 0), Window::new(4095, 0, 0)),
+                (512, Window::new(4096, 0, 0), Window::new(4096, 0, 0)),
+            ] {
+                assert!(matches!(
+                    drive(
+                        &reactor,
+                        reactor.write_vectored_at(file.clone(), offset, header, body, (), &request)
+                    ),
+                    Err(Error::Os(libc::EINVAL))
+                ));
+            }
+            let read = drive(
+                &reactor,
+                reactor.read_at(file, 4096, Window::new(12288, 0, 0), (), &request),
+            )
+            .unwrap();
+            let bytes = read.buffer.bytes().unwrap();
+            assert!(bytes[..4096].iter().all(|&b| b == b'h'));
+            assert!(bytes[4096..].iter().all(|&b| b == b'b'));
+            assert_eq!(reactor.in_flight(), 0);
+        }
+    }
+}
