@@ -564,6 +564,8 @@ mod duplex_release {
 
 struct Link {
     client: Rc<Requester>,
+    /// The only node with a reachable peer endpoint.
+    provider: racer_control_wire::NodeId,
     demands: Rc<RefCell<Vec<u64>>>,
     stats: Rc<LinkStats>,
 }
@@ -600,6 +602,14 @@ impl Link {
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
+            // Requester endpoints are unbound, so a request to one cannot
+            // succeed. Refuse it here as the closed port would: otherwise the
+            // health of the refused direct path decides whether the requester
+            // retries through the provider's relay, whose outbound stack is a
+            // stub, and the read then stalls on wall-clock timing.
+            if request.route.destination != self.provider {
+                return Err(Error::Os(libc::ECONNREFUSED));
+            }
             // Direct window fills send page requests; selections send Subscribe.
             let PeerOperation::Subscribe { subscription, .. } = &request.operation else {
                 return self.client.request(request, membership, scope).await;
@@ -1263,6 +1273,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
             Requester::scripted(
                 Rc::new(Link {
                     client: requester,
+                    provider: node(2),
                     demands: demands.clone(),
                     stats: stats[i].clone(),
                 }),

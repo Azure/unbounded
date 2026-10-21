@@ -3299,6 +3299,11 @@ impl NoOutbound {
 }
 impl Drop for NoOutbound {
     fn drop(&mut self) {
+        // A second panic while unwinding aborts the whole test binary and
+        // hides the original failure.
+        if std::thread::panicking() {
+            return;
+        }
         assert_eq!(
             self.requester.outbound_requests(),
             0,
