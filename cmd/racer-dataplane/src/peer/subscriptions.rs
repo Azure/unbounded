@@ -189,6 +189,14 @@ struct Entry {
 
     /// Selected flights whose response has not been consumed or dropped.
     pending: Vec<Flight>,
+
+    /// Allowance a newer ceiling was widened by on account of a lower
+    /// sequence in the window that has not arrived yet: the sequence, whether
+    /// it holds a page, and its bytes. The requester debited that request
+    /// before issuing the newer one, so a late arrival takes this allowance
+    /// instead of the shared budget. Rebuilt by every newer ceiling, which
+    /// forfeits allowance for sequences that left the window.
+    pledges: Vec<(u64, bool, u64)>,
 }
 
 /// One admitted request. Its grant is reported relative to the request's own
@@ -262,7 +270,13 @@ impl Entry {
     fn apply_ceiling(&mut self, sequence: u64, page_budget: u32, byte_budget: u64) {
         const RESERVE: u64 = crate::model::PAGE_BYTES + 16;
         let older = |r: &&mut Reservation| r.sequence != sequence;
-        let pages = self.admitted.iter_mut().filter(older).count();
+        // Lower sequences in the window that have not arrived. Must run after
+        // the replay window has been shifted to `sequence`.
+        let unseen: Vec<u64> = (1..self.flights.min(64) as u64)
+            .filter(|&offset| offset <= sequence && self.seen & (1 << offset) == 0)
+            .map(|offset| sequence - offset)
+            .collect();
+        let pages = self.admitted.iter_mut().filter(older).count() + unseen.len();
         let flights = pages + self.pending.iter().filter(|f| !f.settled).count();
         self.subscription.page_budget = self
             .subscription
@@ -285,6 +299,30 @@ impl Entry {
         }
         for flight in self.pending.iter_mut().filter(|f| !f.settled) {
             cover(&mut flight.reservation.covered_bytes);
+        }
+        self.pledges = unseen
+            .into_iter()
+            .map(|s| {
+                let page = pages > 0;
+                pages = pages.saturating_sub(1);
+                let mut covered = 0;
+                cover(&mut covered);
+                (s, page, covered)
+            })
+            .collect();
+    }
+
+    /// Hand a late request the allowance pledged for its sequence, if any.
+    /// It then charges or forfeits it like any other covered reservation.
+    fn take_pledge(&mut self, reservation: &mut Reservation) {
+        if let Some(index) = self
+            .pledges
+            .iter()
+            .position(|(s, ..)| *s == reservation.sequence)
+        {
+            let (_, page, bytes) = self.pledges.swap_remove(index);
+            reservation.covered_page = page;
+            reservation.covered_bytes = bytes;
         }
     }
 
@@ -477,7 +515,8 @@ impl Subscriptions {
     /// sequence below the highest admitted one is accepted once if it is
     /// within the granted flight window. Only the highest sequence replaces
     /// demand, budgets and deadline; an older request selects from its own
-    /// demand under the current contract budgets.
+    /// demand under the current contract budgets, funded by the allowance
+    /// newer ceilings set aside for it (see `Entry::pledges`).
     fn admit(
         &self,
         subscription: Subscription,
@@ -521,6 +560,11 @@ impl Subscriptions {
                         return Err(Error::InvalidRequest);
                     }
                     entry.reserve(Entry::reservation(&subscription, deadline))?;
+                    // Fund the late request from the allowance a newer ceiling
+                    // excluded for it. The replay bit below makes this once.
+                    let mut reservation = entry.admitted.pop().expect("just reserved");
+                    entry.take_pledge(&mut reservation);
+                    entry.admitted.push(reservation);
                     entry.seen |= 1 << offset;
                     return Ok((key, sequence));
                 }
@@ -579,6 +623,7 @@ impl Subscriptions {
                         seen: 1,
                         admitted: vec![reservation],
                         pending: Vec::new(),
+                        pledges: Vec::new(),
                     },
                 );
             }
@@ -1525,7 +1570,10 @@ mod tests {
             scheduler.state.lock().unwrap().entries[&key]
                 .subscription
                 .page_budget,
-            5
+            // Sequence 4's ceiling of 6 excludes the refused sequence 3, which
+            // was never admitted and keeps its own page until the window
+            // moves past it.
+            6
         );
         drop((held, next));
     }
@@ -1724,6 +1772,90 @@ mod tests {
         scheduler.release(&one);
         assert_eq!(contract(&scheduler), (1, RESERVE));
         drop(two);
+    }
+
+    /// Three-flight contract whose sequence 0 already completed and was
+    /// consumed, leaving `(pages, bytes)` on the contract.
+    fn late_contract(pages: u32, bytes: u64) -> Arc<Subscriptions> {
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        let mut zero = multi(1, 0, 3);
+        zero.page_budget = pages;
+        zero.byte_budget = bytes;
+        let (work, mut waiter) = leader(schedule(&scheduler, zero, "a"));
+        let _admission = complete(work);
+        drop(waiter.try_result(2).unwrap().unwrap());
+        scheduler
+    }
+
+    fn late(sequence: u64, pages: u32, bytes: u64) -> Subscription {
+        let mut sub = multi(1, sequence, 3);
+        sub.page_budget = pages;
+        sub.byte_budget = bytes;
+        sub
+    }
+
+    fn finish(selection: Result<Selection>) -> Completion {
+        let (work, mut waiter) = leader(selection);
+        let _admission = complete(work);
+        waiter.try_result(2).unwrap().unwrap()
+    }
+
+    #[test]
+    fn multi_flight_late_sequence_is_funded_from_its_own_allowance() {
+        const RESERVE: u64 = crate::model::PAGE_BYTES + 16;
+        // Pages: sequence 2's ceiling excluded sequence 1's page.
+        let scheduler = late_contract(3, 3 * RESERVE);
+        assert_eq!(contract(&scheduler), (2, 3 * RESERVE - 19));
+        let two = finish(schedule(&scheduler, late(2, 1, RESERVE), "a"));
+        assert_eq!(contract(&scheduler).0, 1);
+        let one = finish(schedule(&scheduler, late(1, 2, 2 * RESERVE), "a"));
+        assert_eq!((one.grant.sequence, two.grant.sequence), (1, 2));
+        // The late completion is charged its full reservation.
+        assert_eq!(contract(&scheduler), (0, RESERVE - 19));
+        assert!(matches!(
+            schedule(&scheduler, late(1, 2, 2 * RESERVE), "a"),
+            Err(Error::Replay)
+        ));
+        assert_eq!(contract(&scheduler), (0, RESERVE - 19));
+
+        // Bytes: sequence 2's ceiling leaves exactly one page of bytes.
+        let scheduler = late_contract(10, 3 * RESERVE);
+        finish(schedule(&scheduler, late(2, 8, 19), "a"));
+        assert_eq!(contract(&scheduler), (8, RESERVE));
+        finish(schedule(&scheduler, late(1, 9, RESERVE + 19), "a"));
+        assert_eq!(contract(&scheduler), (7, 0));
+    }
+
+    #[test]
+    fn multi_flight_late_allowance_is_funded_once_and_forfeited() {
+        const RESERVE: u64 = crate::model::PAGE_BYTES + 16;
+        // A late request that never selects forfeits its allowance.
+        let scheduler = late_contract(3, 3 * RESERVE);
+        let admit = |sub| scheduler.admit(sub, MembershipVersion(1), NodeId("a".into()), 1000, 1);
+        let two = admit(late(2, 1, RESERVE)).unwrap();
+        assert_eq!(contract(&scheduler), (2, 2 * RESERVE));
+        let one = admit(late(1, 2, 2 * RESERVE)).unwrap();
+        scheduler.release(&one);
+        assert_eq!(contract(&scheduler), (1, RESERVE));
+        assert!(matches!(admit(late(1, 2, 2 * RESERVE)), Err(Error::Replay)));
+        assert_eq!(contract(&scheduler), (1, RESERVE));
+        drop(two);
+
+        // A newer ceiling that moves the window past an unseen sequence
+        // forfeits its allowance; the stale sequence is a replay.
+        let scheduler = late_contract(5, 5 * RESERVE);
+        let admit = |sub| scheduler.admit(sub, MembershipVersion(1), NodeId("a".into()), 1000, 1);
+        let two = admit(late(2, 2, 2 * RESERVE)).unwrap();
+        assert_eq!(contract(&scheduler).0, 3);
+        scheduler.release(&two);
+        // Sequence 4 excludes 1, 2 and 3; only the unseen 3 is in its window.
+        let four = admit(late(4, 0, 0)).unwrap();
+        assert_eq!(contract(&scheduler), (1, RESERVE));
+        assert!(matches!(admit(late(1, 3, 3 * RESERVE)), Err(Error::Replay)));
+        assert!(matches!(admit(late(2, 2, 2 * RESERVE)), Err(Error::Replay)));
+        let three = admit(late(3, 1, RESERVE)).unwrap();
+        assert_eq!(contract(&scheduler), (1, RESERVE));
+        drop((three, four));
     }
 
     #[test]
